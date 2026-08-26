@@ -11,7 +11,8 @@ mod pdu;
 mod state;
 
 pub use log::{
-    AppendError, EventId, EventInput, ForkWindow, ForkWindowError, LinearIndex, LogEntry, RoomLog,
+    AppendError, EventId, EventInput, ForkWindow, ForkWindowError, LinearIndex, LogEntry,
+    RestoreError, RestoredEntry, RestoredLog, RoomLog,
 };
 pub use pdu::{Pdu, PduError};
 pub use state::{EventType, StateKey, StateRoot, StateSnapshot};

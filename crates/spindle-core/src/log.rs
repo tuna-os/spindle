@@ -82,6 +82,11 @@ pub struct LogEntry {
     pub event_id: EventId,
     pub prev_events: Vec<EventId>,
     pub depth: u64,
+    /// The state slot this entry wrote, if it wrote one.
+    ///
+    /// Retained so the log is self-describing: a reader with only the log can
+    /// rebuild room state by folding forward, without a separate state index.
+    pub state_key: Option<StateKey>,
     pub state_after: StateSnapshot,
 }
 
@@ -157,6 +162,19 @@ impl RoomLog {
     #[must_use]
     pub fn forward_extremities(&self) -> &BTreeSet<EventId> {
         &self.forward_extremities
+    }
+
+    /// Next index a live append will take. Durable state; a reopen must
+    /// restore it or the log will reissue indices it has already used.
+    #[must_use]
+    pub fn next_forward(&self) -> i64 {
+        self.next_forward
+    }
+
+    /// Next index a backfill prepend will take.
+    #[must_use]
+    pub fn next_backward(&self) -> i64 {
+        self.next_backward
     }
 
     /// Find the bounded divergent ancestry behind a set of event tips.
@@ -279,7 +297,8 @@ impl RoomLog {
         }
 
         let mut state_after = merge_states(&parent_entries)?;
-        if let Some(state_key) = input.state_key {
+        let state_key = input.state_key;
+        if let Some(state_key) = state_key.clone() {
             state_after = state_after.apply(state_key, input.event_id.as_str());
         }
         let depth = parent_entries
@@ -299,6 +318,7 @@ impl RoomLog {
             event_id: input.event_id,
             prev_events: input.prev_events,
             depth,
+            state_key,
             state_after,
         };
 
@@ -355,6 +375,7 @@ impl RoomLog {
             event_id: input.event_id,
             prev_events: input.prev_events,
             depth,
+            state_key: input.state_key,
             state_after,
         };
 
@@ -381,6 +402,118 @@ impl RoomLog {
             );
         }
         ancestors
+    }
+}
+
+/// One entry read back from storage, ready to be replayed.
+#[derive(Clone, Debug)]
+pub struct RestoredEntry {
+    pub li: LinearIndex,
+    pub event_id: EventId,
+    pub prev_events: Vec<EventId>,
+    pub depth: u64,
+    pub state_key: Option<StateKey>,
+    /// The state root recorded when this entry was first written.
+    pub expected_state_root: [u8; 32],
+}
+
+/// A log rebuilt from storage, plus whichever entries could not be verified.
+#[derive(Clone, Debug)]
+pub struct RestoredLog {
+    pub log: RoomLog,
+    /// Entries whose refolded state disagrees with the root recorded at write
+    /// time.
+    ///
+    /// Expected for backfilled ranges, whose state was supplied by the caller
+    /// from `/state_ids` (SPEC §6.5) rather than derived from parents this log
+    /// holds — re-establishing it is a fetch, not a replay. Anything else in
+    /// here is corruption, and the caller must treat it as such rather than
+    /// serving state it could not reproduce.
+    pub unverified: Vec<LinearIndex>,
+}
+
+/// Why a log could not be rebuilt from storage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RestoreError {
+    /// Entries were not supplied in ascending linear-index order.
+    OutOfOrder { expected_after: i64, found: i64 },
+    /// Two entries claim the same index.
+    DuplicateIndex(i64),
+}
+
+impl RoomLog {
+    /// Rebuild a log from durable records, supplied in ascending `li` order.
+    ///
+    /// State is refolded rather than stored per entry, then checked against the
+    /// root recorded at write time. A disagreement is reported, never silently
+    /// accepted: serving state we could not reproduce is worse than admitting
+    /// we could not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RestoreError`] if the records are out of order or duplicated.
+    pub fn restore(
+        entries: impl IntoIterator<Item = RestoredEntry>,
+        next_forward: i64,
+        next_backward: i64,
+        forward_extremities: impl IntoIterator<Item = EventId>,
+    ) -> Result<RestoredLog, RestoreError> {
+        let mut log = Self {
+            entries: BTreeMap::new(),
+            positions: HashMap::new(),
+            forward_extremities: forward_extremities.into_iter().collect(),
+            next_forward,
+            next_backward,
+        };
+        let mut unverified = Vec::new();
+        let mut previous: Option<i64> = None;
+
+        for restored in entries {
+            let li = restored.li.get();
+            if let Some(previous) = previous {
+                if li == previous {
+                    return Err(RestoreError::DuplicateIndex(li));
+                }
+                if li < previous {
+                    return Err(RestoreError::OutOfOrder {
+                        expected_after: previous,
+                        found: li,
+                    });
+                }
+            }
+            previous = Some(li);
+
+            let parents: Vec<&LogEntry> = restored
+                .prev_events
+                .iter()
+                .filter_map(|parent| log.get(parent))
+                .collect();
+            let mut state_after = match merge_states(&parents) {
+                Ok(state) => state,
+                // A conflict here means the fold cannot be reproduced; record
+                // it rather than refusing to open the room.
+                Err(_) => StateSnapshot::new(),
+            };
+            if let Some(state_key) = restored.state_key.clone() {
+                state_after = state_after.apply(state_key, restored.event_id.as_str());
+            }
+            if *state_after.root().as_bytes() != restored.expected_state_root {
+                unverified.push(restored.li);
+            }
+
+            let entry = LogEntry {
+                li: restored.li,
+                event_id: restored.event_id,
+                prev_events: restored.prev_events,
+                depth: restored.depth,
+                state_key: restored.state_key,
+                state_after,
+            };
+            log.positions.insert(entry.event_id.clone(), li);
+            log.entries.insert(li, entry);
+        }
+
+        Ok(RestoredLog { log, unverified })
     }
 }
 
