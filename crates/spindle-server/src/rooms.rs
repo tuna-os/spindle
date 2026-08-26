@@ -48,6 +48,15 @@ const _: () = assert!(
 /// sections and a client acts on them differently.
 const INVITE: &[u8] = b"invite";
 
+/// Left of their own accord.
+const LEAVE: &[u8] = b"leave";
+
+/// Removed by someone else. A different membership from [`LEAVE`], and it has
+/// to stay one -- the auth rules refuse a rejoin only while the state says
+/// `ban` -- but for `/sync` the two are the same section: either way the user
+/// is out of the room.
+const BAN: &[u8] = b"ban";
+
 /// [`INVITE`] as a `str`, for the same reason [`JOIN_STR`] exists.
 const INVITE_STR: &str = "invite";
 
@@ -108,6 +117,7 @@ pub struct SyncResult {
     pub next_batch: u64,
     pub rooms: Vec<SyncRoom>,
     pub invited: Vec<String>,
+    pub left: Vec<SyncRoom>,
 }
 
 /// One room's share of a sync response.
@@ -1089,7 +1099,7 @@ impl Rooms {
         for room_id in joined {
             let (events, limited) = match since {
                 None => self.timeline_tail(&room_id, timeline_limit)?,
-                Some(since) => (self.timeline_since(&room_id, since, position)?, false),
+                Some(since) => (self.timeline_since(&room_id, since, position, None)?, false),
             };
             // An incremental sync says nothing about a room where nothing
             // happened. A client diffing rooms it was sent against rooms it
@@ -1112,10 +1122,13 @@ impl Rooms {
             });
         }
 
+        let left = self.left_rooms(user_id, since, position)?;
+
         Ok(SyncResult {
             next_batch: position,
             rooms,
             invited,
+            left,
         })
     }
 
@@ -1126,6 +1139,88 @@ impl Rooms {
     /// Returns [`RoomError`] if the index cannot be read.
     pub fn invited(&self, user_id: &str) -> Result<Vec<String>, RoomError> {
         self.membership_rooms(user_id, INVITE)
+    }
+
+    /// Rooms the user is out of, and has not forgotten.
+    ///
+    /// This is where forgetting finally becomes visible: a room the user
+    /// forgot is one they asked to stop seeing, and the leave section is the
+    /// only place it would otherwise keep appearing.
+    ///
+    /// **The timeline is capped at the user's own departure.** A left room
+    /// keeps receiving events, and `timeline_since` would happily return them
+    /// -- so without the cap an incremental sync would hand a departed member
+    /// everything said after they left, which is the one thing leaving is
+    /// supposed to prevent.
+    ///
+    /// An initial sync carries just the departure itself. A client needs to
+    /// know the room exists and that it is out of it; replaying the whole
+    /// history of every room a user ever left would make the first sync
+    /// proportional to their entire past.
+    fn left_rooms(
+        &self,
+        user_id: &str,
+        since: Option<u64>,
+        position: u64,
+    ) -> Result<Vec<SyncRoom>, RoomError> {
+        let mut out = Vec::new();
+        for membership in [LEAVE, BAN] {
+            for room_id in self.membership_rooms(user_id, membership)? {
+                if self.is_forgotten(user_id, &room_id)? {
+                    continue;
+                }
+                let Some((departure, departed_at)) = self.departure(&room_id, user_id)? else {
+                    continue;
+                };
+                let events = match since {
+                    None => vec![departure],
+                    Some(since) => {
+                        self.timeline_since(&room_id, since, position, Some(departed_at))?
+                    }
+                };
+                // An incremental sync says nothing about a room the user left
+                // long ago, for the same reason it says nothing about a joined
+                // room where nothing happened.
+                if since.is_some() && events.is_empty() {
+                    continue;
+                }
+                out.push(SyncRoom {
+                    room_id,
+                    state: Vec::new(),
+                    events,
+                    limited: false,
+                });
+            }
+        }
+        out.sort_by(|a, b| a.room_id.cmp(&b.room_id));
+        Ok(out)
+    }
+
+    /// The membership event that put `user_id` out of `room_id`, and its `li`.
+    ///
+    /// Read from current state rather than by walking the log: the *latest*
+    /// membership is the one that removed them, which is exactly what the
+    /// state snapshot holds.
+    fn departure(&self, room_id: &str, user_id: &str) -> Result<Option<(Value, i64)>, RoomError> {
+        let wanted = StateKey::new("m.room.member", user_id);
+        let found = self.with_room(room_id, |_, log| {
+            Ok(current_state(log)
+                .into_iter()
+                .find(|(key, _)| key == &wanted)
+                .map(|(_, event_id)| event_id))
+        })?;
+        let Some(event_id) = found else {
+            return Ok(None);
+        };
+        let li = self.with_room(room_id, |_, log| {
+            Ok(log
+                .get(&EventId::new(event_id.as_str()))
+                .map(|entry| entry.li.get()))
+        })?;
+        let Some(li) = li else {
+            return Ok(None);
+        };
+        Ok(Some((self.event(room_id, &event_id)?, li)))
     }
 
     /// The newest `limit` events of a room, oldest first.
@@ -1140,11 +1235,21 @@ impl Rooms {
     }
 
     /// Events of one room that entered the global stream after `since`.
+    /// `max_li` caps the range at a position in the room's own order, which is
+    /// how the leave section stops at the user's departure. `None` means the
+    /// whole range, which is what a joined room wants.
+    ///
+    /// The cap is tested against the stream record's `li` rather than against
+    /// anything in the event body -- events do not carry their linear index,
+    /// and an earlier draft of this filtered on `unsigned.li`, a field that
+    /// does not exist. Every comparison silently succeeded and the cap did
+    /// nothing at all.
     fn timeline_since(
         &self,
         room_id: &str,
         since: u64,
         position: u64,
+        max_li: Option<i64>,
     ) -> Result<Vec<Value>, RoomError> {
         let mut out = Vec::new();
         for stream_id in (since + 1)..=position {
@@ -1159,6 +1264,9 @@ impl Rooms {
                 continue;
             };
             if record.room_id != room_id {
+                continue;
+            }
+            if max_li.is_some_and(|max| record.li > max) {
                 continue;
             }
             let event_id = self.with_room(room_id, |_, log| {

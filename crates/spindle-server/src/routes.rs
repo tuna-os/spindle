@@ -1547,56 +1547,8 @@ async fn sync(
         }
     }
 
-    let mut join = serde_json::Map::new();
-    for room in result.rooms {
-        let unread = state
-            .rooms
-            .unread(&room.room_id, &identity.user_id)
-            .map_err(room_error)?;
-        let typing = state.typing.event(&room.room_id);
-        // Sent in full on every sync, incremental ones included, rather than
-        // only when it changed. Account data has no stream position of its
-        // own -- the sync token counts room events, and a `PUT` to
-        // `/account_data` appends nothing -- so sending only the delta would
-        // need a second cursor. Until there is one, repeating it is the
-        // answer that cannot silently drop a change, and the payload is a
-        // client's own settings rather than history.
-        let room_data = state
-            .account_data
-            .all(&identity.user_id, &room.room_id)
-            .map_err(|error| account_data_error(&error))?;
-        join.insert(
-            room.room_id,
-            json!({
-                "timeline": {
-                    "events": room.events,
-                    "limited": room.limited,
-                },
-                "state": { "events": room.state },
-                "ephemeral": {
-                    "events": typing.map(|event| vec![event]).unwrap_or_default(),
-                },
-                "account_data": { "events": room_data },
-                "unread_notifications": {
-                    "notification_count": unread.notification_count,
-                },
-            }),
-        );
-    }
+    let join = sync_join(&state, &identity, result.rooms)?;
 
-    // A room where the only news is that someone is typing has no timeline
-    // events, so `Rooms::sync` leaves it out -- correctly, since it knows
-    // nothing about typing. Adding it back here is what keeps typing out of
-    // the log layer entirely, which is where it belongs.
-    for room_id in state.rooms.joined(&identity.user_id).map_err(room_error)? {
-        if join.contains_key(&room_id) {
-            continue;
-        }
-        let Some(typing) = state.typing.event(&room_id) else {
-            continue;
-        };
-        join.insert(room_id, json!({ "ephemeral": { "events": [typing] } }));
-    }
     let mut invite = serde_json::Map::new();
     for room_id in result.invited {
         // An invited user is not in the room, so there is no timeline to show
@@ -1604,6 +1556,19 @@ async fn sync(
         // empty until stripped state lands, and empty is the honest answer
         // rather than state they are not entitled to.
         invite.insert(room_id, json!({ "invite_state": { "events": [] } }));
+    }
+
+    let mut leave = serde_json::Map::new();
+    for room in result.left {
+        // No `state` block: the state of a room you are not in is not yours to
+        // read, and the departure event in the timeline already says what a
+        // client needs -- that you are out, and how you came to be.
+        leave.insert(
+            room.room_id,
+            json!({
+                "timeline": { "events": room.events, "limited": room.limited },
+            }),
+        );
     }
 
     let mut global = state
@@ -1627,9 +1592,68 @@ async fn sync(
 
     Ok(Json(json!({
         "next_batch": crate::tokens::Sync(result.next_batch).to_string(),
-        "rooms": { "join": join, "invite": invite },
+        "rooms": { "join": join, "invite": invite, "leave": leave },
         "account_data": { "events": global },
     })))
+}
+
+/// One room's entry in `rooms.join`, for every joined room the sync found.
+///
+/// Lifted out of the handler because the handler had four sections to
+/// assemble and the joined one is by far the largest: it is the only one that
+/// carries state, account data, ephemeral events and an unread count at once.
+fn sync_join(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    rooms: Vec<crate::rooms::SyncRoom>,
+) -> Result<serde_json::Map<String, Value>, MatrixError> {
+    let mut join = serde_json::Map::new();
+    for room in rooms {
+        let unread = state
+            .rooms
+            .unread(&room.room_id, &identity.user_id)
+            .map_err(room_error)?;
+        // Sent in full on every sync, incremental ones included, rather than
+        // only when it changed. Account data has no stream position of its
+        // own -- the sync token counts room events, and a `PUT` to
+        // `/account_data` appends nothing -- so sending only the delta would
+        // need a second cursor. Until there is one, repeating it is the
+        // answer that cannot silently drop a change.
+        let room_data = state
+            .account_data
+            .all(&identity.user_id, &room.room_id)
+            .map_err(|error| account_data_error(&error))?;
+        let typing = state.typing.event(&room.room_id);
+        join.insert(
+            room.room_id,
+            json!({
+                "timeline": { "events": room.events, "limited": room.limited },
+                "state": { "events": room.state },
+                "account_data": { "events": room_data },
+                "ephemeral": {
+                    "events": typing.map(|event| vec![event]).unwrap_or_default(),
+                },
+                "unread_notifications": {
+                    "notification_count": unread.notification_count,
+                },
+            }),
+        );
+    }
+
+    // A room where the only news is that someone is typing has no timeline
+    // events, so `Rooms::sync` leaves it out -- correctly, since it knows
+    // nothing about typing. Adding it back here is what keeps typing out of
+    // the log layer entirely.
+    for room_id in state.rooms.joined(&identity.user_id).map_err(room_error)? {
+        if join.contains_key(&room_id) {
+            continue;
+        }
+        let Some(typing) = state.typing.event(&room_id) else {
+            continue;
+        };
+        join.insert(room_id, json!({ "ephemeral": { "events": [typing] } }));
+    }
+    Ok(join)
 }
 
 /// `POST /_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}`
