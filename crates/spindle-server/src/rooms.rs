@@ -991,10 +991,33 @@ impl Rooms {
     /// Returns [`RoomError`] if the room or its events cannot be read.
     pub fn unread(&self, room_id: &str, user_id: &str) -> Result<Unread, RoomError> {
         let read_up_to = self.receipt(room_id, user_id, "m.read")?;
-        // No receipt means nothing has been read, so the boundary sits below
-        // every index the log can hold -- including backfilled history, which
-        // is why this is `i64::MIN` and not zero.
-        let boundary = read_up_to.as_ref().map_or(i64::MIN, |receipt| receipt.li);
+        // A user is not behind on what was said before they arrived, so the
+        // count starts at their own membership event however far back the
+        // room goes. Without that floor a user with no receipt -- which is
+        // every new joiner -- has a boundary of `i64::MIN`, and the walk below
+        // reads *every event body in the room* on their first sync. That was
+        // #81, and it is the one operation that grew with room size while the
+        // rest of the API stayed flat.
+        //
+        // With a receipt, the later of the two wins. A receipt can sit below
+        // the join -- backfilled history carries negative indices, and the
+        // spec does not stop a client acknowledging one -- and taking the
+        // receipt alone there would walk back into history the user was never
+        // present for.
+        let joined_at = self.membership_event(room_id, user_id)?.map(|(_, li)| li);
+        let boundary = match (read_up_to.as_ref().map(|receipt| receipt.li), joined_at) {
+            (Some(receipt), Some(joined)) => receipt.max(joined),
+            (Some(receipt), None) => receipt,
+            (None, Some(joined)) => joined,
+            // Neither a receipt nor a membership: not a member, so there is
+            // nothing this user could be behind on, and no range to walk.
+            (None, None) => {
+                return Ok(Unread {
+                    notification_count: 0,
+                    read_up_to: None,
+                });
+            }
+        };
 
         // Which events are after the receipt: arithmetic on the index, no
         // ordering step. Walking backwards from the head and stopping at the
@@ -1169,7 +1192,8 @@ impl Rooms {
                 if self.is_forgotten(user_id, &room_id)? {
                     continue;
                 }
-                let Some((departure, departed_at)) = self.departure(&room_id, user_id)? else {
+                let Some((departure, departed_at)) = self.membership_event(&room_id, user_id)?
+                else {
                     continue;
                 };
                 let events = match since {
@@ -1196,12 +1220,17 @@ impl Rooms {
         Ok(out)
     }
 
-    /// The membership event that put `user_id` out of `room_id`, and its `li`.
+    /// `user_id`'s current membership event in `room_id`, and its `li`.
     ///
     /// Read from current state rather than by walking the log: the *latest*
-    /// membership is the one that removed them, which is exactly what the
-    /// state snapshot holds.
-    fn departure(&self, room_id: &str, user_id: &str) -> Result<Option<(Value, i64)>, RoomError> {
+    /// membership is the one that counts, which is exactly what the state
+    /// snapshot holds. For someone who has left, that is the event that
+    /// removed them; for someone still in the room, it is their join.
+    fn membership_event(
+        &self,
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<Option<(Value, i64)>, RoomError> {
         let wanted = StateKey::new("m.room.member", user_id);
         let found = self.with_room(room_id, |_, log| {
             Ok(current_state(log)
