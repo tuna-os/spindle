@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import html
 import json
 import pathlib
@@ -71,7 +72,7 @@ def comparison_rows(benchmarks: dict, ours_key: str, theirs_key: str, sizes: lis
         yield size, ours, theirs, ratio
 
 
-def render(document: dict) -> str:
+def render(document: dict, repository: str) -> str:
     benchmarks = document.get("benchmarks", {})
     parts: list[str] = []
     add = parts.append
@@ -161,7 +162,7 @@ code { font-size: .85em; }
     add(
         "<p class=\"note\">Raw data: <a href=\"latest.json\">latest.json</a>. "
         "Method, caveats and what each comparison does and does not establish: "
-        "<a href=\"https://github.com/hanthor/spindle/blob/main/docs/benchmarks.md\">"
+        f"<a href=\"https://github.com/{repository}/blob/main/docs/benchmarks.md\">"
         "docs/benchmarks.md</a>.</p>"
     )
     add("</body></html>")
@@ -172,11 +173,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results", type=pathlib.Path)
     parser.add_argument("output", type=pathlib.Path)
+    # Derived, not hardcoded. The published page used to name the repository
+    # in a string literal, which silently pointed at the old owner the moment
+    # the project moved -- a dead link on the one page that is supposed to be
+    # the authoritative one.
+    parser.add_argument(
+        "--repository",
+        default=os.environ.get("GITHUB_REPOSITORY", ""),
+        help="owner/name, for links back to the source (default: $GITHUB_REPOSITORY)",
+    )
     args = parser.parse_args()
+    if not args.repository:
+        parser.error("--repository is required when GITHUB_REPOSITORY is unset")
 
     document = json.loads(args.results.read_text())
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(render(document))
+    args.output.write_text(render(document, args.repository))
     print(f"rendered {len(document.get('benchmarks', {}))} benchmarks into {args.output}")
     return 0
 

@@ -26,12 +26,36 @@ assert marks["demo group/ours/1"]["lower_ns"] == 90.0, marks
 print(f"collect: {len(marks)} benchmarks, values intact")
 PY
 
-python3 "$here/render-benchmarks.py" "$work/latest.json" "$work/index.html"
+python3 "$here/render-benchmarks.py" "$work/latest.json" "$work/index.html" \
+    --repository example/fixture
 grep -q "Spindle benchmarks" "$work/index.html"
 grep -q "demo group/ours/1" "$work/index.html"
 # The humanising must not silently drop precision to zero.
 grep -q "100 ns" "$work/index.html"
-echo "render: page built and contains the measurements"
+# The link back to the source is derived from the repository it was told
+# about, not baked in. It was baked in once, and pointed at the previous
+# owner from the moment the project moved.
+grep -q "github.com/example/fixture/blob/main/docs/benchmarks.md" "$work/index.html"
+if grep -q "github.com/tuna-os/spindle" "$work/index.html"; then
+    echo "the rendered page hardcodes a repository instead of using the one given" >&2
+    exit 1
+fi
+echo "render: page built, measurements intact, source link derived"
+
+# Prose cannot be derived, so it is checked instead: the published-results URL
+# in docs/benchmarks.md has to name the repository this actually is. Nothing
+# else would have caught the links going stale on a transfer.
+if [[ -n "${GITHUB_REPOSITORY:-}" ]]; then
+    owner="${GITHUB_REPOSITORY%%/*}"
+    name="${GITHUB_REPOSITORY##*/}"
+    expected="https://${owner}.github.io/${name}/"
+    if ! grep -qF "$expected" "$here/../docs/benchmarks.md"; then
+        echo "docs/benchmarks.md does not point at ${expected}" >&2
+        grep -n "github.io" "$here/../docs/benchmarks.md" >&2 || true
+        exit 1
+    fi
+    echo "docs: the published-results URL matches ${GITHUB_REPOSITORY}"
+fi
 
 # An empty result set must fail rather than publish, because a page with no
 # rows reads as "everything got fast" rather than as "the collector broke".
