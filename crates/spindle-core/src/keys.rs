@@ -15,10 +15,39 @@ use crate::LinearIndex;
 
 /// On-disk key schema version.
 ///
-/// Bumped whenever an encoding below changes shape. Written as the first byte
-/// of every key so a store opened by a newer binary can detect an older layout
-/// rather than misread it.
+/// Bumped whenever an encoding below changes shape, and written as the first
+/// byte of every key so two layouts can never be confused for one another.
+///
+/// It does **not**, on its own, let a binary detect a version it does not
+/// speak. A scan is a prefix scan: a binary looking under version 1 for a store
+/// written at version 2 finds no keys, and reports an empty store rather than a
+/// wrong one. That is a quieter failure than a misread, not a safer one — which
+/// is why the store also carries a single version marker, read when it is
+/// opened, so a mismatch is an error rather than an absence.
+///
+/// The marker key must never collide with a key produced here, which holds as
+/// long as this constant is non-zero: [`store_marker`] is the all-zero prefix.
 pub const KEY_SCHEMA_VERSION: u8 = 1;
+
+/// The one key holding the store's schema versions.
+///
+/// Deliberately outside every [`Keyspace`]: it has to be readable *before* the
+/// binary knows whether it understands the layout the rest of the store uses,
+/// so it cannot itself be versioned by the scheme it describes. Its bytes are
+/// frozen forever — a marker that moved between versions could not be found by
+/// the binary that needs it most.
+#[must_use]
+pub fn store_marker() -> Vec<u8> {
+    vec![0x00, 0x00]
+}
+
+/// The marker's non-collision is a compile-time property, so it is checked at
+/// compile time: a zero `KEY_SCHEMA_VERSION` would put room keys in the
+/// marker's range, and that must fail the build rather than a test run.
+const _: () = assert!(
+    KEY_SCHEMA_VERSION != 0,
+    "the store marker relies on no key starting with a zero byte"
+);
 
 /// Which index a key belongs to. Distinct prefixes keep the keyspaces from
 /// interleaving even when they share a backing tree.
