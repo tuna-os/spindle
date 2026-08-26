@@ -297,7 +297,7 @@ concern and should be revisited then.
 | `event_index` | `event_id` → `(room_id, li)` | `/event`, `/context`, redaction targets |
 | `state_nodes` | `node_hash` → `HamtNode` | Content-addressed state trie (§6) |
 | `state_roots` | `(room_id, li)` → `StateRoot` | Sparse: only at state-changing `li` |
-| `relations` | `(room_id, target_event_id, rel_type, li)` → `event_id` | Threads, edits, reactions |
+| `relations` | `(room_id, target_event_id, li)` → `(rel_type, event_id)` | Threads, edits, reactions. *Amended from `(…, rel_type, li)`: with the type ahead of `li`, the type-less `/relations` arity cannot return timeline order — a length-prefixed `rel_type` sorts by length before bytes. Found by test; see `docs/divergence.md` §4.6.* |
 | `membership` | `(room_id, user_id)` → `(membership, li)` | Fan-out, ACL, room lists |
 | `user_rooms` | `(user_id, room_id)` → `membership` | Room list, sliding sync |
 | `stream` | `stream_id` → `(room_id, li)` | Global order for `/sync` catch-up (§10.2) |
