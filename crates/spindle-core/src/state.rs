@@ -60,6 +60,12 @@ impl StateRoot {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Rebuild a root from its stored bytes.
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 /// An immutable, structurally shared room-state snapshot.
@@ -342,4 +348,234 @@ fn hash_branch(bitmap: u32, children: &[Arc<Node>]) -> [u8; 32] {
 fn hash_bytes(hasher: &mut blake3::Hasher, value: &[u8]) {
     hasher.update(&(value.len() as u64).to_be_bytes());
     hasher.update(value);
+}
+
+// ---------------------------------------------------------------------------
+// Persistence
+// ---------------------------------------------------------------------------
+
+/// Tag bytes for the two node shapes. Part of the on-disk format, so they are
+/// fixed rather than derived from enum ordering.
+const TAG_LEAF: u8 = 0;
+const TAG_BRANCH: u8 = 1;
+
+/// Why a stored state trie could not be rebuilt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RehydrateError {
+    /// A node the trie references is not in the store.
+    MissingNode,
+    /// A node's bytes do not hash to the address they were stored under.
+    ///
+    /// Content addressing makes this detectable, and it is always corruption:
+    /// the alternative is serving state that silently is not what was written.
+    HashMismatch,
+    /// A node's encoding is truncated or uses an unknown tag.
+    Malformed,
+}
+
+impl StateSnapshot {
+    /// Every node reachable from this snapshot that `previous` does not already
+    /// contain, encoded and addressed by hash.
+    ///
+    /// Because nodes are content-addressed and updates path-copy, an unchanged
+    /// subtree keeps its address — so the walk stops as soon as it reaches a
+    /// node the previous snapshot held. That makes a state write O(log n) nodes
+    /// rather than O(state), which is what SPEC §6.1 claims and what keeps a
+    /// large room's state affordable to persist per event.
+    #[must_use]
+    pub fn delta_nodes(&self, previous: Option<&Self>) -> Vec<(StateRoot, Vec<u8>)> {
+        let mut out = Vec::new();
+        if let Some(root) = self.root.as_deref() {
+            collect_new(
+                root,
+                previous.and_then(|state| state.root.as_deref()),
+                &mut out,
+            );
+        }
+        out
+    }
+
+    /// Rebuild a snapshot from stored nodes, verifying each one's address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RehydrateError`] if a node is missing, malformed, or does not
+    /// hash to the address it was stored under.
+    pub fn rehydrate(
+        root: StateRoot,
+        load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+    ) -> Result<Self, RehydrateError> {
+        if root == Self::new().root() {
+            return Ok(Self::new());
+        }
+        let node = rebuild(&root, load)?;
+        let len = count_entries(&node);
+        Ok(Self {
+            root: Some(node),
+            len,
+        })
+    }
+}
+
+/// Emit the nodes `new` has that `old` did not, descending only where they
+/// differ.
+///
+/// Path copying means an unchanged subtree keeps its content address, so a
+/// matching hash ends the descent immediately. Walking both trees in step is
+/// what makes this proportional to the changed path; collecting the old tree's
+/// hashes up front would be proportional to the whole state, which is the cost
+/// this exists to avoid.
+fn collect_new(new: &Node, old: Option<&Node>, out: &mut Vec<(StateRoot, Vec<u8>)>) {
+    if old.is_some_and(|old| old.hash() == new.hash()) {
+        return;
+    }
+    if let Node::Branch {
+        bitmap, children, ..
+    } = new
+    {
+        for (index, child) in children.iter().enumerate() {
+            let slot = nth_set_bit(*bitmap, index);
+            collect_new(child, old.and_then(|old| child_at_slot(old, slot)), out);
+        }
+    }
+    out.push((StateRoot(new.hash()), encode_node(new)));
+}
+
+/// Position of the `index`-th set bit, which is the trie slot that child
+/// occupies.
+fn nth_set_bit(bitmap: u32, index: usize) -> u32 {
+    let mut remaining = bitmap;
+    for _ in 0..index {
+        remaining &= remaining - 1;
+    }
+    remaining.trailing_zeros()
+}
+
+fn child_at_slot(node: &Node, slot: u32) -> Option<&Node> {
+    match node {
+        Node::Branch {
+            bitmap, children, ..
+        } => {
+            let bit = 1_u32 << slot;
+            if bitmap & bit == 0 {
+                return None;
+            }
+            let index = (bitmap & (bit - 1)).count_ones() as usize;
+            children.get(index).map(AsRef::as_ref)
+        }
+        Node::Leaf { .. } => None,
+    }
+}
+
+fn encode_node(node: &Node) -> Vec<u8> {
+    let mut out = Vec::new();
+    match node {
+        Node::Leaf {
+            digest, entries, ..
+        } => {
+            out.push(TAG_LEAF);
+            out.extend_from_slice(digest);
+            out.extend_from_slice(
+                &u32::try_from(entries.len())
+                    .unwrap_or(u32::MAX)
+                    .to_be_bytes(),
+            );
+            for (key, event_id) in entries.iter() {
+                put_field(&mut out, key.event_type().as_str().as_bytes());
+                put_field(&mut out, key.state_key().as_bytes());
+                put_field(&mut out, event_id.as_bytes());
+            }
+        }
+        Node::Branch {
+            bitmap, children, ..
+        } => {
+            out.push(TAG_BRANCH);
+            out.extend_from_slice(&bitmap.to_be_bytes());
+            out.extend_from_slice(
+                &u32::try_from(children.len())
+                    .unwrap_or(u32::MAX)
+                    .to_be_bytes(),
+            );
+            for child in children.iter() {
+                out.extend_from_slice(&child.hash());
+            }
+        }
+    }
+    out
+}
+
+fn put_field(out: &mut Vec<u8>, value: &[u8]) {
+    out.extend_from_slice(&u32::try_from(value.len()).unwrap_or(u32::MAX).to_be_bytes());
+    out.extend_from_slice(value);
+}
+
+fn rebuild(
+    address: &StateRoot,
+    load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+) -> Result<Arc<Node>, RehydrateError> {
+    let bytes = load(address).ok_or(RehydrateError::MissingNode)?;
+    let mut at = 0_usize;
+    let tag = *bytes.first().ok_or(RehydrateError::Malformed)?;
+    at += 1;
+
+    let node = match tag {
+        TAG_LEAF => {
+            let digest = take_array::<32>(&bytes, &mut at)?;
+            let count = take_len(&bytes, &mut at)?;
+            let mut entries = Vec::with_capacity(count);
+            for _ in 0..count {
+                let event_type = take_string(&bytes, &mut at)?;
+                let state_key = take_string(&bytes, &mut at)?;
+                let event_id = take_string(&bytes, &mut at)?;
+                entries.push((
+                    StateKey::new(event_type, state_key),
+                    event_id.into_boxed_str(),
+                ));
+            }
+            Node::leaf_from_entries(digest, entries)
+        }
+        TAG_BRANCH => {
+            let bitmap = u32::from_be_bytes(take_array::<4>(&bytes, &mut at)?);
+            let count = take_len(&bytes, &mut at)?;
+            let mut children = Vec::with_capacity(count);
+            for _ in 0..count {
+                let child = StateRoot(take_array::<32>(&bytes, &mut at)?);
+                children.push(rebuild(&child, load)?);
+            }
+            Node::branch(bitmap, children)
+        }
+        _ => return Err(RehydrateError::Malformed),
+    };
+
+    // Content addressing is only worth anything if it is checked.
+    if node.hash() != *address.as_bytes() {
+        return Err(RehydrateError::HashMismatch);
+    }
+    Ok(Arc::new(node))
+}
+
+fn take_array<const N: usize>(bytes: &[u8], at: &mut usize) -> Result<[u8; N], RehydrateError> {
+    let end = at.checked_add(N).ok_or(RehydrateError::Malformed)?;
+    let slice = bytes.get(*at..end).ok_or(RehydrateError::Malformed)?;
+    *at = end;
+    slice.try_into().map_err(|_| RehydrateError::Malformed)
+}
+
+fn take_len(bytes: &[u8], at: &mut usize) -> Result<usize, RehydrateError> {
+    Ok(u32::from_be_bytes(take_array::<4>(bytes, at)?) as usize)
+}
+
+fn take_string(bytes: &[u8], at: &mut usize) -> Result<String, RehydrateError> {
+    let len = take_len(bytes, at)?;
+    let end = at.checked_add(len).ok_or(RehydrateError::Malformed)?;
+    let slice = bytes.get(*at..end).ok_or(RehydrateError::Malformed)?;
+    *at = end;
+    String::from_utf8(slice.to_vec()).map_err(|_| RehydrateError::Malformed)
+}
+
+fn count_entries(node: &Node) -> usize {
+    match node {
+        Node::Leaf { entries, .. } => entries.len(),
+        Node::Branch { children, .. } => children.iter().map(|child| count_entries(child)).sum(),
+    }
 }

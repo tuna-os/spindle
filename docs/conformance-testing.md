@@ -37,6 +37,8 @@ makes the claim. §5 is where that gets built.
 | **[trafficlight](https://github.com/matrix-org/trafficlight)** | Coordinator + per-client adapters | Multi-client, client↔client scenarios | Later-stage. Adapters (element-web, element-call) register and poll for commands, so scenarios span two real clients. |
 | **[Element Web Playwright suite](https://github.com/element-hq/element-web)** | TypeScript + Docker | Real client against a real homeserver | Its `playwright/plugins/homeserver/` starts homeservers in Docker; adding a Spindle plugin gives us Element's own test suite as our client-compat matrix. |
 | **[matrix-federation-tester](https://github.com/matrix-org/matrix-federation-tester)** | Go service | Live deployment federation readiness | Deployment smoke test — `.well-known`, SRV, keys, TLS. Public instance at `federationtester.matrix.org/api/report?server_name=`. |
+| **[Tuwunel](https://github.com/matrix-construct/tuwunel)** | Rust homeserver | Working Complement, complement-crypto, interop and appservice CI | **Reference implementation of this whole plan.** Its `docker/complement.sh` and `.github/workflows/summarise/` are the closest thing to a finished version of what §3–§5 describe. |
+| **[Continuwuity](https://github.com/continuwuity/continuwuity)** | Rust homeserver | Complement image contract + committed results ledger | `complement/complement-entrypoint.sh` is a working image contract; `tests/test_results/complement/test_results.jsonl` is the ratchet ledger as a real artifact. |
 
 ---
 
@@ -140,29 +142,57 @@ because clients happen to tolerate them. Cheap to build, and it fails loudly.
 Three gaps. The first is shared with every homeserver; the second and third are
 consequences of Spindle's design and are the tests that actually matter.
 
-### 5.1 Heterogeneous federation — the interop rig
+### 5.1 Heterogeneous federation — mostly configuration
 
-**The gap:** Complement drives a *single* `COMPLEMENT_BASE_IMAGE` per run. Its
-federation tests work by having Complement itself act as the remote homeserver.
-That validates protocol conformance, but it does not put a real Synapse on the
-other end of the wire, and C2 is specifically a claim about real Synapse.
+**Correction.** An earlier revision of this document claimed Complement drives a
+single `COMPLEMENT_BASE_IMAGE` per run, could not put a real Synapse on the other
+end of the wire, and therefore forced us to build a bespoke compose rig. **That
+is wrong.** Complement natively supports per-homeserver image overrides, so
+heterogeneous federation is a configuration of the suite we are already
+adopting, not a second harness.
 
-**The build:** a compose-based **interop rig** — Spindle and a pinned real
-Synapse (plus Dendrite and conduwuit as secondary targets) on one network,
-sharing a CA, with a driver that runs scenarios against both:
+Upstream `config/config.go` documents `COMPLEMENT_BASE_IMAGE_*`:
 
-| Scenario | Asserts |
-|---|---|
-| Synapse user joins a Spindle-hosted room, and vice versa | `/make_join` + `/send_join` both directions, state materialization |
-| Message send both directions, checked on both servers | PDU acceptance, ordering agreement |
-| Back-pagination across the join point from the Synapse side | Our DAG projection backfills correctly |
-| State change (PL, topic, ban) originating on each side | Auth agreement |
-| Partition, then heal | Catch-up, and the fork path in §5.2 |
-| **Final state comparison** | `/state_ids` on both servers returns the *same set* |
+> This allows you to override the base image used for a particular named
+> homeserver. […] This allows Complement to test how different homeserver
+> implementations work with each other.
 
-That last row is the real assertion. Everything else is setup. Run it against
-pinned Synapse versions, and re-run against Synapse `develop` on a schedule so
-upstream changes surface as a failing job rather than a user report.
+So a mixed deployment is:
+
+```bash
+COMPLEMENT_BASE_IMAGE=complement-spindle:latest \
+COMPLEMENT_BASE_IMAGE_hs2=ghcr.io/element-hq/synapse/complement-synapse:latest \
+  go test -v -tags="spindle_blacklist" ./tests/...
+```
+
+`hs1` is Spindle, `hs2` is a real Synapse, and every federation test in the suite
+now exercises the interop path. Element publishes that Synapse image, so we do
+not build or maintain a peer.
+
+**Gotcha — the suffix must be lowercase.** The upstream doc comment says matching
+is case-insensitive and gives the example `COMPLEMENT_BASE_IMAGE_HS1=…`. It is
+not, and that example does not work: `config.go` stores the captured suffix
+verbatim into `BaseImageURIs`, while `deployer.go` looks it up by the blueprint's
+lowercase homeserver name (`hs1`, `hs2`). A Go map lookup is case-sensitive, so
+the conventional uppercase form is silently ignored and the run quietly stays
+homogeneous — passing, and testing nothing. Use `COMPLEMENT_BASE_IMAGE_hs2`.
+Tuwunel's runner lowercases the suffix for exactly this reason. Worth reporting
+upstream, since a silently-ignored override is worse than an error.
+
+**What Tuwunel does that we should copy.** It runs interop as a separate,
+**report-only** board rather than gating the main one, because a heterogeneous
+result set legitimately does not match the homogeneous baseline. Its summariser
+then diffs interop against that baseline so a shared gap renders differently from
+a true interop regression, and it annotates known peer-side false positives — for
+example Synapse 404ing its own deprecated unauthenticated `/_matrix/media/v3`
+endpoint per MSC3916, which is the peer's deprecation and not our bug. It also
+runs the pairing in **both directions**, swapping which implementation is `hs1`.
+
+**What still has to be built.** Only the assertion that matters most, which no
+generic suite makes: after a scenario, `/state_ids` on both servers returns the
+*same set*. Complement gets the servers talking; agreeing on state is Spindle's
+specific claim and needs a purpose-written test. The partition-and-heal scenario
+likewise needs driving explicitly.
 
 ### 5.2 Fork injection — testing the exception path
 
@@ -219,7 +249,7 @@ so it runs on every commit, and a counterexample is a release blocker.
 | Per commit | Unit tests, §5.3 property tests, schema validation (§4.3), fuzz corpus | Blocking |
 | Per PR | Complement with `spindle_blacklist`, blacklist-size ratchet | Blocking |
 | Per PR | §5.2 fork injection | Blocking |
-| Nightly | sytest, full fuzzing, §5.1 interop rig against pinned Synapse | Non-blocking, tracked |
+| Nightly | sytest, full fuzzing, §5.1 interop run against pinned Synapse (report-only board, both directions) | Non-blocking, tracked |
 | Nightly | complement-crypto | Blocking from M2 |
 | Weekly | Interop rig against Synapse `develop`; Element Web Playwright suite | Non-blocking, alerts |
 | Release | Full matrix + manual client pass + federation tester against a live deploy | Blocking |
@@ -231,7 +261,7 @@ so it runs on every commit, and a counterexample is a release blocker.
 | **M0** Core | §5.3 property tests. These come *first* — they are the design's proof, and they need no server. |
 | **M1** Client API, local | Complement image + CS-API subset; schema validation; blacklist ratchet established. |
 | **M2** E2EE + modern sync | complement-crypto; Element Web Playwright plugin; Element X manual pass. |
-| **M3** Federation | Full Complement including federation; §5.2 fork injection; §5.1 interop rig against Synapse. |
+| **M3** Federation | Full Complement including federation; §5.2 fork injection; §5.1 interop run against Synapse plus the `/state_ids` agreement assertion. |
 | **M4** Linearized mode | Two-Spindle hub/participant scenarios; hub failover under induced partition; equivocation-proof tests. |
 | **M5** Production | sytest for residual coverage; trafficlight; federation tester in deploy verification; published benchmark harness. |
 
@@ -241,9 +271,9 @@ so it runs on every commit, and a counterexample is a release blocker.
 
 The conformance work is mostly **adoption, not invention** — one Dockerfile
 gets us the industry-standard suite, and a GitHub Action gets us E2EE interop.
-The invented parts are narrow and directly tied to what makes Spindle
-different: the interop rig (§5.1), fork injection (§5.2), and the equivalence
-oracle (§5.3).
+The invented parts are narrower than first scoped: cross-implementation
+federation turned out to be configuration (§5.1), leaving the state-agreement
+assertion, fork injection (§5.2), and the equivalence oracle (§5.3).
 
 Two things are worth budgeting for honestly:
 
