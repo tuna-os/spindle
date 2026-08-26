@@ -8,10 +8,11 @@ repository.workspace = true
 
 [dependencies]
 blake3.workspace = true
+ruma.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 
 [lints]
 workspace = true
-
