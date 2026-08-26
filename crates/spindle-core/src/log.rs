@@ -66,6 +66,18 @@ pub struct LogEntry {
     pub state_after: StateSnapshot,
 }
 
+/// The ancestry that differs between a set of forward extremities.
+///
+/// Events are returned in Spindle's topological storage order. The nearest
+/// common ancestor is a diagnostic anchor; all history common to every tip is
+/// excluded from `events`, including DAGs with more than one maximal common
+/// ancestor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForkWindow {
+    pub nearest_common_ancestor: EventId,
+    pub events: Vec<EventId>,
+}
+
 /// A per-room append-only log plus the minimal DAG overlay federation requires.
 #[derive(Clone, Debug, Default)]
 pub struct RoomLog {
@@ -88,6 +100,66 @@ impl RoomLog {
     #[must_use]
     pub fn forward_extremities(&self) -> &BTreeSet<EventId> {
         &self.forward_extremities
+    }
+
+    /// Find the bounded divergent ancestry behind a set of event tips.
+    ///
+    /// This walks signed `prev_events`; linear-index proximity is never used to
+    /// decide ancestry. The index is used only to return a deterministic,
+    /// topological order and to break ties between common ancestors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForkWindowError`] for an empty tip set, an unknown tip, a DAG
+    /// without common history, or a divergent window larger than `max_events`.
+    pub fn fork_window(
+        &self,
+        tips: &[EventId],
+        max_events: usize,
+    ) -> Result<ForkWindow, ForkWindowError> {
+        if tips.is_empty() {
+            return Err(ForkWindowError::EmptyTips);
+        }
+
+        let mut ancestries = Vec::with_capacity(tips.len());
+        for tip in tips {
+            let Some(position) = self.positions.get(tip) else {
+                return Err(ForkWindowError::UnknownTip(tip.clone()));
+            };
+            ancestries.push(self.ancestor_positions(*position));
+        }
+
+        let mut common = ancestries[0].clone();
+        for ancestry in &ancestries[1..] {
+            common.retain(|position| ancestry.contains(position));
+        }
+        let Some(nearest_position) = common
+            .iter()
+            .copied()
+            .max_by_key(|position| (self.entries[*position].depth, self.entries[*position].li))
+        else {
+            return Err(ForkWindowError::NoCommonAncestor);
+        };
+
+        let divergent: BTreeSet<usize> = ancestries
+            .into_iter()
+            .flatten()
+            .filter(|position| !common.contains(position))
+            .collect();
+        if divergent.len() > max_events {
+            return Err(ForkWindowError::TooLarge {
+                limit: max_events,
+                event_count: divergent.len(),
+            });
+        }
+
+        Ok(ForkWindow {
+            nearest_common_ancestor: self.entries[nearest_position].event_id.clone(),
+            events: divergent
+                .into_iter()
+                .map(|position| self.entries[position].event_id.clone())
+                .collect(),
+        })
     }
 
     /// Append a received event without changing its signed `prev_events`.
@@ -180,6 +252,23 @@ impl RoomLog {
         self.entries.push(entry);
         Ok(self.entries.last().expect("entry was just pushed"))
     }
+
+    fn ancestor_positions(&self, tip: usize) -> BTreeSet<usize> {
+        let mut ancestors = BTreeSet::new();
+        let mut pending = vec![tip];
+        while let Some(position) = pending.pop() {
+            if !ancestors.insert(position) {
+                continue;
+            }
+            pending.extend(
+                self.entries[position]
+                    .prev_events
+                    .iter()
+                    .map(|parent| self.positions[parent]),
+            );
+        }
+        ancestors
+    }
 }
 
 fn merge_states(parents: &[&LogEntry]) -> Result<StateSnapshot, AppendError> {
@@ -228,5 +317,17 @@ pub enum AppendError {
     NeedsStateResolution {
         key: StateKey,
         candidates: Vec<EventId>,
+    },
+}
+
+/// Why a bounded divergent-ancestry window could not be produced.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ForkWindowError {
+    EmptyTips,
+    UnknownTip(EventId),
+    NoCommonAncestor,
+    TooLarge {
+        limit: usize,
+        event_count: usize,
     },
 }
