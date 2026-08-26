@@ -300,6 +300,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 depth: record.depth,
                 state_key: record.slot(),
                 expected_state_root: record.state_root,
+                chain: record.chain,
             });
         }
         Ok(Some((meta, entries)))

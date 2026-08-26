@@ -216,13 +216,35 @@ Beyond the standard Matrix `prev_events`/reference-hash linkage, the serializing
 server maintains a **log chain**: a running hash
 
 ```
-chain[li] = SHA-256( chain[li-1] || event_id[li] )
+chain[li] = BLAKE3( DOMAIN || chain[li-1] || event_id[li] )
 ```
 
-`chain[0]` is the empty string's hash. The serializer signs `(room_id, li,
-event_id, chain[li])` with its Ed25519 server key and stores that signature.
-This is a transparency-log construction, and it is what upgrades "trust the hub
-for ordering" into "detect the hub cheating about ordering" (§13.3).
+seeded from `BLAKE3(DOMAIN)`, where `DOMAIN` is `"spindle-log-chain-v1\0"`. The
+serializer signs `(room_id, li, event_id, chain[li])` with its Ed25519 server
+key and stores that signature. This is a transparency-log construction, and it
+is what upgrades "trust the hub for ordering" into "detect the hub cheating
+about ordering" (§13.3).
+
+Two properties are load-bearing and are tested as such. Each value commits to
+the *entire* ordered history before it, so the same events in a different order
+produce a different chain — attesting to sequence, not merely to membership.
+And a divergence never re-converges: two histories that differ at one index
+disagree at every index after, even where later events are identical, so the
+first differing value localises the change.
+
+**Only forward-appended entries carry a chain value.** Backfilled history was
+sequenced by another server and arrives with its own provenance; attesting to
+an order we did not choose would be a claim we cannot back. A server's chain
+covers what it ordered.
+
+An earlier revision specified SHA-256 here. BLAKE3 is used instead, for
+consistency with the state trie's content addressing (§6.1) and its
+domain-separation convention: one hash function and one input-framing rule
+across the codebase means no construction's value can be replayed as another's.
+Nothing in Matrix constrains this choice — the chain is Spindle's own
+attestation, not a spec-defined wire hash — but if it is ever standardised for
+cross-implementation equivocation proofs, the algorithm becomes an interop
+concern and should be revisited then.
 
 ### 5.4 Indexes
 
