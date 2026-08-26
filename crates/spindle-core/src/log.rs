@@ -91,6 +91,12 @@ impl RoomLog {
     }
 
     /// Append a received event without changing its signed `prev_events`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppendError`] when the event is duplicated, has invalid or
+    /// unknown predecessors, exceeds the Matrix parent limit, or needs full
+    /// state resolution.
     pub fn append_remote(&mut self, input: EventInput) -> Result<&LogEntry, AppendError> {
         self.append(input)
     }
@@ -100,6 +106,12 @@ impl RoomLog {
     /// In a linear room this is exactly one parent. After a stale class-D PDU it
     /// is a bounded set of parents, which collapses the federation DAG back to
     /// one extremity while the event still receives one linear storage index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppendError`] when the new event is duplicated, the room has
+    /// invalid predecessor state, or competing parent states need the Matrix
+    /// room-version resolver.
     pub fn append_local(
         &mut self,
         event_id: impl Into<Box<str>>,

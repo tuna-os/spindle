@@ -249,10 +249,8 @@ impl Node {
                     Arc::new(Self::branch(*bitmap, next))
                 }
             }
-            (Self::Branch { .. }, Self::Branch { .. }) => {
-                unreachable!("only leaf nodes are inserted")
-            }
-            (Self::Leaf { .. }, Self::Branch { .. }) => {
+            (Self::Branch { .. }, Self::Branch { .. })
+            | (Self::Leaf { .. }, Self::Branch { .. }) => {
                 unreachable!("only leaf nodes are inserted")
             }
         }
