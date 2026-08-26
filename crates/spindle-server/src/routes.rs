@@ -59,35 +59,52 @@ pub const MOUNTED: &[&str] = &[
     "/ready",
 ];
 
+/// The server's routes.
+///
+/// Split by what a route is *about* rather than by spec section, because the
+/// spec's own grouping cuts across the same path prefixes: `/rooms/{id}/...`
+/// holds membership, timeline and state alike. Four builders also keep any one
+/// of them short enough to read at a glance, which a single chain of forty
+/// routes had stopped being.
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/_matrix/client/versions", get(versions))
-        .route("/_matrix/client/v3/capabilities", get(capabilities))
+        .merge(account_routes())
+        .merge(room_routes())
+        .merge(timeline_routes())
+        .merge(discovery_routes())
+        .with_state(state)
+}
+
+/// Registration, login, and the per-user data that is not in any room.
+fn account_routes() -> Router<AppState> {
+    Router::new()
         .route("/_matrix/client/v3/register", post(register))
         .route("/_matrix/client/v3/login", get(login_flows).post(login))
         .route("/_matrix/client/v3/logout", post(logout))
         .route("/_matrix/client/v3/refresh", post(refresh))
         .route("/_matrix/client/v3/account/whoami", get(whoami))
-        .route("/_matrix/client/v3/createRoom", post(create_room))
         .route("/_matrix/client/v3/joined_rooms", get(joined_rooms))
+        .route("/_matrix/client/v3/sync", get(sync))
         .route(
-            "/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}",
-            axum::routing::put(send_event),
+            "/_matrix/client/v3/user/{user_id}/account_data/{event_type}",
+            get(get_account_data).put(set_account_data),
         )
         .route(
-            "/_matrix/client/v3/rooms/{room_id}/messages",
-            get(room_messages),
+            "/_matrix/client/v3/user/{user_id}/rooms/{room_id}/account_data/{event_type}",
+            get(get_room_account_data).put(set_room_account_data),
         )
+}
+
+/// Creating a room, getting in and out of one, and who else is there.
+fn room_routes() -> Router<AppState> {
+    Router::new()
+        .route("/_matrix/client/v3/createRoom", post(create_room))
         .route(
             "/_matrix/client/v3/rooms/{room_id}/invite",
             post(invite_to_room),
         )
         .route("/_matrix/client/v3/rooms/{room_id}/join", post(join_room))
         .route("/_matrix/client/v3/rooms/{room_id}/leave", post(leave_room))
-        .route(
-            "/_matrix/client/v3/rooms/{room_id}/typing/{user_id}",
-            axum::routing::put(set_typing),
-        )
         .route(
             "/_matrix/client/v3/rooms/{room_id}/kick",
             post(kick_from_room),
@@ -112,7 +129,23 @@ pub fn router(state: AppState) -> Router {
             "/_matrix/client/v3/join/{room_id_or_alias}",
             post(join_room_by_id_or_alias),
         )
-        .route("/_matrix/client/v3/sync", get(sync))
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/typing/{user_id}",
+            axum::routing::put(set_typing),
+        )
+}
+
+/// Everything that reads or writes a room's log, and its state.
+fn timeline_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}",
+            axum::routing::put(send_event),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/messages",
+            get(room_messages),
+        )
         .route(
             "/_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}",
             post(set_receipt),
@@ -156,12 +189,18 @@ pub fn router(state: AppState) -> Router {
             "/_matrix/client/v3/rooms/{room_id}/event/{event_id}",
             get(room_event),
         )
+}
+
+/// What a client or a peer reads before it knows anything else.
+fn discovery_routes() -> Router<AppState> {
+    Router::new()
+        .route("/_matrix/client/versions", get(versions))
+        .route("/_matrix/client/v3/capabilities", get(capabilities))
         .route("/_matrix/key/v2/server", get(server_keys))
         .route("/.well-known/matrix/client", get(well_known_client))
         .route("/.well-known/matrix/server", get(well_known_server))
         .route("/health", get(health))
         .route("/ready", get(ready))
-        .with_state(state)
 }
 
 /// `GET /_matrix/client/versions`
@@ -841,6 +880,114 @@ async fn set_typing(
     Ok(Json(json!({})))
 }
 
+/// `GET /_matrix/client/v3/user/{user_id}/account_data/{event_type}`
+async fn get_account_data(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((user_id, event_type)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    read_account_data(&state, &identity, &user_id, "", &event_type)
+}
+
+/// `PUT /_matrix/client/v3/user/{user_id}/account_data/{event_type}`
+async fn set_account_data(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((user_id, event_type)): axum::extract::Path<(String, String)>,
+    Json(content): Json<Value>,
+) -> Result<Json<Value>, MatrixError> {
+    write_account_data(&state, &identity, &user_id, "", &event_type, &content)
+}
+
+/// `GET /_matrix/client/v3/user/{user_id}/rooms/{room_id}/account_data/{event_type}`
+async fn get_room_account_data(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((user_id, room_id, event_type)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Json<Value>, MatrixError> {
+    read_account_data(&state, &identity, &user_id, &room_id, &event_type)
+}
+
+/// `PUT /_matrix/client/v3/user/{user_id}/rooms/{room_id}/account_data/{event_type}`
+async fn set_room_account_data(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((user_id, room_id, event_type)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+    Json(content): Json<Value>,
+) -> Result<Json<Value>, MatrixError> {
+    write_account_data(&state, &identity, &user_id, &room_id, &event_type, &content)
+}
+
+/// Account data is per-user and private, so the `user_id` in the path has to
+/// be the caller's.
+///
+/// The spec says `M_FORBIDDEN` for someone else's, and that is the right code
+/// even though the data may not exist: answering `M_NOT_FOUND` for a user who
+/// has set nothing and `M_FORBIDDEN` for one who has would turn this endpoint
+/// into an oracle for what other people have configured.
+fn own_account(identity: &crate::accounts::Identity, user_id: &str) -> Result<(), MatrixError> {
+    if identity.user_id == user_id {
+        return Ok(());
+    }
+    Err(MatrixError::forbidden(
+        "account data belongs to the user who set it",
+    ))
+}
+
+fn read_account_data(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    user_id: &str,
+    room_id: &str,
+    event_type: &str,
+) -> Result<Json<Value>, MatrixError> {
+    own_account(identity, user_id)?;
+    state
+        .account_data
+        .get(user_id, room_id, event_type)
+        .map_err(|error| account_data_error(&error))?
+        .map(Json)
+        .ok_or_else(|| {
+            MatrixError::new(
+                StatusCode::NOT_FOUND,
+                "M_NOT_FOUND",
+                format!("no {event_type} for {user_id}"),
+            )
+        })
+}
+
+fn write_account_data(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    user_id: &str,
+    room_id: &str,
+    event_type: &str,
+    content: &Value,
+) -> Result<Json<Value>, MatrixError> {
+    own_account(identity, user_id)?;
+    // The server keeps the bytes and has no opinion about them, so there is no
+    // validation of `content` beyond it being JSON -- which the extractor has
+    // already established. A client inventing a new `event_type` has to work
+    // on a server that has never heard of it.
+    state
+        .account_data
+        .put(user_id, room_id, event_type, content)
+        .map_err(|error| account_data_error(&error))?;
+    Ok(Json(json!({})))
+}
+
+fn account_data_error(error: &crate::account_data::AccountDataError) -> MatrixError {
+    MatrixError::internal(&error.to_string())
+}
+
 /// `GET /_matrix/client/v3/sync`
 ///
 /// The token is a position in the server-global stream (SPEC §10.2), because
@@ -896,6 +1043,17 @@ async fn sync(
             .unread(&room.room_id, &identity.user_id)
             .map_err(room_error)?;
         let typing = state.typing.event(&room.room_id);
+        // Sent in full on every sync, incremental ones included, rather than
+        // only when it changed. Account data has no stream position of its
+        // own -- the sync token counts room events, and a `PUT` to
+        // `/account_data` appends nothing -- so sending only the delta would
+        // need a second cursor. Until there is one, repeating it is the
+        // answer that cannot silently drop a change, and the payload is a
+        // client's own settings rather than history.
+        let room_data = state
+            .account_data
+            .all(&identity.user_id, &room.room_id)
+            .map_err(|error| account_data_error(&error))?;
         join.insert(
             room.room_id,
             json!({
@@ -907,6 +1065,7 @@ async fn sync(
                 "ephemeral": {
                     "events": typing.map(|event| vec![event]).unwrap_or_default(),
                 },
+                "account_data": { "events": room_data },
                 "unread_notifications": {
                     "notification_count": unread.notification_count,
                 },
@@ -936,9 +1095,15 @@ async fn sync(
         invite.insert(room_id, json!({ "invite_state": { "events": [] } }));
     }
 
+    let global = state
+        .account_data
+        .all(&identity.user_id, "")
+        .map_err(|error| account_data_error(&error))?;
+
     Ok(Json(json!({
         "next_batch": crate::tokens::Sync(result.next_batch).to_string(),
         "rooms": { "join": join, "invite": invite },
+        "account_data": { "events": global },
     })))
 }
 

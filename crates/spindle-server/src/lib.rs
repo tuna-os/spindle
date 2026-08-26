@@ -6,6 +6,7 @@
 //! table that builds the router, so claiming something unbuilt is a
 //! compile-or-test failure rather than a documentation drift.
 
+pub mod account_data;
 pub mod accounts;
 pub mod auth;
 pub mod authorize;
@@ -35,6 +36,7 @@ pub struct AppState {
     pub key: Arc<signing::ServerKey>,
     pub rooms: Arc<rooms::Rooms>,
     pub typing: Arc<typing::Typing>,
+    pub account_data: Arc<account_data::AccountData>,
 }
 
 /// Build the HTTP application.
@@ -54,6 +56,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, signing::Si
     let limiter = Arc::new(ratelimit::RateLimiter::with_enabled(
         config.ratelimit.enabled,
     ));
+    let account_data = Arc::new(account_data::AccountData::new(Arc::clone(&store)));
     let state = AppState {
         config: Arc::new(config),
         store,
@@ -61,6 +64,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, signing::Si
         key,
         rooms,
         typing: Arc::new(typing::Typing::new()),
+        account_data,
     };
     Ok(routes::router(state))
 }
