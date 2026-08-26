@@ -44,6 +44,7 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/v3/sync",
     "/_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}",
     "/_matrix/client/v3/rooms/{room_id}/read_markers",
+    "/_matrix/client/v3/rooms/{room_id}/redact/{event_id}/{txn_id}",
     "/_matrix/client/v3/rooms/{room_id}/state",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}",
@@ -92,6 +93,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/_matrix/client/v3/rooms/{room_id}/read_markers",
             post(read_markers),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/redact/{event_id}/{txn_id}",
+            axum::routing::put(redact_event),
         )
         .route("/_matrix/client/v3/rooms/{room_id}/state", get(room_state))
         // Two routes, because the spec has two forms and a router cannot
@@ -744,6 +749,39 @@ async fn read_markers(
         }
     }
     Ok(Json(json!({})))
+}
+
+#[derive(Debug, Deserialize)]
+struct RedactRequest {
+    reason: Option<String>,
+}
+
+/// `PUT /_matrix/client/v3/rooms/{room_id}/redact/{event_id}/{txn_id}`
+///
+/// The transaction ID is accepted and ignored, as it is on `/send` — replay
+/// is #11's work, and a redaction replayed twice redacts an already-redacted
+/// event, which is harmless but still mints a second redaction event.
+async fn redact_event(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((room_id, event_id, _txn_id)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+    Json(request): Json<RedactRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    let redaction = state
+        .rooms
+        .redact(
+            &room_id,
+            &identity.user_id,
+            state.key.pair(),
+            &event_id,
+            request.reason.as_deref(),
+        )
+        .map_err(room_error)?;
+    Ok(Json(json!({ "event_id": redaction })))
 }
 
 /// `GET /_matrix/client/v3/rooms/{room_id}/state`
