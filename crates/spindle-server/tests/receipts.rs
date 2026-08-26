@@ -312,7 +312,32 @@ async fn receipts_are_per_user_and_per_room() {
         )
         .await;
 
-    // One room read, the other not: a receipt keyed by room only.
+    // One room read, the other not: the key carries the room.
     assert_eq!(harness.unread(&bob, &first).await, 0);
     assert_eq!(harness.unread(&bob, &second).await, 1);
+
+    // And two people in the *same* room keep separate positions. This needs
+    // bob to be the one talking: alice's own messages never count for her, so
+    // a version of this test where alice speaks reports zero for her whether
+    // or not the receipts collide, and cannot tell the two apart.
+    let shared = harness.shared_room(&alice, &bob).await;
+    harness.say(&shared, &bob, "one", "s1").await;
+    let last = harness.say(&shared, &bob, "two", "s2").await;
+    assert_eq!(harness.unread(&alice, &shared).await, 2);
+
+    // Bob marks the room read for *himself*. Alice has read nothing, so her
+    // count must not move -- if the receipt key omitted the user, bob's
+    // receipt would answer alice's lookup and silently zero her badge.
+    harness
+        .post(
+            &format!("/_matrix/client/v3/rooms/{shared}/receipt/m.read/{last}"),
+            &bob,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(
+        harness.unread(&alice, &shared).await,
+        2,
+        "one user's receipt cleared another user's unread count"
+    );
 }

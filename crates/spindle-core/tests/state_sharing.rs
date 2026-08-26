@@ -114,8 +114,13 @@ fn for_each_visits_in_key_order_however_the_trie_arranged_them() {
 /// inspection is how a format break ships unnoticed.
 #[test]
 fn state_roots_are_the_bytes_they_have_always_been() {
-    let hex =
-        |bytes: &[u8; 32]| -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() };
+    let hex = |bytes: &[u8; 32]| -> String {
+        use std::fmt::Write as _;
+        bytes.iter().fold(String::new(), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+    };
 
     let mut state = StateSnapshot::new();
     for (kind, key, event_id, expected) in [
