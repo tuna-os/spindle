@@ -16,6 +16,11 @@ blake3.workspace = true
 criterion.workspace = true
 im.workspace = true
 proptest.workspace = true
+# The oracle for SPEC 19.2. A dev-dependency deliberately: ADR 0002 keeps the
+# core ruma-free precisely so that comparing our state handling against ruma's
+# reference resolver is not circular.
+ruma = { workspace = true, features = ["state-res", "events"] }
+serde_json.workspace = true
 
 [[bench]]
 name = "fork_window"
