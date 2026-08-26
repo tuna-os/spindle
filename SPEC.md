@@ -20,8 +20,14 @@ In the overwhelming majority of real traffic there are no concurrent branches.
 A room owned by one server, or a room whose events all flow through one
 serializing node, has a DAG that is a **chain**: every event has exactly one
 `prev_event`, and there is never more than one forward extremity. On a chain,
-state resolution is the identity function. Every mechanism built to support it
-is pure overhead.
+state resolution is the identity function.
+
+The current Rust homeservers know this and already skip the algorithm on a
+fork-free event (§3). What they cannot skip is the *bookkeeping* the algorithm
+needs in order to be available: the extremity set that must be read, pruned and
+rewritten on every append; the state-group delta stack that must be walked to
+answer what the state was. That machinery is maintained per event whether or not
+the room ever forks, and it is what a linear log removes.
 
 Spindle takes the Linearized Matrix insight (MSC3995 / `draft-ralston-mimi-linearized-matrix`)
 and applies it *inward*, as a server implementation strategy, rather than only
@@ -85,21 +91,58 @@ topological sort, no auth chain walk.
 
 ## 3. Design thesis: where the time actually goes
 
-The costs Spindle is designed to eliminate, and why they exist:
+The costs Spindle is designed to eliminate — and, equally, the ones the current
+Rust homeservers have already eliminated for themselves. An earlier revision of
+this section measured every row against Synapse and presented the result as an
+advantage over DAG homeservers generally. That was wrong for three of the seven
+rows, and this table separates the two so each claim names who it is about
+(#57).
 
-| Mechanism | Why the DAG needs it | Cost class | Spindle |
-|---|---|---|---|
-| State Resolution v2 | Merge divergent state across concurrent branches | O(conflicted state × auth chain) — superlinear, and the pathological cases are the "state reset" bugs operators know by name | Runs only over a bounded fork window; never in Class L/H/P rooms |
-| `auth_chain_difference` | Input to state res v2 ordering | Graph reachability over the whole auth chain; the single hottest query in large-room Synapse | Never computed globally; window-bounded, and unnecessary under MSC3995 |
-| State groups + deltas | Avoid storing full state per event | Chains of deltas that must be walked; periodic compaction; unbounded growth on fork-heavy rooms | Persistent HAMT with content-addressed nodes; O(log n) copy per update, O(1) historical lookup |
-| Topological ordering | `/messages` must paginate in DAG order, which is not insertion order | Sort at read time, or maintained `topological_ordering`/`stream_ordering` pairs | `li` **is** the topological order, assigned once at write |
-| Backfill + `/get_missing_events` | Reconstruct ancestors of a received event | Recursive fetch, re-auth, re-state | Still needed for legacy peers; linearized once at ingest, never re-derived |
-| Forward extremity management | Multiple heads must be tracked and merged | Extremity table growth is a known Synapse pathology | Exactly one extremity in classes L/H/P; in class D a stale peer PDU adds one transiently, and the next local event merges it away (§4) |
-| Full state on join | `/send_join` returns the whole room state | 10k-member room = tens of MB and a state res over it | Materialize once into a HAMT root; faster joins (MSC3706/MSC3902) for large rooms |
+"conduwuit-lineage" below means Tuwunel and Continuwuity, the servers this
+project actually benchmarks against.
 
-The observation that makes this tractable: **all of these are federation
-mechanisms.** A homeserver running a room whose members are all local executes
-every one of them, on every event, to solve a problem it does not have.
+| Mechanism | Why the DAG needs it | Synapse | conduwuit-lineage | Spindle |
+|---|---|---|---|---|
+| State Resolution v2 | Merge divergent state across concurrent branches | O(conflicted state × auth chain); the pathological cases are the "state reset" bugs operators know by name | **Already skipped on the fork-free path** — a PDU with one `prev_event` takes a special case that does not resolve at all | Runs only over a bounded fork window; never in class L/H/P |
+| `auth_chain_difference` | Input to state res v2 ordering | Graph reachability over the whole auth chain; the single hottest query in large rooms | **Already avoided** — computed only inside `resolve()`, so never on the fork-free path, and auth chains are persistently cached | Never computed globally; window-bounded, and unnecessary under MSC3995 |
+| Topological ordering | `/messages` must paginate in DAG order, which is not insertion order | Maintained `topological_ordering`/`stream_ordering` pairs | **Already solved the same way we do** — a monotonic counter assigned at append, used as the PDU ID, no read-time sort | `li` **is** the topological order, assigned once at write |
+| Forward extremity management | Multiple heads must be tracked and merged | Extremity table growth is a known pathology | **Suffers it too**, by their own account: soft-failed events do not prune their predecessors, extremities build up, and synthetic "dummy events" get written to squash the references. Every append reads the whole extremity set, issues a reference query per member, and walks prev events past soft-fails | Exactly one extremity in classes L/H/P; in class D a stale peer PDU adds one transiently, and the next local event merges it away (§4) |
+| State groups + deltas | Avoid storing full state per event | Chains of deltas that must be walked; periodic compaction; unbounded growth on fork-heavy rooms | Same shape: a layered `shortstatehash` diff stack walked at read time | Persistent HAMT with content-addressed nodes; O(log n) copy per update, O(1) historical lookup |
+| Full state on join | `/send_join` returns the whole room state | 10k-member room = tens of MB and a state res over it | Same: no partial-state or faster-join support | Materialize once into a HAMT root; faster joins (MSC3706/MSC3902) for large rooms |
+| Backfill + `/get_missing_events` | Reconstruct ancestors of a received event | Recursive fetch, re-auth, re-state | Same | Still needed for legacy peers; linearized once at ingest, never re-derived |
+
+### 3.1 What the thesis actually is
+
+The rows are ordered by how much they still distinguish us, and the first three
+do not. **A DAG homeserver does not run state resolution on a fork-free event.**
+Both siblings dispatch on `prev_events` count and take a path documented as
+needing no resolution; both compute `auth_chain_difference` only inside
+`resolve()`; both already paginate on a write-time counter rather than sorting.
+Any framing of this project as "we skip state resolution and they don't" is
+false, and #56 measures the consequence: on a real fork our advantage over
+`ruma-state-res` is a flat 2.2–3.1× constant factor across the whole range out
+to a full `max_fork_window` — not the superlinear gap the cost column invites a
+reader to expect.
+
+What survives is the bottom four rows, and they have one thing in common:
+**they are bookkeeping, not algorithms.** Maintaining the extremity set,
+walking the state-group diff stack, materializing full state on join — this is
+the cost of keeping a DAG's shape available for questions that may never be
+asked. It is paid per event, on every event, whether or not the room ever
+forks.
+
+So the thesis is not that Spindle removes an expensive algorithm. It is that
+**linear storage removes the bookkeeping the algorithm needs to exist.** A room
+with exactly one forward extremity has no extremity set to prune, no reference
+query per member on append, and no dummy events to write when pruning fails. A
+materialized content-addressed state root has no diff stack to walk. The
+algorithm the bookkeeping was for is still there, in §9, for the bounded case
+that genuinely needs it.
+
+The observation that makes this tractable is still the one this section opened
+with, restated to survive contact with what the siblings do: **these are all
+federation mechanisms**, and a homeserver running a room whose members are all
+local is maintaining the machinery for a problem it does not have.
 
 ---
 
@@ -1043,17 +1086,21 @@ a forensic exercise.
 
 ### 18.1 Complexity comparison
 
+Where the middle column differs between implementations, it describes
+conduwuit-lineage, which is what this project benchmarks against; §3 separates
+the rows where Synapse and the Rust servers diverge.
+
 | Operation | DAG homeserver | Spindle (class L/H/P) |
 |---|---|---|
 | Append local message | State group lookup, auth chain check, extremity update, multi-table txn | ≤6 trie lookups + hash + append |
 | Append state event | Above, plus state group allocation/delta | Above, plus O(log n) path copy |
 | Current state lookup | State group resolution | O(log n) in-memory |
 | Historical state at event | Walk state group deltas | One index seek + O(log n) |
-| `/messages` page | Topological ordering, possible backfill | Sequential range scan |
+| `/messages` page | Range scan on a write-time counter, possible backfill — the one row where a DAG homeserver already does what we do | Sequential range scan |
 | `/sync` incremental (active client) | Stream queries per stream type | Ring-buffer slice, no storage read |
 | Join room with S state events | Fetch + state res over S | Fetch + S folds, no state res |
 | Federation catch-up after outage | Graph walk to find what to resend | Sequential scan of `stream` |
-| Concurrent-send merge | State res v2 over room state | Case 1/2: none. Case 3: bounded window |
+| Concurrent-send merge | State res v2 over the conflicted set. Measured at 2.2–3.1× our cost across the whole fork range (`docs/benchmarks.md`) — a constant factor, not a superlinear gap | Case 1/2: none. Case 3: bounded window |
 
 ### 18.2 Latency budget, local send, class L
 

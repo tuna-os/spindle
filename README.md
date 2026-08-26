@@ -73,12 +73,25 @@ protocol code here yet, by design.
 ## What this is honest about
 
 The load-bearing claim is the equivalence theorem in §9.3 — that window-bounded
-state resolution produces exactly what full state resolution would. It is stated
-as a theorem and meant to be tested as one, differentially against
-`ruma-state-res` as an oracle (§19.2). A counterexample is a release blocker.
+state resolution produces exactly what full state resolution would. It is now
+tested as one, differentially against `ruma-state-res` as an oracle (§19.2), for
+every fork the fast path claims to handle without state resolution. A
+counterexample is a release blocker.
 
-The performance numbers in §18.3 are **design targets, not measurements**. They
-exist so the design can be falsified by the benchmark harness in §19.4.
+**The comparison against another implementation is a constant factor, not the
+asymptotic win the design thesis originally implied.** Resolving a fork is
+2.2–3.1× cheaper than `ruma-state-res` across the whole range out to a full
+`max_fork_window` — flat, not widening. And the current Rust homeservers already
+skip state resolution on a fork-free event, so "we skip it and they don't" was
+never true of them. What linear storage removes is the per-event *bookkeeping*
+the algorithm needs to exist — extremity sets, state-group delta stacks — not
+the algorithm. See [§3](SPEC.md#3-design-thesis-where-the-time-actually-goes)
+and [docs/benchmarks.md](docs/benchmarks.md), which publishes the losses
+alongside the wins.
+
+Server-to-server numbers remain **design targets, not measurements** (§18.3):
+everything measured so far is algorithmic, inside the library. Synapse and
+Tuwunel under protocol workload needs a server and starts at M1.
 
 The known risks, including the one that would invalidate the headline claim, are
 enumerated in §21.
