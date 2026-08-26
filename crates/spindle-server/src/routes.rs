@@ -42,6 +42,8 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/v3/rooms/{room_id}/leave",
     "/_matrix/client/v3/join/{room_id_or_alias}",
     "/_matrix/client/v3/sync",
+    "/_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}",
+    "/_matrix/client/v3/rooms/{room_id}/read_markers",
     "/_matrix/client/v3/rooms/{room_id}/state",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}",
@@ -83,6 +85,14 @@ pub fn router(state: AppState) -> Router {
             post(join_room_by_id_or_alias),
         )
         .route("/_matrix/client/v3/sync", get(sync))
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}",
+            post(set_receipt),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/read_markers",
+            post(read_markers),
+        )
         .route("/_matrix/client/v3/rooms/{room_id}/state", get(room_state))
         // Two routes, because the spec has two forms and a router cannot
         // match an empty trailing segment: `/state/m.room.topic` means the
@@ -652,6 +662,10 @@ async fn sync(
 
     let mut join = serde_json::Map::new();
     for room in result.rooms {
+        let unread = state
+            .rooms
+            .unread(&room.room_id, &identity.user_id)
+            .map_err(room_error)?;
         join.insert(
             room.room_id,
             json!({
@@ -660,6 +674,9 @@ async fn sync(
                     "limited": room.limited,
                 },
                 "state": { "events": room.state },
+                "unread_notifications": {
+                    "notification_count": unread.notification_count,
+                },
             }),
         );
     }
@@ -676,6 +693,57 @@ async fn sync(
         "next_batch": crate::tokens::Sync(result.next_batch).to_string(),
         "rooms": { "join": join, "invite": invite },
     })))
+}
+
+/// `POST /_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}`
+async fn set_receipt(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((room_id, receipt_type, event_id)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Json<Value>, MatrixError> {
+    state
+        .rooms
+        .set_receipt(&room_id, &identity.user_id, &receipt_type, &event_id)
+        .map_err(room_error)?;
+    Ok(Json(json!({})))
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadMarkers {
+    #[serde(rename = "m.fully_read")]
+    fully_read: Option<String>,
+    #[serde(rename = "m.read")]
+    read: Option<String>,
+}
+
+/// `POST /_matrix/client/v3/rooms/{room_id}/read_markers`
+///
+/// Two markers with different jobs: `m.fully_read` is private and is where the
+/// client puts its "jump to first unread" line, while `m.read` is public and
+/// is what other people see and what the unread count is measured from. A
+/// client may set either or both, so neither is required.
+async fn read_markers(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    Json(markers): Json<ReadMarkers>,
+) -> Result<Json<Value>, MatrixError> {
+    for (receipt_type, event_id) in [
+        ("m.fully_read", markers.fully_read.as_deref()),
+        ("m.read", markers.read.as_deref()),
+    ] {
+        if let Some(event_id) = event_id {
+            state
+                .rooms
+                .set_receipt(&room_id, &identity.user_id, receipt_type, event_id)
+                .map_err(room_error)?;
+        }
+    }
+    Ok(Json(json!({})))
 }
 
 /// `GET /_matrix/client/v3/rooms/{room_id}/state`

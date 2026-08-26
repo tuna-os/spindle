@@ -153,6 +153,7 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::RoomMeta, 0x05),
         (Keyspace::Membership, 0x0b),
         (Keyspace::Stream, 0x0c),
+        (Keyspace::Receipt, 0x0d),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(

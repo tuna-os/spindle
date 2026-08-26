@@ -80,6 +80,8 @@ pub enum Keyspace {
     /// index only orders within one. This is the one index that exists purely
     /// because a per-room order is not a server order.
     Stream = 0x0c,
+    /// `(room_id, user_id, receipt_type)` -> receipt.
+    Receipt = 0x0d,
     /// `(user_id, room_id)` -> membership.
     ///
     /// Indexed by user rather than by room so that "which rooms is this user
