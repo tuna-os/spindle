@@ -73,6 +73,7 @@ pub const ROOM_VERSION_REQUIRES: &[&str] = &[
     "/_matrix/client/v3/join/{room_id_or_alias}",
     "/_matrix/client/v3/rooms/{room_id}/join",
     "/_matrix/client/v3/rooms/{room_id}/leave",
+    "/_matrix/client/v3/rooms/{room_id}/state",
 ];
 
 /// Unstable features. Same rule: nothing here that is not built.

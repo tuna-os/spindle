@@ -41,6 +41,10 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/v3/rooms/{room_id}/join",
     "/_matrix/client/v3/rooms/{room_id}/leave",
     "/_matrix/client/v3/join/{room_id_or_alias}",
+    "/_matrix/client/v3/rooms/{room_id}/state",
+    "/_matrix/client/v3/rooms/{room_id}/state/{event_type}",
+    "/_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}",
+    "/_matrix/client/v3/rooms/{room_id}/event/{event_id}",
     "/_matrix/key/v2/server",
     "/.well-known/matrix/client",
     "/.well-known/matrix/server",
@@ -76,6 +80,22 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/_matrix/client/v3/join/{room_id_or_alias}",
             post(join_room_by_id_or_alias),
+        )
+        .route("/_matrix/client/v3/rooms/{room_id}/state", get(room_state))
+        // Two routes, because the spec has two forms and a router cannot
+        // match an empty trailing segment: `/state/m.room.topic` means the
+        // same as `/state/m.room.topic/""`, and a client may send either.
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/state/{event_type}",
+            get(room_state_event_default).put(set_room_state_default),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}",
+            get(room_state_event).put(set_room_state),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/event/{event_id}",
+            get(room_event),
         )
         .route("/_matrix/key/v2/server", get(server_keys))
         .route("/.well-known/matrix/client", get(well_known_client))
@@ -525,7 +545,7 @@ async fn invite_to_room(
             "invite",
             state.key.pair(),
         )
-        .map_err(membership_error)?;
+        .map_err(room_error)?;
     // The spec's response is an empty object, not the event ID. A client that
     // wanted the event reads it from the timeline.
     Ok(Json(json!({})))
@@ -557,7 +577,7 @@ fn join(state: &AppState, user_id: &str, room_id: &str) -> Result<Json<Value>, M
     state
         .rooms
         .set_membership(room_id, user_id, user_id, "join", state.key.pair())
-        .map_err(membership_error)?;
+        .map_err(room_error)?;
     Ok(Json(json!({ "room_id": room_id })))
 }
 
@@ -576,14 +596,125 @@ async fn leave_room(
             "leave",
             state.key.pair(),
         )
-        .map_err(membership_error)?;
+        .map_err(room_error)?;
     Ok(Json(json!({})))
 }
 
-fn membership_error(error: crate::rooms::RoomError) -> MatrixError {
+/// `GET /_matrix/client/v3/rooms/{room_id}/state`
+async fn room_state(
+    State(state): State<AppState>,
+    Authenticated(_identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    let events = state.rooms.state(&room_id).map_err(room_error)?;
+    Ok(Json(Value::Array(events)))
+}
+
+/// `GET /_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}`
+///
+/// Returns the event's *content*, not the event — which is what the spec says
+/// and what surprises people, so it is worth stating here rather than leaving
+/// to the reader.
+async fn room_state_event(
+    State(state): State<AppState>,
+    Authenticated(_identity): Authenticated,
+    axum::extract::Path((room_id, event_type, state_key)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Json<Value>, MatrixError> {
+    let content = state
+        .rooms
+        .state_event(&room_id, &event_type, &state_key)
+        .map_err(room_error)?;
+    Ok(Json(content))
+}
+
+/// `PUT /_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}`
+async fn set_room_state(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((room_id, event_type, state_key)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+    Json(content): Json<Value>,
+) -> Result<Json<Value>, MatrixError> {
+    let event_id = state
+        .rooms
+        .set_state(
+            &room_id,
+            &identity.user_id,
+            state.key.pair(),
+            &event_type,
+            &state_key,
+            &content,
+        )
+        .map_err(room_error)?;
+    Ok(Json(json!({ "event_id": event_id })))
+}
+
+/// `GET /_matrix/client/v3/rooms/{room_id}/state/{event_type}`
+///
+/// The state key is empty, which is what the two-segment form means.
+async fn room_state_event_default(
+    state: State<AppState>,
+    identity: Authenticated,
+    axum::extract::Path((room_id, event_type)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    room_state_event(
+        state,
+        identity,
+        axum::extract::Path((room_id, event_type, String::new())),
+    )
+    .await
+}
+
+/// `PUT /_matrix/client/v3/rooms/{room_id}/state/{event_type}`
+async fn set_room_state_default(
+    state: State<AppState>,
+    identity: Authenticated,
+    axum::extract::Path((room_id, event_type)): axum::extract::Path<(String, String)>,
+    content: Json<Value>,
+) -> Result<Json<Value>, MatrixError> {
+    set_room_state(
+        state,
+        identity,
+        axum::extract::Path((room_id, event_type, String::new())),
+        content,
+    )
+    .await
+}
+
+/// `GET /_matrix/client/v3/rooms/{room_id}/event/{event_id}`
+async fn room_event(
+    State(state): State<AppState>,
+    Authenticated(_identity): Authenticated,
+    axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    let event = state.rooms.event(&room_id, &event_id).map_err(room_error)?;
+    Ok(Json(event))
+}
+
+/// Map a room failure onto the status a client can act on.
+///
+/// `M_NOT_FOUND` covers three different absences — the room, a state entry,
+/// and an event body — and that is correct: from a client's side they are the
+/// same answer, "there is nothing here". What must not collapse is the
+/// difference between absent and *refused*, which is why `Forbidden` has its
+/// own arm.
+fn room_error(error: crate::rooms::RoomError) -> MatrixError {
     match error {
         crate::rooms::RoomError::UnknownRoom(_) => {
             MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such room")
+        }
+        crate::rooms::RoomError::UnknownState(what) => {
+            MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", format!("no {what}"))
+        }
+        crate::rooms::RoomError::MissingBody(_) => {
+            MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such event")
         }
         crate::rooms::RoomError::Forbidden(rule) => MatrixError::forbidden(rule),
         other => MatrixError::internal(&other.to_string()),

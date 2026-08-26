@@ -130,6 +130,13 @@ impl StateSnapshot {
     }
 
     /// Visit every state slot in deterministic key order.
+    /// Visit every entry, **in key order**.
+    ///
+    /// The order is part of the contract, not an accident of the walk: the
+    /// trie places entries by digest, so an unsorted walk would return the
+    /// same state in an order that shifts with the key set. Callers that
+    /// render state to a client compare successive responses, and a set that
+    /// reorders itself looks like a set that changed.
     pub fn for_each(&self, mut visitor: impl FnMut(&StateKey, &str)) {
         let mut entries = Vec::with_capacity(self.len);
         if let Some(root) = &self.root {
