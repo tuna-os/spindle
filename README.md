@@ -63,6 +63,13 @@ OpenAPI schemas, plus the three things we have to build ourselves (a
 heterogeneous Spindle↔Synapse interop rig, fork injection, and a property-test
 oracle for the equivalence claim).
 
+**[docs/divergence.md](docs/divergence.md)** — the seam: what we inherit
+unchanged from the Matrix spec, ruma and Complement, what is genuinely ours
+(the linear index, the state trie, the bounded fork window, the log chain,
+the store format), and what is deliberately deferred. Short version: we
+diverge below the wire and nowhere above it — and there is no MSC3995
+protocol code here yet, by design.
+
 ## What this is honest about
 
 The load-bearing claim is the equivalence theorem in §9.3 — that window-bounded
