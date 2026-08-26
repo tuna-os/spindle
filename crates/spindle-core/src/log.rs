@@ -2,6 +2,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::{StateKey, StateSnapshot};
 
+/// Matrix caps `prev_events` at 20 references per event.
+const MAX_PREV_EVENTS: usize = 20;
+
 /// A Matrix event ID, treated as an opaque value.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct EventId(Box<str>);
@@ -19,12 +22,19 @@ impl EventId {
 }
 
 /// Spindle's durable, per-room storage order.
+///
+/// Signed, because backfill needs somewhere to put history that arrives later
+/// but belongs earlier. Live events ascend from `1`; backfilled history
+/// descends from `0`. Backfill always proceeds strictly backwards from the
+/// earliest event we hold, so an insertion *between* two stored events is never
+/// required and a plain integer suffices — no fractional indexing, no
+/// rebalancing.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct LinearIndex(u64);
+pub struct LinearIndex(i64);
 
 impl LinearIndex {
     #[must_use]
-    pub fn get(self) -> u64 {
+    pub fn get(self) -> i64 {
         self.0
     }
 }
@@ -78,12 +88,31 @@ pub struct ForkWindow {
     pub events: Vec<EventId>,
 }
 
-/// A per-room append-only log plus the minimal DAG overlay federation requires.
-#[derive(Clone, Debug, Default)]
+/// A per-room log in linear-index order, plus the minimal DAG overlay
+/// federation requires.
+///
+/// Entries are keyed by [`LinearIndex`] rather than held in arrival order: this
+/// is the in-memory analogue of the ordered key-value store the events are
+/// destined for, so backfill lands in the right place without renumbering.
+#[derive(Clone, Debug)]
 pub struct RoomLog {
-    entries: Vec<LogEntry>,
-    positions: HashMap<EventId, usize>,
+    entries: BTreeMap<i64, LogEntry>,
+    positions: HashMap<EventId, i64>,
     forward_extremities: BTreeSet<EventId>,
+    next_forward: i64,
+    next_backward: i64,
+}
+
+impl Default for RoomLog {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            positions: HashMap::new(),
+            forward_extremities: BTreeSet::new(),
+            next_forward: 1,
+            next_backward: 0,
+        }
+    }
 }
 
 impl RoomLog {
@@ -92,9 +121,28 @@ impl RoomLog {
         Self::default()
     }
 
+    /// Every entry in linear-index order, oldest first.
     #[must_use]
-    pub fn entries(&self) -> &[LogEntry] {
-        &self.entries
+    pub fn entries(&self) -> impl DoubleEndedIterator<Item = &LogEntry> + ExactSizeIterator {
+        self.entries.values()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Look one entry up by event ID.
+    #[must_use]
+    pub fn get(&self, event_id: &EventId) -> Option<&LogEntry> {
+        self.positions
+            .get(event_id)
+            .and_then(|li| self.entries.get(li))
     }
 
     #[must_use]
@@ -123,28 +171,28 @@ impl RoomLog {
 
         let mut ancestries = Vec::with_capacity(tips.len());
         for tip in tips {
-            let Some(position) = self.positions.get(tip) else {
+            let Some(li) = self.positions.get(tip) else {
                 return Err(ForkWindowError::UnknownTip(tip.clone()));
             };
-            ancestries.push(self.ancestor_positions(*position));
+            ancestries.push(self.ancestor_positions(*li));
         }
 
         let mut common = ancestries[0].clone();
         for ancestry in &ancestries[1..] {
             common.retain(|position| ancestry.contains(position));
         }
-        let Some(nearest_position) = common
+        let Some(nearest) = common
             .iter()
             .copied()
-            .max_by_key(|position| (self.entries[*position].depth, self.entries[*position].li))
+            .max_by_key(|li| (self.entries[li].depth, *li))
         else {
             return Err(ForkWindowError::NoCommonAncestor);
         };
 
-        let divergent: BTreeSet<usize> = ancestries
+        let divergent: BTreeSet<i64> = ancestries
             .into_iter()
             .flatten()
-            .filter(|position| !common.contains(position))
+            .filter(|li| !common.contains(li))
             .collect();
         if divergent.len() > max_events {
             return Err(ForkWindowError::TooLarge {
@@ -154,10 +202,10 @@ impl RoomLog {
         }
 
         Ok(ForkWindow {
-            nearest_common_ancestor: self.entries[nearest_position].event_id.clone(),
+            nearest_common_ancestor: self.entries[&nearest].event_id.clone(),
             events: divergent
                 .into_iter()
-                .map(|position| self.entries[position].event_id.clone())
+                .map(|li| self.entries[&li].event_id.clone())
                 .collect(),
         })
     }
@@ -201,7 +249,7 @@ impl RoomLog {
         if self.positions.contains_key(&input.event_id) {
             return Err(AppendError::DuplicateEvent(input.event_id));
         }
-        if input.prev_events.len() > 20 {
+        if input.prev_events.len() > MAX_PREV_EVENTS {
             return Err(AppendError::TooManyPredecessors(input.prev_events.len()));
         }
         if self.entries.is_empty() && !input.prev_events.is_empty() {
@@ -215,10 +263,10 @@ impl RoomLog {
 
         let mut parent_entries = Vec::with_capacity(input.prev_events.len());
         for parent in &input.prev_events {
-            let Some(position) = self.positions.get(parent) else {
+            let Some(entry) = self.get(parent) else {
                 return Err(AppendError::UnknownPredecessor(parent.clone()));
             };
-            parent_entries.push(&self.entries[*position]);
+            parent_entries.push(entry);
         }
 
         let mut state_after = merge_states(&parent_entries)?;
@@ -230,13 +278,15 @@ impl RoomLog {
             .map(|entry| entry.depth)
             .max()
             .map_or(0, |depth| depth.saturating_add(1));
-        let li = LinearIndex(
-            u64::try_from(self.entries.len())
-                .expect("room event count fits in u64")
-                .saturating_add(1),
-        );
+
+        let li = self.next_forward;
+        self.next_forward = self
+            .next_forward
+            .checked_add(1)
+            .ok_or(AppendError::IndexSpaceExhausted)?;
+
         let entry = LogEntry {
-            li,
+            li: LinearIndex(li),
             event_id: input.event_id,
             prev_events: input.prev_events,
             depth,
@@ -247,24 +297,78 @@ impl RoomLog {
             self.forward_extremities.remove(parent);
         }
         self.forward_extremities.insert(entry.event_id.clone());
-        self.positions
-            .insert(entry.event_id.clone(), self.entries.len());
-        self.entries.push(entry);
-        Ok(self.entries.last().expect("entry was just pushed"))
+        self.positions.insert(entry.event_id.clone(), li);
+        Ok(self.entries.entry(li).or_insert(entry))
     }
 
-    fn ancestor_positions(&self, tip: usize) -> BTreeSet<usize> {
+    /// Place one backfilled event before everything currently held.
+    ///
+    /// Backfill walks strictly backwards from the earliest event we have, so
+    /// these take descending non-positive indices and never collide with live
+    /// history. Two things are supplied by the caller rather than derived:
+    ///
+    /// - `state_after`, because the state of backfilled history is established
+    ///   per chunk from one `/state_ids` call folded forward (SPEC §6.5), not
+    ///   by walking parents we may not hold.
+    /// - `depth`, because a backfilled PDU carries its own signed depth.
+    ///
+    /// The event's `prev_events` may name events older than anything we hold;
+    /// that is ordinary at a backfill frontier, not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppendError`] when the event is already present, exceeds the
+    /// Matrix parent limit, the room is empty, or the index space is exhausted.
+    pub fn prepend_remote(
+        &mut self,
+        input: EventInput,
+        state_after: StateSnapshot,
+        depth: u64,
+    ) -> Result<&LogEntry, AppendError> {
+        if self.positions.contains_key(&input.event_id) {
+            return Err(AppendError::DuplicateEvent(input.event_id));
+        }
+        if input.prev_events.len() > MAX_PREV_EVENTS {
+            return Err(AppendError::TooManyPredecessors(input.prev_events.len()));
+        }
+        if self.entries.is_empty() {
+            return Err(AppendError::EmptyRoom);
+        }
+
+        let li = self.next_backward;
+        self.next_backward = self
+            .next_backward
+            .checked_sub(1)
+            .ok_or(AppendError::IndexSpaceExhausted)?;
+
+        let entry = LogEntry {
+            li: LinearIndex(li),
+            event_id: input.event_id,
+            prev_events: input.prev_events,
+            depth,
+            state_after,
+        };
+
+        // Backfilled history is never a forward extremity: it is, by
+        // construction, behind everything we already hold.
+        self.positions.insert(entry.event_id.clone(), li);
+        Ok(self.entries.entry(li).or_insert(entry))
+    }
+
+    fn ancestor_positions(&self, tip: i64) -> BTreeSet<i64> {
         let mut ancestors = BTreeSet::new();
         let mut pending = vec![tip];
-        while let Some(position) = pending.pop() {
-            if !ancestors.insert(position) {
+        while let Some(li) = pending.pop() {
+            if !ancestors.insert(li) {
                 continue;
             }
+            // A backfilled event may name parents older than anything we hold.
+            // Those are outside our history, not a corrupt index.
             pending.extend(
-                self.entries[position]
+                self.entries[&li]
                     .prev_events
                     .iter()
-                    .map(|parent| self.positions[parent]),
+                    .filter_map(|parent| self.positions.get(parent).copied()),
             );
         }
         ancestors
@@ -313,6 +417,10 @@ pub enum AppendError {
     MissingPredecessor,
     UnknownPredecessor(EventId),
     TooManyPredecessors(usize),
+    /// Backfill needs an existing room to walk backwards from.
+    EmptyRoom,
+    /// The room exhausted its 64-bit linear index space.
+    IndexSpaceExhausted,
     /// Competing state events require the room-version-specific Matrix resolver.
     NeedsStateResolution {
         key: StateKey,

@@ -135,15 +135,14 @@ proptest! {
         room.append_local("$genesis", None).unwrap();
 
         for (number, choice) in stale_parent_choices.into_iter().enumerate() {
-            let known = room.entries().len();
-            let parent = room.entries()[choice % known].event_id.clone();
+            let known = room.len();
+            let parent = room.entries().nth(choice % known).unwrap().event_id.clone();
             room.append_remote(EventInput::new(format!("$remote-{number}"), vec![parent])).unwrap();
             room.append_local(format!("$local-{number}"), None).unwrap();
         }
 
         let positions: BTreeMap<_, _> = room
             .entries()
-            .iter()
             .map(|entry| (entry.event_id.clone(), entry.li))
             .collect();
         for entry in room.entries() {
@@ -153,4 +152,77 @@ proptest! {
         }
         prop_assert_eq!(room.forward_extremities().len(), 1);
     }
+}
+
+#[test]
+fn backfill_takes_descending_indices_below_live_history() {
+    let mut room = RoomLog::new();
+    room.append_local("$join", Some(StateKey::new("m.room.create", "")))
+        .unwrap();
+    room.append_local("$live", None).unwrap();
+
+    // Two chunks of history walked strictly backwards from the join point.
+    let older = room
+        .prepend_remote(
+            EventInput::new("$older", vec![EventId::new("$oldest")]),
+            StateSnapshot::new(),
+            41,
+        )
+        .unwrap()
+        .li;
+    let oldest = room
+        .prepend_remote(EventInput::new("$oldest", vec![]), StateSnapshot::new(), 40)
+        .unwrap()
+        .li;
+
+    assert_eq!(older.get(), 0);
+    assert_eq!(oldest.get(), -1);
+
+    // Live history is untouched and still ascends from 1.
+    let live: Vec<_> = room
+        .entries()
+        .map(|entry| (entry.event_id.as_str().to_owned(), entry.li.get()))
+        .collect();
+    assert_eq!(
+        live,
+        vec![
+            ("$oldest".to_owned(), -1),
+            ("$older".to_owned(), 0),
+            ("$join".to_owned(), 1),
+            ("$live".to_owned(), 2),
+        ]
+    );
+}
+
+#[test]
+fn backfilled_history_sorts_before_the_join_point_it_precedes() {
+    let mut room = RoomLog::new();
+    room.append_local("$join", None).unwrap();
+    room.prepend_remote(
+        EventInput::new("$ancestor", vec![]),
+        StateSnapshot::new(),
+        7,
+    )
+    .unwrap();
+
+    let ancestor = room.get(&EventId::new("$ancestor")).unwrap().li;
+    let join = room.get(&EventId::new("$join")).unwrap().li;
+    assert!(ancestor < join);
+    // Backfill is behind everything held, so it is never an extremity.
+    assert_eq!(room.forward_extremities().len(), 1);
+    assert!(room.forward_extremities().contains(&EventId::new("$join")));
+}
+
+#[test]
+fn backfill_requires_a_room_to_walk_backwards_from() {
+    let mut room = RoomLog::new();
+    assert_eq!(
+        room.prepend_remote(
+            EventInput::new("$ancestor", vec![]),
+            StateSnapshot::new(),
+            0
+        )
+        .err(),
+        Some(AppendError::EmptyRoom)
+    );
 }
