@@ -34,11 +34,49 @@ const ROOM_VERSION: &str = "11";
 /// from the room the moment invites or knocks matter.
 const JOIN: &[u8] = b"join";
 
+/// Invited, which is not joined -- `/sync` reports the two in different
+/// sections and a client acts on them differently.
+const INVITE: &[u8] = b"invite";
+
 /// Rooms held open, keyed by room ID.
 pub struct Rooms {
     store: Arc<FjallStore>,
     server_name: String,
     open: Mutex<HashMap<String, RoomLog>>,
+    /// The server-global order `/sync` needs (SPEC §10.2). The linear index
+    /// orders events within one room; nothing orders them across rooms, so
+    /// this is the one counter that exists purely because a per-room order is
+    /// not a server order.
+    ///
+    /// SPEC §10.2 describes a sharded counter with a watermark over in-flight
+    /// ids, because commits there complete out of order. Here every append
+    /// holds the same lock, so ids are assigned and committed in the same
+    /// order and the watermark *is* the counter. That equivalence is a
+    /// property of the single lock, and stops holding the moment §15's
+    /// per-room executors land -- at which point the interval set the spec
+    /// describes has to come back.
+    stream: Mutex<u64>,
+    /// Woken whenever an event lands, so a long-polling `/sync` does not have
+    /// to spin. SPEC §10.3 wants per-room subscriber lists; this is the same
+    /// shape at server granularity, which is enough while there is one lock.
+    appended: tokio::sync::Notify,
+}
+
+/// What one `/sync` call found.
+pub struct SyncResult {
+    pub next_batch: u64,
+    pub rooms: Vec<SyncRoom>,
+    pub invited: Vec<String>,
+}
+
+/// One room's share of a sync response.
+pub struct SyncRoom {
+    pub room_id: String,
+    pub state: Vec<Value>,
+    pub events: Vec<Value>,
+    /// Whether older events were left out, so a client knows to back-paginate
+    /// rather than assume it has the room's whole history.
+    pub limited: bool,
 }
 
 /// One stored event, as a client sees it.
@@ -52,10 +90,18 @@ pub struct TimelineEvent {
 impl Rooms {
     #[must_use]
     pub fn new(store: Arc<FjallStore>, server_name: impl Into<String>) -> Self {
+        let store_for_stream = Arc::clone(&store);
         Self {
             store,
             server_name: server_name.into(),
             open: Mutex::new(HashMap::new()),
+            // Resumed, not reset. A counter that restarted at zero would
+            // re-issue stream ids already on disk, overwriting the entries
+            // they point at -- the same shape of bug as a room registry that
+            // does not survive a restart, and worse, because it corrupts
+            // rather than merely forgets.
+            stream: Mutex::new(highest_stream_id(store_for_stream.as_ref())),
+            appended: tokio::sync::Notify::new(),
         }
     }
 
@@ -343,12 +389,151 @@ impl Rooms {
     ///
     /// Returns [`RoomError`] if the index cannot be read.
     pub fn joined(&self, user_id: &str) -> Result<Vec<String>, RoomError> {
+        self.membership_rooms(user_id, JOIN)
+    }
+
+    /// The current global stream position.
+    #[must_use]
+    pub fn stream_position(&self) -> u64 {
+        *self
+            .stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Wait until an event lands, or the deadline passes.
+    ///
+    /// SPEC §10.3 wants `/sync` to be push rather than poll, and this is the
+    /// smallest thing that is: a waiter is woken by the append itself, so a
+    /// client blocked here costs nothing until there is something to send. It
+    /// is server-wide rather than per-room, which wakes more clients than
+    /// strictly needed -- correct, and coarser than §10.3's per-room
+    /// subscriber lists, which is the shape to reach for when rooms stop
+    /// sharing one lock.
+    pub async fn wait_for_event(&self, timeout: std::time::Duration) {
+        // `notified()` must be created *before* the position is re-checked by
+        // the caller, or an append landing in between is missed and the client
+        // waits out the full timeout for news that already arrived.
+        let notified = self.appended.notified();
+        let _ = tokio::time::timeout(timeout, notified).await;
+    }
+
+    /// Everything that happened after `since`, grouped by room.
+    ///
+    /// `since` of `None` is an initial sync: every joined room, with its
+    /// current state and a tail of its timeline. Otherwise it is a range scan
+    /// of the global stream from `since`, which is the cheap case and the
+    /// common one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the stream or an event cannot be read.
+    pub fn sync(
+        &self,
+        user_id: &str,
+        since: Option<u64>,
+        timeline_limit: usize,
+    ) -> Result<SyncResult, RoomError> {
+        let position = self.stream_position();
+        let joined = self.joined(user_id)?;
+        let invited = self.invited(user_id)?;
+
+        let mut rooms = Vec::new();
+        for room_id in joined {
+            let (events, limited) = match since {
+                None => self.timeline_tail(&room_id, timeline_limit)?,
+                Some(since) => (self.timeline_since(&room_id, since, position)?, false),
+            };
+            // An incremental sync says nothing about a room where nothing
+            // happened. A client diffing rooms it was sent against rooms it
+            // knows would otherwise see an empty timeline as a change.
+            if since.is_some() && events.is_empty() {
+                continue;
+            }
+            rooms.push(SyncRoom {
+                room_id: room_id.clone(),
+                // State only on an initial sync. Incrementally, the state
+                // events are in the timeline already, and sending them twice
+                // would make a client apply each one twice.
+                state: if since.is_none() {
+                    self.state(&room_id)?
+                } else {
+                    Vec::new()
+                },
+                events,
+                limited,
+            });
+        }
+
+        Ok(SyncResult {
+            next_batch: position,
+            rooms,
+            invited,
+        })
+    }
+
+    /// Rooms this user has been invited to but has not joined.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the index cannot be read.
+    pub fn invited(&self, user_id: &str) -> Result<Vec<String>, RoomError> {
+        self.membership_rooms(user_id, INVITE)
+    }
+
+    /// The newest `limit` events of a room, oldest first.
+    fn timeline_tail(&self, room_id: &str, limit: usize) -> Result<(Vec<Value>, bool), RoomError> {
+        let (events, more) = self.messages(room_id, None, limit)?;
+        let mut out: Vec<Value> = events
+            .into_iter()
+            .map(|event| stamp(event.json, &event.event_id))
+            .collect();
+        out.reverse();
+        Ok((out, more.is_some()))
+    }
+
+    /// Events of one room that entered the global stream after `since`.
+    fn timeline_since(
+        &self,
+        room_id: &str,
+        since: u64,
+        position: u64,
+    ) -> Result<Vec<Value>, RoomError> {
+        let mut out = Vec::new();
+        for stream_id in (since + 1)..=position {
+            let Some(raw) = spindle_store::ReadView::get(
+                self.store.as_ref(),
+                &spindle_core::keys::stream(stream_id),
+            )?
+            else {
+                continue;
+            };
+            let Some(record) = StreamRecord::decode(&raw) else {
+                continue;
+            };
+            if record.room_id != room_id {
+                continue;
+            }
+            let event_id = self.with_room(room_id, |_, log| {
+                Ok(log
+                    .entries()
+                    .find(|entry| entry.li.get() == record.li)
+                    .map(|entry| entry.event_id.as_str().to_owned()))
+            })?;
+            if let Some(event_id) = event_id {
+                out.push(self.event(room_id, &event_id)?);
+            }
+        }
+        Ok(out)
+    }
+
+    fn membership_rooms(&self, user_id: &str, wanted: &[u8]) -> Result<Vec<String>, RoomError> {
         let prefix =
             spindle_core::keys::user_prefix(spindle_core::keys::Keyspace::Membership, user_id);
         let mut rooms: Vec<String> =
             spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?
                 .into_iter()
-                .filter(|(_, membership)| membership.as_slice() == JOIN)
+                .filter(|(_, membership)| membership.as_slice() == wanted)
                 .filter_map(|(key, _)| spindle_core::keys::room_from_user_room(user_id, &key))
                 .collect();
         rooms.sort();
@@ -356,17 +541,6 @@ impl Rooms {
         Ok(rooms)
     }
 
-    /// Run `work` against a room's log, loading it from storage if this
-    /// process has not opened it yet.
-    ///
-    /// The load is what makes a room survive a restart. Without it the log is
-    /// durable but the registry of open rooms is not, so after a restart a
-    /// room's history stays readable while the room itself becomes
-    /// permanently unwritable — a silent half-state, worse than losing it.
-    ///
-    /// Loading is `O(room)` and happens at most once per room per process,
-    /// which is what "rooms are held open, not reloaded per request" means:
-    /// the cost is paid on first touch, never on the send path.
     fn with_room<T>(
         &self,
         room_id: &str,
@@ -452,7 +626,30 @@ impl Rooms {
             &event_body_key(room_id, &event_id),
             &serde_json::to_vec(&json)?,
         )?;
-        room_store.commit_entry(&entry, log, Durability::Group)?;
+        // The stream id goes in the entry's own batch, so an event is either
+        // in the global order or not stored at all. Assigned under the same
+        // lock that serialises appends, which is what makes the watermark the
+        // counter -- see the field's own note.
+        let mut stream = self
+            .stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stream_id = stream.saturating_add(1);
+        room_store.commit_entry_with(
+            &entry,
+            log,
+            &[(
+                spindle_core::keys::stream(stream_id),
+                StreamRecord {
+                    room_id: room_id.to_owned(),
+                    li: entry.li.get(),
+                }
+                .encode(),
+            )],
+            Durability::Group,
+        )?;
+        *stream = stream_id;
+        drop(stream);
 
         // The index is derived from the event that just landed, and only from
         // an event that landed: writing it before the commit would leave a
@@ -460,6 +657,7 @@ impl Rooms {
         if event_type == "m.room.member" {
             self.index_membership(room_id, state_key, content)?;
         }
+        self.appended.notify_waiters();
         Ok(event_id)
     }
 
@@ -541,6 +739,17 @@ impl Rooms {
         .ok_or_else(|| RoomError::MissingBody(event_id.as_str().to_owned()))?;
         Ok(serde_json::from_slice(&raw)?)
     }
+}
+
+/// Put the event ID into the body a client sees.
+///
+/// A v11 event does not carry its own ID -- the ID *is* the hash of the body,
+/// so storing it inside would change what it hashes to.
+fn stamp(mut json: Value, event_id: &str) -> Value {
+    if let Some(object) = json.as_object_mut() {
+        object.insert("event_id".to_owned(), Value::String(event_id.to_owned()));
+    }
+    json
 }
 
 /// The room's current state, as `(key, event_id)` pairs.
@@ -775,6 +984,45 @@ impl std::fmt::Display for RoomError {
 }
 
 impl std::error::Error for RoomError {}
+
+/// What the global stream stores at each id: which room, and where in it.
+///
+/// Deliberately not the event itself. The stream exists to give `/sync` a
+/// total order across rooms; the events are already in the log, and copying
+/// them would make every append write the event twice and every edit to the
+/// storage format have two places to change.
+struct StreamRecord {
+    room_id: String,
+    li: i64,
+}
+
+impl StreamRecord {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(9 + self.room_id.len());
+        out.extend_from_slice(&self.li.to_be_bytes());
+        out.extend_from_slice(self.room_id.as_bytes());
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let li = i64::from_be_bytes(bytes.get(..8)?.try_into().ok()?);
+        let room_id = String::from_utf8(bytes.get(8..)?.to_vec()).ok()?;
+        Some(Self { room_id, li })
+    }
+}
+
+/// The highest stream id already on disk, or 0 for a fresh store.
+fn highest_stream_id(store: &FjallStore) -> u64 {
+    // A prefix scan rather than a stored high-water mark: one number that has
+    // to be kept in step with the rows it describes is one number that can
+    // disagree with them, and the rows are the truth.
+    spindle_store::ReadView::scan_prefix(store, &spindle_core::keys::stream_prefix())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|(key, _)| spindle_core::keys::stream_from_key(key))
+        .max()
+        .unwrap_or(0)
+}
 
 #[cfg(test)]
 mod membership_index_tests {

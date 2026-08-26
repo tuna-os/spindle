@@ -164,9 +164,9 @@ async fn an_unimplemented_endpoint_is_a_404_not_a_stub() {
     // client cannot distinguish it from success.
     // This list shrinks as endpoints land, and it failing is the signal to
     // shrink it: `/createRoom` and `/joined_rooms` were here until rooms were
-    // built, and the test said so on the commit that built them.
+    // built, and `/sync` until sync was, and the test said so on each of the
+    // commits that built them.
     for path in [
-        "/_matrix/client/v3/sync",
         "/_matrix/client/v3/publicRooms",
         "/_matrix/client/v3/account/password",
         "/_matrix/client/v3/profile/@alice:example.org",

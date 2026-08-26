@@ -74,6 +74,12 @@ pub enum Keyspace {
     RefreshToken = 0x09,
     /// `key_id` -> this server's signing key.
     ServerKey = 0x0a,
+    /// `stream_id` -> `(room_id, li)`.
+    ///
+    /// SPEC §10.2: `/sync` needs a total order *across* rooms, and the linear
+    /// index only orders within one. This is the one index that exists purely
+    /// because a per-room order is not a server order.
+    Stream = 0x0c,
     /// `(user_id, room_id)` -> membership.
     ///
     /// Indexed by user rather than by room so that "which rooms is this user
@@ -128,6 +134,33 @@ pub fn room_prefix(keyspace: Keyspace, room_id: &str) -> Vec<u8> {
     key.extend_from_slice(&len.to_be_bytes());
     key.extend_from_slice(&room[..len as usize]);
     key
+}
+
+/// `stream_id` key, ordered numerically.
+///
+/// Big-endian over a `u64` rather than [`order_preserving`]: stream ids start
+/// at 1 and only ever increase, so there is no negative range to fold and the
+/// plain encoding already sorts correctly.
+#[must_use]
+pub fn stream(stream_id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(10);
+    key.push(KEY_SCHEMA_VERSION);
+    key.push(Keyspace::Stream as u8);
+    key.extend_from_slice(&stream_id.to_be_bytes());
+    key
+}
+
+/// The `stream_id` a [`stream`] key encodes.
+#[must_use]
+pub fn stream_from_key(key: &[u8]) -> Option<u64> {
+    let bytes: [u8; 8] = key.get(2..10)?.try_into().ok()?;
+    Some(u64::from_be_bytes(bytes))
+}
+
+/// The prefix every stream key shares, for scanning the whole stream.
+#[must_use]
+pub fn stream_prefix() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::Stream as u8]
 }
 
 /// The prefix every key for one user in one keyspace shares.
