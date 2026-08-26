@@ -37,6 +37,15 @@ impl LinearIndex {
     pub fn get(self) -> i64 {
         self.0
     }
+
+    /// Build an index from a raw value.
+    ///
+    /// The log allocates indices itself; this exists for storage round-trips
+    /// and for tests that need to probe the encoding at the extremes.
+    #[must_use]
+    pub fn from_raw(value: i64) -> Self {
+        Self(value)
+    }
 }
 
 /// An already authenticated event ready to enter the room log.
