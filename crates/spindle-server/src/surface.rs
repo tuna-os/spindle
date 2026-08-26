@@ -79,7 +79,13 @@ pub const ROOM_VERSION_REQUIRES: &[&str] = &[
 ];
 
 /// Unstable features. Same rule: nothing here that is not built.
-pub const UNSTABLE_FEATURES: &[(&str, bool)] = &[];
+pub const UNSTABLE_FEATURES: &[(&str, bool)] = &[
+    // MSC3266's room summary. Advertised because the endpoint is served under
+    // the unstable prefix as well as at `/v1/room_summary`, and a client that
+    // checks this flag before probing the unstable path is doing the right
+    // thing.
+    ("im.nheko.summary", true),
+];
 
 #[must_use]
 pub fn spec_version_names() -> Vec<&'static str> {
