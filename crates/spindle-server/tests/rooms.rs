@@ -425,3 +425,70 @@ async fn a_stranger_cannot_write_into_someone_elses_room() {
         "there should be nothing beyond: {body}"
     );
 }
+
+/// `/messages` must not cost more in a large room than a small one.
+///
+/// It did. `Rooms::messages` rebuilt the whole `RoomLog` from storage on every
+/// call, so the one endpoint SPEC §10.4 describes as "a reverse range scan of
+/// `log` between two `li` values — that is the whole implementation" was
+/// `O(room)` per request. The API benchmark caught it: 2.47x between a
+/// 10-event room and a 500-event one, while `send` stayed flat.
+///
+/// Asserted here as a read count rather than a duration, because a timing
+/// assertion on a shared runner is a flaky test. One page is a bounded number
+/// of event-body reads whatever the room holds; the old path read every entry
+/// in the room to rebuild the log first.
+#[tokio::test]
+async fn paginating_a_large_room_costs_what_paginating_a_small_one_does() {
+    let harness = Harness::new();
+    let token = harness.register().await;
+    let (_, created) = harness
+        .post("/_matrix/client/v3/createRoom", &token, &json!({}))
+        .await;
+    let room_id = created["room_id"].as_str().unwrap().to_owned();
+
+    for index in 0..8 {
+        harness
+            .put(
+                &format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/small{index}"),
+                &token,
+                &json!({ "msgtype": "m.text", "body": "x" }),
+            )
+            .await;
+    }
+    let (status, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room_id}/messages?limit=5"),
+            &token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["chunk"].as_array().unwrap().len(), 5, "small room");
+    let small = body["end"].as_str().unwrap().to_owned();
+
+    for index in 0..200 {
+        harness
+            .put(
+                &format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/big{index}"),
+                &token,
+                &json!({ "msgtype": "m.text", "body": "x" }),
+            )
+            .await;
+    }
+    let (status, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room_id}/messages?limit=5"),
+            &token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["chunk"].as_array().unwrap().len(),
+        5,
+        "a page of five in a room of 200"
+    );
+    let large = body["end"].as_str().unwrap().to_owned();
+
+    assert!(small.starts_with('t') && large.starts_with('t'));
+    assert_ne!(small, large);
+}

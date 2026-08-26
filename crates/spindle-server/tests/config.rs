@@ -137,3 +137,21 @@ fn a_missing_file_names_the_path_it_could_not_read() {
     let text = format!("{error}");
     assert!(text.contains("/nonexistent/spindle.toml"), "{text}");
 }
+
+/// Rate limiting is on unless a config says otherwise, and saying otherwise is
+/// a single explicit key. Defaulting it off would make a server exposed to the
+/// internet a brute-force target through inattention rather than intent.
+#[test]
+fn rate_limiting_defaults_on_and_is_switched_off_explicitly() {
+    let default = Config::parse("[server]\nname = \"example.org\"\n").unwrap();
+    assert!(default.ratelimit.enabled);
+
+    let off = Config::parse("[server]\nname = \"example.org\"\n\n[ratelimit]\nenabled = false\n")
+        .unwrap();
+    assert!(!off.ratelimit.enabled);
+
+    // The section rejects anything it does not know, so a misspelled key is an
+    // error rather than a limit that silently stays on.
+    let typo = Config::parse("[server]\nname = \"example.org\"\n\n[ratelimit]\nenable = false\n");
+    assert!(typo.is_err(), "a misspelled key was accepted: {typo:?}");
+}

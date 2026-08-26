@@ -365,28 +365,34 @@ impl Rooms {
         from: Option<i64>,
         limit: usize,
     ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
-        let room_store = RoomStore::new(self.store.as_ref(), room_id);
-        let restored = room_store
-            .load()?
-            .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
+        // Against the open log, not a fresh `load()`. Reloading rebuilt the
+        // whole `RoomLog` from storage on every page, which made the one
+        // endpoint SPEC §10.4 calls "a reverse range scan ... that is the
+        // whole implementation" cost `O(room)` per request instead. The API
+        // benchmark caught it: `/messages` grew 2.47x between a 10-event room
+        // and a 500-event one, and `/sync` 4.79x, while `send` stayed flat.
+        let wanted = self.with_room(room_id, |_, log| {
+            let mut wanted = Vec::new();
+            let mut next = None;
+            for entry in log.entries().rev() {
+                let li = entry.li.get();
+                if from.is_some_and(|from| li >= from) {
+                    continue;
+                }
+                if wanted.len() == limit {
+                    next = Some(li + 1);
+                    break;
+                }
+                wanted.push((li, entry.event_id.as_str().to_owned()));
+            }
+            Ok((wanted, next))
+        })?;
 
-        let mut out = Vec::new();
-        let mut next = None;
-        for entry in restored.log.entries().rev() {
-            let li = entry.li.get();
-            if from.is_some_and(|from| li >= from) {
-                continue;
-            }
-            if out.len() == limit {
-                next = Some(li + 1);
-                break;
-            }
-            let json = self.read_event(room_id, &entry.event_id)?;
-            out.push(TimelineEvent {
-                event_id: entry.event_id.as_str().to_owned(),
-                li,
-                json,
-            });
+        let (wanted, next) = wanted;
+        let mut out = Vec::with_capacity(wanted.len());
+        for (li, event_id) in wanted {
+            let json = self.read_event(room_id, &EventId::new(event_id.as_str()))?;
+            out.push(TimelineEvent { event_id, li, json });
         }
         Ok((out, next))
     }
