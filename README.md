@@ -57,6 +57,12 @@ impossible and the exception path is dead code.
 | §16–18 | Encryption (Megolm now, MLS track) · operations · performance model |
 | §19–23 | Correctness strategy · migration · risks · roadmap · prior art |
 
+**[docs/conformance-testing.md](docs/conformance-testing.md)** — how we prove
+interoperability: adopting Complement, complement-crypto and the spec's own
+OpenAPI schemas, plus the three things we have to build ourselves (a
+heterogeneous Spindle↔Synapse interop rig, fork injection, and a property-test
+oracle for the equivalence claim).
+
 ## What this is honest about
 
 The load-bearing claim is the equivalence theorem in §9.3 — that window-bounded
