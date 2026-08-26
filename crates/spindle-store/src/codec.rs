@@ -27,6 +27,9 @@ pub struct EntryRecord {
     /// state was supplied externally, and either way must be surfaced rather
     /// than silently accepted.
     pub state_root: [u8; 32],
+    /// The chain value this server recorded when it sequenced the entry, absent
+    /// for backfilled history it did not sequence.
+    pub chain: Option<[u8; 32]>,
 }
 
 impl EntryRecord {
@@ -48,6 +51,7 @@ impl EntryRecord {
                 )
             }),
             state_root: *entry.state_after.root().as_bytes(),
+            chain: entry.chain.map(|chain| *chain.as_bytes()),
         }
     }
 
@@ -95,6 +99,13 @@ impl EntryRecord {
             }
             None => out.push(0),
         }
+        match &self.chain {
+            Some(chain) => {
+                out.push(1);
+                out.extend_from_slice(chain);
+            }
+            None => out.push(0),
+        }
         out
     }
 
@@ -121,6 +132,11 @@ impl EntryRecord {
             1 => Some((cursor.string()?, cursor.string()?)),
             other => return Err(CodecError::Malformed(other)),
         };
+        let chain = match cursor.byte()? {
+            0 => None,
+            1 => Some(cursor.array::<32>()?),
+            other => return Err(CodecError::Malformed(other)),
+        };
         Ok(Self {
             li,
             event_id,
@@ -128,6 +144,7 @@ impl EntryRecord {
             depth,
             state_key,
             state_root,
+            chain,
         })
     }
 }

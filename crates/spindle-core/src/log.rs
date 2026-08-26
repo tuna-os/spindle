@@ -5,6 +5,10 @@ use crate::{StateKey, StateRoot, StateSnapshot};
 /// Matrix caps `prev_events` at 20 references per event.
 const MAX_PREV_EVENTS: usize = 20;
 
+/// Domain separator for the log chain, matching the convention the state trie
+/// uses so no two hash inputs in this codebase can ever collide by accident.
+const CHAIN_DOMAIN: &[u8] = b"spindle-log-chain-v1\0";
+
 /// One bit per tip tracks which tips reach a node, so the tip set must fit a
 /// `u64`. Matrix caps `prev_events` at 20, so a real fork is far below this.
 const MAX_TIPS: usize = u64::BITS as usize;
@@ -79,6 +83,48 @@ impl EventInput {
     }
 }
 
+/// A running hash over everything this server has sequenced in a room.
+///
+/// `chain[li] = H(CHAIN_DOMAIN || chain[li-1] || event_id[li])`, seeded from the
+/// domain separator alone. Each value therefore commits to the entire ordered
+/// history before it, so a server cannot restate what it once served without
+/// producing a different chain — which is what turns "trust the serializer for
+/// ordering" into "detect the serializer changing its mind" (SPEC §13.3).
+///
+/// Only forward-appended entries carry one. Backfilled history was sequenced by
+/// somebody else and arrives with its own provenance; attesting to an order we
+/// did not choose would be a claim we cannot back.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ChainHash([u8; 32]);
+
+impl ChainHash {
+    /// The value the chain starts from, before any event is sequenced.
+    #[must_use]
+    pub fn seed() -> Self {
+        Self(*blake3::hash(CHAIN_DOMAIN).as_bytes())
+    }
+
+    /// Extend the chain with one event.
+    #[must_use]
+    pub fn extend(self, event_id: &EventId) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(CHAIN_DOMAIN);
+        hasher.update(&self.0);
+        hasher.update(event_id.as_str().as_bytes());
+        Self(*hasher.finalize().as_bytes())
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
 /// One event in storage order, with its Matrix DAG relationship intact.
 #[derive(Clone, Debug)]
 pub struct LogEntry {
@@ -91,6 +137,10 @@ pub struct LogEntry {
     /// Retained so the log is self-describing: a reader with only the log can
     /// rebuild room state by folding forward, without a separate state index.
     pub state_key: Option<StateKey>,
+    /// This server's attestation to the order, for entries it sequenced.
+    ///
+    /// `None` for backfilled history, which it did not.
+    pub chain: Option<ChainHash>,
     pub state_after: StateSnapshot,
 }
 
@@ -123,6 +173,7 @@ pub struct RoomLog {
     forward_extremities: BTreeSet<EventId>,
     next_forward: i64,
     next_backward: i64,
+    head_chain: ChainHash,
 }
 
 impl Default for RoomLog {
@@ -133,6 +184,7 @@ impl Default for RoomLog {
             forward_extremities: BTreeSet::new(),
             next_forward: 1,
             next_backward: 0,
+            head_chain: ChainHash::seed(),
         }
     }
 }
@@ -183,6 +235,14 @@ impl RoomLog {
     #[must_use]
     pub fn next_backward(&self) -> i64 {
         self.next_backward
+    }
+
+    /// The chain value covering everything this server has sequenced so far.
+    ///
+    /// This is what a server signs and publishes to attest to its ordering.
+    #[must_use]
+    pub fn head_chain(&self) -> ChainHash {
+        self.head_chain
     }
 
     /// Find the bounded divergent ancestry behind a set of event tips.
@@ -377,14 +437,17 @@ impl RoomLog {
             .checked_add(1)
             .ok_or(AppendError::IndexSpaceExhausted)?;
 
+        let chain = self.head_chain.extend(&input.event_id);
         let entry = LogEntry {
             li: LinearIndex(li),
             event_id: input.event_id,
             prev_events: input.prev_events,
             depth,
             state_key,
+            chain: Some(chain),
             state_after,
         };
+        self.head_chain = chain;
 
         for parent in &entry.prev_events {
             self.forward_extremities.remove(parent);
@@ -440,6 +503,8 @@ impl RoomLog {
             prev_events: input.prev_events,
             depth,
             state_key: input.state_key,
+            // Backfilled history was sequenced by somebody else.
+            chain: None,
             state_after,
         };
 
@@ -463,12 +528,25 @@ pub struct RestoredEntry {
     pub state_key: Option<StateKey>,
     /// The state root recorded when this entry was first written.
     pub expected_state_root: [u8; 32],
+    /// The chain value recorded when this entry was sequenced, if this server
+    /// sequenced it.
+    pub chain: Option<[u8; 32]>,
 }
 
 /// A log rebuilt from storage, plus whichever entries could not be verified.
 #[derive(Clone, Debug)]
 pub struct RestoredLog {
     pub log: RoomLog,
+    /// Entries whose recorded chain value does not match the one recomputed
+    /// from the entries before them.
+    ///
+    /// The chain commits to the whole ordered history, so a break here means
+    /// the log was altered after it was sequenced — an event edited, removed,
+    /// or reordered. Unlike `unverified`, there is no benign explanation: this
+    /// is the tamper signal (SPEC §13.3), and the first broken index is where
+    /// the history stopped matching what was attested.
+    pub broken_chain: Vec<LinearIndex>,
+
     /// Entries whose refolded state disagrees with the root recorded at write
     /// time.
     ///
@@ -556,8 +634,10 @@ impl RoomLog {
             forward_extremities: forward_extremities.into_iter().collect(),
             next_forward,
             next_backward,
+            head_chain: ChainHash::seed(),
         };
         let mut unverified = Vec::new();
+        let mut broken_chain = Vec::new();
         let mut previous: Option<i64> = None;
 
         for restored in entries {
@@ -614,19 +694,39 @@ impl RoomLog {
                 }
             };
 
+            // Recompute the chain rather than trusting what was stored: a
+            // stored value that agrees with itself proves nothing. Backfilled
+            // entries are skipped because they carry no attestation from us.
+            let chain = match restored.chain {
+                Some(stored) => {
+                    let recomputed = log.head_chain.extend(&restored.event_id);
+                    if *recomputed.as_bytes() != stored {
+                        broken_chain.push(restored.li);
+                    }
+                    log.head_chain = recomputed;
+                    Some(recomputed)
+                }
+                None => None,
+            };
+
             let entry = LogEntry {
                 li: restored.li,
                 event_id: restored.event_id,
                 prev_events: restored.prev_events,
                 depth: restored.depth,
                 state_key: restored.state_key,
+                chain,
                 state_after,
             };
             log.positions.insert(entry.event_id.clone(), li);
             log.entries.insert(li, entry);
         }
 
-        Ok(RestoredLog { log, unverified })
+        Ok(RestoredLog {
+            log,
+            broken_chain,
+            unverified,
+        })
     }
 }
 
