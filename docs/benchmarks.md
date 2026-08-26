@@ -3,6 +3,28 @@
 Measurements, methodology, and the results that do not favour us. A suite that
 only reports its wins is not evidence (#34).
 
+## Where the current numbers are
+
+**Published automatically on every push to `main`:**
+<https://hanthor.github.io/spindle/> — with
+[`latest.json`](https://hanthor.github.io/spindle/latest.json) as the raw data
+and a per-commit copy kept beside it, so a regression can be traced to the push
+that caused it.
+
+**The tables in this document are dated snapshots, not the live figures.** They
+are here because the analysis around them needs something concrete to point at,
+and they are what the numbers looked like when that analysis was written. The
+published results are authoritative; where the two disagree, this document is
+the stale one.
+
+That split is deliberate. A figure typed into prose has nothing holding it to
+the code, so it drifts the first time somebody changes one and not the other —
+which is the same failure the rest of this repository spends effort avoiding
+(see `crates/spindle-server/src/surface.rs`, or the frozen format fixtures).
+What belongs in a document is the reasoning: what a comparison establishes, what
+it does not, and which caveats travel with the number. Reasoning does not go
+stale on a runner change. Wall times do.
+
 ## What is measured, and what is not
 
 | Comparison | Status |
@@ -22,7 +44,13 @@ server comparison starts at M1 and is defined in #42.
 
 ## Method
 
-Run on the development host, Rust 1.89, release mode, Criterion. Absolute times
+Published runs execute on a GitHub Actions `ubuntu-24.04` runner, which is both
+slower and noisier than a workstation by an amount that varies run to run. The
+snapshots below were taken on the development host. Neither is comparable to the
+other in absolute terms, which is why **ratios measured inside a single run are
+the result** and wall times are context.
+
+Rust 1.89, release mode, Criterion. Absolute times
 are not portable between machines; the **shape across sizes** is the result, and
 that is what the commentary below reads.
 
