@@ -11,11 +11,8 @@ fn stale_remote_event_is_joined_by_the_next_local_event() {
     room.append_local("$one", None).unwrap();
     room.append_local("$two", None).unwrap();
 
-    room.append_remote(EventInput::new(
-        "$remote",
-        vec![EventId::new("$one")],
-    ))
-    .unwrap();
+    room.append_remote(EventInput::new("$remote", vec![EventId::new("$one")]))
+        .unwrap();
     assert_eq!(room.forward_extremities().len(), 2);
 
     let merge = room.append_local("$merge", None).unwrap();
@@ -89,4 +86,3 @@ proptest! {
         prop_assert_eq!(room.forward_extremities().len(), 1);
     }
 }
-

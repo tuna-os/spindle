@@ -91,11 +91,10 @@ impl StateSnapshot {
 
     #[must_use]
     pub fn root(&self) -> StateRoot {
-        self.root
-            .as_ref()
-            .map_or(StateRoot(*blake3::hash(b"spindle-empty-state-v1").as_bytes()), |node| {
-                StateRoot(node.hash())
-            })
+        self.root.as_ref().map_or(
+            StateRoot(*blake3::hash(b"spindle-empty-state-v1").as_bytes()),
+            |node| StateRoot(node.hash()),
+        )
     }
 
     #[must_use]
@@ -156,10 +155,7 @@ impl Node {
         Self::leaf_from_entries(digest, vec![(key, event_id)])
     }
 
-    fn leaf_from_entries(
-        digest: [u8; 32],
-        mut entries: Vec<(StateKey, Box<str>)>,
-    ) -> Self {
+    fn leaf_from_entries(digest: [u8; 32], mut entries: Vec<(StateKey, Box<str>)>) -> Self {
         entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
         let hash = hash_leaf(&digest, &entries);
         Self::Leaf {
@@ -265,7 +261,11 @@ impl Node {
     fn collect<'a>(&'a self, output: &mut Vec<(&'a StateKey, &'a str)>) {
         match self {
             Self::Leaf { entries, .. } => {
-                output.extend(entries.iter().map(|(key, event_id)| (key, event_id.as_ref())));
+                output.extend(
+                    entries
+                        .iter()
+                        .map(|(key, event_id)| (key, event_id.as_ref())),
+                );
             }
             Self::Branch { children, .. } => {
                 for child in children.iter() {
@@ -296,7 +296,13 @@ fn join_nodes(
         )),
         Ordering::Equal => Arc::new(Node::branch(
             1_u32 << left_slot,
-            vec![join_nodes(left, left_digest, right, right_digest, depth + 1)],
+            vec![join_nodes(
+                left,
+                left_digest,
+                right,
+                right_digest,
+                depth + 1,
+            )],
         )),
     }
 }
@@ -340,4 +346,3 @@ fn hash_bytes(hasher: &mut blake3::Hasher, value: &[u8]) {
     hasher.update(&(value.len() as u64).to_be_bytes());
     hasher.update(value);
 }
-
