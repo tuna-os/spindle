@@ -41,6 +41,7 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/v3/rooms/{room_id}/join",
     "/_matrix/client/v3/rooms/{room_id}/leave",
     "/_matrix/client/v3/join/{room_id_or_alias}",
+    "/_matrix/client/v3/sync",
     "/_matrix/client/v3/rooms/{room_id}/state",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}",
@@ -81,6 +82,7 @@ pub fn router(state: AppState) -> Router {
             "/_matrix/client/v3/join/{room_id_or_alias}",
             post(join_room_by_id_or_alias),
         )
+        .route("/_matrix/client/v3/sync", get(sync))
         .route("/_matrix/client/v3/rooms/{room_id}/state", get(room_state))
         // Two routes, because the spec has two forms and a router cannot
         // match an empty trailing segment: `/state/m.room.topic` means the
@@ -600,6 +602,82 @@ async fn leave_room(
     Ok(Json(json!({})))
 }
 
+#[derive(Debug, Deserialize)]
+struct SyncQuery {
+    since: Option<String>,
+    timeout: Option<u64>,
+    #[serde(rename = "timeline_limit")]
+    timeline_limit: Option<usize>,
+}
+
+/// `GET /_matrix/client/v3/sync`
+///
+/// The token is a position in the server-global stream (SPEC §10.2), because
+/// `/sync` is the one endpoint that needs an order *across* rooms and the
+/// linear index only orders within one.
+async fn sync(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Query(query): axum::extract::Query<SyncQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    let since = match query.since.as_deref() {
+        Some(token) => Some(
+            token
+                .parse::<crate::tokens::Sync>()
+                .map_err(|error| MatrixError::bad_json(error.to_string()))?
+                .0,
+        ),
+        None => None,
+    };
+    let timeline_limit = query.timeline_limit.unwrap_or(20).clamp(1, 100);
+
+    let mut result = state
+        .rooms
+        .sync(&identity.user_id, since, timeline_limit)
+        .map_err(room_error)?;
+
+    // Long-poll, but only for an incremental sync: an initial sync always has
+    // something to say, and blocking one would leave a first-time client
+    // staring at nothing for the whole timeout.
+    if let Some(since) = since {
+        let timeout = std::time::Duration::from_millis(query.timeout.unwrap_or(0).min(60_000));
+        if result.rooms.is_empty() && !timeout.is_zero() {
+            state.rooms.wait_for_event(timeout).await;
+            result = state
+                .rooms
+                .sync(&identity.user_id, Some(since), timeline_limit)
+                .map_err(room_error)?;
+        }
+    }
+
+    let mut join = serde_json::Map::new();
+    for room in result.rooms {
+        join.insert(
+            room.room_id,
+            json!({
+                "timeline": {
+                    "events": room.events,
+                    "limited": room.limited,
+                },
+                "state": { "events": room.state },
+            }),
+        );
+    }
+    let mut invite = serde_json::Map::new();
+    for room_id in result.invited {
+        // An invited user is not in the room, so there is no timeline to show
+        // them. `invite_state` is what a client renders the invite from; it is
+        // empty until stripped state lands, and empty is the honest answer
+        // rather than state they are not entitled to.
+        invite.insert(room_id, json!({ "invite_state": { "events": [] } }));
+    }
+
+    Ok(Json(json!({
+        "next_batch": crate::tokens::Sync(result.next_batch).to_string(),
+        "rooms": { "join": join, "invite": invite },
+    })))
+}
+
 /// `GET /_matrix/client/v3/rooms/{room_id}/state`
 async fn room_state(
     State(state): State<AppState>,
@@ -779,8 +857,9 @@ async fn room_messages(
     let from = match query.from.as_deref() {
         Some(token) => Some(
             token
-                .parse::<i64>()
-                .map_err(|_| MatrixError::bad_json("malformed pagination token"))?,
+                .parse::<crate::tokens::Pagination>()
+                .map_err(|error| MatrixError::bad_json(error.to_string()))?
+                .0,
         ),
         None => None,
     };
@@ -810,13 +889,21 @@ async fn room_messages(
 
     let mut body = serde_json::Map::new();
     body.insert("chunk".to_owned(), Value::Array(chunk));
+    // Where this chunk began. Without a `from` that is the room's head, which
+    // is one past the newest event -- not the literal string "end", which is
+    // what this sent before and which no client could page from.
+    let start =
+        from.unwrap_or_else(|| events.first().map_or(0, |event| event.li.saturating_add(1)));
     body.insert(
         "start".to_owned(),
-        json!(from.map_or_else(|| "end".to_owned(), |from| from.to_string())),
+        json!(crate::tokens::Pagination(start).to_string()),
     );
     // Absent when there is nothing more, which is how a client knows to stop.
     if let Some(next) = next {
-        body.insert("end".to_owned(), json!(next.to_string()));
+        body.insert(
+            "end".to_owned(),
+            json!(crate::tokens::Pagination(next).to_string()),
+        );
     }
     Ok(Json(Value::Object(body)))
 }

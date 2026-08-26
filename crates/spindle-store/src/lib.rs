@@ -324,6 +324,29 @@ impl<'a, S: Store> RoomStore<'a, S> {
         log: &RoomLog,
         durability: Durability,
     ) -> Result<(), StoreError> {
+        self.commit_entry_with(entry, log, &[], durability)
+    }
+
+    /// As [`Self::commit_entry`], with extra records in the *same* batch.
+    ///
+    /// The caller's records land if and only if the entry does. That matters
+    /// for anything derived from the entry existing -- the global stream index
+    /// above all: a stream id written after the commit is lost to a crash in
+    /// between, and the event becomes one `/sync` will never deliver, while a
+    /// stream id written before points at an entry that may never arrive.
+    /// Neither ordering is safe, so there is no ordering, only one batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the batch cannot be committed, or
+    /// [`StoreError::StateNotResident`] if the entry's state has been evicted.
+    pub fn commit_entry_with(
+        &self,
+        entry: &spindle_core::LogEntry,
+        log: &RoomLog,
+        extra: &[Record],
+        durability: Durability,
+    ) -> Result<(), StoreError> {
         // Only the nodes this entry actually created. Path copying means an
         // unchanged subtree keeps its content address, so the walk stops as
         // soon as it reaches something the previous state already held --
@@ -353,6 +376,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 node,
             ));
         }
+        writes.extend_from_slice(extra);
 
         self.store.commit(&writes, durability)
     }
