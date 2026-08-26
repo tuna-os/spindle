@@ -98,13 +98,23 @@ def summarise(samples: list[float]) -> dict:
     }
 
 
-def fill_room(client: Client, room_id: str, count: int, offset: int) -> None:
+def fill_room(client: Client, room_id: str, count: int, offset: int) -> str | None:
+    """Send `count` messages, returning the id of the first one sent.
+
+    The first event's id is what makes `context_deep` possible: it is a handle
+    on a point near the *start* of the room, which is where asking for state
+    costs a DAG server something and costs us a snapshot read.
+    """
+    first = None
     for index in range(count):
-        client.request(
+        body = client.request(
             "PUT",
             f"/_matrix/client/v3/rooms/{room_id}/send/m.room.message/fill{offset + index}",
             {"msgtype": "m.text", "body": f"filler {offset + index}"},
         )
+        if first is None:
+            first = body.get("event_id")
+    return first
 
 
 def measure(base: str, sizes: list[int], samples: int, warmup: int) -> dict:
@@ -121,9 +131,12 @@ def measure(base: str, sizes: list[int], samples: int, warmup: int) -> dict:
 
     room_id = alice.request("POST", "/_matrix/client/v3/createRoom", {})["room_id"]
     filled = 0
+    oldest = None
 
     for size in sorted(sizes):
-        fill_room(alice, room_id, size - filled, filled)
+        first = fill_room(alice, room_id, size - filled, filled)
+        if oldest is None:
+            oldest = first
         filled = size
 
         counter = {"n": 0}
@@ -147,11 +160,36 @@ def measure(base: str, sizes: list[int], samples: int, warmup: int) -> dict:
         def read_state() -> None:
             alice.request("GET", f"/_matrix/client/v3/rooms/{room_id}/state")
 
-        for name, operation in (
+        # State at a point *deep* in history, which is the operation SPEC 18.1
+        # is actually about.
+        #
+        # The rest of this sweep measures the head of the room, where every
+        # server is fast because the answer is the one it just computed.
+        # `/context` on the oldest event asks a different question: what was
+        # the state back there? A server that stores state as a DAG has to
+        # resolve or walk to answer it; a server that keeps a content-addressed
+        # snapshot per event reads one. If the design's central claim is true,
+        # this is the column where it shows.
+        #
+        # It is also the closest this driver can get to the claim. Fork depth
+        # is unreachable over the client-server API -- a single server
+        # linearizes everything it accepts, and forks arrive over federation --
+        # so history depth is the dimension that can actually be varied here.
+        def context_deep() -> None:
+            alice.request(
+                "GET",
+                f"/_matrix/client/v3/rooms/{room_id}/context/{oldest}?limit=10",
+            )
+
+        operations = [
             ("send", send),
             ("messages_page", paginate),
             ("state", read_state),
-        ):
+        ]
+        if oldest:
+            operations.append(("context_deep", context_deep))
+
+        for name, operation in operations:
             for _ in range(warmup):
                 operation()
             results[f"{name}/{size}"] = summarise(

@@ -85,6 +85,10 @@ pub const UNSTABLE_FEATURES: &[(&str, bool)] = &[
     // checks this flag before probing the unstable path is doing the right
     // thing.
     ("im.nheko.summary", true),
+    // MSC4222. Advertised because the flag is accepted under the unstable
+    // name as well as the stable one, and a client that checks here before
+    // sending it is doing the right thing.
+    ("org.matrix.msc4222.use_state_after", true),
 ];
 
 #[must_use]

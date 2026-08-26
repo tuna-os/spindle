@@ -36,7 +36,8 @@ stale on a runner change. Wall times do.
 | Durability cost: strict vs relaxed | Done (#47) |
 | Our fast path vs `ruma-state-res`, **correctness** | Done (#55), below |
 | Our fast path vs `ruma-state-res`, performance | Done, below — and the result is narrower than the spec implies |
-| `/messages`, `/sync`, join latency vs Synapse and Tuwunel | Needs a server; M1–M3 (#42) |
+| `/messages`, `/sync`, join latency vs **Synapse** | Done at M1, below (#42) |
+| The same vs **Tuwunel** | Not yet — no build in the sandbox (#42) |
 
 Everything here is **algorithmic**, measured inside the library. None of it is a
 server throughput figure and none of it should be quoted as one. Server-to-
@@ -59,6 +60,83 @@ cargo bench -p spindle-core --bench state_snapshot
 cargo bench -p spindle-core --bench fork_window
 cargo test -p spindle-store --release --test scale -- --ignored --nocapture
 ```
+
+## Client-server API vs Synapse, at M1
+
+Run with `scripts/compare-against.sh`, which owns both servers: it installs
+Synapse into a virtualenv, generates its config, runs the driver against it,
+then builds Spindle and runs the same driver against that — same host, same
+sitting, same `api-benchmark.py`. A number from one machine set against a
+number from another is not evidence, so the script does not offer the option.
+
+Synapse runs from a virtualenv rather than Docker deliberately. A Docker
+daemon is not available in the sandbox where most of this work happens, and a
+comparison that can be skipped for want of a daemon is a comparison that will
+be skipped.
+
+Spindle at M1 (`a883e0e` plus the leave section) against Synapse 1.159.0,
+mean of 25 samples after 5 warmups, milliseconds:
+
+| operation | spindle @1600 | synapse @1600 | ratio |
+|---|---|---|---|
+| join | 1.371 | 41.577 | **30.3× faster** |
+| send | 1.485 | 24.628 | **16.6× faster** |
+| messages_page | 1.088 | 5.411 | **5.0× faster** |
+| state | 0.803 | 2.692 | **3.4× faster** |
+| sync_initial | 1.722 | 3.302 | **1.9× faster** |
+| context_deep (at 3200) | 1.076 | 5.501 | **5.1× faster** |
+
+### What this establishes
+
+On a single-node local workload, Spindle is faster than Synapse on every
+operation the driver measures, at every room size measured. That is a real
+result, and it is worth roughly what it looks like to a user: joins and sends
+are the operations a client waits on most, and they are 17–30× quicker.
+
+It is very likely a **constant-factor** win rather than an asymptotic one.
+Synapse is Python with an ORM and Spindle is Rust reading a materialized
+snapshot; a 20× gap on `send` is the sort of number that difference produces on
+its own, with no help from the log being linear.
+
+### What it does not establish — and why this method never will
+
+SPEC §18.1's claims are about how cost *changes*: with room size, and with fork
+depth. This driver cannot test them, and after extending it to try, the reason
+turns out to be structural rather than a matter of turning the sizes up.
+
+`context_deep` was added specifically to probe it. It asks `/context` for the
+*oldest* event in the room, which is the sharpest question reachable over the
+client-server API: what was the state back there? A server that stores state as
+a DAG should have to resolve or walk to answer; a server keeping a
+content-addressed snapshot per event reads one.
+
+The result at 200 → 3200 events:
+
+| | growth | |
+|---|---|---|
+| `context_deep`, Spindle | 0.97× | flat |
+| `context_deep`, Synapse | 0.97× | **also flat** |
+
+Synapse is flat because **there is nothing for it to resolve.** State
+resolution runs when a room's history forks, and a single server linearizes
+everything it accepts — forks arrive over *federation*. Synapse's state groups
+make state-at-a-point a direct lookup in an unforked room, so on this workload
+it is doing the same asymptotic work we are, more slowly.
+
+That is a finding about the methodology, and it retires an assumption: **no
+amount of client-server benchmarking against a single peer can demonstrate the
+design's central claim**, because the workload that triggers the cost cannot be
+constructed through that API. Bigger rooms will not fix it. More samples will
+not fix it.
+
+The rig that can is the federated one — #16's class-D fork handling against a
+real Synapse, where forks exist because two servers accepted events
+concurrently. Until that exists, this table should be read as "faster in
+practice today", not as evidence for the architecture.
+
+Tuwunel is not in this table. It needs a build the sandbox does not have; the
+script is server-agnostic and takes a base URL, so adding it is a matter of
+getting a binary rather than of writing code.
 
 ## Fork window: bounded search vs exhaustive walk
 
