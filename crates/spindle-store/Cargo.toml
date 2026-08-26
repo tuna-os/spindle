@@ -1,0 +1,18 @@
+[package]
+name = "spindle-store"
+version = "0.1.0"
+description = "Durable ordered-key storage for the Spindle linear log"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+fjall.workspace = true
+spindle-core = { path = "../spindle-core" }
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

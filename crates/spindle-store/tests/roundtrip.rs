@@ -1,0 +1,210 @@
+//! Part of #6: what a reopen must reproduce, and what it must admit it cannot.
+
+use proptest::prelude::*;
+use spindle_core::{EventInput, RoomLog, StateKey, StateSnapshot};
+use spindle_store::{
+    FjallStore, RoomStore, Store, StoreError,
+    codec::{CodecError, EntryRecord, RECORD_VERSION, RoomRecord},
+};
+use tempfile::TempDir;
+
+const ROOM: &str = "!room:example.org";
+
+fn live_room() -> RoomLog {
+    let mut room = RoomLog::new();
+    room.append_local("$create", Some(StateKey::new("m.room.create", "")))
+        .unwrap();
+    room.append_local("$topic", Some(StateKey::new("m.room.topic", "")))
+        .unwrap();
+    room.append_local("$message", None).unwrap();
+    room
+}
+
+#[test]
+fn a_reopen_reproduces_head_extremities_counters_and_state() {
+    let dir = TempDir::new().unwrap();
+    let original = live_room();
+
+    {
+        let store = FjallStore::open(dir.path()).unwrap();
+        RoomStore::new(&store, ROOM).save(&original).unwrap();
+    }
+
+    // A genuinely separate open, not a reused handle.
+    let store = FjallStore::open(dir.path()).unwrap();
+    let restored = RoomStore::new(&store, ROOM).load().unwrap().unwrap();
+
+    assert!(
+        restored.unverified.is_empty(),
+        "live history must refold exactly; unverified: {:?}",
+        restored.unverified
+    );
+    assert_eq!(restored.log.len(), original.len());
+    assert_eq!(restored.log.next_forward(), original.next_forward());
+    assert_eq!(restored.log.next_backward(), original.next_backward());
+    assert_eq!(
+        restored.log.forward_extremities(),
+        original.forward_extremities()
+    );
+
+    // The state root is the real test: it proves the fold was reproduced, not
+    // merely that bytes survived.
+    let restored_head = restored.log.entries().next_back().unwrap();
+    let original_head = original.entries().next_back().unwrap();
+    assert_eq!(restored_head.event_id, original_head.event_id);
+    assert_eq!(
+        restored_head.state_after.root().as_bytes(),
+        original_head.state_after.root().as_bytes()
+    );
+
+    // And the state itself is queryable, not just hash-equal.
+    assert_eq!(
+        restored_head
+            .state_after
+            .get(&StateKey::new("m.room.topic", "")),
+        Some("$topic")
+    );
+}
+
+#[test]
+fn history_scans_back_in_log_order_after_a_reopen() {
+    let dir = TempDir::new().unwrap();
+    let mut room = live_room();
+    room.prepend_remote(EventInput::new("$older", vec![]), StateSnapshot::new(), 40)
+        .unwrap();
+
+    let store = FjallStore::open(dir.path()).unwrap();
+    RoomStore::new(&store, ROOM).save(&room).unwrap();
+    let restored = RoomStore::new(&store, ROOM).load().unwrap().unwrap();
+
+    let order: Vec<&str> = restored
+        .log
+        .entries()
+        .map(|entry| entry.event_id.as_str())
+        .collect();
+    // Backfilled history sorts first purely on key bytes -- nothing re-sorts.
+    assert_eq!(order, vec!["$older", "$create", "$topic", "$message"]);
+}
+
+#[test]
+fn backfilled_state_is_reported_unverified_rather_than_invented() {
+    let dir = TempDir::new().unwrap();
+    let mut room = live_room();
+
+    // Backfilled state comes from /state_ids (SPEC 6.5), not from parents this
+    // log holds, so a refold cannot reproduce it.
+    let supplied = StateSnapshot::new().apply(StateKey::new("m.room.name", ""), "$name");
+    room.prepend_remote(EventInput::new("$older", vec![]), supplied, 40)
+        .unwrap();
+
+    let store = FjallStore::open(dir.path()).unwrap();
+    RoomStore::new(&store, ROOM).save(&room).unwrap();
+    let restored = RoomStore::new(&store, ROOM).load().unwrap().unwrap();
+
+    assert_eq!(
+        restored.unverified.len(),
+        1,
+        "the backfilled entry must be flagged, not silently served"
+    );
+    assert_eq!(restored.unverified[0].get(), 0);
+    // Live history is still exact.
+    assert!(
+        restored
+            .log
+            .entries()
+            .filter(|entry| entry.li.get() > 0)
+            .all(|entry| !restored.unverified.contains(&entry.li))
+    );
+}
+
+#[test]
+fn an_unknown_room_is_distinguishable_from_an_empty_one() {
+    let dir = TempDir::new().unwrap();
+    let store = FjallStore::open(dir.path()).unwrap();
+    assert!(RoomStore::new(&store, ROOM).load().unwrap().is_none());
+
+    RoomStore::new(&store, ROOM).save(&RoomLog::new()).unwrap();
+    let empty = RoomStore::new(&store, ROOM).load().unwrap();
+    assert!(empty.is_some());
+    assert_eq!(empty.unwrap().log.len(), 0);
+}
+
+#[test]
+fn a_truncated_record_is_an_error_not_a_panic() {
+    let entry = EntryRecord {
+        li: 7,
+        event_id: "$abc".to_owned(),
+        prev_events: vec!["$def".to_owned()],
+        depth: 3,
+        state_key: Some(("m.room.topic".to_owned(), String::new())),
+        state_root: [9_u8; 32],
+    };
+    let encoded = entry.encode();
+    assert_eq!(EntryRecord::decode(&encoded).unwrap(), entry);
+
+    for cut in 0..encoded.len() {
+        match EntryRecord::decode(&encoded[..cut]) {
+            Err(CodecError::Truncated | CodecError::UnsupportedVersion(_)) => {}
+            other => panic!("truncating to {cut} bytes should not yield {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_record_from_another_schema_version_is_refused() {
+    let mut encoded = RoomRecord {
+        next_forward: 4,
+        next_backward: -2,
+        forward_extremities: vec!["$head".to_owned()],
+    }
+    .encode();
+    encoded[0] = RECORD_VERSION.wrapping_add(1);
+
+    assert!(matches!(
+        RoomRecord::decode(&encoded),
+        Err(CodecError::UnsupportedVersion(_))
+    ));
+}
+
+#[test]
+fn a_corrupt_stored_record_surfaces_as_a_store_error() {
+    let dir = TempDir::new().unwrap();
+    let store = FjallStore::open(dir.path()).unwrap();
+    RoomStore::new(&store, ROOM).save(&live_room()).unwrap();
+
+    // Overwrite one log record with rubbish, as a bad disk would.
+    let prefix = spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::Log, ROOM);
+    let (key, _) = store
+        .scan_prefix(&prefix)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    store.put(&key, b"not a record").unwrap();
+
+    assert!(matches!(
+        RoomStore::new(&store, ROOM).load(),
+        Err(StoreError::Codec(_))
+    ));
+}
+
+proptest! {
+    #[test]
+    fn entry_records_round_trip(
+        li: i64,
+        depth: u64,
+        event_id in "\\$[a-zA-Z0-9]{1,24}",
+        parents in prop::collection::vec("\\$[a-zA-Z0-9]{1,24}", 0..5),
+        slot in prop::option::of(("[a-z.]{1,20}", "[a-z:@.]{0,20}")),
+    ) {
+        let record = EntryRecord {
+            li,
+            event_id,
+            prev_events: parents,
+            depth,
+            state_key: slot,
+            state_root: [0_u8; 32],
+        };
+        prop_assert_eq!(EntryRecord::decode(&record.encode()).unwrap(), record);
+    }
+}
