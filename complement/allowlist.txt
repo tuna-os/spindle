@@ -1,0 +1,21 @@
+# Complement tests Spindle is expected to pass.
+#
+# A ratchet, not a wish list: a test named here must pass, and CI fails if it
+# stops passing. Adding a name before the feature exists inverts that -- it
+# turns the file into a list of aspirations that are always red, which everyone
+# then learns to ignore.
+#
+# It is empty, and that is the accurate state of things. #62 builds the server
+# shell: discovery answers, the container starts, the health check passes.
+# Nothing else exists yet, so no Complement test can pass. The image is here to
+# satisfy the *startup* contract and to make the next milestone's tests runnable
+# the day they can pass, not because anything passes today.
+#
+# Names are Go test names, one per line, as Complement reports them:
+#   TestLogin
+#   TestCreateRoom/parallel/Parallel
+#
+# What unblocks the first entries, in order:
+#   #11  registration and login          -> TestLogin, TestRegistration
+#   #7   rooms, state, timelines         -> TestCreateRoom, TestRoomState
+#   #10  sync                            -> TestSync*

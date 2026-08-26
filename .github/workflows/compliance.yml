@@ -27,12 +27,114 @@ jobs:
 
   complement-readiness:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+
       - name: Require Complement assets once the server crate lands
         shell: bash
         run: |
           if [[ -f crates/spindle-server/Cargo.toml ]]; then
             test -f complement/Dockerfile
             test -f complement/allowlist.txt
+            test -x complement/entrypoint.sh
           fi
+
+      # File existence is not the contract. Complement's startup contract is
+      # that the image builds, comes up from SERVER_NAME and a mounted CA, and
+      # answers /_matrix/client/versions -- so that is what is checked, rather
+      # than that somebody committed a Dockerfile.
+      - name: Build the Complement image
+        if: hashFiles('crates/spindle-server/Cargo.toml') != ''
+        run: docker build -f complement/Dockerfile -t complement-spindle:ci .
+
+      - name: Start it the way Complement does
+        if: hashFiles('crates/spindle-server/Cargo.toml') != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ca
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout ca/ca.key -out ca/ca.crt -subj "/CN=Complement CA"
+          docker run -d --name spindle-ci \
+            -e SERVER_NAME=hs1 \
+            -v "$PWD/ca:/complement/ca:ro" \
+            -p 18008:8008 \
+            complement-spindle:ci
+
+          # Wait on the image's own HEALTHCHECK, which is what Complement waits
+          # on. A container that never reports healthy is the failure mode this
+          # job exists to catch -- but "exited" and "probe failing" are different
+          # faults with different fixes, and reporting them as one sends whoever
+          # reads this looking in the wrong place.
+          for _ in $(seq 1 60); do
+            running=$(docker inspect -f '{{.State.Running}}' spindle-ci 2>/dev/null || echo false)
+            if [[ "$running" != true ]]; then
+              code=$(docker inspect -f '{{.State.ExitCode}}' spindle-ci 2>/dev/null || echo '?')
+              echo "::error::the container exited with code $code before becoming healthy"
+              docker logs spindle-ci || true
+              exit 1
+            fi
+            state=$(docker inspect -f '{{.State.Health.Status}}' spindle-ci 2>/dev/null || echo starting)
+            [[ "$state" == healthy ]] && break
+            sleep 2
+          done
+          docker logs spindle-ci
+          state=$(docker inspect -f '{{.State.Health.Status}}' spindle-ci)
+          if [[ "$state" != healthy ]]; then
+            echo "::error::container is running but the health check never passed ($state)"
+            docker inspect -f '{{json .State.Health}}' spindle-ci || true
+            exit 1
+          fi
+
+      - name: Check the endpoint Complement probes
+        if: hashFiles('crates/spindle-server/Cargo.toml') != ''
+        run: |
+          set -euo pipefail
+          curl -fsS http://localhost:18008/_matrix/client/versions | tee /dev/stderr | grep -q '"versions"'
+
+      # #11 requires a non-root runtime, and an image that quietly runs as root
+      # is the kind of thing nobody notices until it is deployed somewhere real.
+      #
+      # PID 1, not `id -u`: the image has no USER directive, because setup has
+      # to read Complement's 0600 CA key. `docker exec` would therefore report
+      # root and prove nothing. What matters is the process that stays up, which
+      # the entrypoint exec's into after dropping privileges.
+      - name: Check the server process does not run as root
+        if: hashFiles('crates/spindle-server/Cargo.toml') != ''
+        run: |
+          set -euo pipefail
+          uid=$(docker exec spindle-ci stat -c '%u' /proc/1)
+          comm=$(docker exec spindle-ci cat /proc/1/comm)
+          echo "pid 1 is '$comm' running as uid $uid"
+          test "$comm" = spindle
+          test "$uid" = "10001"
+
+      # Complement starts the image repeatedly from the same entrypoint, so a
+      # second run over existing storage has to work too.
+      - name: Check it restarts over its own storage
+        if: hashFiles('crates/spindle-server/Cargo.toml') != ''
+        run: |
+          set -euo pipefail
+          docker restart spindle-ci
+          for _ in $(seq 1 60); do
+            state=$(docker inspect -f '{{.State.Health.Status}}' spindle-ci 2>/dev/null || echo starting)
+            [[ "$state" == healthy ]] && break
+            sleep 2
+          done
+          docker logs --tail 20 spindle-ci
+          test "$(docker inspect -f '{{.State.Health.Status}}' spindle-ci)" = healthy
+
+      - name: Missing SERVER_NAME must fail loudly
+        if: hashFiles('crates/spindle-server/Cargo.toml') != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          if docker run --rm -v "$PWD/ca:/complement/ca:ro" complement-spindle:ci; then
+            echo "started without SERVER_NAME, which should be impossible"
+            exit 1
+          fi
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker logs spindle-ci || true
