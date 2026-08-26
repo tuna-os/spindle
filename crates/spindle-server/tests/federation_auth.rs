@@ -128,92 +128,164 @@ impl Event for ServerPdu {
     }
 }
 
+/// A server driven only through its public HTTP API.
+///
+/// Everything ruma judges below is produced this way rather than constructed
+/// in the test, so the path under test is the one a real client drives.
+struct Harness {
+    _dir: TempDir,
+    app: axum::Router,
+}
+
+impl Harness {
+    fn new() -> Self {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let config = spindle_server::Config::parse("[server]\nname = \"example.org\"\n").unwrap();
+        let app = spindle_server::app(config, store).expect("a signing key is established");
+        Self { _dir: dir, app }
+    }
+
+    async fn call(&self, request: Request<Body>) -> (StatusCode, Value) {
+        let response = self.app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    async fn register(&self, username: &str) -> String {
+        let (status, body) = self
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_matrix/client/v3/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "username": username,
+                            "password": "hunter2",
+                            "auth": { "type": "m.login.dummy" },
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["access_token"].as_str().unwrap().to_owned()
+    }
+
+    async fn post(&self, path: &str, token: &str, payload: &Value) -> Value {
+        let (status, body) = self
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        body
+    }
+
+    async fn put(&self, path: &str, token: &str, payload: &Value) {
+        let (status, body) = self
+            .call(
+                Request::builder()
+                    .method("PUT")
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    }
+
+    async fn get(&self, path: &str, token: &str) -> Value {
+        let (status, body) = self
+            .call(
+                Request::builder()
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        body
+    }
+}
+
 /// Drive the public API and return every event of the room it built, oldest
 /// first.
 async fn room_as_a_peer_would_see_it() -> Vec<ServerPdu> {
-    let dir = TempDir::new().unwrap();
-    let store = Arc::new(FjallStore::open(dir.path()).unwrap());
-    let config = spindle_server::Config::parse("[server]\nname = \"example.org\"\n").unwrap();
-    let app = spindle_server::app(config, store).expect("a signing key is established");
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
 
-    let call = |request: Request<Body>| {
-        let app = app.clone();
-        async move {
-            let response = app.oneshot(request).await.unwrap();
-            let status = response.status();
-            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-                .await
-                .unwrap();
-            (
-                status,
-                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
-            )
-        }
-    };
-
-    let (status, body) = call(
-        Request::builder()
-            .method("POST")
-            .uri("/_matrix/client/v3/register")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                json!({
-                    "username": "alice",
-                    "password": "hunter2",
-                    "auth": { "type": "m.login.dummy" },
-                })
-                .to_string(),
-            ))
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let token = body["access_token"].as_str().unwrap().to_owned();
-
-    let (status, body) = call(
-        Request::builder()
-            .method("POST")
-            .uri("/_matrix/client/v3/createRoom")
-            .header("authorization", format!("Bearer {token}"))
-            .header("content-type", "application/json")
-            .body(Body::from(
-                json!({ "name": "Federated", "topic": "A topic" }).to_string(),
-            ))
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let room_id = body["room_id"].as_str().unwrap().to_owned();
-
-    for index in 0..3 {
-        let (status, body) = call(
-            Request::builder()
-                .method("PUT")
-                .uri(format!(
-                    "/_matrix/client/v3/rooms/{room_id}/send/m.room.message/txn{index}"
-                ))
-                .header("authorization", format!("Bearer {token}"))
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({ "msgtype": "m.text", "body": format!("message {index}") }).to_string(),
-                ))
-                .unwrap(),
+    let created = harness
+        .post(
+            "/_matrix/client/v3/createRoom",
+            &alice,
+            &json!({ "name": "Federated", "topic": "A topic" }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
+    let room_id = created["room_id"].as_str().unwrap().to_owned();
+
+    for index in 0..3 {
+        harness
+            .put(
+                &format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/txn{index}"),
+                &alice,
+                &json!({ "msgtype": "m.text", "body": format!("message {index}") }),
+            )
+            .await;
     }
 
-    let (status, body) = call(
-        Request::builder()
-            .uri(format!(
-                "/_matrix/client/v3/rooms/{room_id}/messages?limit=100"
-            ))
-            .header("authorization", format!("Bearer {token}"))
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    // A second participant, so the fixture reaches the membership branches of
+    // the auth-event selection. Until `/invite` and `/join` existed those
+    // branches could only be unit-tested against our own reading of the rules;
+    // now ruma judges them like everything else, and it immediately caught one
+    // of them being wrong.
+    let invite = format!("/_matrix/client/v3/rooms/{room_id}/invite");
+    let bob_id = json!({ "user_id": "@bob:example.org" });
+    harness.post(&invite, &alice, &bob_id).await;
+    harness
+        .post(
+            &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+            &bob,
+            &json!({}),
+        )
+        .await;
+    harness
+        .post(
+            &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+            &bob,
+            &json!({}),
+        )
+        .await;
+    // Invited back. This is the only way, with the endpoints that exist, to
+    // produce a membership event whose target already *has* a membership --
+    // the case where the target's own member event must be cited. The first
+    // invite does not reach it, because bob had no membership to cite yet.
+    harness.post(&invite, &alice, &bob_id).await;
+
+    let body = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room_id}/messages?limit=100"),
+            &alice,
+        )
+        .await;
 
     // `/messages` is newest first; authorization runs in the order the events
     // were created, because each one is checked against the state its
@@ -225,7 +297,9 @@ async fn room_as_a_peer_would_see_it() -> Vec<ServerPdu> {
         .map(ServerPdu::parse)
         .collect();
     events.reverse();
-    assert!(events.len() >= 9, "expected the full room, got {events:?}");
+    // create, alice's join, power levels, join rules, name, topic, three
+    // messages, then bob invited, joined, left and invited again.
+    assert_eq!(events.len(), 13, "expected the full room, got {events:?}");
     events
 }
 

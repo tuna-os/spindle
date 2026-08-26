@@ -71,6 +71,8 @@ pub const FEDERATION_REQUIRES: &[&str] = &["/_matrix/key/v2/server"];
 pub const ROOM_VERSION_REQUIRES: &[&str] = &[
     "/_matrix/client/v3/createRoom",
     "/_matrix/client/v3/join/{room_id_or_alias}",
+    "/_matrix/client/v3/rooms/{room_id}/join",
+    "/_matrix/client/v3/rooms/{room_id}/leave",
 ];
 
 /// Unstable features. Same rule: nothing here that is not built.
