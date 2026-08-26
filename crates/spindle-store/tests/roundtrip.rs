@@ -87,7 +87,7 @@ fn history_scans_back_in_log_order_after_a_reopen() {
 }
 
 #[test]
-fn backfilled_state_is_reported_unverified_rather_than_invented() {
+fn backfilled_state_survives_a_reopen_now_that_the_trie_is_persisted() {
     let dir = TempDir::new().unwrap();
     let mut room = live_room();
 
@@ -101,19 +101,76 @@ fn backfilled_state_is_reported_unverified_rather_than_invented() {
     RoomStore::new(&store, ROOM).save(&room).unwrap();
     let restored = RoomStore::new(&store, ROOM).load().unwrap().unwrap();
 
-    assert_eq!(
-        restored.unverified.len(),
-        1,
-        "the backfilled entry must be flagged, not silently served"
-    );
-    assert_eq!(restored.unverified[0].get(), 0);
-    // Live history is still exact.
+    // Before the trie was persisted this could only be refolded, and a refold
+    // cannot reproduce it: the state came from /state_ids, not from parents
+    // this log holds. Loading the stored nodes restores it exactly.
     assert!(
-        restored
-            .log
+        restored.unverified.is_empty(),
+        "persisted state should restore exactly; unverified: {:?}",
+        restored.unverified
+    );
+    let backfilled = restored
+        .log
+        .entries()
+        .find(|entry| entry.li.get() == 0)
+        .unwrap();
+    assert_eq!(
+        backfilled
+            .state_after
+            .get(&StateKey::new("m.room.name", "")),
+        Some("$name"),
+        "the externally supplied state came back"
+    );
+}
+
+#[test]
+fn a_corrupted_state_node_is_detected_rather_than_served() {
+    let dir = TempDir::new().unwrap();
+    let store = FjallStore::open(dir.path()).unwrap();
+    RoomStore::new(&store, ROOM).save(&live_room()).unwrap();
+
+    // Flip a byte in a stored trie node. Content addressing exists precisely so
+    // this is caught; the alternative is serving state that silently is not
+    // what was written.
+    let prefix = [
+        spindle_core::keys::KEY_SCHEMA_VERSION,
+        spindle_core::keys::Keyspace::StateNode as u8,
+    ];
+    let (key, mut value) = store
+        .scan_prefix(&prefix)
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("state nodes were persisted");
+    let last = value.len() - 1;
+    value[last] ^= 0xff;
+    store.put(&key, &value).unwrap();
+
+    let restored = RoomStore::new(&store, ROOM).load().unwrap().unwrap();
+
+    // Rehydration rejects the tampered node on its hash, and the load falls
+    // back to refolding from the log -- which is the authoritative record. The
+    // state trie is derived data, so corrupting it costs time on the next open,
+    // not correctness.
+    assert!(
+        restored.unverified.is_empty(),
+        "a refold from the log should still reproduce the recorded roots"
+    );
+    let head = restored.log.entries().next_back().unwrap();
+    assert_eq!(
+        head.state_after.get(&StateKey::new("m.room.topic", "")),
+        Some("$topic"),
+        "the room's state survived a corrupted trie node"
+    );
+    assert_eq!(
+        head.state_after.root().as_bytes(),
+        live_room()
             .entries()
-            .filter(|entry| entry.li.get() > 0)
-            .all(|entry| !restored.unverified.contains(&entry.li))
+            .next_back()
+            .unwrap()
+            .state_after
+            .root()
+            .as_bytes(),
     );
 }
 

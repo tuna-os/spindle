@@ -12,8 +12,8 @@ use fjall::{
     Config, Keyspace as FjallKeyspace, PartitionCreateOptions, PartitionHandle, PersistMode,
 };
 use spindle_core::{
-    EventId, RestoreError, RestoredEntry, RestoredLog, RoomLog,
-    keys::{Keyspace, room_li, room_prefix},
+    EventId, RestoreError, RestoredEntry, RestoredLog, RoomLog, StateRoot,
+    keys::{Keyspace, content_addressed, room_li, room_prefix},
 };
 
 use crate::codec::{CodecError, EntryRecord, RoomRecord};
@@ -179,7 +179,17 @@ impl<'a, S: Store> RoomStore<'a, S> {
         log: &RoomLog,
         durability: Durability,
     ) -> Result<(), StoreError> {
-        let writes = [
+        // Only the nodes this entry actually created. Path copying means an
+        // unchanged subtree keeps its content address, so the walk stops as
+        // soon as it reaches something the previous state already held --
+        // O(log n) nodes per state change rather than O(state).
+        let previous = log
+            .entries()
+            .rev()
+            .find(|candidate| candidate.li < entry.li)
+            .map(|candidate| &candidate.state_after);
+
+        let mut writes = vec![
             (
                 room_li(Keyspace::Log, &self.room_id, entry.li),
                 EntryRecord::from_entry(entry).encode(),
@@ -189,6 +199,13 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 Self::meta(log).encode(),
             ),
         ];
+        for (address, node) in entry.state_after.delta_nodes(previous) {
+            writes.push((
+                content_addressed(Keyspace::StateNode, address.as_bytes()),
+                node,
+            ));
+        }
+
         self.store.commit(&writes, durability)
     }
 
@@ -213,37 +230,54 @@ impl<'a, S: Store> RoomStore<'a, S> {
     ///
     /// Returns [`StoreError`] if any write fails.
     pub fn save(&self, log: &RoomLog) -> Result<(), StoreError> {
+        let mut previous = None;
         for entry in log.entries() {
             let key = room_li(Keyspace::Log, &self.room_id, entry.li);
             self.store
                 .put(&key, &EntryRecord::from_entry(entry).encode())?;
+            // Persist the state trie here too, so both write paths restore
+            // identically. A seeding path that produced a differently
+            // restorable room would be a trap for whoever hit it first.
+            for (address, node) in entry.state_after.delta_nodes(previous) {
+                self.store.put(
+                    &content_addressed(Keyspace::StateNode, address.as_bytes()),
+                    &node,
+                )?;
+            }
+            previous = Some(&entry.state_after);
         }
-        let meta = RoomRecord {
-            next_forward: log.next_forward(),
-            next_backward: log.next_backward(),
-            forward_extremities: log
-                .forward_extremities()
-                .iter()
-                .map(|id| id.as_str().to_owned())
-                .collect(),
-        };
         self.store.put(
             &room_prefix(Keyspace::RoomMeta, &self.room_id),
-            &meta.encode(),
+            &Self::meta(log).encode(),
         )?;
         self.store.flush()
     }
 
-    /// Rebuild the log from storage.
+    /// Rebuild the log by refolding state from the log alone, ignoring the
+    /// stored state trie.
     ///
-    /// Returns `Ok(None)` when the room has no metadata, which is how an unknown
-    /// room is distinguished from an empty one.
+    /// The log is the authoritative record and the trie is derived from it, so
+    /// this is the recovery path when the trie is lost or unreadable — and the
+    /// baseline for judging whether persisting the trie earns its cost.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] on a backend failure, an unreadable record, or
-    /// records that cannot be replayed in order.
-    pub fn load(&self) -> Result<Option<RestoredLog>, StoreError> {
+    /// Returns [`StoreError`] on a backend failure or an unreadable record.
+    pub fn load_refolding(&self) -> Result<Option<RestoredLog>, StoreError> {
+        let Some((meta, entries)) = self.read_records()? else {
+            return Ok(None);
+        };
+        Ok(Some(RoomLog::restore(
+            entries,
+            meta.next_forward,
+            meta.next_backward,
+            meta.forward_extremities
+                .into_iter()
+                .map(|id| EventId::new(id.as_str())),
+        )?))
+    }
+
+    fn read_records(&self) -> Result<Option<(RoomRecord, Vec<RestoredEntry>)>, StoreError> {
         let Some(raw_meta) = self
             .store
             .get(&room_prefix(Keyspace::RoomMeta, &self.room_id))?
@@ -268,14 +302,38 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 expected_state_root: record.state_root,
             });
         }
+        Ok(Some((meta, entries)))
+    }
 
-        let restored = RoomLog::restore(
+    /// Rebuild the log from storage.
+    ///
+    /// Returns `Ok(None)` when the room has no metadata, which is how an unknown
+    /// room is distinguished from an empty one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] on a backend failure, an unreadable record, or
+    /// records that cannot be replayed in order.
+    pub fn load(&self) -> Result<Option<RestoredLog>, StoreError> {
+        let Some((meta, entries)) = self.read_records()? else {
+            return Ok(None);
+        };
+
+        let mut load_node = |address: &StateRoot| {
+            self.store
+                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
+                .ok()
+                .flatten()
+        };
+
+        let restored = RoomLog::restore_with_state(
             entries,
             meta.next_forward,
             meta.next_backward,
             meta.forward_extremities
                 .into_iter()
                 .map(|id| EventId::new(id.as_str())),
+            &mut load_node,
         )?;
         Ok(Some(restored))
     }

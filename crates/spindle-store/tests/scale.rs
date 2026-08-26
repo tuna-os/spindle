@@ -151,3 +151,60 @@ fn strict_durability_costs_an_fsync_per_commit() {
     // shared CI runner. The number is here to be read, not to gate.
     assert_eq!(strict.appended, 2_000);
 }
+
+#[test]
+#[ignore = "comparison measurement; run explicitly with --ignored --release"]
+fn persisting_the_state_trie_pays_off_only_when_there_is_state() {
+    // The honest question this answers: does storing the trie make a reopen
+    // faster? It depends entirely on how much *state* the room has, because a
+    // refold replays state events, not all events.
+    // Sizes are modest because RoomLog currently retains a full StateSnapshot
+    // per entry, so a state-heavy room holds every historical snapshot in
+    // memory at once. SPEC §6.4 says rooms should evict to a 32-byte root; that
+    // is not implemented yet, and a larger run here exhausts memory rather than
+    // measuring anything.
+    for (label, state_every) in [("messages-only", 0_usize), ("state-heavy", 1)] {
+        let dir = TempDir::new().unwrap();
+        let events = 8_000_usize;
+
+        {
+            let store = FjallStore::open(dir.path()).unwrap();
+            let room_store = RoomStore::new(&store, ROOM);
+            let mut log = RoomLog::new();
+            for number in 0..events {
+                let slot = if state_every > 0 && number % state_every == 0 {
+                    Some(spindle_core::StateKey::new(
+                        "m.room.member",
+                        format!("@user{number}:example.org"),
+                    ))
+                } else {
+                    None
+                };
+                let entry = log.append_local(format!("$event-{number}"), slot).unwrap();
+                let entry = entry.clone();
+                room_store
+                    .commit_entry(&entry, &log, Durability::Relaxed)
+                    .unwrap();
+            }
+        }
+
+        let store = FjallStore::open(dir.path()).unwrap();
+        let room_store = RoomStore::new(&store, ROOM);
+
+        let started = Instant::now();
+        let loaded = room_store.load().unwrap().unwrap();
+        let load_seconds = started.elapsed().as_secs_f64();
+
+        let started = Instant::now();
+        let refolded = room_store.load_refolding().unwrap().unwrap();
+        let refold_seconds = started.elapsed().as_secs_f64();
+
+        assert_eq!(loaded.log.len(), events);
+        assert_eq!(refolded.log.len(), events);
+        println!(
+            "trie/{label}: {events} events | load-from-trie {load_seconds:.3}s | \
+             refold {refold_seconds:.3}s | ratio {:.2}x",
+            refold_seconds / load_seconds.max(f64::MIN_POSITIVE)
+        );
+    }
+}

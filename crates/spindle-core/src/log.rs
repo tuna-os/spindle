@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::{StateKey, StateSnapshot};
+use crate::{StateKey, StateRoot, StateSnapshot};
 
 /// Matrix caps `prev_events` at 20 references per event.
 const MAX_PREV_EVENTS: usize = 20;
@@ -405,6 +405,9 @@ impl RoomLog {
     }
 }
 
+/// Loads a stored state-trie node by its content address.
+pub type NodeLoader<'a> = &'a mut dyn FnMut(&StateRoot) -> Option<Vec<u8>>;
+
 /// One entry read back from storage, ready to be replayed.
 #[derive(Clone, Debug)]
 pub struct RestoredEntry {
@@ -458,6 +461,50 @@ impl RoomLog {
         next_backward: i64,
         forward_extremities: impl IntoIterator<Item = EventId>,
     ) -> Result<RestoredLog, RestoreError> {
+        Self::rebuild(
+            entries,
+            next_forward,
+            next_backward,
+            forward_extremities,
+            None,
+        )
+    }
+
+    /// Rebuild a log, loading each entry's state from stored trie nodes rather
+    /// than refolding it.
+    ///
+    /// This is the path a server uses. Refolding is `O(room)` — the state of
+    /// the head is derived by replaying every state event before it — whereas
+    /// loading a persisted root is `O(log n)` in the size of the state. It also
+    /// restores backfilled ranges, whose state came from `/state_ids` and which
+    /// a refold cannot reproduce by construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RestoreError`] if the records are out of order or duplicated.
+    pub fn restore_with_state(
+        entries: impl IntoIterator<Item = RestoredEntry>,
+        next_forward: i64,
+        next_backward: i64,
+        forward_extremities: impl IntoIterator<Item = EventId>,
+        load_node: NodeLoader<'_>,
+    ) -> Result<RestoredLog, RestoreError> {
+        Self::rebuild(
+            entries,
+            next_forward,
+            next_backward,
+            forward_extremities,
+            Some(load_node),
+        )
+    }
+
+    fn rebuild(
+        entries: impl IntoIterator<Item = RestoredEntry>,
+        next_forward: i64,
+        next_backward: i64,
+        forward_extremities: impl IntoIterator<Item = EventId>,
+        mut load_node: Option<NodeLoader<'_>>,
+    ) -> Result<RestoredLog, RestoreError> {
         let mut log = Self {
             entries: BTreeMap::new(),
             positions: HashMap::new(),
@@ -483,23 +530,44 @@ impl RoomLog {
             }
             previous = Some(li);
 
+            // Refold first. It is O(1) per entry given the parent's state,
+            // which is already in hand from the previous iteration, whereas
+            // rebuilding an entry's trie from stored nodes is O(state) — doing
+            // that for every entry would make a reopen quadratic. The stored
+            // trie is the fallback for the entries a refold cannot reproduce,
+            // not the primary path.
             let parents: Vec<&LogEntry> = restored
                 .prev_events
                 .iter()
                 .filter_map(|parent| log.get(parent))
                 .collect();
-            let mut state_after = match merge_states(&parents) {
+            let mut folded = match merge_states(&parents) {
                 Ok(state) => state,
-                // A conflict here means the fold cannot be reproduced; record
-                // it rather than refusing to open the room.
+                // A conflict means the fold cannot be reproduced; fall through
+                // to the stored trie rather than refusing to open the room.
                 Err(_) => StateSnapshot::new(),
             };
             if let Some(state_key) = restored.state_key.clone() {
-                state_after = state_after.apply(state_key, restored.event_id.as_str());
+                folded = folded.apply(state_key, restored.event_id.as_str());
             }
-            if *state_after.root().as_bytes() != restored.expected_state_root {
-                unverified.push(restored.li);
-            }
+
+            let state_after = if *folded.root().as_bytes() == restored.expected_state_root {
+                folded
+            } else {
+                // Backfilled ranges land here: their state came from
+                // `/state_ids`, not from parents this log holds, so only the
+                // stored trie can supply it.
+                let stored = StateRoot::from_bytes(restored.expected_state_root);
+                if let Some(state) = load_node
+                    .as_mut()
+                    .and_then(|load| StateSnapshot::rehydrate(stored, load).ok())
+                {
+                    state
+                } else {
+                    unverified.push(restored.li);
+                    folded
+                }
+            };
 
             let entry = LogEntry {
                 li: restored.li,
