@@ -123,7 +123,11 @@ fn append(log: &mut RoomLog, parent: Option<&str>, key: &StateKey, event_id: &st
 fn compare(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("fork resolution");
 
-    for per_side in [1_usize, 4, 16, 64] {
+    // Up to 256 a side, so the window is 512 -- SPEC §9.1's `max_fork_window`.
+    // #34 asks for the deep case precisely because it is where the advantage
+    // should shrink, and a benchmark that stops before its unfavourable end is
+    // not evidence.
+    for per_side in [1_usize, 4, 16, 64, 256] {
         let fork = build(per_side);
         // Hoisted: a homeserver stores auth chains rather than rebuilding them
         // per resolution, so charging the reference resolver for that walk on

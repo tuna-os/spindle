@@ -159,15 +159,22 @@ in the case Spindle claims to handle without state resolution.
 
 | Divergent events per side | `ruma-state-res` | Spindle window merge | Ratio |
 |---|---|---|---|
-| 1 | 25.5 µs | **11.4 µs** | 2.24× |
-| 4 | 84.7 µs | **26.9 µs** | 3.15× |
-| 16 | 335 µs | **116 µs** | 2.88× |
-| 64 | 1.30 ms | **574 µs** | 2.27× |
+| 1 | 26.7 µs | **11.9 µs** | 2.25× |
+| 4 | 91.1 µs | **29.4 µs** | 3.10× |
+| 16 | 347 µs | **121 µs** | 2.87× |
+| 64 | 1.43 ms | **604 µs** | 2.37× |
+| 256 (a full `max_fork_window`) | 6.34 ms | **2.67 ms** | 2.37× |
 
 We are consistently faster, by between two and three times. **Both sides scale
 linearly in the size of the fork, and per-event cost is flat for both** — about
-10 µs per event for `resolve()`, about 4.5 µs for ours. That is the result, and
-it is not the one SPEC §18.1's complexity table leads a reader to expect.
+11 µs per event for `resolve()`, about 5 µs for ours. That is the result, and it
+is not the one SPEC §18.1's complexity table leads a reader to expect.
+
+#34 asks specifically for the deep case, on the grounds that it is where the
+advantage should shrink. It does not: 256 events a side fills SPEC §9.1's
+512-event `max_fork_window` entirely, and the ratio there is the same 2.4× as at
+64. Whatever the advantage is, it is not something that erodes as the fork
+grows — but it is also not something that grows.
 
 Three things this does not show, each of which matters more than the ratio:
 
