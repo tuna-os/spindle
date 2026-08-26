@@ -1,0 +1,38 @@
+name: Matrix compliance
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  protocol-fixtures:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Matrix protocol compliance fixtures
+        run: cargo test --test matrix_compliance
+
+  complement-readiness:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Require Complement assets once the server crate lands
+        shell: bash
+        run: |
+          if [[ -f crates/spindle-server/Cargo.toml ]]; then
+            test -f complement/Dockerfile
+            test -f complement/allowlist.txt
+          fi
