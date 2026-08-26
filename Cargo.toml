@@ -9,6 +9,7 @@ repository = "https://github.com/hanthor/spindle"
 
 [workspace.dependencies]
 blake3 = "1.8"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 fjall = "2.11.2"
 proptest = "1.7"
 ruma = { version = "0.16", features = ["signatures"] }

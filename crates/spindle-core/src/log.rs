@@ -5,6 +5,10 @@ use crate::{StateKey, StateRoot, StateSnapshot};
 /// Matrix caps `prev_events` at 20 references per event.
 const MAX_PREV_EVENTS: usize = 20;
 
+/// One bit per tip tracks which tips reach a node, so the tip set must fit a
+/// `u64`. Matrix caps `prev_events` at 20, so a real fork is far below this.
+const MAX_TIPS: usize = u64::BITS as usize;
+
 /// A Matrix event ID, treated as an opaque value.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct EventId(Box<str>);
@@ -100,6 +104,10 @@ pub struct LogEntry {
 pub struct ForkWindow {
     pub nearest_common_ancestor: EventId,
     pub events: Vec<EventId>,
+    /// Entries the search touched. Proportional to the window, not to room
+    /// history — assert on this to catch a regression back to a full scan, and
+    /// report it as the fork-cost metric.
+    pub visited: usize,
 }
 
 /// A per-room log in linear-index order, plus the minimal DAG overlay
@@ -180,13 +188,26 @@ impl RoomLog {
     /// Find the bounded divergent ancestry behind a set of event tips.
     ///
     /// This walks signed `prev_events`; linear-index proximity is never used to
-    /// decide ancestry. The index is used only to return a deterministic,
-    /// topological order and to break ties between common ancestors.
+    /// decide ancestry. The index supplies only the order the walk runs in.
+    ///
+    /// The search is bounded by the fork, not by room history. Every event's
+    /// `li` is strictly greater than each of its parents' — appends allocate
+    /// above everything held and backfill below it — so descending `li` is a
+    /// valid reverse-topological order. Visiting in that order means a node's
+    /// set of reaching tips is final when it is popped, so the walk can stop
+    /// the moment every frontier entry is reachable from every tip: everything
+    /// below that is common ancestry by definition and cannot affect the
+    /// answer.
+    ///
+    /// Work is therefore `O(window x MAX_PREV_EVENTS)`. Each entry visited is
+    /// either divergent, and so charged against `max_events`, or one of the
+    /// bounded frontier that ends the walk.
     ///
     /// # Errors
     ///
-    /// Returns [`ForkWindowError`] for an empty tip set, an unknown tip, a DAG
-    /// without common history, or a divergent window larger than `max_events`.
+    /// Returns [`ForkWindowError`] for an empty or oversized tip set, an
+    /// unknown tip, a DAG without common history, or a divergent window larger
+    /// than `max_events`.
     pub fn fork_window(
         &self,
         tips: &[EventId],
@@ -195,38 +216,80 @@ impl RoomLog {
         if tips.is_empty() {
             return Err(ForkWindowError::EmptyTips);
         }
+        if tips.len() > MAX_TIPS {
+            return Err(ForkWindowError::TooManyTips(tips.len()));
+        }
 
-        let mut ancestries = Vec::with_capacity(tips.len());
-        for tip in tips {
+        // One bit per tip; a node reachable from all of them is common ancestry.
+        let full = if tips.len() == u64::BITS as usize {
+            u64::MAX
+        } else {
+            (1_u64 << tips.len()) - 1
+        };
+
+        let mut reached: HashMap<i64, u64> = HashMap::new();
+        let mut frontier: BTreeSet<i64> = BTreeSet::new();
+        for (index, tip) in tips.iter().enumerate() {
             let Some(li) = self.positions.get(tip) else {
                 return Err(ForkWindowError::UnknownTip(tip.clone()));
             };
-            ancestries.push(self.ancestor_positions(*li));
+            *reached.entry(*li).or_default() |= 1_u64 << index;
+            frontier.insert(*li);
         }
 
-        let mut common = ancestries[0].clone();
-        for ancestry in &ancestries[1..] {
-            common.retain(|position| ancestry.contains(position));
+        let mut divergent: BTreeSet<i64> = BTreeSet::new();
+        let mut visited = 0_usize;
+
+        // Reach is propagated all the way down, including through entries
+        // already known common: an entry can also be reachable by a longer path
+        // that has not been walked yet, and truncating there would leave its
+        // reach understated and mis-report it as divergent.
+        //
+        // Popping by descending `li` is a reverse-topological order, so an
+        // entry's reach is final when it is popped, and the first entry popped
+        // that every tip reaches has the greatest `li` of any such entry — the
+        // nearest common ancestor.
+        let mut nearest: Option<i64> = None;
+
+        while let Some(li) = frontier.iter().next_back().copied() {
+            // Once every frontier entry is reachable from every tip, all
+            // remaining history is common ancestry and cannot affect the
+            // answer. This is what keeps an ordinary tip fork from walking the
+            // room: it fires one pop after the fork closes.
+            if frontier.iter().all(|entry| reached[entry] == full) {
+                nearest = nearest.or(Some(li));
+                break;
+            }
+
+            frontier.remove(&li);
+            visited += 1;
+
+            let mask = reached[&li];
+            if mask == full {
+                nearest = nearest.or(Some(li));
+            } else {
+                divergent.insert(li);
+                if divergent.len() > max_events {
+                    return Err(ForkWindowError::TooLarge {
+                        limit: max_events,
+                        event_count: divergent.len(),
+                    });
+                }
+            }
+
+            // A backfill frontier names parents older than anything we hold.
+            // Those are outside our history, not a corrupt index.
+            for parent in &self.entries[&li].prev_events {
+                if let Some(parent_li) = self.positions.get(parent).copied() {
+                    *reached.entry(parent_li).or_default() |= mask;
+                    frontier.insert(parent_li);
+                }
+            }
         }
-        let Some(nearest) = common
-            .iter()
-            .copied()
-            .max_by_key(|li| (self.entries[li].depth, *li))
-        else {
+
+        let Some(nearest) = nearest else {
             return Err(ForkWindowError::NoCommonAncestor);
         };
-
-        let divergent: BTreeSet<i64> = ancestries
-            .into_iter()
-            .flatten()
-            .filter(|li| !common.contains(li))
-            .collect();
-        if divergent.len() > max_events {
-            return Err(ForkWindowError::TooLarge {
-                limit: max_events,
-                event_count: divergent.len(),
-            });
-        }
 
         Ok(ForkWindow {
             nearest_common_ancestor: self.entries[&nearest].event_id.clone(),
@@ -234,6 +297,7 @@ impl RoomLog {
                 .into_iter()
                 .map(|li| self.entries[&li].event_id.clone())
                 .collect(),
+            visited,
         })
     }
 
@@ -383,25 +447,6 @@ impl RoomLog {
         // construction, behind everything we already hold.
         self.positions.insert(entry.event_id.clone(), li);
         Ok(self.entries.entry(li).or_insert(entry))
-    }
-
-    fn ancestor_positions(&self, tip: i64) -> BTreeSet<i64> {
-        let mut ancestors = BTreeSet::new();
-        let mut pending = vec![tip];
-        while let Some(li) = pending.pop() {
-            if !ancestors.insert(li) {
-                continue;
-            }
-            // A backfilled event may name parents older than anything we hold.
-            // Those are outside our history, not a corrupt index.
-            pending.extend(
-                self.entries[&li]
-                    .prev_events
-                    .iter()
-                    .filter_map(|parent| self.positions.get(parent).copied()),
-            );
-        }
-        ancestors
     }
 }
 
@@ -642,7 +687,12 @@ pub enum AppendError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ForkWindowError {
     EmptyTips,
+    /// More tips than the reachability bitmap can track.
+    TooManyTips(usize),
     UnknownTip(EventId),
     NoCommonAncestor,
-    TooLarge { limit: usize, event_count: usize },
+    TooLarge {
+        limit: usize,
+        event_count: usize,
+    },
 }
