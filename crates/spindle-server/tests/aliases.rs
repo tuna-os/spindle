@@ -421,8 +421,18 @@ async fn a_rooms_aliases_are_listed_to_members_only() {
     let room = harness.create_room(&alice).await;
     let other = harness.create_room(&alice).await;
 
-    // Claimed out of alphabetical order, to prove the listing sorts.
-    for alias in ["#zebra:example.org", "#lobby:example.org"] {
+    // Three aliases, whose lengths and bytes are picked so that the scan
+    // order, the sorted order, and the *reverse* of the scan order are three
+    // different lists.
+    //
+    // Alias keys are length-prefixed, so a prefix scan orders by length first:
+    // `#zz` (15), `#aaa` (16), `#bbb` (16). Sorted, that is `#aaa`, `#bbb`,
+    // `#zz`. Two aliases were not enough -- with two, reversing the scan gave
+    // the sorted list by coincidence and a `reverse()`-for-`sort()` mutant
+    // survived. Same shape as the relation index's length-prefix trap, and the
+    // same shape as the typing roster's, which needed eight names for the same
+    // reason.
+    for alias in ["#zz:example.org", "#aaa:example.org", "#bbb:example.org"] {
         let (status, body) = harness.claim(alias, &room, &alice).await;
         assert_eq!(status, StatusCode::OK, "{alias}: {body}");
     }
@@ -439,7 +449,7 @@ async fn a_rooms_aliases_are_listed_to_members_only() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["aliases"],
-        json!(["#lobby:example.org", "#zebra:example.org"]),
+        json!(["#aaa:example.org", "#bbb:example.org", "#zz:example.org"]),
         "sorted, and not carrying the other room's alias"
     );
 
