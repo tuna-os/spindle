@@ -289,3 +289,81 @@ async fn accounts_survive_a_restart() {
     assert_eq!(status, StatusCode::OK, "the session did not survive: {who}");
     assert_eq!(who["user_id"], "@alice:example.org");
 }
+
+/// #11's exit criterion in full: discover, register, log in, **refresh**, log out.
+#[tokio::test]
+async fn a_client_can_refresh_its_access_token() {
+    let harness = Harness::new();
+
+    let (status, body) = harness
+        .post(
+            "/_matrix/client/v3/register",
+            &json!({
+                "username": "alice",
+                "password": "hunter2",
+                "refresh_token": true,
+                "auth": { "type": "m.login.dummy" },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let refresh = body["refresh_token"]
+        .as_str()
+        .expect("asked for refresh")
+        .to_owned();
+    assert!(
+        body["expires_in_ms"].is_number(),
+        "a refreshing session must say when to renew: {body}"
+    );
+
+    let (status, refreshed) = harness
+        .post(
+            "/_matrix/client/v3/refresh",
+            &json!({ "refresh_token": refresh }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{refreshed}");
+    let new_access = refreshed["access_token"].as_str().unwrap();
+    assert_ne!(new_access, body["access_token"].as_str().unwrap());
+
+    // The new access token is live and names the same user and device.
+    let (status, who) = harness
+        .get_auth("/_matrix/client/v3/account/whoami", new_access)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(who["user_id"], "@alice:example.org");
+    assert_eq!(who["device_id"], body["device_id"]);
+
+    // Replaying the spent refresh token fails, with the code a client acts on.
+    let (status, replayed) = harness
+        .post(
+            "/_matrix/client/v3/refresh",
+            &json!({ "refresh_token": refresh }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(replayed["errcode"], "M_UNKNOWN_TOKEN");
+}
+
+/// A client that did not ask for refresh gets neither key, rather than nulls:
+/// clients check for the key's presence to decide whether to schedule renewal.
+#[tokio::test]
+async fn a_non_refreshing_login_omits_the_refresh_keys_entirely() {
+    let harness = Harness::new();
+    harness.register("alice", "hunter2").await;
+
+    let (status, body) = harness
+        .post(
+            "/_matrix/client/v3/login",
+            &json!({
+                "type": "m.login.password",
+                "identifier": { "type": "m.id.user", "user": "alice" },
+                "password": "hunter2",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let object = body.as_object().unwrap();
+    assert!(!object.contains_key("refresh_token"), "{body}");
+    assert!(!object.contains_key("expires_in_ms"), "{body}");
+}

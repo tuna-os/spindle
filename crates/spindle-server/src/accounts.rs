@@ -52,6 +52,30 @@ pub struct TokenRecord {
     pub device_id: String,
 }
 
+/// A session's credentials, as handed to the client.
+///
+/// The tokens exist in clear exactly once, here. What the store holds is their
+/// hashes.
+#[derive(Clone, Debug)]
+pub struct Session {
+    pub access_token: String,
+    /// Absent unless the client asked: handing a refresh token to a client that
+    /// does not implement refresh creates a long-lived credential nobody will
+    /// ever rotate or revoke.
+    pub refresh_token: Option<String>,
+    pub device: Device,
+    /// How long the access token is good for, when refresh is in use.
+    pub expires_in_ms: Option<u64>,
+}
+
+/// How long an access token lives when the client is refreshing.
+///
+/// Only meaningful with a refresh token. Expiring a token the client cannot
+/// renew would log them out for no reason, so a non-refreshing session gets one
+/// that does not expire -- which is why `expires_in_ms` is absent there rather
+/// than merely large.
+const ACCESS_TOKEN_LIFETIME_MS: u64 = 60 * 60 * 1000;
+
 /// The identity behind an authenticated request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Identity {
@@ -148,7 +172,8 @@ impl<'a, S: Store> Accounts<'a, S> {
         localpart: &str,
         device_id: Option<String>,
         display_name: Option<String>,
-    ) -> Result<(String, Device), AccountError> {
+        with_refresh: bool,
+    ) -> Result<Session, AccountError> {
         let device_id = device_id.unwrap_or_else(|| random_id("DEV"));
         let device = Device {
             localpart: localpart.to_owned(),
@@ -158,13 +183,77 @@ impl<'a, S: Store> Accounts<'a, S> {
         self.store
             .put(&device_key(localpart, &device_id), &encode(&device)?)?;
 
-        let token = random_token();
         let record = TokenRecord {
             localpart: localpart.to_owned(),
             device_id,
         };
-        self.store.put(&token_key(&token), &encode(&record)?)?;
-        Ok((token, device))
+        let access_token = random_token("syt");
+        self.store.put(
+            &token_key(Keyspace::AccessToken, &access_token),
+            &encode(&record)?,
+        )?;
+
+        let refresh_token = if with_refresh {
+            let refresh = random_token("syr");
+            self.store.put(
+                &token_key(Keyspace::RefreshToken, &refresh),
+                &encode(&record)?,
+            )?;
+            Some(refresh)
+        } else {
+            None
+        };
+
+        Ok(Session {
+            access_token,
+            expires_in_ms: refresh_token.as_ref().map(|_| ACCESS_TOKEN_LIFETIME_MS),
+            refresh_token,
+            device,
+        })
+    }
+
+    /// Exchange a refresh token for a fresh pair.
+    ///
+    /// The presented refresh token is consumed. Rotation is the point: a
+    /// refresh token is long-lived by design, so one that stayed valid after
+    /// use would let anyone who ever saw it -- a proxy log, a stale backup, a
+    /// device that was later wiped -- mint access tokens indefinitely.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountError::UnknownToken`] if the token is not live, or a
+    /// storage error.
+    pub fn refresh(&self, refresh_token: &str) -> Result<Session, AccountError> {
+        let key = token_key(Keyspace::RefreshToken, refresh_token);
+        let raw = self.store.get(&key)?.ok_or(AccountError::UnknownToken)?;
+        let record: TokenRecord = decode(&raw)?;
+
+        // Consumed before the replacements are issued. Reversed, a process that
+        // died between the two writes would leave the old token live alongside
+        // a new one.
+        self.store.delete(&key)?;
+
+        let access_token = random_token("syt");
+        self.store.put(
+            &token_key(Keyspace::AccessToken, &access_token),
+            &encode(&record)?,
+        )?;
+        let replacement = random_token("syr");
+        self.store.put(
+            &token_key(Keyspace::RefreshToken, &replacement),
+            &encode(&record)?,
+        )?;
+
+        Ok(Session {
+            access_token,
+            refresh_token: Some(replacement),
+            expires_in_ms: Some(ACCESS_TOKEN_LIFETIME_MS),
+            device: Device {
+                localpart: record.localpart,
+                device_id: record.device_id,
+                display_name: None,
+            },
+        })
     }
 
     /// Resolve a bearer token to an identity.
@@ -173,7 +262,7 @@ impl<'a, S: Store> Accounts<'a, S> {
     ///
     /// Returns a storage or decoding error.
     pub fn identify(&self, token: &str) -> Result<Option<Identity>, AccountError> {
-        match self.store.get(&token_key(token))? {
+        match self.store.get(&token_key(Keyspace::AccessToken, token))? {
             Some(raw) => {
                 let record: TokenRecord = decode(&raw)?;
                 Ok(Some(Identity {
@@ -191,7 +280,8 @@ impl<'a, S: Store> Accounts<'a, S> {
     ///
     /// Returns a storage error.
     pub fn logout(&self, token: &str) -> Result<(), AccountError> {
-        self.store.delete(&token_key(token))?;
+        self.store
+            .delete(&token_key(Keyspace::AccessToken, token))?;
         Ok(())
     }
 }
@@ -212,20 +302,22 @@ fn device_key(localpart: &str, device_id: &str) -> Vec<u8> {
 }
 
 /// Tokens are keyed by their hash, so the store never holds a usable one.
-fn token_key(token: &str) -> Vec<u8> {
+///
+/// Access and refresh tokens live in separate keyspaces, so one cannot be
+/// presented as the other. Sharing a keyspace would make them interchangeable,
+/// which quietly turns the long-lived credential into a bearer token for the
+/// whole API.
+fn token_key(keyspace: Keyspace, token: &str) -> Vec<u8> {
     let digest = blake3::hash(token.as_bytes());
-    let mut key = vec![
-        spindle_core::keys::KEY_SCHEMA_VERSION,
-        Keyspace::AccessToken as u8,
-    ];
+    let mut key = vec![spindle_core::keys::KEY_SCHEMA_VERSION, keyspace as u8];
     key.extend_from_slice(digest.as_bytes());
     key
 }
 
-fn random_token() -> String {
+fn random_token(prefix: &str) -> String {
     let mut bytes = [0_u8; TOKEN_BYTES];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
-    format!("syt_{}", hex(&bytes))
+    format!("{prefix}_{}", hex(&bytes))
 }
 
 fn random_id(prefix: &str) -> String {
@@ -267,6 +359,8 @@ fn validate_localpart(localpart: &str) -> Result<(), AccountError> {
 #[derive(Debug)]
 pub enum AccountError {
     UserInUse,
+    /// A presented token is not live.
+    UnknownToken,
     InvalidUsername,
     Storage(StoreError),
     Codec(String),
@@ -283,6 +377,7 @@ impl std::fmt::Display for AccountError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UserInUse => write!(formatter, "that username is taken"),
+            Self::UnknownToken => write!(formatter, "that token is not valid"),
             Self::InvalidUsername => write!(formatter, "that username is not valid"),
             Self::Storage(error) => write!(formatter, "storage: {error}"),
             Self::Codec(message) => write!(formatter, "unreadable record: {message}"),

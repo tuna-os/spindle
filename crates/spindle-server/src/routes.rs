@@ -27,6 +27,7 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/v3/register",
     "/_matrix/client/v3/login",
     "/_matrix/client/v3/logout",
+    "/_matrix/client/v3/refresh",
     "/_matrix/client/v3/account/whoami",
     "/.well-known/matrix/client",
     "/.well-known/matrix/server",
@@ -41,6 +42,7 @@ pub fn router(state: AppState) -> Router {
         .route("/_matrix/client/v3/register", post(register))
         .route("/_matrix/client/v3/login", get(login_flows).post(login))
         .route("/_matrix/client/v3/logout", post(logout))
+        .route("/_matrix/client/v3/refresh", post(refresh))
         .route("/_matrix/client/v3/account/whoami", get(whoami))
         .route("/.well-known/matrix/client", get(well_known_client))
         .route("/.well-known/matrix/server", get(well_known_server))
@@ -130,6 +132,13 @@ struct LoginRequest {
     password: Option<String>,
     device_id: Option<String>,
     initial_device_display_name: Option<String>,
+    #[serde(default)]
+    refresh_token: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefreshRequest {
+    refresh_token: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -140,7 +149,28 @@ struct RegisterRequest {
     initial_device_display_name: Option<String>,
     #[serde(default)]
     inhibit_login: bool,
+    #[serde(default)]
+    refresh_token: bool,
     auth: Option<Value>,
+}
+
+/// The login/register/refresh response body.
+///
+/// `refresh_token` and `expires_in_ms` are omitted when the client did not ask
+/// for refresh, rather than sent null: a client checks for the key's presence
+/// to decide whether to schedule a renewal.
+fn session_body(user_id: &str, session: &crate::accounts::Session) -> Value {
+    let mut body = serde_json::Map::new();
+    body.insert("user_id".to_owned(), json!(user_id));
+    body.insert("access_token".to_owned(), json!(session.access_token));
+    body.insert("device_id".to_owned(), json!(session.device.device_id));
+    if let Some(refresh) = &session.refresh_token {
+        body.insert("refresh_token".to_owned(), json!(refresh));
+    }
+    if let Some(expires) = session.expires_in_ms {
+        body.insert("expires_in_ms".to_owned(), json!(expires));
+    }
+    Value::Object(body)
 }
 
 /// `GET /_matrix/client/v3/login`
@@ -185,19 +215,36 @@ async fn login(
         return Err(MatrixError::forbidden("invalid username or password"));
     }
 
-    let (token, device) = accounts
+    let session = accounts
         .create_session(
             &localpart,
             request.device_id,
             request.initial_device_display_name,
+            request.refresh_token,
         )
         .map_err(|error| internal(&error))?;
 
-    Ok(Json(json!({
-        "user_id": accounts.user_id(&localpart),
-        "access_token": token,
-        "device_id": device.device_id,
-    })))
+    Ok(Json(session_body(&accounts.user_id(&localpart), &session)))
+}
+
+/// `POST /_matrix/client/v3/refresh`
+///
+/// Unauthenticated by design: the refresh token *is* the credential, and a
+/// client refreshing precisely because its access token expired has nothing
+/// else to present.
+async fn refresh(
+    State(state): State<AppState>,
+    Json(request): Json<RefreshRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let session = accounts
+        .refresh(&request.refresh_token)
+        .map_err(|error| match error {
+            AccountError::UnknownToken => MatrixError::unknown_token(),
+            other => internal(&other),
+        })?;
+    let user_id = accounts.user_id(&session.device.localpart);
+    Ok(Json(session_body(&user_id, &session)))
 }
 
 /// `POST /_matrix/client/v3/register`
@@ -246,18 +293,15 @@ async fn register(
         return Ok(Json(json!({ "user_id": user_id })));
     }
 
-    let (token, device) = accounts
+    let session = accounts
         .create_session(
             username,
             request.device_id,
             request.initial_device_display_name,
+            request.refresh_token,
         )
         .map_err(|error| internal(&error))?;
-    Ok(Json(json!({
-        "user_id": user_id,
-        "access_token": token,
-        "device_id": device.device_id,
-    })))
+    Ok(Json(session_body(&user_id, &session)))
 }
 
 /// `POST /_matrix/client/v3/logout`
