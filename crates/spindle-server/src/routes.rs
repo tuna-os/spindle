@@ -13,9 +13,13 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use axum::extract::ConnectInfo;
+use std::net::SocketAddr;
+
 use crate::accounts::{AccountError, Accounts};
 use crate::auth::Authenticated;
 use crate::errors::MatrixError;
+use crate::ratelimit::{FAILED_LOGIN_PER_ACCOUNT, FAILED_LOGIN_PER_SOURCE, REGISTER_PER_SOURCE};
 use crate::{AppState, surface};
 
 /// Every path this server answers.
@@ -185,6 +189,7 @@ async fn login_flows() -> Json<Value> {
 /// `POST /_matrix/client/v3/login`
 async fn login(
     State(state): State<AppState>,
+    source: ClientAddr,
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<Value>, MatrixError> {
     if request.kind != "m.login.password" {
@@ -204,6 +209,19 @@ async fn login(
         .as_deref()
         .ok_or_else(|| MatrixError::bad_json("no password"))?;
 
+    // Both keys are checked before the password is, so a caller already over
+    // the limit does not get a free Argon2 verification out of each attempt.
+    let account_key = format!("login:account:{localpart}");
+    let source_key = format!("login:source:{source}");
+    for (key, limit) in [
+        (&account_key, FAILED_LOGIN_PER_ACCOUNT),
+        (&source_key, FAILED_LOGIN_PER_SOURCE),
+    ] {
+        if let Err(retry) = state.limiter.check(key, limit) {
+            return Err(MatrixError::limit_exceeded(retry.as_millis()));
+        }
+    }
+
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     // One message for a wrong password and for an unknown user. The
     // verification cost is already equal (see `verify_password`); saying
@@ -214,6 +232,11 @@ async fn login(
     {
         return Err(MatrixError::forbidden("invalid username or password"));
     }
+
+    // A correct login is not the traffic being defended against, and counting
+    // it would lock out the legitimate users of a busy shared address first.
+    state.limiter.forget(&account_key);
+    state.limiter.forget(&source_key);
 
     let session = accounts
         .create_session(
@@ -255,12 +278,24 @@ async fn refresh(
 /// that skips it for registration makes them special-case it.
 async fn register(
     State(state): State<AppState>,
+    source: ClientAddr,
     Json(request): Json<RegisterRequest>,
 ) -> Result<Json<Value>, MatrixError> {
+    // Counted after the UIA hand-shake, so the mandatory first 401 does not
+    // spend a client's budget on the flow the server itself required.
+    if request.auth.is_some()
+        && let Err(retry) = state
+            .limiter
+            .check(&format!("register:source:{source}"), REGISTER_PER_SOURCE)
+    {
+        return Err(MatrixError::limit_exceeded(retry.as_millis()));
+    }
+
     if request.auth.is_none() {
         return Err(MatrixError {
             status: StatusCode::UNAUTHORIZED,
             errcode: "M_FORBIDDEN",
+            retry_after_ms: None,
             error: serde_json::to_string(&json!({
                 "flows": [{ "stages": ["m.login.dummy"] }],
                 "params": {},
@@ -340,4 +375,37 @@ fn localpart_of(user: &str) -> String {
 
 fn internal(error: &AccountError) -> MatrixError {
     MatrixError::internal(&error.to_string())
+}
+
+/// The caller's address, as far as it can be known.
+///
+/// Behind a reverse proxy every request appears to come from the proxy, which
+/// would collapse the per-source limit onto a single key and make it useless.
+/// Reading a forwarding header instead is worse: any client can set it, so the
+/// limit becomes opt-out. Until the deployment can say which proxies it trusts,
+/// the peer address is the only value that is not attacker-controlled — and the
+/// per-account limit is the one that still bites in that case, which is why
+/// both exist.
+pub struct ClientAddr(String);
+
+impl std::fmt::Display for ClientAddr {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for ClientAddr {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map_or_else(|| "unknown".to_owned(), |info| info.0.ip().to_string()),
+        ))
+    }
 }

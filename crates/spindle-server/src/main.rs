@@ -59,7 +59,11 @@ async fn main() -> ExitCode {
 
     tracing::info!("spindle listening on {bind} as {name}");
     let app = spindle_server::app(config, store);
-    if let Err(error) = axum::serve(listener, app)
+    // into_make_service_with_connect_info, so the rate limiter can see peer
+    // addresses. Without it every request looks like it came from nowhere and
+    // the per-source limit collapses onto one key.
+    let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    if let Err(error) = axum::serve(listener, service)
         .with_graceful_shutdown(shutdown())
         .await
     {
