@@ -6,8 +6,8 @@ only reports its wins is not evidence (#34).
 ## Where the current numbers are
 
 **Published automatically on every push to `main`:**
-<https://hanthor.github.io/spindle/> — with
-[`latest.json`](https://hanthor.github.io/spindle/latest.json) as the raw data
+<https://tuna-os.github.io/spindle/> — with
+[`latest.json`](https://tuna-os.github.io/spindle/latest.json) as the raw data
 and a per-commit copy kept beside it, so a regression can be traced to the push
 that caused it.
 

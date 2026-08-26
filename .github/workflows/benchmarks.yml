@@ -49,7 +49,9 @@ jobs:
             --runner "github-actions/ubuntu-24.04"
 
       - name: Render the page
-        run: python3 scripts/render-benchmarks.py site/latest.json site/index.html
+        run: |
+          python3 scripts/render-benchmarks.py site/latest.json site/index.html \
+            --repository "${GITHUB_REPOSITORY}"
 
       # Keeping the per-commit file means a regression can be traced to the
       # push that caused it, rather than only observed after the fact.
