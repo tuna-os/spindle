@@ -2052,30 +2052,27 @@ struct RedactRequest {
 
 /// `PUT /_matrix/client/v3/rooms/{room_id}/redact/{event_id}/{txn_id}`
 ///
-/// The transaction ID is accepted and ignored, as it is on `/send` — replay
-/// is #11's work, and a redaction replayed twice redacts an already-redacted
-/// event, which is harmless but still mints a second redaction event.
+/// Replayed like `/send`. A duplicated redaction is the mildest duplicate --
+/// it redacts an already-redacted event -- but it still mints a second
+/// event into the log, and the log is forever.
 async fn redact_event(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
-    axum::extract::Path((room_id, event_id, _txn_id)): axum::extract::Path<(
-        String,
-        String,
-        String,
-    )>,
+    axum::extract::Path((room_id, event_id, txn_id)): axum::extract::Path<(String, String, String)>,
     Json(request): Json<RedactRequest>,
 ) -> Result<Json<Value>, MatrixError> {
-    let redaction = state
-        .rooms
-        .redact(
-            &room_id,
-            &identity.user_id,
-            state.key.pair(),
-            &event_id,
-            request.reason.as_deref(),
-        )
-        .map_err(room_error)?;
-    Ok(Json(json!({ "event_id": redaction })))
+    with_transaction(&state, &identity, &txn_id, || {
+        state
+            .rooms
+            .redact(
+                &room_id,
+                &identity.user_id,
+                state.key.pair(),
+                &event_id,
+                request.reason.as_deref(),
+            )
+            .map_err(room_error)
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -2325,41 +2322,70 @@ fn room_error(error: crate::rooms::RoomError) -> MatrixError {
 }
 
 /// `PUT /_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}`
+/// Replay a transaction if this device has already sent it, or run `mint` and
+/// record what it produced.
+///
+/// The check-then-record is not atomic, and deliberately so: the race it
+/// leaves open is two *concurrent* retries of the same transaction, which can
+/// both mint. Closing it would mean a lock held across `append`. The failure
+/// the spec's idempotency exists for is the sequential retry -- a client that
+/// timed out, cannot know whether its send landed, and asks again -- and that
+/// case a durable read-then-write handles completely, including across a
+/// server restart, which an in-memory lock would not.
+///
+/// Only success is recorded. A refused send must stay refusable: recording a
+/// failure would replay the *error* forever, and recording nothing means the
+/// retry gets a fresh chance, which is what a client expects of a 429 or an
+/// auth refusal that a later state change resolves.
+fn with_transaction(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    txn_id: &str,
+    mint: impl FnOnce() -> Result<String, MatrixError>,
+) -> Result<Json<Value>, MatrixError> {
+    let key = spindle_core::keys::transaction(&identity.user_id, &identity.device_id, txn_id);
+    if let Ok(Some(stored)) = spindle_store::ReadView::get(state.store.as_ref(), &key)
+        && let Ok(event_id) = String::from_utf8(stored)
+    {
+        return Ok(Json(json!({ "event_id": event_id })));
+    }
+    let event_id = mint()?;
+    spindle_store::Store::put(state.store.as_ref(), &key, event_id.as_bytes())
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    Ok(Json(json!({ "event_id": event_id })))
+}
+
 async fn send_event(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
-    axum::extract::Path((room_id, event_type, _txn_id)): axum::extract::Path<(
+    axum::extract::Path((room_id, event_type, txn_id)): axum::extract::Path<(
         String,
         String,
         String,
     )>,
     Json(content): Json<Value>,
 ) -> Result<Json<Value>, MatrixError> {
-    // The transaction ID is accepted and ignored. Idempotent replay is real
-    // work -- storing the response against the ID and returning it on a repeat
-    // -- and claiming it by accepting the parameter would be worse than not
-    // taking it at all: a client retrying after a timeout would silently
-    // duplicate its message. Tracked as the remaining item on #11.
-    let event_id = state
-        .rooms
-        .send(
-            &room_id,
-            &identity.user_id,
-            state.key.pair(),
-            &event_type,
-            &content,
-        )
-        .map_err(|error| match error {
-            crate::rooms::RoomError::UnknownRoom(_) => {
-                MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such room")
-            }
-            // The message is ruma's own wording for the rule that refused,
-            // which is the same explanation a federating peer would give. A
-            // generic "forbidden" would make a client's bug report useless.
-            crate::rooms::RoomError::Forbidden(rule) => MatrixError::forbidden(rule),
-            other => MatrixError::internal(&other.to_string()),
-        })?;
-    Ok(Json(json!({ "event_id": event_id })))
+    with_transaction(&state, &identity, &txn_id, || {
+        state
+            .rooms
+            .send(
+                &room_id,
+                &identity.user_id,
+                state.key.pair(),
+                &event_type,
+                &content,
+            )
+            .map_err(|error| match error {
+                crate::rooms::RoomError::UnknownRoom(_) => {
+                    MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such room")
+                }
+                // The message is ruma's own wording for the rule that refused,
+                // which is the same explanation a federating peer would give. A
+                // generic "forbidden" would make a client's bug report useless.
+                crate::rooms::RoomError::Forbidden(rule) => MatrixError::forbidden(rule),
+                other => MatrixError::internal(&other.to_string()),
+            })
+    })
 }
 
 #[derive(Debug, Deserialize)]

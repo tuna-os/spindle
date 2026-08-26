@@ -126,6 +126,14 @@ pub enum Keyspace {
     /// the mapping from the opaque ID a client is given to the content hash
     /// the bytes are filed under.
     Media = 0x13,
+    /// `(user_id, device_id, txn_id)` -> the event ID minted the first time.
+    ///
+    /// The spec scopes transaction IDs to a device, not a user: two devices
+    /// may reuse an ID and mean different sends. Stored durably rather than
+    /// in memory because the retry that matters most is the one that arrives
+    /// after a crash -- the case where the client cannot know whether its
+    /// send landed is exactly the case where the server must.
+    Transaction = 0x14,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -370,6 +378,23 @@ pub fn media(media_id: &str) -> Vec<u8> {
     key.push(Keyspace::Media as u8);
     key.extend_from_slice(&len.to_be_bytes());
     key.extend_from_slice(&id[..len as usize]);
+    key
+}
+
+/// One transaction's key: who sent it, from which device, under what name.
+///
+/// All three components are length-prefixed. `txn_id` is client-chosen text,
+/// so without the prefixes `(dev, "1x")` and `(de, "v1x")` would collide --
+/// the same trap every other composite key here guards against.
+#[must_use]
+pub fn transaction(user_id: &str, device_id: &str, txn_id: &str) -> Vec<u8> {
+    let mut key = user_prefix(Keyspace::Transaction, user_id);
+    for part in [device_id, txn_id] {
+        let bytes = part.as_bytes();
+        let len = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
+        key.extend_from_slice(&len.to_be_bytes());
+        key.extend_from_slice(&bytes[..len as usize]);
+    }
     key
 }
 
