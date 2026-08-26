@@ -4,7 +4,7 @@
 use std::{cell::RefCell, collections::BTreeMap};
 
 use spindle_core::RoomLog;
-use spindle_store::{Durability, Record, RoomStore, Store, StoreError};
+use spindle_store::{Durability, ReadView, Record, RoomStore, Store, StoreError};
 
 /// An in-memory store that stops accepting commits after a set number, the way
 /// a machine losing power stops accepting them: abruptly, mid-workload.
@@ -28,12 +28,7 @@ impl FaultyStore {
     }
 }
 
-impl Store for FaultyStore {
-    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
-        self.data.borrow_mut().insert(key.to_vec(), value.to_vec());
-        Ok(())
-    }
-
+impl ReadView for FaultyStore {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         Ok(self.data.borrow().get(key).cloned())
     }
@@ -47,6 +42,16 @@ impl Store for FaultyStore {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect())
     }
+}
+
+impl Store for FaultyStore {
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        self.data.borrow_mut().insert(key.to_vec(), value.to_vec());
+        Ok(())
+    }
+
+    // No `snapshot` override: this double has no snapshot isolation, which is
+    // exactly what the default `None` says.
 
     fn commit(&self, writes: &[Record], _durability: Durability) -> Result<(), StoreError> {
         let mut remaining = self.commits_before_failure.borrow_mut();

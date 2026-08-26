@@ -58,12 +58,7 @@ pub type Record = (Vec<u8>, Vec<u8>);
 /// Narrow on purpose: every hot operation is a point lookup or a sorted range
 /// scan, so nothing here needs a query planner and a second backend has little
 /// to implement.
-pub trait Store {
-    /// # Errors
-    ///
-    /// Returns a backend error if the write fails.
-    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError>;
-
+pub trait ReadView {
     /// # Errors
     ///
     /// Returns a backend error if the read fails.
@@ -75,6 +70,28 @@ pub trait Store {
     ///
     /// Returns a backend error if the scan fails.
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<Record>, StoreError>;
+}
+
+pub trait Store: ReadView {
+    /// # Errors
+    ///
+    /// Returns a backend error if the write fails.
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError>;
+
+    /// A read view frozen at this moment, if the backend can provide one.
+    ///
+    /// Rebuilding a room takes two reads — the metadata, then the log — and a
+    /// commit landing between them yields a room whose head and counters
+    /// disagree. Metadata that trails the log is the dangerous direction: the
+    /// next append reissues an index the log already holds, which is precisely
+    /// the fork that ordering is supposed to make impossible.
+    ///
+    /// `None` means the backend has no snapshot isolation and reads are live.
+    /// That is honest rather than silently unsafe: a backend without this
+    /// cannot be backed up under concurrent writes, and callers can tell.
+    fn snapshot(&self) -> Option<Box<dyn ReadView + '_>> {
+        None
+    }
 
     /// Apply every write together, or none of them.
     ///
@@ -115,12 +132,7 @@ impl FjallStore {
     }
 }
 
-impl Store for FjallStore {
-    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
-        self.partition.insert(key, value)?;
-        Ok(())
-    }
-
+impl ReadView for FjallStore {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         Ok(self.partition.get(key)?.map(|slice| slice.to_vec()))
     }
@@ -132,6 +144,48 @@ impl Store for FjallStore {
             out.push((key.to_vec(), value.to_vec()));
         }
         Ok(out)
+    }
+}
+
+/// A Fjall read snapshot: every read sees the partition as of the sequence
+/// number current when it was taken, whatever lands afterwards.
+pub struct FjallCheckpoint(fjall::Snapshot);
+
+impl ReadView for FjallCheckpoint {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self
+            .0
+            .get(key)
+            .map_err(|error| StoreError::Backend(error.to_string()))?
+            .map(|value| value.to_vec()))
+    }
+
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<Record>, StoreError> {
+        let mut out = Vec::new();
+        for pair in self.0.prefix(prefix) {
+            let (key, value) = pair.map_err(|error| StoreError::Backend(error.to_string()))?;
+            out.push((key.to_vec(), value.to_vec()));
+        }
+        Ok(out)
+    }
+}
+
+impl Store for FjallStore {
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        self.partition.insert(key, value)?;
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Option<Box<dyn ReadView + '_>> {
+        // `Keyspace::instant`, not `Partition::snapshot`. The latter reads the
+        // raw sequence counter, which a batch commit bumps *before* inserting
+        // its items; a snapshot taken in that window sees the batch half
+        // applied. `instant` returns `visible_seqno`, which is published only
+        // once every item has landed, so a batch is all-or-nothing to a reader
+        // exactly as it is to a crash.
+        Some(Box::new(FjallCheckpoint(
+            self.partition.snapshot_at(self.keyspace.instant()),
+        )))
     }
 
     fn commit(&self, writes: &[Record], durability: Durability) -> Result<(), StoreError> {
@@ -289,10 +343,18 @@ impl<'a, S: Store> RoomStore<'a, S> {
     }
 
     fn read_records(&self) -> Result<Option<(RoomRecord, Vec<RestoredEntry>)>, StoreError> {
-        let Some(raw_meta) = self
-            .store
-            .get(&room_prefix(Keyspace::RoomMeta, &self.room_id))?
-        else {
+        // Read metadata and log through one frozen view. Rebuilding a room
+        // takes two reads, and a commit landing between them yields a room
+        // whose counters and log disagree -- metadata trailing the log being
+        // the dangerous direction, because the next append then reissues an
+        // index the log already holds. Backends without snapshot isolation fall
+        // back to live reads and are correspondingly unsafe to read under
+        // concurrent writes; that is a property of the backend, not something
+        // this function can paper over.
+        let snapshot = self.store.snapshot();
+        let view: &dyn ReadView = snapshot.as_deref().unwrap_or(self.store);
+
+        let Some(raw_meta) = view.get(&room_prefix(Keyspace::RoomMeta, &self.room_id))? else {
             return Ok(None);
         };
         let meta = RoomRecord::decode(&raw_meta)?;
@@ -302,7 +364,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
         // first without any sorting here.
         let prefix = room_prefix(Keyspace::Log, &self.room_id);
         let mut entries = Vec::new();
-        for (_, value) in self.store.scan_prefix(&prefix)? {
+        for (_, value) in view.scan_prefix(&prefix)? {
             let record = EntryRecord::decode(&value)?;
             entries.push(RestoredEntry {
                 li: record.linear_index(),

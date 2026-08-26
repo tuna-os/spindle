@@ -3,7 +3,7 @@
 use proptest::prelude::*;
 use spindle_core::{EventInput, RoomLog, StateKey, StateSnapshot};
 use spindle_store::{
-    FjallStore, RoomStore, Store, StoreError,
+    FjallStore, ReadView, RoomStore, Store, StoreError,
     codec::{CodecError, EntryRecord, RECORD_VERSION, RoomRecord},
 };
 use tempfile::TempDir;
