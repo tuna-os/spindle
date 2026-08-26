@@ -64,15 +64,28 @@ jobs:
 
           # Wait on the image's own HEALTHCHECK, which is what Complement waits
           # on. A container that never reports healthy is the failure mode this
-          # job exists to catch.
+          # job exists to catch -- but "exited" and "probe failing" are different
+          # faults with different fixes, and reporting them as one sends whoever
+          # reads this looking in the wrong place.
           for _ in $(seq 1 60); do
+            running=$(docker inspect -f '{{.State.Running}}' spindle-ci 2>/dev/null || echo false)
+            if [[ "$running" != true ]]; then
+              code=$(docker inspect -f '{{.State.ExitCode}}' spindle-ci 2>/dev/null || echo '?')
+              echo "::error::the container exited with code $code before becoming healthy"
+              docker logs spindle-ci || true
+              exit 1
+            fi
             state=$(docker inspect -f '{{.State.Health.Status}}' spindle-ci 2>/dev/null || echo starting)
             [[ "$state" == healthy ]] && break
-            [[ "$state" == unhealthy ]] && { echo "container reported unhealthy"; break; }
             sleep 2
           done
           docker logs spindle-ci
-          test "$(docker inspect -f '{{.State.Health.Status}}' spindle-ci)" = healthy
+          state=$(docker inspect -f '{{.State.Health.Status}}' spindle-ci)
+          if [[ "$state" != healthy ]]; then
+            echo "::error::container is running but the health check never passed ($state)"
+            docker inspect -f '{{json .State.Health}}' spindle-ci || true
+            exit 1
+          fi
 
       - name: Check the endpoint Complement probes
         if: hashFiles('crates/spindle-server/Cargo.toml') != ''
