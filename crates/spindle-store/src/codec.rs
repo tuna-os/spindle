@@ -50,7 +50,7 @@ impl EntryRecord {
                     key.state_key().to_owned(),
                 )
             }),
-            state_root: *entry.state_after.root().as_bytes(),
+            state_root: *entry.state_root.as_bytes(),
             chain: entry.chain.map(|chain| *chain.as_bytes()),
         }
     }

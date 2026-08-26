@@ -187,7 +187,10 @@ impl<'a, S: Store> RoomStore<'a, S> {
             .entries()
             .rev()
             .find(|candidate| candidate.li < entry.li)
-            .map(|candidate| &candidate.state_after);
+            .and_then(|candidate| log.state_after(candidate.li));
+        let state = log
+            .state_after(entry.li)
+            .ok_or(StoreError::StateNotResident { li: entry.li.get() })?;
 
         let mut writes = vec![
             (
@@ -199,7 +202,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 Self::meta(log).encode(),
             ),
         ];
-        for (address, node) in entry.state_after.delta_nodes(previous) {
+        for (address, node) in state.delta_nodes(previous) {
             writes.push((
                 content_addressed(Keyspace::StateNode, address.as_bytes()),
                 node,
@@ -230,7 +233,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
     ///
     /// Returns [`StoreError`] if any write fails.
     pub fn save(&self, log: &RoomLog) -> Result<(), StoreError> {
-        let mut previous = None;
+        let mut previous: Option<&spindle_core::StateSnapshot> = None;
         for entry in log.entries() {
             let key = room_li(Keyspace::Log, &self.room_id, entry.li);
             self.store
@@ -238,13 +241,21 @@ impl<'a, S: Store> RoomStore<'a, S> {
             // Persist the state trie here too, so both write paths restore
             // identically. A seeding path that produced a differently
             // restorable room would be a trap for whoever hit it first.
-            for (address, node) in entry.state_after.delta_nodes(previous) {
+            // This is why `save` is a seeding path and not a serving one: it
+            // needs every entry's materialized state at once, and a room long
+            // enough to have evicted some cannot supply that. Such a room is
+            // already persisted incrementally by `commit_entry`, which needs
+            // only the entry in hand.
+            let state = log
+                .state_after(entry.li)
+                .ok_or(StoreError::StateNotResident { li: entry.li.get() })?;
+            for (address, node) in state.delta_nodes(previous) {
                 self.store.put(
                     &content_addressed(Keyspace::StateNode, address.as_bytes()),
                     &node,
                 )?;
             }
-            previous = Some(&entry.state_after);
+            previous = Some(state);
         }
         self.store.put(
             &room_prefix(Keyspace::RoomMeta, &self.room_id),
@@ -349,6 +360,13 @@ pub enum StoreError {
     Codec(CodecError),
     /// Records could not be replayed into a log.
     Restore(RestoreError),
+    /// The entry's materialized state is no longer held in memory.
+    ///
+    /// Only [`RoomStore::save`] can raise this, and only for a room long enough
+    /// to have evicted state it is being asked to rewrite wholesale. Use
+    /// [`RoomStore::commit_entry`] per append instead, which is the serving
+    /// path and never needs more than the entry it is writing.
+    StateNotResident { li: i64 },
 }
 
 impl From<fjall::Error> for StoreError {
@@ -375,6 +393,10 @@ impl std::fmt::Display for StoreError {
             Self::Backend(message) => write!(formatter, "storage backend failed: {message}"),
             Self::Codec(error) => write!(formatter, "unreadable record: {error:?}"),
             Self::Restore(error) => write!(formatter, "could not replay log: {error:?}"),
+            Self::StateNotResident { li } => write!(
+                formatter,
+                "state for li {li} has been evicted; use commit_entry per append"
+            ),
         }
     }
 }

@@ -315,6 +315,32 @@ A room with 50k state events holds on the order of a few MB resident; rooms
 evict to disk under an LRU keyed by last activity, retaining only the 32-byte
 root.
 
+Within a room the same rule applies per entry. Every log entry keeps its state
+root — 32 bytes, forever — but the materialized snapshot it names is held only
+while something can still ask for it. Retaining one snapshot per entry sounds
+free, because the trie shares structure perfectly, but it is not: each append
+path-copies `O(log n)` nodes and keeping every root alive keeps every version of
+every copied path alive with it, so memory grows with the length of the log
+rather than with the size of the state.
+
+Snapshots are therefore retained for:
+
+- the most recent `resident_window` entries, defaulting to `max_fork_window`
+  (§9.1). The coupling is the argument: a fork deeper than the window already
+  falls back to full state resolution, which reads the trie from the store, so
+  a window this size holds everything the fast path can reach and nothing that
+  only the slow path can;
+- every forward extremity, at any age. A class-D stale peer event can leave an
+  extremity arbitrarily far back (ADR 0001), and the next local event has to
+  merge that extremity's state with the head's;
+- the entry just written, so a backfill prepend — which takes an index far
+  below the window floor — can hand its `/state_ids` state to the store before
+  it is dropped.
+
+Anything else is rehydrated from `state_nodes` by its root, which is `O(log n)`
+in the size of the state. The bound is asserted rather than assumed: a room
+whose resident count tracks its length has lost it.
+
 ### 6.5 Backfilled history
 
 Backfilled events have `li <= 0` and their state must be established backwards.
