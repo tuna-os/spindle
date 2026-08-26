@@ -6,9 +6,11 @@
 //! signed `prev_events` graph required by Matrix federation.
 
 mod log;
+mod pdu;
 mod state;
 
 pub use log::{
     AppendError, EventId, EventInput, ForkWindow, ForkWindowError, LinearIndex, LogEntry, RoomLog,
 };
+pub use pdu::{Pdu, PduError};
 pub use state::{EventType, StateKey, StateRoot, StateSnapshot};
