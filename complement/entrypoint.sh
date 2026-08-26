@@ -84,5 +84,10 @@ path = "/data/store"
 filter = "${SPINDLE_LOG:-info}"
 TOML
 
-say "starting spindle as ${SERVER_NAME}"
-exec /usr/local/bin/spindle /data/spindle.toml
+# Everything above needed root: the trust store, and Complement's 0600 CA key.
+# Nothing below does. `exec` means PID 1 is the server itself, running as
+# uid 10001 -- so the process that stays up and takes traffic is unprivileged
+# even though the setup that produced its certificate was not.
+say "starting spindle as ${SERVER_NAME}, dropping to uid 10001"
+exec setpriv --reuid=10001 --regid=10001 --clear-groups \
+    /usr/local/bin/spindle /data/spindle.toml

@@ -17,31 +17,28 @@ RUN cargo build --release --locked --bin spindle
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates openssl curl \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates openssl curl util-linux \
     && rm -rf /var/lib/apt/lists/*
 
-# Non-root at runtime (#11). The entrypoint installs a CA and writes a signed
-# certificate, so it needs the paths that involves rather than the container
-# being handed root to sidestep the problem.
+# Non-root at runtime (#11) — the *server*, not the setup.
 #
-# `update-ca-certificates` writes more than the drop-in directory: it rebuilds
-# the bundle in /etc/ssl/certs and reads /etc/ca-certificates.conf. Owning only
-# /usr/local/share/ca-certificates leaves it failing on the rebuild, which the
-# entrypoint would then report — correctly, and on every single start.
+# The entrypoint has to read /complement/ca/ca.key, and Complement writes that
+# key the way OpenSSL writes any private key: mode 0600, owned by whoever
+# generated it. A container user that is not that owner cannot read it, and no
+# amount of chowning inside the image changes a file that arrives on a mount.
+# So setup runs as root and the entrypoint drops to this user before exec'ing
+# the server, which is the part that stays up and takes traffic.
 RUN useradd --system --create-home --uid 10001 spindle \
     && mkdir -p /data /certs \
-    && chown -R spindle:spindle \
-        /data \
-        /certs \
-        /usr/local/share/ca-certificates \
-        /etc/ssl/certs \
-        /etc/ca-certificates.conf
+    && chown -R spindle:spindle /data /certs
 
 COPY --from=build /src/target/release/spindle /usr/local/bin/spindle
 COPY complement/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-USER spindle
+# No `USER` directive: the entrypoint needs root for the CA, and drops to
+# uid 10001 itself. PID 1 is therefore the server running unprivileged.
 WORKDIR /data
 
 EXPOSE 8008 8448

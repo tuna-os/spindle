@@ -95,13 +95,20 @@ jobs:
 
       # #11 requires a non-root runtime, and an image that quietly runs as root
       # is the kind of thing nobody notices until it is deployed somewhere real.
-      - name: Check it does not run as root
+      #
+      # PID 1, not `id -u`: the image has no USER directive, because setup has
+      # to read Complement's 0600 CA key. `docker exec` would therefore report
+      # root and prove nothing. What matters is the process that stays up, which
+      # the entrypoint exec's into after dropping privileges.
+      - name: Check the server process does not run as root
         if: hashFiles('crates/spindle-server/Cargo.toml') != ''
         run: |
           set -euo pipefail
-          uid=$(docker exec spindle-ci id -u)
-          echo "running as uid $uid"
-          test "$uid" != "0"
+          uid=$(docker exec spindle-ci stat -c '%u' /proc/1)
+          comm=$(docker exec spindle-ci cat /proc/1/comm)
+          echo "pid 1 is '$comm' running as uid $uid"
+          test "$comm" = spindle
+          test "$uid" = "10001"
 
       # Complement starts the image repeatedly from the same entrypoint, so a
       # second run over existing storage has to work too.
