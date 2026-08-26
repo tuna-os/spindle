@@ -16,7 +16,10 @@ fjall = "2.11.2"
 proptest = "1.7"
 rand = "0.8"
 im = "15"
-ruma = { version = "0.16", features = ["signatures"] }
+# `state-res` is a runtime dependency, not just an oracle: SPEC 9.3 and
+# docs/divergence.md both require the local send path to use the same auth
+# predicate the siblings use. ADR 0002 permits this above the core.
+ruma = { version = "0.16", features = ["signatures", "state-res", "events"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3"

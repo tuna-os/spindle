@@ -72,11 +72,13 @@ Reading top to bottom: the further down, the more of it is ours.
 
 The single most important row is the sixth. Both siblings call ruma's
 `auth_check` on the local send path (`service/rooms/timeline/create.rs` in
-each), and so do we — the *rules* are not a divergence and must not become
-one. What differs is that they compute or look up the state to check against,
-and we already have it materialized as a snapshot hanging off the previous log
-entry. Same predicate, different cost to reach its inputs. That is the
-project's thesis in one row.
+each), and so do we — `server/src/authorize.rs`, called from `rooms.rs`
+before anything is appended. The *rules* are not a divergence and must not
+become one; that module deliberately contains no authorization logic at all,
+only the conversion into the shape `ruma-state-res` reads. What differs is
+that the siblings compute or look up the state to check against, and we index
+into a snapshot already hanging off the previous log entry. Same predicate,
+different cost to reach its inputs. That is the project's thesis in one row.
 
 ## 4. What is genuinely ours today
 
