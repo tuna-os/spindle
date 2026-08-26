@@ -14,10 +14,15 @@ serde_json.workspace = true
 [dev-dependencies]
 blake3.workspace = true
 criterion.workspace = true
+im.workspace = true
 proptest.workspace = true
 
 [[bench]]
 name = "fork_window"
+harness = false
+
+[[bench]]
+name = "state_snapshot"
 harness = false
 
 [lints]
