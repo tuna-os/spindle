@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
-use spindle_core::{AppendError, EventId, EventInput, RoomLog, StateKey, StateSnapshot};
+use spindle_core::{
+    AppendError, EventId, EventInput, ForkWindowError, RoomLog, StateKey, StateSnapshot,
+};
 
 #[test]
 fn stale_remote_event_is_joined_by_the_next_local_event() {
@@ -39,6 +41,72 @@ fn conflicting_state_fork_requires_the_matrix_resolver() {
         room.append_local("$merge", None),
         Err(AppendError::NeedsStateResolution { .. })
     ));
+}
+
+#[test]
+fn fork_window_uses_ancestry_not_nearby_linear_indices() {
+    let mut room = RoomLog::new();
+    room.append_local("$root", None).unwrap();
+    room.append_local("$a1", None).unwrap();
+    room.append_remote(EventInput::new("$b1", vec![EventId::new("$root")]))
+        .unwrap();
+    room.append_remote(EventInput::new("$a2", vec![EventId::new("$a1")]))
+        .unwrap();
+    room.append_remote(EventInput::new("$b2", vec![EventId::new("$b1")]))
+        .unwrap();
+
+    let window = room
+        .fork_window(&[EventId::new("$a2"), EventId::new("$b2")], 4)
+        .unwrap();
+    assert_eq!(window.nearest_common_ancestor, EventId::new("$root"));
+    assert_eq!(
+        window.events,
+        vec![
+            EventId::new("$a1"),
+            EventId::new("$b1"),
+            EventId::new("$a2"),
+            EventId::new("$b2")
+        ]
+    );
+}
+
+#[test]
+fn fork_window_excludes_all_common_history_after_a_prior_merge() {
+    let mut room = RoomLog::new();
+    room.append_local("$root", None).unwrap();
+    room.append_local("$left", None).unwrap();
+    room.append_remote(EventInput::new("$right", vec![EventId::new("$root")]))
+        .unwrap();
+    room.append_local("$joined", None).unwrap();
+    room.append_local("$new-left", None).unwrap();
+    room.append_remote(EventInput::new("$new-right", vec![EventId::new("$joined")]))
+        .unwrap();
+
+    let window = room
+        .fork_window(&[EventId::new("$new-left"), EventId::new("$new-right")], 2)
+        .unwrap();
+    assert_eq!(window.nearest_common_ancestor, EventId::new("$joined"));
+    assert_eq!(
+        window.events,
+        vec![EventId::new("$new-left"), EventId::new("$new-right")]
+    );
+}
+
+#[test]
+fn fork_window_enforces_its_event_budget() {
+    let mut room = RoomLog::new();
+    room.append_local("$root", None).unwrap();
+    room.append_local("$left", None).unwrap();
+    room.append_remote(EventInput::new("$right", vec![EventId::new("$root")]))
+        .unwrap();
+
+    assert_eq!(
+        room.fork_window(&[EventId::new("$left"), EventId::new("$right")], 1),
+        Err(ForkWindowError::TooLarge {
+            limit: 1,
+            event_count: 2
+        })
+    );
 }
 
 proptest! {
