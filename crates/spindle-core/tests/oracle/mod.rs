@@ -11,10 +11,16 @@
 //! Everything here is deliberately built with ruma types. Our side of the
 //! comparison is not (ADR 0002), which is what stops the comparison being
 //! circular.
+//!
+//! Shared by the equivalence test and the comparison benchmark, each of which
+//! uses a different part of it — hence the blanket `dead_code` allow, which is
+//! about the two consumers rather than about anything here being unused.
+
+#![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use ruma::state_res::{StateMap, events::Event};
+use ruma::state_res::{StateMap, events::Event, utils::event_id_set::EventIdSet};
 use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UInt,
     UserId,
@@ -299,16 +305,39 @@ pub fn reference_resolve(
     left: &StateMap<OwnedEventId>,
     right: &StateMap<OwnedEventId>,
 ) -> StateMap<OwnedEventId> {
+    let chains = auth_chains(graph, left, right);
+    reference_resolve_with_chains(graph, left, right, chains)
+}
+
+/// Auth chains for a pair of state maps, computed once.
+///
+/// A homeserver stores auth chains; it does not walk the graph to rebuild them
+/// on every resolution. Computing them inside a timed loop would charge the
+/// reference resolver for work a real deployment has already done, so the
+/// benchmark hoists this out and only `reference_resolve_with_chains` is timed.
+pub fn auth_chains(
+    graph: &RoomBuilder,
+    left: &StateMap<OwnedEventId>,
+    right: &StateMap<OwnedEventId>,
+) -> Vec<EventIdSet<OwnedEventId>> {
+    vec![
+        graph.auth_chain(left).into_iter().collect(),
+        graph.auth_chain(right).into_iter().collect(),
+    ]
+}
+
+/// As [`reference_resolve`], but with the auth chains supplied.
+pub fn reference_resolve_with_chains(
+    graph: &RoomBuilder,
+    left: &StateMap<OwnedEventId>,
+    right: &StateMap<OwnedEventId>,
+    chains: Vec<EventIdSet<OwnedEventId>>,
+) -> StateMap<OwnedEventId> {
     let rules = RoomVersionRules::V11;
     let state_res_rules = match rules.state_res {
         ruma::room_version_rules::StateResolutionVersion::V2(rules) => rules,
         other => panic!("room version 11 must use state resolution v2, got {other:?}"),
     };
-
-    let chains = vec![
-        graph.auth_chain(left).into_iter().collect(),
-        graph.auth_chain(right).into_iter().collect(),
-    ];
 
     ruma::state_res::resolve(
         &rules.authorization,
