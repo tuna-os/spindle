@@ -29,6 +29,11 @@ use spindle_store::{Durability, FjallStore, RoomStore, StoreError};
 /// Native rooms are v11 (SPEC §11.6).
 const ROOM_VERSION: &str = "11";
 
+/// The membership index stores the membership verbatim, not a flag. `join` and
+/// `leave` are two of six states, and a boolean would have to be recomputed
+/// from the room the moment invites or knocks matter.
+const JOIN: &[u8] = b"join";
+
 /// Rooms held open, keyed by room ID.
 pub struct Rooms {
     store: Arc<FjallStore>,
@@ -196,29 +201,39 @@ impl Rooms {
 
     /// Room IDs a user is joined to.
     ///
+    /// A prefix scan of that user's membership rows, so the cost is
+    /// proportional to the rooms they are in rather than to the rooms the
+    /// server knows. Reading it from storage rather than from the open-rooms
+    /// map is what makes it correct after a restart, when nothing is open yet.
+    ///
     /// # Errors
     ///
-    /// Returns [`RoomError`] if a room's records cannot be read.
+    /// Returns [`RoomError`] if the index cannot be read.
     pub fn joined(&self, user_id: &str) -> Result<Vec<String>, RoomError> {
-        let open = self
-            .open
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut rooms = Vec::new();
-        for (room_id, log) in open.iter() {
-            let head = log.entries().next_back().map(|entry| entry.li);
-            let joined = head
-                .and_then(|li| log.state_after(li))
-                .and_then(|state| state.get(&StateKey::new("m.room.member", user_id)))
-                .is_some();
-            if joined {
-                rooms.push(room_id.clone());
-            }
-        }
+        let prefix =
+            spindle_core::keys::user_prefix(spindle_core::keys::Keyspace::Membership, user_id);
+        let mut rooms: Vec<String> =
+            spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?
+                .into_iter()
+                .filter(|(_, membership)| membership.as_slice() == JOIN)
+                .filter_map(|(key, _)| spindle_core::keys::room_from_user_room(user_id, &key))
+                .collect();
         rooms.sort();
+        rooms.dedup();
         Ok(rooms)
     }
 
+    /// Run `work` against a room's log, loading it from storage if this
+    /// process has not opened it yet.
+    ///
+    /// The load is what makes a room survive a restart. Without it the log is
+    /// durable but the registry of open rooms is not, so after a restart a
+    /// room's history stays readable while the room itself becomes
+    /// permanently unwritable — a silent half-state, worse than losing it.
+    ///
+    /// Loading is `O(room)` and happens at most once per room per process,
+    /// which is what "rooms are held open, not reloaded per request" means:
+    /// the cost is paid on first touch, never on the send path.
     fn with_room<T>(
         &self,
         room_id: &str,
@@ -228,6 +243,12 @@ impl Rooms {
             .open
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !open.contains_key(room_id) {
+            let restored = RoomStore::new(self.store.as_ref(), room_id)
+                .load()?
+                .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
+            open.insert(room_id.to_owned(), restored.log);
+        }
         let log = open
             .get_mut(room_id)
             .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
@@ -299,7 +320,41 @@ impl Rooms {
             &serde_json::to_vec(&json)?,
         )?;
         room_store.commit_entry(&entry, log, Durability::Group)?;
+
+        // The index is derived from the event that just landed, and only from
+        // an event that landed: writing it before the commit would leave a
+        // user joined to a room whose membership event was never stored.
+        if event_type == "m.room.member" {
+            self.index_membership(room_id, state_key, content)?;
+        }
         Ok(event_id)
+    }
+
+    /// Record `(user, room) -> membership` so `/joined_rooms` need not open
+    /// every room the server knows to answer.
+    ///
+    /// A membership other than `join` is written rather than deleted: the
+    /// difference between "left" and "never joined" is one a later invite or
+    /// ban check needs, and a delete would erase it.
+    fn index_membership(
+        &self,
+        room_id: &str,
+        state_key: Option<&str>,
+        content: &Value,
+    ) -> Result<(), RoomError> {
+        let (Some(user_id), Some(membership)) = (state_key, content["membership"].as_str()) else {
+            return Ok(());
+        };
+        spindle_store::Store::put(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::Membership,
+                user_id,
+                room_id,
+            ),
+            membership.as_bytes(),
+        )?;
+        Ok(())
     }
 
     /// Refuse the candidate unless ruma's predicate allows it.
@@ -644,5 +699,49 @@ mod tests {
         let error = auth_events_for(&log, "@alice:example.org", "m.room.message", None)
             .expect_err("there is nothing to authorize against");
         assert!(matches!(error, RoomError::StateUnavailable(_)), "{error:?}");
+    }
+}
+
+#[cfg(test)]
+mod membership_index_tests {
+    use std::sync::Arc;
+
+    use spindle_core::keys::{Keyspace, user_room};
+    use spindle_store::{FjallStore, Store};
+    use tempfile::TempDir;
+
+    use super::Rooms;
+
+    /// `/joined_rooms` must list only rooms the user is *in*. No endpoint can
+    /// produce a membership other than `join` yet, so the row is written
+    /// directly here — the reader has to be right before the writer that
+    /// exercises it exists, or leaving a room would silently keep it in the
+    /// list. Delete this in favour of an end-to-end leave once there is a
+    /// `/leave` endpoint.
+    #[test]
+    fn a_room_the_user_left_is_not_a_room_they_are_in() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let rooms = Rooms::new(Arc::clone(&store), "example.org");
+        let user = "@alice:example.org";
+
+        for (room, membership) in [
+            ("!stayed:example.org", "join"),
+            ("!left:example.org", "leave"),
+            ("!banned:example.org", "ban"),
+            ("!invited:example.org", "invite"),
+        ] {
+            store
+                .put(
+                    &user_room(Keyspace::Membership, user, room),
+                    membership.as_bytes(),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            rooms.joined(user).unwrap(),
+            vec!["!stayed:example.org".to_owned()]
+        );
     }
 }

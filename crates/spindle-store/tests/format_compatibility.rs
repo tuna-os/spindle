@@ -151,6 +151,7 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::StateNode, 0x03),
         (Keyspace::StateRoot, 0x04),
         (Keyspace::RoomMeta, 0x05),
+        (Keyspace::Membership, 0x0b),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(

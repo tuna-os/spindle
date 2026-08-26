@@ -74,6 +74,12 @@ pub enum Keyspace {
     RefreshToken = 0x09,
     /// `key_id` -> this server's signing key.
     ServerKey = 0x0a,
+    /// `(user_id, room_id)` -> membership.
+    ///
+    /// Indexed by user rather than by room so that "which rooms is this user
+    /// in" is a prefix scan over that user's rooms, not a walk of every room
+    /// the server knows. `/joined_rooms` is the first call most clients make.
+    Membership = 0x0b,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -122,6 +128,45 @@ pub fn room_prefix(keyspace: Keyspace, room_id: &str) -> Vec<u8> {
     key.extend_from_slice(&len.to_be_bytes());
     key.extend_from_slice(&room[..len as usize]);
     key
+}
+
+/// The prefix every key for one user in one keyspace shares.
+///
+/// Length-prefixed for the same reason as [`room_prefix`]: `@ab:x` must not
+/// scan into `@abc:x`.
+#[must_use]
+pub fn user_prefix(keyspace: Keyspace, user_id: &str) -> Vec<u8> {
+    let user = user_id.as_bytes();
+    let len = u16::try_from(user.len()).unwrap_or(u16::MAX);
+    let mut key = Vec::with_capacity(4 + user.len());
+    key.push(KEY_SCHEMA_VERSION);
+    key.push(keyspace as u8);
+    key.extend_from_slice(&len.to_be_bytes());
+    key.extend_from_slice(&user[..len as usize]);
+    key
+}
+
+/// `(user_id, room_id)` key, ordered by room within a user.
+#[must_use]
+pub fn user_room(keyspace: Keyspace, user_id: &str, room_id: &str) -> Vec<u8> {
+    let mut key = user_prefix(keyspace, user_id);
+    key.extend_from_slice(room_id.as_bytes());
+    key
+}
+
+/// The room ID a [`user_room`] key ends with, for `user_id`.
+///
+/// `None` unless the key really is that user's. Slicing at the prefix's
+/// *length* would be enough for keys that came from a scan of this user, and
+/// wrong for anything else: two users whose IDs are the same length produce
+/// prefixes of the same length, so a mismatched key would decode to a
+/// plausible room ID rather than to nothing. A lookup that quietly answers for
+/// the wrong user is worse than one that fails.
+#[must_use]
+pub fn room_from_user_room(user_id: &str, key: &[u8]) -> Option<String> {
+    let prefix = user_prefix(Keyspace::Membership, user_id);
+    let room = key.strip_prefix(prefix.as_slice())?;
+    String::from_utf8(room.to_vec()).ok()
 }
 
 /// `(room_id, li)` key, ordered by `li` within a room.
