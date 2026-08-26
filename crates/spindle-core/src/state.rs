@@ -229,7 +229,7 @@ impl Node {
                 Arc::new(Self::leaf_from_entries(*current_digest, merged))
             }
             (Self::Leaf { digest: left, .. }, Self::Leaf { digest: right, .. }) => {
-                join_nodes(Arc::clone(self), left, incoming, right, depth)
+                join_nodes(Arc::clone(self), left, Arc::clone(&incoming), right, depth)
             }
             (
                 Self::Branch {
