@@ -101,10 +101,16 @@ pub enum Keyspace {
     /// later join simply deletes the marker. Kept out of [`Self::Membership`]
     /// so that forgetting cannot overwrite *why* the user is not in the room
     /// -- "left" and "banned" have to stay distinguishable underneath.
-    ///
-    /// 0x0f, not 0x0e: relations claimed that discriminant on a branch that
-    /// had not landed when this was written, and a reused byte is a migration.
     Forgotten = 0x0f,
+    /// `(user_id, room_id, event_type)` -> account data, with an empty
+    /// `room_id` for the global kind.
+    ///
+    /// One keyspace for both kinds rather than two, because `/sync` wants all
+    /// of a user's account data and would otherwise scan twice. The two stay
+    /// distinguishable because the room ID is length-prefixed: a global key
+    /// carries a zero length, which no room key can, so a scan for the global
+    /// kind cannot walk into a room's.
+    AccountData = 0x10,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -260,6 +266,48 @@ pub fn room_from_user_room(user_id: &str, key: &[u8]) -> Option<String> {
     let prefix = user_prefix(Keyspace::Membership, user_id);
     let room = key.strip_prefix(prefix.as_slice())?;
     String::from_utf8(room.to_vec()).ok()
+}
+
+/// `(user_id, room_id, event_type)` key for [`Keyspace::AccountData`].
+///
+/// The room ID is length-prefixed even though it is followed by a type rather
+/// than by another room: without it, room `!a` with type `bc` and room `!ab`
+/// with type `c` would produce the same key. That is the same collision
+/// [`room_prefix`] guards against, arriving from the other direction.
+///
+/// An empty `room_id` means the global kind. Its zero length sorts before
+/// every room's, so the global entries form one contiguous run that
+/// [`account_data_prefix`] can scan without touching a room's.
+#[must_use]
+pub fn account_data(user_id: &str, room_id: &str, event_type: &str) -> Vec<u8> {
+    let mut key = account_data_prefix(user_id, room_id);
+    key.extend_from_slice(event_type.as_bytes());
+    key
+}
+
+/// The prefix every account-data key for one user and one room shares.
+///
+/// Pass an empty `room_id` for the global kind.
+#[must_use]
+pub fn account_data_prefix(user_id: &str, room_id: &str) -> Vec<u8> {
+    let room = room_id.as_bytes();
+    let len = u16::try_from(room.len()).unwrap_or(u16::MAX);
+    let mut key = user_prefix(Keyspace::AccountData, user_id);
+    key.extend_from_slice(&len.to_be_bytes());
+    key.extend_from_slice(&room[..len as usize]);
+    key
+}
+
+/// The `event_type` an [`account_data`] key ends with.
+///
+/// `None` unless the key really belongs to that user and room, for the reason
+/// [`room_from_user_room`] gives: answering for the wrong one is worse than
+/// not answering.
+#[must_use]
+pub fn account_data_type(user_id: &str, room_id: &str, key: &[u8]) -> Option<String> {
+    let prefix = account_data_prefix(user_id, room_id);
+    let event_type = key.strip_prefix(prefix.as_slice())?;
+    String::from_utf8(event_type.to_vec()).ok()
 }
 
 /// `(room_id, li)` key, ordered by `li` within a room.

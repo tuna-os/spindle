@@ -71,6 +71,14 @@ pub fn router(state: AppState) -> Router {
         .route("/_matrix/client/v3/createRoom", post(create_room))
         .route("/_matrix/client/v3/joined_rooms", get(joined_rooms))
         .route(
+            "/_matrix/client/v3/user/{user_id}/account_data/{event_type}",
+            get(get_account_data).put(set_account_data),
+        )
+        .route(
+            "/_matrix/client/v3/user/{user_id}/rooms/{room_id}/account_data/{event_type}",
+            get(get_room_account_data).put(set_room_account_data),
+        )
+        .route(
             "/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}",
             axum::routing::put(send_event),
         )
@@ -841,6 +849,114 @@ async fn set_typing(
     Ok(Json(json!({})))
 }
 
+/// `GET /_matrix/client/v3/user/{user_id}/account_data/{event_type}`
+async fn get_account_data(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((user_id, event_type)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    read_account_data(&state, &identity, &user_id, "", &event_type)
+}
+
+/// `PUT /_matrix/client/v3/user/{user_id}/account_data/{event_type}`
+async fn set_account_data(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((user_id, event_type)): axum::extract::Path<(String, String)>,
+    Json(content): Json<Value>,
+) -> Result<Json<Value>, MatrixError> {
+    write_account_data(&state, &identity, &user_id, "", &event_type, &content)
+}
+
+/// `GET /_matrix/client/v3/user/{user_id}/rooms/{room_id}/account_data/{event_type}`
+async fn get_room_account_data(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((user_id, room_id, event_type)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Json<Value>, MatrixError> {
+    read_account_data(&state, &identity, &user_id, &room_id, &event_type)
+}
+
+/// `PUT /_matrix/client/v3/user/{user_id}/rooms/{room_id}/account_data/{event_type}`
+async fn set_room_account_data(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((user_id, room_id, event_type)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+    Json(content): Json<Value>,
+) -> Result<Json<Value>, MatrixError> {
+    write_account_data(&state, &identity, &user_id, &room_id, &event_type, &content)
+}
+
+/// Account data is per-user and private, so the `user_id` in the path has to
+/// be the caller's.
+///
+/// The spec says `M_FORBIDDEN` for someone else's, and that is the right code
+/// even though the data may not exist: answering `M_NOT_FOUND` for a user who
+/// has set nothing and `M_FORBIDDEN` for one who has would turn this endpoint
+/// into an oracle for what other people have configured.
+fn own_account(identity: &crate::accounts::Identity, user_id: &str) -> Result<(), MatrixError> {
+    if identity.user_id == user_id {
+        return Ok(());
+    }
+    Err(MatrixError::forbidden(
+        "account data belongs to the user who set it",
+    ))
+}
+
+fn read_account_data(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    user_id: &str,
+    room_id: &str,
+    event_type: &str,
+) -> Result<Json<Value>, MatrixError> {
+    own_account(identity, user_id)?;
+    state
+        .account_data
+        .get(user_id, room_id, event_type)
+        .map_err(|error| account_data_error(&error))?
+        .map(Json)
+        .ok_or_else(|| {
+            MatrixError::new(
+                StatusCode::NOT_FOUND,
+                "M_NOT_FOUND",
+                format!("no {event_type} for {user_id}"),
+            )
+        })
+}
+
+fn write_account_data(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    user_id: &str,
+    room_id: &str,
+    event_type: &str,
+    content: &Value,
+) -> Result<Json<Value>, MatrixError> {
+    own_account(identity, user_id)?;
+    // The server keeps the bytes and has no opinion about them, so there is no
+    // validation of `content` beyond it being JSON -- which the extractor has
+    // already established. A client inventing a new `event_type` has to work
+    // on a server that has never heard of it.
+    state
+        .account_data
+        .put(user_id, room_id, event_type, content)
+        .map_err(|error| account_data_error(&error))?;
+    Ok(Json(json!({})))
+}
+
+fn account_data_error(error: &crate::account_data::AccountDataError) -> MatrixError {
+    MatrixError::internal(&error.to_string())
+}
+
 /// `GET /_matrix/client/v3/sync`
 ///
 /// The token is a position in the server-global stream (SPEC §10.2), because
@@ -896,6 +1012,17 @@ async fn sync(
             .unread(&room.room_id, &identity.user_id)
             .map_err(room_error)?;
         let typing = state.typing.event(&room.room_id);
+        // Sent in full on every sync, incremental ones included, rather than
+        // only when it changed. Account data has no stream position of its
+        // own -- the sync token counts room events, and a `PUT` to
+        // `/account_data` appends nothing -- so sending only the delta would
+        // need a second cursor. Until there is one, repeating it is the
+        // answer that cannot silently drop a change, and the payload is a
+        // client's own settings rather than history.
+        let room_data = state
+            .account_data
+            .all(&identity.user_id, &room.room_id)
+            .map_err(|error| account_data_error(&error))?;
         join.insert(
             room.room_id,
             json!({
@@ -907,6 +1034,7 @@ async fn sync(
                 "ephemeral": {
                     "events": typing.map(|event| vec![event]).unwrap_or_default(),
                 },
+                "account_data": { "events": room_data },
                 "unread_notifications": {
                     "notification_count": unread.notification_count,
                 },
@@ -936,9 +1064,15 @@ async fn sync(
         invite.insert(room_id, json!({ "invite_state": { "events": [] } }));
     }
 
+    let global = state
+        .account_data
+        .all(&identity.user_id, "")
+        .map_err(|error| account_data_error(&error))?;
+
     Ok(Json(json!({
         "next_batch": crate::tokens::Sync(result.next_batch).to_string(),
         "rooms": { "join": join, "invite": invite },
+        "account_data": { "events": global },
     })))
 }
 
