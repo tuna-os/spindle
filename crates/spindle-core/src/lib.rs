@@ -10,4 +10,3 @@ mod state;
 
 pub use log::{AppendError, EventId, EventInput, LinearIndex, LogEntry, RoomLog};
 pub use state::{EventType, StateKey, StateRoot, StateSnapshot};
-

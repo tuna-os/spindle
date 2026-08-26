@@ -218,4 +218,3 @@ pub enum AppendError {
         candidates: Vec<EventId>,
     },
 }
-
