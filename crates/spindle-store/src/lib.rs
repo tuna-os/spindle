@@ -13,10 +13,10 @@ use fjall::{
 };
 use spindle_core::{
     EventId, RestoreError, RestoredEntry, RestoredLog, RoomLog, StateRoot,
-    keys::{Keyspace, content_addressed, room_li, room_prefix},
+    keys::{KEY_SCHEMA_VERSION, Keyspace, content_addressed, room_li, room_prefix, store_marker},
 };
 
-use crate::codec::{CodecError, EntryRecord, RoomRecord};
+use crate::codec::{CodecError, EntryRecord, RECORD_VERSION, RoomRecord};
 
 /// How hard a commit tries to be on disk before it is acknowledged.
 ///
@@ -125,12 +125,87 @@ impl FjallStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let keyspace = Config::new(path).open()?;
         let partition = keyspace.open_partition("spindle", PartitionCreateOptions::default())?;
-        Ok(Self {
+        let store = Self {
             keyspace,
             partition,
-        })
+        };
+        store.check_schema()?;
+        Ok(store)
+    }
+
+    /// Refuse a store this binary cannot read, and stamp one that has no mark.
+    ///
+    /// This is the whole reason the marker exists. Every other key carries the
+    /// key-schema version in its first byte, which means a binary reading a
+    /// store written under a different one scans a prefix that holds nothing
+    /// and concludes the store is empty. An empty store is a plausible thing to
+    /// find, so nothing about that is reported as an error, and the deployment
+    /// starts serving a room whose entire history it simply cannot see. The
+    /// marker turns that silence into a refusal.
+    fn check_schema(&self) -> Result<(), StoreError> {
+        let key = store_marker();
+        match self.get(&key)? {
+            Some(raw) => {
+                let found = SchemaMarker::decode(&raw)?;
+                let supported = SchemaMarker::current();
+                if found != supported {
+                    return Err(StoreError::UnsupportedSchema { found, supported });
+                }
+                Ok(())
+            }
+            // No mark: either a fresh store, or one written before the marker
+            // existed. Both are version 1 by construction -- there has never
+            // been another -- so stamping is correct rather than a guess. Once
+            // a second version exists this arm needs to distinguish them, and
+            // an unmarked non-empty store becomes a migration, not a stamp.
+            None => self.put(&key, &SchemaMarker::current().encode()),
+        }
     }
 }
+
+/// The schema versions a store was written under.
+///
+/// Read before anything else, so it cannot use the record encoding it
+/// describes: a fixed three bytes, and those bytes are frozen forever.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SchemaMarker {
+    pub key_schema: u8,
+    pub record: u8,
+}
+
+impl SchemaMarker {
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            key_schema: KEY_SCHEMA_VERSION,
+            record: RECORD_VERSION,
+        }
+    }
+
+    #[must_use]
+    pub fn encode(self) -> Vec<u8> {
+        // A marker version of its own, so even this can change shape later.
+        vec![MARKER_VERSION, self.key_schema, self.record]
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] if the marker is truncated or of an unknown
+    /// marker version.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        match bytes {
+            [MARKER_VERSION, key_schema, record] => Ok(Self {
+                key_schema: *key_schema,
+                record: *record,
+            }),
+            [version, ..] => Err(CodecError::UnsupportedVersion(*version)),
+            [] => Err(CodecError::Truncated),
+        }
+    }
+}
+
+/// Version of the marker's own three-byte encoding.
+const MARKER_VERSION: u8 = 1;
 
 impl ReadView for FjallStore {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
@@ -422,6 +497,14 @@ pub enum StoreError {
     Codec(CodecError),
     /// Records could not be replayed into a log.
     Restore(RestoreError),
+    /// The store was written under a schema this binary does not speak.
+    ///
+    /// Refusing is the point: the alternative is scanning a prefix that holds
+    /// nothing and reporting an empty store.
+    UnsupportedSchema {
+        found: SchemaMarker,
+        supported: SchemaMarker,
+    },
     /// The entry's materialized state is no longer held in memory.
     ///
     /// Only [`RoomStore::save`] can raise this, and only for a room long enough
@@ -455,6 +538,11 @@ impl std::fmt::Display for StoreError {
             Self::Backend(message) => write!(formatter, "storage backend failed: {message}"),
             Self::Codec(error) => write!(formatter, "unreadable record: {error:?}"),
             Self::Restore(error) => write!(formatter, "could not replay log: {error:?}"),
+            Self::UnsupportedSchema { found, supported } => write!(
+                formatter,
+                "store was written at key schema {}/record {}, this binary speaks {}/{}",
+                found.key_schema, found.record, supported.key_schema, supported.record
+            ),
             Self::StateNotResident { li } => write!(
                 formatter,
                 "state for li {li} has been evicted; use commit_entry per append"
