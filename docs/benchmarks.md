@@ -36,11 +36,73 @@ stale on a runner change. Wall times do.
 | Durability cost: strict vs relaxed | Done (#47) |
 | Our fast path vs `ruma-state-res`, **correctness** | Done (#55), below |
 | Our fast path vs `ruma-state-res`, performance | Done, below — and the result is narrower than the spec implies |
-| `/messages`, `/sync`, join latency vs Synapse and Tuwunel | Needs a server; M1–M3 (#42) |
+| `/messages`, `/sync`, join latency vs Synapse | **Done at M1, below** |
+| The same, vs Tuwunel and Continuwuity | Needs a build of each; M2–M3 (#42) |
 
 Everything here is **algorithmic**, measured inside the library. None of it is a
 server throughput figure and none of it should be quoted as one. Server-to-
 server comparison starts at M1 and is defined in #42.
+
+
+## M1 against Synapse
+
+The first comparison against a real homeserver, run at the M1 milestone. Same
+driver (`scripts/api-benchmark.py`), same workload, same host, back to back.
+Raw results are in `docs/benchmarks/m1-spindle.json` and
+`docs/benchmarks/m1-synapse-1.159.0.json`.
+
+Synapse 1.159.0, every rate limiter disabled — enumerated from its own
+`config/ratelimiting.py` rather than discovered one `429` at a time, because a
+benchmark that trips a throttle is measuring the throttle.
+
+**How much faster Spindle is, by room size:**
+
+| Operation | 100 events | 400 | 1600 |
+|---|---|---|---|
+| `POST /join` | 27.8x | 28.8x | 30.3x |
+| `PUT /send` | 17.4x | 20.2x | 16.6x |
+| `GET /messages` | 5.2x | 5.0x | 5.0x |
+| `GET /state` | 4.0x | 4.9x | 3.4x |
+| `GET /sync` (initial) | 2.1x | 2.1x | 1.9x |
+
+Nothing is slower, at any size.
+
+### What this establishes, and what it does not
+
+**It does not establish the scaling claim.** Both servers are flat across
+100 to 1600 events — Spindle between 0.94x and 1.24x, Synapse between 0.94x
+and 1.18x. A range where both are flat cannot distinguish a linear log from a
+DAG. What these numbers show is a **constant-factor** advantage, which is a
+different claim from the one SPEC §18.1 makes.
+
+Demonstrating the scaling difference needs rooms large enough, and state
+complex enough, for state resolution to cost something: forks, conflicting
+state, and deep history. That is #16's Synapse interop rig, not this.
+
+**A large share of the constant factor is the runtime, not the design.**
+Synapse is Python and Spindle is Rust. Attributing 28x on `/join` to
+linearization would be dishonest; some unknown part of it is simply that one
+of these servers is compiled.
+
+**Synapse ran on SQLite**, which is its default but not what anyone deploys.
+A Postgres-backed Synapse would differ, in both directions: more network
+round-trips per request, better indexing and concurrency.
+
+Single process, single user, no federation, no Postgres, no workers. This is
+the floor of a comparison, not the whole of one.
+
+### The number worth watching
+
+`/sync` is the narrowest margin at 1.9x, and it is the one that had to be
+*fixed* to get there. Before #81 it grew 3.3x from a 100-event room to a
+1600-event one, while every other operation stayed flat — the exact regression
+shape this design claims to avoid, and it was ours. The count started at
+`i64::MIN` for anyone without a read receipt, so every new joiner's first sync
+read every event body in the room.
+
+Flooring the count at the user's own join made it flat and 2.9x faster at 1600
+events. It is still the operation with the least headroom over Synapse, which
+makes it the first place to look next.
 
 ## Method
 

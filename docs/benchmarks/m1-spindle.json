@@ -1,0 +1,102 @@
+{
+  "base_url": "http://127.0.0.1:8099",
+  "benchmarks": {
+    "join/100": {
+      "lower_ns": 1045655.0,
+      "mean_ns": 1457970.0,
+      "samples": 10,
+      "upper_ns": 1994366.0
+    },
+    "join/1600": {
+      "lower_ns": 1138630.0,
+      "mean_ns": 1371449.0,
+      "samples": 10,
+      "upper_ns": 1748684.0
+    },
+    "join/400": {
+      "lower_ns": 1091297.0,
+      "mean_ns": 1430437.0,
+      "samples": 10,
+      "upper_ns": 1864943.0
+    },
+    "messages_page/100": {
+      "lower_ns": 775188.0,
+      "mean_ns": 878585.5,
+      "samples": 10,
+      "upper_ns": 1189107.0
+    },
+    "messages_page/1600": {
+      "lower_ns": 744406.0,
+      "mean_ns": 1088142.5,
+      "samples": 10,
+      "upper_ns": 1449102.0
+    },
+    "messages_page/400": {
+      "lower_ns": 744042.0,
+      "mean_ns": 998063.0,
+      "samples": 10,
+      "upper_ns": 1249591.0
+    },
+    "send/100": {
+      "lower_ns": 1026844.0,
+      "mean_ns": 1488108.0,
+      "samples": 10,
+      "upper_ns": 2217135.0
+    },
+    "send/1600": {
+      "lower_ns": 1341085.0,
+      "mean_ns": 1484517.5,
+      "samples": 10,
+      "upper_ns": 1616721.0
+    },
+    "send/400": {
+      "lower_ns": 934300.0,
+      "mean_ns": 1342419.0,
+      "samples": 10,
+      "upper_ns": 1786462.0
+    },
+    "state/100": {
+      "lower_ns": 556720.0,
+      "mean_ns": 653111.0,
+      "samples": 10,
+      "upper_ns": 867484.0
+    },
+    "state/1600": {
+      "lower_ns": 662383.0,
+      "mean_ns": 802745.0,
+      "samples": 10,
+      "upper_ns": 1126209.0
+    },
+    "state/400": {
+      "lower_ns": 406131.0,
+      "mean_ns": 625805.5,
+      "samples": 10,
+      "upper_ns": 923694.0
+    },
+    "sync_initial/100": {
+      "lower_ns": 1432158.0,
+      "mean_ns": 1696201.5,
+      "samples": 10,
+      "upper_ns": 1811379.0
+    },
+    "sync_initial/1600": {
+      "lower_ns": 1518056.0,
+      "mean_ns": 1721987.0,
+      "samples": 10,
+      "upper_ns": 2181274.0
+    },
+    "sync_initial/400": {
+      "lower_ns": 1397590.0,
+      "mean_ns": 1515342.5,
+      "samples": 10,
+      "upper_ns": 1822605.0
+    }
+  },
+  "samples": 10,
+  "server": "spindle-m1",
+  "sizes": [
+    100,
+    400,
+    1600
+  ]
+}
