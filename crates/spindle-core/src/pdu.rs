@@ -89,10 +89,7 @@ fn required_string<'a>(
     }
 }
 
-fn required_integer(
-    event: &CanonicalJsonObject,
-    field: &'static str,
-) -> Result<i64, PduError> {
+fn required_integer(event: &CanonicalJsonObject, field: &'static str) -> Result<i64, PduError> {
     match event.get(field) {
         Some(CanonicalJsonValue::Integer(value)) => Ok((*value).into()),
         _ => Err(PduError::InvalidField(field)),
