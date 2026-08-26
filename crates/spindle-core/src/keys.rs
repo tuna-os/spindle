@@ -70,6 +70,8 @@ pub enum Keyspace {
     Device = 0x07,
     /// `token_hash` -> access-token record.
     AccessToken = 0x08,
+    /// `token_hash` -> refresh-token record.
+    RefreshToken = 0x09,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes

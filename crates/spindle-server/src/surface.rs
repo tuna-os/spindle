@@ -27,10 +27,22 @@ pub struct SpecVersion {
 /// Deliberately short. `/versions` is the first thing a client asks and the
 /// answer it plans against; a longer list here buys nothing except clients
 /// failing later, further from the cause.
-pub const SPEC_VERSIONS: &[SpecVersion] = &[SpecVersion {
-    name: "v1.1",
-    requires: &["/_matrix/client/versions"],
-}];
+pub const SPEC_VERSIONS: &[SpecVersion] = &[
+    SpecVersion {
+        name: "v1.1",
+        requires: &["/_matrix/client/versions"],
+    },
+    // Refresh tokens are a v1.3 feature. Claimed only now that /refresh exists
+    // and rotates, which is the rule this module is for.
+    SpecVersion {
+        name: "v1.3",
+        requires: &[
+            "/_matrix/client/versions",
+            "/_matrix/client/v3/login",
+            "/_matrix/client/v3/refresh",
+        ],
+    },
+];
 
 /// Room versions this server can create and join.
 ///
