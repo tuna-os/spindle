@@ -52,6 +52,7 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}",
     "/_matrix/client/v3/rooms/{room_id}/event/{event_id}",
+    "/_matrix/client/v3/rooms/{room_id}/context/{event_id}",
     "/_matrix/key/v2/server",
     "/.well-known/matrix/client",
     "/.well-known/matrix/server",
@@ -188,6 +189,10 @@ fn timeline_routes() -> Router<AppState> {
         .route(
             "/_matrix/client/v3/rooms/{room_id}/event/{event_id}",
             get(room_event),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/context/{event_id}",
+            get(room_context),
         )
 }
 
@@ -1375,6 +1380,43 @@ async fn room_event(
 ) -> Result<Json<Value>, MatrixError> {
     let event = state.rooms.event(&room_id, &event_id).map_err(room_error)?;
     Ok(Json(event))
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextQuery {
+    limit: Option<usize>,
+}
+
+/// `GET /_matrix/client/v3/rooms/{room_id}/context/{event_id}`
+///
+/// What a permalink resolves to: the event, a symmetric window either side of
+/// it, and the room's state as it stood there.
+async fn room_context(
+    State(state): State<AppState>,
+    Authenticated(_identity): Authenticated,
+    axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<ContextQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    // The spec's limit is the total window, so each side gets half.
+    let limit = query.limit.unwrap_or(10).clamp(1, 100);
+    let each_side = limit.div_ceil(2);
+
+    let context = state
+        .rooms
+        .context(&room_id, &event_id, each_side)
+        .map_err(room_error)?;
+
+    Ok(Json(json!({
+        "event": context.event,
+        "events_before": context.events_before,
+        "events_after": context.events_after,
+        "state": context.state,
+        // The same `t`-tagged tokens `/messages` pages with, because they are
+        // positions in the same index -- so a client can carry on paginating
+        // outwards from either edge of the window.
+        "start": crate::tokens::Pagination(context.start).to_string(),
+        "end": crate::tokens::Pagination(context.end).to_string(),
+    })))
 }
 
 /// Map a room failure onto the status a client can act on.
