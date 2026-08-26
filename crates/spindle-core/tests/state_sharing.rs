@@ -68,3 +68,36 @@ fn rewriting_a_slot_to_the_same_value_still_shares_the_rest() {
     assert_eq!(after.root(), before.root());
     assert!(after.delta_nodes(Some(&before)).is_empty());
 }
+
+/// `for_each` promises key order, and the server's `/state` renders its
+/// response straight from that walk. The guarantee had no test: removing the
+/// sort passed the entire workspace, because a handful of keys happen to come
+/// out of the trie already in order. It takes enough of them to spread across
+/// the trie's branches before the digest's own arrangement shows through.
+#[test]
+fn for_each_visits_in_key_order_however_the_trie_arranged_them() {
+    let mut snapshot = StateSnapshot::new();
+    for index in 0..256 {
+        snapshot = snapshot.apply(
+            StateKey::new("m.room.member", format!("@user{index:03}:example.org")),
+            format!("$event{index}"),
+        );
+    }
+    // Mixed types too: the order is over the whole key, not the state key alone.
+    for kind in ["m.room.create", "m.room.topic", "m.room.avatar"] {
+        snapshot = snapshot.apply(StateKey::new(kind, ""), format!("${kind}"));
+    }
+
+    let mut seen = Vec::new();
+    snapshot.for_each(|key, _| {
+        seen.push((
+            key.event_type().as_str().to_owned(),
+            key.state_key().to_owned(),
+        ));
+    });
+
+    let mut expected = seen.clone();
+    expected.sort();
+    assert_eq!(seen, expected, "for_each visited entries out of key order");
+    assert_eq!(seen.len(), 259);
+}

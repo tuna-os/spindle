@@ -198,6 +198,102 @@ impl Rooms {
         })
     }
 
+    /// Every current state event of a room, as full events.
+    ///
+    /// This is the one read that is `O(state)` rather than `O(1)`, and it is
+    /// deliberately not on any write path: authorization uses point queries
+    /// into the same snapshot, so sending an event never walks the room. The
+    /// snapshot itself needs no computing — it is the one hanging off the head
+    /// entry, already materialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room is unknown or an event body is
+    /// missing.
+    pub fn state(&self, room_id: &str) -> Result<Vec<Value>, RoomError> {
+        let ids = self.with_room(room_id, |_, log| Ok(current_state(log)))?;
+        let mut events = Vec::with_capacity(ids.len());
+        for (_, event_id) in ids {
+            events.push(self.event(room_id, &event_id)?);
+        }
+        Ok(events)
+    }
+
+    /// The content of one current state event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownState`] when the room has no such state,
+    /// which is a different answer from an empty content and must stay that
+    /// way: a client reading `m.room.topic` needs to tell "no topic" from "a
+    /// topic that is the empty string".
+    pub fn state_event(
+        &self,
+        room_id: &str,
+        event_type: &str,
+        state_key: &str,
+    ) -> Result<Value, RoomError> {
+        let wanted = StateKey::new(event_type, state_key);
+        let found = self.with_room(room_id, |_, log| {
+            Ok(current_state(log)
+                .into_iter()
+                .find(|(key, _)| *key == wanted)
+                .map(|(_, id)| id))
+        })?;
+        let event_id = found.ok_or_else(|| {
+            RoomError::UnknownState(format!("{event_type} with state key {state_key:?}"))
+        })?;
+        let event = self.read_event(room_id, &EventId::new(event_id))?;
+        Ok(event
+            .get("content")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new())))
+    }
+
+    /// Set a state event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room is unknown or the rules refuse it.
+    pub fn set_state(
+        &self,
+        room_id: &str,
+        sender: &str,
+        key: &Ed25519KeyPair,
+        event_type: &str,
+        state_key: &str,
+        content: &Value,
+    ) -> Result<String, RoomError> {
+        self.with_room(room_id, |rooms, log| {
+            rooms.append(
+                log,
+                room_id,
+                sender,
+                key,
+                event_type,
+                Some(state_key),
+                content,
+            )
+        })
+    }
+
+    /// One event by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room or the event is unknown.
+    pub fn event(&self, room_id: &str, event_id: &str) -> Result<Value, RoomError> {
+        // The room has to exist before its events can be looked up, or an
+        // unknown room would answer "no such event" and a client could not
+        // tell the two apart.
+        self.with_room(room_id, |_, _| Ok(()))?;
+        let mut event = self.read_event(room_id, &EventId::new(event_id))?;
+        if let Some(object) = event.as_object_mut() {
+            object.insert("event_id".to_owned(), Value::String(event_id.to_owned()));
+        }
+        Ok(event)
+    }
+
     /// Events in `li` order, newest first, starting below `from`.
     ///
     /// # Errors
@@ -447,6 +543,25 @@ impl Rooms {
     }
 }
 
+/// The room's current state, as `(key, event_id)` pairs.
+fn current_state(log: &RoomLog) -> Vec<(StateKey, String)> {
+    let Some(state) = log
+        .entries()
+        .next_back()
+        .map(|entry| entry.li)
+        .and_then(|li| log.state_after(li))
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(state.len());
+    // Key order comes from `for_each`, which sorts. The trie itself places
+    // entries by hash, so its raw walk order is an artefact of the digest --
+    // sorting again here would be a second copy of a guarantee that already
+    // has one, and one that could silently disagree with it.
+    state.for_each(|key, event_id| out.push((key.clone(), event_id.to_owned())));
+    out
+}
+
 /// Event bodies live beside the log, keyed by room and event ID.
 fn event_body_key(room_id: &str, event_id: &str) -> Vec<u8> {
     let mut key =
@@ -623,6 +738,7 @@ pub enum RoomError {
     Build(String),
     Append(String),
     StateUnavailable(String),
+    UnknownState(String),
     Forbidden(String),
     Storage(StoreError),
     Codec(String),
@@ -650,6 +766,7 @@ impl std::fmt::Display for RoomError {
             Self::StateUnavailable(message) => {
                 write!(formatter, "cannot authorize the event: {message}")
             }
+            Self::UnknownState(what) => write!(formatter, "no {what} in this room"),
             Self::Forbidden(rule) => write!(formatter, "{rule}"),
             Self::Storage(error) => write!(formatter, "storage: {error}"),
             Self::Codec(message) => write!(formatter, "unreadable: {message}"),
