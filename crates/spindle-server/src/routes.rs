@@ -82,6 +82,10 @@ pub fn router(state: AppState) -> Router {
         .route("/_matrix/client/v3/rooms/{room_id}/join", post(join_room))
         .route("/_matrix/client/v3/rooms/{room_id}/leave", post(leave_room))
         .route(
+            "/_matrix/client/v3/rooms/{room_id}/typing/{user_id}",
+            axum::routing::put(set_typing),
+        )
+        .route(
             "/_matrix/client/v3/join/{room_id_or_alias}",
             post(join_room_by_id_or_alias),
         )
@@ -625,6 +629,51 @@ struct SyncQuery {
     timeline_limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+struct TypingRequest {
+    typing: bool,
+    /// Milliseconds. Absent means the server's default; the spec makes it
+    /// optional and clients frequently omit it when stopping.
+    timeout: Option<u64>,
+}
+
+/// `PUT /_matrix/client/v3/rooms/{room_id}/typing/{user_id}`
+///
+/// Nothing is appended. Typing has no linear index and never enters the log:
+/// it is the clearest case in the API of state that is not an event, and
+/// writing it down would mean a restart could restore a claim about the
+/// present that is no longer true.
+async fn set_typing(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((room_id, user_id)): axum::extract::Path<(String, String)>,
+    Json(request): Json<TypingRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    // Only about yourself. The path carries a user ID because the endpoint's
+    // shape allows an application service to type as a user it owns; for
+    // anyone else it can only ever be their own.
+    if identity.user_id != user_id {
+        return Err(MatrixError::forbidden(
+            "you can only say that you are typing",
+        ));
+    }
+    let joined = state.rooms.joined(&identity.user_id).map_err(room_error)?;
+    if !joined.iter().any(|room| room == &room_id) {
+        return Err(MatrixError::forbidden(format!(
+            "{user_id} is not in {room_id}"
+        )));
+    }
+    let timeout = request
+        .timeout
+        .map_or(crate::typing::DEFAULT_TIMEOUT, |ms| {
+            std::time::Duration::from_millis(ms)
+        });
+    state
+        .typing
+        .set(&room_id, &user_id, request.typing, timeout);
+    Ok(Json(json!({})))
+}
+
 /// `GET /_matrix/client/v3/sync`
 ///
 /// The token is a position in the server-global stream (SPEC §10.2), because
@@ -657,7 +706,15 @@ async fn sync(
     if let Some(since) = since {
         let timeout = std::time::Duration::from_millis(query.timeout.unwrap_or(0).min(60_000));
         if result.rooms.is_empty() && !timeout.is_zero() {
-            state.rooms.wait_for_event(timeout).await;
+            // Either an appended event or a change in who is typing ends the
+            // wait. Typing is not an event and has no stream position, so it
+            // cannot be discovered by re-reading the log -- without this arm a
+            // client would learn that someone started typing only when they
+            // stopped and sent the message.
+            tokio::select! {
+                () = state.rooms.wait_for_event(timeout) => {}
+                () = state.typing.wait(timeout) => {}
+            }
             result = state
                 .rooms
                 .sync(&identity.user_id, Some(since), timeline_limit)
@@ -671,6 +728,7 @@ async fn sync(
             .rooms
             .unread(&room.room_id, &identity.user_id)
             .map_err(room_error)?;
+        let typing = state.typing.event(&room.room_id);
         join.insert(
             room.room_id,
             json!({
@@ -679,11 +737,28 @@ async fn sync(
                     "limited": room.limited,
                 },
                 "state": { "events": room.state },
+                "ephemeral": {
+                    "events": typing.map(|event| vec![event]).unwrap_or_default(),
+                },
                 "unread_notifications": {
                     "notification_count": unread.notification_count,
                 },
             }),
         );
+    }
+
+    // A room where the only news is that someone is typing has no timeline
+    // events, so `Rooms::sync` leaves it out -- correctly, since it knows
+    // nothing about typing. Adding it back here is what keeps typing out of
+    // the log layer entirely, which is where it belongs.
+    for room_id in state.rooms.joined(&identity.user_id).map_err(room_error)? {
+        if join.contains_key(&room_id) {
+            continue;
+        }
+        let Some(typing) = state.typing.event(&room_id) else {
+            continue;
+        };
+        join.insert(room_id, json!({ "ephemeral": { "events": [typing] } }));
     }
     let mut invite = serde_json::Map::new();
     for room_id in result.invited {
