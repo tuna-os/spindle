@@ -1,0 +1,20 @@
+[workspace]
+members = ["crates/spindle-core"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+repository = "https://github.com/hanthor/spindle"
+
+[workspace.dependencies]
+blake3 = "1.8"
+proptest = "1.7"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "deny"
+pedantic = "deny"
+
