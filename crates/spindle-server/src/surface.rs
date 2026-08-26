@@ -75,6 +75,7 @@ pub const ROOM_VERSION_REQUIRES: &[&str] = &[
     "/_matrix/client/v3/rooms/{room_id}/leave",
     "/_matrix/client/v3/rooms/{room_id}/state",
     "/_matrix/client/v3/sync",
+    "/_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}",
 ];
 
 /// Unstable features. Same rule: nothing here that is not built.

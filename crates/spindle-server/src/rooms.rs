@@ -62,6 +62,19 @@ pub struct Rooms {
     appended: tokio::sync::Notify,
 }
 
+/// A user's position in a room.
+pub struct Receipt {
+    pub event_id: String,
+    pub li: i64,
+    pub ts: u64,
+}
+
+/// What a client shows as a badge.
+pub struct Unread {
+    pub notification_count: usize,
+    pub read_up_to: Option<String>,
+}
+
 /// What one `/sync` call found.
 pub struct SyncResult {
     pub next_batch: u64,
@@ -390,6 +403,125 @@ impl Rooms {
     /// Returns [`RoomError`] if the index cannot be read.
     pub fn joined(&self, user_id: &str) -> Result<Vec<String>, RoomError> {
         self.membership_rooms(user_id, JOIN)
+    }
+
+    /// Record that `user_id` has read up to `event_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] if the room does not exist, or
+    /// [`RoomError::MissingBody`] if the event is not one of its events — a
+    /// receipt for an event the room does not have would set an unread
+    /// boundary at a position that means nothing.
+    pub fn set_receipt(
+        &self,
+        room_id: &str,
+        user_id: &str,
+        receipt_type: &str,
+        event_id: &str,
+    ) -> Result<(), RoomError> {
+        let li = self
+            .with_room(room_id, |_, log| {
+                Ok(log.get(&EventId::new(event_id)).map(|entry| entry.li.get()))
+            })?
+            .ok_or_else(|| RoomError::MissingBody(event_id.to_owned()))?;
+
+        spindle_store::Store::put(
+            self.store.as_ref(),
+            &receipt_key(room_id, user_id, receipt_type),
+            &ReceiptRecord {
+                event_id: event_id.to_owned(),
+                li,
+                ts: now_ms(),
+            }
+            .encode(),
+        )?;
+        Ok(())
+    }
+
+    /// How many events a user has not read, and where they read up to.
+    ///
+    /// **The unread boundary is arithmetic, not a traversal.** Every accepted
+    /// event holds a linear index, and the occupied range is contiguous --
+    /// backfill fills `0, -1, -2, …` while live events fill `1, 2, 3, …`, so
+    /// the two meet rather than leaving a hole. "Which events come after this
+    /// one" is therefore `head - receipt`, exactly, including for a receipt on
+    /// backfilled history. A DAG server answers the same question by ordering
+    /// a graph first.
+    ///
+    /// The *count* still reads the events, because not everything in that
+    /// range notifies: a user's own messages do not, and neither do state
+    /// events. That is a scan of a contiguous range rather than a graph walk,
+    /// and it is proportional to how far behind the user is -- which is a real
+    /// cost for a long-absent one, and the reason SPEC §15's per-room executor
+    /// eventually caches it.
+    ///
+    /// Push rules are not applied, because there are none yet (#7 lists them
+    /// separately). Until then every message from somebody else counts, which
+    /// is an over-count for a room with a mute rule and the honest behaviour
+    /// for a server that has no rules to consult.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room or its events cannot be read.
+    pub fn unread(&self, room_id: &str, user_id: &str) -> Result<Unread, RoomError> {
+        let read_up_to = self.receipt(room_id, user_id, "m.read")?;
+        // No receipt means nothing has been read, so the boundary sits below
+        // every index the log can hold -- including backfilled history, which
+        // is why this is `i64::MIN` and not zero.
+        let boundary = read_up_to.as_ref().map_or(i64::MIN, |receipt| receipt.li);
+
+        // Which events are after the receipt: arithmetic on the index, no
+        // ordering step. Walking backwards from the head and stopping at the
+        // boundary touches exactly the unread ones.
+        let unread_ids = self.with_room(room_id, |_, log| {
+            Ok(log
+                .entries()
+                .rev()
+                .take_while(|entry| entry.li.get() > boundary)
+                .filter(|entry| entry.state_key.is_none())
+                .map(|entry| entry.event_id.as_str().to_owned())
+                .collect::<Vec<_>>())
+        })?;
+
+        let mut notification_count = 0;
+        for id in unread_ids {
+            // The sender lives in the body, so this is the part that reads.
+            let event = self.read_event(room_id, &EventId::new(id.as_str()))?;
+            if event["sender"].as_str() != Some(user_id) {
+                notification_count += 1;
+            }
+        }
+
+        Ok(Unread {
+            notification_count,
+            read_up_to: read_up_to.map(|receipt| receipt.event_id),
+        })
+    }
+
+    /// One user's receipt of one type, if they have set it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the record cannot be read.
+    pub fn receipt(
+        &self,
+        room_id: &str,
+        user_id: &str,
+        receipt_type: &str,
+    ) -> Result<Option<Receipt>, RoomError> {
+        let Some(raw) = spindle_store::ReadView::get(
+            self.store.as_ref(),
+            &receipt_key(room_id, user_id, receipt_type),
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(ReceiptRecord::decode(&raw).map(|record| Receipt {
+            event_id: record.event_id,
+            li: record.li,
+            ts: record.ts,
+        }))
     }
 
     /// The current global stream position.
@@ -769,6 +901,41 @@ fn current_state(log: &RoomLog) -> Vec<(StateKey, String)> {
     // has one, and one that could silently disagree with it.
     state.for_each(|key, event_id| out.push((key.clone(), event_id.to_owned())));
     out
+}
+
+/// Receipts live per room, per user, per type.
+fn receipt_key(room_id: &str, user_id: &str, receipt_type: &str) -> Vec<u8> {
+    let mut key = spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::Receipt, room_id);
+    // Length-prefixed for the same reason room and user keys are: `@ab` must
+    // not be read as `@a` followed by a type beginning `b`.
+    let user = user_id.as_bytes();
+    key.extend_from_slice(&u16::try_from(user.len()).unwrap_or(u16::MAX).to_be_bytes());
+    key.extend_from_slice(user);
+    key.extend_from_slice(receipt_type.as_bytes());
+    key
+}
+
+struct ReceiptRecord {
+    event_id: String,
+    li: i64,
+    ts: u64,
+}
+
+impl ReceiptRecord {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16 + self.event_id.len());
+        out.extend_from_slice(&self.li.to_be_bytes());
+        out.extend_from_slice(&self.ts.to_be_bytes());
+        out.extend_from_slice(self.event_id.as_bytes());
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let li = i64::from_be_bytes(bytes.get(..8)?.try_into().ok()?);
+        let ts = u64::from_be_bytes(bytes.get(8..16)?.try_into().ok()?);
+        let event_id = String::from_utf8(bytes.get(16..)?.to_vec()).ok()?;
+        Some(Self { event_id, li, ts })
+    }
 }
 
 /// Event bodies live beside the log, keyed by room and event ID.
