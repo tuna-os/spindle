@@ -3,7 +3,10 @@
 use proptest::prelude::*;
 use spindle_core::{
     EventInput, LinearIndex, RoomLog, StateSnapshot,
-    keys::{Keyspace, from_order_preserving, li_from_key, order_preserving, room_li, room_prefix},
+    keys::{
+        Keyspace, from_order_preserving, li_from_key, order_preserving, room_from_user_room,
+        room_li, room_prefix, user_prefix, user_room,
+    },
 };
 
 proptest! {
@@ -73,8 +76,18 @@ fn a_rooms_keys_scan_in_log_order_across_the_sign_boundary() {
 
 #[test]
 fn one_rooms_range_never_walks_into_another() {
-    // The classic prefix bug: "!a" is a prefix of "!ab", so without a length
-    // prefix a scan of the first would run into the second.
+    // The classic prefix bug, with a pair that actually collides. `!a` and
+    // `!ab` do *not*: their IDs diverge at `:` versus `b`, so this assertion
+    // held whether or not the length prefix existed and proved nothing. Two
+    // rooms on servers whose names nest are the real case, and one a
+    // federating server meets as soon as it stores a remote room.
+    let short = room_prefix(Keyspace::Log, "!a:example.org");
+    let long = room_prefix(Keyspace::Log, "!a:example.org.uk");
+    assert!(
+        !long.starts_with(&short),
+        "a scan of !a:example.org would walk into !a:example.org.uk"
+    );
+
     let short = room_prefix(Keyspace::Log, "!a:example.org");
     let long = room_prefix(Keyspace::Log, "!ab:example.org");
     assert!(!long.starts_with(&short));
@@ -120,4 +133,43 @@ fn every_key_carries_the_schema_version() {
     let key = room_li(Keyspace::Log, "!room:example.org", LinearIndex::from_raw(7));
     assert_eq!(key[0], spindle_core::keys::KEY_SCHEMA_VERSION);
     assert_eq!(key[1], Keyspace::Log as u8);
+}
+
+/// The membership index is keyed by user, so it has the same prefix hazard the
+/// room keys do — and the same fix. Two users whose server names nest is not a
+/// contrived case: it is what a federating server stores the first time it
+/// sees a remote member.
+#[test]
+fn one_users_membership_range_never_walks_into_another() {
+    let short = user_prefix(Keyspace::Membership, "@a:example.org");
+    let long = user_prefix(Keyspace::Membership, "@a:example.org.uk");
+    assert!(
+        !long.starts_with(&short),
+        "a scan of @a:example.org would walk into @a:example.org.uk"
+    );
+
+    // The concrete consequence: one user's rooms must not appear in another's
+    // scan, which is what `/joined_rooms` would otherwise leak.
+    let theirs = user_room(
+        Keyspace::Membership,
+        "@a:example.org.uk",
+        "!secret:example.org.uk",
+    );
+    assert!(!theirs.starts_with(&short));
+
+    // And a user's own rooms are all inside their own prefix, so the scan that
+    // must not over-reach must also not under-reach.
+    let mine = user_room(Keyspace::Membership, "@a:example.org", "!mine:example.org");
+    assert!(mine.starts_with(&short));
+    assert_eq!(
+        room_from_user_room("@a:example.org", &mine).as_deref(),
+        Some("!mine:example.org")
+    );
+
+    // Reading a key back with the wrong user is not merely empty -- it must
+    // not yield a plausible-looking room ID that a caller would then trust.
+    assert_ne!(
+        room_from_user_room("@b:example.org", &mine).as_deref(),
+        Some("!mine:example.org")
+    );
 }
