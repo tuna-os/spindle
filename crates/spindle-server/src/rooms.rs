@@ -93,6 +93,16 @@ pub struct Unread {
     pub read_up_to: Option<String>,
 }
 
+/// The events around one event, and the state there.
+pub struct Context {
+    pub event: Value,
+    pub events_before: Vec<Value>,
+    pub events_after: Vec<Value>,
+    pub state: Vec<Value>,
+    pub start: i64,
+    pub end: i64,
+}
+
 /// What one `/sync` call found.
 pub struct SyncResult {
     pub next_batch: u64,
@@ -552,6 +562,130 @@ impl Rooms {
             out.push(event);
         }
         Ok((out, next))
+    }
+
+    /// The events around one event, and the room's state as it stood there.
+    ///
+    /// SPEC §10.5 in one line: "`/context` is a symmetric scan around it and
+    /// `state_at(li)` for the state block". Both halves are cheap here for the
+    /// same reason.
+    ///
+    /// **The window is arithmetic.** "The events around this one" is
+    /// `li - n ..= li + n` over a contiguous range, because ordering was
+    /// decided once at write. A DAG server has to establish that order before
+    /// it can answer at all — which is the same reason `/messages` was the
+    /// endpoint SPEC §10.4 singles out.
+    ///
+    /// **The state is the trie root that entry already carries.** Every
+    /// `LogEntry` holds the content address of the state after it, and the
+    /// nodes are content-addressed in the store, so state at an arbitrary past
+    /// point is a rehydrate rather than a replay. That works at any depth,
+    /// not only inside the resident window — a permalink to a five-year-old
+    /// message gets the display names people actually had then.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room or the event is unknown, or the state
+    /// nodes it names cannot be read.
+    pub fn context(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        limit: usize,
+    ) -> Result<Context, RoomError> {
+        let found = self.with_room(room_id, |_, log| {
+            let Some(entry) = log.get(&EventId::new(event_id)) else {
+                return Ok(None);
+            };
+            let target = entry.li.get();
+            let state_root = entry.state_root;
+
+            // Symmetric, and each side stops at the end of the log rather than
+            // running off it.
+            let before: Vec<String> = log
+                .entries()
+                .rev()
+                .filter(|entry| entry.li.get() < target)
+                .take(limit)
+                .map(|entry| entry.event_id.as_str().to_owned())
+                .collect();
+            let after: Vec<String> = log
+                .entries()
+                .filter(|entry| entry.li.get() > target)
+                .take(limit)
+                .map(|entry| entry.event_id.as_str().to_owned())
+                .collect();
+
+            // The oldest and newest positions this window reached, which are
+            // where a client paginates on from.
+            let start = before.last().map_or(target, |id| {
+                log.get(&EventId::new(id.as_str()))
+                    .map_or(target, |entry| entry.li.get())
+            });
+            let end = after.last().map_or(target, |id| {
+                log.get(&EventId::new(id.as_str()))
+                    .map_or(target, |entry| entry.li.get())
+            });
+            Ok(Some((before, after, start, end, state_root)))
+        })?;
+
+        let Some((before, after, start, end, state_root)) = found else {
+            return Err(RoomError::MissingBody(event_id.to_owned()));
+        };
+
+        let mut events_before = Vec::with_capacity(before.len());
+        for id in before {
+            events_before.push(self.event(room_id, &id)?);
+        }
+        let mut events_after = Vec::with_capacity(after.len());
+        for id in after {
+            events_after.push(self.event(room_id, &id)?);
+        }
+
+        Ok(Context {
+            event: self.event(room_id, event_id)?,
+            events_before,
+            events_after,
+            state: self.state_at(room_id, state_root)?,
+            start,
+            end,
+        })
+    }
+
+    /// The room's state at a past point, rebuilt from its content address.
+    ///
+    /// Not from the resident window: that bounds what is kept *materialized*,
+    /// and this is a read path where paying to rebuild is the right trade. The
+    /// nodes are content-addressed and shared, so an old state that differs
+    /// from a newer one by a single entry costs a handful of node reads rather
+    /// than a full copy — the property SPEC §6.1 claims and the reason the
+    /// trie is a trie.
+    fn state_at(
+        &self,
+        room_id: &str,
+        root: spindle_core::StateRoot,
+    ) -> Result<Vec<Value>, RoomError> {
+        let mut load = |address: &spindle_core::StateRoot| {
+            spindle_store::ReadView::get(
+                self.store.as_ref(),
+                &spindle_core::keys::content_addressed(
+                    spindle_core::keys::Keyspace::StateNode,
+                    address.as_bytes(),
+                ),
+            )
+            .ok()
+            .flatten()
+        };
+        let snapshot = spindle_core::StateSnapshot::rehydrate(root, &mut load)
+            .map_err(|error| RoomError::Build(format!("cannot rebuild state: {error:?}")))?;
+
+        let mut ids = Vec::with_capacity(snapshot.len());
+        snapshot.for_each(|_, event_id| ids.push(event_id.to_owned()));
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(self.event(room_id, &id)?);
+        }
+        Ok(out)
     }
 
     /// Events in `li` order, newest first, starting below `from`.
