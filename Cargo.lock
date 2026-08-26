@@ -1195,7 +1195,9 @@ dependencies = [
  "js_int",
  "js_option",
  "ruma-common",
+ "ruma-events",
  "ruma-signatures",
+ "ruma-state-res",
  "web-time",
 ]
 
@@ -1222,6 +1224,27 @@ dependencies = [
  "time",
  "tracing",
  "url",
+ "web-time",
+ "wildmatch",
+ "zeroize",
+]
+
+[[package]]
+name = "ruma-events"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85d2f90830fc131691349b96a69ff53444eb6c3e8dc7869c77961b43cfaf3344"
+dependencies = [
+ "as_variant",
+ "indexmap",
+ "js_int",
+ "js_option",
+ "ruma-common",
+ "ruma-macros",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
  "web-time",
  "wildmatch",
  "zeroize",
@@ -1268,6 +1291,22 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "ruma-state-res"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0301d24b3e3f570aa5a37fbeaf829fd68e1a395e9d7a1efef5d2d9d79354ae9d"
+dependencies = [
+ "js_int",
+ "ruma-common",
+ "ruma-events",
+ "ruma-signatures",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]

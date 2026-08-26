@@ -12,7 +12,8 @@ only reports its wins is not evidence (#34).
 | Structural sharing: nodes created per update | Done, asserted as a test |
 | Storage append and reopen at a million events | Done (#47) |
 | Durability cost: strict vs relaxed | Done (#47) |
-| **Our state handling vs `ruma-state-res`** | **Not yet — see below** |
+| Our fast path vs `ruma-state-res`, **correctness** | Done (#55), below |
+| **Our fast path vs `ruma-state-res`, performance** | **Not yet — see below** |
 | `/messages`, `/sync`, join latency vs Synapse and Tuwunel | Needs a server; M1–M3 (#42) |
 
 Everything here is **algorithmic**, measured inside the library. None of it is a
@@ -117,18 +118,43 @@ documents as not yet implemented. It is printed rather than asserted: it is
 dominated by host fsync latency and varies by orders of magnitude between an
 NVMe workstation and a shared runner.
 
-## Still to do: `ruma-state-res`
+## `ruma-state-res`: correctness compared, performance not
 
-The comparison that tests the project's headline claim — our state handling
-against the state resolution v2 implementation Conduit, Continuwuity and
-Tuwunel actually run — is **not done**.
+The comparison that tests the project's headline claim is against
+`ruma-state-res` — the state resolution v2 implementation Conduit, Continuwuity
+and Tuwunel actually run. It has two halves, and only one is done.
 
-`ruma-state-res` is reachable through ruma's `state-res` feature, but its
-`resolve()` needs a caller-supplied `Event` implementation plus valid state maps
-and auth chains for a real room. The crate's own test helpers are gated behind a
-private `__criterion` feature and cannot be used from outside, so a faithful
-harness has to construct a spec-valid room graph by hand. That is the remaining
-work in #34.
+**Correctness: done (#55).** `crates/spindle-core/tests/state_res_equivalence.rs`
+resolves the same fork twice, once through our window-bounded path and once
+through `resolve()`, and asserts the two agree. This is SPEC §19.2's oracle, and
+it is the first thing in this repository that compares Spindle against another
+implementation's code.
 
-Worth stating plainly so the gap is not mistaken for a result: **nothing here
-compares Spindle against another homeserver's code.**
+Getting there meant building what ruma does not export. `resolve()` needs a
+caller-supplied `Event` implementation plus valid state maps and auth chains for
+a real room; the crate's own helpers are gated behind a private `__criterion`
+feature unreachable from outside. So `tests/oracle/` constructs a spec-valid v11
+room by hand, wiring auth events per the v11 selection rules — which matters,
+because `resolve()` walks auth chains to build its conflicted subgraph, and a
+room naming the wrong auth events resolves wrongly in ways that look like a bug
+in whatever it is being compared against.
+
+The scope of the claim is narrower than "we match state resolution", and saying
+so is the point of this document. Spindle only claims to skip state resolution
+for SPEC §9.2's cases 1 and 2 — a fork whose sides touched disjoint state slots.
+A same-slot conflict is case 3, which we hand to `ruma-state-res`, so agreement
+there is trivial and proves nothing. The tested claim is: *for every fork the
+fast path claims to handle without state resolution, the reference resolver
+agrees.*
+
+The oracle was checked against a deliberate regression rather than trusted
+because it passed. Replacing our merge with a plausible wrong implementation —
+"take the first parent's state" — makes it fail with our side missing a
+membership event the reference keeps.
+
+**Performance: not done.** Nothing here times our path against `resolve()`, so
+no speed claim against another implementation is supported yet. That is the
+remaining work in #34, and the harness it was blocked on now exists.
+
+Worth stating plainly so the gap is not mistaken for a result: **no measurement
+in this document compares Spindle's speed against another homeserver's code.**
