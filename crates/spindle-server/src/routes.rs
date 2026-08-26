@@ -1018,6 +1018,19 @@ struct SyncQuery {
     #[serde(rename = "timeline_limit")]
     timeline_limit: Option<usize>,
     filter: Option<String>,
+    /// MSC4222. Accepted under the unstable name too, because the MSC shipped
+    /// in clients before it was adopted and both spellings are in the wild.
+    #[serde(rename = "use_state_after")]
+    use_state_after: Option<bool>,
+    #[serde(rename = "org.matrix.msc4222.use_state_after")]
+    unstable_use_state_after: Option<bool>,
+}
+
+impl SyncQuery {
+    /// Whether to label the state block `state_after` (MSC4222).
+    fn state_after(&self) -> bool {
+        self.use_state_after.or(self.unstable_use_state_after) == Some(true)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1641,7 +1654,13 @@ async fn sync(
         }
     }
 
-    let join = sync_join(&state, &identity, result.rooms, filter.as_ref())?;
+    let join = sync_join(
+        &state,
+        &identity,
+        result.rooms,
+        filter.as_ref(),
+        query.state_after(),
+    )?;
 
     let mut invite = serde_json::Map::new();
     for room_id in result.invited {
@@ -1716,6 +1735,7 @@ fn sync_join(
     identity: &crate::accounts::Identity,
     rooms: Vec<crate::rooms::SyncRoom>,
     filter: Option<&crate::filters::Filter>,
+    state_after: bool,
 ) -> Result<serde_json::Map<String, Value>, MatrixError> {
     let mut join = serde_json::Map::new();
     for room in rooms {
@@ -1750,23 +1770,39 @@ fn sync_join(
             room_filter.and_then(|room| room.account_data.as_ref()),
             room_data,
         );
-        join.insert(
-            room.room_id,
+        let mut entry = serde_json::Map::new();
+        entry.insert(
+            "timeline".to_owned(),
+            json!({ "events": events, "limited": room.limited }),
+        );
+        // MSC4222 renames the block rather than changing what is in it, *for
+        // this server*. What we send is already the state at the end of the
+        // timeline -- it is read from the head entry's own snapshot, which is
+        // exactly what `state_after` is defined to mean. A DAG server has to
+        // compute that; here it is the thing that was already materialized.
+        //
+        // So the flag changes the label, and the label is the part that was
+        // wrong: `state` promises the state *before* the timeline, which is
+        // not what this server was ever sending.
+        entry.insert(
+            if state_after { "state_after" } else { "state" }.to_owned(),
+            json!({ "events": room_state }),
+        );
+        entry.insert("account_data".to_owned(), json!({ "events": room_data }));
+        entry.insert(
+            "ephemeral".to_owned(),
             json!({
-                "timeline": { "events": events, "limited": room.limited },
-                "state": { "events": room_state },
-                "account_data": { "events": room_data },
-                "ephemeral": {
-                    "events": crate::filters::Filter::apply(
-                        room_filter.and_then(|room| room.ephemeral.as_ref()),
-                        typing.map(|event| vec![event]).unwrap_or_default(),
-                    ),
-                },
-                "unread_notifications": {
-                    "notification_count": unread.notification_count,
-                },
+                "events": crate::filters::Filter::apply(
+                    room_filter.and_then(|room| room.ephemeral.as_ref()),
+                    typing.map(|event| vec![event]).unwrap_or_default(),
+                ),
             }),
         );
+        entry.insert(
+            "unread_notifications".to_owned(),
+            json!({ "notification_count": unread.notification_count }),
+        );
+        join.insert(room.room_id, Value::Object(entry));
     }
 
     // A room where the only news is that someone is typing has no timeline
