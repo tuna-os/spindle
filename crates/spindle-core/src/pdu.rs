@@ -39,7 +39,7 @@ impl Pdu {
             .ok_or_else(|| PduError::UnsupportedRoomVersion(room_version.to_string()))?;
         hash_and_sign_event(server_name, key_pair, &mut canonical, &rules.redaction)
             .map_err(|error| PduError::Signing(error.to_string()))?;
-        let hash = reference_hash(&canonical, &rules.redaction)
+        let hash = reference_hash(&canonical, &rules)
             .map_err(|error| PduError::Signing(error.to_string()))?;
 
         Ok(Self {
