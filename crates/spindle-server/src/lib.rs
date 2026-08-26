@@ -12,6 +12,7 @@ pub mod config;
 pub mod errors;
 pub mod ratelimit;
 pub mod routes;
+pub mod signing;
 pub mod surface;
 
 use std::sync::Arc;
@@ -27,14 +28,24 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub store: Arc<FjallStore>,
     pub limiter: Arc<ratelimit::RateLimiter>,
+    pub key: Arc<signing::ServerKey>,
 }
 
 /// Build the HTTP application.
-pub fn app(config: Config, store: Arc<FjallStore>) -> Router {
+///
+/// # Errors
+///
+/// Returns [`signing::SigningError`] if the server's signing key can be neither
+/// loaded nor created. Fatal rather than degraded: a server without a key
+/// cannot create a single valid event, so starting anyway would mean accepting
+/// writes it can only produce invalid results for.
+pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, signing::SigningError> {
+    let key = Arc::new(signing::ServerKey::load_or_create(store.as_ref())?);
     let state = AppState {
         config: Arc::new(config),
         store,
         limiter: Arc::new(ratelimit::RateLimiter::new()),
+        key,
     };
-    routes::router(state)
+    Ok(routes::router(state))
 }

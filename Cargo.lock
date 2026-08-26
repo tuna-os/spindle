@@ -1830,6 +1830,7 @@ dependencies = [
  "axum",
  "blake3",
  "rand 0.8.8",
+ "ruma",
  "serde",
  "serde_json",
  "spindle-core",

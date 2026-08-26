@@ -72,6 +72,8 @@ pub enum Keyspace {
     AccessToken = 0x08,
     /// `token_hash` -> refresh-token record.
     RefreshToken = 0x09,
+    /// `key_id` -> this server's signing key.
+    ServerKey = 0x0a,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes

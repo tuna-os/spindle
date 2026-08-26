@@ -58,7 +58,16 @@ async fn main() -> ExitCode {
     };
 
     tracing::info!("spindle listening on {bind} as {name}");
-    let app = spindle_server::app(config, store);
+    // The key is established before the listener accepts anything. A server
+    // that binds and then discovers it cannot sign has already told a client it
+    // was ready to take events it cannot create.
+    let app = match spindle_server::app(config, store) {
+        Ok(app) => app,
+        Err(error) => {
+            tracing::error!("cannot establish the server signing key: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     // into_make_service_with_connect_info, so the rate limiter can see peer
     // addresses. Without it every request looks like it came from nowhere and
     // the per-source limit collapses onto one key.

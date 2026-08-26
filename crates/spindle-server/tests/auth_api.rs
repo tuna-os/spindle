@@ -27,14 +27,14 @@ impl Harness {
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
-        let app = spindle_server::app(Self::config(), store);
+        let app = spindle_server::app(Self::config(), store).expect("a signing key is established");
         Self { _dir: dir, app }
     }
 
     /// A harness over storage that already exists, as a restart would open it.
     fn reopen(path: &std::path::Path) -> Self {
         let store = Arc::new(FjallStore::open(path).unwrap());
-        let app = spindle_server::app(Self::config(), store);
+        let app = spindle_server::app(Self::config(), store).expect("a signing key is established");
         Self {
             _dir: TempDir::new().unwrap(),
             app,
