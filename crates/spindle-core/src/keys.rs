@@ -111,6 +111,12 @@ pub enum Keyspace {
     /// carries a zero length, which no room key can, so a scan for the global
     /// kind cannot walk into a room's.
     AccountData = 0x10,
+    /// `room_alias` -> the room it names, plus who claimed it.
+    ///
+    /// Keyed by the alias rather than by the room, because resolving one is
+    /// the hot direction: every `/join/#room:server` is a point lookup here,
+    /// while listing a room's aliases is rare enough to pay for a scan.
+    Alias = 0x11,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -308,6 +314,38 @@ pub fn account_data_type(user_id: &str, room_id: &str, key: &[u8]) -> Option<Str
     let prefix = account_data_prefix(user_id, room_id);
     let event_type = key.strip_prefix(prefix.as_slice())?;
     String::from_utf8(event_type.to_vec()).ok()
+}
+
+/// One alias's key.
+///
+/// Length-prefixed like every other variable-length component, for the reason
+/// [`room_prefix`] gives -- though here there is nothing after the alias, so
+/// the prefix buys prefix-scan safety rather than unambiguous parsing. Aliases
+/// are scanned by nothing today; the consistency is worth more than the two
+/// bytes.
+#[must_use]
+pub fn alias(room_alias: &str) -> Vec<u8> {
+    let alias = room_alias.as_bytes();
+    let len = u16::try_from(alias.len()).unwrap_or(u16::MAX);
+    let mut key = Vec::with_capacity(4 + alias.len());
+    key.push(KEY_SCHEMA_VERSION);
+    key.push(Keyspace::Alias as u8);
+    key.extend_from_slice(&len.to_be_bytes());
+    key.extend_from_slice(&alias[..len as usize]);
+    key
+}
+
+/// The prefix every alias key shares, for scanning them all.
+#[must_use]
+pub fn alias_prefix() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::Alias as u8]
+}
+
+/// The alias an [`alias`] key encodes.
+#[must_use]
+pub fn alias_from_key(key: &[u8]) -> Option<String> {
+    let len = u16::from_be_bytes(key.get(2..4)?.try_into().ok()?) as usize;
+    String::from_utf8(key.get(4..4 + len)?.to_vec()).ok()
 }
 
 /// `(room_id, li)` key, ordered by `li` within a room.

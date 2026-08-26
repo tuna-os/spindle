@@ -11,6 +11,7 @@ pub mod accounts;
 pub mod auth;
 pub mod authorize;
 pub mod config;
+pub mod directory;
 pub mod errors;
 pub mod push_rules;
 pub mod ratelimit;
@@ -38,6 +39,7 @@ pub struct AppState {
     pub rooms: Arc<rooms::Rooms>,
     pub typing: Arc<typing::Typing>,
     pub account_data: Arc<account_data::AccountData>,
+    pub directory: Arc<directory::Directory>,
 }
 
 /// Build the HTTP application.
@@ -58,6 +60,10 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, signing::Si
         config.ratelimit.enabled,
     ));
     let account_data = Arc::new(account_data::AccountData::new(Arc::clone(&store)));
+    let directory = Arc::new(directory::Directory::new(
+        Arc::clone(&store),
+        config.server.name.clone(),
+    ));
     let state = AppState {
         config: Arc::new(config),
         store,
@@ -66,6 +72,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, signing::Si
         rooms,
         typing: Arc::new(typing::Typing::new()),
         account_data,
+        directory,
     };
     Ok(routes::router(state))
 }

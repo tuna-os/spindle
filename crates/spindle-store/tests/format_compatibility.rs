@@ -157,6 +157,7 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::Relation, 0x0e),
         (Keyspace::Forgotten, 0x0f),
         (Keyspace::AccountData, 0x10),
+        (Keyspace::Alias, 0x11),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(

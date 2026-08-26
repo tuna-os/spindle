@@ -148,6 +148,14 @@ fn room_routes() -> Router<AppState> {
             post(join_room_by_id_or_alias),
         )
         .route(
+            "/_matrix/client/v3/directory/room/{room_alias}",
+            get(resolve_alias).put(create_alias).delete(delete_alias),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/aliases",
+            get(room_aliases),
+        )
+        .route(
             "/_matrix/client/v3/rooms/{room_id}/typing/{user_id}",
             axum::routing::put(set_typing),
         )
@@ -751,15 +759,149 @@ async fn join_room(
 
 /// `POST /_matrix/client/v3/join/{room_id_or_alias}`
 ///
-/// Aliases do not resolve yet, so this accepts room IDs only and says so
-/// rather than pretending: an alias returns `M_NOT_FOUND` from the room lookup
-/// below, which is the truthful answer for a name this server cannot resolve.
+/// Takes either form. An alias is resolved through the directory first; a room
+/// ID is used as it stands.
+///
+/// The two are told apart by their sigil rather than by trying one and falling
+/// back to the other. A fallback would turn "this alias points nowhere" into
+/// "no such room", which is a different fault with a different fix: one is a
+/// directory that needs an entry, the other is a room that does not exist.
 async fn join_room_by_id_or_alias(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
     axum::extract::Path(room_id_or_alias): axum::extract::Path<String>,
 ) -> Result<Json<Value>, MatrixError> {
-    join(&state, &identity.user_id, &room_id_or_alias)
+    let room_id = if room_id_or_alias.starts_with('#') {
+        state
+            .directory
+            .resolve(&room_id_or_alias)
+            .map_err(|error| directory_error(&error))?
+            .ok_or_else(|| {
+                MatrixError::new(
+                    StatusCode::NOT_FOUND,
+                    "M_NOT_FOUND",
+                    format!("no room is called {room_id_or_alias}"),
+                )
+            })?
+            .room_id
+    } else {
+        room_id_or_alias
+    };
+    join(&state, &identity.user_id, &room_id)
+}
+
+/// `GET /_matrix/client/v3/directory/room/{room_alias}`
+///
+/// Unauthenticated, as the spec requires: resolving a name is how a client
+/// finds a room it has not joined, and requiring an account to look one up
+/// would make published aliases useless to anyone not already signed in.
+///
+/// `servers` is this server alone until federation lands. Naming ourselves is
+/// honest -- we are the only server known to hold the room -- where an empty
+/// list would tell a client there is nowhere to join through.
+async fn resolve_alias(
+    State(state): State<AppState>,
+    axum::extract::Path(room_alias): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    let record = state
+        .directory
+        .resolve(&room_alias)
+        .map_err(|error| directory_error(&error))?
+        .ok_or_else(|| {
+            MatrixError::new(
+                StatusCode::NOT_FOUND,
+                "M_NOT_FOUND",
+                format!("no room is called {room_alias}"),
+            )
+        })?;
+    Ok(Json(json!({
+        "room_id": record.room_id,
+        "servers": [state.config.server.name.clone()],
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateAliasRequest {
+    room_id: String,
+}
+
+/// `PUT /_matrix/client/v3/directory/room/{room_alias}`
+///
+/// The room must exist. Letting an alias point at nothing would put a name in
+/// the directory that resolves to a 404 on join -- a broken link the server
+/// handed out itself.
+async fn create_alias(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_alias): axum::extract::Path<String>,
+    Json(request): Json<CreateAliasRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    state.rooms.state(&request.room_id).map_err(room_error)?;
+    state
+        .directory
+        .create(&room_alias, &request.room_id, &identity.user_id)
+        .map_err(|error| directory_error(&error))?;
+    Ok(Json(json!({})))
+}
+
+/// `DELETE /_matrix/client/v3/directory/room/{room_alias}`
+async fn delete_alias(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_alias): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    state
+        .directory
+        .delete(&room_alias, &identity.user_id)
+        .map_err(|error| directory_error(&error))?;
+    Ok(Json(json!({})))
+}
+
+/// `GET /_matrix/client/v3/rooms/{room_id}/aliases`
+///
+/// Members only. The directory answers alias-to-room for anyone, because that
+/// is a name someone published; room-to-alias is the transpose and enumerates
+/// what a room is reachable by, which is the room's business.
+async fn room_aliases(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    let joined = state.rooms.joined(&identity.user_id).map_err(room_error)?;
+    if !joined.iter().any(|room| room == &room_id) {
+        return Err(MatrixError::forbidden(format!(
+            "{} is not in {room_id}",
+            identity.user_id
+        )));
+    }
+    let aliases = state
+        .directory
+        .for_room(&room_id)
+        .map_err(|error| directory_error(&error))?;
+    Ok(Json(json!({ "aliases": aliases })))
+}
+
+fn directory_error(error: &crate::directory::DirectoryError) -> MatrixError {
+    use crate::directory::DirectoryError as Error;
+    match error {
+        // One arm for both: an alias this server cannot speak for and one that
+        // is not an alias at all are the same answer to the caller -- the name
+        // you sent is not one this server will act on -- and they differ only
+        // in the message, which `error.to_string()` already carries.
+        Error::Malformed(_) | Error::NotOurs(_) => MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            error.to_string(),
+        ),
+        Error::Taken(_) => {
+            MatrixError::new(StatusCode::CONFLICT, "M_ROOM_IN_USE", error.to_string())
+        }
+        Error::Unknown(_) => {
+            MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", error.to_string())
+        }
+        Error::Forbidden(_) => MatrixError::forbidden(error.to_string()),
+        other => MatrixError::internal(&other.to_string()),
+    }
 }
 
 fn join(state: &AppState, user_id: &str, room_id: &str) -> Result<Json<Value>, MatrixError> {
