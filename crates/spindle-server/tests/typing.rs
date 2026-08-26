@@ -38,7 +38,13 @@ impl Harness {
     }
 
     fn build(store: Arc<FjallStore>) -> axum::Router {
-        let config = spindle_server::Config::parse("[server]\nname = \"example.org\"\n").unwrap();
+        // The limiter is off because `typists_come_back_sorted` needs eight
+        // users, and registering eight in a row is exactly what the limiter
+        // exists to stop. Nothing here is about rate limiting.
+        let config = spindle_server::Config::parse(
+            "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n",
+        )
+        .unwrap();
         spindle_server::app(config, store).expect("a signing key is established")
     }
 
@@ -384,36 +390,82 @@ async fn an_over_long_timeout_is_clamped_rather_than_refused() {
 }
 
 #[tokio::test]
-async fn several_typists_come_back_in_a_stable_order() {
-    // A client diffs this list against the one it holds, so a HashMap's order
-    // would make an unchanged set look changed on every read.
+async fn the_clamp_actually_bounds_the_expiry() {
+    // Asserted against `Typing` directly with a small cap, because observing
+    // the real two-minute one means a two-minute test. Going through the
+    // endpoint instead only ever showed that an hour-long request is
+    // accepted — which a mutant dropping the `min` entirely survived, since
+    // an unclamped hour looks exactly like a clamped one for the first two
+    // minutes.
+    let typing = spindle_server::typing::Typing::with_max_timeout(Duration::from_millis(50));
+    typing.set(
+        "!room:example.org",
+        "@alice:example.org",
+        true,
+        Duration::from_secs(3600),
+    );
+    assert_eq!(
+        typing.active("!room:example.org"),
+        vec!["@alice:example.org"],
+        "the notice is set"
+    );
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(
+        typing.active("!room:example.org").is_empty(),
+        "an hour clamped to 50ms must have expired"
+    );
+
+    // And a request *under* the cap is left alone rather than raised to it.
+    typing.set(
+        "!room:example.org",
+        "@bob:example.org",
+        true,
+        Duration::from_millis(10),
+    );
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert!(
+        typing.active("!room:example.org").is_empty(),
+        "a short timeout must not be extended to the cap"
+    );
+}
+
+#[tokio::test]
+async fn typists_come_back_sorted() {
+    // A client diffs this list against the one it holds, so an arbitrary
+    // order would make an unchanged set look changed on every read.
+    //
+    // Eight users, not three: with three, a mutant replacing the sort with a
+    // reverse survived, because reversing a HashMap's arbitrary order landed
+    // on the sorted one by luck. The test passed for a reason that had
+    // nothing to do with the code being right.
     let harness = Harness::new();
     let alice = harness.register("alice").await;
-    let bob = harness.register("bob").await;
-    let carol = harness.register("carol").await;
     let room = harness.create_room(&alice).await;
-    harness.admit(&room, &alice, &bob, "@bob:example.org").await;
-    harness
-        .admit(&room, &alice, &carol, "@carol:example.org")
-        .await;
 
-    for (token, user) in [
-        (&carol, "@carol:example.org"),
-        (&alice, "@alice:example.org"),
-        (&bob, "@bob:example.org"),
-    ] {
+    let mut everyone = vec!["@alice:example.org".to_owned()];
+    for name in ["bob", "carol", "dave", "erin", "frank", "grace", "heidi"] {
+        let token = harness.register(name).await;
+        let user_id = format!("@{name}:example.org");
+        harness.admit(&room, &alice, &token, &user_id).await;
         harness
-            .typing(&room, token, user, &json!({ "typing": true }))
+            .typing(&room, &token, &user_id, &json!({ "typing": true }))
             .await;
+        everyone.push(user_id);
     }
+    harness
+        .typing(
+            &room,
+            &alice,
+            "@alice:example.org",
+            &json!({ "typing": true }),
+        )
+        .await;
+    everyone.sort();
 
-    let expected = vec![
-        "@alice:example.org".to_owned(),
-        "@bob:example.org".to_owned(),
-        "@carol:example.org".to_owned(),
-    ];
     for _ in 0..5 {
-        assert_eq!(typists(&harness.sync(&alice).await, &room), expected);
+        let listed = typists(&harness.sync(&alice).await, &room);
+        assert_eq!(listed, everyone, "the list must come back sorted");
     }
 }
 

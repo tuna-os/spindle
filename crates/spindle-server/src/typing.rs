@@ -30,16 +30,38 @@ pub const MAX_TIMEOUT: Duration = Duration::from_secs(120);
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Who is typing where.
-#[derive(Default)]
 pub struct Typing {
     active: Mutex<HashMap<String, HashMap<String, Instant>>>,
     changed: Notify,
+    max_timeout: Duration,
+}
+
+impl Default for Typing {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Typing {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::with_max_timeout(MAX_TIMEOUT)
+    }
+
+    /// A store whose cap is not [`MAX_TIMEOUT`].
+    ///
+    /// Exists so the clamp can be tested at all. Observing it at two minutes
+    /// means a two-minute test, so the only alternative to this seam is a
+    /// test that asserts the clamp compiles rather than that it bounds
+    /// anything -- which is what a mutant flipping `min` to a plain
+    /// assignment survived.
+    #[must_use]
+    pub fn with_max_timeout(max_timeout: Duration) -> Self {
+        Self {
+            active: Mutex::new(HashMap::new()),
+            changed: Notify::new(),
+            max_timeout,
+        }
     }
 
     /// Start or stop `user_id` typing in `room_id`.
@@ -61,7 +83,7 @@ impl Typing {
             if typing {
                 room.insert(
                     user_id.to_owned(),
-                    Instant::now() + timeout.min(MAX_TIMEOUT),
+                    Instant::now() + timeout.min(self.max_timeout),
                 );
                 !was_typing
             } else {
