@@ -119,6 +119,13 @@ pub enum Keyspace {
     Alias = 0x11,
     /// `(user_id, filter_id)` -> a stored `/sync` filter.
     Filter = 0x12,
+    /// `media_id` -> what was uploaded under it.
+    ///
+    /// The blob itself is not here: bytes belong on a filesystem or in an
+    /// object store, not in the key-value store the log lives in. This holds
+    /// the mapping from the opaque ID a client is given to the content hash
+    /// the bytes are filed under.
+    Media = 0x13,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -348,6 +355,22 @@ pub fn alias_prefix() -> Vec<u8> {
 pub fn alias_from_key(key: &[u8]) -> Option<String> {
     let len = u16::from_be_bytes(key.get(2..4)?.try_into().ok()?) as usize;
     String::from_utf8(key.get(4..4 + len)?.to_vec()).ok()
+}
+
+/// One uploaded file's key.
+///
+/// Length-prefixed like every other variable-length component, for the reason
+/// [`room_prefix`] gives.
+#[must_use]
+pub fn media(media_id: &str) -> Vec<u8> {
+    let id = media_id.as_bytes();
+    let len = u16::try_from(id.len()).unwrap_or(u16::MAX);
+    let mut key = Vec::with_capacity(4 + id.len());
+    key.push(KEY_SCHEMA_VERSION);
+    key.push(Keyspace::Media as u8);
+    key.extend_from_slice(&len.to_be_bytes());
+    key.extend_from_slice(&id[..len as usize]);
+    key
 }
 
 /// `(user_id, filter_id)` key for [`Keyspace::Filter`].
