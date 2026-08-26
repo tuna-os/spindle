@@ -94,7 +94,7 @@ The costs Spindle is designed to eliminate, and why they exist:
 | State groups + deltas | Avoid storing full state per event | Chains of deltas that must be walked; periodic compaction; unbounded growth on fork-heavy rooms | Persistent HAMT with content-addressed nodes; O(log n) copy per update, O(1) historical lookup |
 | Topological ordering | `/messages` must paginate in DAG order, which is not insertion order | Sort at read time, or maintained `topological_ordering`/`stream_ordering` pairs | `li` **is** the topological order, assigned once at write |
 | Backfill + `/get_missing_events` | Reconstruct ancestors of a received event | Recursive fetch, re-auth, re-state | Still needed for legacy peers; linearized once at ingest, never re-derived |
-| Forward extremity management | Multiple heads must be tracked and merged | Extremity table growth is a known Synapse pathology | Invariant: exactly one forward extremity in rooms we serialize |
+| Forward extremity management | Multiple heads must be tracked and merged | Extremity table growth is a known Synapse pathology | Exactly one extremity in classes L/H/P; in class D a stale peer PDU adds one transiently, and the next local event merges it away (§4) |
 | Full state on join | `/send_join` returns the whole room state | 10k-member room = tens of MB and a state res over it | Materialize once into a HAMT root; faster joins (MSC3706/MSC3902) for large rooms |
 
 The observation that makes this tractable: **all of these are federation
@@ -115,14 +115,26 @@ recomputed on membership change, and stored in room metadata.
 | **P — Participant** | Another server holds `m.room.hub`; we submit proposals to it. | Remote hub | Never | Eager (origin signature) |
 | **D — DAG** | At least one participant is a legacy homeserver that authors its own `prev_events`. | This server for local events; forks possible | Bounded window only (§9) | Eager |
 
-**Linearity invariant (LI):** *for every event this server authors, `prev_events`
-has exactly one element, and that element is the current head of the room log.*
+**Linearity invariant (LI):** *storage order is always linear — every accepted
+event receives exactly one monotonic `li` — and the federation overlay is
+normally, but not always, a chain.*
 
-This invariant holds in all four classes. It is what makes Spindle's own output
-always a chain. In classes L, H and P the *whole* room is a chain, because no
-one else authors events into it. In class D other servers may append events
-whose `prev_events` point at a stale head; that is the only source of forks, and
-§9 handles it in bounded time.
+In classes L, H and P the whole room is a chain: this server authors every event
+with exactly one `prev_event`, the current head, because nobody else appends.
+
+Class D is the exception, and it is why the invariant is stated about storage
+order rather than about `prev_events`. When a legacy peer sends a PDU naming a
+stale predecessor, that PDU **cannot be rewritten** — its signature covers
+`prev_events` — so the room briefly holds more than one forward extremity. The
+next locally authored event references *every* current extremity, up to Matrix's
+limit of 20, which collapses the DAG back to a single head.
+
+The naive alternative — appending after our own head and ignoring the stale
+event — does not merge anything: the stale event remains a forward extremity
+indefinitely, and the two heads can carry different state. See
+[ADR 0001](docs/architecture-decisions/0001-linear-storage-dag-overlay.md), which
+records this correction and is the normative statement where it and this section
+disagree.
 
 ### 4.1 Class transitions
 
@@ -444,6 +456,14 @@ almost every real case. Spindle caps it at `max_fork_window` (default 512); a
 window that exceeds the cap falls back to full spec-compliant state resolution
 over the affected range, which is correct but slow, and is logged as an anomaly.
 
+The cap bounds the **work**, not merely the answer. Discovering the window must
+not require walking each tip's full ancestry back to the room's first event and
+intersecting: that would make detecting a three-event fork in a million-event
+room cost a million-node traversal, which is exactly the cost this section
+claims to remove. The window is found by a bounded reverse breadth-first search
+from the tips that stops as soon as the frontiers meet, with the budget applied
+to nodes *visited*.
+
 ### 9.2 Three cases, cheapest first
 
 **Case 1 — non-state event, no state conflict (the common case, ~99%).**
@@ -611,8 +631,8 @@ on the way out and linearized on the way in; peers see an ordinary homeserver.
 ### 11.1 The DAG projection
 
 For any log entry, the federation representation is `federation_json` verbatim —
-the bytes that were signed. `prev_events` is the single-element array written at
-ingest, `auth_events` the derived set, `depth` the monotonic counter. A remote
+the bytes that were signed. `prev_events` is the array written at ingest — one
+element in a fork-free room, or the merged extremity set described in §4 — `auth_events` the derived set, `depth` the monotonic counter. A remote
 server receiving our events sees a room whose DAG is a chain, which is a
 perfectly ordinary DAG that happens never to require state resolution. Nothing
 about it is non-standard, and no peer needs to know Spindle exists.
@@ -677,15 +697,25 @@ block only until the relevant slice of state has arrived.
 |---|---|---|
 | 1–5 | Read-only interop | Legacy event ID format; joinable, not creatable |
 | 6–10 | Full | Full DAG semantics with the class-D path |
-| **11** | **Full, default** | `MSC3820` cleanups: no top-level `origin` (MSC3989), no `creator` in create content (MSC2175), `redacts` in content (MSC2174), updated redaction algorithm (MSC2176/MSC3821) |
-| 12+ / `org.matrix.msc3995.v1` | Experimental | LM room version with hub-assigned `prev_event` (§12.4) |
+| **11** | **Full** | `MSC3820` cleanups: no top-level `origin` (MSC3989), no `creator` in create content (MSC2175), `redacts` in content (MSC2174), updated redaction algorithm (MSC2176/MSC3821) |
+| **12** | **Full; default candidate — see below** | Current stable version; supported by Ruma 0.16 and by both surveyed Rust homeservers |
+| `org.matrix.msc3995.v1` | Experimental | LM room version with hub-assigned `prev_event` (§12.4) |
 
-Native rooms are created as **version 11**. This is the single most important
-compatibility decision in the design: a v11 room whose DAG is a chain requires no
-new room version, no client capability, and no peer negotiation, while still
-delivering every performance property in this document. The LM room version is
-needed only to make forks structurally impossible, which is an optimization, not
-a requirement.
+The load-bearing decision is **not which version number** — it is that native
+rooms use an *ordinary* room version. A room whose DAG is a chain needs no new
+room version, no client capability and no peer negotiation, while still
+delivering every performance property in this document. The LM room version
+(§12.4) is needed only to make forks structurally *impossible*, which is an
+optimization, not a requirement.
+
+**Open decision: v11 or v12 as the creation default.** The ecosystem is split.
+Continuwuity defaults to v12; Tuwunel supports v12 but still defaults to v11.
+Both treat v6–v12 as stable, and Ruma 0.16 implements through v12. Spindle must
+*support* v12 regardless — a server that cannot join a v12 room is not
+interoperable in 2026 — so the only live question is which version
+`/createRoom` picks when a client does not ask. Resolve this before M3 against
+the version the reference clients and the majority of federating peers actually
+create, and record it as an ADR rather than leaving it implied here.
 
 ---
 
