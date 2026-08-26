@@ -25,7 +25,15 @@ fn hamt_applies_twenty_thousand_unique_state_updates_within_budget() {
     let elapsed = started.elapsed();
 
     assert_eq!(state.len(), 20_000);
-    assert_budget("hamt_unique_updates_20k", elapsed, Duration::from_secs(10));
+    // Observed ~160ms on the dev host. Three seconds leaves room for a slow
+    // shared runner while still catching a change in complexity class; the
+    // original ten-second budget was ~60x headroom, which would have passed
+    // almost any regression worth catching.
+    assert_budget(
+        "hamt_unique_updates_20k",
+        elapsed,
+        Duration::from_millis(3_000),
+    );
 }
 
 #[test]
@@ -52,5 +60,18 @@ fn fork_window_walks_four_thousand_divergent_events_within_budget() {
     let elapsed = started.elapsed();
 
     assert_eq!(window.events.len(), 4_000);
-    assert_budget("fork_window_4k", elapsed, Duration::from_secs(5));
+
+    // The assertion that actually guards the property. A wall-clock budget on
+    // a 2ms operation is mostly noise; entries visited is deterministic, and
+    // it is what distinguishes a search bounded by the fork from one that
+    // walks the room. The window is 4,000 events plus the common ancestor and
+    // the frontier around it.
+    assert!(
+        window.visited <= 4_100,
+        "fork window visited {} entries for a 4,000-event fork",
+        window.visited
+    );
+
+    // Observed ~2ms. Half a second is still generous for a shared runner.
+    assert_budget("fork_window_4k", elapsed, Duration::from_millis(500));
 }
