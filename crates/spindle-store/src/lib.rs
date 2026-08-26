@@ -8,13 +8,47 @@ pub mod codec;
 
 use std::path::Path;
 
-use fjall::{Config, Keyspace as FjallKeyspace, PartitionCreateOptions, PartitionHandle};
+use fjall::{
+    Config, Keyspace as FjallKeyspace, PartitionCreateOptions, PartitionHandle, PersistMode,
+};
 use spindle_core::{
     EventId, RestoreError, RestoredEntry, RestoredLog, RoomLog,
     keys::{Keyspace, room_li, room_prefix},
 };
 
 use crate::codec::{CodecError, EntryRecord, RoomRecord};
+
+/// How hard a commit tries to be on disk before it is acknowledged.
+///
+/// Maps SPEC §8.3's three modes onto the engine. Ordering is decided before
+/// durability in every mode, so a crash can only ever lose a *suffix* of the
+/// log — never reorder it, never fork it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Durability {
+    /// `strict`: data and metadata are fsynced before the commit returns.
+    Strict,
+    /// `group`: data is fsynced before the commit returns; file metadata is
+    /// left to the OS.
+    ///
+    /// Note this is not yet the batched fsync SPEC §8.3 describes — commits are
+    /// not currently coalesced across a time window, so this is "one data
+    /// fsync per commit" rather than "one fsync per batch of commits". The
+    /// coalescing needs the per-room executor and lands with it.
+    #[default]
+    Group,
+    /// `relaxed`: the write reaches the OS page cache and is fsynced later.
+    Relaxed,
+}
+
+impl Durability {
+    fn persist_mode(self) -> PersistMode {
+        match self {
+            Self::Strict => PersistMode::SyncAll,
+            Self::Group => PersistMode::SyncData,
+            Self::Relaxed => PersistMode::Buffer,
+        }
+    }
+}
 
 /// One key and its value, as read back from a scan.
 pub type Record = (Vec<u8>, Vec<u8>);
@@ -41,6 +75,17 @@ pub trait Store {
     ///
     /// Returns a backend error if the scan fails.
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<Record>, StoreError>;
+
+    /// Apply every write together, or none of them.
+    ///
+    /// Atomicity is the point: an appended event, its room metadata and its
+    /// extremities describe one state of the room, and a reader must never see
+    /// half of them.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the commit fails.
+    fn commit(&self, writes: &[Record], durability: Durability) -> Result<(), StoreError>;
 
     /// # Errors
     ///
@@ -89,8 +134,17 @@ impl Store for FjallStore {
         Ok(out)
     }
 
+    fn commit(&self, writes: &[Record], durability: Durability) -> Result<(), StoreError> {
+        let mut batch = self.keyspace.batch();
+        for (key, value) in writes {
+            batch.insert(&self.partition, key.as_slice(), value.as_slice());
+        }
+        batch.durability(Some(durability.persist_mode())).commit()?;
+        Ok(())
+    }
+
     fn flush(&self) -> Result<(), StoreError> {
-        self.keyspace.persist(fjall::PersistMode::SyncAll)?;
+        self.keyspace.persist(PersistMode::SyncAll)?;
         Ok(())
     }
 }
@@ -109,7 +163,51 @@ impl<'a, S: Store> RoomStore<'a, S> {
         }
     }
 
+    /// Commit one newly appended entry together with the room's metadata.
+    ///
+    /// This is the write path a server uses: a single atomic batch per event,
+    /// proportional to the event rather than to the room. The entry, the
+    /// counters and the extremity set move together, so a reader never sees a
+    /// room whose head disagrees with its log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the commit fails.
+    pub fn commit_entry(
+        &self,
+        entry: &spindle_core::LogEntry,
+        log: &RoomLog,
+        durability: Durability,
+    ) -> Result<(), StoreError> {
+        let writes = [
+            (
+                room_li(Keyspace::Log, &self.room_id, entry.li),
+                EntryRecord::from_entry(entry).encode(),
+            ),
+            (
+                room_prefix(Keyspace::RoomMeta, &self.room_id),
+                Self::meta(log).encode(),
+            ),
+        ];
+        self.store.commit(&writes, durability)
+    }
+
+    fn meta(log: &RoomLog) -> RoomRecord {
+        RoomRecord {
+            next_forward: log.next_forward(),
+            next_backward: log.next_backward(),
+            forward_extremities: log
+                .forward_extremities()
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect(),
+        }
+    }
+
     /// Write every entry and the room's metadata.
+    ///
+    /// Rewrites the whole room, so it is for seeding and tests rather than the
+    /// serving path; use [`RoomStore::commit_entry`] for an append.
     ///
     /// # Errors
     ///
