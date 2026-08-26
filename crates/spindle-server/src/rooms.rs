@@ -18,6 +18,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::authorize::StoredEvent;
+use ruma::room_version_rules::RoomVersionRules;
 use ruma::signatures::Ed25519KeyPair;
 use ruma::{CanonicalJsonObject, CanonicalJsonValue, RoomVersionId};
 use serde_json::{Map, Value};
@@ -264,6 +266,14 @@ impl Rooms {
             .map_err(|error| RoomError::Build(format!("{error:?}")))?;
 
         let event_id = pdu.event_id().as_str().to_owned();
+        let json = canonical_to_json(pdu.canonical());
+
+        // Authorized before it is appended, against the state the log already
+        // holds materialized. Signing first costs a wasted signature on a
+        // refused event and buys something worth more: what gets authorized is
+        // exactly the bytes a peer would receive, event ID included.
+        self.authorize(log, room_id, &event_id, &json)?;
+
         let input = EventInput::new(
             event_id.clone(),
             prev.into_iter().map(EventId::new).collect(),
@@ -282,7 +292,6 @@ impl Rooms {
         // ordering and state; the event body is what a client actually reads
         // back, and reconstructing it from the log would mean re-signing, which
         // would produce a different event ID.
-        let json = canonical_to_json(pdu.canonical());
         let room_store = RoomStore::new(self.store.as_ref(), room_id);
         spindle_store::Store::put(
             self.store.as_ref(),
@@ -291,6 +300,49 @@ impl Rooms {
         )?;
         room_store.commit_entry(&entry, log, Durability::Group)?;
         Ok(event_id)
+    }
+
+    /// Refuse the candidate unless ruma's predicate allows it.
+    ///
+    /// The state lookups go through the snapshot the log already holds, which
+    /// is the whole point (`docs/divergence.md` §3): a DAG server has to
+    /// compute or fetch the state to check against, and we index into it. Each
+    /// hit still costs one keyed read for the event body, because the snapshot
+    /// stores event IDs rather than bodies — at most five reads, and none of
+    /// them proportional to the room.
+    fn authorize(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        event_id: &str,
+        json: &Value,
+    ) -> Result<(), RoomError> {
+        let candidate = StoredEvent::parse(event_id, json).map_err(|error| {
+            RoomError::Build(format!("cannot authorize a malformed event: {error}"))
+        })?;
+
+        // Nothing is resident before the create event, and the create event is
+        // the one the rules check without any state at all.
+        let state = log
+            .entries()
+            .next_back()
+            .map(|entry| entry.li)
+            .and_then(|li| log.state_after(li));
+
+        let load = |id: &str| -> Option<StoredEvent> {
+            let body = self.read_event(room_id, &EventId::new(id)).ok()?;
+            StoredEvent::parse(id, &body).ok()
+        };
+
+        crate::authorize::authorize(
+            &RoomVersionRules::V11.authorization,
+            &candidate,
+            |event_type: &ruma::events::StateEventType, state_key: &str| {
+                let id = state?.get(&StateKey::new(event_type.to_string().as_str(), state_key))?;
+                load(id)
+            },
+        )
+        .map_err(RoomError::Forbidden)
     }
 
     fn read_event(&self, room_id: &str, event_id: &EventId) -> Result<Value, RoomError> {
@@ -466,6 +518,7 @@ pub enum RoomError {
     Build(String),
     Append(String),
     StateUnavailable(String),
+    Forbidden(String),
     Storage(StoreError),
     Codec(String),
 }
@@ -492,6 +545,7 @@ impl std::fmt::Display for RoomError {
             Self::StateUnavailable(message) => {
                 write!(formatter, "cannot authorize the event: {message}")
             }
+            Self::Forbidden(rule) => write!(formatter, "{rule}"),
             Self::Storage(error) => write!(formatter, "storage: {error}"),
             Self::Codec(message) => write!(formatter, "unreadable: {message}"),
         }

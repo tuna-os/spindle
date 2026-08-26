@@ -519,6 +519,10 @@ async fn send_event(
             crate::rooms::RoomError::UnknownRoom(_) => {
                 MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such room")
             }
+            // The message is ruma's own wording for the rule that refused,
+            // which is the same explanation a federating peer would give. A
+            // generic "forbidden" would make a client's bug report useless.
+            crate::rooms::RoomError::Forbidden(rule) => MatrixError::forbidden(rule),
             other => MatrixError::internal(&other.to_string()),
         })?;
     Ok(Json(json!({ "event_id": event_id })))

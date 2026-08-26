@@ -40,6 +40,10 @@ impl Harness {
     }
 
     async fn register(&self) -> String {
+        self.register_as("alice").await
+    }
+
+    async fn register_as(&self, username: &str) -> String {
         let (status, body) = self
             .send(
                 Request::builder()
@@ -48,7 +52,7 @@ impl Harness {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
-                            "username": "alice",
+                            "username": username,
                             "password": "hunter2",
                             "auth": { "type": "m.login.dummy" },
                         })
@@ -350,4 +354,74 @@ async fn every_event_cites_the_state_that_authorizes_it() {
             assert!(ids.contains(&id), "{event} cites {id}, which is not here");
         }
     }
+}
+
+/// Authorization is not advisory. A user who is not in a room cannot write to
+/// it, and the refusal comes from ruma's rules rather than from a membership
+/// check written here — that is the point of `docs/divergence.md` §3: the
+/// predicate is the spec's, only the cost of reaching its inputs is ours.
+#[tokio::test]
+async fn a_stranger_cannot_write_into_someone_elses_room() {
+    let harness = Harness::new();
+    let alice = harness.register_as("alice").await;
+    let bob = harness.register_as("bob").await;
+
+    let (_, created) = harness
+        .post("/_matrix/client/v3/createRoom", &alice, &json!({}))
+        .await;
+    let room_id = created["room_id"].as_str().unwrap().to_owned();
+
+    let path = format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/txn1");
+    let (status, body) = harness
+        .put(
+            &path,
+            &bob,
+            &json!({ "msgtype": "m.text", "body": "I do not live here" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["errcode"], "M_FORBIDDEN");
+    // Ruma's own wording for the rule that refused, which is the explanation a
+    // federating peer would give for the same event.
+    assert!(
+        body["error"].as_str().unwrap().contains("membership"),
+        "{body}"
+    );
+
+    // And alice, who is in the room, is unaffected.
+    let (status, body) = harness
+        .put(
+            &path,
+            &alice,
+            &json!({ "msgtype": "m.text", "body": "hello" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Refused means nothing landed: not the event, and not a linear index
+    // spent on it. Exactly the four events `createRoom` emits plus alice's
+    // one message -- counted rather than filtered, because a refused event
+    // that consumed an index would leave a hole that pagination would then
+    // have to explain away.
+    let (status, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room_id}/messages?limit=100"),
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let chunk = body["chunk"].as_array().unwrap();
+    let senders: Vec<&str> = chunk
+        .iter()
+        .map(|event| event["sender"].as_str().unwrap())
+        .collect();
+    assert!(
+        senders.iter().all(|sender| *sender == "@alice:example.org"),
+        "a refused event was stored anyway: {senders:?}"
+    );
+    assert_eq!(chunk.len(), 5, "{body}");
+    assert!(
+        body["end"].is_null(),
+        "there should be nothing beyond: {body}"
+    );
 }
