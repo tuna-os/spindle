@@ -13,7 +13,7 @@ only reports its wins is not evidence (#34).
 | Storage append and reopen at a million events | Done (#47) |
 | Durability cost: strict vs relaxed | Done (#47) |
 | Our fast path vs `ruma-state-res`, **correctness** | Done (#55), below |
-| **Our fast path vs `ruma-state-res`, performance** | **Not yet — see below** |
+| Our fast path vs `ruma-state-res`, performance | Done, below — and the result is narrower than the spec implies |
 | `/messages`, `/sync`, join latency vs Synapse and Tuwunel | Needs a server; M1–M3 (#42) |
 
 Everything here is **algorithmic**, measured inside the library. None of it is a
@@ -152,9 +152,50 @@ because it passed. Replacing our merge with a plausible wrong implementation —
 "take the first parent's state" — makes it fail with our side missing a
 membership event the reference keeps.
 
-**Performance: not done.** Nothing here times our path against `resolve()`, so
-no speed claim against another implementation is supported yet. That is the
-remaining work in #34, and the harness it was blocked on now exists.
+**Performance: measured, and it is a constant factor rather than an asymptotic
+win.** `benches/state_res_comparison.rs` resolves the same disjoint fork both
+ways, across fork sizes. Each side writes its own state slot, so the fork stays
+in the case Spindle claims to handle without state resolution.
 
-Worth stating plainly so the gap is not mistaken for a result: **no measurement
-in this document compares Spindle's speed against another homeserver's code.**
+| Divergent events per side | `ruma-state-res` | Spindle window merge | Ratio |
+|---|---|---|---|
+| 1 | 25.5 µs | **11.4 µs** | 2.24× |
+| 4 | 84.7 µs | **26.9 µs** | 3.15× |
+| 16 | 335 µs | **116 µs** | 2.88× |
+| 64 | 1.30 ms | **574 µs** | 2.27× |
+
+We are consistently faster, by between two and three times. **Both sides scale
+linearly in the size of the fork, and per-event cost is flat for both** — about
+10 µs per event for `resolve()`, about 4.5 µs for ours. That is the result, and
+it is not the one SPEC §18.1's complexity table leads a reader to expect.
+
+Three things this does not show, each of which matters more than the ratio:
+
+1. **This is the exception path, not the common one.** Spindle's actual claim is
+   that a fork-free append runs *no* state resolution at all. A DAG homeserver
+   on that same path does not call `resolve()` either — it calls `auth_check`,
+   as `docs/divergence.md` §3 notes both siblings do. So this table compares two
+   fork handlers, not the hot path, and quoting it as "Spindle is 3× faster than
+   Conduit" would be wrong.
+
+2. **The auth chains here do not grow with the fork.** The synthetic room's auth
+   chains stay about four events deep however large the fork gets, which is why
+   `resolve()` comes out linear. State resolution v2 is `O(conflicted state ×
+   auth chain)`, and the case it is supposed to blow up on is a long partition:
+   a large conflicted set over deep auth chains. **That case is untested here**,
+   and it is the one SPEC §18.1's asymptotic claim is actually about. Until it
+   is measured, the honest statement is a 2–3× constant factor.
+
+3. **The two sides start from different places, by design.** Ours starts from
+   two materialized state snapshots, because Spindle paid for materialization at
+   append time; theirs starts from state maps and auth chains, because that is
+   what a DAG homeserver holds. That asymmetry is the design difference rather
+   than a thumb on the scale, and the append-side cost it moves is measured
+   separately above. The benchmark hoists auth-chain construction out of the
+   timed loop for the same reason — a homeserver stores auth chains rather than
+   rebuilding them per resolution. Leaving that walk inside inflated
+   `resolve()`'s time by 4–7%.
+
+Still true, and worth keeping stated plainly: **no measurement in this document
+is a server-to-server comparison.** Everything is algorithmic, measured inside
+the library. Synapse and Tuwunel under protocol workload is #42, at M1–M3.
