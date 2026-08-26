@@ -355,12 +355,15 @@ async fn one_users_data_is_not_reachable_under_a_similar_user_id() {
         .await;
 
     let events = harness.sync(&ab).await["account_data"]["events"].clone();
-    assert_eq!(
-        events.as_array().unwrap().len(),
-        1,
-        "ab must see only ab's data: {events}"
-    );
     assert_eq!(from_events(&events, "m.tag"), Some(json!({ "who": "ab" })));
+    // Asserted as "abc's value appears nowhere" rather than as a count of the
+    // events block: the server injects a default `m.push_rules` alongside, so
+    // a count would measure how many kinds of account data exist rather than
+    // whose data leaked.
+    assert!(
+        !events.to_string().contains("abc"),
+        "abc's data must not be reachable under @ab: {events}"
+    );
 }
 
 #[tokio::test]

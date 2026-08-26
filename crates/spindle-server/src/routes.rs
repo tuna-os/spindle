@@ -93,6 +93,23 @@ fn account_routes() -> Router<AppState> {
             "/_matrix/client/v3/user/{user_id}/rooms/{room_id}/account_data/{event_type}",
             get(get_room_account_data).put(set_room_account_data),
         )
+        // Four arities of the same path, because the spec has four and each
+        // reads or writes a different slice of one ruleset.
+        .route("/_matrix/client/v3/pushrules/", get(get_push_rules))
+        .route(
+            "/_matrix/client/v3/pushrules/{scope}/{kind}/{rule_id}",
+            get(get_push_rule)
+                .put(set_push_rule)
+                .delete(delete_push_rule),
+        )
+        .route(
+            "/_matrix/client/v3/pushrules/{scope}/{kind}/{rule_id}/enabled",
+            get(get_push_rule_enabled).put(set_push_rule_enabled),
+        )
+        .route(
+            "/_matrix/client/v3/pushrules/{scope}/{kind}/{rule_id}/actions",
+            get(get_push_rule_actions).put(set_push_rule_actions),
+        )
 }
 
 /// Creating a room, getting in and out of one, and who else is there.
@@ -964,6 +981,15 @@ fn read_account_data(
         })
 }
 
+/// Account-data types this endpoint must not write.
+///
+/// Both have an endpoint of their own that does more than store bytes:
+/// `m.push_rules` is edited a rule at a time through `/pushrules/`, and
+/// `m.fully_read` moves a receipt through `/read_markers`. Letting a client
+/// `PUT` them here would put a second writer on a value the server also
+/// maintains, and the two would drift.
+const RESERVED_ACCOUNT_DATA: [&str; 2] = ["m.push_rules", "m.fully_read"];
+
 fn write_account_data(
     state: &AppState,
     identity: &crate::accounts::Identity,
@@ -973,6 +999,13 @@ fn write_account_data(
     content: &Value,
 ) -> Result<Json<Value>, MatrixError> {
     own_account(identity, user_id)?;
+    if RESERVED_ACCOUNT_DATA.contains(&event_type) {
+        return Err(MatrixError::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "M_BAD_JSON",
+            format!("{event_type} has its own endpoint and cannot be set here"),
+        ));
+    }
     // The server keeps the bytes and has no opinion about them, so there is no
     // validation of `content` beyond it being JSON -- which the extractor has
     // already established. A client inventing a new `event_type` has to work
@@ -986,6 +1019,240 @@ fn write_account_data(
 
 fn account_data_error(error: &crate::account_data::AccountDataError) -> MatrixError {
     MatrixError::internal(&error.to_string())
+}
+
+/// The caller's ruleset, seeded from the defaults if they have never edited it.
+///
+/// Seeding on read rather than at registration is deliberate: the defaults
+/// change as the spec adds rules, and a user who registered before a rule
+/// existed should get it. Only an edit freezes a ruleset, because only then is
+/// there something of the user's to preserve.
+fn ruleset_of(state: &AppState, user_id: &str) -> Result<Value, MatrixError> {
+    Ok(state
+        .account_data
+        .get(user_id, "", crate::push_rules::TYPE)
+        .map_err(|error| account_data_error(&error))?
+        .unwrap_or_else(|| crate::push_rules::defaults(user_id)))
+}
+
+fn save_ruleset(state: &AppState, user_id: &str, ruleset: &Value) -> Result<(), MatrixError> {
+    state
+        .account_data
+        .put(user_id, "", crate::push_rules::TYPE, ruleset)
+        .map_err(|error| account_data_error(&error))
+}
+
+/// Reject a scope the spec does not define.
+///
+/// Only `global` exists today. `device` was in older drafts and clients still
+/// occasionally ask for it, so answering `M_NOT_FOUND` rather than treating it
+/// as `global` keeps a client from believing it stored a per-device rule that
+/// silently applied everywhere.
+fn check_scope(scope: &str) -> Result<(), MatrixError> {
+    if scope == "global" {
+        return Ok(());
+    }
+    Err(MatrixError::new(
+        StatusCode::NOT_FOUND,
+        "M_NOT_FOUND",
+        format!("no such push rule scope: {scope}"),
+    ))
+}
+
+fn check_kind(kind: &str) -> Result<(), MatrixError> {
+    if crate::push_rules::KINDS.contains(&kind) {
+        return Ok(());
+    }
+    Err(MatrixError::new(
+        StatusCode::BAD_REQUEST,
+        "M_INVALID_PARAM",
+        format!("no such push rule kind: {kind}"),
+    ))
+}
+
+fn rule_not_found(kind: &str, rule_id: &str) -> MatrixError {
+    MatrixError::new(
+        StatusCode::NOT_FOUND,
+        "M_NOT_FOUND",
+        format!("no {kind} rule {rule_id}"),
+    )
+}
+
+/// `GET /_matrix/client/v3/pushrules/`
+async fn get_push_rules(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+) -> Result<Json<Value>, MatrixError> {
+    let ruleset = ruleset_of(&state, &identity.user_id)?;
+    Ok(Json(json!({ "global": ruleset })))
+}
+
+/// `GET /_matrix/client/v3/pushrules/{scope}/{kind}/{rule_id}`
+async fn get_push_rule(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((scope, kind, rule_id)): axum::extract::Path<(String, String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    check_scope(&scope)?;
+    check_kind(&kind)?;
+    let ruleset = ruleset_of(&state, &identity.user_id)?;
+    let index = crate::push_rules::position(&ruleset, &kind, &rule_id)
+        .ok_or_else(|| rule_not_found(&kind, &rule_id))?;
+    Ok(Json(ruleset[&kind][index].clone()))
+}
+
+/// `PUT /_matrix/client/v3/pushrules/{scope}/{kind}/{rule_id}`
+async fn set_push_rule(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((scope, kind, rule_id)): axum::extract::Path<(String, String, String)>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, MatrixError> {
+    check_scope(&scope)?;
+    check_kind(&kind)?;
+    // A dotted ID means a rule the *server* defined. A client may enable,
+    // disable and re-action one, but minting a new one would let it claim a
+    // meaning the server assigns -- and then a later spec version defining
+    // that ID would collide with the client's.
+    if crate::push_rules::is_server_default(&rule_id) {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            "rule IDs beginning with a dot belong to the server",
+        ));
+    }
+    let mut rule = body;
+    if !rule["actions"].is_array() {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_BAD_JSON",
+            "a push rule needs an `actions` array",
+        ));
+    }
+    // A rule a client wrote is enabled unless it says otherwise, and is never
+    // a default however the body is decorated: `default` is the server's word
+    // for "this rule came with the server", and a client cannot make it true.
+    if rule.get("enabled").is_none() {
+        rule["enabled"] = Value::Bool(true);
+    }
+    rule["default"] = Value::Bool(false);
+
+    let mut ruleset = ruleset_of(&state, &identity.user_id)?;
+    crate::push_rules::upsert(&mut ruleset, &kind, &rule_id, rule);
+    save_ruleset(&state, &identity.user_id, &ruleset)?;
+    Ok(Json(json!({})))
+}
+
+/// `DELETE /_matrix/client/v3/pushrules/{scope}/{kind}/{rule_id}`
+async fn delete_push_rule(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((scope, kind, rule_id)): axum::extract::Path<(String, String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    check_scope(&scope)?;
+    check_kind(&kind)?;
+    let mut ruleset = ruleset_of(&state, &identity.user_id)?;
+    if !crate::push_rules::remove(&mut ruleset, &kind, &rule_id) {
+        return Err(rule_not_found(&kind, &rule_id));
+    }
+    save_ruleset(&state, &identity.user_id, &ruleset)?;
+    Ok(Json(json!({})))
+}
+
+/// `GET /_matrix/client/v3/pushrules/{scope}/{kind}/{rule_id}/enabled`
+async fn get_push_rule_enabled(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((scope, kind, rule_id)): axum::extract::Path<(String, String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    let rule = one_rule(&state, &identity.user_id, &scope, &kind, &rule_id)?;
+    Ok(Json(json!({ "enabled": rule["enabled"] })))
+}
+
+/// `GET /_matrix/client/v3/pushrules/{scope}/{kind}/{rule_id}/actions`
+async fn get_push_rule_actions(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((scope, kind, rule_id)): axum::extract::Path<(String, String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    let rule = one_rule(&state, &identity.user_id, &scope, &kind, &rule_id)?;
+    Ok(Json(json!({ "actions": rule["actions"] })))
+}
+
+fn one_rule(
+    state: &AppState,
+    user_id: &str,
+    scope: &str,
+    kind: &str,
+    rule_id: &str,
+) -> Result<Value, MatrixError> {
+    check_scope(scope)?;
+    check_kind(kind)?;
+    let ruleset = ruleset_of(state, user_id)?;
+    let index = crate::push_rules::position(&ruleset, kind, rule_id)
+        .ok_or_else(|| rule_not_found(kind, rule_id))?;
+    Ok(ruleset[kind][index].clone())
+}
+
+#[derive(Debug, Deserialize)]
+struct EnabledRequest {
+    enabled: bool,
+}
+
+/// `PUT /_matrix/client/v3/pushrules/{scope}/{kind}/{rule_id}/enabled`
+///
+/// Works on a server default as well as a user's own rule: silencing
+/// `.m.rule.message` is exactly what this endpoint is for.
+async fn set_push_rule_enabled(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((scope, kind, rule_id)): axum::extract::Path<(String, String, String)>,
+    Json(request): Json<EnabledRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    edit_rule(&state, &identity.user_id, &scope, &kind, &rule_id, |rule| {
+        rule["enabled"] = Value::Bool(request.enabled);
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct ActionsRequest {
+    actions: Vec<Value>,
+}
+
+/// `PUT /_matrix/client/v3/pushrules/{scope}/{kind}/{rule_id}/actions`
+async fn set_push_rule_actions(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((scope, kind, rule_id)): axum::extract::Path<(String, String, String)>,
+    Json(request): Json<ActionsRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    edit_rule(&state, &identity.user_id, &scope, &kind, &rule_id, |rule| {
+        rule["actions"] = Value::Array(request.actions.clone());
+    })
+}
+
+/// Read the ruleset, change one rule in place, write it back.
+///
+/// In place: `enabled` and `actions` are edits to an existing rule, so the
+/// rule keeps its position. Moving it would re-prioritise a ruleset the client
+/// did not ask to reorder -- and for a default rule, would move it out of the
+/// order the spec fixes.
+fn edit_rule(
+    state: &AppState,
+    user_id: &str,
+    scope: &str,
+    kind: &str,
+    rule_id: &str,
+    change: impl FnOnce(&mut Value),
+) -> Result<Json<Value>, MatrixError> {
+    check_scope(scope)?;
+    check_kind(kind)?;
+    let mut ruleset = ruleset_of(state, user_id)?;
+    let index = crate::push_rules::position(&ruleset, kind, rule_id)
+        .ok_or_else(|| rule_not_found(kind, rule_id))?;
+    change(&mut ruleset[kind][index]);
+    save_ruleset(state, user_id, &ruleset)?;
+    Ok(Json(json!({})))
 }
 
 /// `GET /_matrix/client/v3/sync`
@@ -1095,10 +1362,24 @@ async fn sync(
         invite.insert(room_id, json!({ "invite_state": { "events": [] } }));
     }
 
-    let global = state
+    let mut global = state
         .account_data
         .all(&identity.user_id, "")
         .map_err(|error| account_data_error(&error))?;
+    // A user who has never edited a rule still has a ruleset, and a client
+    // reads it from here rather than from `/pushrules/`. Injected rather than
+    // written at registration for the reason `ruleset_of` gives: only an edit
+    // freezes a ruleset, so an unedited one keeps tracking the defaults as the
+    // spec adds rules.
+    if !global
+        .iter()
+        .any(|event| event["type"] == crate::push_rules::TYPE)
+    {
+        global.push(json!({
+            "type": crate::push_rules::TYPE,
+            "content": crate::push_rules::defaults(&identity.user_id),
+        }));
+    }
 
     Ok(Json(json!({
         "next_batch": crate::tokens::Sync(result.next_batch).to_string(),
