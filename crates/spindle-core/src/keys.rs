@@ -64,7 +64,22 @@ pub enum Keyspace {
     StateRoot = 0x04,
     /// `room_id` -> room metadata.
     RoomMeta = 0x05,
+    /// `localpart` -> account record.
+    Account = 0x06,
+    /// `(localpart, device_id)` -> device record.
+    Device = 0x07,
+    /// `token_hash` -> access-token record.
+    AccessToken = 0x08,
 }
+
+// Adding a discriminant is additive: every key already written keeps its bytes
+// and its meaning, so it needs no `KEY_SCHEMA_VERSION` bump. Reusing or
+// reordering one would need both a bump and a migration, which is what
+// `keyspace_discriminants_are_unchanged` in spindle-store is there to stop.
+const _: () = assert!(
+    Keyspace::Account as u8 > Keyspace::RoomMeta as u8,
+    "new keyspaces take fresh discriminants; they never reuse an existing one"
+);
 
 /// Map an `i64` onto `u64` so that big-endian byte order matches numeric order.
 ///

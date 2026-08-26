@@ -50,6 +50,11 @@ impl Store for FaultyStore {
         Ok(())
     }
 
+    fn delete(&self, key: &[u8]) -> Result<(), StoreError> {
+        self.data.borrow_mut().remove(key);
+        Ok(())
+    }
+
     // No `snapshot` override: this double has no snapshot isolation, which is
     // exactly what the default `None` says.
 

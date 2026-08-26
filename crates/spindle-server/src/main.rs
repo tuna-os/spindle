@@ -1,8 +1,10 @@
 //! The `spindle` binary.
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use spindle_server::Config;
+use spindle_store::FjallStore;
 use tokio::net::TcpListener;
 use tokio::signal;
 
@@ -31,6 +33,20 @@ async fn main() -> ExitCode {
         .with_target(false)
         .init();
 
+    // Storage opens before the listener. A server that binds first and then
+    // discovers it cannot read its own database has already accepted
+    // connections it cannot answer.
+    let store = match FjallStore::open(&config.storage.path) {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            tracing::error!(
+                "cannot open storage at {}: {error}",
+                config.storage.path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
     let bind = config.server.bind.clone();
     let name = config.server.name.clone();
     let listener = match TcpListener::bind(&bind).await {
@@ -42,7 +58,7 @@ async fn main() -> ExitCode {
     };
 
     tracing::info!("spindle listening on {bind} as {name}");
-    let app = spindle_server::app(config);
+    let app = spindle_server::app(config, store);
     if let Err(error) = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown())
         .await

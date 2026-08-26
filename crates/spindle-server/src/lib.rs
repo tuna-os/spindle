@@ -6,13 +6,17 @@
 //! table that builds the router, so claiming something unbuilt is a
 //! compile-or-test failure rather than a documentation drift.
 
+pub mod accounts;
+pub mod auth;
 pub mod config;
+pub mod errors;
 pub mod routes;
 pub mod surface;
 
 use std::sync::Arc;
 
 use axum::Router;
+use spindle_store::FjallStore;
 
 pub use config::{Config, ConfigError};
 
@@ -20,12 +24,14 @@ pub use config::{Config, ConfigError};
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    pub store: Arc<FjallStore>,
 }
 
 /// Build the HTTP application.
-pub fn app(config: Config) -> Router {
+pub fn app(config: Config, store: Arc<FjallStore>) -> Router {
     let state = AppState {
         config: Arc::new(config),
+        store,
     };
     routes::router(state)
 }
