@@ -84,24 +84,55 @@ mean of 25 samples after 5 warmups, milliseconds:
 | messages_page | 1.088 | 5.411 | **5.0× faster** |
 | state | 0.803 | 2.692 | **3.4× faster** |
 | sync_initial | 1.722 | 3.302 | **1.9× faster** |
+| context_deep (at 3200) | 1.076 | 5.501 | **5.1× faster** |
 
-### What this establishes, and what it does not
+### What this establishes
 
-It establishes that on a single-node local workload at these room sizes,
-Spindle is faster than Synapse on every operation the driver measures. That is
-a real result and it is the direction the design predicts.
+On a single-node local workload, Spindle is faster than Synapse on every
+operation the driver measures, at every room size measured. That is a real
+result, and it is worth roughly what it looks like to a user: joins and sends
+are the operations a client waits on most, and they are 17–30× quicker.
 
-**It does not establish the claim the design actually rests on.** SPEC §18.1 is
-about how cost *changes* with room size and with fork depth, and at 1600 events
-both servers are flat — Synapse's growth is 0.94×–1.18× across the same sweep.
-A room of 1600 events is small. The costs a DAG server pays for state
-resolution show up in rooms with deep or forked history, which this driver does
-not construct, and until it does, the flat Synapse column here is evidence that
-the workload is too easy rather than that the difference has been measured.
+It is very likely a **constant-factor** win rather than an asymptotic one.
+Synapse is Python with an ORM and Spindle is Rust reading a materialized
+snapshot; a 20× gap on `send` is the sort of number that difference produces on
+its own, with no help from the log being linear.
 
-So the honest summary is: **we are faster, and we have not yet measured the
-thing we say makes us faster.** #80 tracks the suite measuring what content
-addressing buys rather than only what it costs, and the same gap applies here.
+### What it does not establish — and why this method never will
+
+SPEC §18.1's claims are about how cost *changes*: with room size, and with fork
+depth. This driver cannot test them, and after extending it to try, the reason
+turns out to be structural rather than a matter of turning the sizes up.
+
+`context_deep` was added specifically to probe it. It asks `/context` for the
+*oldest* event in the room, which is the sharpest question reachable over the
+client-server API: what was the state back there? A server that stores state as
+a DAG should have to resolve or walk to answer; a server keeping a
+content-addressed snapshot per event reads one.
+
+The result at 200 → 3200 events:
+
+| | growth | |
+|---|---|---|
+| `context_deep`, Spindle | 0.97× | flat |
+| `context_deep`, Synapse | 0.97× | **also flat** |
+
+Synapse is flat because **there is nothing for it to resolve.** State
+resolution runs when a room's history forks, and a single server linearizes
+everything it accepts — forks arrive over *federation*. Synapse's state groups
+make state-at-a-point a direct lookup in an unforked room, so on this workload
+it is doing the same asymptotic work we are, more slowly.
+
+That is a finding about the methodology, and it retires an assumption: **no
+amount of client-server benchmarking against a single peer can demonstrate the
+design's central claim**, because the workload that triggers the cost cannot be
+constructed through that API. Bigger rooms will not fix it. More samples will
+not fix it.
+
+The rig that can is the federated one — #16's class-D fork handling against a
+real Synapse, where forks exist because two servers accepted events
+concurrently. Until that exists, this table should be read as "faster in
+practice today", not as evidence for the architecture.
 
 Tuwunel is not in this table. It needs a build the sandbox does not have; the
 script is server-agnostic and takes a base URL, so adding it is a matter of
