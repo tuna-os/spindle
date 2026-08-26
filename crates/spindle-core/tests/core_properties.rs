@@ -79,17 +79,11 @@ fn fork_window_excludes_all_common_history_after_a_prior_merge() {
         .unwrap();
     room.append_local("$joined", None).unwrap();
     room.append_local("$new-left", None).unwrap();
-    room.append_remote(EventInput::new(
-        "$new-right",
-        vec![EventId::new("$joined")],
-    ))
-    .unwrap();
+    room.append_remote(EventInput::new("$new-right", vec![EventId::new("$joined")]))
+        .unwrap();
 
     let window = room
-        .fork_window(
-            &[EventId::new("$new-left"), EventId::new("$new-right")],
-            2,
-        )
+        .fork_window(&[EventId::new("$new-left"), EventId::new("$new-right")], 2)
         .unwrap();
     assert_eq!(window.nearest_common_ancestor, EventId::new("$joined"));
     assert_eq!(

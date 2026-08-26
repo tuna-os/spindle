@@ -326,8 +326,5 @@ pub enum ForkWindowError {
     EmptyTips,
     UnknownTip(EventId),
     NoCommonAncestor,
-    TooLarge {
-        limit: usize,
-        event_count: usize,
-    },
+    TooLarge { limit: usize, event_count: usize },
 }
