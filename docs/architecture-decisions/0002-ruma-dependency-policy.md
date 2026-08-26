@@ -82,3 +82,10 @@ The cost of the boundary is some duplication: `EventId` and `StateKey` are ours
 rather than ruma's, and conversions are needed at the seam. That is deliberate.
 The alternative — ruma types threaded through the log — would make the core
 untestable in isolation and the benchmarks circular.
+
+## See also
+
+[`docs/divergence.md`](../divergence.md) places this decision in the wider map
+of what Spindle inherits and what it deliberately reimplements. The ruma-free
+core is one row of that seam; the others are the linear index, the state trie,
+the bounded fork window, the log chain and the store format.
