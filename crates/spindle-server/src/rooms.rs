@@ -34,9 +34,27 @@ const ROOM_VERSION: &str = "11";
 /// from the room the moment invites or knocks matter.
 const JOIN: &[u8] = b"join";
 
+/// The same word as [`JOIN`], as a `str`, for comparing against event content
+/// rather than against index bytes. One definition would need a conversion at
+/// every use; two constants that cannot drift apart are checked below instead.
+const JOIN_STR: &str = "join";
+
+const _: () = assert!(
+    JOIN_STR.as_bytes()[0] == JOIN[0] && JOIN_STR.len() == JOIN.len(),
+    "the membership index and the event content must spell `join` the same way"
+);
+
 /// Invited, which is not joined -- `/sync` reports the two in different
 /// sections and a client acts on them differently.
 const INVITE: &[u8] = b"invite";
+
+/// [`INVITE`] as a `str`, for the same reason [`JOIN_STR`] exists.
+const INVITE_STR: &str = "invite";
+
+const _: () = assert!(
+    INVITE_STR.as_bytes()[0] == INVITE[0] && INVITE_STR.len() == INVITE.len(),
+    "the membership index and the event content must spell `invite` the same way"
+);
 
 /// Rooms held open, keyed by room ID.
 pub struct Rooms {
@@ -241,9 +259,17 @@ impl Rooms {
         sender: &str,
         target: &str,
         membership: &str,
+        reason: Option<&str>,
         key: &Ed25519KeyPair,
     ) -> Result<String, RoomError> {
-        let content = serde_json::json!({ "membership": membership });
+        let mut content = serde_json::json!({ "membership": membership });
+        // Absent rather than null when there is no reason: `reason` is part of
+        // the event content, so it is covered by the signature and by the
+        // event ID, and a null would make the same kick hash differently from
+        // one sent by a server that simply omits the field.
+        if let Some(reason) = reason {
+            content["reason"] = Value::String(reason.to_owned());
+        }
         self.with_room(room_id, |rooms, log| {
             rooms.append(
                 log,
@@ -584,6 +610,108 @@ impl Rooms {
     /// Returns [`RoomError`] if the index cannot be read.
     pub fn joined(&self, user_id: &str) -> Result<Vec<String>, RoomError> {
         self.membership_rooms(user_id, JOIN)
+    }
+
+    /// Everyone currently joined to a room, with their profile at the time
+    /// they joined.
+    ///
+    /// Read from the room's own state rather than from the membership index:
+    /// the index is keyed by user so that "which rooms is this user in" is a
+    /// prefix scan, and answering the transpose from it would mean scanning
+    /// every user the server knows. The state snapshot already holds exactly
+    /// this room's members, so the cost is proportional to the room -- which
+    /// is what the caller asked for.
+    ///
+    /// `display_name` and `avatar_url` are whatever the member event carries.
+    /// A member who set neither gets JSON nulls, which is what the spec's
+    /// `RoomMember` says and what a client expects to see.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] if the room does not exist, or
+    /// [`RoomError`] if a member event body cannot be read.
+    pub fn joined_members(&self, room_id: &str) -> Result<Map<String, Value>, RoomError> {
+        let members = self.with_room(room_id, |_, log| {
+            Ok(current_state(log)
+                .into_iter()
+                .filter(|(key, _)| key.event_type().as_str() == "m.room.member")
+                .map(|(key, event_id)| (key.state_key().to_owned(), event_id))
+                .collect::<Vec<_>>())
+        })?;
+        let mut out = Map::new();
+        for (user_id, event_id) in members {
+            let event = self.event(room_id, &event_id)?;
+            if event["content"]["membership"].as_str() != Some(JOIN_STR) {
+                continue;
+            }
+            out.insert(
+                user_id,
+                serde_json::json!({
+                    "display_name": event["content"]["displayname"].clone(),
+                    "avatar_url": event["content"]["avatar_url"].clone(),
+                }),
+            );
+        }
+        Ok(out)
+    }
+
+    /// Drop a room from one user's view of the server.
+    ///
+    /// Purely local bookkeeping: no event is appended, so nobody else's view
+    /// of the room changes and the log still records that the user left. The
+    /// spec refuses a forget from someone still in the room, and so does this
+    /// -- otherwise a client could hide a room it is still receiving events
+    /// for, and every subsequent `/sync` would contradict the hiding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] if the room does not exist, or
+    /// [`RoomError::Forbidden`] if the user is still joined or invited.
+    pub fn forget(&self, user_id: &str, room_id: &str) -> Result<(), RoomError> {
+        // Opening the room is what makes an unknown room a 404 rather than a
+        // silent success: without it, forgetting a room that never existed
+        // would happily write a marker for it.
+        self.with_room(room_id, |_, _| Ok(()))?;
+        let current = spindle_store::ReadView::get(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::Membership,
+                user_id,
+                room_id,
+            ),
+        )?;
+        if matches!(current.as_deref(), Some(JOIN | INVITE)) {
+            return Err(RoomError::Forbidden(format!(
+                "{user_id} is still in {room_id} and cannot forget it"
+            )));
+        }
+        spindle_store::Store::put(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::Forgotten,
+                user_id,
+                room_id,
+            ),
+            &[],
+        )?;
+        Ok(())
+    }
+
+    /// Whether `user_id` has forgotten `room_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the index cannot be read.
+    pub fn is_forgotten(&self, user_id: &str, room_id: &str) -> Result<bool, RoomError> {
+        Ok(spindle_store::ReadView::get(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::Forgotten,
+                user_id,
+                room_id,
+            ),
+        )?
+        .is_some())
     }
 
     /// Record that `user_id` has read up to `event_id`.
@@ -1015,6 +1143,20 @@ impl Rooms {
             ),
             membership.as_bytes(),
         )?;
+        // Being brought back into a room undoes forgetting it, and this is the
+        // one place every member event passes through -- doing it in the
+        // `/join` handler instead would miss an invite, a third-party join and
+        // whatever path federation eventually appends through.
+        if membership == JOIN_STR || membership == INVITE_STR {
+            spindle_store::Store::delete(
+                self.store.as_ref(),
+                &spindle_core::keys::user_room(
+                    spindle_core::keys::Keyspace::Forgotten,
+                    user_id,
+                    room_id,
+                ),
+            )?;
+        }
         Ok(())
     }
 
