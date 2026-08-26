@@ -111,3 +111,38 @@ fn the_retry_hint_counts_down() {
         immediately.as_millis()
     );
 }
+
+/// The limiter can be switched off, and the switch is real.
+///
+/// Not a convenience. With it on, Complement's registration-heavy suites and
+/// the API benchmark in `scripts/api-benchmark.py` both measure our own rate
+/// limit rather than the server. The benchmark found this by failing on its
+/// sixth registration: `M_LIMIT_EXCEEDED, retry in 299682ms`.
+///
+/// Disabled is decided inside `check`, not by leaving the limiter unwired, so
+/// both configurations run the same code path. A limiter that is absent in one
+/// build and present in another is two servers.
+#[test]
+fn a_disabled_limiter_refuses_nothing() {
+    let limiter = RateLimiter::with_enabled(false);
+    for attempt in 0..1000 {
+        assert!(
+            limiter.check("k", LIMIT).is_ok(),
+            "attempt {attempt} was refused by a disabled limiter"
+        );
+    }
+}
+
+/// And the default is on, so switching it off has to be deliberate.
+#[test]
+fn the_default_limiter_is_enabled() {
+    for limiter in [RateLimiter::new(), RateLimiter::default()] {
+        for _ in 0..3 {
+            limiter.check("k", LIMIT).unwrap();
+        }
+        assert!(
+            limiter.check("k", LIMIT).is_err(),
+            "a limiter built by the default path let everything through"
+        );
+    }
+}

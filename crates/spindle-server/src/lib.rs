@@ -49,10 +49,13 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, signing::Si
         Arc::clone(&store),
         config.server.name.clone(),
     ));
+    let limiter = Arc::new(ratelimit::RateLimiter::with_enabled(
+        config.ratelimit.enabled,
+    ));
     let state = AppState {
         config: Arc::new(config),
         store,
-        limiter: Arc::new(ratelimit::RateLimiter::new()),
+        limiter,
         key,
         rooms,
     };

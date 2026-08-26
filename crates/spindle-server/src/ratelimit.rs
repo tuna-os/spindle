@@ -63,6 +63,7 @@ impl RetryAfter {
 /// noted here rather than silently assumed away, because a per-node limit
 /// behind a load balancer is N times the limit it claims to be.
 pub struct RateLimiter {
+    enabled: bool,
     windows: Mutex<HashMap<String, Window>>,
 }
 
@@ -75,7 +76,19 @@ impl Default for RateLimiter {
 impl RateLimiter {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_enabled(true)
+    }
+
+    /// A limiter that lets everything through when `enabled` is false.
+    ///
+    /// Disabled is checked at the point of decision rather than by not
+    /// wiring the limiter up, so the code path a test exercises is the one
+    /// production runs -- a limiter that is absent in one build and present
+    /// in another is two servers.
+    #[must_use]
+    pub fn with_enabled(enabled: bool) -> Self {
         Self {
+            enabled,
             windows: Mutex::new(HashMap::new()),
         }
     }
@@ -98,6 +111,9 @@ impl RateLimiter {
     ///
     /// Returns [`RetryAfter`] when the limit is already reached.
     pub fn check_at(&self, key: &str, limit: Limit, now: Instant) -> Result<(), RetryAfter> {
+        if !self.enabled {
+            return Ok(());
+        }
         let mut windows = self.windows.lock().unwrap_or_else(|poisoned| {
             // A panic inside the critical section leaves counters, not
             // invariants, so the recovered state is usable. Refusing traffic

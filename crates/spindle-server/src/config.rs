@@ -17,6 +17,8 @@ pub struct Config {
     pub storage: StorageConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub ratelimit: RateLimitConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -33,6 +35,31 @@ pub struct ServerConfig {
     /// server name need not be the hostname.
     #[serde(default)]
     pub public_base_url: Option<String>,
+}
+
+/// Whether the rate limiter is in force.
+///
+/// On by default, because a server exposed to the internet without it is a
+/// brute-force target (#66). Off is for the two contexts where the limiter is
+/// measuring the harness rather than the server: Complement, which registers
+/// users far faster than any human, and the API benchmark, whose whole job is
+/// to issue requests as fast as the server will take them. Both would
+/// otherwise report our own rate limit as the server's latency.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize)]

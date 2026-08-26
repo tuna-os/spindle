@@ -82,6 +82,15 @@ path = "/data/store"
 
 [logging]
 filter = "${SPINDLE_LOG:-info}"
+
+# Off, because Complement is not the traffic the limiter defends against: it
+# registers users and sends events as fast as the server will take them, which
+# is exactly what a brute-force limit refuses. Left on, the suite fails at
+# M_LIMIT_EXCEEDED on its sixth registration and every result after that
+# measures our rate limit rather than our server. The shipped default is on
+# (see config.rs); this is a test image and says so.
+[ratelimit]
+enabled = false
 TOML
 
 # Everything above needed root: the trust store, and Complement's 0600 CA key.
