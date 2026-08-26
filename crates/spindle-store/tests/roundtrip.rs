@@ -195,6 +195,7 @@ fn a_truncated_record_is_an_error_not_a_panic() {
         depth: 3,
         state_key: Some(("m.room.topic".to_owned(), String::new())),
         state_root: [9_u8; 32],
+        chain: Some([7_u8; 32]),
     };
     let encoded = entry.encode();
     assert_eq!(EntryRecord::decode(&encoded).unwrap(), entry);
@@ -253,6 +254,7 @@ proptest! {
         event_id in "\\$[a-zA-Z0-9]{1,24}",
         parents in prop::collection::vec("\\$[a-zA-Z0-9]{1,24}", 0..5),
         slot in prop::option::of(("[a-z.]{1,20}", "[a-z:@.]{0,20}")),
+        chain: bool,
     ) {
         let record = EntryRecord {
             li,
@@ -261,7 +263,46 @@ proptest! {
             depth,
             state_key: slot,
             state_root: [0_u8; 32],
+            chain: chain.then_some([3_u8; 32]),
         };
         prop_assert_eq!(EntryRecord::decode(&record.encode()).unwrap(), record);
     }
+}
+
+#[test]
+fn tampering_with_stored_history_breaks_the_chain_on_reopen() {
+    let dir = TempDir::new().unwrap();
+    let store = FjallStore::open(dir.path()).unwrap();
+    RoomStore::new(&store, ROOM).save(&live_room()).unwrap();
+
+    // A clean reopen attests to itself.
+    let clean = RoomStore::new(&store, ROOM).load().unwrap().unwrap();
+    assert!(clean.broken_chain.is_empty());
+
+    // Rewrite the middle entry's record so it names a different event, exactly
+    // as an operator quietly editing history would have to. The record stays
+    // structurally valid -- only the content changes.
+    let prefix = spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::Log, ROOM);
+    let records = store.scan_prefix(&prefix).unwrap();
+    let (key, value) = &records[1];
+    let mut record = EntryRecord::decode(value).unwrap();
+    let original = record.li;
+    record.event_id = "$substituted".to_owned();
+    store.put(key, &record.encode()).unwrap();
+
+    let tampered = RoomStore::new(&store, ROOM).load().unwrap().unwrap();
+
+    // The chain recomputed from the entries no longer matches what was
+    // recorded, and it stays broken for every entry after -- the edit cannot be
+    // contained.
+    assert!(
+        !tampered.broken_chain.is_empty(),
+        "an edited history must not reopen silently"
+    );
+    assert_eq!(tampered.broken_chain[0].get(), original);
+    assert_eq!(
+        tampered.broken_chain.len(),
+        2,
+        "the substituted entry and everything sequenced after it"
+    );
 }
