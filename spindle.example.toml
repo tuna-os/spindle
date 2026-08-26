@@ -1,0 +1,26 @@
+# Spindle homeserver configuration.
+#
+# Only `server.name` is required. Every other value below is its default, shown
+# so you can see what you are changing rather than what you are adding.
+
+[server]
+# Permanent. It is baked into every user and room ID this server mints, and
+# those federate — changing it later orphans every room the server is in.
+name = "example.org"
+
+# Loopback by default: binding every interface on install would be an exposure
+# decision made on your behalf. Put a reverse proxy in front, or change this
+# deliberately.
+bind = "127.0.0.1:8008"
+
+# What `.well-known` tells clients to connect to, when that differs from
+# `name`. Delegation is the ordinary case — it exists so the server name need
+# not be the hostname.
+# public_base_url = "https://matrix.example.org"
+
+[storage]
+path = "./data"
+
+[logging]
+# A `tracing-subscriber` filter directive.
+# filter = "spindle=debug,warn"
