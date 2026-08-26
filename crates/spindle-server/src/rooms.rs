@@ -353,6 +353,113 @@ impl Rooms {
         Ok(event)
     }
 
+    /// Redact an event.
+    ///
+    /// **The redaction algorithm is ruma's**, for the same reason the auth
+    /// rules are (`docs/divergence.md` §3): it is spec-defined, fiddly, and
+    /// version-dependent, and a second implementation of it is a second thing
+    /// to keep in step with the spec. What is ours is only *when* it runs and
+    /// what is stored afterwards.
+    ///
+    /// The redaction is itself an event, authorized like any other — a user
+    /// who may not redact is refused by the rules rather than by a check here.
+    ///
+    /// **The stored body is rewritten in place**, which SPEC §10.5 calls for
+    /// and which the log chain permits: `ChainHash::extend` covers the event
+    /// *ID*, and a v11 event ID is the reference hash of the **redacted**
+    /// form, so redacting changes neither. The chain still verifies, and so
+    /// does the event ID over what is left. That is why this can rewrite
+    /// history without breaking the integrity construction — the same property
+    /// that lets an admin purge bodies (#83).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room or target is unknown, or the rules
+    /// refuse the redaction.
+    pub fn redact(
+        &self,
+        room_id: &str,
+        sender: &str,
+        key: &Ed25519KeyPair,
+        target: &str,
+        reason: Option<&str>,
+    ) -> Result<String, RoomError> {
+        // The target has to be an event of this room. Redacting something the
+        // room does not have would mint an event that refers to nothing, and
+        // federate that nothing to every peer.
+        let known = self.with_room(room_id, |_, log| {
+            Ok(log.get(&EventId::new(target)).is_some())
+        })?;
+        if !known {
+            return Err(RoomError::MissingBody(target.to_owned()));
+        }
+
+        let mut content = serde_json::Map::new();
+        // `redacts` in content, not at the top level: MSC2174, which room v11
+        // adopts (SPEC §11's version table).
+        content.insert("redacts".to_owned(), Value::String(target.to_owned()));
+        if let Some(reason) = reason {
+            content.insert("reason".to_owned(), Value::String(reason.to_owned()));
+        }
+        let content = Value::Object(content);
+
+        let redaction_id = self.with_room(room_id, |rooms, log| {
+            rooms.append(
+                log,
+                room_id,
+                sender,
+                key,
+                "m.room.redaction",
+                None,
+                &content,
+            )
+        })?;
+
+        // Only after the redaction is authorized, signed and stored. Rewriting
+        // first would strip an event on behalf of a redaction the rules then
+        // refused.
+        self.apply_redaction(room_id, target, &redaction_id)?;
+        Ok(redaction_id)
+    }
+
+    /// Rewrite a stored event to its redacted form.
+    fn apply_redaction(
+        &self,
+        room_id: &str,
+        target: &str,
+        redaction_id: &str,
+    ) -> Result<(), RoomError> {
+        let stored = self.read_event(room_id, &EventId::new(target))?;
+        let object = CanonicalJsonValue::try_from(stored)
+            .map_err(|error| RoomError::Build(error.to_string()))?;
+        let CanonicalJsonValue::Object(object) = object else {
+            return Err(RoomError::Build(
+                "a stored event is not an object".to_owned(),
+            ));
+        };
+
+        let rules = RoomVersionRules::V11.redaction;
+        let redacted = ruma::canonical_json::redact(object, &rules, None)
+            .map_err(|error| RoomError::Build(format!("cannot redact: {error}")))?;
+
+        let mut json = canonical_to_json(&redacted);
+        // `redacted_because` goes in `unsigned`, which is not covered by the
+        // event ID -- so a client can see why without the ID changing.
+        if let Some(map) = json.as_object_mut() {
+            map.insert(
+                "unsigned".to_owned(),
+                serde_json::json!({ "redacted_because": { "event_id": redaction_id } }),
+            );
+        }
+
+        spindle_store::Store::put(
+            self.store.as_ref(),
+            &event_body_key(room_id, target),
+            &serde_json::to_vec(&json)?,
+        )?;
+        Ok(())
+    }
+
     /// Events in `li` order, newest first, starting below `from`.
     ///
     /// # Errors
