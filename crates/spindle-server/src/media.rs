@@ -1,0 +1,379 @@
+//! Uploaded files: where the bytes go, and who is allowed to see them.
+//!
+//! Blobs are **content-addressed** by BLAKE3, the same idea the state trie
+//! rests on, applied to a different thing. Two users uploading the same image
+//! store one copy, and a re-upload after a delete costs nothing.
+//!
+//! The **media ID is not the hash**, and that separation is load-bearing. A
+//! hash-addressed URL would let anyone holding a file confirm whether this
+//! server has it — and, for any file drawn from a small set, recover which of
+//! that set a user uploaded. Content addressing is a storage decision; it must
+//! not become an addressing one. The ID is random and opaque, and the mapping
+//! from ID to hash lives in the store.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+use spindle_core::keys;
+use spindle_store::{FjallStore, ReadView, Store, StoreError};
+
+/// The largest upload accepted, in bytes.
+///
+/// A limit the server states rather than discovers: `/config` advertises it,
+/// so a client can refuse a file before spending a minute sending it.
+pub const MAX_UPLOAD: usize = 50 * 1024 * 1024;
+
+/// Content types safe to render inline in a browser.
+///
+/// Everything else is served as an attachment. The list is deliberately short
+/// and deliberately does **not** include `text/html`, `image/svg+xml`, or
+/// anything else that can execute script: a homeserver that renders uploaded
+/// HTML inline has handed every user a stored-XSS primitive against its own
+/// origin. SVG is an image and still excluded, because it is also a document
+/// that can carry `<script>`.
+const INLINE_SAFE: &[&str] = &[
+    "image/jpeg",
+    "image/gif",
+    "image/png",
+    "image/apng",
+    "image/webp",
+    "image/avif",
+    "video/mp4",
+    "video/webm",
+    "video/ogg",
+    "video/quicktime",
+    "audio/mp4",
+    "audio/webm",
+    "audio/aac",
+    "audio/mpeg",
+    "audio/ogg",
+    "audio/wave",
+    "audio/wav",
+    "audio/flac",
+];
+
+/// What is known about one uploaded file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaRecord {
+    /// Hex BLAKE3 of the bytes. The blob's name on disk.
+    pub hash: String,
+    pub content_type: String,
+    /// The name the uploader gave, already made safe to put in a header.
+    pub filename: Option<String>,
+    pub size: usize,
+    pub uploaded_by: String,
+}
+
+impl MediaRecord {
+    /// Whether a browser may render this inline, or must be made to download it.
+    #[must_use]
+    pub fn inline_safe(&self) -> bool {
+        INLINE_SAFE.contains(&self.content_type.as_str())
+    }
+
+    /// The `Content-Disposition` header value.
+    ///
+    /// The filename is quoted and escaped rather than interpolated: a name
+    /// containing a quote or a newline would otherwise let the uploader inject
+    /// header content, and the uploader chooses the name.
+    #[must_use]
+    pub fn content_disposition(&self) -> String {
+        let kind = if self.inline_safe() {
+            "inline"
+        } else {
+            "attachment"
+        };
+        match &self.filename {
+            Some(name) => format!("{kind}; filename=\"{}\"", escape_quoted(name)),
+            None => kind.to_owned(),
+        }
+    }
+}
+
+/// Make a string safe inside a quoted HTTP header parameter.
+///
+/// Backslashes and quotes are escaped; control characters -- CR and LF above
+/// all -- are dropped entirely rather than escaped, because there is no
+/// escaping of them that a header parser is required to understand, and a
+/// dropped byte is a worse filename where a kept one is a header injection.
+fn escape_quoted(name: &str) -> String {
+    name.chars()
+        .filter(|character| !character.is_control())
+        .flat_map(|character| {
+            if character == '"' || character == '\\' {
+                vec!['\\', character]
+            } else {
+                vec![character]
+            }
+        })
+        .collect()
+}
+
+/// Blobs on disk, metadata in the store.
+pub struct Media {
+    store: Arc<FjallStore>,
+    root: PathBuf,
+    server_name: String,
+}
+
+impl Media {
+    #[must_use]
+    pub fn new(
+        store: Arc<FjallStore>,
+        root: impl Into<PathBuf>,
+        server_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            store,
+            root: root.into(),
+            server_name: server_name.into(),
+        }
+    }
+
+    /// Store `bytes`, returning the new media ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError::TooLarge`] past [`MAX_UPLOAD`], or
+    /// [`MediaError`] if the blob or its record cannot be written.
+    pub fn put(
+        &self,
+        bytes: &[u8],
+        content_type: &str,
+        filename: Option<&str>,
+        uploaded_by: &str,
+    ) -> Result<String, MediaError> {
+        if bytes.len() > MAX_UPLOAD {
+            return Err(MediaError::TooLarge {
+                size: bytes.len(),
+                limit: MAX_UPLOAD,
+            });
+        }
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        let path = self.blob_path(&hash);
+        // Written only if absent: identical bytes are one blob, and rewriting
+        // them would be work done to produce a file that already exists.
+        if !path.exists() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Written beside and renamed, so a reader can never observe a
+            // half-written blob under its final name. The name is the content
+            // hash, so a truncated file under it would be a permanent lie.
+            let staging = path.with_extension("partial");
+            std::fs::write(&staging, bytes)?;
+            std::fs::rename(&staging, &path)?;
+        }
+
+        let media_id = random_media_id();
+        let record = MediaRecord {
+            hash,
+            content_type: content_type.to_owned(),
+            filename: filename.map(str::to_owned),
+            size: bytes.len(),
+            uploaded_by: uploaded_by.to_owned(),
+        };
+        Store::put(
+            self.store.as_ref(),
+            &keys::media(&media_id),
+            &serde_json::to_vec(&record)?,
+        )?;
+        Ok(media_id)
+    }
+
+    /// What is known about `media_id`, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the record cannot be read or decoded.
+    pub fn record(&self, media_id: &str) -> Result<Option<MediaRecord>, MediaError> {
+        let Some(bytes) = ReadView::get(self.store.as_ref(), &keys::media(media_id))? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(&bytes)?))
+    }
+
+    /// The bytes of `media_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError::Unknown`] if nothing is stored under that ID, or
+    /// [`MediaError::Missing`] if the record exists but its blob does not --
+    /// which means the store and the filesystem disagree, and is worth saying
+    /// rather than reporting as "no such file".
+    pub fn bytes(&self, media_id: &str) -> Result<(MediaRecord, Vec<u8>), MediaError> {
+        let record = self
+            .record(media_id)?
+            .ok_or_else(|| MediaError::Unknown(media_id.to_owned()))?;
+        let path = self.blob_path(&record.hash);
+        let bytes = std::fs::read(&path).map_err(|_| MediaError::Missing {
+            media_id: media_id.to_owned(),
+            hash: record.hash.clone(),
+        })?;
+        Ok((record, bytes))
+    }
+
+    /// Whether this server is the one that holds `server_name`'s media.
+    #[must_use]
+    pub fn is_ours(&self, server_name: &str) -> bool {
+        server_name == self.server_name
+    }
+
+    /// Two levels of fan-out from the hash, so no directory holds every blob.
+    ///
+    /// Filesystems degrade with very large directories, and a media store is
+    /// exactly the thing that grows without bound. The prefix comes from the
+    /// hash rather than from the upload time, so the distribution is uniform
+    /// by construction rather than by hoping uploads are.
+    fn blob_path(&self, hash: &str) -> PathBuf {
+        let (first, rest) = hash.split_at(2);
+        let (second, _) = rest.split_at(2);
+        Path::new(&self.root).join(first).join(second).join(hash)
+    }
+}
+
+/// An opaque, unguessable media ID.
+///
+/// Random rather than derived from the content, for the reason the module
+/// header gives: a hash-addressed URL is an existence oracle. 32 hex
+/// characters is 128 bits, which is not guessable by anyone.
+fn random_media_id() -> String {
+    use rand::RngCore as _;
+    use std::fmt::Write as _;
+    let mut bytes = [0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes
+        .iter()
+        .fold(String::with_capacity(32), |mut id, byte| {
+            let _ = write!(id, "{byte:02x}");
+            id
+        })
+}
+
+/// What can go wrong with media.
+#[derive(Debug)]
+pub enum MediaError {
+    Unknown(String),
+    /// The record exists and the blob does not: the store and the filesystem
+    /// disagree, which is a different fault from a missing upload.
+    Missing {
+        media_id: String,
+        hash: String,
+    },
+    TooLarge {
+        size: usize,
+        limit: usize,
+    },
+    Storage(StoreError),
+    Io(String),
+    Codec(String),
+}
+
+impl From<StoreError> for MediaError {
+    fn from(error: StoreError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl From<std::io::Error> for MediaError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error.to_string())
+    }
+}
+
+impl From<serde_json::Error> for MediaError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Codec(error.to_string())
+    }
+}
+
+impl std::fmt::Display for MediaError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown(id) => write!(formatter, "no media with ID {id}"),
+            Self::Missing { media_id, hash } => write!(
+                formatter,
+                "{media_id} is recorded but its blob {hash} is not on disk"
+            ),
+            Self::TooLarge { size, limit } => {
+                write!(formatter, "{size} bytes exceeds the {limit}-byte limit")
+            }
+            Self::Storage(error) => write!(formatter, "storage: {error}"),
+            Self::Io(message) => write!(formatter, "filesystem: {message}"),
+            Self::Codec(message) => write!(formatter, "unreadable: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for MediaError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_filename_cannot_inject_a_header() {
+        // The uploader chooses the name, so it is attacker-controlled input
+        // going into a response header.
+        let record = |name: &str| MediaRecord {
+            hash: "abc".to_owned(),
+            content_type: "application/octet-stream".to_owned(),
+            filename: Some(name.to_owned()),
+            size: 1,
+            uploaded_by: "@a:b".to_owned(),
+        };
+
+        let injected = record("evil\r\nX-Evil: yes").content_disposition();
+        assert!(
+            !injected.contains('\r') && !injected.contains('\n'),
+            "{injected}"
+        );
+
+        let quoted = record("say \"hello\"").content_disposition();
+        assert_eq!(quoted, r#"attachment; filename="say \"hello\"""#);
+
+        let backslash = record(r"back\slash").content_disposition();
+        assert_eq!(backslash, r#"attachment; filename="back\\slash""#);
+    }
+
+    #[test]
+    fn html_and_svg_are_never_inline() {
+        // A homeserver that renders uploaded HTML inline has handed every user
+        // a stored-XSS primitive against its own origin. SVG is an image and
+        // also a document that can carry script.
+        for dangerous in [
+            "text/html",
+            "image/svg+xml",
+            "application/xhtml+xml",
+            "text/javascript",
+            "application/javascript",
+        ] {
+            let record = MediaRecord {
+                hash: "abc".to_owned(),
+                content_type: dangerous.to_owned(),
+                filename: None,
+                size: 1,
+                uploaded_by: "@a:b".to_owned(),
+            };
+            assert!(!record.inline_safe(), "{dangerous} must not render inline");
+            assert_eq!(record.content_disposition(), "attachment");
+        }
+    }
+
+    #[test]
+    fn ordinary_images_are_inline() {
+        let record = MediaRecord {
+            hash: "abc".to_owned(),
+            content_type: "image/png".to_owned(),
+            filename: Some("cat.png".to_owned()),
+            size: 1,
+            uploaded_by: "@a:b".to_owned(),
+        };
+        assert!(record.inline_safe());
+        assert_eq!(
+            record.content_disposition(),
+            r#"inline; filename="cat.png""#
+        );
+    }
+}

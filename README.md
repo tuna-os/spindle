@@ -2,8 +2,19 @@
 
 **A Matrix homeserver with no state resolution on the hot path.**
 
-Status: design specification, v0.1. Nothing is implemented yet — this repository
-is the spec and the argument for it.
+Status: implementation in progress. The M1 client-server surface — rooms,
+timelines, state, membership and moderation, relations, redaction, receipts,
+typing, account data, push rules, aliases, filters, `/context`, MSC3266
+summaries, MSC4222 `state_after` — is implemented and tested, on an append-only
+log with materialized state (`spindle-core`, `spindle-store`,
+`spindle-server`). M2 (media, sliding sync, E2EE) has begun. Federation is not
+implemented yet; SPEC.md remains the design the code is held against.
+
+Measured against Synapse 1.159.0 on the same host and driver
+([method](docs/benchmarks.md)): joins 26–30× faster, sends 17–21×,
+`/messages` 5×, initial `/sync` ~2× — with the honest caveat that this is a
+constant-factor win on an unforked workload; the architectural claim needs the
+M3 federation rig to test.
 
 ## The idea
 

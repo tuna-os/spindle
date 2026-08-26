@@ -72,6 +72,7 @@ pub fn router(state: AppState) -> Router {
         .merge(account_routes())
         .merge(room_routes())
         .merge(timeline_routes())
+        .merge(media_routes())
         .merge(discovery_routes())
         .with_state(state)
 }
@@ -239,6 +240,178 @@ fn timeline_routes() -> Router<AppState> {
             "/_matrix/client/v3/rooms/{room_id}/context/{event_id}",
             get(room_context),
         )
+}
+
+/// Uploading and fetching files.
+///
+/// Only the authenticated surface. The unauthenticated `/media/v3/download`
+/// endpoints are deliberately absent: the spec froze and deprecated them
+/// because an unauthenticated media URL is a capability that leaks the moment
+/// it is pasted anywhere, and serving them would undo the access control the
+/// authenticated endpoints exist to impose. A client old enough to need them
+/// gets a 404, which is the truthful answer for a surface this server does not
+/// offer.
+fn media_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/_matrix/media/v3/upload",
+            post(upload_media)
+                // Axum's default body limit is 2 MiB, which would reject an
+                // upload before the handler ever saw it -- with a bare 413 and
+                // no Matrix error code. The server would then be advertising a
+                // 50 MiB limit in `/config` and enforcing 2 MiB, which is the
+                // worst kind of disagreement: the client is told the file is
+                // fine, sends it, and gets an opaque failure.
+                //
+                // The extractor limit is set one byte above ours so that
+                // `Media::put` is the thing that refuses, and refuses with
+                // `M_TOO_LARGE`.
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    crate::media::MAX_UPLOAD + 1,
+                )),
+        )
+        .route("/_matrix/media/v3/config", get(media_config))
+        .route("/_matrix/client/v1/media/config", get(media_config))
+        .route(
+            "/_matrix/client/v1/media/download/{server_name}/{media_id}",
+            get(download_media),
+        )
+        .route(
+            "/_matrix/client/v1/media/download/{server_name}/{media_id}/{file_name}",
+            get(download_media_named),
+        )
+}
+
+/// `POST /_matrix/media/v3/upload`
+async fn upload_media(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Query(query): axum::extract::Query<UploadQuery>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, MatrixError> {
+    // The uploader's claim about the type, not a guess at it. Sniffing would
+    // mean the server deciding a file is HTML and then having to be right
+    // about that forever; taking the claim and refusing to render anything
+    // risky inline is the safer half of the same problem.
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+    let media_id = state
+        .media
+        .put(
+            &body,
+            &content_type,
+            query.filename.as_deref(),
+            &identity.user_id,
+        )
+        .map_err(|error| media_error(&error))?;
+    Ok(Json(json!({
+        "content_uri": format!("mxc://{}/{media_id}", state.config.server.name),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct UploadQuery {
+    filename: Option<String>,
+}
+
+/// `GET /_matrix/media/v3/config` and its `/client/v1` twin.
+async fn media_config(State(_state): State<AppState>) -> Json<Value> {
+    // Stated rather than discovered: a client that knows the limit can refuse
+    // a file before spending a minute sending it.
+    Json(json!({ "m.upload.size": crate::media::MAX_UPLOAD }))
+}
+
+/// `GET /_matrix/client/v1/media/download/{server_name}/{media_id}`
+async fn download_media(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
+) -> Result<axum::response::Response, MatrixError> {
+    serve_media(&state, &identity, &server_name, &media_id)
+}
+
+/// The same, with a filename the client would like the browser to use.
+///
+/// The name in the path is ignored. The one that goes in the header is the one
+/// recorded at upload: letting the *downloader* choose it would let a link
+/// dictate what a file appears to be, which is how a `.png` turns into a
+/// `.exe` in someone's downloads folder.
+async fn download_media_named(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((server_name, media_id, _file_name)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+) -> Result<axum::response::Response, MatrixError> {
+    serve_media(&state, &identity, &server_name, &media_id)
+}
+
+fn serve_media(
+    state: &AppState,
+    _identity: &crate::accounts::Identity,
+    server_name: &str,
+    media_id: &str,
+) -> Result<axum::response::Response, MatrixError> {
+    if !state.media.is_ours(server_name) {
+        // Remote media needs federation to fetch, which does not exist yet.
+        // A 404 rather than a fabricated empty file: a client that gets bytes
+        // back believes it has the attachment.
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            format!("{server_name} is not this server, and remote media is not fetched yet"),
+        ));
+    }
+    let (record, bytes) = state
+        .media
+        .bytes(media_id)
+        .map_err(|error| media_error(&error))?;
+
+    let mut response = axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, &record.content_type)
+        .header(
+            axum::http::header::CONTENT_DISPOSITION,
+            record.content_disposition(),
+        )
+        // Without this a browser may decide for itself that an
+        // `application/octet-stream` is really HTML, and run it.
+        .header("x-content-type-options", "nosniff")
+        // Belt and braces around the same risk: even if something renders,
+        // it can load nothing, run nothing, and frame nothing.
+        .header(
+            "content-security-policy",
+            "sandbox; default-src 'none'; script-src 'none'; plugin-types application/pdf; \
+             style-src 'unsafe-inline'; object-src 'self';",
+        )
+        .header("cross-origin-resource-policy", "cross-origin");
+    if let Some(headers) = response.headers_mut() {
+        let _ = headers;
+    }
+    response
+        .body(axum::body::Body::from(bytes))
+        .map_err(|error| MatrixError::internal(&error.to_string()))
+}
+
+fn media_error(error: &crate::media::MediaError) -> MatrixError {
+    use crate::media::MediaError as Error;
+    match error {
+        Error::Unknown(_) | Error::Missing { .. } => {
+            MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", error.to_string())
+        }
+        Error::TooLarge { .. } => MatrixError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "M_TOO_LARGE",
+            error.to_string(),
+        ),
+        other => MatrixError::internal(&other.to_string()),
+    }
 }
 
 /// What a client or a peer reads before it knows anything else.

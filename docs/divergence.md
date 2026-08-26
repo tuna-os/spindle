@@ -82,8 +82,9 @@ different cost to reach its inputs. That is the project's thesis in one row.
 
 ## 4. What is genuinely ours today
 
-All of it is in `spindle-core` and `spindle-store`, and all of it is invisible
-to peers. Nothing here changes a byte on the wire.
+The load-bearing pieces are in `spindle-core` and `spindle-store`; since M1
+landed, `spindle-server` carries divergences of its own (§4.6–4.8). All of it
+is invisible to peers. Nothing here changes a byte on the wire.
 
 ### 4.1 The linear index (`core/src/log.rs`, SPEC §5.1)
 
@@ -139,6 +140,50 @@ Order-preserving `i64` encoding (sign-bit flip, so byte order matches numeric
 order across zero), keyspace-tagged and room-prefixed; a hand-written versioned
 record format over Fjall. Purely internal, versioned from day one so the format
 can move without a flag day.
+
+### 4.6 Read paths as index arithmetic (`server/src/rooms.rs`)
+
+The M1 endpoints lean on the linear index instead of maintaining derived
+tables. The unread count is `head − max(receipt, own join)` filtered over a
+contiguous range; `/context` is a window either side of one `li` plus the
+event's own state snapshot; `/relations` is a prefix scan whose key *ends* in
+`li`, so results arrive in timeline order with nothing sorting them.
+
+That last one is a recorded departure from our own SPEC §7, whose key shape
+`(room, target, rel_type, li)` cannot serve the type-less `/relations` arity
+in timeline order — the length-prefixed `rel_type` sorts by *length* before
+bytes. The type moved into the value; the narrowed arities filter on read.
+
+**Siblings:** Synapse maintains `event_push_actions` (written per event, per
+user, summarised by a background job) for unread counts, and orders relations
+with a stream-ordering sort at read. Ours are computed at read from the index;
+the trade is write-time work and storage against a read cost proportional to
+how far behind the reader is — cheap here because "which events follow this
+one" is subtraction, not a graph walk.
+
+### 4.7 Media: content-addressed blobs, opaque IDs (`server/src/media.rs`)
+
+Blobs are stored under their BLAKE3 hash — upload deduplication for free —
+but addressed by a random 128-bit ID, because a hash-addressed URL is an
+existence oracle. Content addressing is a storage decision that must not
+become an addressing one. The unauthenticated legacy download surface is
+absent by decision, not omission.
+
+**Siblings:** Synapse stores one file per upload under a random ID (no
+dedup); conduwuit/tuwunel key media by ID in the database. Neither content
+addresses; none of the three serves unauthenticated media any more, so there
+we agree.
+
+### 4.8 Ephemeral state that is never an event (`server/src/typing.rs`)
+
+Typing lives in memory, expires by being read (no sweeper), and wakes the
+`/sync` long-poll only when the *set of typists changes* — a refresh of an
+existing notice wakes nobody, which is what keeps a room of phones from
+polling in lockstep while someone types. A restart forgets it, correctly.
+
+**Siblings:** Synapse tracks typing in a replicated stream with serial
+numbers, because workers must share it. We have one process; the divergence
+is having less machinery, and it holds only until scale-out (#24) reopens it.
 
 ## 5. What we take from the siblings without taking their code
 
