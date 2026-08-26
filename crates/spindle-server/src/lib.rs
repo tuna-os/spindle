@@ -10,6 +10,7 @@ pub mod accounts;
 pub mod auth;
 pub mod config;
 pub mod errors;
+pub mod ratelimit;
 pub mod routes;
 pub mod surface;
 
@@ -25,6 +26,7 @@ pub use config::{Config, ConfigError};
 pub struct AppState {
     pub config: Arc<Config>,
     pub store: Arc<FjallStore>,
+    pub limiter: Arc<ratelimit::RateLimiter>,
 }
 
 /// Build the HTTP application.
@@ -32,6 +34,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Router {
     let state = AppState {
         config: Arc::new(config),
         store,
+        limiter: Arc::new(ratelimit::RateLimiter::new()),
     };
     routes::router(state)
 }

@@ -15,14 +15,30 @@ use tower::ServiceExt;
 
 struct Harness {
     _dir: TempDir,
-    store: Arc<FjallStore>,
+    /// One router for the whole harness, cloned per request.
+    ///
+    /// Building a fresh app per request would give every request its own rate
+    /// limiter and its own in-process state, which no deployment does — and
+    /// which quietly makes a rate-limit test unable to fail.
+    app: axum::Router,
 }
 
 impl Harness {
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
-        Self { _dir: dir, store }
+        let app = spindle_server::app(Self::config(), store);
+        Self { _dir: dir, app }
+    }
+
+    /// A harness over storage that already exists, as a restart would open it.
+    fn reopen(path: &std::path::Path) -> Self {
+        let store = Arc::new(FjallStore::open(path).unwrap());
+        let app = spindle_server::app(Self::config(), store);
+        Self {
+            _dir: TempDir::new().unwrap(),
+            app,
+        }
     }
 
     fn config() -> spindle_server::Config {
@@ -30,8 +46,12 @@ impl Harness {
     }
 
     async fn send(&self, request: Request<Body>) -> (StatusCode, Value) {
-        let app = spindle_server::app(Self::config(), Arc::clone(&self.store));
-        let response = app.oneshot(request).await.expect("the router answers");
+        let response = self
+            .app
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("the router answers");
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
             .await
@@ -268,21 +288,13 @@ async fn login_flows_advertise_only_password() {
 async fn accounts_survive_a_restart() {
     let dir = TempDir::new().unwrap();
     let token = {
-        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
-        let harness = Harness {
-            _dir: TempDir::new().unwrap(),
-            store,
-        };
+        let harness = Harness::reopen(dir.path());
         let registered = harness.register("alice", "hunter2").await;
         registered["access_token"].as_str().unwrap().to_owned()
     };
 
     // A fresh handle over the same directory, as a restart would open.
-    let store = Arc::new(FjallStore::open(dir.path()).unwrap());
-    let harness = Harness {
-        _dir: TempDir::new().unwrap(),
-        store,
-    };
+    let harness = Harness::reopen(dir.path());
     let (status, who) = harness
         .get_auth("/_matrix/client/v3/account/whoami", &token)
         .await;
@@ -366,4 +378,124 @@ async fn a_non_refreshing_login_omits_the_refresh_keys_entirely() {
     let object = body.as_object().unwrap();
     assert!(!object.contains_key("refresh_token"), "{body}");
     assert!(!object.contains_key("expires_in_ms"), "{body}");
+}
+
+/// A password endpoint with no limit is a brute-force target. The limit has to
+/// bite on repeated failures against one account.
+#[tokio::test]
+async fn repeated_failed_logins_against_one_account_are_refused() {
+    let harness = Harness::new();
+    harness.register("alice", "hunter2").await;
+
+    let wrong = json!({
+        "type": "m.login.password",
+        "identifier": { "type": "m.id.user", "user": "alice" },
+        "password": "nope",
+    });
+
+    let mut refused = None;
+    for attempt in 0..12 {
+        let (status, body) = harness.post("/_matrix/client/v3/login", &wrong).await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            refused = Some((attempt, body));
+            break;
+        }
+        assert_eq!(status, StatusCode::FORBIDDEN, "attempt {attempt}: {body}");
+    }
+
+    let (attempt, body) = refused.expect("brute force was never refused");
+    assert!(attempt <= 6, "took {attempt} attempts to trip the limit");
+    assert_eq!(body["errcode"], "M_LIMIT_EXCEEDED");
+    // Without this a client backs off by guessing, and the usual guess is
+    // "immediately, but again".
+    let retry = body["retry_after_ms"]
+        .as_u64()
+        .expect("no retry hint: {body}");
+    assert!(retry > 0, "a client told to wait 0ms retries now");
+}
+
+/// A correct login must not consume budget, or a busy shared address locks out
+/// its own legitimate users before it inconveniences an attacker.
+#[tokio::test]
+async fn a_correct_login_does_not_count_against_the_limit() {
+    let harness = Harness::new();
+    harness.register("alice", "hunter2").await;
+
+    let right = json!({
+        "type": "m.login.password",
+        "identifier": { "type": "m.id.user", "user": "alice" },
+        "password": "hunter2",
+    });
+
+    // Comfortably more than the failure budget.
+    for attempt in 0..15 {
+        let (status, body) = harness.post("/_matrix/client/v3/login", &right).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "correct login {attempt} was refused: {body}"
+        );
+    }
+}
+
+/// Failing, then succeeding, then failing again must not carry the earlier
+/// failures forward — the success cleared them.
+#[tokio::test]
+async fn a_success_clears_the_failures_that_preceded_it() {
+    let harness = Harness::new();
+    harness.register("alice", "hunter2").await;
+    let attempt = |password: &'static str| {
+        json!({
+            "type": "m.login.password",
+            "identifier": { "type": "m.id.user", "user": "alice" },
+            "password": password,
+        })
+    };
+
+    for _ in 0..4 {
+        let (status, _) = harness
+            .post("/_matrix/client/v3/login", &attempt("nope"))
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    let (status, _) = harness
+        .post("/_matrix/client/v3/login", &attempt("hunter2"))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The budget is whole again, so four more failures are still refusals
+    // rather than rate-limit responses.
+    for index in 0..4 {
+        let (status, body) = harness
+            .post("/_matrix/client/v3/login", &attempt("nope"))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "failure {index} after a success was rate limited: {body}"
+        );
+    }
+}
+
+/// The mandatory first 401 of the UIA hand-shake is the server's own
+/// requirement; spending the client's registration budget on it would let a
+/// client be locked out by doing exactly what the server told it to.
+#[tokio::test]
+async fn the_uia_challenge_does_not_consume_the_registration_budget() {
+    let harness = Harness::new();
+    for index in 0..20 {
+        let (status, _) = harness
+            .post(
+                "/_matrix/client/v3/register",
+                &json!({ "username": "alice", "password": "hunter2" }),
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "challenge {index} was rate limited"
+        );
+    }
+    // And a real registration still goes through afterwards.
+    harness.register("alice", "hunter2").await;
 }

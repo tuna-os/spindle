@@ -17,6 +17,8 @@ pub struct MatrixError {
     pub status: StatusCode,
     pub errcode: &'static str,
     pub error: String,
+    /// Present only on `M_LIMIT_EXCEEDED`, where the spec defines it.
+    pub retry_after_ms: Option<u64>,
 }
 
 impl MatrixError {
@@ -26,6 +28,7 @@ impl MatrixError {
             status,
             errcode,
             error: error.into(),
+            retry_after_ms: None,
         }
     }
 
@@ -70,6 +73,21 @@ impl MatrixError {
         )
     }
 
+    /// `M_LIMIT_EXCEEDED`, with the wait a client should honour.
+    ///
+    /// `retry_after_ms` is not decoration: without it a client backs off by
+    /// guessing, and the usual guess is "immediately, but again", which is the
+    /// behaviour the limit exists to stop.
+    #[must_use]
+    pub fn limit_exceeded(retry_after_ms: u64) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            errcode: "M_LIMIT_EXCEEDED",
+            error: format!("too many requests; retry in {retry_after_ms}ms"),
+            retry_after_ms: Some(retry_after_ms),
+        }
+    }
+
     #[must_use]
     pub fn bad_json(error: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "M_BAD_JSON", error)
@@ -92,10 +110,12 @@ impl MatrixError {
 
 impl IntoResponse for MatrixError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(json!({ "errcode": self.errcode, "error": self.error })),
-        )
-            .into_response()
+        let mut body = serde_json::Map::new();
+        body.insert("errcode".to_owned(), json!(self.errcode));
+        body.insert("error".to_owned(), json!(self.error));
+        if let Some(retry) = self.retry_after_ms {
+            body.insert("retry_after_ms".to_owned(), json!(retry));
+        }
+        (self.status, Json(serde_json::Value::Object(body))).into_response()
     }
 }
