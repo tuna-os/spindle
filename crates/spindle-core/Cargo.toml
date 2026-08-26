@@ -1,0 +1,17 @@
+[package]
+name = "spindle-core"
+version = "0.1.0"
+description = "Core linear-log and persistent-state primitives for Spindle"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+blake3.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
+
