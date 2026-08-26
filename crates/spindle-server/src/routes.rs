@@ -33,6 +33,10 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/v3/logout",
     "/_matrix/client/v3/refresh",
     "/_matrix/client/v3/account/whoami",
+    "/_matrix/client/v3/createRoom",
+    "/_matrix/client/v3/joined_rooms",
+    "/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}",
+    "/_matrix/client/v3/rooms/{room_id}/messages",
     "/_matrix/key/v2/server",
     "/.well-known/matrix/client",
     "/.well-known/matrix/server",
@@ -49,6 +53,16 @@ pub fn router(state: AppState) -> Router {
         .route("/_matrix/client/v3/logout", post(logout))
         .route("/_matrix/client/v3/refresh", post(refresh))
         .route("/_matrix/client/v3/account/whoami", get(whoami))
+        .route("/_matrix/client/v3/createRoom", post(create_room))
+        .route("/_matrix/client/v3/joined_rooms", get(joined_rooms))
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}",
+            axum::routing::put(send_event),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/messages",
+            get(room_messages),
+        )
         .route("/_matrix/key/v2/server", get(server_keys))
         .route("/.well-known/matrix/client", get(well_known_client))
         .route("/.well-known/matrix/server", get(well_known_server))
@@ -438,4 +452,136 @@ async fn server_keys(State(state): State<AppState>) -> Json<Value> {
         // with an old key should still be honoured.
         "old_verify_keys": {},
     }))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CreateRoomRequest {
+    name: Option<String>,
+    topic: Option<String>,
+}
+
+/// `POST /_matrix/client/v3/createRoom`
+async fn create_room(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    Json(request): Json<CreateRoomRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    let room_id = state
+        .rooms
+        .create(
+            &identity.user_id,
+            state.key.pair(),
+            request.name.as_deref(),
+            request.topic.as_deref(),
+        )
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    Ok(Json(json!({ "room_id": room_id })))
+}
+
+/// `GET /_matrix/client/v3/joined_rooms`
+async fn joined_rooms(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+) -> Result<Json<Value>, MatrixError> {
+    let rooms = state
+        .rooms
+        .joined(&identity.user_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    Ok(Json(json!({ "joined_rooms": rooms })))
+}
+
+/// `PUT /_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}`
+async fn send_event(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((room_id, event_type, _txn_id)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+    Json(content): Json<Value>,
+) -> Result<Json<Value>, MatrixError> {
+    // The transaction ID is accepted and ignored. Idempotent replay is real
+    // work -- storing the response against the ID and returning it on a repeat
+    // -- and claiming it by accepting the parameter would be worse than not
+    // taking it at all: a client retrying after a timeout would silently
+    // duplicate its message. Tracked as the remaining item on #11.
+    let event_id = state
+        .rooms
+        .send(
+            &room_id,
+            &identity.user_id,
+            state.key.pair(),
+            &event_type,
+            &content,
+        )
+        .map_err(|error| match error {
+            crate::rooms::RoomError::UnknownRoom(_) => {
+                MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such room")
+            }
+            other => MatrixError::internal(&other.to_string()),
+        })?;
+    Ok(Json(json!({ "event_id": event_id })))
+}
+
+#[derive(Debug, Deserialize)]
+struct MessagesQuery {
+    from: Option<String>,
+    limit: Option<usize>,
+}
+
+/// `GET /_matrix/client/v3/rooms/{room_id}/messages`
+///
+/// The pagination token is the linear index, which is what SPEC 10.2's
+/// "tokens are opaque to clients" buys: the ordering already exists, so there
+/// is nothing to sort at read time and nothing to maintain alongside.
+async fn room_messages(
+    State(state): State<AppState>,
+    Authenticated(_identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<MessagesQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    let from = match query.from.as_deref() {
+        Some(token) => Some(
+            token
+                .parse::<i64>()
+                .map_err(|_| MatrixError::bad_json("malformed pagination token"))?,
+        ),
+        None => None,
+    };
+    let limit = query.limit.unwrap_or(10).clamp(1, 100);
+
+    let (events, next) =
+        state
+            .rooms
+            .messages(&room_id, from, limit)
+            .map_err(|error| match error {
+                crate::rooms::RoomError::UnknownRoom(_) => {
+                    MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such room")
+                }
+                other => MatrixError::internal(&other.to_string()),
+            })?;
+
+    let chunk: Vec<Value> = events
+        .iter()
+        .map(|event| {
+            let mut json = event.json.clone();
+            if let Some(object) = json.as_object_mut() {
+                object.insert("event_id".to_owned(), json!(event.event_id));
+            }
+            json
+        })
+        .collect();
+
+    let mut body = serde_json::Map::new();
+    body.insert("chunk".to_owned(), Value::Array(chunk));
+    body.insert(
+        "start".to_owned(),
+        json!(from.map_or_else(|| "end".to_owned(), |from| from.to_string())),
+    );
+    // Absent when there is nothing more, which is how a client knows to stop.
+    if let Some(next) = next {
+        body.insert("end".to_owned(), json!(next.to_string()));
+    }
+    Ok(Json(Value::Object(body)))
 }

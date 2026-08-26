@@ -11,6 +11,7 @@ pub mod auth;
 pub mod config;
 pub mod errors;
 pub mod ratelimit;
+pub mod rooms;
 pub mod routes;
 pub mod signing;
 pub mod surface;
@@ -29,6 +30,7 @@ pub struct AppState {
     pub store: Arc<FjallStore>,
     pub limiter: Arc<ratelimit::RateLimiter>,
     pub key: Arc<signing::ServerKey>,
+    pub rooms: Arc<rooms::Rooms>,
 }
 
 /// Build the HTTP application.
@@ -41,11 +43,16 @@ pub struct AppState {
 /// writes it can only produce invalid results for.
 pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, signing::SigningError> {
     let key = Arc::new(signing::ServerKey::load_or_create(store.as_ref())?);
+    let rooms = Arc::new(rooms::Rooms::new(
+        Arc::clone(&store),
+        config.server.name.clone(),
+    ));
     let state = AppState {
         config: Arc::new(config),
         store,
         limiter: Arc::new(ratelimit::RateLimiter::new()),
         key,
+        rooms,
     };
     Ok(routes::router(state))
 }

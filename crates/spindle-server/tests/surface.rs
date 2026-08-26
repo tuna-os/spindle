@@ -162,11 +162,14 @@ async fn an_unimplemented_endpoint_is_a_404_not_a_stub() {
     // Every endpoint SPEC 10.1 lists but this milestone has not built must be
     // absent. A stub answering 200 with an empty body is worse than a 404: a
     // client cannot distinguish it from success.
+    // This list shrinks as endpoints land, and it failing is the signal to
+    // shrink it: `/createRoom` and `/joined_rooms` were here until rooms were
+    // built, and the test said so on the commit that built them.
     for path in [
         "/_matrix/client/v3/sync",
-        "/_matrix/client/v3/createRoom",
-        "/_matrix/client/v3/joined_rooms",
         "/_matrix/client/v3/publicRooms",
+        "/_matrix/client/v3/account/password",
+        "/_matrix/client/v3/profile/@alice:example.org",
     ] {
         assert_eq!(
             get(path).await.0,
