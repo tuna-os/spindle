@@ -1,0 +1,71 @@
+name: Benchmarks
+
+# Published on every push to main, so the numbers in the open are the numbers
+# from the code on main rather than whatever was hand-copied into a document
+# the last time somebody remembered. A figure typed into prose is a claim with
+# nothing holding it to the code.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One publish at a time, and never cancel one half-done: a partially deployed
+# result set reads as "everything got fast".
+concurrency:
+  group: benchmarks
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run the benchmark suite
+        run: cargo bench --workspace --all-features
+
+      - name: Collect the results
+        run: |
+          set -euo pipefail
+          mkdir -p site
+          python3 scripts/collect-benchmarks.py \
+            target/criterion site/latest.json \
+            --commit "${GITHUB_SHA}" \
+            --ref "${GITHUB_REF_NAME}" \
+            --timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --runner "github-actions/ubuntu-24.04"
+
+      - name: Render the page
+        run: python3 scripts/render-benchmarks.py site/latest.json site/index.html
+
+      # Keeping the per-commit file means a regression can be traced to the
+      # push that caused it, rather than only observed after the fact.
+      - name: Keep a per-commit copy
+        run: cp site/latest.json "site/${GITHUB_SHA}.json"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  publish:
+    needs: measure
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

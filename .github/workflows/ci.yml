@@ -32,3 +32,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --workspace --all-features
+
+      # The benchmark publishing scripts run on push to main, which is the
+      # worst place to find out they are broken: the failure lands after the
+      # change is in, and the site keeps serving whatever it served last.
+      - name: Check the benchmark publishing tooling
+        run: scripts/check-benchmark-tooling.sh
