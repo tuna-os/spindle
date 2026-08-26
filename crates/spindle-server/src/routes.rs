@@ -89,6 +89,26 @@ pub fn router(state: AppState) -> Router {
             axum::routing::put(set_typing),
         )
         .route(
+            "/_matrix/client/v3/rooms/{room_id}/kick",
+            post(kick_from_room),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/ban",
+            post(ban_from_room),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/unban",
+            post(unban_from_room),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/forget",
+            post(forget_room),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/joined_members",
+            get(room_joined_members),
+        )
+        .route(
             "/_matrix/client/v3/join/{room_id_or_alias}",
             post(join_room_by_id_or_alias),
         )
@@ -563,9 +583,22 @@ async fn joined_rooms(
     Ok(Json(json!({ "joined_rooms": rooms })))
 }
 
+/// The body every membership endpoint that names a target shares.
+///
+/// `/invite`, `/kick`, `/ban` and `/unban` differ only in the membership they
+/// end up writing, so they differ only in the handler, not in the shape they
+/// parse. `reason` is optional everywhere, including on `/invite`, where the
+/// spec allows it even though few clients send one.
 #[derive(Debug, Deserialize)]
-struct InviteRequest {
+struct TargetedMembershipRequest {
     user_id: String,
+    reason: Option<String>,
+}
+
+/// The body of `/leave` and `/forget`, neither of which names a target.
+#[derive(Debug, Default, Deserialize)]
+struct SelfMembershipRequest {
+    reason: Option<String>,
 }
 
 /// `POST /_matrix/client/v3/rooms/{room_id}/invite`
@@ -573,15 +606,71 @@ async fn invite_to_room(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
     axum::extract::Path(room_id): axum::extract::Path<String>,
-    Json(request): Json<InviteRequest>,
+    Json(request): Json<TargetedMembershipRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    targeted_membership(&state, &identity.user_id, &room_id, &request, "invite")
+}
+
+/// `POST /_matrix/client/v3/rooms/{room_id}/kick`
+///
+/// A kick is a `leave` the target did not send, which is why it needs no
+/// membership of its own: the spec's auth rules read the sender against the
+/// target and decide whether the power levels allow it. That check is ruma's
+/// (`docs/divergence.md` §3), so a member without kick power gets `M_FORBIDDEN`
+/// from the same code path that refuses any other unauthorized state event.
+async fn kick_from_room(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    Json(request): Json<TargetedMembershipRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    targeted_membership(&state, &identity.user_id, &room_id, &request, "leave")
+}
+
+/// `POST /_matrix/client/v3/rooms/{room_id}/ban`
+///
+/// Ban is its own membership rather than a leave with a flag, because it has
+/// to survive the target trying to rejoin: the auth rules refuse a join whose
+/// current membership is `ban`, and they can only do that if the state says
+/// `ban`.
+async fn ban_from_room(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    Json(request): Json<TargetedMembershipRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    targeted_membership(&state, &identity.user_id, &room_id, &request, "ban")
+}
+
+/// `POST /_matrix/client/v3/rooms/{room_id}/unban`
+///
+/// Unbanning writes `leave`, not "no membership": the room has no way to spell
+/// "never here", and `leave` is the state a user who is not banned and not in
+/// the room is in.
+async fn unban_from_room(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    Json(request): Json<TargetedMembershipRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    targeted_membership(&state, &identity.user_id, &room_id, &request, "leave")
+}
+
+fn targeted_membership(
+    state: &AppState,
+    sender: &str,
+    room_id: &str,
+    request: &TargetedMembershipRequest,
+    membership: &str,
 ) -> Result<Json<Value>, MatrixError> {
     state
         .rooms
         .set_membership(
-            &room_id,
-            &identity.user_id,
+            room_id,
+            sender,
             &request.user_id,
-            "invite",
+            membership,
+            request.reason.as_deref(),
             state.key.pair(),
         )
         .map_err(room_error)?;
@@ -615,7 +704,7 @@ async fn join_room_by_id_or_alias(
 fn join(state: &AppState, user_id: &str, room_id: &str) -> Result<Json<Value>, MatrixError> {
     state
         .rooms
-        .set_membership(room_id, user_id, user_id, "join", state.key.pair())
+        .set_membership(room_id, user_id, user_id, "join", None, state.key.pair())
         .map_err(room_error)?;
     Ok(Json(json!({ "room_id": room_id })))
 }
@@ -625,7 +714,9 @@ async fn leave_room(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
     axum::extract::Path(room_id): axum::extract::Path<String>,
+    body: axum::body::Bytes,
 ) -> Result<Json<Value>, MatrixError> {
+    let request: SelfMembershipRequest = optional_body(&body)?;
     state
         .rooms
         .set_membership(
@@ -633,10 +724,68 @@ async fn leave_room(
             &identity.user_id,
             &identity.user_id,
             "leave",
+            request.reason.as_deref(),
             state.key.pair(),
         )
         .map_err(room_error)?;
     Ok(Json(json!({})))
+}
+
+/// `GET /_matrix/client/v3/rooms/{room_id}/joined_members`
+///
+/// Restricted to members: the response is the room's roster, and handing it to
+/// a non-member would leak who is in a room they cannot see. `joined()` is a
+/// prefix scan over the caller's own rooms, so the check costs a scan of what
+/// the caller is in rather than a walk of the room.
+async fn room_joined_members(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    let joined = state.rooms.joined(&identity.user_id).map_err(room_error)?;
+    if !joined.iter().any(|room| room == &room_id) {
+        return Err(MatrixError::forbidden(format!(
+            "{} is not in {room_id}",
+            identity.user_id
+        )));
+    }
+    let members = state.rooms.joined_members(&room_id).map_err(room_error)?;
+    Ok(Json(json!({ "joined": members })))
+}
+
+/// `POST /_matrix/client/v3/rooms/{room_id}/forget`
+///
+/// Nothing is appended: forgetting is one user's bookkeeping, so the room's
+/// log is untouched and every other member's view of it is unchanged. The
+/// spec's own wording is that the room is removed from the user's view, not
+/// from the server.
+async fn forget_room(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    state
+        .rooms
+        .forget(&identity.user_id, &room_id)
+        .map_err(room_error)?;
+    Ok(Json(json!({})))
+}
+
+/// Parse a request body that the spec allows to be absent.
+///
+/// `/leave` takes an optional `reason`, and clients send all three of an empty
+/// body, `{}`, and a populated object. Extracting `Json<T>` would reject the
+/// first with a 400 that the spec does not license, so the bytes are taken raw
+/// and only parsed when there are some. A body that is present but malformed
+/// is still an error -- silently defaulting there would swallow a client's
+/// typo'd `reason` rather than reporting it.
+fn optional_body<T: Default + serde::de::DeserializeOwned>(
+    body: &axum::body::Bytes,
+) -> Result<T, MatrixError> {
+    if body.is_empty() {
+        return Ok(T::default());
+    }
+    serde_json::from_slice(body).map_err(|error| MatrixError::bad_json(error.to_string()))
 }
 
 #[derive(Debug, Deserialize)]

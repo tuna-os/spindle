@@ -94,6 +94,17 @@ pub enum Keyspace {
     /// in" is a prefix scan over that user's rooms, not a walk of every room
     /// the server knows. `/joined_rooms` is the first call most clients make.
     Membership = 0x0b,
+    /// `(user_id, room_id)` -> nothing; presence is the whole value.
+    ///
+    /// Forgetting is per-user and does not touch the room: the log keeps the
+    /// leave event, so anyone else's view of who left is unchanged, and a
+    /// later join simply deletes the marker. Kept out of [`Self::Membership`]
+    /// so that forgetting cannot overwrite *why* the user is not in the room
+    /// -- "left" and "banned" have to stay distinguishable underneath.
+    ///
+    /// 0x0f, not 0x0e: relations claimed that discriminant on a branch that
+    /// had not landed when this was written, and a reused byte is a migration.
+    Forgotten = 0x0f,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
