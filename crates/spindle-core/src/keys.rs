@@ -82,6 +82,12 @@ pub enum Keyspace {
     Stream = 0x0c,
     /// `(room_id, user_id, receipt_type)` -> receipt.
     Receipt = 0x0d,
+    /// `(room_id, target_event_id, rel_type, li)` -> `event_id` (SPEC §7).
+    ///
+    /// The key ends in `li`, so a scan returns a target's relations already in
+    /// the order they were sent. Nothing sorts them: the ordering was decided
+    /// once at write, which is the same property `/messages` rests on.
+    Relation = 0x0e,
     /// `(user_id, room_id)` -> membership.
     ///
     /// Indexed by user rather than by room so that "which rooms is this user
@@ -163,6 +169,47 @@ pub fn stream_from_key(key: &[u8]) -> Option<u64> {
 #[must_use]
 pub fn stream_prefix() -> Vec<u8> {
     vec![KEY_SCHEMA_VERSION, Keyspace::Stream as u8]
+}
+
+/// The prefix every relation of one event shares.
+///
+/// The target is length-prefixed for the reason [`room_prefix`] gives: without
+/// it, `$ab` would scan into `$abc`.
+#[must_use]
+pub fn relation_prefix(room_id: &str, target: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::Relation, room_id);
+    let target = target.as_bytes();
+    key.extend_from_slice(
+        &u16::try_from(target.len())
+            .unwrap_or(u16::MAX)
+            .to_be_bytes(),
+    );
+    key.extend_from_slice(target);
+    key
+}
+
+/// One relation's key: its target, then where it sits in the log.
+///
+/// **`li` comes immediately after the target, and the relation type is not in
+/// the key at all** — which is a deliberate departure from SPEC §7's
+/// `(room_id, target_event_id, rel_type, li)`.
+///
+/// With `rel_type` in the key, a scan of everything related to an event is
+/// ordered by relation type first and only then by `li`, so
+/// `/relations/{eventId}` — the arity that takes no type — cannot return
+/// timeline order, which is the order the spec requires of it. The type is
+/// stored in the value and filtered on read instead: the narrowed arities cost
+/// one extra comparison per row, and the unfiltered one is correct.
+///
+/// Worth stating because the ordering is otherwise invisible. A
+/// length-prefixed `rel_type` sorts by *length* before bytes, so the original
+/// key returned `m.thread`, `m.replace`, `m.annotation` in that order — not
+/// alphabetical, not chronological, and stable enough to look deliberate.
+#[must_use]
+pub fn relation(room_id: &str, target: &str, li: LinearIndex) -> Vec<u8> {
+    let mut key = relation_prefix(room_id, target);
+    key.extend_from_slice(&order_preserving(li.get()));
+    key
 }
 
 /// The prefix every key for one user in one keyspace shares.

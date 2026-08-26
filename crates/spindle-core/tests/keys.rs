@@ -4,8 +4,8 @@ use proptest::prelude::*;
 use spindle_core::{
     EventInput, LinearIndex, RoomLog, StateSnapshot,
     keys::{
-        Keyspace, from_order_preserving, li_from_key, order_preserving, room_from_user_room,
-        room_li, room_prefix, user_prefix, user_room,
+        Keyspace, from_order_preserving, li_from_key, order_preserving, relation, relation_prefix,
+        room_from_user_room, room_li, room_prefix, user_prefix, user_room,
     },
 };
 
@@ -172,4 +172,43 @@ fn one_users_membership_range_never_walks_into_another() {
         room_from_user_room("@b:example.org", &mine).as_deref(),
         Some("!mine:example.org")
     );
+}
+
+/// One event's relations must not scan into another's.
+///
+/// The same hazard as `one_rooms_range_never_walks_into_another`, and the same
+/// fix. Real event IDs are fixed-length reference hashes, so `$ab` and `$abc`
+/// never actually occur — which is exactly why this needs a test rather than a
+/// reader's confidence: nothing in the type stops a caller passing a shorter
+/// ID, and the day something does (a synthetic ID, a fixture, a future room
+/// version with a different ID format) the failure is silent, and it is one
+/// event's reactions appearing under another event.
+#[test]
+fn one_events_relations_never_walk_into_anothers() {
+    let short = relation_prefix("!r:example.org", "$ab");
+    let long = relation_prefix("!r:example.org", "$abc");
+    assert!(
+        !long.starts_with(&short),
+        "a scan of $ab's relations would walk into $abc's"
+    );
+
+    // And the concrete consequence: a relation of the longer ID must not land
+    // inside the shorter one's range.
+    let theirs = relation("!r:example.org", "$abc", LinearIndex::from_raw(1));
+    assert!(!theirs.starts_with(&short));
+
+    // While an event's own relations are all inside its own prefix, in `li`
+    // order -- the property `/relations` returns them by.
+    let mut mine = [
+        relation("!r:example.org", "$ab", LinearIndex::from_raw(9)),
+        relation("!r:example.org", "$ab", LinearIndex::from_raw(1)),
+        relation("!r:example.org", "$ab", LinearIndex::from_raw(-4)),
+    ];
+    assert!(mine.iter().all(|key| key.starts_with(&short)));
+    mine.sort();
+    let order: Vec<i64> = mine
+        .iter()
+        .map(|key| li_from_key(key).expect("a relation key carries its index"))
+        .collect();
+    assert_eq!(order, vec![-4, 1, 9], "relations are not in linear order");
 }

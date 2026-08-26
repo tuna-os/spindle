@@ -460,6 +460,74 @@ impl Rooms {
         Ok(())
     }
 
+    /// Events related to `target`, oldest first.
+    ///
+    /// Oldest first because that is the order the index already holds them in:
+    /// its key ends in `li`, so a prefix scan comes back sorted with nothing
+    /// doing the sorting. A DAG server has to order these itself.
+    ///
+    /// A relation whose event has been redacted is skipped. `m.relates_to`
+    /// lives in `content`, which redaction strips, so a redacted reaction
+    /// stops being a reaction — filtered by reading the event rather than by
+    /// deleting the index entry, because an index kept in step with redaction
+    /// is one more thing that can fall out of step with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room is unknown or the index cannot be
+    /// read.
+    pub fn relations(
+        &self,
+        room_id: &str,
+        target: &str,
+        rel_type: Option<&str>,
+        event_type: Option<&str>,
+        from: Option<i64>,
+        limit: usize,
+    ) -> Result<(Vec<Value>, Option<i64>), RoomError> {
+        // The room has to exist, or an unknown room answers "no relations"
+        // and a client cannot tell that from an event nobody replied to.
+        self.with_room(room_id, |_, _| Ok(()))?;
+
+        let prefix = spindle_core::keys::relation_prefix(room_id, target);
+        let rows = spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?;
+
+        let mut out = Vec::new();
+        let mut next = None;
+        for (key, value) in rows {
+            let Some(li) = spindle_core::keys::li_from_key(&key) else {
+                continue;
+            };
+            if from.is_some_and(|from| li <= from) {
+                continue;
+            }
+            let Some((stored_type, event_id)) = decode_relation(&value) else {
+                continue;
+            };
+            // Filtered here rather than by the key, so the unfiltered arity
+            // can stay in timeline order -- see `keys::relation`.
+            if rel_type.is_some_and(|wanted| stored_type != wanted) {
+                continue;
+            }
+            let event = self.event(room_id, &event_id)?;
+
+            // Redacted: `m.relates_to` is gone from content, so this is no
+            // longer a relation to anything.
+            if relates_to(&event["content"]).is_none() {
+                continue;
+            }
+            if event_type.is_some_and(|wanted| event["type"] != wanted) {
+                continue;
+            }
+            if out.len() == limit {
+                next = Some(li - 1);
+                break;
+            }
+            out.push(event);
+        }
+        Ok((out, next))
+    }
+
     /// Events in `li` order, newest first, starting below `from`.
     ///
     /// # Errors
@@ -871,6 +939,27 @@ impl Rooms {
             &event_body_key(room_id, &event_id),
             &serde_json::to_vec(&json)?,
         )?;
+        // A relation is indexed in the entry's own batch too, and for the same
+        // reason: an index entry written separately can outlive a commit that
+        // failed, leaving `/relations` pointing at an event the room does not
+        // have.
+        let mut extra = Vec::new();
+        if let Some((rel_type, target)) = relates_to(content) {
+            // The type goes in the value, not the key -- see `keys::relation`.
+            let mut value = Vec::with_capacity(2 + rel_type.len() + event_id.len());
+            value.extend_from_slice(
+                &u16::try_from(rel_type.len())
+                    .unwrap_or(u16::MAX)
+                    .to_be_bytes(),
+            );
+            value.extend_from_slice(rel_type.as_bytes());
+            value.extend_from_slice(event_id.as_bytes());
+            extra.push((
+                spindle_core::keys::relation(room_id, &target, entry.li),
+                value,
+            ));
+        }
+
         // The stream id goes in the entry's own batch, so an event is either
         // in the global order or not stored at all. Assigned under the same
         // lock that serialises appends, which is what makes the watermark the
@@ -880,19 +969,15 @@ impl Rooms {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stream_id = stream.saturating_add(1);
-        room_store.commit_entry_with(
-            &entry,
-            log,
-            &[(
-                spindle_core::keys::stream(stream_id),
-                StreamRecord {
-                    room_id: room_id.to_owned(),
-                    li: entry.li.get(),
-                }
-                .encode(),
-            )],
-            Durability::Group,
-        )?;
+        extra.push((
+            spindle_core::keys::stream(stream_id),
+            StreamRecord {
+                room_id: room_id.to_owned(),
+                li: entry.li.get(),
+            }
+            .encode(),
+        ));
+        room_store.commit_entry_with(&entry, log, &extra, Durability::Group)?;
         *stream = stream_id;
         drop(stream);
 
@@ -984,6 +1069,29 @@ impl Rooms {
         .ok_or_else(|| RoomError::MissingBody(event_id.as_str().to_owned()))?;
         Ok(serde_json::from_slice(&raw)?)
     }
+}
+
+/// Read back the `(rel_type, event_id)` a relation row stores.
+fn decode_relation(value: &[u8]) -> Option<(String, String)> {
+    let len = usize::from(u16::from_be_bytes(value.get(..2)?.try_into().ok()?));
+    let rel_type = String::from_utf8(value.get(2..2 + len)?.to_vec()).ok()?;
+    let event_id = String::from_utf8(value.get(2 + len..)?.to_vec()).ok()?;
+    Some((rel_type, event_id))
+}
+
+/// The `(rel_type, event_id)` an event relates to, if it relates to anything.
+///
+/// Both fields are required: a `m.relates_to` missing either is not a relation
+/// this server can index, and indexing it under an empty key would put every
+/// such event in one bucket.
+fn relates_to(content: &Value) -> Option<(String, String)> {
+    let relates = content.get("m.relates_to")?;
+    let rel_type = relates.get("rel_type")?.as_str()?;
+    let event_id = relates.get("event_id")?.as_str()?;
+    if rel_type.is_empty() || event_id.is_empty() {
+        return None;
+    }
+    Some((rel_type.to_owned(), event_id.to_owned()))
 }
 
 /// Put the event ID into the body a client sees.
