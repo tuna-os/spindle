@@ -37,19 +37,13 @@ fn fork_window_walks_four_thousand_divergent_events_within_budget() {
     let mut right = EventId::new("$root");
     for number in 0..2_000 {
         let next_left = EventId::new(format!("$left-{number}"));
-        room.append_remote(EventInput::new(
-            next_left.as_str(),
-            vec![left.clone()],
-        ))
-        .unwrap();
+        room.append_remote(EventInput::new(next_left.as_str(), vec![left.clone()]))
+            .unwrap();
         left = next_left;
 
         let next_right = EventId::new(format!("$right-{number}"));
-        room.append_remote(EventInput::new(
-            next_right.as_str(),
-            vec![right.clone()],
-        ))
-        .unwrap();
+        room.append_remote(EventInput::new(next_right.as_str(), vec![right.clone()]))
+            .unwrap();
         right = next_right;
     }
 

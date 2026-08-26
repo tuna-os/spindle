@@ -31,13 +31,7 @@ fn event() -> CanonicalJsonObject {
 #[test]
 fn room_v12_event_passes_ruma_signature_and_content_hash_verification() {
     let key_pair = Ed25519KeyPair::from_der(PKCS8, "test".to_owned()).unwrap();
-    let pdu = Pdu::sign(
-        RoomVersionId::V12,
-        event(),
-        "example.org",
-        &key_pair,
-    )
-    .unwrap();
+    let pdu = Pdu::sign(RoomVersionId::V12, event(), "example.org", &key_pair).unwrap();
 
     let mut server_keys = BTreeMap::new();
     server_keys.insert(
