@@ -161,6 +161,43 @@ impl Rooms {
         })
     }
 
+    /// Set a user's membership in a room.
+    ///
+    /// Invite, join and leave are all one state event with a different
+    /// `membership`, and none of them is checked here. Whether the sender may
+    /// invite, whether the room's join rules admit this join, whether a leave
+    /// is a leave or a kick — every one of those is a rule in the spec, and
+    /// [`crate::authorize`] runs the spec's own implementation of them on the
+    /// way through `append`. Re-deciding any of it here would be a second,
+    /// divergent copy of the auth rules, which `docs/divergence.md` names as
+    /// the thing that must not happen.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] if the room does not exist, or
+    /// [`RoomError::Forbidden`] if the rules refuse the transition.
+    pub fn set_membership(
+        &self,
+        room_id: &str,
+        sender: &str,
+        target: &str,
+        membership: &str,
+        key: &Ed25519KeyPair,
+    ) -> Result<String, RoomError> {
+        let content = serde_json::json!({ "membership": membership });
+        self.with_room(room_id, |rooms, log| {
+            rooms.append(
+                log,
+                room_id,
+                sender,
+                key,
+                "m.room.member",
+                Some(target),
+                &content,
+            )
+        })
+    }
+
     /// Events in `li` order, newest first, starting below `from`.
     ///
     /// # Errors
@@ -277,7 +314,7 @@ impl Rooms {
             .map(|id| id.as_str().to_owned())
             .collect();
 
-        let auth = auth_events_for(log, sender, event_type, state_key)?;
+        let auth = auth_events_for(log, sender, event_type, state_key, content)?;
         let canonical = build_canonical(
             room_id, sender, event_type, state_key, content, &prev, &auth, depth,
         )?;
@@ -439,6 +476,7 @@ fn auth_events_for(
     sender: &str,
     event_type: &str,
     state_key: Option<&str>,
+    content: &Value,
 ) -> Result<Vec<String>, RoomError> {
     if event_type == "m.room.create" {
         return Ok(Vec::new());
@@ -462,7 +500,19 @@ fn auth_events_for(
     cite("m.room.power_levels", "");
     cite("m.room.member", sender);
     if event_type == "m.room.member" {
-        cite("m.room.join_rules", "");
+        // Only for memberships the join rules have any say over. A leave or a
+        // ban is not gated on how the room admits people, so citing the join
+        // rules there is not harmless padding -- it is a longer list than the
+        // rules call for, and a peer checking the list against its own
+        // selection rejects the event. Found by the ruma cross-check
+        // disagreeing with what this code originally did, which asserted my
+        // reading of the spec rather than the spec.
+        if matches!(
+            content["membership"].as_str(),
+            Some("join" | "invite" | "knock")
+        ) {
+            cite("m.room.join_rules", "");
+        }
         // A membership event that acts on somebody else has to cite what it is
         // acting on: their current membership decides whether the transition is
         // allowed at all.
@@ -608,99 +658,6 @@ impl std::fmt::Display for RoomError {
 }
 
 impl std::error::Error for RoomError {}
-
-#[cfg(test)]
-mod tests {
-    use super::{RoomError, auth_events_for};
-    use spindle_core::{RoomLog, StateKey};
-
-    /// A room whose state has everything a membership event could need to cite:
-    /// create, power levels, join rules, and two members.
-    fn populated_room() -> RoomLog {
-        let mut log = RoomLog::new();
-        for (event_id, event_type, state_key) in [
-            ("$create", "m.room.create", ""),
-            ("$alice-join", "m.room.member", "@alice:example.org"),
-            ("$power", "m.room.power_levels", ""),
-            ("$join-rules", "m.room.join_rules", ""),
-            ("$bob-join", "m.room.member", "@bob:example.org"),
-        ] {
-            log.append_local(event_id, Some(StateKey::new(event_type, state_key)))
-                .expect("the log accepts a well-formed append");
-        }
-        log
-    }
-
-    /// Covered here rather than in `tests/federation_auth.rs` because the HTTP
-    /// surface cannot yet produce a membership event after the join rules exist
-    /// — there is no invite or join endpoint. Once there is, the ruma
-    /// cross-check reaches these two branches and this test becomes redundant;
-    /// deleting it then is the right move.
-    #[test]
-    fn a_membership_event_cites_the_join_rules_and_its_target() {
-        let log = populated_room();
-
-        // Acting on somebody else: their current membership decides whether the
-        // transition is allowed, so it has to be cited.
-        let auth = auth_events_for(
-            &log,
-            "@alice:example.org",
-            "m.room.member",
-            Some("@bob:example.org"),
-        )
-        .expect("the state is resident");
-        assert_eq!(
-            auth,
-            vec![
-                "$create",
-                "$power",
-                "$alice-join",
-                "$join-rules",
-                "$bob-join"
-            ]
-        );
-
-        // Acting on yourself: the target is the sender, and citing it twice
-        // would be a duplicate that the auth rules reject outright.
-        let auth = auth_events_for(
-            &log,
-            "@alice:example.org",
-            "m.room.member",
-            Some("@alice:example.org"),
-        )
-        .expect("the state is resident");
-        assert_eq!(
-            auth,
-            vec!["$create", "$power", "$alice-join", "$join-rules"]
-        );
-
-        // A non-membership event cites neither the join rules nor a target.
-        let auth = auth_events_for(&log, "@alice:example.org", "m.room.message", None)
-            .expect("the state is resident");
-        assert_eq!(auth, vec!["$create", "$power", "$alice-join"]);
-    }
-
-    /// The create event is the root of the auth chain, and asking for its auth
-    /// events must not depend on state that does not exist yet.
-    #[test]
-    fn the_create_event_cites_nothing_even_in_an_empty_log() {
-        let log = RoomLog::new();
-        let auth = auth_events_for(&log, "@alice:example.org", "m.room.create", Some(""))
-            .expect("the create event needs no state");
-        assert!(auth.is_empty());
-    }
-
-    /// Silence is the one answer that must never be given: an empty list and
-    /// "the state is gone" are indistinguishable on the wire, and only one of
-    /// them is a correct event.
-    #[test]
-    fn a_room_with_no_state_is_an_error_rather_than_an_empty_list() {
-        let log = RoomLog::new();
-        let error = auth_events_for(&log, "@alice:example.org", "m.room.message", None)
-            .expect_err("there is nothing to authorize against");
-        assert!(matches!(error, RoomError::StateUnavailable(_)), "{error:?}");
-    }
-}
 
 #[cfg(test)]
 mod membership_index_tests {

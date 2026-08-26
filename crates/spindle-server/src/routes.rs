@@ -37,6 +37,10 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/v3/joined_rooms",
     "/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}",
     "/_matrix/client/v3/rooms/{room_id}/messages",
+    "/_matrix/client/v3/rooms/{room_id}/invite",
+    "/_matrix/client/v3/rooms/{room_id}/join",
+    "/_matrix/client/v3/rooms/{room_id}/leave",
+    "/_matrix/client/v3/join/{room_id_or_alias}",
     "/_matrix/key/v2/server",
     "/.well-known/matrix/client",
     "/.well-known/matrix/server",
@@ -62,6 +66,16 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/_matrix/client/v3/rooms/{room_id}/messages",
             get(room_messages),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/invite",
+            post(invite_to_room),
+        )
+        .route("/_matrix/client/v3/rooms/{room_id}/join", post(join_room))
+        .route("/_matrix/client/v3/rooms/{room_id}/leave", post(leave_room))
+        .route(
+            "/_matrix/client/v3/join/{room_id_or_alias}",
+            post(join_room_by_id_or_alias),
         )
         .route("/_matrix/key/v2/server", get(server_keys))
         .route("/.well-known/matrix/client", get(well_known_client))
@@ -488,6 +502,92 @@ async fn joined_rooms(
         .joined(&identity.user_id)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
     Ok(Json(json!({ "joined_rooms": rooms })))
+}
+
+#[derive(Debug, Deserialize)]
+struct InviteRequest {
+    user_id: String,
+}
+
+/// `POST /_matrix/client/v3/rooms/{room_id}/invite`
+async fn invite_to_room(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    Json(request): Json<InviteRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    state
+        .rooms
+        .set_membership(
+            &room_id,
+            &identity.user_id,
+            &request.user_id,
+            "invite",
+            state.key.pair(),
+        )
+        .map_err(membership_error)?;
+    // The spec's response is an empty object, not the event ID. A client that
+    // wanted the event reads it from the timeline.
+    Ok(Json(json!({})))
+}
+
+/// `POST /_matrix/client/v3/rooms/{room_id}/join`
+async fn join_room(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    join(&state, &identity.user_id, &room_id)
+}
+
+/// `POST /_matrix/client/v3/join/{room_id_or_alias}`
+///
+/// Aliases do not resolve yet, so this accepts room IDs only and says so
+/// rather than pretending: an alias returns `M_NOT_FOUND` from the room lookup
+/// below, which is the truthful answer for a name this server cannot resolve.
+async fn join_room_by_id_or_alias(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id_or_alias): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    join(&state, &identity.user_id, &room_id_or_alias)
+}
+
+fn join(state: &AppState, user_id: &str, room_id: &str) -> Result<Json<Value>, MatrixError> {
+    state
+        .rooms
+        .set_membership(room_id, user_id, user_id, "join", state.key.pair())
+        .map_err(membership_error)?;
+    Ok(Json(json!({ "room_id": room_id })))
+}
+
+/// `POST /_matrix/client/v3/rooms/{room_id}/leave`
+async fn leave_room(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    state
+        .rooms
+        .set_membership(
+            &room_id,
+            &identity.user_id,
+            &identity.user_id,
+            "leave",
+            state.key.pair(),
+        )
+        .map_err(membership_error)?;
+    Ok(Json(json!({})))
+}
+
+fn membership_error(error: crate::rooms::RoomError) -> MatrixError {
+    match error {
+        crate::rooms::RoomError::UnknownRoom(_) => {
+            MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such room")
+        }
+        crate::rooms::RoomError::Forbidden(rule) => MatrixError::forbidden(rule),
+        other => MatrixError::internal(&other.to_string()),
+    }
 }
 
 /// `PUT /_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}`

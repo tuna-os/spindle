@@ -172,7 +172,7 @@ impl RoomBuilder {
         let event_id = EventId::parse(format!("$event{}{}:example.org", self.counter, self.branch))
             .expect("a generated event ID is valid");
 
-        let auth_events = self.auth_events_for(sender, &event_type, state_key.as_deref());
+        let auth_events = self.auth_events_for(sender, &event_type, state_key.as_deref(), content);
         let prev_events = self.heads();
 
         let pdu = TestPdu {
@@ -198,12 +198,22 @@ impl RoomBuilder {
     }
 
     /// The v11 auth-event selection: create, the sender's membership, power
-    /// levels, and — for a join or leave — join rules.
+    /// levels, and — for a join, invite or knock — the join rules.
+    ///
+    /// Not "for a join or leave", which is what this said and did until the
+    /// server-side copy of the same rule was caught disagreeing with ruma's
+    /// `auth_types_for_event`. Latent here rather than active: the only
+    /// membership this builder produces is the creator's join, for which the
+    /// join rules are cited either way. It is fixed anyway because a fixture
+    /// that names the wrong auth events produces a reference resolution that
+    /// is wrong in ways that look like a bug in whatever is compared against
+    /// it — which is exactly what this module's own docs warn about.
     fn auth_events_for(
         &self,
         sender: &str,
         event_type: &TimelineEventType,
         state_key: Option<&str>,
+        content: &serde_json::Value,
     ) -> Vec<OwnedEventId> {
         if *event_type == TimelineEventType::RoomCreate {
             return Vec::new();
@@ -220,7 +230,12 @@ impl RoomBuilder {
         push((TimelineEventType::RoomMember, sender.to_owned()));
 
         if *event_type == TimelineEventType::RoomMember {
-            push((TimelineEventType::RoomJoinRules, String::new()));
+            if matches!(
+                content["membership"].as_str(),
+                Some("join" | "invite" | "knock")
+            ) {
+                push((TimelineEventType::RoomJoinRules, String::new()));
+            }
             // The target's current membership, when it differs from the sender's.
             if let Some(target) = state_key.filter(|target| *target != sender) {
                 push((TimelineEventType::RoomMember, target.to_owned()));
