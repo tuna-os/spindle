@@ -12,6 +12,7 @@ pub mod auth;
 pub mod authorize;
 pub mod config;
 pub mod errors;
+pub mod push_rules;
 pub mod ratelimit;
 pub mod rooms;
 pub mod routes;
