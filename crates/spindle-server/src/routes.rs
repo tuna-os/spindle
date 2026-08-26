@@ -45,6 +45,9 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}",
     "/_matrix/client/v3/rooms/{room_id}/read_markers",
     "/_matrix/client/v3/rooms/{room_id}/redact/{event_id}/{txn_id}",
+    "/_matrix/client/v1/rooms/{room_id}/relations/{event_id}",
+    "/_matrix/client/v1/rooms/{room_id}/relations/{event_id}/{rel_type}",
+    "/_matrix/client/v1/rooms/{room_id}/relations/{event_id}/{rel_type}/{event_type}",
     "/_matrix/client/v3/rooms/{room_id}/state",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}",
@@ -101,6 +104,21 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/_matrix/client/v3/rooms/{room_id}/redact/{event_id}/{txn_id}",
             axum::routing::put(redact_event),
+        )
+        // Three arities, because the spec has three and a client may use any.
+        // `/v1` rather than `/v3`: relations arrived on the versioned path
+        // (MSC2675) and that is where clients look for them.
+        .route(
+            "/_matrix/client/v1/rooms/{room_id}/relations/{event_id}",
+            get(relations_all),
+        )
+        .route(
+            "/_matrix/client/v1/rooms/{room_id}/relations/{event_id}/{rel_type}",
+            get(relations_by_type),
+        )
+        .route(
+            "/_matrix/client/v1/rooms/{room_id}/relations/{event_id}/{rel_type}/{event_type}",
+            get(relations_by_event_type),
         )
         .route("/_matrix/client/v3/rooms/{room_id}/state", get(room_state))
         // Two routes, because the spec has two forms and a router cannot
@@ -857,6 +875,94 @@ async fn redact_event(
         )
         .map_err(room_error)?;
     Ok(Json(json!({ "event_id": redaction })))
+}
+
+#[derive(Debug, Deserialize)]
+struct RelationsQuery {
+    from: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn relations_all(
+    State(state): State<AppState>,
+    Authenticated(_identity): Authenticated,
+    axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<RelationsQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    relations(&state, &room_id, &event_id, None, None, &query)
+}
+
+async fn relations_by_type(
+    State(state): State<AppState>,
+    Authenticated(_identity): Authenticated,
+    axum::extract::Path((room_id, event_id, rel_type)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+    axum::extract::Query(query): axum::extract::Query<RelationsQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    relations(&state, &room_id, &event_id, Some(&rel_type), None, &query)
+}
+
+async fn relations_by_event_type(
+    State(state): State<AppState>,
+    Authenticated(_identity): Authenticated,
+    axum::extract::Path((room_id, event_id, rel_type, event_type)): axum::extract::Path<(
+        String,
+        String,
+        String,
+        String,
+    )>,
+    axum::extract::Query(query): axum::extract::Query<RelationsQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    relations(
+        &state,
+        &room_id,
+        &event_id,
+        Some(&rel_type),
+        Some(&event_type),
+        &query,
+    )
+}
+
+/// `GET /_matrix/client/v1/rooms/{room_id}/relations/{event_id}[/{rel_type}[/{event_type}]]`
+fn relations(
+    state: &AppState,
+    room_id: &str,
+    event_id: &str,
+    rel_type: Option<&str>,
+    event_type: Option<&str>,
+    query: &RelationsQuery,
+) -> Result<Json<Value>, MatrixError> {
+    // The same `t`-tagged pagination token `/messages` uses, because it is the
+    // same thing: a position in this room's linear index.
+    let from = match query.from.as_deref() {
+        Some(token) => Some(
+            token
+                .parse::<crate::tokens::Pagination>()
+                .map_err(|error| MatrixError::bad_json(error.to_string()))?
+                .0,
+        ),
+        None => None,
+    };
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
+
+    let (chunk, next) = state
+        .rooms
+        .relations(room_id, event_id, rel_type, event_type, from, limit)
+        .map_err(room_error)?;
+
+    let mut body = serde_json::Map::new();
+    body.insert("chunk".to_owned(), Value::Array(chunk));
+    // Absent when there is nothing more, which is how a client stops.
+    if let Some(next) = next {
+        body.insert(
+            "next_batch".to_owned(),
+            json!(crate::tokens::Pagination(next).to_string()),
+        );
+    }
+    Ok(Json(Value::Object(body)))
 }
 
 /// `GET /_matrix/client/v3/rooms/{room_id}/state`
