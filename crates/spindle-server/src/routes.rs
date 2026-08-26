@@ -59,17 +59,32 @@ pub const MOUNTED: &[&str] = &[
     "/ready",
 ];
 
+/// The server's routes.
+///
+/// Split by what a route is *about* rather than by spec section, because the
+/// spec's own grouping cuts across the same path prefixes: `/rooms/{id}/...`
+/// holds membership, timeline and state alike. Four builders also keep any one
+/// of them short enough to read at a glance, which a single chain of forty
+/// routes had stopped being.
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/_matrix/client/versions", get(versions))
-        .route("/_matrix/client/v3/capabilities", get(capabilities))
+        .merge(account_routes())
+        .merge(room_routes())
+        .merge(timeline_routes())
+        .merge(discovery_routes())
+        .with_state(state)
+}
+
+/// Registration, login, and the per-user data that is not in any room.
+fn account_routes() -> Router<AppState> {
+    Router::new()
         .route("/_matrix/client/v3/register", post(register))
         .route("/_matrix/client/v3/login", get(login_flows).post(login))
         .route("/_matrix/client/v3/logout", post(logout))
         .route("/_matrix/client/v3/refresh", post(refresh))
         .route("/_matrix/client/v3/account/whoami", get(whoami))
-        .route("/_matrix/client/v3/createRoom", post(create_room))
         .route("/_matrix/client/v3/joined_rooms", get(joined_rooms))
+        .route("/_matrix/client/v3/sync", get(sync))
         .route(
             "/_matrix/client/v3/user/{user_id}/account_data/{event_type}",
             get(get_account_data).put(set_account_data),
@@ -78,24 +93,18 @@ pub fn router(state: AppState) -> Router {
             "/_matrix/client/v3/user/{user_id}/rooms/{room_id}/account_data/{event_type}",
             get(get_room_account_data).put(set_room_account_data),
         )
-        .route(
-            "/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}",
-            axum::routing::put(send_event),
-        )
-        .route(
-            "/_matrix/client/v3/rooms/{room_id}/messages",
-            get(room_messages),
-        )
+}
+
+/// Creating a room, getting in and out of one, and who else is there.
+fn room_routes() -> Router<AppState> {
+    Router::new()
+        .route("/_matrix/client/v3/createRoom", post(create_room))
         .route(
             "/_matrix/client/v3/rooms/{room_id}/invite",
             post(invite_to_room),
         )
         .route("/_matrix/client/v3/rooms/{room_id}/join", post(join_room))
         .route("/_matrix/client/v3/rooms/{room_id}/leave", post(leave_room))
-        .route(
-            "/_matrix/client/v3/rooms/{room_id}/typing/{user_id}",
-            axum::routing::put(set_typing),
-        )
         .route(
             "/_matrix/client/v3/rooms/{room_id}/kick",
             post(kick_from_room),
@@ -120,7 +129,23 @@ pub fn router(state: AppState) -> Router {
             "/_matrix/client/v3/join/{room_id_or_alias}",
             post(join_room_by_id_or_alias),
         )
-        .route("/_matrix/client/v3/sync", get(sync))
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/typing/{user_id}",
+            axum::routing::put(set_typing),
+        )
+}
+
+/// Everything that reads or writes a room's log, and its state.
+fn timeline_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}",
+            axum::routing::put(send_event),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/messages",
+            get(room_messages),
+        )
         .route(
             "/_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}",
             post(set_receipt),
@@ -164,12 +189,18 @@ pub fn router(state: AppState) -> Router {
             "/_matrix/client/v3/rooms/{room_id}/event/{event_id}",
             get(room_event),
         )
+}
+
+/// What a client or a peer reads before it knows anything else.
+fn discovery_routes() -> Router<AppState> {
+    Router::new()
+        .route("/_matrix/client/versions", get(versions))
+        .route("/_matrix/client/v3/capabilities", get(capabilities))
         .route("/_matrix/key/v2/server", get(server_keys))
         .route("/.well-known/matrix/client", get(well_known_client))
         .route("/.well-known/matrix/server", get(well_known_server))
         .route("/health", get(health))
         .route("/ready", get(ready))
-        .with_state(state)
 }
 
 /// `GET /_matrix/client/versions`
