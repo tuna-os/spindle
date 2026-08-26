@@ -158,14 +158,14 @@ fn persisting_the_state_trie_pays_off_only_when_there_is_state() {
     // The honest question this answers: does storing the trie make a reopen
     // faster? It depends entirely on how much *state* the room has, because a
     // refold replays state events, not all events.
-    // Sizes are modest because RoomLog currently retains a full StateSnapshot
-    // per entry, so a state-heavy room holds every historical snapshot in
-    // memory at once. SPEC §6.4 says rooms should evict to a 32-byte root; that
-    // is not implemented yet, and a larger run here exhausts memory rather than
-    // measuring anything.
+    // The state-heavy run used to be capped at 8,000 because RoomLog retained a
+    // full StateSnapshot per entry and a larger room exhausted memory rather
+    // than measuring anything (#49). SPEC §6.4's eviction is implemented now,
+    // so the size is set by how long the refold takes, not by how much the log
+    // can hold.
     for (label, state_every) in [("messages-only", 0_usize), ("state-heavy", 1)] {
         let dir = TempDir::new().unwrap();
-        let events = 8_000_usize;
+        let events = 50_000_usize;
 
         {
             let store = FjallStore::open(dir.path()).unwrap();
@@ -205,6 +205,72 @@ fn persisting_the_state_trie_pays_off_only_when_there_is_state() {
             "trie/{label}: {events} events | load-from-trie {load_seconds:.3}s | \
              refold {refold_seconds:.3}s | ratio {:.2}x",
             refold_seconds / load_seconds.max(f64::MIN_POSITIVE)
+        );
+    }
+}
+
+/// #49: a reopen materializes a bounded number of snapshots, not one per entry.
+///
+/// This is the half of the bound that a pure in-memory test cannot reach.
+/// Restoring a room walks every stored entry, and the obvious implementation
+/// keeps each one's state as it goes — which exhausts memory on exactly the
+/// rooms the bound exists for, before the server has finished starting.
+#[test]
+fn reopening_a_state_heavy_room_does_not_materialize_every_snapshot() {
+    let dir = TempDir::new().unwrap();
+    let events = 20_000_usize;
+
+    {
+        let store = FjallStore::open(dir.path()).unwrap();
+        let room_store = RoomStore::new(&store, ROOM);
+        let mut log = RoomLog::new();
+        for number in 0..events {
+            let entry = log
+                .append_local(
+                    format!("$event-{number}"),
+                    Some(spindle_core::StateKey::new(
+                        "m.room.member",
+                        format!("@user{number}:example.org"),
+                    )),
+                )
+                .unwrap();
+            let entry = entry.clone();
+            room_store
+                .commit_entry(&entry, &log, Durability::Relaxed)
+                .unwrap();
+        }
+        assert!(
+            log.resident_len() <= spindle_core::DEFAULT_RESIDENT_WINDOW + 1,
+            "appending kept {} snapshots resident",
+            log.resident_len()
+        );
+    }
+
+    let store = FjallStore::open(dir.path()).unwrap();
+    let room_store = RoomStore::new(&store, ROOM);
+
+    for (label, restored) in [
+        ("load", room_store.load().unwrap().unwrap()),
+        ("refold", room_store.load_refolding().unwrap().unwrap()),
+    ] {
+        assert_eq!(restored.log.len(), events, "{label} lost entries");
+        assert!(
+            restored.log.resident_len() <= spindle_core::DEFAULT_RESIDENT_WINDOW + 1,
+            "{label} materialized {} snapshots for {events} entries",
+            restored.log.resident_len()
+        );
+        // The head's state is what a server actually serves from, and it has to
+        // be right after a bounded restore, not merely small.
+        let head = restored.log.entries().next_back().unwrap();
+        let state = restored.log.state_after(head.li).expect("head is resident");
+        assert_eq!(*state.root().as_bytes(), *head.state_root.as_bytes());
+        assert_eq!(
+            state.get(&spindle_core::StateKey::new(
+                "m.room.member",
+                format!("@user{}:example.org", events - 1),
+            )),
+            Some(format!("$event-{}", events - 1).as_str()),
+            "{label} lost the newest state event"
         );
     }
 }

@@ -13,6 +13,15 @@ const CHAIN_DOMAIN: &[u8] = b"spindle-log-chain-v1\0";
 /// `u64`. Matrix caps `prev_events` at 20, so a real fork is far below this.
 const MAX_TIPS: usize = u64::BITS as usize;
 
+/// How many recent entries keep their materialized state resident, by default.
+///
+/// Matched to SPEC §9.1's `max_fork_window`, and that coupling is the whole
+/// argument: a fork deeper than the window already falls back to full state
+/// resolution, which reads the trie from the store. So a window this size holds
+/// every snapshot the fast path can ask for, and nothing that only the slow
+/// path can.
+pub const DEFAULT_RESIDENT_WINDOW: usize = 512;
+
 /// A Matrix event ID, treated as an opaque value.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct EventId(Box<str>);
@@ -141,7 +150,13 @@ pub struct LogEntry {
     ///
     /// `None` for backfilled history, which it did not.
     pub chain: Option<ChainHash>,
-    pub state_after: StateSnapshot,
+    /// Content address of the room state after this entry applied.
+    ///
+    /// The address, not the state. A 32-byte root is what every entry can
+    /// afford to keep forever; the materialized [`StateSnapshot`] it names is
+    /// held only while it is recent enough to be reachable by a fork, and is
+    /// otherwise rehydrated from the store (SPEC §6.4).
+    pub state_root: StateRoot,
 }
 
 /// The ancestry that differs between a set of forward extremities.
@@ -174,6 +189,13 @@ pub struct RoomLog {
     next_forward: i64,
     next_backward: i64,
     head_chain: ChainHash,
+    /// Materialized state for the entries that can still be asked for it.
+    ///
+    /// Bounded, because the alternative is not: a snapshot per entry retains
+    /// every version of every path the trie ever copied, so a long-lived room
+    /// grows without limit even though the trie shares structure perfectly.
+    resident: BTreeMap<i64, StateSnapshot>,
+    resident_window: usize,
 }
 
 impl Default for RoomLog {
@@ -185,6 +207,8 @@ impl Default for RoomLog {
             next_forward: 1,
             next_backward: 0,
             head_chain: ChainHash::seed(),
+            resident: BTreeMap::new(),
+            resident_window: DEFAULT_RESIDENT_WINDOW,
         }
     }
 }
@@ -193,6 +217,92 @@ impl RoomLog {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A log that keeps `window` recent snapshots resident instead of the
+    /// default [`DEFAULT_RESIDENT_WINDOW`].
+    ///
+    /// Set this to at least the `max_events` passed to [`RoomLog::fork_window`]
+    /// — below that, a fork the design says is cheap has to reach the store for
+    /// state the design says should be in hand.
+    #[must_use]
+    pub fn with_resident_window(window: usize) -> Self {
+        Self {
+            resident_window: window,
+            ..Self::default()
+        }
+    }
+
+    /// Materialized state after the entry at `li`, if it is still resident.
+    ///
+    /// `None` means evicted, not absent: the state exists, addressed by that
+    /// entry's `state_root`, and is rehydrated from the store. Callers on the
+    /// fast path never see `None`, because everything a fork can reach is
+    /// pinned.
+    #[must_use]
+    pub fn state_after(&self, li: LinearIndex) -> Option<&StateSnapshot> {
+        self.resident.get(&li.get())
+    }
+
+    /// Materialized state after `event_id`, if it is still resident.
+    #[must_use]
+    pub fn state_after_event(&self, event_id: &EventId) -> Option<&StateSnapshot> {
+        self.positions
+            .get(event_id)
+            .and_then(|li| self.resident.get(li))
+    }
+
+    /// How many snapshots are currently held in memory.
+    ///
+    /// Exposed so a test can assert the bound holds rather than assume it. A
+    /// room whose resident count tracks its length has lost the bound, which is
+    /// the regression this whole mechanism exists to prevent.
+    #[must_use]
+    pub fn resident_len(&self) -> usize {
+        self.resident.len()
+    }
+
+    /// Record a snapshot and drop whatever the window no longer covers.
+    ///
+    /// The entry just written always survives this call, whatever its index.
+    /// That is what lets a backfill prepend — which takes an index far below
+    /// the window floor — hand its `/state_ids` state to the caller for
+    /// persistence before it is dropped again on the next append.
+    fn make_resident(&mut self, li: i64, state: StateSnapshot) {
+        self.resident.insert(li, state);
+        self.evict(li);
+    }
+
+    /// Retain the window, `keep`, and every forward extremity at any age.
+    ///
+    /// The extremity rule is the one that is not obvious and is load-bearing:
+    /// a class-D stale peer event can leave an extremity arbitrarily far back
+    /// (ADR 0001), and the next local event has to merge that extremity's state
+    /// with the head's. Evicting it by age would turn an ordinary federation
+    /// append into a store read at best, and an unresolvable merge at worst.
+    ///
+    /// The floor comes from the highest resident index rather than from `keep`,
+    /// so a backfill prepend cannot drag the window down and resurrect the
+    /// whole room.
+    fn evict(&mut self, keep: i64) {
+        let Some(&newest) = self.resident.keys().next_back() else {
+            return;
+        };
+        let floor = newest.saturating_sub_unsigned(self.resident_window as u64);
+        if self
+            .resident
+            .first_key_value()
+            .is_none_or(|(&li, _)| li >= floor)
+        {
+            return;
+        }
+        let pinned: BTreeSet<i64> = self
+            .forward_extremities
+            .iter()
+            .filter_map(|id| self.positions.get(id).copied())
+            .collect();
+        self.resident
+            .retain(|&li, _| li >= floor || li == keep || pinned.contains(&li));
     }
 
     /// Every entry in linear-index order, oldest first.
@@ -412,24 +522,33 @@ impl RoomLog {
             return Err(AppendError::MissingPredecessor);
         }
 
-        let mut parent_entries = Vec::with_capacity(input.prev_events.len());
+        let mut parent_states = Vec::with_capacity(input.prev_events.len());
+        let mut depth = 0_u64;
         for parent in &input.prev_events {
             let Some(entry) = self.get(parent) else {
                 return Err(AppendError::UnknownPredecessor(parent.clone()));
             };
-            parent_entries.push(entry);
+            let entry_li = entry.li;
+            let entry_depth = entry.depth;
+            let Some(state) = self.resident.get(&entry_li.get()) else {
+                // Every parent an append can name is either recent or a pinned
+                // extremity, so this is unreachable by construction. It is an
+                // error rather than a panic because "unreachable by
+                // construction" is a claim about code that can be changed.
+                return Err(AppendError::StateNotResident {
+                    li: entry_li,
+                    event_id: parent.clone(),
+                });
+            };
+            parent_states.push(state);
+            depth = depth.max(entry_depth.saturating_add(1));
         }
 
-        let mut state_after = merge_states(&parent_entries)?;
+        let mut state_after = merge_states(&parent_states)?;
         let state_key = input.state_key;
         if let Some(state_key) = state_key.clone() {
             state_after = state_after.apply(state_key, input.event_id.as_str());
         }
-        let depth = parent_entries
-            .iter()
-            .map(|entry| entry.depth)
-            .max()
-            .map_or(0, |depth| depth.saturating_add(1));
 
         let li = self.next_forward;
         self.next_forward = self
@@ -445,7 +564,7 @@ impl RoomLog {
             depth,
             state_key,
             chain: Some(chain),
-            state_after,
+            state_root: state_after.root(),
         };
         self.head_chain = chain;
 
@@ -454,7 +573,11 @@ impl RoomLog {
         }
         self.forward_extremities.insert(entry.event_id.clone());
         self.positions.insert(entry.event_id.clone(), li);
-        Ok(self.entries.entry(li).or_insert(entry))
+        self.entries.insert(li, entry);
+        // After the extremity set is updated, so a parent that just stopped
+        // being an extremity stops being pinned by it.
+        self.make_resident(li, state_after);
+        Ok(&self.entries[&li])
     }
 
     /// Place one backfilled event before everything currently held.
@@ -505,13 +628,19 @@ impl RoomLog {
             state_key: input.state_key,
             // Backfilled history was sequenced by somebody else.
             chain: None,
-            state_after,
+            state_root: state_after.root(),
         };
 
         // Backfilled history is never a forward extremity: it is, by
         // construction, behind everything we already hold.
         self.positions.insert(entry.event_id.clone(), li);
-        Ok(self.entries.entry(li).or_insert(entry))
+        self.entries.insert(li, entry);
+        // Backfill takes descending indices, so it is always below the window
+        // floor and this snapshot is dropped again immediately. That is correct
+        // and deliberate: backfilled state came from `/state_ids`, is persisted
+        // by the commit, and is rehydrated rather than refolded on reopen.
+        self.make_resident(li, state_after);
+        Ok(&self.entries[&li])
     }
 }
 
@@ -635,6 +764,8 @@ impl RoomLog {
             next_forward,
             next_backward,
             head_chain: ChainHash::seed(),
+            resident: BTreeMap::new(),
+            resident_window: DEFAULT_RESIDENT_WINDOW,
         };
         let mut unverified = Vec::new();
         let mut broken_chain = Vec::new();
@@ -661,10 +792,10 @@ impl RoomLog {
             // that for every entry would make a reopen quadratic. The stored
             // trie is the fallback for the entries a refold cannot reproduce,
             // not the primary path.
-            let parents: Vec<&LogEntry> = restored
+            let parents: Vec<&StateSnapshot> = restored
                 .prev_events
                 .iter()
-                .filter_map(|parent| log.get(parent))
+                .filter_map(|parent| log.state_after_event(parent))
                 .collect();
             let mut folded = match merge_states(&parents) {
                 Ok(state) => state,
@@ -716,10 +847,19 @@ impl RoomLog {
                 depth: restored.depth,
                 state_key: restored.state_key,
                 chain,
-                state_after,
+                // The root of the state we actually have, which is not always
+                // the root that was stored: an entry we could neither refold
+                // nor rehydrate is reported in `unverified`, and giving it the
+                // stored root anyway would leave the log advertising an address
+                // its own snapshot does not hash to.
+                state_root: state_after.root(),
             };
             log.positions.insert(entry.event_id.clone(), li);
             log.entries.insert(li, entry);
+            // Bounded here too. A reopen that materialized every entry's state
+            // would exhaust memory on exactly the rooms this bound exists for,
+            // and would do it before the server finished starting.
+            log.make_resident(li, state_after);
         }
 
         Ok(RestoredLog {
@@ -730,17 +870,17 @@ impl RoomLog {
     }
 }
 
-fn merge_states(parents: &[&LogEntry]) -> Result<StateSnapshot, AppendError> {
+fn merge_states(parents: &[&StateSnapshot]) -> Result<StateSnapshot, AppendError> {
     let Some(first) = parents.first() else {
         return Ok(StateSnapshot::new());
     };
     if parents.len() == 1 {
-        return Ok(first.state_after.clone());
+        return Ok((*first).clone());
     }
 
     let mut values: BTreeMap<StateKey, BTreeSet<Box<str>>> = BTreeMap::new();
     for parent in parents {
-        parent.state_after.for_each(|key, event_id| {
+        parent.for_each(|key, event_id| {
             values
                 .entry(key.clone())
                 .or_default()
@@ -780,6 +920,15 @@ pub enum AppendError {
     NeedsStateResolution {
         key: StateKey,
         candidates: Vec<EventId>,
+    },
+    /// A named predecessor's state has been evicted from memory.
+    ///
+    /// Unreachable on the append path, which can only name recent entries or
+    /// pinned extremities. It exists so that a future change which breaks that
+    /// invariant fails loudly instead of silently appending onto empty state.
+    StateNotResident {
+        li: LinearIndex,
+        event_id: EventId,
     },
 }
 

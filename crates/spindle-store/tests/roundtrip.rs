@@ -53,14 +53,16 @@ fn a_reopen_reproduces_head_extremities_counters_and_state() {
     let original_head = original.entries().next_back().unwrap();
     assert_eq!(restored_head.event_id, original_head.event_id);
     assert_eq!(
-        restored_head.state_after.root().as_bytes(),
-        original_head.state_after.root().as_bytes()
+        restored_head.state_root.as_bytes(),
+        original_head.state_root.as_bytes()
     );
 
     // And the state itself is queryable, not just hash-equal.
     assert_eq!(
-        restored_head
-            .state_after
+        restored
+            .log
+            .state_after(restored_head.li)
+            .unwrap()
             .get(&StateKey::new("m.room.topic", "")),
         Some("$topic")
     );
@@ -115,8 +117,10 @@ fn backfilled_state_survives_a_reopen_now_that_the_trie_is_persisted() {
         .find(|entry| entry.li.get() == 0)
         .unwrap();
     assert_eq!(
-        backfilled
-            .state_after
+        restored
+            .log
+            .state_after(backfilled.li)
+            .unwrap()
             .get(&StateKey::new("m.room.name", "")),
         Some("$name"),
         "the externally supplied state came back"
@@ -156,21 +160,19 @@ fn a_corrupted_state_node_is_detected_rather_than_served() {
         restored.unverified.is_empty(),
         "a refold from the log should still reproduce the recorded roots"
     );
-    let head = restored.log.entries().next_back().unwrap();
+    let head_li = restored.log.entries().next_back().unwrap().li;
     assert_eq!(
-        head.state_after.get(&StateKey::new("m.room.topic", "")),
+        restored
+            .log
+            .state_after(head_li)
+            .unwrap()
+            .get(&StateKey::new("m.room.topic", "")),
         Some("$topic"),
         "the room's state survived a corrupted trie node"
     );
     assert_eq!(
-        head.state_after.root().as_bytes(),
-        live_room()
-            .entries()
-            .next_back()
-            .unwrap()
-            .state_after
-            .root()
-            .as_bytes(),
+        restored.log.entries().next_back().unwrap().state_root,
+        live_room().entries().next_back().unwrap().state_root,
     );
 }
 
@@ -305,4 +307,59 @@ fn tampering_with_stored_history_breaks_the_chain_on_reopen() {
         2,
         "the substituted entry and everything sequenced after it"
     );
+}
+
+/// An entry's `state_root` must be the address of the state the log actually
+/// holds, even for an entry the restore could not reproduce.
+///
+/// Backfilled state comes from `/state_ids`, so a refold cannot rebuild it. A
+/// restore with no node loader therefore has nothing to rehydrate from and
+/// reports the entry in `unverified` — and the tempting thing to do is store
+/// the root that was recorded anyway. That would leave the log advertising an
+/// address its own snapshot does not hash to, and every rehydration downstream
+/// trusts that address.
+#[test]
+fn an_unverified_entry_advertises_the_state_it_has_not_the_one_it_wanted() {
+    let dir = TempDir::new().unwrap();
+    let mut room = live_room();
+    let supplied = StateSnapshot::new().apply(StateKey::new("m.room.name", ""), "$name");
+    let recorded = room
+        .prepend_remote(EventInput::new("$older", vec![]), supplied, 40)
+        .unwrap()
+        .state_root;
+
+    let store = FjallStore::open(dir.path()).unwrap();
+    RoomStore::new(&store, ROOM).save(&room).unwrap();
+    // `load_refolding` deliberately ignores the stored trie, so the backfilled
+    // entry cannot come back.
+    let restored = RoomStore::new(&store, ROOM)
+        .load_refolding()
+        .unwrap()
+        .unwrap();
+
+    let backfilled = restored
+        .log
+        .entries()
+        .find(|entry| entry.li.get() == 0)
+        .unwrap();
+    assert!(
+        restored.unverified.contains(&backfilled.li),
+        "a backfilled entry cannot be refolded and must be reported"
+    );
+    assert_ne!(
+        backfilled.state_root, recorded,
+        "the refold could not reproduce the recorded state, and must not claim to"
+    );
+
+    // The invariant that matters: root and state agree, for every entry.
+    for entry in restored.log.entries() {
+        if let Some(state) = restored.log.state_after(entry.li) {
+            assert_eq!(
+                state.root(),
+                entry.state_root,
+                "li {} advertises a root its own snapshot does not hash to",
+                entry.li.get()
+            );
+        }
+    }
 }
