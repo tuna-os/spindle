@@ -117,6 +117,8 @@ pub enum Keyspace {
     /// the hot direction: every `/join/#room:server` is a point lookup here,
     /// while listing a room's aliases is rare enough to pay for a scan.
     Alias = 0x11,
+    /// `(user_id, filter_id)` -> a stored `/sync` filter.
+    Filter = 0x12,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -346,6 +348,20 @@ pub fn alias_prefix() -> Vec<u8> {
 pub fn alias_from_key(key: &[u8]) -> Option<String> {
     let len = u16::from_be_bytes(key.get(2..4)?.try_into().ok()?) as usize;
     String::from_utf8(key.get(4..4 + len)?.to_vec()).ok()
+}
+
+/// `(user_id, filter_id)` key for [`Keyspace::Filter`].
+#[must_use]
+pub fn filter(user_id: &str, filter_id: &str) -> Vec<u8> {
+    let mut key = filter_prefix(user_id);
+    key.extend_from_slice(filter_id.as_bytes());
+    key
+}
+
+/// The prefix every filter key for one user shares.
+#[must_use]
+pub fn filter_prefix(user_id: &str) -> Vec<u8> {
+    user_prefix(Keyspace::Filter, user_id)
 }
 
 /// `(room_id, li)` key, ordered by `li` within a room.

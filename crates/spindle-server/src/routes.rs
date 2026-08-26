@@ -94,6 +94,14 @@ fn account_routes() -> Router<AppState> {
             "/_matrix/client/v3/user/{user_id}/rooms/{room_id}/account_data/{event_type}",
             get(get_room_account_data).put(set_room_account_data),
         )
+        .route(
+            "/_matrix/client/v3/user/{user_id}/filter",
+            post(create_filter),
+        )
+        .route(
+            "/_matrix/client/v3/user/{user_id}/filter/{filter_id}",
+            get(get_filter),
+        )
         // Four arities of the same path, because the spec has four and each
         // reads or writes a different slice of one ruleset.
         .route("/_matrix/client/v3/pushrules/", get(get_push_rules))
@@ -1009,6 +1017,7 @@ struct SyncQuery {
     timeout: Option<u64>,
     #[serde(rename = "timeline_limit")]
     timeline_limit: Option<usize>,
+    filter: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1499,6 +1508,82 @@ async fn room_summary(
     Ok(Json(Value::Object(body)))
 }
 
+/// `POST /_matrix/client/v3/user/{user_id}/filter`
+///
+/// The filter is parsed here rather than stored as opaque bytes, so a
+/// malformed one is refused at upload instead of on every sync that quotes it.
+async fn create_filter(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+    Json(filter): Json<crate::filters::Filter>,
+) -> Result<Json<Value>, MatrixError> {
+    own_account(&identity, &user_id)?;
+    let filter_id = state
+        .filters
+        .put(&user_id, &filter)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    Ok(Json(json!({ "filter_id": filter_id })))
+}
+
+/// `GET /_matrix/client/v3/user/{user_id}/filter/{filter_id}`
+async fn get_filter(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((user_id, filter_id)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    own_account(&identity, &user_id)?;
+    let filter = state
+        .filters
+        .get(&user_id, &filter_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+        .ok_or_else(|| {
+            MatrixError::new(
+                StatusCode::NOT_FOUND,
+                "M_NOT_FOUND",
+                format!("no filter {filter_id}"),
+            )
+        })?;
+    Ok(Json(
+        serde_json::to_value(filter).unwrap_or_else(|_| json!({})),
+    ))
+}
+
+/// The filter a `/sync` request is asking for, in either of the two forms.
+///
+/// A client may send the JSON inline or the id of one it uploaded. Both end up
+/// as the same parsed `Filter`, so a filter cannot mean one thing uploaded and
+/// another inline.
+///
+/// An unknown id is an error rather than "no filter". Silently syncing
+/// unfiltered would send a client on a slow connection everything it just
+/// asked not to receive, which is the opposite of what it wanted and looks
+/// like the server ignoring it.
+fn requested_filter(
+    state: &AppState,
+    user_id: &str,
+    raw: Option<&str>,
+) -> Result<Option<crate::filters::Filter>, MatrixError> {
+    let Some(raw) = raw else { return Ok(None) };
+    if raw.starts_with('{') {
+        return serde_json::from_str(raw)
+            .map(Some)
+            .map_err(|error| MatrixError::bad_json(error.to_string()));
+    }
+    state
+        .filters
+        .get(user_id, raw)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+        .map(Some)
+        .ok_or_else(|| {
+            MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                format!("no filter {raw}"),
+            )
+        })
+}
+
 /// `GET /_matrix/client/v3/sync`
 ///
 /// The token is a position in the server-global stream (SPEC §10.2), because
@@ -1518,7 +1603,16 @@ async fn sync(
         ),
         None => None,
     };
-    let timeline_limit = query.timeline_limit.unwrap_or(20).clamp(1, 100);
+    let filter = requested_filter(&state, &identity.user_id, query.filter.as_deref())?;
+    // A filter's own timeline limit outranks the query parameter: the client
+    // set both, and the filter is the more specific of the two.
+    let timeline_limit = filter
+        .as_ref()
+        .and_then(|filter| filter.room.timeline.as_ref())
+        .and_then(|timeline| timeline.limit)
+        .or(query.timeline_limit)
+        .unwrap_or(20)
+        .clamp(1, 100);
 
     let mut result = state
         .rooms
@@ -1547,10 +1641,13 @@ async fn sync(
         }
     }
 
-    let join = sync_join(&state, &identity, result.rooms)?;
+    let join = sync_join(&state, &identity, result.rooms, filter.as_ref())?;
 
     let mut invite = serde_json::Map::new();
     for room_id in result.invited {
+        if filter.as_ref().is_some_and(|f| !f.allows_room(&room_id)) {
+            continue;
+        }
         // An invited user is not in the room, so there is no timeline to show
         // them. `invite_state` is what a client renders the invite from; it is
         // empty until stripped state lands, and empty is the honest answer
@@ -1560,6 +1657,12 @@ async fn sync(
 
     let mut leave = serde_json::Map::new();
     for room in result.left {
+        if filter
+            .as_ref()
+            .is_some_and(|f| !f.allows_room(&room.room_id))
+        {
+            continue;
+        }
         // No `state` block: the state of a room you are not in is not yours to
         // read, and the departure event in the timeline already says what a
         // client needs -- that you are out, and how you came to be.
@@ -1589,6 +1692,12 @@ async fn sync(
             "content": crate::push_rules::defaults(&identity.user_id),
         }));
     }
+    let global = crate::filters::Filter::apply(
+        filter
+            .as_ref()
+            .and_then(|filter| filter.account_data.as_ref()),
+        global,
+    );
 
     Ok(Json(json!({
         "next_batch": crate::tokens::Sync(result.next_batch).to_string(),
@@ -1606,9 +1715,13 @@ fn sync_join(
     state: &AppState,
     identity: &crate::accounts::Identity,
     rooms: Vec<crate::rooms::SyncRoom>,
+    filter: Option<&crate::filters::Filter>,
 ) -> Result<serde_json::Map<String, Value>, MatrixError> {
     let mut join = serde_json::Map::new();
     for room in rooms {
+        if filter.is_some_and(|f| !f.allows_room(&room.room_id)) {
+            continue;
+        }
         let unread = state
             .rooms
             .unread(&room.room_id, &identity.user_id)
@@ -1624,14 +1737,30 @@ fn sync_join(
             .all(&identity.user_id, &room.room_id)
             .map_err(|error| account_data_error(&error))?;
         let typing = state.typing.event(&room.room_id);
+        let room_filter = filter.map(|filter| &filter.room);
+        let events = crate::filters::Filter::apply(
+            room_filter.and_then(|room| room.timeline.as_ref()),
+            room.events,
+        );
+        let room_state = crate::filters::Filter::apply(
+            room_filter.and_then(|room| room.state.as_ref()),
+            room.state,
+        );
+        let room_data = crate::filters::Filter::apply(
+            room_filter.and_then(|room| room.account_data.as_ref()),
+            room_data,
+        );
         join.insert(
             room.room_id,
             json!({
-                "timeline": { "events": room.events, "limited": room.limited },
-                "state": { "events": room.state },
+                "timeline": { "events": events, "limited": room.limited },
+                "state": { "events": room_state },
                 "account_data": { "events": room_data },
                 "ephemeral": {
-                    "events": typing.map(|event| vec![event]).unwrap_or_default(),
+                    "events": crate::filters::Filter::apply(
+                        room_filter.and_then(|room| room.ephemeral.as_ref()),
+                        typing.map(|event| vec![event]).unwrap_or_default(),
+                    ),
                 },
                 "unread_notifications": {
                     "notification_count": unread.notification_count,
@@ -1645,7 +1774,7 @@ fn sync_join(
     // nothing about typing. Adding it back here is what keeps typing out of
     // the log layer entirely.
     for room_id in state.rooms.joined(&identity.user_id).map_err(room_error)? {
-        if join.contains_key(&room_id) {
+        if join.contains_key(&room_id) || filter.is_some_and(|f| !f.allows_room(&room_id)) {
             continue;
         }
         let Some(typing) = state.typing.event(&room_id) else {

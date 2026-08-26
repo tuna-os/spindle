@@ -1,3 +1,8 @@
 /target/
 *.profraw
 
+# Benchmark and interop scratch: databases, signing keys, logs and result
+# JSON, none of which belongs in the repository. A run against Synapse leaves
+# a homeserver.db and a signing key here, and a Spindle run leaves a fjall
+# store -- all of it reproducible, and one of it secret.
+/tmp/
