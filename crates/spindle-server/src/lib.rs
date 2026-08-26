@@ -17,6 +17,7 @@ pub mod routes;
 pub mod signing;
 pub mod surface;
 pub mod tokens;
+pub mod typing;
 
 use std::sync::Arc;
 
@@ -33,6 +34,7 @@ pub struct AppState {
     pub limiter: Arc<ratelimit::RateLimiter>,
     pub key: Arc<signing::ServerKey>,
     pub rooms: Arc<rooms::Rooms>,
+    pub typing: Arc<typing::Typing>,
 }
 
 /// Build the HTTP application.
@@ -58,6 +60,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, signing::Si
         limiter,
         key,
         rooms,
+        typing: Arc::new(typing::Typing::new()),
     };
     Ok(routes::router(state))
 }
