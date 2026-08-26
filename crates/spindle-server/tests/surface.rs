@@ -6,10 +6,14 @@
 //! hold them against each other — so growing the advertisement without building
 //! the endpoint fails here rather than in a client three weeks later.
 
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
 use spindle_server::{Config, routes, surface};
+use spindle_store::FjallStore;
+use tempfile::TempDir;
 use tower::ServiceExt;
 
 fn config() -> Config {
@@ -23,7 +27,9 @@ fn config() -> Config {
 }
 
 async fn get(path: &str) -> (StatusCode, Value) {
-    let app = spindle_server::app(config());
+    let dir = TempDir::new().expect("a temp dir");
+    let store = Arc::new(FjallStore::open(dir.path()).expect("a store opens"));
+    let app = spindle_server::app(config(), store);
     let response = app
         .oneshot(
             Request::builder()
@@ -158,9 +164,9 @@ async fn an_unimplemented_endpoint_is_a_404_not_a_stub() {
     // client cannot distinguish it from success.
     for path in [
         "/_matrix/client/v3/sync",
-        "/_matrix/client/v3/login",
         "/_matrix/client/v3/createRoom",
-        "/_matrix/client/v3/register",
+        "/_matrix/client/v3/joined_rooms",
+        "/_matrix/client/v3/publicRooms",
     ] {
         assert_eq!(
             get(path).await.0,

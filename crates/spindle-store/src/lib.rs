@@ -89,6 +89,17 @@ pub trait Store: ReadView {
     /// `None` means the backend has no snapshot isolation and reads are live.
     /// That is honest rather than silently unsafe: a backend without this
     /// cannot be backed up under concurrent writes, and callers can tell.
+    /// Remove one key, if it is there.
+    ///
+    /// Deleting a key that does not exist is not an error: the caller wanted it
+    /// gone, and it is gone. Logging out twice is the ordinary case, not a
+    /// fault.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the delete fails.
+    fn delete(&self, key: &[u8]) -> Result<(), StoreError>;
+
     fn snapshot(&self) -> Option<Box<dyn ReadView + '_>> {
         None
     }
@@ -248,6 +259,11 @@ impl ReadView for FjallCheckpoint {
 impl Store for FjallStore {
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         self.partition.insert(key, value)?;
+        Ok(())
+    }
+
+    fn delete(&self, key: &[u8]) -> Result<(), StoreError> {
+        self.partition.remove(key)?;
         Ok(())
     }
 
