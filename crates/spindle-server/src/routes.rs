@@ -33,6 +33,7 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/v3/logout",
     "/_matrix/client/v3/refresh",
     "/_matrix/client/v3/account/whoami",
+    "/_matrix/key/v2/server",
     "/.well-known/matrix/client",
     "/.well-known/matrix/server",
     "/health",
@@ -48,6 +49,7 @@ pub fn router(state: AppState) -> Router {
         .route("/_matrix/client/v3/logout", post(logout))
         .route("/_matrix/client/v3/refresh", post(refresh))
         .route("/_matrix/client/v3/account/whoami", get(whoami))
+        .route("/_matrix/key/v2/server", get(server_keys))
         .route("/.well-known/matrix/client", get(well_known_client))
         .route("/.well-known/matrix/server", get(well_known_server))
         .route("/health", get(health))
@@ -408,4 +410,32 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for ClientAddr {
                 .map_or_else(|| "unknown".to_owned(), |info| info.0.ip().to_string()),
         ))
     }
+}
+
+/// `GET /_matrix/key/v2/server`
+///
+/// Publishes the *public* half of this server's signing key, so a peer can
+/// verify events we signed.
+///
+/// `valid_until_ts` is a re-fetch hint, not an expiry the spec enforces. It is
+/// deliberately short-ish: a peer that caches this for a long time keeps
+/// trusting a key we may have had to rotate, and the cost of it being wrong is
+/// borne by whoever has to explain why signatures stopped verifying.
+async fn server_keys(State(state): State<AppState>) -> Json<Value> {
+    let valid_until = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis().saturating_add(24 * 60 * 60 * 1000))
+        .unwrap_or_default();
+
+    Json(json!({
+        "server_name": state.config.server.name,
+        "valid_until_ts": u64::try_from(valid_until).unwrap_or(u64::MAX),
+        "verify_keys": {
+            state.key.key_id(): { "key": state.key.public_key_base64() },
+        },
+        // No key has been retired, and saying so explicitly is not the same as
+        // omitting it: a peer reads this to decide whether a signature made
+        // with an old key should still be honoured.
+        "old_verify_keys": {},
+    }))
 }

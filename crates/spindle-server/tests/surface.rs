@@ -29,7 +29,7 @@ fn config() -> Config {
 async fn get(path: &str) -> (StatusCode, Value) {
     let dir = TempDir::new().expect("a temp dir");
     let store = Arc::new(FjallStore::open(dir.path()).expect("a store opens"));
-    let app = spindle_server::app(config(), store);
+    let app = spindle_server::app(config(), store).expect("a signing key is established");
     let response = app
         .oneshot(
             Request::builder()

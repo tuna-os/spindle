@@ -63,6 +63,11 @@ pub const DEFAULT_ROOM_VERSION: Option<&str> = None;
 ///
 /// A client that reads a room version from `/capabilities` will try to create
 /// or join a room with it, so these are the endpoints that have to exist first.
+/// Federation needs the published key, so claiming to federate before
+/// `/_matrix/key/v2/server` answers would send a peer looking for a key it
+/// cannot fetch.
+pub const FEDERATION_REQUIRES: &[&str] = &["/_matrix/key/v2/server"];
+
 pub const ROOM_VERSION_REQUIRES: &[&str] = &[
     "/_matrix/client/v3/createRoom",
     "/_matrix/client/v3/join/{room_id_or_alias}",
