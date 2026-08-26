@@ -36,7 +36,8 @@ stale on a runner change. Wall times do.
 | Durability cost: strict vs relaxed | Done (#47) |
 | Our fast path vs `ruma-state-res`, **correctness** | Done (#55), below |
 | Our fast path vs `ruma-state-res`, performance | Done, below — and the result is narrower than the spec implies |
-| `/messages`, `/sync`, join latency vs Synapse and Tuwunel | Needs a server; M1–M3 (#42) |
+| `/messages`, `/sync`, join latency vs **Synapse** | Done at M1, below (#42) |
+| The same vs **Tuwunel** | Not yet — no build in the sandbox (#42) |
 
 Everything here is **algorithmic**, measured inside the library. None of it is a
 server throughput figure and none of it should be quoted as one. Server-to-
@@ -59,6 +60,52 @@ cargo bench -p spindle-core --bench state_snapshot
 cargo bench -p spindle-core --bench fork_window
 cargo test -p spindle-store --release --test scale -- --ignored --nocapture
 ```
+
+## Client-server API vs Synapse, at M1
+
+Run with `scripts/compare-against.sh`, which owns both servers: it installs
+Synapse into a virtualenv, generates its config, runs the driver against it,
+then builds Spindle and runs the same driver against that — same host, same
+sitting, same `api-benchmark.py`. A number from one machine set against a
+number from another is not evidence, so the script does not offer the option.
+
+Synapse runs from a virtualenv rather than Docker deliberately. A Docker
+daemon is not available in the sandbox where most of this work happens, and a
+comparison that can be skipped for want of a daemon is a comparison that will
+be skipped.
+
+Spindle at M1 (`a883e0e` plus the leave section) against Synapse 1.159.0,
+mean of 25 samples after 5 warmups, milliseconds:
+
+| operation | spindle @1600 | synapse @1600 | ratio |
+|---|---|---|---|
+| join | 1.371 | 41.577 | **30.3× faster** |
+| send | 1.485 | 24.628 | **16.6× faster** |
+| messages_page | 1.088 | 5.411 | **5.0× faster** |
+| state | 0.803 | 2.692 | **3.4× faster** |
+| sync_initial | 1.722 | 3.302 | **1.9× faster** |
+
+### What this establishes, and what it does not
+
+It establishes that on a single-node local workload at these room sizes,
+Spindle is faster than Synapse on every operation the driver measures. That is
+a real result and it is the direction the design predicts.
+
+**It does not establish the claim the design actually rests on.** SPEC §18.1 is
+about how cost *changes* with room size and with fork depth, and at 1600 events
+both servers are flat — Synapse's growth is 0.94×–1.18× across the same sweep.
+A room of 1600 events is small. The costs a DAG server pays for state
+resolution show up in rooms with deep or forked history, which this driver does
+not construct, and until it does, the flat Synapse column here is evidence that
+the workload is too easy rather than that the difference has been measured.
+
+So the honest summary is: **we are faster, and we have not yet measured the
+thing we say makes us faster.** #80 tracks the suite measuring what content
+addressing buys rather than only what it costs, and the same gap applies here.
+
+Tuwunel is not in this table. It needs a build the sandbox does not have; the
+script is server-agnostic and takes a base URL, so adding it is a matter of
+getting a binary rather than of writing code.
 
 ## Fork window: bounded search vs exhaustive walk
 
