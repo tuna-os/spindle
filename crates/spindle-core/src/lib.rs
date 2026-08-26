@@ -5,6 +5,7 @@
 //! monotonic [`LinearIndex`] to every accepted event, while retaining the real
 //! signed `prev_events` graph required by Matrix federation.
 
+pub mod keys;
 mod log;
 mod pdu;
 mod state;
