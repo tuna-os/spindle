@@ -120,6 +120,26 @@ pub struct SyncRoom {
     pub limited: bool,
 }
 
+/// A room as MSC3266 describes it to someone who may not be in it.
+///
+/// Everything optional is optional because the room may simply not have set
+/// it. The two booleans are not optional because "not set" and "false" mean
+/// the same thing for them: a room with no `m.room.guest_access` does not
+/// admit guests.
+pub struct RoomSummary {
+    pub room_id: String,
+    pub name: Option<String>,
+    pub topic: Option<String>,
+    pub avatar_url: Option<String>,
+    pub canonical_alias: Option<String>,
+    pub num_joined_members: usize,
+    pub world_readable: bool,
+    pub guest_can_join: bool,
+    pub join_rule: Option<String>,
+    pub room_type: Option<String>,
+    pub encryption: Option<String>,
+}
+
 /// One stored event, as a client sees it.
 #[derive(Clone, Debug)]
 pub struct TimelineEvent {
@@ -787,6 +807,58 @@ impl Rooms {
             );
         }
         Ok(out)
+    }
+
+    /// What a room looks like from outside it.
+    ///
+    /// Every field is read from current state, and every one of them is
+    /// optional in the response because every one of them is optional in the
+    /// room: a room with no name, no topic and no avatar is ordinary, not
+    /// broken. `UnknownState` is therefore not an error here -- it is the
+    /// answer "the room never set that", which the caller renders as absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
+    pub fn summary(&self, room_id: &str) -> Result<RoomSummary, RoomError> {
+        // Establishes the room exists before any of the optional reads, so an
+        // unknown room is a 404 rather than a summary of nothing.
+        let joined = self.joined_members(room_id)?;
+
+        let string = |event_type: &str, field: &str| -> Option<String> {
+            self.state_event(room_id, event_type, "")
+                .ok()
+                .and_then(|content| content[field].as_str().map(str::to_owned))
+        };
+
+        let join_rule = string("m.room.join_rules", "join_rule");
+        Ok(RoomSummary {
+            room_id: room_id.to_owned(),
+            name: string("m.room.name", "name"),
+            topic: string("m.room.topic", "topic"),
+            avatar_url: string("m.room.avatar", "url"),
+            canonical_alias: string("m.room.canonical_alias", "alias"),
+            num_joined_members: joined.len(),
+            // `world_readable` is about *history*, not about joining, so it
+            // comes from m.room.history_visibility rather than the join rules.
+            // Conflating the two would report a public room whose history is
+            // members-only as readable by anyone.
+            world_readable: self
+                .state_event(room_id, "m.room.history_visibility", "")
+                .ok()
+                .and_then(|content| content["history_visibility"].as_str().map(str::to_owned))
+                .as_deref()
+                == Some("world_readable"),
+            guest_can_join: self
+                .state_event(room_id, "m.room.guest_access", "")
+                .ok()
+                .and_then(|content| content["guest_access"].as_str().map(str::to_owned))
+                .as_deref()
+                == Some("can_join"),
+            join_rule,
+            room_type: string("m.room.create", "type"),
+            encryption: string("m.room.encryption", "algorithm"),
+        })
     }
 
     /// Drop a room from one user's view of the server.

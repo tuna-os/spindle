@@ -155,6 +155,18 @@ fn room_routes() -> Router<AppState> {
             "/_matrix/client/v3/rooms/{room_id}/aliases",
             get(room_aliases),
         )
+        // Two paths for one endpoint. MSC3266 shipped under the unstable
+        // prefix long enough that clients still ask for it there, and it
+        // became `/v1/room_summary` in Matrix 1.15. Serving both costs one
+        // route and spares every client a version probe.
+        .route(
+            "/_matrix/client/v1/room_summary/{room_id_or_alias}",
+            get(room_summary),
+        )
+        .route(
+            "/_matrix/client/unstable/im.nheko.summary/rooms/{room_id_or_alias}/summary",
+            get(room_summary),
+        )
         .route(
             "/_matrix/client/v3/rooms/{room_id}/typing/{user_id}",
             axum::routing::put(set_typing),
@@ -1400,6 +1412,91 @@ fn edit_rule(
     change(&mut ruleset[kind][index]);
     save_ruleset(state, user_id, &ruleset)?;
     Ok(Json(json!({})))
+}
+
+/// `GET /_matrix/client/v1/room_summary/{room_id_or_alias}` (MSC3266)
+///
+/// Optionally authenticated, which is the whole point: a client showing a
+/// preview of a room it has not joined has no membership to offer, and a
+/// summary that required one could never be used for a preview.
+///
+/// Who may see it is decided by the room, not by the caller: a room is
+/// summarisable if its join rules invite strangers to look (`public` or
+/// `knock`) or its history is `world_readable`. A member may always see their
+/// own room's summary whatever the rules say -- they can read the state
+/// directly anyway, so refusing here would protect nothing.
+async fn room_summary(
+    State(state): State<AppState>,
+    crate::auth::MaybeAuthenticated(viewer): crate::auth::MaybeAuthenticated,
+    axum::extract::Path(room_id_or_alias): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    let room_id = if room_id_or_alias.starts_with('#') {
+        state
+            .directory
+            .resolve(&room_id_or_alias)
+            .map_err(|error| directory_error(&error))?
+            .ok_or_else(|| {
+                MatrixError::new(
+                    StatusCode::NOT_FOUND,
+                    "M_NOT_FOUND",
+                    format!("no room is called {room_id_or_alias}"),
+                )
+            })?
+            .room_id
+    } else {
+        room_id_or_alias
+    };
+
+    let summary = state.rooms.summary(&room_id).map_err(room_error)?;
+    let membership = match viewer {
+        Some(identity) => {
+            let joined = state.rooms.joined(&identity.user_id).map_err(room_error)?;
+            joined
+                .iter()
+                .any(|room| room == &room_id)
+                .then(|| "join".to_owned())
+        }
+        None => None,
+    };
+
+    let open =
+        matches!(summary.join_rule.as_deref(), Some("public" | "knock")) || summary.world_readable;
+    if !open && membership.is_none() {
+        // M_FORBIDDEN rather than M_NOT_FOUND: the room ID came from
+        // somewhere, so pretending it does not exist tells a caller who
+        // already has the ID nothing it did not know, and misleads a caller
+        // who mistyped one.
+        return Err(MatrixError::forbidden(format!(
+            "{room_id} does not publish a summary"
+        )));
+    }
+
+    let mut body = serde_json::Map::new();
+    body.insert("room_id".to_owned(), json!(summary.room_id));
+    body.insert(
+        "num_joined_members".to_owned(),
+        json!(summary.num_joined_members),
+    );
+    body.insert("world_readable".to_owned(), json!(summary.world_readable));
+    body.insert("guest_can_join".to_owned(), json!(summary.guest_can_join));
+    // Absent rather than null for everything the room never set: MSC3266's
+    // fields are optional, and a client distinguishing "no topic" from "an
+    // empty topic" needs the key to be missing rather than null.
+    for (field, value) in [
+        ("name", summary.name),
+        ("topic", summary.topic),
+        ("avatar_url", summary.avatar_url),
+        ("canonical_alias", summary.canonical_alias),
+        ("join_rule", summary.join_rule),
+        ("room_type", summary.room_type),
+        ("encryption", summary.encryption),
+        ("membership", membership),
+    ] {
+        if let Some(value) = value {
+            body.insert(field.to_owned(), json!(value));
+        }
+    }
+    Ok(Json(Value::Object(body)))
 }
 
 /// `GET /_matrix/client/v3/sync`
