@@ -505,27 +505,83 @@ async fn being_re_invited_undoes_forgetting() {
 
     harness.admit(&room, &alice, &bob, "@bob:example.org").await;
     assert_eq!(harness.joined_rooms(&bob).await, vec![room.clone()]);
+}
 
-    // And the marker really is cleared, not merely shadowed by the join: bob
-    // can leave and forget again, which a stuck marker would not stop but a
-    // *second* forget of an already-forgotten room would not prove either --
-    // so check the observable consequence instead, that leaving again and
-    // forgetting again both still work from a clean slate.
-    harness
-        .post(
-            &format!("/_matrix/client/v3/rooms/{room}/leave"),
-            &bob,
-            &json!({}),
+#[tokio::test]
+async fn an_invite_or_a_join_clears_the_forget_marker() {
+    // Asserted against `is_forgotten` rather than through HTTP, because today
+    // nothing over HTTP reads the marker: it is groundwork for `/sync`'s leave
+    // section, which does not exist yet. That makes this the one test standing
+    // between a stale marker and a room that stays hidden after a rejoin --
+    // going through an endpoint would pass whether or not the marker was ever
+    // cleared, which is exactly the hole a mutant found here.
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+    let key = spindle_server::signing::ServerKey::load_or_create(store.as_ref()).unwrap();
+    let rooms = spindle_server::rooms::Rooms::new(Arc::clone(&store), "example.org");
+    let alice = "@alice:example.org";
+    let bob = "@bob:example.org";
+    let room = rooms.create(alice, key.pair(), None, None).unwrap();
+
+    let member = |room: &str, sender: &str, target: &str, membership: &str| {
+        rooms
+            .set_membership(room, sender, target, membership, None, key.pair())
+            .unwrap_or_else(|error| panic!("{sender} -> {target} {membership}: {error}"));
+    };
+
+    member(&room, alice, bob, "invite");
+    member(&room, bob, bob, "join");
+    member(&room, bob, bob, "leave");
+    rooms.forget(bob, &room).unwrap();
+    assert!(rooms.is_forgotten(bob, &room).unwrap());
+
+    // An invite alone clears it: the room is being offered again, so it has to
+    // be visible before bob can act on the offer.
+    member(&room, alice, bob, "invite");
+    assert!(
+        !rooms.is_forgotten(bob, &room).unwrap(),
+        "an invite must undo forgetting"
+    );
+
+    // And so does a join on its own. Reaching that needs a public room: in an
+    // invite-only one every join is preceded by an invite that has already
+    // cleared the marker, so the join branch would never run and a mutant that
+    // deleted it would survive -- which is precisely what happened when this
+    // test first tried to make the point with an invite in the way.
+    let open = rooms.create(alice, key.pair(), None, None).unwrap();
+    rooms
+        .set_state(
+            &open,
+            alice,
+            key.pair(),
+            "m.room.join_rules",
+            "",
+            &json!({ "join_rule": "public" }),
         )
-        .await;
-    let (status, body) = harness
-        .post(
-            &format!("/_matrix/client/v3/rooms/{room}/forget"),
-            &bob,
-            &json!({}),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+        .unwrap();
+    member(&open, bob, bob, "join");
+    member(&open, bob, bob, "leave");
+    rooms.forget(bob, &open).unwrap();
+    assert!(rooms.is_forgotten(bob, &open).unwrap());
+    member(&open, bob, bob, "join");
+    assert!(
+        !rooms.is_forgotten(bob, &open).unwrap(),
+        "a join with no invite before it must undo forgetting"
+    );
+
+    // Clearing one room's marker must not clear another's. The key carries
+    // both the user and the room, and a delete that ignored the room would
+    // silently unhide every room the user had ever forgotten.
+    let other = rooms.create(alice, key.pair(), None, None).unwrap();
+    member(&other, alice, bob, "invite");
+    member(&other, bob, bob, "leave");
+    rooms.forget(bob, &other).unwrap();
+    member(&room, bob, bob, "leave");
+    member(&room, alice, bob, "invite");
+    assert!(
+        rooms.is_forgotten(bob, &other).unwrap(),
+        "clearing one room's marker must leave another room's alone"
+    );
 }
 
 #[tokio::test]
