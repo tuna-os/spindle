@@ -254,8 +254,9 @@ impl Rooms {
             .map(|id| id.as_str().to_owned())
             .collect();
 
+        let auth = auth_events_for(log, sender, event_type, state_key)?;
         let canonical = build_canonical(
-            room_id, sender, event_type, state_key, content, &prev, depth,
+            room_id, sender, event_type, state_key, content, &prev, &auth, depth,
         )?;
         let version = RoomVersionId::try_from(ROOM_VERSION)
             .map_err(|error| RoomError::Build(error.to_string()))?;
@@ -310,6 +311,62 @@ fn event_body_key(room_id: &str, event_id: &str) -> Vec<u8> {
     key
 }
 
+/// The state events a new event must cite to be authorizable (room v11's
+/// auth-events selection rules).
+///
+/// `m.room.create` cites nothing — it is the root of the auth chain. Every
+/// other event names the create event, the current power levels, and the
+/// sender's own membership; a membership event additionally names the join
+/// rules and, when it targets somebody else, that person's membership.
+///
+/// This is not bookkeeping that can wait for the second participant. A v11
+/// event with an empty `auth_events` fails `auth_check` on any peer that
+/// receives it, whatever the room's size — so a server that omits it is not
+/// building a local-only room on purpose, it is minting events nobody else
+/// will ever accept.
+///
+/// Missing state is an error rather than an empty list, because the two are
+/// indistinguishable on the wire and only one of them is correct.
+fn auth_events_for(
+    log: &RoomLog,
+    sender: &str,
+    event_type: &str,
+    state_key: Option<&str>,
+) -> Result<Vec<String>, RoomError> {
+    if event_type == "m.room.create" {
+        return Ok(Vec::new());
+    }
+    let head = log
+        .entries()
+        .next_back()
+        .map(|entry| entry.li)
+        .ok_or_else(|| RoomError::StateUnavailable("the room has no events".to_owned()))?;
+    let state = log.state_after(head).ok_or_else(|| {
+        RoomError::StateUnavailable(format!("the state after li {} is not resident", head.get()))
+    })?;
+
+    let mut auth = Vec::new();
+    let mut cite = |kind: &str, key: &str| {
+        if let Some(id) = state.get(&StateKey::new(kind, key)) {
+            auth.push(id.to_owned());
+        }
+    };
+    cite("m.room.create", "");
+    cite("m.room.power_levels", "");
+    cite("m.room.member", sender);
+    if event_type == "m.room.member" {
+        cite("m.room.join_rules", "");
+        // A membership event that acts on somebody else has to cite what it is
+        // acting on: their current membership decides whether the transition is
+        // allowed at all.
+        if let Some(target) = state_key.filter(|target| *target != sender) {
+            cite("m.room.member", target);
+        }
+    }
+    Ok(auth)
+}
+
+#[allow(clippy::too_many_arguments, reason = "an event is what it is")]
 fn build_canonical(
     room_id: &str,
     sender: &str,
@@ -317,6 +374,7 @@ fn build_canonical(
     state_key: Option<&str>,
     content: &Value,
     prev_events: &[String],
+    auth_events: &[String],
     depth: u64,
 ) -> Result<CanonicalJsonObject, RoomError> {
     let mut object = CanonicalJsonObject::new();
@@ -350,7 +408,12 @@ fn build_canonical(
     );
     object.insert(
         "auth_events".to_owned(),
-        CanonicalJsonValue::Array(Vec::new()),
+        CanonicalJsonValue::Array(
+            auth_events
+                .iter()
+                .map(|id| CanonicalJsonValue::String(id.clone()))
+                .collect(),
+        ),
     );
     object.insert(
         "depth".to_owned(),
@@ -402,6 +465,7 @@ pub enum RoomError {
     MissingBody(String),
     Build(String),
     Append(String),
+    StateUnavailable(String),
     Storage(StoreError),
     Codec(String),
 }
@@ -425,6 +489,9 @@ impl std::fmt::Display for RoomError {
             Self::MissingBody(id) => write!(formatter, "the body of {id} is missing"),
             Self::Build(message) => write!(formatter, "cannot build the event: {message}"),
             Self::Append(message) => write!(formatter, "cannot append: {message}"),
+            Self::StateUnavailable(message) => {
+                write!(formatter, "cannot authorize the event: {message}")
+            }
             Self::Storage(error) => write!(formatter, "storage: {error}"),
             Self::Codec(message) => write!(formatter, "unreadable: {message}"),
         }
@@ -432,3 +499,96 @@ impl std::fmt::Display for RoomError {
 }
 
 impl std::error::Error for RoomError {}
+
+#[cfg(test)]
+mod tests {
+    use super::{RoomError, auth_events_for};
+    use spindle_core::{RoomLog, StateKey};
+
+    /// A room whose state has everything a membership event could need to cite:
+    /// create, power levels, join rules, and two members.
+    fn populated_room() -> RoomLog {
+        let mut log = RoomLog::new();
+        for (event_id, event_type, state_key) in [
+            ("$create", "m.room.create", ""),
+            ("$alice-join", "m.room.member", "@alice:example.org"),
+            ("$power", "m.room.power_levels", ""),
+            ("$join-rules", "m.room.join_rules", ""),
+            ("$bob-join", "m.room.member", "@bob:example.org"),
+        ] {
+            log.append_local(event_id, Some(StateKey::new(event_type, state_key)))
+                .expect("the log accepts a well-formed append");
+        }
+        log
+    }
+
+    /// Covered here rather than in `tests/federation_auth.rs` because the HTTP
+    /// surface cannot yet produce a membership event after the join rules exist
+    /// — there is no invite or join endpoint. Once there is, the ruma
+    /// cross-check reaches these two branches and this test becomes redundant;
+    /// deleting it then is the right move.
+    #[test]
+    fn a_membership_event_cites_the_join_rules_and_its_target() {
+        let log = populated_room();
+
+        // Acting on somebody else: their current membership decides whether the
+        // transition is allowed, so it has to be cited.
+        let auth = auth_events_for(
+            &log,
+            "@alice:example.org",
+            "m.room.member",
+            Some("@bob:example.org"),
+        )
+        .expect("the state is resident");
+        assert_eq!(
+            auth,
+            vec![
+                "$create",
+                "$power",
+                "$alice-join",
+                "$join-rules",
+                "$bob-join"
+            ]
+        );
+
+        // Acting on yourself: the target is the sender, and citing it twice
+        // would be a duplicate that the auth rules reject outright.
+        let auth = auth_events_for(
+            &log,
+            "@alice:example.org",
+            "m.room.member",
+            Some("@alice:example.org"),
+        )
+        .expect("the state is resident");
+        assert_eq!(
+            auth,
+            vec!["$create", "$power", "$alice-join", "$join-rules"]
+        );
+
+        // A non-membership event cites neither the join rules nor a target.
+        let auth = auth_events_for(&log, "@alice:example.org", "m.room.message", None)
+            .expect("the state is resident");
+        assert_eq!(auth, vec!["$create", "$power", "$alice-join"]);
+    }
+
+    /// The create event is the root of the auth chain, and asking for its auth
+    /// events must not depend on state that does not exist yet.
+    #[test]
+    fn the_create_event_cites_nothing_even_in_an_empty_log() {
+        let log = RoomLog::new();
+        let auth = auth_events_for(&log, "@alice:example.org", "m.room.create", Some(""))
+            .expect("the create event needs no state");
+        assert!(auth.is_empty());
+    }
+
+    /// Silence is the one answer that must never be given: an empty list and
+    /// "the state is gone" are indistinguishable on the wire, and only one of
+    /// them is a correct event.
+    #[test]
+    fn a_room_with_no_state_is_an_error_rather_than_an_empty_list() {
+        let log = RoomLog::new();
+        let error = auth_events_for(&log, "@alice:example.org", "m.room.message", None)
+            .expect_err("there is nothing to authorize against");
+        assert!(matches!(error, RoomError::StateUnavailable(_)), "{error:?}");
+    }
+}

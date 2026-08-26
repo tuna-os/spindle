@@ -260,3 +260,94 @@ async fn room_endpoints_need_authentication_and_a_real_room() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["errcode"], "M_NOT_FOUND");
 }
+
+/// Every event a v11 room emits has to name the state that authorizes it. An
+/// empty `auth_events` is not a smaller version of this — it is an event that
+/// `auth_check` rejects, so a room built that way produces nothing a peer will
+/// ever accept.
+#[tokio::test]
+async fn every_event_cites_the_state_that_authorizes_it() {
+    let harness = Harness::new();
+    let token = harness.register().await;
+    let (_, created) = harness
+        .post("/_matrix/client/v3/createRoom", &token, &json!({}))
+        .await;
+    let room_id = created["room_id"].as_str().unwrap().to_owned();
+
+    harness
+        .put(
+            &format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/txn1"),
+            &token,
+            &json!({ "msgtype": "m.text", "body": "hello" }),
+        )
+        .await;
+
+    let (status, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room_id}/messages?limit=100"),
+            &token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let chunk = body["chunk"].as_array().unwrap();
+
+    let mut by_type = std::collections::HashMap::new();
+    let mut ids = std::collections::BTreeSet::new();
+    for event in chunk {
+        let id = event["event_id"].as_str().unwrap().to_owned();
+        by_type.insert(event["type"].as_str().unwrap().to_owned(), event.clone());
+        ids.insert(id);
+    }
+
+    let auth_of = |event: &Value| -> Vec<String> {
+        event["auth_events"]
+            .as_array()
+            .unwrap_or_else(|| panic!("auth_events is missing from {event}"))
+            .iter()
+            .map(|id| id.as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // The create event is the root of the auth chain: it cites nothing,
+    // because there is nothing yet to cite.
+    let create = &by_type["m.room.create"];
+    assert!(auth_of(create).is_empty(), "{create}");
+    let create_id = create["event_id"].as_str().unwrap().to_owned();
+    let power_id = by_type["m.room.power_levels"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let member_id = by_type["m.room.member"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // A message cites the three that decide whether it is allowed: the room
+    // exists, the sender is in it, and the sender is permitted to speak.
+    let message = &by_type["m.room.message"];
+    let cited: std::collections::BTreeSet<String> = auth_of(message).into_iter().collect();
+    assert_eq!(
+        cited,
+        [create_id.clone(), power_id, member_id.clone()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "{message}"
+    );
+
+    // The creator's join happens before power levels exist, so it cites only
+    // the create event -- which is also what authorizes it.
+    assert_eq!(auth_of(&by_type["m.room.member"]), vec![create_id]);
+
+    // Every event except the create event cites something, and everything
+    // cited is an event this room actually contains. A dangling reference
+    // fails auth on a peer exactly as an empty list does.
+    for event in chunk {
+        let cited = auth_of(event);
+        if event["type"] != "m.room.create" {
+            assert!(!cited.is_empty(), "nothing authorizes {event}");
+        }
+        for id in cited {
+            assert!(ids.contains(&id), "{event} cites {id}, which is not here");
+        }
+    }
+}
