@@ -20,12 +20,22 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates openssl curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Non-root at runtime (#11). The entrypoint needs to write into the trust store
-# and the data directory, so both are owned by this user rather than the
-# container being given root to avoid the problem.
+# Non-root at runtime (#11). The entrypoint installs a CA and writes a signed
+# certificate, so it needs the paths that involves rather than the container
+# being handed root to sidestep the problem.
+#
+# `update-ca-certificates` writes more than the drop-in directory: it rebuilds
+# the bundle in /etc/ssl/certs and reads /etc/ca-certificates.conf. Owning only
+# /usr/local/share/ca-certificates leaves it failing on the rebuild, which the
+# entrypoint would then report — correctly, and on every single start.
 RUN useradd --system --create-home --uid 10001 spindle \
     && mkdir -p /data /certs \
-    && chown -R spindle:spindle /data /certs /usr/local/share/ca-certificates
+    && chown -R spindle:spindle \
+        /data \
+        /certs \
+        /usr/local/share/ca-certificates \
+        /etc/ssl/certs \
+        /etc/ca-certificates.conf
 
 COPY --from=build /src/target/release/spindle /usr/local/bin/spindle
 COPY complement/entrypoint.sh /usr/local/bin/entrypoint.sh
