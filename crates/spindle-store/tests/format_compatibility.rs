@@ -160,6 +160,7 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::Alias, 0x11),
         (Keyspace::Filter, 0x12),
         (Keyspace::Media, 0x13),
+        (Keyspace::Transaction, 0x14),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(
