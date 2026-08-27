@@ -89,8 +89,13 @@ pub struct Registration {
     /// MSC2409, stable in the spec: whether transactions also carry
     /// ephemeral data (typing, for now) for the service's rooms. Opt-in
     /// because a bridge that never asked would have to parse and discard
-    /// a stream of second-by-second presence noise.
-    #[serde(default)]
+    /// a stream of second-by-second presence noise. The unstable names
+    /// are what shipping bridge registrations still write.
+    #[serde(
+        default,
+        alias = "de.sorunome.msc2409.push_ephemeral",
+        alias = "push_ephemeral"
+    )]
     pub receive_ephemeral: bool,
     /// MSC4190: the service manages devices itself. Registration mints
     /// no session (the `as_token` is the only credential), and the
