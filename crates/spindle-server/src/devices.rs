@@ -257,6 +257,99 @@ impl Devices {
         Ok(Some((key_id, record["key"].clone())))
     }
 
+    /// Store one of a user's cross-signing keys (master, self, user).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the write fails.
+    pub fn upload_cross_signing(
+        &self,
+        user_id: &str,
+        key_type: &str,
+        key: &Value,
+    ) -> Result<(), StoreError> {
+        Store::put(
+            self.store.as_ref(),
+            &keys::cross_signing(user_id, key_type),
+            key.to_string().as_bytes(),
+        )
+    }
+
+    /// One of a user's cross-signing keys, if uploaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the read fails.
+    pub fn cross_signing_key(
+        &self,
+        user_id: &str,
+        key_type: &str,
+    ) -> Result<Option<Value>, StoreError> {
+        let Some(bytes) =
+            ReadView::get(self.store.as_ref(), &keys::cross_signing(user_id, key_type))?
+        else {
+            return Ok(None);
+        };
+        Ok(serde_json::from_slice(&bytes).ok())
+    }
+
+    /// Merge an uploaded signature into a stored key.
+    ///
+    /// `target` names either one of `user_id`'s devices or one of their
+    /// cross-signing keys (by the key ID its `keys` map carries). Only the
+    /// `signatures` object is touched: the signed key material itself is
+    /// what the uploader attested to, and letting a signature upload alter
+    /// it would let anyone "sign" a key into being a different key.
+    ///
+    /// Returns `false` if no such key exists to sign.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if a read or write fails.
+    pub fn add_signatures(
+        &self,
+        user_id: &str,
+        target: &str,
+        signed: &Value,
+    ) -> Result<bool, StoreError> {
+        // A device first: device IDs are the common case (self-verifying
+        // one's own devices with the self-signing key).
+        let device_key = keys::device_scoped(Keyspace::DeviceKeys, user_id, target, &[]);
+        if let Some(bytes) = ReadView::get(self.store.as_ref(), &device_key)?
+            && let Ok(stored) = serde_json::from_slice::<Value>(&bytes)
+        {
+            let merged = merge_signatures(stored, signed);
+            Store::put(
+                self.store.as_ref(),
+                &device_key,
+                merged.to_string().as_bytes(),
+            )?;
+            return Ok(true);
+        }
+        // Then the cross-signing keys, matched by the key ID inside them —
+        // that is how the spec addresses them (e.g. signing another user's
+        // master key with one's user-signing key).
+        for key_type in ["master", "self_signing", "user_signing"] {
+            let Some(stored) = self.cross_signing_key(user_id, key_type)? else {
+                continue;
+            };
+            let holds_target = stored["keys"].as_object().is_some_and(|map| {
+                map.keys()
+                    .any(|id| id == target || id.ends_with(&format!(":{target}")))
+            });
+            if holds_target {
+                let merged = merge_signatures(stored, signed);
+                Store::put(
+                    self.store.as_ref(),
+                    &keys::cross_signing(user_id, key_type),
+                    merged.to_string().as_bytes(),
+                )?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Record that `user_id`'s device list changed at stream position `seq`.
     ///
     /// # Errors
@@ -367,6 +460,30 @@ impl Devices {
         }
         Ok(pending)
     }
+}
+
+/// `stored` with `signed`'s signatures merged in, and nothing else changed.
+fn merge_signatures(mut stored: Value, signed: &Value) -> Value {
+    let Some(new_signatures) = signed["signatures"].as_object() else {
+        return stored;
+    };
+    if !stored["signatures"].is_object() {
+        stored["signatures"] = Value::Object(Map::new());
+    }
+    let existing = stored["signatures"]
+        .as_object_mut()
+        .expect("just made an object");
+    for (signer, sigs) in new_signatures {
+        let slot = existing
+            .entry(signer.clone())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let (Some(slot), Some(sigs)) = (slot.as_object_mut(), sigs.as_object()) {
+            for (key_id, signature) in sigs {
+                slot.insert(key_id.clone(), signature.clone());
+            }
+        }
+    }
+    stored
 }
 
 /// The device ID a [`keys::device_scoped`] key names, given its user prefix.
