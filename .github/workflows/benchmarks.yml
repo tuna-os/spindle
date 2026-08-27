@@ -59,6 +59,12 @@ jobs:
       - name: Render the dashboard
         run: python3 scripts/coverage-dashboard.py --html site/dashboard.html
 
+      # The per-milestone competitive numbers are measured off-CI (a shared
+      # runner cannot host both sides honestly — docs/benchmarks.md) and
+      # committed as raw JSON; publishing re-renders whatever is committed.
+      - name: Render the milestone comparisons
+        run: python3 scripts/render-comparisons.py docs/benchmarks/data site/comparisons.html
+
       # Keeping the per-commit file means a regression can be traced to the
       # push that caused it, rather than only observed after the fact.
       - name: Keep a per-commit copy

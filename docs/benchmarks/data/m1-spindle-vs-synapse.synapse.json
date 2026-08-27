@@ -1,0 +1,102 @@
+{
+  "base_url": "http://127.0.0.1:8098",
+  "benchmarks": {
+    "join/100": {
+      "lower_ns": 37455910.0,
+      "mean_ns": 40459352.5,
+      "samples": 10,
+      "upper_ns": 48375363.0
+    },
+    "join/1600": {
+      "lower_ns": 38358263.0,
+      "mean_ns": 41576763.5,
+      "samples": 10,
+      "upper_ns": 46226078.0
+    },
+    "join/400": {
+      "lower_ns": 34795217.0,
+      "mean_ns": 41257419.0,
+      "samples": 10,
+      "upper_ns": 50095245.0
+    },
+    "messages_page/100": {
+      "lower_ns": 4096509.0,
+      "mean_ns": 4580404.5,
+      "samples": 10,
+      "upper_ns": 6243599.0
+    },
+    "messages_page/1600": {
+      "lower_ns": 4531470.0,
+      "mean_ns": 5410546.0,
+      "samples": 10,
+      "upper_ns": 5715593.0
+    },
+    "messages_page/400": {
+      "lower_ns": 4321299.0,
+      "mean_ns": 5022751.5,
+      "samples": 10,
+      "upper_ns": 6426396.0
+    },
+    "send/100": {
+      "lower_ns": 24953139.0,
+      "mean_ns": 25906250.0,
+      "samples": 10,
+      "upper_ns": 27996445.0
+    },
+    "send/1600": {
+      "lower_ns": 21413155.0,
+      "mean_ns": 24627783.0,
+      "samples": 10,
+      "upper_ns": 30697156.0
+    },
+    "send/400": {
+      "lower_ns": 23198369.0,
+      "mean_ns": 27077302.5,
+      "samples": 10,
+      "upper_ns": 30427428.0
+    },
+    "state/100": {
+      "lower_ns": 1964238.0,
+      "mean_ns": 2615092.5,
+      "samples": 10,
+      "upper_ns": 3340746.0
+    },
+    "state/1600": {
+      "lower_ns": 2308113.0,
+      "mean_ns": 2692329.0,
+      "samples": 10,
+      "upper_ns": 3136543.0
+    },
+    "state/400": {
+      "lower_ns": 2628276.0,
+      "mean_ns": 3040468.0,
+      "samples": 10,
+      "upper_ns": 3487275.0
+    },
+    "sync_initial/100": {
+      "lower_ns": 2821894.0,
+      "mean_ns": 3521951.5,
+      "samples": 10,
+      "upper_ns": 3715021.0
+    },
+    "sync_initial/1600": {
+      "lower_ns": 2953857.0,
+      "mean_ns": 3302496.5,
+      "samples": 10,
+      "upper_ns": 3766108.0
+    },
+    "sync_initial/400": {
+      "lower_ns": 2802930.0,
+      "mean_ns": 3150460.5,
+      "samples": 10,
+      "upper_ns": 3621408.0
+    }
+  },
+  "samples": 10,
+  "server": "synapse-1.159.0",
+  "sizes": [
+    100,
+    400,
+    1600
+  ]
+}

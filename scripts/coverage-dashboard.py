@@ -274,7 +274,10 @@ def build_markdown() -> str:
         "  to main — the numbers in the open are the numbers from the code.",
         "- **Server-level comparisons** vs Synapse and Continuwuity: measured",
         "  per milestone with `scripts/api-benchmark.py` (same driver, same",
-        "  host, same sitting) and recorded with caveats in",
+        "  host, same sitting); raw results are committed under",
+        "  docs/benchmarks/data/ and rendered to the",
+        "  [comparisons page](https://tuna-os.github.io/spindle/comparisons.html),",
+        "  with method and caveats in",
         "  [docs/benchmarks.md](./benchmarks.md). Tuwunel is currently",
         "  unreachable from the bench environment (#42 records why); the",
         "  parity gate at M5 requires it.",
@@ -350,7 +353,7 @@ th, td {{ border: 1px solid #ccc; padding: .4rem .6rem; text-align: left; vertic
 code {{ background: #f3f3f3; padding: .1rem .3rem; border-radius: 3px; font-size: .9em; }}
 nav {{ margin-bottom: 1rem; }}
 </style>
-<nav><a href="./index.html">← benchmark results</a></nav>
+<nav><a href="./index.html">← benchmark results</a> · <a href="./comparisons.html">milestone comparisons</a></nav>
 {content}
 """
 

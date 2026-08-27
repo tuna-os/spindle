@@ -103,7 +103,7 @@ code { font-size: .85em; }
 """)
     add("</style></head><body>")
     add("<h1>Spindle benchmarks</h1>")
-    add('<nav><a href="./dashboard.html">coverage &amp; feature dashboard →</a></nav>')
+    add('<nav><a href="./dashboard.html">coverage &amp; feature dashboard</a> · <a href="./comparisons.html">milestone comparisons vs siblings</a></nav>')
     add(
         f"<p class=\"meta\">Commit <code>{html.escape(document.get('commit','?')[:12])}</code> "
         f"on <code>{html.escape(document.get('ref','?'))}</code> · "
