@@ -368,7 +368,7 @@ th, td {{ border: 1px solid #ccc; padding: .4rem .6rem; text-align: left; vertic
 code {{ background: #f3f3f3; padding: .1rem .3rem; border-radius: 3px; font-size: .9em; }}
 nav {{ margin-bottom: 1rem; }}
 </style>
-<nav><a href="./index.html">← benchmark results</a> · <a href="./comparisons.html">milestone comparisons</a></nav>
+<nav><a href="./comparisons.html"><strong>Spindle vs the field</strong></a> · <a href="./index.html">micro-benchmarks</a></nav>
 {content}
 """
 
