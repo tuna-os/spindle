@@ -231,6 +231,14 @@ pub enum Keyspace {
     /// source and the rooms are the propagation. Keyed by the full user ID
     /// because federation asks by full user ID.
     Profile = 0x23,
+    /// `appservice_id` -> big-endian `u64` position in the global stream.
+    ///
+    /// The durable half of the appservice transaction push: the row
+    /// advances only after the service acknowledged the transaction
+    /// carrying everything up to that position, so a crash between send
+    /// and acknowledgement re-delivers — at-least-once, made idempotent
+    /// on the service's side by the transaction ID.
+    AppserviceCursor = 0x24,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -247,6 +255,14 @@ const _: () = assert!(
 pub fn profile(user_id: &str) -> Vec<u8> {
     let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::Profile as u8];
     key.extend_from_slice(user_id.as_bytes());
+    key
+}
+
+/// The transaction-push cursor for one appservice.
+#[must_use]
+pub fn appservice_cursor(appservice_id: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::AppserviceCursor as u8];
+    key.extend_from_slice(appservice_id.as_bytes());
     key
 }
 

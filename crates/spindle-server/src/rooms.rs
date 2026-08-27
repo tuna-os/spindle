@@ -2074,6 +2074,57 @@ impl Rooms {
         Ok(out)
     }
 
+    /// Events that entered the global stream in `(since, until]`, in
+    /// stream order, each paired with the room it belongs to.
+    ///
+    /// `limit` caps the number of events returned; the second half of the
+    /// result is the stream position the scan actually reached — `until`
+    /// unless the cap cut the range short. Built for the appservice
+    /// transaction push, whose cursor must advance to exactly the position
+    /// its delivered batch covers: advancing to `until` past an uncut scan
+    /// and to the cut point past a cut one is what keeps a capped batch
+    /// from silently skipping the remainder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the stream or an event cannot be read.
+    pub fn stream_events(
+        &self,
+        since: u64,
+        until: u64,
+        limit: usize,
+    ) -> Result<(Vec<(String, Value)>, u64), RoomError> {
+        let mut out = Vec::new();
+        let mut reached = until;
+        for stream_id in (since + 1)..=until {
+            if out.len() >= limit {
+                reached = stream_id - 1;
+                break;
+            }
+            let Some(raw) = spindle_store::ReadView::get(
+                self.store.as_ref(),
+                &spindle_core::keys::stream(stream_id),
+            )?
+            else {
+                continue;
+            };
+            let Some(record) = StreamRecord::decode(&raw) else {
+                continue;
+            };
+            let event_id = self.with_room(&record.room_id, |_, log| {
+                Ok(log
+                    .entries()
+                    .find(|entry| entry.li.get() == record.li)
+                    .map(|entry| entry.event_id.as_str().to_owned()))
+            })?;
+            if let Some(event_id) = event_id {
+                let event = self.event(&record.room_id, &event_id)?;
+                out.push((record.room_id, event));
+            }
+        }
+        Ok((out, reached))
+    }
+
     /// Bundle an event's relations into `unsigned.m.relations` (MSC2675).
     ///
     /// Read-time aggregation, which is the shape SPEC §10.5 already committed
