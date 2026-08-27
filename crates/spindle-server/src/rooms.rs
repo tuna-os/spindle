@@ -1082,8 +1082,8 @@ impl Rooms {
                     room_id,
                 ),
             )?;
-            let held = matches!(membership.as_deref(), Some(b"invite" | b"join" | b"knock"));
-            if !held {
+            let leavable = matches!(membership.as_deref(), Some(b"invite" | b"join" | b"knock"));
+            if !leavable {
                 return Err(RoomError::Forbidden(
                     "the user has no membership to leave".to_owned(),
                 ));
