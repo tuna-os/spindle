@@ -40,6 +40,13 @@ pub struct Account {
     /// old user's identity — but no longer authenticate.
     #[serde(default)]
     pub deactivated: bool,
+    /// Server administrator. A flag on an account rather than a shared
+    /// secret, so the audit log can name who acted and revocation is
+    /// per-operator (#83). Settable only by another admin through the
+    /// API; the first admin is minted by the offline `promote-admin`
+    /// subcommand against the store.
+    #[serde(default)]
+    pub admin: bool,
 }
 
 /// One logged-in device.
@@ -144,6 +151,7 @@ impl<'a, S: Store> Accounts<'a, S> {
             localpart: localpart.to_owned(),
             password_hash,
             deactivated: false,
+            admin: false,
         };
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
@@ -374,6 +382,82 @@ impl<'a, S: Store> Accounts<'a, S> {
         self.store
             .put(&device_key(localpart, device_id), &encode(&device)?)?;
         Ok(())
+    }
+
+    /// Flip an account's admin flag. Returns whether the account
+    /// existed — granting admin to a localpart that does not exist is a
+    /// typo about to become a security incident, so the caller must be
+    /// able to tell and refuse rather than silently no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or decoding error.
+    pub fn set_admin(&self, localpart: &str, admin: bool) -> Result<bool, AccountError> {
+        let Some(mut account) = self.account(localpart)? else {
+            return Ok(false);
+        };
+        account.admin = admin;
+        self.store
+            .put(&account_key(localpart), &encode(&account)?)?;
+        Ok(true)
+    }
+
+    /// Replace an account's password.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage, decoding, or hashing error.
+    pub fn set_password(&self, localpart: &str, password: &str) -> Result<bool, AccountError> {
+        let Some(mut account) = self.account(localpart)? else {
+            return Ok(false);
+        };
+        let salt = SaltString::generate(&mut OsRng);
+        account.password_hash = Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .map_err(|error| AccountError::Hashing(error.to_string()))?
+            .to_string();
+        self.store
+            .put(&account_key(localpart), &encode(&account)?)?;
+        Ok(true)
+    }
+
+    /// Delete every access and refresh token of one user, ending all
+    /// their sessions at once. Device rows stay — the devices still
+    /// exist, they are just logged out.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or decoding error.
+    pub fn logout_everywhere(&self, localpart: &str) -> Result<(), AccountError> {
+        for keyspace in [Keyspace::AccessToken, Keyspace::RefreshToken] {
+            let prefix = [spindle_core::keys::KEY_SCHEMA_VERSION, keyspace as u8];
+            for (key, raw) in self.store.scan_prefix(&prefix)? {
+                let record: TokenRecord = decode(&raw)?;
+                if record.localpart == localpart {
+                    self.store.delete(&key)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every account, in stored (localpart) order — the admin listing's
+    /// backing scan. Bounded by the number of accounts on the server,
+    /// which is the admin's own population.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or decoding error.
+    pub fn all_accounts(&self) -> Result<Vec<Account>, AccountError> {
+        let prefix = [
+            spindle_core::keys::KEY_SCHEMA_VERSION,
+            Keyspace::Account as u8,
+        ];
+        let mut out = Vec::new();
+        for (_, raw) in self.store.scan_prefix(&prefix)? {
+            out.push(decode(&raw)?);
+        }
+        Ok(out)
     }
 
     /// Delete a device and every token that authenticates as it.

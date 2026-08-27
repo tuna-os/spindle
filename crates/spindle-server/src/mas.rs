@@ -345,25 +345,39 @@ async fn delete_user(
     Json(request): Json<DeleteUserRequest>,
 ) -> Result<Json<Value>, MatrixError> {
     admit(&state, &headers)?;
+    deactivate_user(&state, &request.localpart, request.erase)?;
+    Ok(Json(json!({})))
+}
+
+/// Deactivate one account: every device (with its sessions and E2E
+/// material) goes, the row stays with the flag set, `erase` clears the
+/// profile. Shared between the MAS provisioning surface and the admin
+/// API — the two authorities allowed to end an account both mean the
+/// same thing by it.
+pub(crate) fn deactivate_user(
+    state: &AppState,
+    localpart: &str,
+    erase: bool,
+) -> Result<(), MatrixError> {
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     let devices = accounts
-        .devices_of(&request.localpart)
+        .devices_of(localpart)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
     for device in devices {
-        remove_device(&state, &accounts, &request.localpart, &device.device_id)?;
+        remove_device(state, &accounts, localpart, &device.device_id)?;
     }
     accounts
-        .set_deactivated(&request.localpart, true)
+        .set_deactivated(localpart, true)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    let user_id = accounts.user_id(&request.localpart);
-    if request.erase {
+    let user_id = accounts.user_id(localpart);
+    if erase {
         state
             .profiles
             .set(&user_id, Some(None), Some(None))
             .map_err(|error| MatrixError::internal(&error.to_string()))?;
     }
-    device_list_changed(&state, &user_id);
-    Ok(Json(json!({})))
+    device_list_changed(state, &user_id);
+    Ok(())
 }
 
 /// `POST /_synapse/mas/reactivate_user`
@@ -437,7 +451,7 @@ async fn allow_cross_signing_reset(
 }
 
 /// One device, gone whole: the row, its sessions, its E2E material.
-fn remove_device(
+pub(crate) fn remove_device(
     state: &AppState,
     accounts: &Accounts<'_, spindle_store::FjallStore>,
     localpart: &str,
@@ -455,7 +469,7 @@ fn remove_device(
 
 /// Mark the user's device list changed and wake `/sync`, so peers stop
 /// (or start) encrypting to the right set of devices.
-fn device_list_changed(state: &AppState, user_id: &str) {
+pub(crate) fn device_list_changed(state: &AppState, user_id: &str) {
     let seq = state.rooms.allocate_stream_id();
     if let Err(error) = state.devices.mark_device_list_changed(user_id, seq) {
         tracing::warn!(user_id, %error, "device-list change mark failed");

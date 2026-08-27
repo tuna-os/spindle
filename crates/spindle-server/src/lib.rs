@@ -8,6 +8,7 @@
 
 pub mod account_data;
 pub mod accounts;
+pub mod admin;
 pub mod appservices;
 pub mod auth;
 pub mod authorize;

@@ -239,6 +239,13 @@ pub enum Keyspace {
     /// and acknowledgement re-delivers — at-least-once, made idempotent
     /// on the service's side by the transaction ID.
     AppserviceCursor = 0x24,
+    /// `(seq: u64 be)` → one audit record.
+    ///
+    /// Every mutating admin request appends one. Its own keyspace rather
+    /// than a room, because an admin action is not a Matrix event —
+    /// modelled as one it would sit in a timeline and federate. Exempt
+    /// from purge: the record of deletions must survive the deletions.
+    AuditLog = 0x25,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -263,6 +270,15 @@ pub fn profile(user_id: &str) -> Vec<u8> {
 pub fn appservice_cursor(appservice_id: &str) -> Vec<u8> {
     let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::AppserviceCursor as u8];
     key.extend_from_slice(appservice_id.as_bytes());
+    key
+}
+
+/// One audit record, keyed by an append sequence so a scan reads the
+/// log in the order the actions happened.
+#[must_use]
+pub fn audit_entry(seq: u64) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::AuditLog as u8];
+    key.extend_from_slice(&seq.to_be_bytes());
     key
 }
 
