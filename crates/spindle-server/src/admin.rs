@@ -1,4 +1,4 @@
-//! The admin API's users group — `/_spindle/admin/v1`, with the
+//! The admin API — `/_spindle/admin/v1`, with the
 //! `/_synapse/admin/v1` compatibility alias existing tooling drives.
 //!
 //! The shape is deliberately Synapse's (#83): operators have tooling and
@@ -12,8 +12,10 @@
 //! The honest-advertisement rule from `surface.rs` applies here in its
 //! sternest form: an admin endpoint that is routed must work, because a
 //! stub returning `{}` is indistinguishable from success to the tooling
-//! that calls it. This module is one group of #83's spec — users — and
-//! routes nothing beyond what it serves.
+//! that calls it. This module carries the groups of #83's spec that are
+//! built — users, and the rooms group's read side — and routes nothing
+//! beyond what it serves: `state_at`, room deletion and purge land as
+//! their own slices.
 
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::StatusCode;
@@ -57,6 +59,20 @@ pub fn routes() -> Router<AppState> {
                 get(joined_rooms),
             )
             .route(&format!("{prefix}/whois/{{user_id}}"), get(whois))
+            .route(&format!("{prefix}/rooms"), get(list_rooms))
+            .route(&format!("{prefix}/rooms/{{room_id}}"), get(room_detail))
+            .route(
+                &format!("{prefix}/rooms/{{room_id}}/members"),
+                get(room_members),
+            )
+            .route(
+                &format!("{prefix}/rooms/{{room_id}}/state"),
+                get(room_state),
+            )
+            .route(
+                &format!("{prefix}/rooms/{{room_id}}/timeline"),
+                get(room_timeline),
+            )
             .route(&format!("{prefix}/audit"), get(audit_log))
     };
     group("/_spindle/admin/v1").merge(group("/_synapse/admin/v1"))
@@ -456,6 +472,201 @@ async fn whois(
         devices.insert(device.device_id, json!({ "sessions": [] }));
     }
     Ok(Json(json!({ "user_id": user_id, "devices": devices })))
+}
+
+/// One room as the admin listing and detail views describe it.
+///
+/// Everything here is read from the room's current state and metadata —
+/// nothing is cached or estimated, because an operator acting on this
+/// view (blocking, purging) needs it to be the room, not a summary of
+/// last week's room.
+fn room_json(state: &AppState, room_id: &str) -> Result<Value, crate::rooms::RoomError> {
+    let events = state.rooms.state(room_id)?;
+    let content = |event_type: &str, field: &str| -> Value {
+        events
+            .iter()
+            .find(|event| event["type"] == event_type && event["state_key"] == "")
+            .map_or(Value::Null, |event| event["content"][field].clone())
+    };
+    let create = events
+        .iter()
+        .find(|event| event["type"] == "m.room.create" && event["state_key"] == "");
+    let joined = state.rooms.joined_members(room_id)?;
+    let local_suffix = format!(":{}", state.config.server.name);
+    let joined_local = joined
+        .keys()
+        .filter(|user| user.ends_with(&local_suffix))
+        .count();
+    Ok(json!({
+        "room_id": room_id,
+        "name": content("m.room.name", "name"),
+        "topic": content("m.room.topic", "topic"),
+        "avatar": content("m.room.avatar", "url"),
+        "canonical_alias": content("m.room.canonical_alias", "alias"),
+        "joined_members": joined.len(),
+        "joined_local_members": joined_local,
+        // The spec's default when m.room.create names no version.
+        "version": create
+            .and_then(|event| event["content"]["room_version"].as_str())
+            .unwrap_or("1"),
+        "creator": create.and_then(|event| event["sender"].as_str()),
+        "encryption": content("m.room.encryption", "algorithm"),
+        "federatable": create.is_none_or(|event| event["content"]["m.federate"] != false),
+        "public": content("m.room.join_rules", "join_rule") == "public",
+        "join_rules": content("m.room.join_rules", "join_rule"),
+        "guest_access": content("m.room.guest_access", "guest_access"),
+        "history_visibility": content("m.room.history_visibility", "history_visibility"),
+        "room_type": create.map_or(Value::Null, |event| event["content"]["type"].clone()),
+        "state_events": events.len(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct RoomsQuery {
+    #[serde(default)]
+    from: usize,
+    limit: Option<usize>,
+    order_by: Option<String>,
+    search_term: Option<String>,
+}
+
+/// `GET /rooms?from&limit&order_by&search_term`
+async fn list_rooms(
+    State(state): State<AppState>,
+    _actor: AdminActor,
+    Query(query): Query<RoomsQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    let mut rooms = Vec::new();
+    for room_id in state
+        .rooms
+        .all_room_ids()
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+    {
+        let room = room_json(&state, &room_id).map_err(crate::routes::room_error)?;
+        let matches = query.search_term.as_deref().is_none_or(|term| {
+            [&room["room_id"], &room["name"], &room["canonical_alias"]]
+                .iter()
+                .any(|field| field.as_str().is_some_and(|value| value.contains(term)))
+        });
+        if matches {
+            rooms.push(room);
+        }
+    }
+    // Synapse's orderings, the ones this store can answer exactly: name
+    // ascending (rooms without one sort by ID, so they group last rather
+    // than vanishing), sizes descending.
+    match query.order_by.as_deref().unwrap_or("name") {
+        "name" => rooms.sort_by_key(|room| {
+            (
+                room["name"].as_str().is_none(),
+                room["name"].as_str().unwrap_or_default().to_owned(),
+                room["room_id"].as_str().unwrap_or_default().to_owned(),
+            )
+        }),
+        "joined_members" => {
+            rooms.sort_by_key(|room| std::cmp::Reverse(room["joined_members"].as_u64()));
+        }
+        "state_events" => {
+            rooms.sort_by_key(|room| std::cmp::Reverse(room["state_events"].as_u64()));
+        }
+        other => {
+            return Err(MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                format!("cannot order by {other:?}"),
+            ));
+        }
+    }
+    let total = rooms.len();
+    let limit = query.limit.unwrap_or(100);
+    let page: Vec<Value> = rooms.into_iter().skip(query.from).take(limit).collect();
+    let mut body = json!({ "rooms": page, "offset": query.from, "total_rooms": total });
+    if query.from + limit < total {
+        body["next_batch"] = json!(query.from + limit);
+    }
+    Ok(Json(body))
+}
+
+/// `GET /rooms/{roomId}`
+async fn room_detail(
+    State(state): State<AppState>,
+    _actor: AdminActor,
+    Path(room_id): Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    let room = room_json(&state, &room_id).map_err(crate::routes::room_error)?;
+    Ok(Json(room))
+}
+
+/// `GET /rooms/{roomId}/members`
+async fn room_members(
+    State(state): State<AppState>,
+    _actor: AdminActor,
+    Path(room_id): Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    let members = state
+        .rooms
+        .joined_members(&room_id)
+        .map_err(crate::routes::room_error)?;
+    let names: Vec<&String> = members.keys().collect();
+    Ok(Json(json!({ "total": names.len(), "members": names })))
+}
+
+/// `GET /rooms/{roomId}/state`
+async fn room_state(
+    State(state): State<AppState>,
+    _actor: AdminActor,
+    Path(room_id): Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    let events = state
+        .rooms
+        .state(&room_id)
+        .map_err(crate::routes::room_error)?;
+    Ok(Json(json!({ "state": events })))
+}
+
+#[derive(Deserialize)]
+struct TimelineQuery {
+    from: Option<i64>,
+    limit: Option<usize>,
+    dir: Option<String>,
+}
+
+/// `GET /rooms/{roomId}/timeline?from&limit&dir`
+///
+/// The admin view of the log, in storage order — which for this store
+/// *is* the topological order, the query #83's table calls trivial.
+/// Forward is the default because the operator's question is "what does
+/// the log say", read the way the log is written.
+async fn room_timeline(
+    State(state): State<AppState>,
+    _actor: AdminActor,
+    Path(room_id): Path<String>,
+    Query(query): Query<TimelineQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    let forward = match query.dir.as_deref().unwrap_or("f") {
+        "f" => true,
+        "b" => false,
+        other => {
+            return Err(MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                format!("dir must be \"f\" or \"b\", not {other:?}"),
+            ));
+        }
+    };
+    let (events, next) = state
+        .rooms
+        .admin_timeline(&room_id, query.from, query.limit.unwrap_or(100), forward)
+        .map_err(crate::routes::room_error)?;
+    let chunk: Vec<Value> = events
+        .into_iter()
+        .map(|event| json!({ "li": event.li, "event_id": event.event_id, "event": event.json }))
+        .collect();
+    let mut body = json!({ "chunk": chunk });
+    if let Some(next) = next {
+        body["next_token"] = json!(next);
+    }
+    Ok(Json(body))
 }
 
 /// `GET /audit?from&limit&actor&action`

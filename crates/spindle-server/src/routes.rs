@@ -6037,7 +6037,7 @@ async fn room_context(
 /// same answer, "there is nothing here". What must not collapse is the
 /// difference between absent and *refused*, which is why `Forbidden` has its
 /// own arm.
-fn room_error(error: crate::rooms::RoomError) -> MatrixError {
+pub(crate) fn room_error(error: crate::rooms::RoomError) -> MatrixError {
     match error {
         crate::rooms::RoomError::UnknownRoom(_) => {
             MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such room")
