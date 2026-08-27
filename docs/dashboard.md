@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**95 routes implemented; 21 known gaps in scope.**
+**96 routes implemented; 21 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -154,10 +154,11 @@ neither implemented nor counted.
 - ⏳ `DELETE /_matrix/client/v3/devices/{device_id}` — device logout (M2)
 - ⏳ `POST /_matrix/client/v3/delete_devices` — bulk device logout (M2)
 
-### Server, discovery & operations — 15 implemented, 0 planned
+### Server, discovery & operations — 16 implemented, 0 planned
 
 - `GET /.well-known/matrix/client`
 - `GET /.well-known/matrix/server`
+- `POST /_matrix/client/v1/appservice/{appservice_id}/ping`
 - `GET /_matrix/client/v3/capabilities`
 - `GET /_matrix/client/v3/profile/{user_id}`
 - `GET/PUT /_matrix/client/v3/profile/{user_id}/avatar_url`
