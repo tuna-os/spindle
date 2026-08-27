@@ -23,6 +23,18 @@ pub struct Config {
     pub previews: PreviewConfig,
     #[serde(default)]
     pub federation: FederationConfig,
+    #[serde(default)]
+    pub appservices: AppservicesConfig,
+}
+
+/// Which appservice registration files to load at startup.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AppservicesConfig {
+    /// Paths to YAML registration files, spec shape. Every file must load
+    /// and validate or the server refuses to start — a bridge silently not
+    /// registered looks exactly like a bridge receiving nothing.
+    #[serde(default)]
+    pub registrations: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

@@ -8,6 +8,7 @@
 
 pub mod account_data;
 pub mod accounts;
+pub mod appservices;
 pub mod auth;
 pub mod authorize;
 pub mod backups;
@@ -56,6 +57,7 @@ pub struct AppState {
     pub backups: Arc<backups::Backups>,
     pub previews: Arc<previews::Previews>,
     pub profiles: Arc<profiles::Profiles>,
+    pub appservices: Arc<appservices::Appservices>,
     pub federation: Arc<federation::Federation>,
 }
 
@@ -66,6 +68,7 @@ pub struct AppState {
 pub enum AppError {
     Signing(signing::SigningError),
     PreviewConfig(String),
+    Appservice(String),
 }
 
 impl std::fmt::Display for AppError {
@@ -73,6 +76,7 @@ impl std::fmt::Display for AppError {
         match self {
             Self::Signing(error) => write!(formatter, "signing key: {error}"),
             Self::PreviewConfig(why) => write!(formatter, "preview config: {why}"),
+            Self::Appservice(why) => write!(formatter, "appservice registration: {why}"),
         }
     }
 }
@@ -122,6 +126,10 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
         config.server.name.clone(),
     ));
     let profiles = Arc::new(profiles::Profiles::new(Arc::clone(&store)));
+    let appservices = Arc::new(
+        appservices::Appservices::load(&config.appservices.registrations)
+            .map_err(|error| AppError::Appservice(error.to_string()))?,
+    );
     let previews = Arc::new(
         previews::Previews::new(
             Arc::clone(&store),
@@ -151,6 +159,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
         backups: Arc::new(backups::Backups::new(store_for_backups)),
         previews,
         profiles,
+        appservices,
         federation,
     };
     // The outbound drain runs for the life of the process. Spawned only
