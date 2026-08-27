@@ -537,3 +537,44 @@ async fn a_lying_content_type_is_unsupported_not_a_crash() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_uploads_of_identical_bytes_all_land_intact() {
+    // The ordinary case in a content-addressed store: several uploads of
+    // the same bytes racing (Complement's parallel media subtests upload
+    // one PNG three times at once). A staging file named only by the
+    // content hash lets one writer rename another's half-written file
+    // into place, or fail its own rename because the file already moved —
+    // so every one of these must succeed, and every download must return
+    // the full bytes.
+    let harness = std::sync::Arc::new(Harness::new());
+    let alice = harness.register("alice").await;
+    let payload: Vec<u8> = (0u32..40_000).flat_map(u32::to_le_bytes).collect();
+
+    let uploads = (0..16).map(|index| {
+        let harness = harness.clone();
+        let alice = alice.clone();
+        let payload = payload.clone();
+        tokio::spawn(async move {
+            harness
+                .upload(
+                    &alice,
+                    "application/octet-stream",
+                    Some(&format!("copy-{index}")),
+                    &payload,
+                )
+                .await
+        })
+    });
+    let mut uris = Vec::new();
+    for upload in uploads {
+        let (status, body) = upload.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        uris.push(body["content_uri"].as_str().unwrap().to_owned());
+    }
+    for uri in uris {
+        let (status, _, bytes) = harness.download(&alice, &uri).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bytes, payload, "a racing writer tore the blob");
+    }
+}
