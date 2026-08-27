@@ -130,11 +130,15 @@ impl Instance {
     }
 
     async fn start_msc3202(as_url: &str) -> Instance {
+        // The unstable flag spellings throughout — they are what shipping
+        // bridge registrations contain, so the aliases are what this
+        // exercises.
         Self::start_yaml(&format!(
             "id: testbridge\nurl: \"{as_url}\"\nas_token: {AS_TOKEN}\n\
              hs_token: {HS_TOKEN}\nsender_localpart: _bridge_bot\n\
              io.element.msc4190: true\n\
              org.matrix.msc3202: true\n\
+             de.sorunome.msc2409.push_ephemeral: true\n\
              namespaces:\n  users:\n    - exclusive: true\n      regex: \"@_bridge_.*:.*\"\n"
         ))
         .await
@@ -619,4 +623,294 @@ async fn a_service_without_msc3202_never_sees_its_keys() {
         "MSC3202 is opt-in; its keys must be absent: {:?}",
         bridge.deliveries()
     );
+}
+
+/// The `to_device` entries across all deliveries.
+fn to_device_of(deliveries: &[Delivery]) -> Vec<Value> {
+    deliveries
+        .iter()
+        .flat_map(|delivery| {
+            delivery.raw["to_device"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn to_device_ciphertext_reaches_the_service_exactly_once() {
+    let (bridge, as_url) = Bridge::serve().await;
+    let server = Instance::start_msc3202(&as_url).await;
+    let ghost = format!("@_bridge_inbox:{}", server.name);
+
+    // The ghost exists with an MSC4190-minted device; nobody ever syncs
+    // as it, which is exactly why the push may take its mail.
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/register",
+            Some(AS_TOKEN),
+            Some(&json!({
+                "type": "m.login.application_service",
+                "username": "_bridge_inbox",
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/devices/GHOSTDEV?user_id={ghost}"),
+            Some(AS_TOKEN),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+
+    let alice = server.register("alice").await;
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            "/_matrix/client/v3/sendToDevice/m.room.encrypted/td-1",
+            Some(&alice),
+            Some(&json!({ "messages": { &ghost: { "GHOSTDEV": { "ciphertext": "olm..." } } } })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    assert!(
+        eventually(|| {
+            to_device_of(&bridge.deliveries()).iter().any(|entry| {
+                entry["type"] == "m.room.encrypted"
+                    && entry["to_user_id"] == ghost.as_str()
+                    && entry["to_device_id"] == "GHOSTDEV"
+                    && entry["content"]["ciphertext"] == "olm..."
+            })
+        })
+        .await,
+        "the ciphertext reaches the bridge: {:?}",
+        bridge.deliveries()
+    );
+    // Acknowledged means consumed: no re-delivery on later passes.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(
+        to_device_of(&bridge.deliveries())
+            .iter()
+            .filter(|entry| entry["to_user_id"] == ghost.as_str())
+            .count(),
+        1,
+        "exactly once after acknowledgement: {:?}",
+        bridge.deliveries()
+    );
+}
+
+#[tokio::test]
+async fn a_syncing_humans_mail_is_never_taken() {
+    let (bridge, as_url) = Bridge::serve().await;
+    let server = Instance::start_msc3202(&as_url).await;
+    let ghost = format!("@_bridge_carrier:{}", server.name);
+
+    let alice = server.register("alice").await;
+    let bob = server.register("bob").await;
+    let bob_id = format!("@bob:{}", server.name);
+    let (_, whoami) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(&bob),
+            None,
+        )
+        .await;
+    let bob_device = whoami["device_id"].as_str().unwrap().to_owned();
+
+    // Mail for a human, then an interesting event so a batch definitely
+    // covers the window the mail landed in.
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            "/_matrix/client/v3/sendToDevice/m.room.encrypted/td-2",
+            Some(&alice),
+            Some(&json!({ "messages": { &bob_id: { &bob_device: { "for": "bob" } } } })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    server.ghost_room_with_message(&ghost, "carrier").await;
+    assert!(
+        eventually(|| bodies(&bridge.deliveries()).contains(&"carrier".to_owned())).await,
+        "the batch covering the window arrived"
+    );
+
+    assert!(
+        to_device_of(&bridge.deliveries()).is_empty(),
+        "a human's inbox is not the bridge's: {:?}",
+        bridge.deliveries()
+    );
+    // And bob still receives it the ordinary way.
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/sync?timeout=0",
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["to_device"]["events"]
+            .as_array()
+            .is_some_and(|events| events.iter().any(|evt| evt["content"]["for"] == "bob")),
+        "bob's sync still carries his mail: {body}"
+    );
+}
+
+/// Write the config + registration for a subprocess spindle on `name`,
+/// returning the config path.
+fn subprocess_config(work: &TempDir, as_url: &str, name: &str) -> std::path::PathBuf {
+    let reg_path = work.path().join("bridge.yaml");
+    std::fs::write(
+        &reg_path,
+        format!(
+            "id: testbridge\nurl: \"{as_url}\"\nas_token: {AS_TOKEN}\n\
+             hs_token: {HS_TOKEN}\nsender_localpart: _bridge_bot\n\
+             namespaces:\n  users:\n    - exclusive: true\n      regex: \"@_bridge_.*:.*\"\n"
+        ),
+    )
+    .unwrap();
+    let config_path = work.path().join("spindle.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[server]\nname = \"{name}\"\nbind = \"{name}\"\n\
+             [storage]\npath = \"{}\"\n[ratelimit]\nenabled = false\n\
+             [federation]\nretry_base_ms = 50\n\
+             [appservices]\nregistrations = [\"{}\"]\n",
+            work.path().join("data").display(),
+            reg_path.display()
+        ),
+    )
+    .unwrap();
+    config_path
+}
+
+fn spawn_spindle(config_path: &std::path::Path) -> std::process::Child {
+    std::process::Command::new(env!("CARGO_BIN_EXE_spindle"))
+        .arg(config_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+async fn wait_up(client: &reqwest::Client, name: &str) {
+    for _ in 0..100 {
+        if client
+            .get(format!("http://{name}/_matrix/client/versions"))
+            .send()
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("spindle never came up on {name}");
+}
+
+#[tokio::test]
+async fn a_restart_mid_push_redelivers_under_the_same_transaction_id() {
+    let (bridge, as_url) = Bridge::serve().await;
+    bridge.fail_next(u32::MAX);
+
+    // A real spindle process over a durable store, so the restart is a
+    // process death, not a polite shutdown.
+    let work = TempDir::new().unwrap();
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let name = format!("127.0.0.1:{port}");
+    let config_path = subprocess_config(&work, &as_url, &name);
+    let client = reqwest::Client::new();
+    let mut child = spawn_spindle(&config_path);
+    wait_up(&client, &name).await;
+
+    // One ghost message; every delivery attempt fails, so the cursor
+    // never advances.
+    let ghost = format!("@_bridge_phoenix:{name}");
+    let send = |method: reqwest::Method, path: String, body: Value| {
+        let client = client.clone();
+        let name = name.clone();
+        async move {
+            let response = client
+                .request(method, format!("http://{name}{path}"))
+                .header("authorization", format!("Bearer {AS_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(body.to_string())
+                .send()
+                .await
+                .unwrap();
+            let status = response.status().as_u16();
+            let body: Value = serde_json::from_slice(&response.bytes().await.unwrap_or_default())
+                .unwrap_or(Value::Null);
+            (status, body)
+        }
+    };
+    let (status, body) = send(
+        reqwest::Method::POST,
+        format!("/_matrix/client/v3/createRoom?user_id={ghost}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = send(
+        reqwest::Method::PUT,
+        format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/t-1?user_id={ghost}"),
+        json!({ "msgtype": "m.text", "body": "survives the crash" }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    // Wait for a refused attempt that carries the message itself: only
+    // then does the pinned range cover it, and only a matching range
+    // makes the post-restart recomputation produce the same ID. (An
+    // earlier attempt pinned mid-room-creation redelivers under a wider
+    // fresh ID — at-least-once either way, but the strong assertion
+    // needs the ranges equal.)
+    assert!(
+        eventually(|| {
+            bridge.deliveries().last().is_some_and(|delivery| {
+                bodies(std::slice::from_ref(delivery)).contains(&"survives the crash".to_owned())
+            })
+        })
+        .await,
+        "a refused push attempt carrying the message happened"
+    );
+    let attempted = bridge.deliveries();
+    let first_txn = attempted.last().unwrap().txn_id.clone();
+
+    // Kill mid-push — SIGKILL, no drain — and bring a fresh process up
+    // over the same store, with the bridge now willing.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    bridge.fail_next(0);
+    let mut child = spawn_spindle(&config_path);
+    wait_up(&client, &name).await;
+
+    assert!(
+        eventually(|| {
+            bodies(&bridge.deliveries()).contains(&"survives the crash".to_owned())
+                && bridge.deliveries().last().is_some_and(|delivery| {
+                    delivery.txn_id == first_txn
+                        && bodies(std::slice::from_ref(delivery))
+                            .contains(&"survives the crash".to_owned())
+                })
+        })
+        .await,
+        "the fresh process recomputed the batch from the durable cursor and \
+         redelivered under the same deterministic transaction ID: {:?}",
+        bridge.deliveries()
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
 }

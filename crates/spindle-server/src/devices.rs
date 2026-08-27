@@ -444,6 +444,56 @@ impl Devices {
         )
     }
 
+    /// Every queued to-device message whose sequence lies in
+    /// `(since, until]`, with its owner, device, and raw store key — the
+    /// appservice push's read (MSC2409).
+    ///
+    /// A whole-keyspace scan, deliberately: the push cannot know which
+    /// users have mail, and the keyspace holds only undelivered
+    /// messages, so the scan is bounded by the live backlog — the same
+    /// argument the federation outbox drain already makes for its own
+    /// empty-case scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the scan fails.
+    pub fn pending_to_device_in(
+        &self,
+        since: u64,
+        until: u64,
+    ) -> Result<Vec<PendingToDevice>, StoreError> {
+        let prefix = [keys::KEY_SCHEMA_VERSION, Keyspace::ToDevice as u8];
+        let mut out = Vec::new();
+        for (key, bytes) in ReadView::scan_prefix(self.store.as_ref(), &prefix)? {
+            let Some((user_id, device_id, seq)) = parse_to_device_key(&key) else {
+                continue;
+            };
+            if seq <= since || seq > until {
+                continue;
+            }
+            if let Ok(message) = serde_json::from_slice::<Value>(&bytes) {
+                out.push(PendingToDevice {
+                    user_id,
+                    device_id,
+                    key,
+                    message,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete one queued to-device row by its exact key — the appservice
+    /// push's acknowledgement, doing for a transaction ID what a sync
+    /// token does for a syncing client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the delete fails.
+    pub fn delete_queued(&self, key: &[u8]) -> Result<(), StoreError> {
+        Store::delete(self.store.as_ref(), key)
+    }
+
     /// Everything pending for a device, deleting what `since` acknowledges.
     ///
     /// A client presenting `since` has durably received every batch up to
@@ -506,6 +556,29 @@ fn merge_signatures(mut stored: Value, signed: &Value) -> Value {
         }
     }
     stored
+}
+
+/// One queued to-device message as [`Devices::pending_to_device_in`]
+/// hands it over: whose it is, which device, the raw key that deletes
+/// it, and the stored message.
+pub struct PendingToDevice {
+    pub user_id: String,
+    pub device_id: String,
+    pub key: Vec<u8>,
+    pub message: Value,
+}
+
+/// The `(user_id, device_id, seq)` a [`keys::device_scoped`] `ToDevice`
+/// key encodes, walking the same length-prefixed layout that built it.
+fn parse_to_device_key(key: &[u8]) -> Option<(String, String, u64)> {
+    let rest = key.get(2..)?;
+    let user_len = usize::from(u16::from_be_bytes(rest.get(..2)?.try_into().ok()?));
+    let user_id = String::from_utf8(rest.get(2..2 + user_len)?.to_vec()).ok()?;
+    let rest = rest.get(2 + user_len..)?;
+    let device_len = usize::from(u16::from_be_bytes(rest.get(..2)?.try_into().ok()?));
+    let device_id = String::from_utf8(rest.get(2..2 + device_len)?.to_vec()).ok()?;
+    let seq = u64::from_be_bytes(rest.get(2 + device_len..)?.try_into().ok()?);
+    Some((user_id, device_id, seq))
 }
 
 /// The device ID a [`keys::device_scoped`] key names, given its user prefix.

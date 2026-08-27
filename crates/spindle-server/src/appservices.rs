@@ -135,6 +135,19 @@ impl Registration {
                 .any(|namespace| namespace.matches(user_id))
     }
 
+    /// Whether this registration *exclusively* claims `user_id`. The
+    /// to-device push runs behind this rather than plain namespace
+    /// membership: delivered rows are deleted on acknowledgement, and
+    /// only a user who exists solely through the service has no syncing
+    /// client whose mail we would be eating.
+    #[must_use]
+    pub fn exclusively_claims(&self, user_id: &str) -> bool {
+        self.namespaces
+            .users
+            .iter()
+            .any(|namespace| namespace.exclusive && namespace.matches(user_id))
+    }
+
     /// Whether the service hears about an event: its sender or any joined
     /// member inside the user namespaces (the sender user included), or
     /// the room itself inside the room namespaces.
@@ -244,13 +257,9 @@ impl Appservices {
     /// to find its namespace squatted.
     #[must_use]
     pub fn exclusively_claims(&self, user_id: &str) -> bool {
-        self.list.iter().any(|registration| {
-            registration
-                .namespaces
-                .users
-                .iter()
-                .any(|namespace| namespace.exclusive && namespace.matches(user_id))
-        })
+        self.list
+            .iter()
+            .any(|registration| registration.exclusively_claims(user_id))
     }
 
     /// The service (with a URL) that *exclusively* claims `user_id`, if
@@ -261,12 +270,7 @@ impl Appservices {
     #[must_use]
     pub fn exclusive_claimant(&self, user_id: &str) -> Option<&Arc<Registration>> {
         self.list.iter().find(|registration| {
-            registration.url.is_some()
-                && registration
-                    .namespaces
-                    .users
-                    .iter()
-                    .any(|namespace| namespace.exclusive && namespace.matches(user_id))
+            registration.url.is_some() && registration.exclusively_claims(user_id)
         })
     }
 
@@ -434,6 +438,13 @@ struct PendingPush {
     otk_counts: Value,
     /// MSC3202: the same shape over unused fallback key algorithms.
     fallback_keys: Value,
+    /// MSC2409: to-device messages for the service's exclusive users,
+    /// pinned with the batch like events. The rows behind them are
+    /// deleted only on acknowledgement — for session-establishment
+    /// ciphertext, redelivery is the correct side to err on.
+    to_device: Vec<Value>,
+    /// The store keys of those rows, for the acknowledgement delete.
+    to_device_keys: Vec<Vec<u8>>,
     advance_to: u64,
 }
 
@@ -675,6 +686,9 @@ async fn deliver(
     {
         body["org.matrix.msc3202.device_unused_fallback_key_types"] = push.fallback_keys.clone();
     }
+    if !push.to_device.is_empty() {
+        body["to_device"] = Value::Array(push.to_device.clone());
+    }
     let response = client
         .put(target)
         .header("authorization", format!("Bearer {hs_token}"))
@@ -765,11 +779,35 @@ fn compute_pending(
     } else {
         Vec::new()
     };
+    // MSC2409's other half: queued to-device messages for users who exist
+    // only through this service, shaped like sync's plus the MSC's
+    // `to_user_id`/`to_device_id` so the bridge knows which ghost's inbox
+    // each one is. Exclusive users only — these rows are deleted on
+    // acknowledgement, and only a user with no syncing client has no
+    // mail we could be eating.
+    let mut to_device = Vec::new();
+    let mut to_device_keys = Vec::new();
+    if registration.receive_ephemeral && advance_to > cursor {
+        for row in sources
+            .devices
+            .pending_to_device_in(cursor, advance_to)
+            .unwrap_or_default()
+        {
+            if !registration.exclusively_claims(&row.user_id) {
+                continue;
+            }
+            let mut message = row.message;
+            message["to_user_id"] = Value::String(row.user_id);
+            message["to_device_id"] = Value::String(row.device_id);
+            to_device.push(message);
+            to_device_keys.push(row.key);
+        }
+    }
     // A batch advances the cursor when it carries anything at-least-once:
-    // events, or a device-list change a bridge must not miss (encrypting
-    // to a stale device set is the failure mode). Ephemeral alone stays
-    // fire-once.
-    let advancing = !events.is_empty() || !device_lists_changed.is_empty();
+    // events, a device-list change a bridge must not miss (encrypting to
+    // a stale device set is the failure mode), or to-device ciphertext.
+    // Typing alone stays fire-once.
+    let advancing = !events.is_empty() || !device_lists_changed.is_empty() || !to_device.is_empty();
     if !advancing && ephemeral.is_empty() {
         return None;
     }
@@ -790,6 +828,8 @@ fn compute_pending(
         device_lists_changed,
         otk_counts,
         fallback_keys,
+        to_device,
+        to_device_keys,
     })
 }
 
@@ -857,6 +897,14 @@ pub async fn push_loop(
             };
             match deliver(&client, url, &registration.hs_token, push).await {
                 Ok(()) => {
+                    // The delivered to-device rows are consumed, deleted
+                    // before the cursor moves: the reverse order could
+                    // strand rows below the cursor forever, while this
+                    // order at worst deletes what the 200 already proved
+                    // received.
+                    for key in &push.to_device_keys {
+                        let _ = devices.delete_queued(key);
+                    }
                     write_cursor(&store, &registration.id, push.advance_to);
                     pending.remove(&registration.id);
                     backoff.remove(&registration.id);
@@ -868,7 +916,10 @@ pub async fn push_loop(
                     // backoff is a lie about the present, exactly the
                     // federation outbox's rule for its EDUs. The next
                     // real change produces a fresh delta anyway.
-                    if push.events.is_empty() && push.device_lists_changed.is_empty() {
+                    if push.events.is_empty()
+                        && push.device_lists_changed.is_empty()
+                        && push.to_device.is_empty()
+                    {
                         pending.remove(&registration.id);
                     }
                     let failures = backoff.get(&registration.id).map_or(0, |(count, _)| *count) + 1;
