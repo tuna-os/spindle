@@ -86,6 +86,11 @@ OpenAPI schemas, plus the three things we have to build ourselves (a
 heterogeneous Spindle↔Synapse interop rig, fork injection, and a property-test
 oracle for the equivalence claim).
 
+**[docs/delegated-auth.md](docs/delegated-auth.md)** — running Spindle
+behind the Matrix Authentication Service (MSC3861): the config on both
+sides, what turns off, the revocation window, and what an unmodified MAS
+release binary has been proven to do against it.
+
 **[docs/divergence.md](docs/divergence.md)** — the seam: what we inherit
 unchanged from the Matrix spec, ruma and Complement, what is genuinely ours
 (the linear index, the state trie, the bounded fork window, the log chain,
