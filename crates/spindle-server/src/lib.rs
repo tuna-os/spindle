@@ -149,5 +149,16 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
         previews,
         federation,
     };
+    // The outbound drain runs for the life of the process. Spawned only
+    // when a runtime is running — which is every real caller; a build
+    // outside one gets a router that serves but never sends, and the
+    // absence of a runtime is that caller's own statement of intent.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::spawn(federation::drain_outbox(
+            Arc::clone(&state.store),
+            Arc::clone(&state.federation),
+            std::time::Duration::from_millis(state.config.federation.retry_base_ms),
+        ));
+    }
     Ok(routes::router(state))
 }

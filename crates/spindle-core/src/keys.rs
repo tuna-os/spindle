@@ -201,6 +201,14 @@ pub enum Keyspace {
     /// at-least-once delivery is the sender's retry loop, and this row is
     /// what makes redelivery idempotent on our side.
     FederationTxn = 0x1f,
+    /// `(destination, seq)` -> one PDU awaiting delivery to a peer.
+    ///
+    /// The outbound half of at-least-once: rows are deleted only after the
+    /// destination acknowledged the transaction that carried them, so a
+    /// crash between send and acknowledgement re-sends — and the
+    /// transaction ID being derived from the first row's sequence means
+    /// the peer's replay table absorbs the duplicate.
+    FederationOutbox = 0x20,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -513,6 +521,39 @@ pub fn cross_signing(user_id: &str, key_type: &str) -> Vec<u8> {
     let mut key = user_prefix(Keyspace::CrossSigning, user_id);
     key.extend_from_slice(key_type.as_bytes());
     key
+}
+
+/// `(destination, seq)` key for [`Keyspace::FederationOutbox`].
+#[must_use]
+pub fn federation_outbox(destination: &str, seq: u64) -> Vec<u8> {
+    let mut key = federation_outbox_prefix(destination);
+    key.extend_from_slice(&seq.to_be_bytes());
+    key
+}
+
+/// The scan prefix for one destination's pending rows.
+#[must_use]
+pub fn federation_outbox_prefix(destination: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::FederationOutbox as u8];
+    let bytes = destination.as_bytes();
+    let len = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
+    key.extend_from_slice(&len.to_be_bytes());
+    key.extend_from_slice(&bytes[..len as usize]);
+    key
+}
+
+/// The scan prefix covering every destination's pending rows.
+#[must_use]
+pub fn federation_outbox_all() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::FederationOutbox as u8]
+}
+
+/// The destination a [`Keyspace::FederationOutbox`] key names.
+#[must_use]
+pub fn federation_outbox_destination(key: &[u8]) -> Option<String> {
+    let rest = key.strip_prefix(federation_outbox_all().as_slice())?;
+    let len = usize::from(u16::from_be_bytes(rest.get(..2)?.try_into().ok()?));
+    String::from_utf8(rest.get(2..2 + len)?.to_vec()).ok()
 }
 
 /// `(origin, txn_id)` key for [`Keyspace::FederationTxn`].

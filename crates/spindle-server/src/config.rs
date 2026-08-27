@@ -67,7 +67,7 @@ const fn default_true() -> bool {
 }
 
 /// Federation transport.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FederationConfig {
     /// Fetch peer keys and send requests over plain http instead of https.
@@ -77,6 +77,24 @@ pub struct FederationConfig {
     /// all but name: anyone on the network path can answer the key fetch.
     #[serde(default)]
     pub insecure_http: bool,
+    /// Base retry delay for outbound delivery, milliseconds. Doubles per
+    /// consecutive failure per destination, capped at 64×. Tests shrink it;
+    /// operators should not need to touch it.
+    #[serde(default = "default_retry_base_ms")]
+    pub retry_base_ms: u64,
+}
+
+fn default_retry_base_ms() -> u64 {
+    1000
+}
+
+impl Default for FederationConfig {
+    fn default() -> Self {
+        Self {
+            insecure_http: false,
+            retry_base_ms: default_retry_base_ms(),
+        }
+    }
 }
 
 /// URL preview fetching.
