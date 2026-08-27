@@ -249,11 +249,45 @@ def measure(base: str, sizes: list[int], samples: int, warmup: int) -> dict:
         def sync_initial() -> None:
             observer.request("GET", "/_matrix/client/v3/sync")
 
+        # The same question through the sliding window (MSC4186): the visible
+        # slice of the room list, not the whole account. This is the endpoint
+        # Element X actually calls where classic clients call /sync, so the
+        # pair (sync_initial, sliding_window) is the before/after of the
+        # room-list story. Skipped without complaint on a server that has not
+        # implemented it -- Synapse without the feature flag 404s, and a
+        # missing column is honest where a fabricated one is not.
+        def sliding_window() -> None:
+            observer.request(
+                "POST",
+                "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync",
+                {
+                    "lists": {
+                        "main": {
+                            "ranges": [[0, 10]],
+                            "required_state": [["m.room.name", ""]],
+                            "timeline_limit": 3,
+                        }
+                    }
+                },
+            )
+
+        sliding_supported = True
+        try:
+            sliding_window()
+        except Failed:
+            sliding_supported = False
+
         for _ in range(warmup):
             sync_initial()
         results[f"sync_initial/{size}"] = summarise(
             [timed(sync_initial) for _ in range(samples)]
         )
+        if sliding_supported:
+            for _ in range(warmup):
+                sliding_window()
+            results[f"sliding_window/{size}"] = summarise(
+                [timed(sliding_window) for _ in range(samples)]
+            )
 
         results[f"join/{size}"] = summarise(
             [

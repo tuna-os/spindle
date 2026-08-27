@@ -94,6 +94,11 @@ fn account_routes() -> Router<AppState> {
         )
         .route("/_matrix/client/v3/joined_rooms", get(joined_rooms))
         .route("/_matrix/client/v3/sync", get(sync))
+        // Element X speaks the unstable path; MSC4186 has no stable one yet.
+        .route(
+            "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync",
+            post(sliding_sync),
+        )
         .route(
             "/_matrix/client/v3/user/{user_id}/account_data/{event_type}",
             get(get_account_data).put(set_account_data),
@@ -2095,6 +2100,191 @@ async fn send_to_device(
     // message lands in no room, so nothing else would wake them.
     state.rooms.wake_sync_waiters();
     Ok(Json(json!({})))
+}
+
+#[derive(Debug, Deserialize)]
+struct SlidingQuery {
+    pos: Option<String>,
+    timeout: Option<u64>,
+}
+
+/// `POST /_matrix/client/unstable/org.matrix.simplified_msc3575/sync`
+///
+/// Stateless (`sliding.rs` explains why): `pos` is a stream position, and the
+/// request carries its lists in full each time. The response sends a room in
+/// full (`initial: true`) on an initial request, and after that only the
+/// rooms the stream says changed — the one scan `changed_rooms` exists for.
+async fn sliding_sync(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Query(query): axum::extract::Query<SlidingQuery>,
+    Json(request): Json<crate::sliding::SlidingRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    let since = match query.pos.as_deref() {
+        Some(token) => Some(
+            token
+                .parse::<crate::tokens::Sync>()
+                .map_err(|error| MatrixError::bad_json(error.to_string()))?
+                .0,
+        ),
+        None => None,
+    };
+    let lists = request.decoded_lists().map_err(MatrixError::bad_json)?;
+    let subscriptions = request
+        .decoded_subscriptions()
+        .map_err(MatrixError::bad_json)?;
+
+    let mut position = state.rooms.stream_position();
+    // Long-poll before answering, not after assembling: an incremental request
+    // with nothing new blocks here, and answers fresh when something lands.
+    if let Some(since) = since {
+        let timeout_ms = request.timeout.or(query.timeout).unwrap_or(0).min(60_000);
+        if position <= since && timeout_ms > 0 {
+            state
+                .rooms
+                .wait_for_event(std::time::Duration::from_millis(timeout_ms))
+                .await;
+            position = state.rooms.stream_position();
+        }
+    }
+
+    // The sorted room list: every joined room, newest activity first. The
+    // sort is recomputed per request because it is what the ranges index
+    // into, and a stale order would make the client's window show the wrong
+    // rooms — the exact bug sliding sync exists to avoid.
+    let joined = state.rooms.joined(&identity.user_id).map_err(room_error)?;
+    let mut ordered: Vec<(String, i64)> = Vec::with_capacity(joined.len());
+    for room_id in joined {
+        let activity = state.rooms.last_activity(&room_id).map_err(room_error)?;
+        ordered.push((room_id, activity));
+    }
+    ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    // Which rooms may appear at all in an incremental response.
+    let changed: Option<Vec<String>> = match since {
+        Some(since) => Some(
+            state
+                .rooms
+                .changed_rooms(since, position)
+                .map_err(room_error)?,
+        ),
+        None => None,
+    };
+
+    let mut rooms_out: serde_json::Map<String, Value> = serde_json::Map::new();
+    let mut lists_out = serde_json::Map::new();
+
+    // What each room in view should carry: the union over every list whose
+    // window it is in, plus any direct subscription. A room in two windows is
+    // sent once, with the larger ask.
+    let mut wanted: std::collections::HashMap<String, (Vec<(String, String)>, usize)> =
+        std::collections::HashMap::new();
+    for (name, list) in &lists {
+        let indices = crate::sliding::indices_in_view(&list.ranges, ordered.len());
+        for &index in &indices {
+            let room_id = &ordered[index].0;
+            let entry = wanted
+                .entry(room_id.clone())
+                .or_insert_with(|| (Vec::new(), 0));
+            entry.0.extend(list.required_state.iter().cloned());
+            entry.1 = entry.1.max(list.timeline_limit);
+        }
+        lists_out.insert(name.clone(), json!({ "count": ordered.len() }));
+    }
+    for (room_id, subscription) in &subscriptions {
+        let entry = wanted
+            .entry(room_id.clone())
+            .or_insert_with(|| (Vec::new(), 0));
+        entry.0.extend(subscription.required_state.iter().cloned());
+        entry.1 = entry.1.max(subscription.timeline_limit);
+    }
+
+    for (room_id, (required_state, timeline_limit)) in wanted {
+        // Incrementally, silence about an unchanged room *is* the answer.
+        if let Some(changed) = &changed
+            && !changed.contains(&room_id)
+        {
+            continue;
+        }
+        let entry = sliding_room_entry(
+            &state,
+            &identity,
+            &room_id,
+            &required_state,
+            timeline_limit,
+            since.is_none(),
+        )?;
+        rooms_out.insert(room_id, entry);
+    }
+
+    Ok(Json(json!({
+        "pos": crate::tokens::Sync(position).to_string(),
+        "lists": lists_out,
+        "rooms": rooms_out,
+        "extensions": {},
+    })))
+}
+
+/// One room's sliding-sync entry.
+fn sliding_room_entry(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    room_id: &str,
+    required_state: &[(String, String)],
+    timeline_limit: usize,
+    initial: bool,
+) -> Result<Value, MatrixError> {
+    let name = state
+        .rooms
+        .state_event(room_id, "m.room.name", "")
+        .ok()
+        .and_then(|content| content["name"].as_str().map(str::to_owned));
+    let state_events: Vec<Value> = if required_state.is_empty() {
+        Vec::new()
+    } else {
+        state
+            .rooms
+            .state(room_id)
+            .map_err(room_error)?
+            .into_iter()
+            .filter(|event| {
+                let event_type = event["type"].as_str().unwrap_or_default();
+                let state_key = event["state_key"].as_str().unwrap_or_default();
+                crate::sliding::wants_state(
+                    required_state,
+                    &identity.user_id,
+                    event_type,
+                    state_key,
+                )
+            })
+            .collect()
+    };
+    let (timeline, limited) = if timeline_limit == 0 {
+        (Vec::new(), false)
+    } else {
+        state
+            .rooms
+            .timeline_tail_public(room_id, timeline_limit.min(50))
+            .map_err(room_error)?
+    };
+    let joined_count = state
+        .rooms
+        .joined_members(room_id)
+        .map_err(room_error)?
+        .len();
+    let unread = state
+        .rooms
+        .unread(room_id, &identity.user_id)
+        .map_err(room_error)?;
+    Ok(crate::sliding::room_entry(
+        name,
+        state_events,
+        timeline,
+        limited,
+        joined_count,
+        unread.notification_count,
+        initial,
+    ))
 }
 
 /// `GET /_matrix/client/v3/sync`

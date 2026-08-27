@@ -175,6 +175,46 @@ sliding sync will reshape it anyway.
 Same caveat as the Synapse table: no forks, so no state resolution on either
 side. The curves compare storage and read-path shape, not the exception path.
 
+## M2 progress: sliding sync on the curve, both competitors re-measured
+
+Run at the sliding-sync slice (#105), with `sliding_window` added to the
+driver: the MSC4186 request Element X makes where classic clients call
+`/sync` — an 11-room window with names and a 3-event timeline. All three
+servers implement the MSC, so for the first time the column is a
+three-way comparison of the same feature.
+
+Milliseconds, mean of 15 samples, at 3 200 events:
+
+| operation | spindle | continuwuity 26.8.1 | synapse 1.159.0 |
+|---|---|---|---|
+| sliding_window | **1.079** | 1.361 (1.3×) | 8.902 (8.2×) |
+| join | **1.412** | 6.073 (4.3×) | 43.873 (31×) |
+| send | **1.481** | 4.858 (3.3×) | 23.937 (16×) |
+| context_deep | **1.114** | 3.989 (3.6×) | 5.031 (4.5×) |
+| messages_page | **1.225** | 2.787 (2.3×) | 6.771 (5.5×) |
+| state | **0.548** | 0.813 (1.5×) | 2.798 (5.1×) |
+| sync_initial | **1.712** | 2.775 (1.6×) | 3.302 (1.9×) |
+
+Three findings:
+
+**The send-growth result replicates.** Continuwuity's `send` grew 2.56× in
+the M1 run and 2.67× here, against our 1.10× — two independent runs, same
+shape. What looked like one run's curve is now a repeatable property of the
+comparison.
+
+**The new endpoint starts ahead.** `sliding_window` was implemented against
+this storage the day it was measured, and already edges the conduwuit
+lineage's own implementation of the same MSC (1.1–1.3×) and clears Synapse's
+by 8×. The room-list question — "the visible slice, sorted by activity" — is
+one point read per room here, and that shows.
+
+**`sync_initial` stopped being the closest race.** The 1.0×-at-800 tie from
+the M1 run reads as 1.6× here; run-to-run variance on this host is real, so
+the honest statement is "between 1.0× and 1.6×", and sliding sync is the
+endpoint that matters for new clients anyway.
+
+Nothing is slower than either competitor at any size measured.
+
 ## Fork window: bounded search vs exhaustive walk
 
 | Room history | Bounded | Exhaustive | Ratio |
