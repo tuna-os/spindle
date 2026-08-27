@@ -214,6 +214,88 @@ impl Media {
         Ok((record, bytes))
     }
 
+    /// A thumbnail of `media_id` at (or near) the requested size.
+    ///
+    /// Generated on first request and cached content-addressed, keyed by the
+    /// *source hash* plus the normalized dimensions and method — so two media
+    /// IDs sharing bytes share thumbnails too, and a regenerate is impossible
+    /// by construction: the same inputs name the same blob.
+    ///
+    /// Dimensions are normalized to a small fixed set before anything else.
+    /// Honouring arbitrary `width`x`height` would let one client mint an
+    /// unbounded family of cached files from a single upload — a disk
+    /// amplification the spec itself warns about, which is why it permits
+    /// the server to return a size other than the one requested.
+    ///
+    /// Only image types are thumbnailed. A PDF or a video has no cheap safe
+    /// thumbnail, and `M_UNSUPPORTED` is the truthful answer.
+    ///
+    /// # Errors
+    ///
+    /// [`MediaError::Unknown`] for an ID nothing is stored under,
+    /// [`MediaError::Unsupported`] for a non-image type, and
+    /// [`MediaError::Unreadable`] when the bytes do not decode as the format
+    /// they were declared to be — the uploader's claim, checked exactly at
+    /// the moment it is first relied upon.
+    pub fn thumbnail(
+        &self,
+        media_id: &str,
+        width: u32,
+        height: u32,
+        crop: bool,
+    ) -> Result<(String, Vec<u8>), MediaError> {
+        let record = self
+            .record(media_id)?
+            .ok_or_else(|| MediaError::Unknown(media_id.to_owned()))?;
+        if !record.content_type.starts_with("image/") || record.content_type == "image/svg+xml" {
+            return Err(MediaError::Unsupported(record.content_type));
+        }
+        let (width, height) = normalize_dimensions(width, height);
+
+        let cache_key = format!(
+            "{}-{}x{}-{}",
+            record.hash,
+            width,
+            height,
+            if crop { "crop" } else { "scale" }
+        );
+        let cache_hash = blake3::hash(cache_key.as_bytes()).to_hex().to_string();
+        let cached = self.blob_path(&cache_hash);
+        if let Ok(bytes) = std::fs::read(&cached) {
+            return Ok(("image/png".to_owned(), bytes));
+        }
+
+        let source =
+            std::fs::read(self.blob_path(&record.hash)).map_err(|_| MediaError::Missing {
+                media_id: media_id.to_owned(),
+                hash: record.hash.clone(),
+            })?;
+        let decoded = image::load_from_memory(&source)
+            .map_err(|error| MediaError::Unreadable(error.to_string()))?;
+        let resized = if crop {
+            decoded.resize_to_fill(width, height, image::imageops::FilterType::Triangle)
+        } else {
+            decoded.resize(width, height, image::imageops::FilterType::Triangle)
+        };
+        let mut bytes = Vec::new();
+        resized
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .map_err(|error| MediaError::Unreadable(error.to_string()))?;
+
+        // Cached exactly like an upload: staging name, then rename, so a
+        // concurrent request never reads a half-written thumbnail.
+        if let Some(parent) = cached.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let staging = cached.with_extension("partial");
+        std::fs::write(&staging, &bytes)?;
+        std::fs::rename(&staging, &cached)?;
+        Ok(("image/png".to_owned(), bytes))
+    }
+
     /// Whether this server is the one that holds `server_name`'s media.
     #[must_use]
     pub fn is_ours(&self, server_name: &str) -> bool {
@@ -231,6 +313,21 @@ impl Media {
         let (second, _) = rest.split_at(2);
         Path::new(&self.root).join(first).join(second).join(hash)
     }
+}
+
+/// Snap requested dimensions to the ladder the spec suggests.
+///
+/// The smallest rung at least as large as the request wins, so a client never
+/// gets less than it asked for unless it asked for more than the largest rung.
+/// A fixed ladder bounds the cache at a handful of files per upload.
+fn normalize_dimensions(width: u32, height: u32) -> (u32, u32) {
+    const LADDER: [(u32, u32); 5] = [(32, 32), (96, 96), (320, 240), (640, 480), (800, 600)];
+    for (rung_width, rung_height) in LADDER {
+        if width <= rung_width && height <= rung_height {
+            return (rung_width, rung_height);
+        }
+    }
+    (800, 600)
 }
 
 /// An opaque, unguessable media ID.
@@ -265,6 +362,10 @@ pub enum MediaError {
         size: usize,
         limit: usize,
     },
+    /// A type this server does not thumbnail.
+    Unsupported(String),
+    /// Bytes that do not decode as the format they were declared to be.
+    Unreadable(String),
     Storage(StoreError),
     Io(String),
     Codec(String),
@@ -298,6 +399,15 @@ impl std::fmt::Display for MediaError {
             ),
             Self::TooLarge { size, limit } => {
                 write!(formatter, "{size} bytes exceeds the {limit}-byte limit")
+            }
+            Self::Unsupported(content_type) => {
+                write!(formatter, "no thumbnails for {content_type}")
+            }
+            Self::Unreadable(message) => {
+                write!(
+                    formatter,
+                    "the bytes do not decode as their declared type: {message}"
+                )
             }
             Self::Storage(error) => write!(formatter, "storage: {error}"),
             Self::Io(message) => write!(formatter, "filesystem: {message}"),

@@ -11,6 +11,11 @@ repository = "https://github.com/tuna-os/spindle"
 argon2 = "0.5"
 axum = "0.8"
 blake3 = "1.8"
+# Thumbnails only. Default features off and codecs named, because the default
+# set drags in every format the crate knows -- each decoder is attack surface
+# fed with attacker-controlled bytes, so the list is the formats we thumbnail
+# and nothing else.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 fjall = "2.11.2"
 proptest = "1.7"
