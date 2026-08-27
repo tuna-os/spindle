@@ -215,6 +215,68 @@ endpoint that matters for new clients anyway.
 
 Nothing is slower than either competitor at any size measured.
 
+## M2 close-out: all three siblings, one sitting — and the loss that earned its keep
+
+The milestone-closing run, 2026-08-27, on the M2-complete server (through
+#113). Four servers, one host, one sitting, cold databases, the machine
+otherwise idle, every serving binary verified by `pgrep` before its leg:
+Spindle, Synapse 1.159.0, Continuwuity 26.8.1, and — for the first time —
+**Tuwunel 1.9.0, built from source** (the release-asset 403 recorded in #42
+stopped blocking once the source tree built here: `liburing-dev`, Rust
+1.95.0, and `RUSTFLAGS="--cfg ruma_unstable_exhaustive_types"`, which
+upstream injects outside the repo). Raw results:
+`docs/benchmarks/data/m2-final.*`, rendered on the comparisons page.
+
+**60 of 63 cells favour Spindle.** Medians, milliseconds, ratio = theirs/ours:
+
+| op/size | spindle | synapse | continuwuity | tuwunel |
+|---|---|---|---|---|
+| send/3200 | 1.18 | 23.3 (19.8×) | 4.02 (3.4×) | 2.74 (2.3×) |
+| join/3200 | 1.41 | 37.7 (26.7×) | 5.95 (4.2×) | 4.31 (3.1×) |
+| messages_page/3200 | 1.00 | 6.99 (7.0×) | 4.08 (4.1×) | 1.86 (1.9×) |
+| context_deep/3200 | 1.18 | 5.03 (4.3×) | 4.57 (3.9×) | 1.79 (1.5×) |
+| state/3200 | 0.53 | 2.58 (4.9×) | 1.16 (2.2×) | 0.86 (1.6×) |
+| sync_initial/3200 | 1.92 | 3.24 (1.7×) | 2.87 (1.5×) | 2.10 (1.1×) |
+| sliding_window/3200 | 1.25 | 8.44 (6.8×) | 1.17 (0.94×) | 1.51 (1.2×) |
+
+(Full 63-cell matrix on the comparisons page; the 200 and 800 columns tell
+the same story.)
+
+### The loss that was real, and what it bought
+
+The first pass of this run reported `sliding_window` at **0.87×** against
+Continuwuity — and it was the only operation whose curve grew with room
+size. Investigated per the roadmap rule that a slower column is a defect
+until explained: bisecting a live server pinned it to the unread count,
+which read **every event body after the receipt floor** to learn its
+sender. A user with no read receipt — every bot, every receipt-less
+client, our own driver — paid O(room) store reads per room per sync,
+classic and sliding alike: 11.79 ms for one sliding sync against a
+3200-event room, 0.49 ms with a receipt at the head. #113 replaced the
+walk with a per-room sender index (two binary searches); the same
+pathological probe now reads 1.00 ms, and the curve above is flat.
+
+### The three cells that remain, and why they stand
+
+`sliding_window/200` (0.99×) and `/3200` (0.94×) vs Continuwuity, and
+`state/200` (0.85×) vs Tuwunel. All three are sub-1.5 ms cells where the
+two servers' bands overlap this host's run-to-run variance — measured, not
+assumed: the same Spindle code produced 1.088, 1.198 and 0.829 ms for
+`sliding_window/800` across three sittings today. None correlates with
+room size (`state` is *flatter* for us: 0.68/0.68/0.53 against Tuwunel's
+0.58/0.77/0.86 — the crossover by 800 is their constant factor being
+smaller at trivial scale, not a curve). Disposition: within noise,
+published, watched at the next milestone close rather than chased into the
+noise floor now.
+
+### What invalidated a run along the way
+
+One intermediate Spindle leg was measured while a RocksDB build saturated
+the cores, and read ~25% slow across the board. Same host and same sitting
+are not enough — **same load** is part of the method, and that run was
+discarded rather than averaged. The final sitting above ran on an idle
+machine.
+
 ## Fork window: bounded search vs exhaustive walk
 
 | Room history | Bounded | Exhaustive | Ratio |
