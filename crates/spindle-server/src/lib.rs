@@ -22,6 +22,7 @@ pub mod federation;
 pub mod filters;
 pub mod mas;
 pub mod media;
+pub mod oidc;
 pub mod previews;
 pub mod profiles;
 pub mod push_rules;
@@ -63,6 +64,9 @@ pub struct AppState {
     /// Present exactly when MSC3861 delegation is configured; its
     /// absence is what "local auth" means everywhere else.
     pub delegated: Option<Arc<delegated::Delegated>>,
+    /// Present exactly when the built-in OIDC provider is configured
+    /// (#159): this server is then its own MSC3861 issuer.
+    pub oidc: Option<Arc<oidc::BuiltinOidc>>,
     pub federation: Arc<federation::Federation>,
 }
 
@@ -154,6 +158,10 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
         .delegated
         .clone()
         .map(|delegated| Arc::new(delegated::Delegated::new(delegated)));
+    let oidc_provider = config
+        .auth
+        .builtin_oidc
+        .then(|| Arc::new(oidc::BuiltinOidc::new()));
     let state = AppState {
         config: Arc::new(config),
         store,
@@ -171,6 +179,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
         profiles,
         appservices,
         delegated,
+        oidc: oidc_provider,
         federation,
     };
     spawn_delivery_loops(&state);

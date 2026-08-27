@@ -12,6 +12,11 @@ This page is the operator's view. The protocol view — what each side
 does and the evidence it works against an unmodified MAS v1.9.0 release
 binary — is [evidence/m4-delegated-auth.md](evidence/m4-delegated-auth.md).
 
+If what you want is modern (OIDC-native) login for Element X without
+deploying a second service at all, that is not this page: see
+[the built-in provider](#the-built-in-provider-modern-login-without-mas)
+below.
+
 ## What turns on, what turns off
 
 With `[auth.delegated]` configured:
@@ -118,3 +123,46 @@ configured. If `whoami` answers `M_UNKNOWN_TOKEN` for a token MAS just
 issued, check the introspection client credentials first — from the
 caller's side, "provider unreachable", "wrong client secret" and
 "revoked token" are deliberately the same answer.
+
+## The built-in provider: modern login without MAS
+
+MSC3861-native clients — Element X natively, Element Web behind
+`feature_oidc_native_flow` — log in through an OAuth 2.0 provider or
+not at all. Running MAS buys the full identity stack, but it also
+costs a second service and the PostgreSQL it requires, which is a lot
+of ceremony for a single-node server whose accounts already live in
+Spindle. The other answer:
+
+```toml
+[server]
+# The issuer; omit it and https://<server.name> is used.
+public_base_url = "https://matrix.example.org"
+
+[auth]
+builtin_oidc = true
+```
+
+With that, Spindle itself serves the small provider surface those
+clients need — discovery (`/.well-known/openid-configuration`, relayed
+by `auth_metadata`), dynamic client registration (RFC 7591), an
+authorization page over Spindle's own accounts and passwords, PKCE
+`S256` (mandatory — `plain` is refused), token exchange, refresh and
+revocation (RFC 7009). Both MSC2967 scope spellings are accepted, the
+current `urn:matrix:client:*` and the legacy
+`urn:matrix:org.matrix.msc2967.client:*`.
+
+The decisive simplification is that **the tokens it mints are Spindle's
+native sessions** — the token endpoint calls the same session machinery
+as a password login, so there is no introspection hop, no JWT
+machinery, no signing keys to rotate, and nothing new to back up.
+Password login and registration stay on: the provider is a second door
+into the same accounts, not a second set of accounts.
+
+It is the floor, not a MAS replacement: no upstream identity providers,
+no SSO, no email flows, no account-management UI. When you need those,
+deploy MAS — `builtin_oidc` and `[auth.delegated]` refuse to be
+configured together, because one identity authority is the point.
+
+The proof it works — Element Web completing the whole OIDC-native flow
+against a lone Spindle process, with nothing else running — is
+[evidence/builtin-oidc.md](evidence/builtin-oidc.md).

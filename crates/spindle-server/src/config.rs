@@ -39,6 +39,14 @@ pub struct AuthConfig {
     /// point, and two is how accounts drift apart.
     #[serde(default)]
     pub delegated: Option<DelegatedAuthConfig>,
+    /// The built-in OIDC provider (#159): this server issues its own
+    /// authorization codes and sessions over the accounts it already
+    /// holds, so Element X's OIDC-native login works from one binary
+    /// with nothing else deployed. The floor, not a MAS replacement —
+    /// upstream identity providers, SSO and account management are what
+    /// `[auth.delegated]` and a real MAS are for.
+    #[serde(default)]
+    pub builtin_oidc: bool,
 }
 
 /// The delegated provider, named explicitly rather than discovered at
@@ -312,6 +320,15 @@ impl Config {
             return Err(ConfigError::Invalid {
                 field: "server.bind",
                 message: format!("{:?} is not an address:port", self.server.bind),
+            });
+        }
+        // One identity authority is the point of both modes; a server
+        // with two would mint accounts nobody can say who owns.
+        if self.auth.builtin_oidc && self.auth.delegated.is_some() {
+            return Err(ConfigError::Invalid {
+                field: "auth.builtin_oidc",
+                message: "cannot be combined with auth.delegated — pick one identity authority"
+                    .to_owned(),
             });
         }
         Ok(())

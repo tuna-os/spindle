@@ -239,6 +239,12 @@ pub enum Keyspace {
     /// and acknowledgement re-delivers — at-least-once, made idempotent
     /// on the service's side by the transaction ID.
     AppserviceCursor = 0x24,
+    /// `client_id` → a dynamically registered OAuth 2.0 client (#159).
+    ///
+    /// 0x25 is deliberately skipped: the admin audit log claims it on a
+    /// concurrent branch, and two keyspaces colliding on a discriminant
+    /// would silently interleave.
+    OidcClient = 0x26,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -263,6 +269,14 @@ pub fn profile(user_id: &str) -> Vec<u8> {
 pub fn appservice_cursor(appservice_id: &str) -> Vec<u8> {
     let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::AppserviceCursor as u8];
     key.extend_from_slice(appservice_id.as_bytes());
+    key
+}
+
+/// One dynamically registered OAuth 2.0 client.
+#[must_use]
+pub fn oidc_client(client_id: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::OidcClient as u8];
+    key.extend_from_slice(client_id.as_bytes());
     key
 }
 

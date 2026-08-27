@@ -21,6 +21,16 @@ bind = "127.0.0.1:8008"
 [storage]
 path = "./data"
 
+[auth]
+# Serve a minimal OAuth 2.0 / OIDC provider from this same process, so
+# MSC3861-native clients (Element X; Element Web's OIDC flow) can log in
+# with no separate Matrix Authentication Service deployed. Tokens it
+# mints are ordinary Spindle sessions. The issuer is
+# `server.public_base_url` (falling back to `https://<server.name>`);
+# mutually exclusive with `[auth.delegated]`. See docs/delegated-auth.md
+# for both options.
+# builtin_oidc = false
+
 [logging]
 # A `tracing-subscriber` filter directive.
 # filter = "spindle=debug,warn"
