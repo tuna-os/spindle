@@ -237,6 +237,19 @@ pub struct TimelineEvent {
     pub json: Value,
 }
 
+/// One log entry as the admin timeline shows it: the spine always, the
+/// body only while it exists. `json: None` with the entry present is the
+/// mark of a purge — the distinction #83 §3 says a purge must preserve.
+#[derive(Clone, Debug)]
+pub struct AdminTimelineEntry {
+    pub li: i64,
+    pub event_id: String,
+    /// This server's chain attestation, `None` for backfilled history.
+    pub chain: Option<[u8; 32]>,
+    /// `None` when the body was purged.
+    pub json: Option<Value>,
+}
+
 impl Rooms {
     #[must_use]
     pub fn new(store: Arc<FjallStore>, server_name: impl Into<String>) -> Self {
@@ -1491,59 +1504,7 @@ impl Rooms {
         room_id: &str,
         anchor: &StateAtAnchor,
     ) -> Result<(i64, String, bool, Vec<Value>), RoomError> {
-        let resolve = |li: i64| -> Result<(i64, String), RoomError> {
-            self.with_room(room_id, |_, log| {
-                log.entry_at_or_before(li)
-                    .map(|entry| (entry.li.get(), entry.event_id.as_str().to_owned()))
-                    .ok_or_else(|| RoomError::UnknownState("entry at or before that point".into()))
-            })
-        };
-        let (li, event_id) = match anchor {
-            StateAtAnchor::Li(li) => resolve(*li)?,
-            StateAtAnchor::Event(id) => self.with_room(room_id, |_, log| {
-                log.get(&EventId::new(id.as_str()))
-                    .map(|entry| (entry.li.get(), entry.event_id.as_str().to_owned()))
-                    .ok_or_else(|| RoomError::UnknownState("such an event in this room".into()))
-            })?,
-            StateAtAnchor::Ts(wanted) => {
-                let (mut low, high) = self.with_room(room_id, |_, log| {
-                    let mut entries = log.entries();
-                    let first = entries.next().map(|entry| entry.li.get());
-                    let last = entries.next_back().map(|entry| entry.li.get());
-                    Ok((first, last.or(first)))
-                })?;
-                let (Some(mut low_li), Some(mut high_li)) = (low.take(), high) else {
-                    return Err(RoomError::UnknownState("entries in this room".into()));
-                };
-                let ts_of = |li: i64| -> Result<(i64, u64), RoomError> {
-                    let (li, event_id) = resolve(li)?;
-                    let event = self.event(room_id, &event_id)?;
-                    Ok((li, event["origin_server_ts"].as_u64().unwrap_or(0)))
-                };
-                let (first_li, first_ts) = ts_of(low_li)?;
-                if first_ts > *wanted {
-                    return Err(RoomError::UnknownState(
-                        "entry at or before that time".into(),
-                    ));
-                }
-                // Invariant: the entry at or before `low_li` is at or
-                // under the wanted time. Probe above the midpoint so the
-                // range always narrows; a probe landing in a gap between
-                // entries resolves to the nearest entry below it, which
-                // both branches handle.
-                low_li = first_li;
-                while low_li < high_li {
-                    let probe = low_li + (high_li - low_li + 1) / 2;
-                    let (entry_li, entry_ts) = ts_of(probe)?;
-                    if entry_ts <= *wanted {
-                        low_li = probe;
-                    } else {
-                        high_li = entry_li - 1;
-                    }
-                }
-                resolve(low_li)?
-            }
-        };
+        let (li, event_id) = self.resolve_anchor(room_id, anchor)?;
 
         let root_or_resident = self.with_room(room_id, |_, log| {
             if let Some(snapshot) = log.state_after(spindle_core::LinearIndex::from_raw(li)) {
@@ -1568,6 +1529,94 @@ impl Rooms {
             Err(root) => (false, self.state_at(room_id, root)?),
         };
         Ok((li, event_id, resident, state))
+    }
+
+    /// Resolve a [`StateAtAnchor`] to the log entry it names — shared by
+    /// `admin_state_at` and `purge_history`, so "the point before 14:03"
+    /// means the same entry whether it is being read or purged to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] for a room that does not
+    /// exist, and [`RoomError::UnknownState`] when the log starts after
+    /// the requested point or the event is not in this room.
+    pub fn resolve_anchor(
+        &self,
+        room_id: &str,
+        anchor: &StateAtAnchor,
+    ) -> Result<(i64, String), RoomError> {
+        let resolve = |li: i64| -> Result<(i64, String), RoomError> {
+            self.with_room(room_id, |_, log| {
+                log.entry_at_or_before(li)
+                    .map(|entry| (entry.li.get(), entry.event_id.as_str().to_owned()))
+                    .ok_or_else(|| RoomError::UnknownState("entry at or before that point".into()))
+            })
+        };
+        match anchor {
+            StateAtAnchor::Li(li) => resolve(*li),
+            StateAtAnchor::Event(id) => self.with_room(room_id, |_, log| {
+                log.get(&EventId::new(id.as_str()))
+                    .map(|entry| (entry.li.get(), entry.event_id.as_str().to_owned()))
+                    .ok_or_else(|| RoomError::UnknownState("such an event in this room".into()))
+            }),
+            StateAtAnchor::Ts(wanted) => {
+                let (mut low, high) = self.with_room(room_id, |_, log| {
+                    let mut entries = log.entries();
+                    let first = entries.next().map(|entry| entry.li.get());
+                    let last = entries.next_back().map(|entry| entry.li.get());
+                    Ok((first, last.or(first)))
+                })?;
+                let (Some(mut low_li), Some(mut high_li)) = (low.take(), high) else {
+                    return Err(RoomError::UnknownState("entries in this room".into()));
+                };
+                let ts_of = |li: i64| -> Result<(i64, u64), RoomError> {
+                    let (mut li, mut event_id) = resolve(li)?;
+                    loop {
+                        match self.event(room_id, &event_id) {
+                            Ok(event) => {
+                                return Ok((li, event["origin_server_ts"].as_u64().unwrap_or(0)));
+                            }
+                            // A purged body cannot say when it happened;
+                            // the nearest surviving predecessor bounds it
+                            // from below — state bodies survive every
+                            // purge, so the walk terminates. A fully
+                            // purged prefix reads as time zero, which
+                            // resolves conservatively into the purge.
+                            Err(RoomError::MissingBody(_)) => match resolve(li - 1) {
+                                Ok((below_li, below_id)) => {
+                                    li = below_li;
+                                    event_id = below_id;
+                                }
+                                Err(_) => return Ok((li, 0)),
+                            },
+                            Err(error) => return Err(error),
+                        }
+                    }
+                };
+                let (first_li, first_ts) = ts_of(low_li)?;
+                if first_ts > *wanted {
+                    return Err(RoomError::UnknownState(
+                        "entry at or before that time".into(),
+                    ));
+                }
+                // Invariant: the entry at or before `low_li` is at or
+                // under the wanted time. Probe above the midpoint so the
+                // range always narrows; a probe landing in a gap between
+                // entries resolves to the nearest entry below it, which
+                // both branches handle.
+                low_li = first_li;
+                while low_li < high_li {
+                    let probe = low_li + (high_li - low_li + 1) / 2;
+                    let (entry_li, entry_ts) = ts_of(probe)?;
+                    if entry_ts <= *wanted {
+                        low_li = probe;
+                    } else {
+                        high_li = entry_li - 1;
+                    }
+                }
+                resolve(low_li)
+            }
+        }
     }
 
     /// Every room this server holds, from the stored metadata rows.
@@ -1625,25 +1674,28 @@ impl Rooms {
         from: Option<i64>,
         limit: usize,
         forward: bool,
-    ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
+    ) -> Result<(Vec<AdminTimelineEntry>, Option<i64>), RoomError> {
         let (wanted, next) = self.with_room(room_id, |_, log| {
             let mut wanted = Vec::new();
             let mut next = None;
-            let mut visit = |li: i64, event_id: &str| {
+            let mut visit = |entry: &LogEntry| {
                 if wanted.len() == limit {
-                    next = Some(li);
+                    next = Some(entry.li.get());
                     return true;
                 }
-                wanted.push((li, event_id.to_owned()));
+                wanted.push((
+                    entry.li.get(),
+                    entry.event_id.as_str().to_owned(),
+                    entry.chain.map(|chain| *chain.as_bytes()),
+                ));
                 false
             };
             if forward {
                 for entry in log.entries() {
-                    let li = entry.li.get();
-                    if from.is_some_and(|from| li <= from) {
+                    if from.is_some_and(|from| entry.li.get() <= from) {
                         continue;
                     }
-                    if visit(li, entry.event_id.as_str()) {
+                    if visit(entry) {
                         break;
                     }
                 }
@@ -1652,11 +1704,10 @@ impl Rooms {
                 next = next.map(|li| li - 1);
             } else {
                 for entry in log.entries().rev() {
-                    let li = entry.li.get();
-                    if from.is_some_and(|from| li >= from) {
+                    if from.is_some_and(|from| entry.li.get() >= from) {
                         continue;
                     }
-                    if visit(li, entry.event_id.as_str()) {
+                    if visit(entry) {
                         break;
                     }
                 }
@@ -1665,12 +1716,84 @@ impl Rooms {
             Ok((wanted, next))
         })?;
 
+        let watermark = self.purge_watermark(room_id)?;
         let mut out = Vec::with_capacity(wanted.len());
-        for (li, event_id) in wanted {
-            let json = self.read_event(room_id, &EventId::new(event_id.as_str()))?;
-            out.push(TimelineEvent { event_id, li, json });
+        for (li, event_id, chain) in wanted {
+            let json = match self.read_event(room_id, &EventId::new(event_id.as_str())) {
+                Ok(json) => Some(json),
+                Err(RoomError::MissingBody(_)) if watermark.is_some_and(|mark| li < mark) => None,
+                Err(error) => return Err(error),
+            };
+            out.push(AdminTimelineEntry {
+                li,
+                event_id,
+                chain,
+                json,
+            });
         }
         Ok((out, next))
+    }
+
+    /// The first `li` NOT covered by a history purge, if one ever ran.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the row cannot be read.
+    pub fn purge_watermark(&self, room_id: &str) -> Result<Option<i64>, RoomError> {
+        Ok(spindle_store::ReadView::get(
+            self.store.as_ref(),
+            &spindle_core::keys::purge_watermark(room_id),
+        )?
+        .and_then(|raw| raw.get(..8).map(|bytes| bytes.try_into().unwrap_or([0; 8])))
+        .map(i64::from_be_bytes))
+    }
+
+    /// Purge history before `before_li`: delete the bodies, keep the spine.
+    ///
+    /// What is deleted is exactly the content-bearing records — the bodies
+    /// of non-state events below the cutoff. Everything else survives on
+    /// purpose (#83 §3): the log entries `(li, event_id, chain)`, because
+    /// `ChainHash::extend` hashes event IDs and deleting an entry would
+    /// break every chain value after it; state event bodies, because
+    /// current state and `state_at` must keep folding from the log; and
+    /// the trie nodes, which hold event IDs, never content. The watermark
+    /// is written before the deletes so a crash between them leaves
+    /// below-the-mark gaps reading as "purged", never as corruption.
+    ///
+    /// Returns how many event bodies were actually deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] for a room that does not exist,
+    /// or [`RoomError`] if the store cannot be written.
+    pub fn purge_history(&self, room_id: &str, before_li: i64) -> Result<u64, RoomError> {
+        let victims = self.with_room(room_id, |_, log| {
+            Ok(log
+                .entries()
+                .take_while(|entry| entry.li.get() < before_li)
+                .filter(|entry| entry.state_key.is_none())
+                .map(|entry| entry.event_id.as_str().to_owned())
+                .collect::<Vec<_>>())
+        })?;
+        // The watermark only moves forward: a second, shallower purge must
+        // not un-mark entries the first one already deleted.
+        let mark = self
+            .purge_watermark(room_id)?
+            .map_or(before_li, |existing| existing.max(before_li));
+        spindle_store::Store::put(
+            self.store.as_ref(),
+            &spindle_core::keys::purge_watermark(room_id),
+            &mark.to_be_bytes(),
+        )?;
+        let mut purged = 0;
+        for event_id in &victims {
+            let key = event_body_key(room_id, event_id);
+            if spindle_store::ReadView::get(self.store.as_ref(), &key)?.is_some() {
+                spindle_store::Store::delete(self.store.as_ref(), &key)?;
+                purged += 1;
+            }
+        }
+        Ok(purged)
     }
 
     /// Events in `li` order, newest first, starting below `from`.
@@ -1709,9 +1832,19 @@ impl Rooms {
         })?;
 
         let (wanted, next) = wanted;
+        let watermark = self.purge_watermark(room_id)?;
         let mut out = Vec::with_capacity(wanted.len());
         for (li, event_id) in wanted {
-            let json = self.read_event(room_id, &EventId::new(event_id.as_str()))?;
+            let json = match self.read_event(room_id, &EventId::new(event_id.as_str())) {
+                Ok(json) => json,
+                // SPEC/#83 §3: a purged entry is a marker, not a hole —
+                // the client can tell "deleted on purpose" from "never
+                // existed", which is the property purge preserves.
+                Err(RoomError::MissingBody(_)) if watermark.is_some_and(|mark| li < mark) => {
+                    purged_marker()
+                }
+                Err(error) => return Err(error),
+            };
             out.push(TimelineEvent { event_id, li, json });
         }
         Ok((out, next))
@@ -2387,7 +2520,14 @@ impl Rooms {
             let Some((rel_type, event_id)) = decode_relation(&value) else {
                 continue;
             };
-            let event = self.event(room_id, &event_id)?;
+            // A purged child cannot contribute to an aggregate — its
+            // content is gone, so counting or previewing it would invent
+            // what was deleted. Skipped, not an error.
+            let event = match self.event(room_id, &event_id) {
+                Ok(event) => event,
+                Err(RoomError::MissingBody(_)) => continue,
+                Err(error) => return Err(error),
+            };
             // Redacted: the relation is gone from the content, so it is gone
             // from the aggregate.
             if relates_to(&event["content"]).is_none() {
@@ -3508,6 +3648,19 @@ impl ReceiptRecord {
         let event_id = String::from_utf8(bytes.get(16..)?.to_vec()).ok()?;
         Some(Self { event_id, li, ts })
     }
+}
+
+/// The event-shaped marker a purged entry renders as in a timeline.
+///
+/// The `event_id` is stamped on by the caller like any other timeline
+/// event — it is the one thing the purge kept. Everything content-bearing
+/// is honestly absent, and the type is unmistakably not a real event, so
+/// clients that do not know it render nothing rather than something wrong.
+fn purged_marker() -> Value {
+    serde_json::json!({
+        "type": "org.spindle.purged",
+        "content": {},
+    })
 }
 
 /// Event bodies live beside the log, keyed by room and event ID.
