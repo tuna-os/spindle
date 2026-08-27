@@ -241,6 +241,99 @@ async fn a_wrong_token_is_still_a_wrong_token() {
 }
 
 #[tokio::test]
+async fn the_appservice_registration_type_skips_uia_entirely() {
+    let harness = Harness::new();
+    // No `auth` dict, no session, no password: the as_token is the proof.
+    let (status, body) = harness
+        .send(
+            "POST",
+            "/_matrix/client/v3/register",
+            AS_TOKEN,
+            &json!({
+                "type": "m.login.application_service",
+                "username": "_bridge_new",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["user_id"], "@_bridge_new:example.org", "{body}");
+    let token = body["access_token"].as_str().unwrap();
+    // And the session it returns is a real one.
+    let (status, body) = harness
+        .get("/_matrix/client/v3/account/whoami", token)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["user_id"], "@_bridge_new:example.org");
+}
+
+#[tokio::test]
+async fn appservice_registration_outside_the_namespace_is_exclusive() {
+    let harness = Harness::new();
+    let (status, body) = harness
+        .send(
+            "POST",
+            "/_matrix/client/v3/register",
+            AS_TOKEN,
+            &json!({
+                "type": "m.login.application_service",
+                "username": "eve",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["errcode"], "M_EXCLUSIVE", "{body}");
+}
+
+#[tokio::test]
+async fn appservice_registration_without_the_token_is_refused() {
+    let harness = Harness::new();
+    let (status, body) = harness
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/_matrix/client/v3/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "type": "m.login.application_service",
+                        "username": "_bridge_impostor",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["errcode"], "M_UNKNOWN_TOKEN", "{body}");
+}
+
+#[tokio::test]
+async fn an_exclusive_namespace_refuses_ordinary_registration() {
+    let harness = Harness::new();
+    // A human walks in wearing a bridge name. The reservation answers
+    // before the UIA dance would even start.
+    let (status, body) = harness
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/_matrix/client/v3/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "username": "_bridge_stolen",
+                        "password": "hunter2",
+                        "auth": { "type": "m.login.dummy", "session": "register" },
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_EXCLUSIVE", "{body}");
+}
+
+#[tokio::test]
 async fn a_provisioned_ghost_cannot_be_logged_into_from_outside() {
     // The virtual account exists after first use, but its password is
     // random and held by nobody — the appservice door is the only door.

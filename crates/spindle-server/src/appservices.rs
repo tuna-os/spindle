@@ -209,6 +209,21 @@ impl Appservices {
     pub fn all(&self) -> &[Arc<Registration>] {
         &self.list
     }
+
+    /// Whether any service holds an *exclusive* users-namespace claim on
+    /// `user_id`. Exclusivity is a reservation against everyone else:
+    /// ordinary registration must refuse the name, or the service arrives
+    /// to find its namespace squatted.
+    #[must_use]
+    pub fn exclusively_claims(&self, user_id: &str) -> bool {
+        self.list.iter().any(|registration| {
+            registration
+                .namespaces
+                .users
+                .iter()
+                .any(|namespace| namespace.exclusive && namespace.matches(user_id))
+        })
+    }
 }
 
 /// At most this many events ride one transaction; the rest wait for the
