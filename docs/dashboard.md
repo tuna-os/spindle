@@ -17,7 +17,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 |---|---|---|---|
 | M0 | Prove the core | **Done** | Fork resolution vs ruma-state-res and HAMT-vs-im benchmarks published on the [benchmark site](https://tuna-os.github.io/spindle/); durability and recovery covered by restart and torn-write tests. |
 | M1 | Usable local homeserver | **Done** | Full local CS-API surface with classic `/sync`; leftovers tracked on #7 (room upgrade, spaces, search, pushers, OpenAPI validation, Element Web rig). Benchmarked vs Synapse and Continuwuity — see docs/benchmarks.md. |
-| M2 | Modern encrypted clients | In progress | Landed: authenticated media + thumbnails (#99, #104), Simplified Sliding Sync (#105), E2EE key/to-device transport (#106), fallback keys + device-list tracking (#107), key backup + cross-signing. Remaining: S3 media backend, URL previews. |
+| M2 | Modern encrypted clients | In progress | Landed: authenticated media + thumbnails (#99, #104), Simplified Sliding Sync (#105), E2EE key/to-device transport (#106), fallback keys + device-list tracking (#107), key backup + cross-signing (#108), URL previews with an SSRF vetting resolver. Remaining: S3 media backend, then the M2 close-out benchmark. |
 | M3 | Ordinary Matrix federation | Not started | #14 #15 #16 — includes the federated fork-proof rig, which is where the no-state-resolution claim meets adversarial evidence. |
 | M4 | Ecosystem integration | Not started | #18 appservices, #17 MAS/OIDC. |
 | M5 | Production lifecycle | Not started | #19 #20 #21; #42's parity gate vs Synapse and Tuwunel is part of the definition of done. |
@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**71 routes implemented; 25 known gaps in scope.**
+**72 routes implemented; 24 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -61,15 +61,15 @@ neither implemented nor counted.
 - ⏳ `GET /_matrix/client/v3/pushers` — pusher list (#7)
 - ⏳ `POST /_matrix/client/v3/pushers/set` — pusher registration (#7)
 
-### Media — 6 implemented, 1 planned
+### Media — 7 implemented, 0 planned
 
 - `GET /_matrix/client/v1/media/config`
 - `GET /_matrix/client/v1/media/download/{server_name}/{media_id}`
 - `GET /_matrix/client/v1/media/download/{server_name}/{media_id}/{file_name}`
+- `GET /_matrix/client/v1/media/preview_url`
 - `GET /_matrix/client/v1/media/thumbnail/{server_name}/{media_id}`
 - `GET /_matrix/media/v3/config`
 - `POST /_matrix/media/v3/upload`
-- ⏳ `GET /_matrix/client/v1/media/preview_url` — URL previews (M2, SSRF-gated)
 
 ### Timeline, messaging & search — 11 implemented, 2 planned
 

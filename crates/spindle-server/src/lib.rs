@@ -17,6 +17,7 @@ pub mod directory;
 pub mod errors;
 pub mod filters;
 pub mod media;
+pub mod previews;
 pub mod push_rules;
 pub mod ratelimit;
 pub mod rooms;
@@ -49,18 +50,39 @@ pub struct AppState {
     pub media: Arc<media::Media>,
     pub devices: Arc<devices::Devices>,
     pub backups: Arc<backups::Backups>,
+    pub previews: Arc<previews::Previews>,
 }
+
+/// Why the application cannot be built. Both are startup-fatal on purpose:
+/// a server without a signing key cannot create a single valid event, and a
+/// preview allow-list that failed to parse must not fail *open*.
+#[derive(Debug)]
+pub enum AppError {
+    Signing(signing::SigningError),
+    PreviewConfig(String),
+}
+
+impl std::fmt::Display for AppError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Signing(error) => write!(formatter, "signing key: {error}"),
+            Self::PreviewConfig(why) => write!(formatter, "preview config: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for AppError {}
 
 /// Build the HTTP application.
 ///
 /// # Errors
 ///
-/// Returns [`signing::SigningError`] if the server's signing key can be neither
-/// loaded nor created. Fatal rather than degraded: a server without a key
-/// cannot create a single valid event, so starting anyway would mean accepting
-/// writes it can only produce invalid results for.
-pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, signing::SigningError> {
-    let key = Arc::new(signing::ServerKey::load_or_create(store.as_ref())?);
+/// Returns [`AppError`] if the server's signing key can be neither loaded
+/// nor created, or if the preview allow-list does not parse. Fatal rather
+/// than degraded in both cases — see [`AppError`].
+pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
+    let key =
+        Arc::new(signing::ServerKey::load_or_create(store.as_ref()).map_err(AppError::Signing)?);
     let rooms = Arc::new(rooms::Rooms::new(
         Arc::clone(&store),
         config.server.name.clone(),
@@ -81,6 +103,14 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, signing::Si
         Arc::clone(&store),
         config.server.name.clone(),
     ));
+    let previews = Arc::new(
+        previews::Previews::new(
+            Arc::clone(&store),
+            Arc::clone(&media),
+            &config.previews.allow_private,
+        )
+        .map_err(|error| AppError::PreviewConfig(error.to_string()))?,
+    );
     let state = AppState {
         config: Arc::new(config),
         store,
@@ -94,6 +124,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, signing::Si
         media,
         devices: Arc::new(devices::Devices::new(store_for_devices)),
         backups: Arc::new(backups::Backups::new(store_for_backups)),
+        previews,
     };
     Ok(routes::router(state))
 }

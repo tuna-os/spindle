@@ -1,0 +1,6 @@
+<html><head>
+                        <title>Fallback</title>
+                        <meta property="og:title" content="A &amp; B"/>
+                        <meta property="og:description" content="described">
+                        <meta property="og:image" content="/img.png">
+                        </head><body>body text</body></html>

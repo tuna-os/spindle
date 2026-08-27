@@ -333,6 +333,7 @@ fn media_routes() -> Router<AppState> {
         )
         .route("/_matrix/media/v3/config", get(media_config))
         .route("/_matrix/client/v1/media/config", get(media_config))
+        .route("/_matrix/client/v1/media/preview_url", get(preview_url))
         .route(
             "/_matrix/client/v1/media/download/{server_name}/{media_id}",
             get(download_media),
@@ -381,6 +382,48 @@ async fn upload_media(
 #[derive(Debug, Deserialize)]
 struct UploadQuery {
     filename: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PreviewQuery {
+    url: String,
+    // `ts` (the point in history to preview at) is accepted and ignored: we
+    // keep no preview history, and serving the current preview for any ts
+    // is within what the spec allows.
+    #[allow(dead_code)]
+    ts: Option<u64>,
+}
+
+/// `GET /_matrix/client/v1/media/preview_url`
+async fn preview_url(
+    State(state): State<AppState>,
+    Authenticated(_identity): Authenticated,
+    axum::extract::Query(query): axum::extract::Query<PreviewQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    if !state.config.previews.enabled {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_UNRECOGNIZED",
+            "URL previews are disabled on this server".to_owned(),
+        ));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    match state.previews.preview(&query.url, now).await {
+        Ok(og) => Ok(Json(og)),
+        // A refused URL and an unfetchable page must stay distinguishable:
+        // the refusal is policy and retrying is pointless; the fetch failure
+        // is the internet being the internet.
+        Err(crate::previews::PreviewError::Refused(why)) => Err(MatrixError::forbidden(&why)),
+        Err(crate::previews::PreviewError::Unfetchable(why)) => Err(MatrixError::new(
+            StatusCode::BAD_GATEWAY,
+            "M_UNKNOWN",
+            format!("cannot preview that page: {why}"),
+        )),
+        Err(crate::previews::PreviewError::Storage(why)) => Err(MatrixError::internal(&why)),
+    }
 }
 
 /// `GET /_matrix/media/v3/config` and its `/client/v1` twin.

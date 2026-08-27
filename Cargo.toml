@@ -10,6 +10,7 @@ repository = "https://github.com/tuna-os/spindle"
 [workspace.dependencies]
 argon2 = "0.5"
 axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "stream"] }
 blake3 = "1.8"
 # Thumbnails only. Default features off and codecs named, because the default
 # set drags in every format the crate knows -- each decoder is attack surface

@@ -179,6 +179,13 @@ pub enum Keyspace {
     KeyBackupData = 0x1b,
     /// `(user_id, key_type)` -> a cross-signing key (master, self, user).
     CrossSigning = 0x1c,
+    /// `blake3(url)` -> a cached URL preview.
+    ///
+    /// Hashed rather than raw because the URL is unbounded and user-chosen,
+    /// and keys should be neither. Cache-global, not per-user: the preview
+    /// of a public page is the same for everyone, and a per-user copy would
+    /// multiply fetches of third-party sites by the user count.
+    UrlPreview = 0x1d,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes

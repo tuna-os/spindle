@@ -19,6 +19,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub ratelimit: RateLimitConfig,
+    #[serde(default)]
+    pub previews: PreviewConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -60,6 +62,37 @@ impl Default for RateLimitConfig {
 
 const fn default_true() -> bool {
     true
+}
+
+/// URL preview fetching.
+///
+/// The preview endpoint makes the server fetch attacker-chosen URLs, which
+/// is the textbook server-side request forgery vector: "preview this" must
+/// never become a way to read the metadata service, the loopback admin
+/// port, or anything else on the inside of the network the server sits in.
+/// Private, loopback, link-local and otherwise non-global ranges are
+/// therefore refused *by resolved address*, always. `allow_private` opens
+/// named CIDR ranges back up — it exists for tests, which serve their
+/// fixtures on 127.0.0.1, and for the rare deployment that genuinely wants
+/// previews of an internal wiki and says so explicitly, range by range.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// CIDR ranges exempted from the private-address refusal, e.g.
+    /// `["127.0.0.0/8"]`.
+    #[serde(default)]
+    pub allow_private: Vec<String>,
+}
+
+impl Default for PreviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_private: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

@@ -296,6 +296,12 @@ impl Media {
         Ok(("image/png".to_owned(), bytes))
     }
 
+    /// The `mxc://` URI for one of this server's media IDs.
+    #[must_use]
+    pub fn mxc(&self, media_id: &str) -> String {
+        format!("mxc://{}/{media_id}", self.server_name)
+    }
+
     /// Whether this server is the one that holds `server_name`'s media.
     #[must_use]
     pub fn is_ours(&self, server_name: &str) -> bool {
