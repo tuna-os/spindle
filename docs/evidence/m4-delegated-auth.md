@@ -109,15 +109,43 @@ $ sleep 125; curl -H "Authorization: Bearer mct_…3" …/account/whoami
 {"errcode":"M_UNKNOWN_TOKEN","error":"the access token is not valid"}
 ```
 
+## Element Web, through the front door
+
+The milestone's headline exit criterion, run for real: **Element Web
+v1.12.26** (release tarball, `feature_oidc_native_flow` enabled) served
+at one origin, Spindle at another, MAS at a third, driven by a scripted
+browser (Chromium via Playwright) with no test double anywhere:
+
+1. Element discovers the provider through Spindle's MSC2965
+   advertisement, registers itself with MAS by dynamic client
+   registration, and hands the user to `{issuer}/login` — MAS's own
+   page, not Element's.
+2. alice signs in with her MAS password, passes MAS's consent screen
+   for the newly registered client, and is redirected back.
+3. Element lands on `#/home` — *"Welcome @alice:127.0.0.1:8008"* — and
+   proceeds to make 41 client-API calls to Spindle with the
+   provider-issued token, including E2EE device-key bootstrap (the
+   backup prompt appears, meaning key upload against Spindle worked).
+
+Two Spindle bugs and one MAS deployment fact fell out of doing it for
+real, which is the argument for doing it for real:
+
+- **Spindle sent no CORS headers.** Every native client and Complement's
+  Go client worked; a browser blocked every response. The spec's
+  Web Browser Clients section is now implemented (`routes::cors`) and
+  pinned by `tests/browser_cors.rs` — Complement can never catch this
+  class, since its client sends no `Origin`.
+- **Element asks the unstable MSC2965 path first**
+  (`/_matrix/client/unstable/org.matrix.msc2965/auth_metadata`); a
+  server answering only the stable `/v1/auth_metadata` looks
+  undelegated to it. Spindle now serves both.
+- MAS's registration policy refuses `http://` client URIs by default;
+  the sandbox run needed `policy.data.client_registration.
+  allow_insecure_uris: true`. A production deployment on https never
+  hits this.
+
 ## What this does not show
 
-- **A browser login through Element.** The OAuth authorization-code
-  flow (MAS's login pages → redirect back to the client) runs entirely
-  between the client and MAS; Spindle only ever sees the resulting
-  access token, which is exactly what the introspection path above
-  exercises. A human-run pass with Element Web against this pair is
-  still worth doing before calling the milestone's UX proven.
-- **E2EE through a delegated session** — device key upload works (the
-  device row exists), but a full cross-signing reset driven from MAS's
-  account UI has no test yet; `allow_cross_signing_reset` is an
-  acknowledged no-op because Spindle imposes no UIA there.
+- **A full cross-signing reset driven from MAS's account UI** —
+  `allow_cross_signing_reset` is an acknowledged no-op because Spindle
+  imposes no UIA on that upload; the reset flow end-to-end has no test.

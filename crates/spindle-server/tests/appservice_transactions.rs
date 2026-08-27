@@ -244,10 +244,15 @@ impl Instance {
     }
 }
 
-/// Poll until `check` passes or five seconds elapse — push delivery rides
-/// the poll interval of the push loop.
+/// Poll until `check` passes or twenty seconds elapse. The horizon has
+/// to clear the push loop's *capped backoff*, not just its poll
+/// interval: a test that refuses every delivery walks the backoff to
+/// its 2⁶ ceiling (3.2 s at the test's 50 ms base), and a loaded CI
+/// runner burning a couple of extra refused attempts pushed the next
+/// one past the old five-second window — a real flake, once. Passing
+/// checks still return on the spot, so the generous cap costs nothing.
 async fn eventually(mut check: impl FnMut() -> bool) -> bool {
-    for _ in 0..100 {
+    for _ in 0..400 {
         if check() {
             return true;
         }

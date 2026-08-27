@@ -84,7 +84,43 @@ pub fn router(state: AppState) -> Router {
         // Complement's TestUnknownEndpoints) read the errcode to tell "this
         // server does not speak that" from "the thing was not found".
         .fallback(unknown_endpoint)
+        .layer(axum::middleware::from_fn(cors))
         .with_state(state)
+}
+
+/// SPEC (client-server, Web Browser Clients): every response carries the
+/// recommended CORS headers, and a preflight `OPTIONS` succeeds without
+/// reaching a handler. Without this, no client running *in a browser* —
+/// Element Web first among them — can make a single request: the
+/// browser blocks every cross-origin response before the app sees it,
+/// which presents as "cannot reach homeserver" against a server that is
+/// reachable fine from curl and every native client. Complement's Go
+/// client never sends an Origin header, which is why no ratcheted test
+/// could have caught the omission — a real browser did.
+async fn cors(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let preflight = request.method() == axum::http::Method::OPTIONS;
+    let mut response = if preflight {
+        axum::response::Response::new(axum::body::Body::empty())
+    } else {
+        next.run(request).await
+    };
+    let headers = response.headers_mut();
+    headers.insert(
+        "access-control-allow-origin",
+        axum::http::HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        "access-control-allow-methods",
+        axum::http::HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
+    );
+    headers.insert(
+        "access-control-allow-headers",
+        axum::http::HeaderValue::from_static("X-Requested-With, Content-Type, Authorization"),
+    );
+    response
 }
 
 /// Any `/_matrix` path no route above claimed.
@@ -810,6 +846,13 @@ fn discovery_routes() -> Router<AppState> {
         )
         .route("/.well-known/matrix/client", get(well_known_client))
         .route("/_matrix/client/v1/auth_metadata", get(auth_metadata))
+        // The unstable alias is load-bearing: Element Web's js-sdk asks
+        // here first, and a deployment serving only the stable path
+        // looks to it like a server with no delegation at all.
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc2965/auth_metadata",
+            get(auth_metadata),
+        )
         .route("/.well-known/matrix/server", get(well_known_server))
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -1502,6 +1545,13 @@ async fn put_device(
 /// password that, for a ghost, nobody holds. Deletion takes the sessions
 /// and the E2E material with it, and marks the device list changed so
 /// peers stop encrypting to the dead device.
+///
+/// Under MSC3861 delegation there is no UIA either: a delegated user's
+/// local password is unguessable by construction, so the challenge would
+/// be one nobody can answer — and the caller's identity was proven
+/// moments ago by the provider vouching for their live token, which is
+/// a stronger statement than re-typing a password. Synapse makes the
+/// same call in its delegated mode.
 async fn delete_device(
     State(state): State<AppState>,
     axum::extract::Path(device_id): axum::extract::Path<String>,
@@ -1524,7 +1574,7 @@ async fn delete_device(
     }
     let manages =
         appservice_of(&state, &headers).is_some_and(|registration| registration.device_management);
-    if !manages {
+    if !manages && state.delegated.is_none() {
         let auth = body
             .as_ref()
             .and_then(|Json(body)| body.get("auth").cloned())
