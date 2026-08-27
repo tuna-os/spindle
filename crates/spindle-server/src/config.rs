@@ -21,6 +21,8 @@ pub struct Config {
     pub ratelimit: RateLimitConfig,
     #[serde(default)]
     pub previews: PreviewConfig,
+    #[serde(default)]
+    pub federation: FederationConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -62,6 +64,19 @@ impl Default for RateLimitConfig {
 
 const fn default_true() -> bool {
     true
+}
+
+/// Federation transport.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FederationConfig {
+    /// Fetch peer keys and send requests over plain http instead of https.
+    ///
+    /// For test rigs whose "servers" are loopback stubs. A production
+    /// deployment with this on has disabled federation authentication in
+    /// all but name: anyone on the network path can answer the key fetch.
+    #[serde(default)]
+    pub insecure_http: bool,
 }
 
 /// URL preview fetching.

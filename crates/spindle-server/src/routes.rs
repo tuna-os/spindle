@@ -580,6 +580,11 @@ fn discovery_routes() -> Router<AppState> {
         .route("/_matrix/client/versions", get(versions))
         .route("/_matrix/client/v3/capabilities", get(capabilities))
         .route("/_matrix/key/v2/server", get(server_keys))
+        .route("/_matrix/federation/v1/version", get(federation_version))
+        .route(
+            "/_matrix/federation/v1/query/directory",
+            get(federation_query_directory),
+        )
         .route("/.well-known/matrix/client", get(well_known_client))
         .route("/.well-known/matrix/server", get(well_known_server))
         .route("/health", get(health))
@@ -939,6 +944,80 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for ClientAddr {
                 .map_or_else(|| "unknown".to_owned(), |info| info.0.ip().to_string()),
         ))
     }
+}
+
+/// `GET /_matrix/federation/v1/version`
+///
+/// Unauthenticated by spec: it exists so operators can tell what is on the
+/// other end before trust is established.
+async fn federation_version() -> Json<Value> {
+    Json(json!({
+        "server": { "name": "spindle", "version": env!("CARGO_PKG_VERSION") }
+    }))
+}
+
+/// Authenticate a federation request, or answer 401 with no gradient.
+///
+/// Every X-Matrix failure — missing header, bad signature, unfetchable
+/// keys, wrong destination — collapses to the same `M_UNAUTHORIZED`, so a
+/// probing peer learns nothing about which check refused it. The detail
+/// lives in our logs, not in their response.
+async fn federation_origin(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    method: &str,
+    uri: &str,
+    content: Option<&Value>,
+) -> Result<String, MatrixError> {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok());
+    state
+        .federation
+        .verify_request(authorization, method, uri, content)
+        .await
+        .map_err(|error| {
+            tracing::debug!("federation auth refused: {error}");
+            MatrixError::new(
+                StatusCode::UNAUTHORIZED,
+                "M_UNAUTHORIZED",
+                "the request signature is not valid".to_owned(),
+            )
+        })
+}
+
+#[derive(Debug, Deserialize)]
+struct FederationDirectoryQuery {
+    room_alias: String,
+}
+
+/// `GET /_matrix/federation/v1/query/directory`
+async fn federation_query_directory(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<FederationDirectoryQuery>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    federation_origin(&state, &headers, "GET", &uri, None).await?;
+    let Some(room_id) = state
+        .directory
+        .resolve(&query.room_alias)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+    else {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            format!("{} is not here", query.room_alias),
+        ));
+    };
+    Ok(Json(json!({
+        "room_id": room_id.room_id,
+        "servers": [state.config.server.name],
+    })))
 }
 
 /// `GET /_matrix/key/v2/server`

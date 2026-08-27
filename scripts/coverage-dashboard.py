@@ -49,9 +49,14 @@ MILESTONES = [
      "#113's unread-index fix (11.79 ms → 1.00 ms); the three residual cells "
      "are within measured noise. See docs/benchmarks.md and the comparisons "
      "page. Element X client-gate work continues as #112."),
-    ("M3", "Ordinary Matrix federation", "Not started",
-     "#14 #15 #16 — includes the federated fork-proof rig, which is where the "
-     "no-state-resolution claim meets adversarial evidence."),
+    ("M3", "Ordinary Matrix federation", "In progress",
+     "Started with #14's identity layer: X-Matrix request signing and "
+     "verification against fetched-and-cached peer keys (self-signature, "
+     "name binding, capped validity all enforced; every failure a uniform "
+     "401), /version, and the first authenticated query. Next: inbound "
+     "/send and the outbound transaction queue, then #15 joins/state/"
+     "history, then #16's fork-proof rig — where the no-state-resolution "
+     "claim meets adversarial evidence."),
     ("M4", "Ecosystem integration", "Not started", "#18 appservices, #17 MAS/OIDC."),
     ("M5", "Production lifecycle", "Not started",
      "#19 #20 #21; #42's parity gate vs Synapse and Tuwunel is part of the "
@@ -106,7 +111,15 @@ PLANNED = {
     "Media": [],
     "Server, discovery & operations": [],
     "Federation": [
-        ("GET", "/_matrix/federation/v1/version", "M3 — no federation surface yet"),
+        ("PUT", "/_matrix/federation/v1/send/{txnId}", "inbound transactions (#14)"),
+        ("GET", "/_matrix/federation/v1/make_join/{roomId}/{userId}", "join handshake (#15)"),
+        ("PUT", "/_matrix/federation/v1/send_join/{roomId}/{eventId}", "join handshake (#15)"),
+        ("GET", "/_matrix/federation/v1/state/{roomId}", "state answers (#15)"),
+        ("GET", "/_matrix/federation/v1/state_ids/{roomId}", "state answers (#15)"),
+        ("GET", "/_matrix/federation/v1/backfill/{roomId}", "history (#15)"),
+        ("POST", "/_matrix/federation/v1/get_missing_events/{roomId}", "catch-up (#15)"),
+        ("GET", "/_matrix/federation/v1/event/{eventId}", "event fetch (#15)"),
+        ("PUT", "/_matrix/federation/v2/invite/{roomId}/{eventId}", "federated invites (#15)"),
     ],
     "VoIP & MatrixRTC": [
         ("GET", "/_matrix/client/v3/voip/turnServer", "TURN discovery (M7)"),
@@ -116,6 +129,7 @@ PLANNED = {
 # How implemented paths are grouped. First match wins, so more specific
 # prefixes come first.
 AREA_RULES = [
+    ("Federation", ("/_matrix/federation/",)),
     ("End-to-end encryption", ("/_matrix/client/v3/keys/", "/_matrix/client/v3/sendToDevice/")),
     ("Sync", ("/_matrix/client/v3/sync", "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync")),
     ("Account data, filters & push", ("/_matrix/client/v3/user/", "/_matrix/client/v3/pushrules/")),
@@ -247,7 +261,7 @@ def build_markdown() -> str:
         "neither implemented nor counted.",
         "",
     ]
-    for area, _ in AREA_RULES + [("Federation", ()), ("VoIP & MatrixRTC", ())]:
+    for area, _ in AREA_RULES + [("VoIP & MatrixRTC", ())]:
         if area in ("Server, discovery & operations",) and area not in implemented:
             continue
         have = implemented.get(area, [])
