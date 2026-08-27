@@ -17,6 +17,7 @@ path = "src/main.rs"
 argon2.workspace = true
 axum.workspace = true
 blake3.workspace = true
+image.workspace = true
 rand.workspace = true
 ruma.workspace = true
 serde.workspace = true

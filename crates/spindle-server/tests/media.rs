@@ -398,3 +398,142 @@ async fn a_name_in_the_path_does_not_override_the_recorded_one() {
         "the recorded name wins over the one in the path"
     );
 }
+
+/// A tiny valid PNG: 8x8, red.
+fn small_png() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut image = image::RgbImage::new(8, 8);
+    for pixel in image.pixels_mut() {
+        *pixel = image::Rgb([255, 0, 0]);
+    }
+    image::DynamicImage::ImageRgb8(image)
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    bytes
+}
+
+#[tokio::test]
+async fn a_thumbnail_comes_back_at_a_ladder_size() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let (_, body) = harness
+        .upload(&alice, "image/png", Some("dot.png"), &small_png())
+        .await;
+    let mxc = body["content_uri"].as_str().unwrap();
+    let rest = mxc.strip_prefix("mxc://").unwrap();
+    let (server, media_id) = rest.split_once('/').unwrap();
+
+    // 50x50 is between the 32 and 96 rungs, so the 96 rung answers: never
+    // less than asked for. The response is a decodable PNG of that size.
+    let (status, headers, bytes) = harness
+        .raw(
+            Request::builder()
+                .uri(format!(
+                    "/_matrix/client/v1/media/thumbnail/{server}/{media_id}?width=50&height=50"
+                ))
+                .header("authorization", format!("Bearer {alice}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(header(&headers, "content-type"), "image/png");
+    let decoded = image::load_from_memory(&bytes).expect("a decodable thumbnail");
+    assert!(
+        decoded.width() <= 96 && decoded.height() <= 96,
+        "{}x{}",
+        decoded.width(),
+        decoded.height()
+    );
+}
+
+#[tokio::test]
+async fn arbitrary_dimensions_cannot_mint_arbitrary_cache_files() {
+    // Disk amplification: honouring every width x height would let one client
+    // mint an unbounded family of cached files from one upload. The ladder
+    // makes 50x50 and 51x51 the same thumbnail.
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let (_, body) = harness
+        .upload(&alice, "image/png", None, &small_png())
+        .await;
+    let mxc = body["content_uri"].as_str().unwrap();
+    let rest = mxc.strip_prefix("mxc://").unwrap();
+    let (server, media_id) = rest.split_once('/').unwrap();
+
+    let fetch = |width: u32, height: u32| {
+        let harness = &harness;
+        let alice = &alice;
+        async move {
+            harness
+                .raw(
+                    Request::builder()
+                        .uri(format!(
+                            "/_matrix/client/v1/media/thumbnail/{server}/{media_id}?width={width}&height={height}"
+                        ))
+                        .header("authorization", format!("Bearer {alice}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .2
+        }
+    };
+    let first = fetch(50, 50).await;
+    let second = fetch(51, 51).await;
+    assert_eq!(first, second, "both requests snap to the same rung");
+}
+
+#[tokio::test]
+async fn a_lying_content_type_is_unsupported_not_a_crash() {
+    // The uploader's declared type is checked exactly when it is first relied
+    // upon: bytes that are not the image they claim to be are a 400, and the
+    // decoder never sees a type we would not thumbnail.
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let (_, body) = harness
+        .upload(&alice, "image/png", None, b"this is not a png")
+        .await;
+    let mxc = body["content_uri"].as_str().unwrap();
+    let rest = mxc.strip_prefix("mxc://").unwrap();
+    let (server, media_id) = rest.split_once('/').unwrap();
+
+    let (status, _, bytes) = harness
+        .raw(
+            Request::builder()
+                .uri(format!(
+                    "/_matrix/client/v1/media/thumbnail/{server}/{media_id}?width=96&height=96"
+                ))
+                .header("authorization", format!("Bearer {alice}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let error: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(error["errcode"], "M_UNSUPPORTED", "{error}");
+
+    // And a type that is never thumbnailed gets the same code -- SVG above
+    // all, which is an image type and also a script container.
+    let (_, body) = harness
+        .upload(&alice, "image/svg+xml", None, b"<svg/>")
+        .await;
+    let mxc = body["content_uri"].as_str().unwrap();
+    let rest = mxc.strip_prefix("mxc://").unwrap();
+    let (server, media_id) = rest.split_once('/').unwrap();
+    let (status, _, _) = harness
+        .raw(
+            Request::builder()
+                .uri(format!(
+                    "/_matrix/client/v1/media/thumbnail/{server}/{media_id}?width=96&height=96"
+                ))
+                .header("authorization", format!("Bearer {alice}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

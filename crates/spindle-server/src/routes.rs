@@ -292,6 +292,10 @@ fn media_routes() -> Router<AppState> {
             "/_matrix/client/v1/media/download/{server_name}/{media_id}/{file_name}",
             get(download_media_named),
         )
+        .route(
+            "/_matrix/client/v1/media/thumbnail/{server_name}/{media_id}",
+            get(thumbnail_media),
+        )
 }
 
 /// `POST /_matrix/media/v3/upload`
@@ -411,6 +415,48 @@ fn serve_media(
         .map_err(|error| MatrixError::internal(&error.to_string()))
 }
 
+#[derive(Debug, Deserialize)]
+struct ThumbnailQuery {
+    width: u32,
+    height: u32,
+    method: Option<String>,
+}
+
+/// `GET /_matrix/client/v1/media/thumbnail/{server_name}/{media_id}`
+async fn thumbnail_media(
+    State(state): State<AppState>,
+    Authenticated(_identity): Authenticated,
+    axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<ThumbnailQuery>,
+) -> Result<axum::response::Response, MatrixError> {
+    if !state.media.is_ours(&server_name) {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            format!("{server_name} is not this server, and remote media is not fetched yet"),
+        ));
+    }
+    if query.width == 0 || query.height == 0 {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            "width and height must be positive",
+        ));
+    }
+    let crop = query.method.as_deref() == Some("crop");
+    let (content_type, bytes) = state
+        .media
+        .thumbnail(&media_id, query.width, query.height, crop)
+        .map_err(|error| media_error(&error))?;
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, content_type)
+        .header("x-content-type-options", "nosniff")
+        .header("cross-origin-resource-policy", "cross-origin")
+        .body(axum::body::Body::from(bytes))
+        .map_err(|error| MatrixError::internal(&error.to_string()))
+}
+
 fn media_error(error: &crate::media::MediaError) -> MatrixError {
     use crate::media::MediaError as Error;
     match error {
@@ -422,6 +468,13 @@ fn media_error(error: &crate::media::MediaError) -> MatrixError {
             "M_TOO_LARGE",
             error.to_string(),
         ),
+        // The spec's own code for "this cannot be thumbnailed". Unreadable
+        // bytes get the same answer as an unsupported type: either way the
+        // uploader's declared type cannot be honoured, and the distinction
+        // belongs in the message, not the status.
+        Error::Unsupported(_) | Error::Unreadable(_) => {
+            MatrixError::new(StatusCode::BAD_REQUEST, "M_UNSUPPORTED", error.to_string())
+        }
         other => MatrixError::internal(&other.to_string()),
     }
 }
