@@ -384,3 +384,54 @@ async fn a_non_member_has_nothing_to_be_behind_on() {
     );
     assert!(unread.read_up_to.is_none());
 }
+
+#[tokio::test]
+async fn the_count_stays_current_after_the_room_is_warm() {
+    // The unread count is served from a per-room index built on first ask
+    // and maintained on append. This test is the maintenance path: ask
+    // (which warms the index), then append, then ask again — a stale index
+    // would freeze the count at whatever the first ask saw.
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness.create_room(&alice).await;
+    harness.admit(&room, &alice, &bob, "@bob:example.org").await;
+
+    harness.say(&room, &alice, "one", "t1").await;
+    assert_eq!(
+        harness.notifications(&room, &bob).await,
+        1,
+        "warms the index"
+    );
+
+    harness.say(&room, &alice, "two", "t2").await;
+    assert_eq!(
+        harness.notifications(&room, &bob).await,
+        2,
+        "an append while warm moves the count"
+    );
+
+    // Bob's own reply must not count — and this exercises the per-sender
+    // side of the warm index, not the cold build.
+    harness.say(&room, &bob, "reply", "t3").await;
+    assert_eq!(
+        harness.notifications(&room, &bob).await,
+        2,
+        "own messages stay invisible while warm"
+    );
+
+    // And a state event while warm is not a notification either.
+    harness
+        .request(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.topic"),
+            &alice,
+            &serde_json::json!({ "topic": "warm" }),
+        )
+        .await;
+    assert_eq!(
+        harness.notifications(&room, &bob).await,
+        2,
+        "state events do not notify"
+    );
+}

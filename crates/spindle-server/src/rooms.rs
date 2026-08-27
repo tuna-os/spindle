@@ -66,10 +66,52 @@ const _: () = assert!(
 );
 
 /// Rooms held open, keyed by room ID.
+/// Per-room index answering "how many timeline events after `li`, and how
+/// many of them are mine" without reading a single event body.
+///
+/// Exists because the unread count used to read every body after the
+/// receipt floor to learn its sender — O(events since floor) store reads
+/// per sync, which for a user with no receipt (every bot, every client
+/// that doesn't send read receipts) meant the whole room, every time. The
+/// M2 close-out benchmark caught it: the one column where a sibling was
+/// faster, and the one whose curve grew with room size. Built once per
+/// room per process (the one remaining full walk), updated on append,
+/// queried by binary search.
+#[derive(Default)]
+struct UnreadIndex {
+    /// Linear indices of every timeline (non-state) entry, ascending.
+    timeline: Vec<i64>,
+    /// The same, per sender.
+    by_sender: HashMap<String, Vec<i64>>,
+}
+
+impl UnreadIndex {
+    fn push(&mut self, li: i64, sender: &str) {
+        // Appends arrive in li order, so pushing keeps both vectors sorted.
+        // Backfill (negative indices, M3) must not use this path: it would
+        // break the invariant — invalidate the room's cache instead.
+        self.timeline.push(li);
+        self.by_sender
+            .entry(sender.to_owned())
+            .or_default()
+            .push(li);
+    }
+
+    /// Timeline events after `boundary` not sent by `user_id`.
+    fn count_after(&self, boundary: i64, user_id: &str) -> usize {
+        let after = |lis: &[i64]| lis.len() - lis.partition_point(|&li| li <= boundary);
+        let own = self.by_sender.get(user_id).map_or(0, |lis| after(lis));
+        after(&self.timeline) - own
+    }
+}
+
 pub struct Rooms {
     store: Arc<FjallStore>,
     server_name: String,
     open: Mutex<HashMap<String, RoomLog>>,
+    /// Lock order: `open` before `unread_index`, always. The fast path takes
+    /// only `unread_index`; the build and append paths already hold `open`.
+    unread_index: Mutex<HashMap<String, UnreadIndex>>,
     /// The server-global order `/sync` needs (SPEC §10.2). The linear index
     /// orders events within one room; nothing orders them across rooms, so
     /// this is the one counter that exists purely because a per-room order is
@@ -166,6 +208,7 @@ impl Rooms {
             store,
             server_name: server_name.into(),
             open: Mutex::new(HashMap::new()),
+            unread_index: Mutex::new(HashMap::new()),
             // Resumed, not reset. A counter that restarted at zero would
             // re-issue stream ids already on disk, overwriting the entries
             // they point at -- the same shape of bug as a room registry that
@@ -1019,27 +1062,32 @@ impl Rooms {
             }
         };
 
-        // Which events are after the receipt: arithmetic on the index, no
-        // ordering step. Walking backwards from the head and stopping at the
-        // boundary touches exactly the unread ones.
-        let unread_ids = self.with_room(room_id, |_, log| {
-            Ok(log
-                .entries()
-                .rev()
-                .take_while(|entry| entry.li.get() > boundary)
-                .filter(|entry| entry.state_key.is_none())
-                .map(|entry| entry.event_id.as_str().to_owned())
-                .collect::<Vec<_>>())
-        })?;
-
-        let mut notification_count = 0;
-        for id in unread_ids {
-            // The sender lives in the body, so this is the part that reads.
-            let event = self.read_event(room_id, &EventId::new(id.as_str()))?;
-            if event["sender"].as_str() != Some(user_id) {
-                notification_count += 1;
+        // Two binary searches over the room's sender index: how many
+        // timeline events sit after the boundary, minus how many of them are
+        // the user's own. The index exists precisely so this never reads an
+        // event body — the count is the operation every sync performs for
+        // every room, and it used to read every body after the floor to
+        // learn its sender (the M2 close-out benchmark's one loss).
+        let notification_count = self.with_room(room_id, |rooms, log| {
+            let mut cache = rooms
+                .unread_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !cache.contains_key(room_id) {
+                // The one remaining full walk: once per room per process,
+                // under the room lock so no append can slip past unindexed.
+                let mut index = UnreadIndex::default();
+                for entry in log.entries() {
+                    if entry.state_key.is_some() {
+                        continue;
+                    }
+                    let event = rooms.read_event(room_id, &entry.event_id)?;
+                    index.push(entry.li.get(), event["sender"].as_str().unwrap_or(""));
+                }
+                cache.insert(room_id.to_owned(), index);
             }
-        }
+            Ok(cache[room_id].count_after(boundary, user_id))
+        })?;
 
         Ok(Unread {
             notification_count,
@@ -1595,6 +1643,19 @@ impl Rooms {
             .append_remote(input)
             .map_err(|error| RoomError::Append(format!("{error:?}")))?
             .clone();
+
+        // Keep the unread index current while it is warm. Only if cached:
+        // a cold room's index is built from the log on first use, so there
+        // is nothing to maintain until someone asks.
+        if state_key.is_none() {
+            let mut cache = self
+                .unread_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(index) = cache.get_mut(room_id) {
+                index.push(entry.li.get(), sender);
+            }
+        }
 
         // The signed JSON is stored beside the log entry. The log holds
         // ordering and state; the event body is what a client actually reads
