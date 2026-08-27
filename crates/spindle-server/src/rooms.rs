@@ -1056,6 +1056,62 @@ impl Rooms {
         })
     }
 
+    /// A knock-event template for a remote user, for `make_knock`.
+    ///
+    /// The precondition mirrors the auth rule that will judge the signed
+    /// event on the way back in: the room's join rule must be `knock`.
+    /// Anything else is refused here, at the cheap step.
+    ///
+    /// # Errors
+    ///
+    /// [`RoomError::UnknownRoom`] when the room is not here,
+    /// [`RoomError::Forbidden`] when the room does not accept knocks.
+    pub fn make_knock_template(&self, room_id: &str, user_id: &str) -> Result<Value, RoomError> {
+        self.with_room(room_id, |rooms, log| {
+            let head = log
+                .entries()
+                .next_back()
+                .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
+            let state = log
+                .state_after(head.li)
+                .ok_or_else(|| RoomError::StateUnavailable("no head state".to_owned()))?;
+            let join_rule = state
+                .get(&StateKey::new("m.room.join_rules", ""))
+                .map(str::to_owned)
+                .and_then(|id| rooms.read_event(room_id, &EventId::new(id.as_str())).ok())
+                .and_then(|event| event["content"]["join_rule"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| "invite".to_owned());
+            if join_rule != "knock" {
+                return Err(RoomError::Forbidden(
+                    "the room does not accept knocks".to_owned(),
+                ));
+            }
+
+            let content = serde_json::json!({ "membership": "knock" });
+            let auth = auth_events_for(log, user_id, "m.room.member", Some(user_id), &content)?;
+            let prev: Vec<String> = log
+                .forward_extremities()
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect();
+            let depth = head.depth.saturating_add(1);
+            Ok(serde_json::json!({
+                "type": "m.room.member",
+                "sender": user_id,
+                "state_key": user_id,
+                "room_id": room_id,
+                "content": content,
+                "origin_server_ts": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+                    .unwrap_or(0),
+                "depth": depth,
+                "prev_events": prev,
+                "auth_events": auth,
+            }))
+        })
+    }
+
     /// A leave-event template for a remote user, for `make_leave`.
     ///
     /// The mirror of [`Self::make_join_template`], with the mirrored

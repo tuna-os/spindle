@@ -524,3 +524,134 @@ async fn send_join_admits_only_join_events() {
     let (status, body) = harness.send_join(&peer, &room, &leave_id, &leave).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
+
+#[tokio::test]
+async fn the_v1_send_join_answers_in_the_spec_fossil_envelope() {
+    // Same handshake, older peer: the v1 endpoint answers `[200, {...}]`,
+    // the array envelope the spec keeps for servers that predate v2.
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.public_room(&alice).await;
+
+    let (status, body) = harness.make_join(&peer, &room, &peer.user()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let join = peer.sign_event(&body["event"]);
+    let join_id = event_id_of(&join);
+
+    let uri = format!("/_matrix/federation/v1/send_join/{room}/{join_id}");
+    let header = peer.put_header(&uri, &join);
+    let (status, body) = harness
+        .call(
+            Request::builder()
+                .method("PUT")
+                .uri(&uri)
+                .header("authorization", header)
+                .header("content-type", "application/json")
+                .body(Body::from(join.to_string()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let envelope = body.as_array().expect("a [200, body] array");
+    assert_eq!(envelope[0], json!(200), "{body}");
+    assert!(
+        envelope[1]["state"].is_array() && envelope[1]["auth_chain"].is_array(),
+        "the v2 body rides inside: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_room_that_does_not_accept_knocks_refuseses_the_template() {
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.public_room(&alice).await;
+
+    let uri = format!("/_matrix/federation/v1/make_knock/{room}/{}", peer.user());
+    let header = peer.get_header(&uri);
+    let (status, body) = harness
+        .call(
+            Request::builder()
+                .uri(&uri)
+                .header("authorization", header)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn a_knock_lands_as_membership_and_answers_with_stripped_state() {
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    // A room that invites knocking, via createRoom's initial_state.
+    let (status, body) = harness
+        .send(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            &alice,
+            &json!({
+                "name": "knock first",
+                "initial_state": [
+                    { "type": "m.room.join_rules", "state_key": "",
+                      "content": { "join_rule": "knock" } },
+                ],
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+
+    let uri = format!("/_matrix/federation/v1/make_knock/{room}/{}", peer.user());
+    let header = peer.get_header(&uri);
+    let (status, body) = harness
+        .call(
+            Request::builder()
+                .uri(&uri)
+                .header("authorization", header)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["event"]["content"]["membership"], json!("knock"));
+
+    let knock = peer.sign_event(&body["event"]);
+    let knock_id = event_id_of(&knock);
+    let uri = format!("/_matrix/federation/v1/send_knock/{room}/{knock_id}");
+    let header = peer.put_header(&uri, &knock);
+    let (status, body) = harness
+        .call(
+            Request::builder()
+                .method("PUT")
+                .uri(&uri)
+                .header("authorization", header)
+                .header("content-type", "application/json")
+                .body(Body::from(knock.to_string()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["knock_room_state"].is_array(),
+        "the knocker gets stripped state: {body}"
+    );
+
+    // The knock is real membership in the room now.
+    let (status, membership) = harness
+        .send(
+            "GET",
+            &format!(
+                "/_matrix/client/v3/rooms/{room}/state/m.room.member/{}",
+                peer.user()
+            ),
+            &alice,
+            &json!(null),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{membership}");
+    assert_eq!(membership["membership"], json!("knock"));
+}
