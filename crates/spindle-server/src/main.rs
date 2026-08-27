@@ -64,7 +64,7 @@ async fn main() -> ExitCode {
     let app = match spindle_server::app(config, store) {
         Ok(app) => app,
         Err(error) => {
-            tracing::error!("cannot establish the server signing key: {error}");
+            tracing::error!("cannot build the server: {error}");
             return ExitCode::FAILURE;
         }
     };
