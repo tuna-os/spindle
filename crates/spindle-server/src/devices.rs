@@ -350,6 +350,28 @@ impl Devices {
         Ok(false)
     }
 
+    /// Forget a deleted device's E2E material: identity keys, one-time
+    /// keys and fallback keys. Without this, `/keys/query` keeps
+    /// advertising the dead device and peers keep encrypting to a key
+    /// nobody will ever hold again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if a scan or delete fails.
+    pub fn remove_device_material(&self, user_id: &str, device_id: &str) -> Result<(), StoreError> {
+        Store::delete(
+            self.store.as_ref(),
+            &keys::device_scoped(Keyspace::DeviceKeys, user_id, device_id, &[]),
+        )?;
+        for keyspace in [Keyspace::OneTimeKeys, Keyspace::FallbackKeys] {
+            let prefix = keys::device_scoped(keyspace, user_id, device_id, &[]);
+            for (key, _) in ReadView::scan_prefix(self.store.as_ref(), &prefix)? {
+                Store::delete(self.store.as_ref(), &key)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Record that `user_id`'s device list changed at stream position `seq`.
     ///
     /// # Errors

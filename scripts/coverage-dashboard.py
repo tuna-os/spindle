@@ -91,9 +91,6 @@ PLANNED = {
     "Accounts, devices & auth": [
         ("POST", "/_matrix/client/v3/account/password", "password change (M1 leftover)"),
         ("POST", "/_matrix/client/v3/account/deactivate", "deactivation (M1 leftover)"),
-        ("GET", "/_matrix/client/v3/devices", "device management (M2)"),
-        ("PUT", "/_matrix/client/v3/devices/{device_id}", "device rename (M2)"),
-        ("DELETE", "/_matrix/client/v3/devices/{device_id}", "device logout (M2)"),
         ("POST", "/_matrix/client/v3/delete_devices", "bulk device logout (M2)"),
     ],
     "Profiles & presence": [

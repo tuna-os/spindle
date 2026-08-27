@@ -298,6 +298,82 @@ impl<'a, S: Store> Accounts<'a, S> {
             .delete(&token_key(Keyspace::AccessToken, token))?;
         Ok(())
     }
+
+    /// Every device of one user, in stored (device-ID) order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or decoding error.
+    pub fn devices_of(&self, localpart: &str) -> Result<Vec<Device>, AccountError> {
+        let prefix = room_prefix(Keyspace::Device, localpart);
+        let mut out = Vec::new();
+        for (_, raw) in self.store.scan_prefix(&prefix)? {
+            out.push(decode(&raw)?);
+        }
+        Ok(out)
+    }
+
+    /// One device of one user, if it exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or decoding error.
+    pub fn device(&self, localpart: &str, device_id: &str) -> Result<Option<Device>, AccountError> {
+        match self.store.get(&device_key(localpart, device_id))? {
+            Some(raw) => Ok(Some(decode(&raw)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Write a device row, creating or replacing it.
+    ///
+    /// This is the sessionless half of MSC4190: an appservice mints a
+    /// device *without* an access token, because the `as_token` is its
+    /// credential and a token nobody will present is a credential nobody
+    /// should hold.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn put_device(
+        &self,
+        localpart: &str,
+        device_id: &str,
+        display_name: Option<String>,
+    ) -> Result<(), AccountError> {
+        let device = Device {
+            localpart: localpart.to_owned(),
+            device_id: device_id.to_owned(),
+            display_name,
+        };
+        self.store
+            .put(&device_key(localpart, device_id), &encode(&device)?)?;
+        Ok(())
+    }
+
+    /// Delete a device and every token that authenticates as it.
+    ///
+    /// The token keyspaces are keyed by token hash, so the sessions are
+    /// found by scanning them — bounded by live sessions on the server,
+    /// which is the price of never storing a usable token. A deleted
+    /// device whose tokens survived would not be deleted at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or decoding error.
+    pub fn delete_device(&self, localpart: &str, device_id: &str) -> Result<(), AccountError> {
+        self.store.delete(&device_key(localpart, device_id))?;
+        for keyspace in [Keyspace::AccessToken, Keyspace::RefreshToken] {
+            let prefix = [spindle_core::keys::KEY_SCHEMA_VERSION, keyspace as u8];
+            for (key, raw) in self.store.scan_prefix(&prefix)? {
+                let record: TokenRecord = decode(&raw)?;
+                if record.localpart == localpart && record.device_id == device_id {
+                    self.store.delete(&key)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// An Argon2id hash of nothing in particular, verified against when the user
