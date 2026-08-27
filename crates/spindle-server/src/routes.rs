@@ -501,16 +501,12 @@ async fn serve_media(
     server_name: &str,
     media_id: &str,
 ) -> Result<axum::response::Response, MatrixError> {
-    if !state.media.is_ours(server_name) {
-        // Remote media needs federation to fetch, which does not exist yet.
-        // A 404 rather than a fabricated empty file: a client that gets bytes
-        // back believes it has the attachment.
-        return Err(MatrixError::new(
-            StatusCode::NOT_FOUND,
-            "M_NOT_FOUND",
-            format!("{server_name} is not this server, and remote media is not fetched yet"),
-        ));
-    }
+    let media_id = if state.media.is_ours(server_name) {
+        media_id.to_owned()
+    } else {
+        cached_remote_media(state, server_name, media_id).await?
+    };
+    let media_id = media_id.as_str();
     let (record, bytes) = state
         .media
         .bytes(media_id)
@@ -543,6 +539,111 @@ async fn serve_media(
         .map_err(|error| MatrixError::internal(&error.to_string()))
 }
 
+/// The local cache ID for a remote server's media, fetching and caching it
+/// on first sight.
+///
+/// The fetch happens once: the blob is content-addressed and the record
+/// write idempotent, so every later request — downloads and thumbnails
+/// alike — is served from local storage.
+async fn cached_remote_media(
+    state: &AppState,
+    server_name: &str,
+    media_id: &str,
+) -> Result<String, MatrixError> {
+    let cache_id = crate::media::Media::remote_id(server_name, media_id);
+    let cached = state
+        .media
+        .record(&cache_id)
+        .map_err(|error| media_error(&error))?
+        .is_some();
+    if !cached {
+        let (content_type, filename, bytes) = state
+            .federation
+            .remote_media_download(server_name, media_id)
+            .await
+            .map_err(|error| {
+                MatrixError::new(
+                    StatusCode::NOT_FOUND,
+                    "M_NOT_FOUND",
+                    format!("{server_name} did not yield {media_id}: {error}"),
+                )
+            })?;
+        state
+            .media
+            .put_remote(
+                server_name,
+                media_id,
+                &bytes,
+                &content_type,
+                filename.as_deref(),
+            )
+            .await
+            .map_err(|error| media_error(&error))?;
+    }
+    Ok(cache_id)
+}
+
+/// `GET /_matrix/federation/v1/media/download/{mediaId}` (MSC3916).
+///
+/// Serves this server's own media to an authenticated peer, as
+/// `multipart/mixed`: a JSON metadata part, then the file — the shape the
+/// MSC fixes, and the one the outbound client parses.
+async fn federation_media_download(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(media_id): axum::extract::Path<String>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<axum::response::Response, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    federation_origin(&state, &headers, "GET", &uri, None).await?;
+    let (record, bytes) = state
+        .media
+        .bytes(&media_id)
+        .await
+        .map_err(|error| media_error(&error))?;
+
+    // The boundary need only be absent from the payload's *framing*, and a
+    // random 32-hex string followed by the exact dash-CRLF framing has no
+    // way to occur inside the file; fixed randomness per response keeps
+    // this simple and stateless.
+    let boundary = {
+        use rand::RngCore as _;
+        use std::fmt::Write as _;
+        let mut raw = [0_u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut raw);
+        raw.iter().fold(String::with_capacity(32), |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        })
+    };
+    let mut body: Vec<u8> = Vec::with_capacity(bytes.len() + 512);
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(b"content-type: application/json\r\n\r\n{}\r\n");
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(format!("content-type: {}\r\n", record.content_type).as_bytes());
+    body.extend_from_slice(
+        format!(
+            "content-disposition: {}\r\n\r\n",
+            record.content_disposition()
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(&bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            format!("multipart/mixed; boundary={boundary}"),
+        )
+        .body(axum::body::Body::from(body))
+        .map_err(|error| MatrixError::internal(&error.to_string()))
+}
+
 #[derive(Debug, Deserialize)]
 struct ThumbnailQuery {
     width: u32,
@@ -557,13 +658,11 @@ async fn thumbnail_media(
     axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
     axum::extract::Query(query): axum::extract::Query<ThumbnailQuery>,
 ) -> Result<axum::response::Response, MatrixError> {
-    if !state.media.is_ours(&server_name) {
-        return Err(MatrixError::new(
-            StatusCode::NOT_FOUND,
-            "M_NOT_FOUND",
-            format!("{server_name} is not this server, and remote media is not fetched yet"),
-        ));
-    }
+    let media_id = if state.media.is_ours(&server_name) {
+        media_id
+    } else {
+        cached_remote_media(&state, &server_name, &media_id).await?
+    };
     if query.width == 0 || query.height == 0 {
         return Err(MatrixError::new(
             StatusCode::BAD_REQUEST,
@@ -682,6 +781,10 @@ fn discovery_routes() -> Router<AppState> {
         .route(
             "/_matrix/federation/v2/invite/{room_id}/{event_id}",
             axum::routing::put(federation_invite),
+        )
+        .route(
+            "/_matrix/federation/v1/media/download/{media_id}",
+            get(federation_media_download),
         )
         .route("/.well-known/matrix/client", get(well_known_client))
         .route("/.well-known/matrix/server", get(well_known_server))
