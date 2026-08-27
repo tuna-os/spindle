@@ -1935,10 +1935,35 @@ fn sync_join(
             room_filter.and_then(|room| room.timeline.as_ref()),
             room.events,
         );
-        let room_state = crate::filters::Filter::apply(
+        let mut room_state = crate::filters::Filter::apply(
             room_filter.and_then(|room| room.state.as_ref()),
             room.state,
         );
+        // Lazy-loaded members: send only the membership events this response
+        // makes the client need -- the senders in its timeline -- instead of
+        // the whole roster. In a 10,000-member room the roster *is* the
+        // initial sync, and a client renders none of it until someone speaks.
+        //
+        // The syncing user's own membership is always kept: the spec permits
+        // redundant members, and a client that cannot find itself in the
+        // state it was sent tends to conclude it is not in the room.
+        if room_filter
+            .and_then(|room| room.state.as_ref())
+            .and_then(|state| state.lazy_load_members)
+            == Some(true)
+        {
+            let needed: std::collections::HashSet<&str> = events
+                .iter()
+                .filter_map(|event| event["sender"].as_str())
+                .chain(std::iter::once(identity.user_id.as_str()))
+                .collect();
+            room_state.retain(|event| {
+                event["type"] != "m.room.member"
+                    || event["state_key"]
+                        .as_str()
+                        .is_some_and(|member| needed.contains(member))
+            });
+        }
         let room_data = crate::filters::Filter::apply(
             room_filter.and_then(|room| room.account_data.as_ref()),
             room_data,
