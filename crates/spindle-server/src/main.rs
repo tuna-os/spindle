@@ -10,6 +10,21 @@ use tokio::signal;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // `spindle promote-admin <config> <localpart>` — the offline path
+    // that mints the FIRST admin (#83). Every later admin is granted
+    // through the API by an existing one, which keeps the grant in the
+    // audit log; the first has no one to grant it, so it happens here,
+    // against the store, with the server stopped.
+    if std::env::args().nth(1).as_deref() == Some("promote-admin") {
+        let (Some(config_path), Some(localpart)) =
+            (std::env::args().nth(2), std::env::args().nth(3))
+        else {
+            eprintln!("usage: spindle promote-admin <config> <localpart>");
+            return ExitCode::FAILURE;
+        };
+        return promote_admin(&config_path, &localpart);
+    }
+
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "spindle.toml".to_owned());
@@ -101,6 +116,47 @@ async fn main() -> ExitCode {
 
     tracing::info!("shut down cleanly");
     ExitCode::SUCCESS
+}
+
+/// Set the admin flag on an existing account, offline.
+///
+/// Refuses an unknown localpart rather than creating it: an admin
+/// account minted with a password nobody chose would be a credential
+/// nobody can present, and a typo'd localpart silently created would be
+/// an admin nobody meant to exist.
+fn promote_admin(config_path: &str, localpart: &str) -> ExitCode {
+    let config = match Config::load(config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("spindle: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let store = match FjallStore::open(&config.storage.path) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!(
+                "spindle: cannot open storage at {}: {error}",
+                config.storage.path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let accounts = spindle_server::accounts::Accounts::new(&store, &config.server.name);
+    match accounts.set_admin(localpart, true) {
+        Ok(true) => {
+            println!("{localpart} is now a server admin");
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            eprintln!("spindle: no account named {localpart} — register it first");
+            ExitCode::FAILURE
+        }
+        Err(error) => {
+            eprintln!("spindle: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Bring up the TLS federation listener, spawned beside the main service.

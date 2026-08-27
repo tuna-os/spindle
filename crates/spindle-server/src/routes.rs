@@ -79,6 +79,7 @@ pub fn router(state: AppState) -> Router {
         .merge(media_routes())
         .merge(discovery_routes())
         .merge(crate::mas::routes())
+        .merge(crate::admin::routes())
         .merge(crate::oidc::routes())
         // SPEC: an endpoint the server does not recognize answers 404
         // M_UNRECOGNIZED — a JSON verdict, not a bare status. Clients (and
