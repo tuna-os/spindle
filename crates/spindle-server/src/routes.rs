@@ -601,6 +601,14 @@ fn discovery_routes() -> Router<AppState> {
             "/_matrix/federation/v1/event/{event_id}",
             get(federation_event),
         )
+        .route(
+            "/_matrix/federation/v1/make_join/{room_id}/{user_id}",
+            get(federation_make_join),
+        )
+        .route(
+            "/_matrix/federation/v2/send_join/{room_id}/{event_id}",
+            axum::routing::put(federation_send_join),
+        )
         .route("/.well-known/matrix/client", get(well_known_client))
         .route("/.well-known/matrix/server", get(well_known_server))
         .route("/health", get(health))
@@ -1327,6 +1335,121 @@ async fn federation_event(
             .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0),
         "pdus": [event],
+    })))
+}
+
+/// `GET /_matrix/federation/v1/make_join/{roomId}/{userId}`
+async fn federation_make_join(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path((room_id, user_id)): axum::extract::Path<(String, String)>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let origin = federation_origin(&state, &headers, "GET", &uri, None).await?;
+    // A server makes joins for its own users only: a template for someone
+    // else's user would be a forgery kit.
+    if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin.as_str()) {
+        return Err(MatrixError::forbidden(
+            "the user does not live on the requesting server",
+        ));
+    }
+    // The version list is the peer telling us what it can speak; if v11 is
+    // not in it, no template we produce will parse on their side.
+    let supports_v11 = request
+        .uri()
+        .query()
+        .is_some_and(|query| query.split('&').any(|pair| pair == "ver=11"));
+    if !supports_v11 {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_INCOMPATIBLE_ROOM_VERSION",
+            "this room is version 11".to_owned(),
+        ));
+    }
+    let event = state
+        .rooms
+        .make_join_template(&room_id, &user_id)
+        .map_err(room_error)?;
+    Ok(Json(json!({
+        "room_version": crate::rooms::ROOM_VERSION,
+        "event": event,
+    })))
+}
+
+/// `PUT /_matrix/federation/v2/send_join/{roomId}/{eventId}`
+async fn federation_send_join(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let join: Value =
+        serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&join)).await?;
+
+    // The shape is checked before the machinery runs: send_join admits one
+    // kind of event, and anything else through this door — however well
+    // signed — is a peer using the join handshake to smuggle.
+    let is_join = join["type"] == json!("m.room.member")
+        && join["content"]["membership"] == json!("join")
+        && join["state_key"] == join["sender"]
+        && join["room_id"].as_str() == Some(room_id.as_str());
+    if !is_join {
+        return Err(MatrixError::bad_json(
+            "send_join carries exactly a join event for this room".to_owned(),
+        ));
+    }
+
+    let key_map = state
+        .federation
+        .public_key_map(&origin)
+        .await
+        .map_err(|error| {
+            tracing::debug!("cannot fetch {origin} keys: {error}");
+            MatrixError::new(
+                StatusCode::UNAUTHORIZED,
+                "M_UNAUTHORIZED",
+                "the origin's keys cannot be verified".to_owned(),
+            )
+        })?;
+    let (computed_id, outcome) = receive_one_pdu(&state, &origin, Some(&key_map), &join);
+    // The path names the event the peer computed; disagreement means one
+    // side hashed a different event than the other signed.
+    if computed_id != event_id {
+        return Err(MatrixError::bad_json(format!(
+            "the event hashes to {computed_id}, not {event_id}"
+        )));
+    }
+    if let Err(reason) = outcome {
+        return Err(MatrixError::forbidden(&reason));
+    }
+
+    // The state *before* the join, with its auth chain: everything the new
+    // server needs to participate from this event onward.
+    let (state_pairs, auth_pairs) = state
+        .rooms
+        .federation_state(&room_id, &event_id)
+        .map_err(room_error)?;
+    let bodies = |events: Vec<crate::rooms::IdentifiedEvent>| -> Vec<Value> {
+        events.into_iter().map(|(_, event)| event).collect()
+    };
+    state.rooms.wake_sync_waiters();
+    Ok(Json(json!({
+        "origin": state.config.server.name,
+        "event": join,
+        "state": bodies(state_pairs),
+        "auth_chain": bodies(auth_pairs),
     })))
 }
 

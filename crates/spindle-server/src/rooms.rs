@@ -786,6 +786,78 @@ impl Rooms {
         Ok(false)
     }
 
+    /// A join-event template for a remote user, for `make_join`.
+    ///
+    /// The template is everything but the signature: the caller's server
+    /// signs it and brings it back through `send_join`. Authorization is
+    /// previewed here — public join rule, or a standing invite — so a
+    /// refused server learns at the cheap step, but the template is not a
+    /// promise: the signed event is authorized again on the way in, against
+    /// whatever the state is *then*.
+    ///
+    /// # Errors
+    ///
+    /// [`RoomError::UnknownRoom`] when the room is not here,
+    /// [`RoomError::Forbidden`] when the rules do not admit the user.
+    pub fn make_join_template(&self, room_id: &str, user_id: &str) -> Result<Value, RoomError> {
+        self.with_room(room_id, |rooms, log| {
+            let head = log
+                .entries()
+                .next_back()
+                .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
+            let state = log
+                .state_after(head.li)
+                .ok_or_else(|| RoomError::StateUnavailable("no head state".to_owned()))?;
+
+            // `read_event`, not `event()`: the latter re-enters `with_room`
+            // on a lock this closure already holds.
+            let join_rule = state
+                .get(&StateKey::new("m.room.join_rules", ""))
+                .map(str::to_owned)
+                .and_then(|id| rooms.read_event(room_id, &EventId::new(id.as_str())).ok())
+                .and_then(|event| event["content"]["join_rule"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| "invite".to_owned());
+            let invited = spindle_store::ReadView::get(
+                rooms.store.as_ref(),
+                &spindle_core::keys::user_room(
+                    spindle_core::keys::Keyspace::Membership,
+                    user_id,
+                    room_id,
+                ),
+            )?
+            .as_deref()
+                == Some(INVITE_STR.as_bytes());
+            if join_rule != "public" && !invited {
+                return Err(RoomError::Forbidden(
+                    "the room is not public and the user holds no invite".to_owned(),
+                ));
+            }
+
+            let content = serde_json::json!({ "membership": "join" });
+            let auth = auth_events_for(log, user_id, "m.room.member", Some(user_id), &content)?;
+            let prev: Vec<String> = log
+                .forward_extremities()
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect();
+            let depth = head.depth.saturating_add(1);
+            Ok(serde_json::json!({
+                "type": "m.room.member",
+                "sender": user_id,
+                "state_key": user_id,
+                "room_id": room_id,
+                "content": content,
+                "origin_server_ts": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+                    .unwrap_or(0),
+                "depth": depth,
+                "prev_events": prev,
+                "auth_events": auth,
+            }))
+        })
+    }
+
     /// The room's state *before* `event_id`, with the auth chain, for
     /// federation's `/state` and `/state_ids`.
     ///

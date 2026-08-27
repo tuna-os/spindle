@@ -59,8 +59,13 @@ MILESTONES = [
      "redact-on-hash-mismatch; the outbound queue delivers local events to "
      "every live-member server with ack-before-delete, deterministic "
      "transaction IDs and per-destination backoff — #14 is functionally "
-     "complete. Next: #15 joins/state/history/backfill, then #16's "
-     "fork-proof rig — where the no-state-resolution claim meets "
+     "complete. #15 under way: state reads (/state, /state_ids, /event) "
+     "serve peers from the materialized log, and the make_join/send_join "
+     "handshake admits remote users — template previews the real "
+     "authorization, the sent join faces the same judgement chain as any "
+     "PDU, and the response carries the state before the join with its "
+     "transitive auth chain. Next: backfill and get_missing_events off the "
+     "linear log, then #16's fork-proof rig — where the no-state-resolution claim meets "
      "adversarial evidence."),
     ("M4", "Ecosystem integration", "Not started", "#18 appservices, #17 MAS/OIDC."),
     ("M5", "Production lifecycle", "Not started",
@@ -116,8 +121,6 @@ PLANNED = {
     "Media": [],
     "Server, discovery & operations": [],
     "Federation": [
-        ("GET", "/_matrix/federation/v1/make_join/{roomId}/{userId}", "join handshake (#15)"),
-        ("PUT", "/_matrix/federation/v1/send_join/{roomId}/{eventId}", "join handshake (#15)"),
         ("GET", "/_matrix/federation/v1/backfill/{roomId}", "history (#15)"),
         ("POST", "/_matrix/federation/v1/get_missing_events/{roomId}", "catch-up (#15)"),
         ("PUT", "/_matrix/federation/v2/invite/{roomId}/{eventId}", "federated invites (#15)"),
