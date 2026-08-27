@@ -103,6 +103,24 @@ INVESTIGATIONS = {
         "cells recover to 0.96× and 1.00×, and Spindle's own growth curve "
         "flattens from 1.28× to 1.13× across a 16× room-size increase.",
     ),
+    ("m3-final", "sliding_window"): (
+        "0.77× vs Continuwuity at 3,200 events, and 0.85× in the same "
+        "day's discarded loaded run — repeatable by the two-sitting rule, "
+        "so it got the full second look. Both servers were probed live "
+        "minutes after the sitting, same client, same instant, two "
+        "shapes: like-for-like the gap does not exist (creator shape "
+        "0.844 ms vs 0.854 ms, parity; the driver's exact observer shape "
+        "0.785 ms vs 0.874 ms, Spindle 1.11× faster). The two sitting "
+        "legs caught opposite sides of the machine's same-day swing. No "
+        "fix ships because no defect was found; the cell keeps its "
+        "measured value and links here — the honest kind of red.",
+    ),
+    ("m3-final", "sync_initial"): (
+        "0.89× vs Tuwunel at 200 events in this sitting — and 1.21× in "
+        "the same day's discarded run, with 800 and 3,200 in noise both "
+        "times. A cell that flips sign between sittings hours apart is "
+        "run-to-run variance, published as measured.",
+    ),
     ("m2-final", "state"): (
         "0.85× vs Tuwunel at 200 events, and 0.93× again at M3 progress — "
         "the one cell Tuwunel held across two sittings, so the investigation "

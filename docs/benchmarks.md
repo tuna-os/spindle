@@ -335,6 +335,54 @@ three servers. A conformance fix breaking our own tooling is the system
 working, and it is recorded here because the method promises the same
 workload through every front door.
 
+## M3 close-out: the four-way at milestone's end — 55 of 63, and a first sitting honest enough to discard
+
+Main at the close of M3 — federation joins, invites, leaves, knocks,
+backfill, profiles, media and typing all interoperating behind a 169-test
+Complement ratchet — measured against Synapse 1.159.0, Continuwuity 26.8.1
+and Tuwunel 1.9.0. Same ritual as every sitting: one host, cold databases
+per leg, pgrep-verified binaries, sizes 200/800/3,200, means over 25
+samples, raw files committed as `m3-final.*.json`.
+
+**The first attempt was discarded, and that is part of the record.** The
+host restarted minutes before the sitting and the release build left the
+1-minute load at 2.28 when the first leg started — the method says
+idleness is checked, not assumed, and a sitting whose legs run under
+*decaying* load hands the early legs a handicap the late legs don't pay.
+The rerun waited for load 0.29 and is the sitting published here.
+
+**The scoreboard: 55 of 63 cells faster, 6 within noise, 2 below the
+floor — both investigated, one to a null result worth reading.**
+
+- **vs Synapse: 21/21 faster**, joins 36–48×, sends 25–27×, pagination
+  and deep context 5–10×.
+- **vs Tuwunel: 20/21 faster or in noise.** The `state` column — the M3
+  investigation that started in their tree — is confirmed flipped:
+  **1.09×, 1.85×, 1.10×** in Spindle's favour, against 0.85× before the
+  render cache. `sync_initial/200` read 0.89× in this sitting and 1.21×
+  in the same day's discarded run; a cell that flips sign between
+  sittings hours apart is variance, and it is published as measured.
+- **vs Continuwuity: 19/21**, with `sliding_window/3200` at 0.77× — and
+  this one got the full second look the roadmap demands.
+
+**The sliding_window investigation, null result and all.** Two runs the
+same day put the cell below the floor (0.85× loaded, 0.77× idle), which
+is the repeatability rule firing. So both servers were probed live,
+minutes after the sitting, same client, same instant, two shapes: a
+creator sliding a fresh 3,200-event room of their own, and the driver's
+exact observer shape — a second user invited, joined, then sliding.
+Like-for-like, the gap does not exist: **creator shape 0.844 ms vs
+0.854 ms (parity); observer shape 0.785 ms vs 0.874 ms (Spindle 1.11×
+faster)**. The sitting's own Spindle value (1.009 ms) is higher than
+anything the same server produces under direct measurement, and the
+sitting's Continuwuity value (0.78 ms) is lower than its own probes
+(0.85–0.87 ms) — the two legs caught opposite sides of the machine's
+same-day swing. Decomposition shows no growth pathology either: the
+request's marginal is ~0.10 ms of timeline and ~0.11 ms of
+required_state over a 0.61 ms base. No fix ships because no defect was
+found; the cell keeps its measured value, and this note is what it
+links to.
+
 ## M3: reading Tuwunel's code for the one cell it kept winning
 
 `state` at 200 events was the only cell Tuwunel held across two sittings —
