@@ -1416,6 +1416,74 @@ impl Rooms {
         Ok((!bundle.is_empty()).then_some(Value::Object(bundle)))
     }
 
+    /// When the room last saw an event, as its head entry's origin timestamp.
+    ///
+    /// This is sliding sync's sort key. The linear index cannot order rooms
+    /// against each other — it is per-room by design — and scanning the
+    /// global stream backwards to rank rooms would touch every event since
+    /// the quietest room last spoke. The head timestamp is one point read per
+    /// room and agrees with what a client shows as "latest activity".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room or its head event cannot be read.
+    pub fn last_activity(&self, room_id: &str) -> Result<i64, RoomError> {
+        let head = self.with_room(room_id, |_, log| {
+            Ok(log
+                .entries()
+                .next_back()
+                .map(|entry| entry.event_id.as_str().to_owned()))
+        })?;
+        let Some(event_id) = head else {
+            return Ok(0);
+        };
+        let event = self.event(room_id, &event_id)?;
+        Ok(event["origin_server_ts"].as_i64().unwrap_or(0))
+    }
+
+    /// Room IDs with at least one event in the stream range `(since, until]`.
+    ///
+    /// One forward scan, deduplicated — the set an incremental sliding sync
+    /// answers about. The classic `/sync` asks a different question (which
+    /// *events*), so it walks per room; this asks only *which rooms*, and one
+    /// pass over the shared stream answers it for all of them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the stream cannot be read.
+    pub fn changed_rooms(&self, since: u64, until: u64) -> Result<Vec<String>, RoomError> {
+        let mut rooms = Vec::new();
+        for stream_id in (since + 1)..=until {
+            let Some(raw) = spindle_store::ReadView::get(
+                self.store.as_ref(),
+                &spindle_core::keys::stream(stream_id),
+            )?
+            else {
+                continue;
+            };
+            let Some(record) = StreamRecord::decode(&raw) else {
+                continue;
+            };
+            if !rooms.contains(&record.room_id) {
+                rooms.push(record.room_id);
+            }
+        }
+        Ok(rooms)
+    }
+
+    /// The newest `limit` timeline events of a room, oldest first, stamped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room or an event cannot be read.
+    pub fn timeline_tail_public(
+        &self,
+        room_id: &str,
+        limit: usize,
+    ) -> Result<(Vec<Value>, bool), RoomError> {
+        self.timeline_tail(room_id, limit)
+    }
+
     fn membership_rooms(&self, user_id: &str, wanted: &[u8]) -> Result<Vec<String>, RoomError> {
         let prefix =
             spindle_core::keys::user_prefix(spindle_core::keys::Keyspace::Membership, user_id);

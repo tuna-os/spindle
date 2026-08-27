@@ -20,6 +20,7 @@ pub mod ratelimit;
 pub mod rooms;
 pub mod routes;
 pub mod signing;
+pub mod sliding;
 pub mod surface;
 pub mod tokens;
 pub mod typing;
