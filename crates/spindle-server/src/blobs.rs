@@ -53,7 +53,23 @@ impl Blobs {
                 // a half-written blob under its final name. The name is the
                 // content hash, so a truncated file under it would be a
                 // permanent lie.
-                let staging = path.with_extension("partial");
+                //
+                // The staging name is unique per write, not per hash: two
+                // concurrent uploads of identical bytes are the ordinary
+                // case in a content-addressed store (Complement's parallel
+                // media subtests upload the same PNG three times at once),
+                // and a shared staging path lets one writer rename the
+                // other's half-written file into place — or fail its own
+                // rename because the file already moved. With unique names
+                // both writers stage complete files and rename atomically;
+                // whichever lands second replaces byte-identical content.
+                static WRITE_SEQ: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let staging = path.with_extension(format!(
+                    "partial-{}-{}",
+                    std::process::id(),
+                    WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                ));
                 std::fs::write(&staging, bytes).map_err(BlobError::Io)?;
                 std::fs::rename(&staging, &path).map_err(BlobError::Io)?;
                 Ok(())
