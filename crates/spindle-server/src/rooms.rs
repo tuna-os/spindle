@@ -2114,7 +2114,22 @@ fn highest_stream_id(store: &FjallStore) -> u64 {
     })
     .max()
     .unwrap_or(0);
-    from_stream.max(from_to_device)
+    // Device-list watermarks are the third drawer the counter allocates into
+    // without a stream row. The failure a low resume causes here is subtler
+    // than an overwrite: `/sync` hands out `next_batch` tokens read off this
+    // counter, so a change recorded at a re-used low sequence would sit at or
+    // below a token a client already holds — and that client would never hear
+    // that a device changed, and keep encrypting to a stale device set.
+    let from_device_lists = spindle_store::ReadView::scan_prefix(
+        store,
+        &spindle_core::keys::device_list_change_prefix(),
+    )
+    .unwrap_or_default()
+    .iter()
+    .filter_map(|(_, value)| value.as_slice().try_into().map(u64::from_be_bytes).ok())
+    .max()
+    .unwrap_or(0);
+    from_stream.max(from_to_device).max(from_device_lists)
 }
 
 #[cfg(test)]

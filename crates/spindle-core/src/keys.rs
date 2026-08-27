@@ -149,6 +149,20 @@ pub enum Keyspace {
     /// presenting `since` has durably received every batch up to it, so every
     /// message with `seq <= since` is acknowledged and can be dropped.
     ToDevice = 0x17,
+    /// `(user_id, device_id, algorithm)` -> the device's fallback key.
+    ///
+    /// The value carries a `used` flag rather than the row being deleted on
+    /// claim: a fallback key is exactly the key that must survive being
+    /// handed out, so that a device that runs out of one-time keys keeps
+    /// receiving sessions. The flag exists so `/sync` can tell the device
+    /// its fallback has been consumed and should be rotated.
+    FallbackKeys = 0x18,
+    /// `user_id` -> the stream position of the user's last device-list change.
+    ///
+    /// One row per user, overwritten on every change, because the question
+    /// `/sync` asks is "who changed since my token" — a watermark answers it
+    /// and a history would only say the same name more times.
+    DeviceListChange = 0x19,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -428,6 +442,26 @@ pub fn device_scoped(keyspace: Keyspace, user_id: &str, device_id: &str, suffix:
     key.extend_from_slice(&device[..len as usize]);
     key.extend_from_slice(suffix);
     key
+}
+
+/// The scan prefix covering every user's [`Keyspace::DeviceListChange`] row.
+#[must_use]
+pub fn device_list_change_prefix() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::DeviceListChange as u8]
+}
+
+/// `user_id` key for [`Keyspace::DeviceListChange`].
+#[must_use]
+pub fn device_list_change(user_id: &str) -> Vec<u8> {
+    user_prefix(Keyspace::DeviceListChange, user_id)
+}
+
+/// The user ID a [`Keyspace::DeviceListChange`] key names.
+#[must_use]
+pub fn device_list_change_user(key: &[u8]) -> Option<String> {
+    let rest = key.strip_prefix(device_list_change_prefix().as_slice())?;
+    let len = usize::from(u16::from_be_bytes(rest.get(..2)?.try_into().ok()?));
+    String::from_utf8(rest.get(2..2 + len)?.to_vec()).ok()
 }
 
 /// `(user_id, filter_id)` key for [`Keyspace::Filter`].
