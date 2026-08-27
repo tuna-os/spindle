@@ -26,23 +26,23 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**75 routes implemented; 31 known gaps in scope.**
+**78 routes implemented; 28 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
 
-### Federation — 3 implemented, 8 planned
+### Federation — 6 implemented, 5 planned
 
+- `GET /_matrix/federation/v1/event/{event_id}`
 - `GET /_matrix/federation/v1/query/directory`
 - `PUT /_matrix/federation/v1/send/{txn_id}`
+- `GET /_matrix/federation/v1/state/{room_id}`
+- `GET /_matrix/federation/v1/state_ids/{room_id}`
 - `GET /_matrix/federation/v1/version`
 - ⏳ `GET /_matrix/federation/v1/make_join/{roomId}/{userId}` — join handshake (#15)
 - ⏳ `PUT /_matrix/federation/v1/send_join/{roomId}/{eventId}` — join handshake (#15)
-- ⏳ `GET /_matrix/federation/v1/state/{roomId}` — state answers (#15)
-- ⏳ `GET /_matrix/federation/v1/state_ids/{roomId}` — state answers (#15)
 - ⏳ `GET /_matrix/federation/v1/backfill/{roomId}` — history (#15)
 - ⏳ `POST /_matrix/federation/v1/get_missing_events/{roomId}` — catch-up (#15)
-- ⏳ `GET /_matrix/federation/v1/event/{eventId}` — event fetch (#15)
 - ⏳ `PUT /_matrix/federation/v2/invite/{roomId}/{eventId}` — federated invites (#15)
 
 ### End-to-end encryption — 7 implemented, 0 planned

@@ -589,6 +589,18 @@ fn discovery_routes() -> Router<AppState> {
             "/_matrix/federation/v1/send/{txn_id}",
             axum::routing::put(federation_send),
         )
+        .route(
+            "/_matrix/federation/v1/state/{room_id}",
+            get(federation_state),
+        )
+        .route(
+            "/_matrix/federation/v1/state_ids/{room_id}",
+            get(federation_state_ids),
+        )
+        .route(
+            "/_matrix/federation/v1/event/{event_id}",
+            get(federation_event),
+        )
         .route("/.well-known/matrix/client", get(well_known_client))
         .route("/.well-known/matrix/server", get(well_known_server))
         .route("/health", get(health))
@@ -1197,6 +1209,125 @@ fn receive_one_pdu(
         Ok(()) => (event_id, Ok(())),
         Err(error) => (event_id, Err(error.to_string())),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct FederationStateQuery {
+    event_id: String,
+}
+
+/// Authenticate a federation request AND require the origin in the room.
+///
+/// The two checks always travel together on room-data reads: an
+/// authenticated stranger is still a stranger, and room state belongs to
+/// the servers in the room.
+async fn federation_room_origin(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    method: &str,
+    uri: &str,
+    room_id: &str,
+) -> Result<String, MatrixError> {
+    let origin = federation_origin(state, headers, method, uri, None).await?;
+    let joined = state
+        .rooms
+        .server_in_room(room_id, &origin)
+        .unwrap_or(false);
+    if !joined {
+        return Err(MatrixError::forbidden(
+            "your server has no joined member in that room",
+        ));
+    }
+    Ok(origin)
+}
+
+/// `GET /_matrix/federation/v1/state/{roomId}?event_id=`
+async fn federation_state(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<FederationStateQuery>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    federation_room_origin(&state, &headers, "GET", &uri, &room_id).await?;
+    let (pdus, auth_chain) = state
+        .rooms
+        .federation_state(&room_id, &query.event_id)
+        .map_err(room_error)?;
+    let bodies = |events: Vec<crate::rooms::IdentifiedEvent>| -> Vec<Value> {
+        events.into_iter().map(|(_, event)| event).collect()
+    };
+    Ok(Json(json!({
+        "pdus": bodies(pdus),
+        "auth_chain": bodies(auth_chain),
+    })))
+}
+
+/// `GET /_matrix/federation/v1/state_ids/{roomId}?event_id=`
+///
+/// The IDs-only form: same computation, smaller wire — a peer that
+/// already holds most events asks for this one.
+async fn federation_state_ids(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<FederationStateQuery>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    federation_room_origin(&state, &headers, "GET", &uri, &room_id).await?;
+    let (pdus, auth_chain) = state
+        .rooms
+        .federation_state(&room_id, &query.event_id)
+        .map_err(room_error)?;
+    let ids = |events: Vec<crate::rooms::IdentifiedEvent>| -> Vec<String> {
+        events.into_iter().map(|(id, _)| id).collect()
+    };
+    Ok(Json(json!({
+        "pdu_ids": ids(pdus),
+        "auth_chain_ids": ids(auth_chain),
+    })))
+}
+
+/// `GET /_matrix/federation/v1/event/{eventId}`
+async fn federation_event(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(event_id): axum::extract::Path<String>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    // Resolve the room first: the in-room check needs it, and an event we
+    // do not hold gets the same 404 whether or not the asker could have
+    // seen it — nothing leaks through the error shape.
+    let Some(room_id) = state.rooms.room_of_event(&event_id).map_err(room_error)? else {
+        federation_origin(&state, &headers, "GET", &uri, None).await?;
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "no such event".to_owned(),
+        ));
+    };
+    federation_room_origin(&state, &headers, "GET", &uri, &room_id).await?;
+    let event = state.rooms.event(&room_id, &event_id).map_err(room_error)?;
+    Ok(Json(json!({
+        "origin": state.config.server.name,
+        "origin_server_ts": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0),
+        "pdus": [event],
+    })))
 }
 
 /// `GET /_matrix/key/v2/server`

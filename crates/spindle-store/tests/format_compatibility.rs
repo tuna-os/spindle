@@ -173,6 +173,7 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::ServerKeys, 0x1e),
         (Keyspace::FederationTxn, 0x1f),
         (Keyspace::FederationOutbox, 0x20),
+        (Keyspace::EventRoom, 0x21),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(
