@@ -41,13 +41,47 @@ impl Peer {
             "verify_keys": { "ed25519:0": { "key": unpadded(&pair.public_key()) } },
         });
         sign_value(&name, &signing, &mut key_document);
-        let router = axum::Router::new().route(
-            "/_matrix/key/v2/server",
-            axum::routing::get(move || {
-                let body = key_document.clone();
-                async move { axum::Json(body) }
-            }),
-        );
+        // The peer co-signs invites like a real invitee's server would:
+        // the harness's `/invite` walks the live `v2/invite` handshake, and
+        // a peer that cannot answer it would fail every invite before the
+        // property under test is reached.
+        let invite_name = name.clone();
+        let invite_pair =
+            std::sync::Arc::new(Ed25519KeyPair::from_der(&document, "0".to_owned()).unwrap());
+        let router = axum::Router::new()
+            .route(
+                "/_matrix/key/v2/server",
+                axum::routing::get(move || {
+                    let body = key_document.clone();
+                    async move { axum::Json(body) }
+                }),
+            )
+            .route(
+                "/_matrix/federation/v2/invite/{_room_id}/{_event_id}",
+                axum::routing::put(
+                    move |axum::extract::Json(body): axum::extract::Json<Value>| {
+                        let name = invite_name.clone();
+                        let pair = invite_pair.clone();
+                        async move {
+                            let ruma::CanonicalJsonValue::Object(mut canonical) =
+                                ruma::CanonicalJsonValue::try_from(body["event"].clone()).unwrap()
+                            else {
+                                unreachable!()
+                            };
+                            let rules = RoomVersionId::V11.rules().unwrap();
+                            hash_and_sign_event(
+                                &name,
+                                pair.as_ref(),
+                                &mut canonical,
+                                &rules.redaction,
+                            )
+                            .unwrap();
+                            let signed = serde_json::to_value(&canonical).unwrap();
+                            axum::Json(json!({ "event": signed }))
+                        }
+                    },
+                ),
+            );
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });

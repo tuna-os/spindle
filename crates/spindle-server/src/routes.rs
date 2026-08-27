@@ -636,6 +636,10 @@ fn discovery_routes() -> Router<AppState> {
             "/_matrix/federation/v2/send_join/{room_id}/{event_id}",
             axum::routing::put(federation_send_join),
         )
+        .route(
+            "/_matrix/federation/v2/invite/{room_id}/{event_id}",
+            axum::routing::put(federation_invite),
+        )
         .route("/.well-known/matrix/client", get(well_known_client))
         .route("/.well-known/matrix/server", get(well_known_server))
         .route("/health", get(health))
@@ -1622,6 +1626,130 @@ async fn federation_send_join(
     })))
 }
 
+/// `PUT /_matrix/federation/v2/invite/{roomId}/{eventId}`
+///
+/// A remote server invites one of this server's users. The event arrives
+/// signed by the inviter; this server checks it names a local user, adds its
+/// own signature — the co-signature is what the rest of the room will accept
+/// as proof the invitee's server was told — and records the invite so the
+/// user's next `/sync` shows it, room history or not.
+async fn federation_invite(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let body: Value =
+        serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&body)).await?;
+
+    // The version check comes first: an event from a room version this
+    // server does not speak cannot be reasoned about, let alone signed.
+    if body["room_version"].as_str() != Some(crate::rooms::ROOM_VERSION) {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_INCOMPATIBLE_ROOM_VERSION",
+            format!(
+                "this server speaks room version {} only",
+                crate::rooms::ROOM_VERSION
+            ),
+        ));
+    }
+    let event = body["event"].clone();
+    let is_invite = event["type"] == json!("m.room.member")
+        && event["content"]["membership"] == json!("invite")
+        && event["room_id"].as_str() == Some(room_id.as_str());
+    if !is_invite {
+        return Err(MatrixError::bad_json(
+            "invite carries exactly an invite event for this room".to_owned(),
+        ));
+    }
+    // The signature this endpoint adds vouches for the *invitee*: their
+    // server was told. It vouches for nothing about the sender — but the
+    // sender must at least belong to the server that signed the request,
+    // or any server could originate invites in another's name.
+    let sender_domain = event["sender"].as_str().and_then(|u| u.split_once(':'));
+    if sender_domain.map(|(_, domain)| domain) != Some(origin.as_str()) {
+        return Err(MatrixError::forbidden(
+            "the invite's sender does not belong to the requesting server",
+        ));
+    }
+    let Some(target) = event["state_key"].as_str() else {
+        return Err(MatrixError::bad_json("the invite names no one".to_owned()));
+    };
+    let target_domain = target.split_once(':').map(|(_, domain)| domain);
+    if target_domain != Some(state.config.server.name.as_str()) {
+        return Err(MatrixError::forbidden(
+            "the invited user is not on this server",
+        ));
+    }
+    // Right domain, no such account: co-signing would vouch that a user
+    // was told about an invite when there is no user to tell.
+    let localpart = target.strip_prefix('@').map_or(target, |rest| {
+        rest.split_once(':')
+            .map_or(rest, |(localpart, _)| localpart)
+    });
+    let known = Accounts::new(state.store.as_ref(), &state.config.server.name)
+        .account(localpart)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+        .is_some();
+    if !known {
+        return Err(MatrixError::forbidden("no such user on this server"));
+    }
+    let target = target.to_owned();
+
+    let Ok(ruma::CanonicalJsonValue::Object(mut canonical)) =
+        ruma::CanonicalJsonValue::try_from(event)
+    else {
+        return Err(MatrixError::bad_json(
+            "the invite event does not canonicalize".to_owned(),
+        ));
+    };
+    let rules = ruma::RoomVersionId::try_from(crate::rooms::ROOM_VERSION)
+        .ok()
+        .and_then(|version| version.rules())
+        .ok_or_else(|| MatrixError::internal("the room version rules are unavailable"))?;
+    // The path names the event the inviter computed; disagreement means the
+    // two servers are not looking at the same event.
+    let hash = ruma::signatures::reference_hash(&canonical, &rules)
+        .map_err(|error| MatrixError::bad_json(format!("the invite cannot be hashed: {error}")))?;
+    if format!("${hash}") != event_id {
+        return Err(MatrixError::bad_json(format!(
+            "the event hashes to ${hash}, not {event_id}"
+        )));
+    }
+    if ruma::signatures::hash_and_sign_event(
+        &state.config.server.name,
+        state.key.pair(),
+        &mut canonical,
+        &rules.redaction,
+    )
+    .is_err()
+    {
+        return Err(MatrixError::internal("the invite cannot be co-signed"));
+    }
+    let signed = serde_json::to_value(&canonical)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+
+    let invite_state: Vec<Value> = body["invite_room_state"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    state
+        .rooms
+        .record_pending_invite(&target, &room_id, &origin, &invite_state)
+        .map_err(room_error)?;
+
+    Ok(Json(json!({ "event": signed })))
+}
+
 /// `GET /_matrix/key/v2/server`
 ///
 /// Publishes the *public* half of this server's signing key, so a peer can
@@ -1718,17 +1846,7 @@ async fn create_room(
     // Invites after the room stands, refused invites failing the create the
     // way the spec asks (the room still exists; the error names why).
     for target in &request.invite {
-        state
-            .rooms
-            .set_membership(
-                &room_id,
-                &identity.user_id,
-                target,
-                "invite",
-                None,
-                state.key.pair(),
-            )
-            .map_err(room_error)?;
+        invite_user(&state, &identity.user_id, &room_id, target, None).await?;
     }
     if let Some(localpart) = request.room_alias_name.as_deref() {
         let alias = format!("#{localpart}:{}", state.config.server.name);
@@ -1777,7 +1895,106 @@ async fn invite_to_room(
     axum::extract::Path(room_id): axum::extract::Path<String>,
     Json(request): Json<TargetedMembershipRequest>,
 ) -> Result<Json<Value>, MatrixError> {
-    targeted_membership(&state, &identity.user_id, &room_id, &request, "invite")
+    invite_user(
+        &state,
+        &identity.user_id,
+        &room_id,
+        &request.user_id,
+        request.reason.as_deref(),
+    )
+    .await?;
+    Ok(Json(json!({})))
+}
+
+/// Invite one user, wherever their server is.
+///
+/// A local target is one membership event. A remote target is the spec's
+/// invite handshake: build and sign the event here, hand it to the target's
+/// server to co-sign over `v2/invite`, and only then append it — the
+/// co-signed event is the one every other server in the room will accept as
+/// proof the invitee's server was told. A refusal from that server fails
+/// the invite, because an invite it never co-signed is one its user would
+/// never see.
+async fn invite_user(
+    state: &AppState,
+    sender: &str,
+    room_id: &str,
+    target: &str,
+    reason: Option<&str>,
+) -> Result<(), MatrixError> {
+    let Some((_, domain)) = target.split_once(':') else {
+        return Err(MatrixError::bad_json(format!("{target} is not a user ID")));
+    };
+    if domain == state.config.server.name {
+        state
+            .rooms
+            .set_membership(room_id, sender, target, "invite", reason, state.key.pair())
+            .map_err(room_error)?;
+        return Ok(());
+    }
+
+    let (event_id, event) = state
+        .rooms
+        .build_invite_event(room_id, sender, target, reason, state.key.pair())
+        .map_err(room_error)?;
+    // The stripped state the invited user renders the invite from — plus
+    // the invite itself, which is not yet state anywhere and is exactly the
+    // line "who asked you in" a client shows first.
+    let mut invite_state = state
+        .rooms
+        .stripped_state(room_id, target)
+        .map_err(room_error)?;
+    invite_state.push(json!({
+        "type": "m.room.member",
+        "state_key": target,
+        "sender": event["sender"],
+        "content": event["content"],
+    }));
+    let body = json!({
+        "event": event,
+        "invite_room_state": invite_state,
+        "room_version": crate::rooms::ROOM_VERSION,
+    });
+    let response = state
+        .federation
+        .remote_invite(domain, room_id, &event_id, &body)
+        .await
+        .map_err(|error| {
+            MatrixError::new(
+                StatusCode::BAD_GATEWAY,
+                "M_UNKNOWN",
+                format!("{domain} did not accept the invite: {error}"),
+            )
+        })?;
+
+    // What comes back must be the same event, co-signature aside — and the
+    // reference hash proves it, because signatures are outside the hash.
+    let cosigned = response["event"].clone();
+    let rules = ruma::RoomVersionId::try_from(crate::rooms::ROOM_VERSION)
+        .ok()
+        .and_then(|version| version.rules())
+        .ok_or_else(|| MatrixError::internal("the room version rules are unavailable"))?;
+    let same = ruma::CanonicalJsonValue::try_from(cosigned.clone())
+        .ok()
+        .and_then(|value| match value {
+            ruma::CanonicalJsonValue::Object(object) => Some(object),
+            _ => None,
+        })
+        .and_then(|object| ruma::signatures::reference_hash(&object, &rules).ok())
+        .is_some_and(|hash| format!("${hash}") == event_id);
+    if !same {
+        return Err(MatrixError::new(
+            StatusCode::BAD_GATEWAY,
+            "M_UNKNOWN",
+            format!("{domain} returned a different event than it was asked to sign"),
+        ));
+    }
+    state
+        .rooms
+        .commit_cosigned(room_id, &event_id, &cosigned)
+        .map_err(room_error)?;
+    state.rooms.wake_sync_waiters();
+    Ok(())
 }
 
 /// `POST /_matrix/client/v3/rooms/{room_id}/kick`
@@ -2088,6 +2305,35 @@ async fn join(
     }
 }
 
+/// Every server worth asking to broker a join, most-specific first.
+///
+/// The client's own `server_name`/`via` hints lead; the domain in the room
+/// ID follows; and a pending invite's origin closes the list — an invited
+/// user accepting knows one server that certainly holds the room, the one
+/// that sent the invite, and clients do not pass `via` when accepting.
+fn join_candidates(
+    state: &AppState,
+    user_id: &str,
+    room_id: &str,
+    servers: &[String],
+) -> Vec<String> {
+    let mut candidates: Vec<String> = servers.to_vec();
+    let push = |domain: &str, candidates: &mut Vec<String>| {
+        if !candidates.iter().any(|server| server == domain) && domain != state.config.server.name {
+            candidates.push(domain.to_owned());
+        }
+    };
+    if let Some((_, domain)) = room_id.split_once(':') {
+        push(domain, &mut candidates);
+    }
+    if let Ok(Some(record)) = state.rooms.pending_invite(user_id, room_id)
+        && let Some(origin) = record["origin"].as_str()
+    {
+        push(origin, &mut candidates);
+    }
+    candidates
+}
+
 /// Walk the `make_join`/`send_join` handshake as the joining server.
 async fn join_remote(
     state: &AppState,
@@ -2095,13 +2341,7 @@ async fn join_remote(
     room_id: &str,
     servers: &[String],
 ) -> Result<Json<Value>, MatrixError> {
-    let mut candidates: Vec<String> = servers.to_vec();
-    if let Some((_, domain)) = room_id.split_once(':')
-        && !candidates.iter().any(|server| server == domain)
-        && domain != state.config.server.name
-    {
-        candidates.push(domain.to_owned());
-    }
+    let candidates = join_candidates(state, user_id, room_id, servers);
     if candidates.is_empty() {
         return Err(MatrixError::new(
             StatusCode::NOT_FOUND,
