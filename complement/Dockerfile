@@ -1,10 +1,9 @@
 # Complement image for Spindle.
 #
-# Satisfies the *startup* contract: the container comes up, answers
-# GET /_matrix/client/versions on 8008, and declares a HEALTHCHECK so Complement
-# can wait for it. It does not yet satisfy the *test* contract -- see
-# complement/README.md for what is missing and complement/allowlist.txt for
-# what currently passes, which is nothing.
+# Satisfies the startup contract (comes up, answers /versions on 8008,
+# HEALTHCHECK, TLS on 8448 from the mounted CA) and the test contract:
+# complement/allowlist.txt is the ratchet of tests that must pass, and
+# scripts/complement.sh runs the suite against this image.
 #
 # Build from the repository root:
 #   docker build -f complement/Dockerfile -t complement-spindle:latest .

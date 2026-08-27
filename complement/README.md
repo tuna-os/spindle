@@ -14,26 +14,29 @@ It satisfies Complement's **startup** contract:
 - declares a `HEALTHCHECK` so Complement can wait for readiness,
 - runs as a non-root user (uid 10001).
 
-## What it does not do
+## The ratchet
 
-**No Complement test passes yet, and `allowlist.txt` is empty for that reason.**
-The server currently implements discovery and health only — there is no
-registration, no login, no room creation, so there is nothing for a conformance
-test to exercise. The image exists so that the startup contract is satisfied
-before the tests need it, not to imply the tests pass.
+`allowlist.txt` names every Complement test Spindle must pass — 117 test
+nodes at seeding (19 whole CS-API suites plus federation-package subtests),
+each verified across two consecutive full local runs before entering the
+list. `scripts/complement-check.py` enforces it against a `go test -json`
+ledger and fails naming whatever regressed.
 
-Specifically missing:
+CI (`complement-suite` in `.github/workflows/compliance.yml`) runs it two
+ways:
 
-| Gap | Lands with |
-|---|---|
-| Registration, login, access tokens | #11 |
-| Rooms, state, timelines | #7 |
-| Sync | #10 |
-| **TLS on 8448** — the certificate is generated but nothing serves it | #14 (M3 federation) |
-| Admin shared-secret registration (`complement` secret) | #11 |
+- **pull requests** run exactly the protected subset, so the gate is fast
+  and every merge proves the list still holds;
+- **pushes to main** run the whole suite, so newly passing tests surface as
+  candidates. Promotion is a reviewed edit to `allowlist.txt`, never
+  automatic — a flaky test promoted by a script teaches everyone to ignore
+  the gate.
 
-Until federation lands, only client-side tests are reachable at all, and none
-of those pass either.
+The suite itself is upstream `matrix-org/complement`, unforked, pinned by
+revision in `scripts/complement.sh` — the same arrangement Continuwuity and
+Tuwunel use. TLS on 8448 is served with the Complement-CA-signed
+certificate; the remaining large gaps (outbound remote joins, federated
+invites, EDUs over federation) are tracked on the M3 issues.
 
 ## Running it
 
