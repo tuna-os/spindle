@@ -76,6 +76,11 @@ impl Harness {
         .await
     }
 
+    async fn get(&self, path: &str) -> (StatusCode, Value) {
+        self.send(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+    }
+
     async fn get_auth(&self, path: &str, token: &str) -> (StatusCode, Value) {
         self.send(
             Request::builder()
@@ -94,7 +99,7 @@ impl Harness {
                 &json!({
                     "username": username,
                     "password": password,
-                    "auth": { "type": "m.login.dummy" },
+                    "auth": { "type": "m.login.dummy", "session": "register" },
                 }),
             )
             .await;
@@ -166,8 +171,118 @@ async fn registration_without_auth_returns_the_uia_flows() {
         )
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let flows: Value = serde_json::from_str(body["error"].as_str().unwrap()).unwrap();
-    assert_eq!(flows["flows"][0]["stages"][0], "m.login.dummy");
+    // Top level, not folded into an error string: generic UIA clients (and
+    // Complement's RegisterUser) read `flows` and `session` from the body
+    // of the 401 itself.
+    assert_eq!(body["flows"][0]["stages"][0], "m.login.dummy");
+    assert!(
+        body["session"].is_string(),
+        "the challenge names a session to resume: {body}"
+    );
+}
+
+#[tokio::test]
+async fn username_verdicts_outrank_the_uia_dance() {
+    // A client should hear M_USER_IN_USE or M_INVALID_USERNAME on its first
+    // request — not complete an auth flow to learn its username was never
+    // going to work. And an auth dict naming no session has not completed
+    // anything: it gets the challenge again, not an account.
+    let harness = Harness::new();
+    harness.register("alice", "hunter2").await;
+
+    let (status, body) = harness
+        .post(
+            "/_matrix/client/v3/register",
+            &json!({ "username": "alice", "password": "hunter2" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_USER_IN_USE");
+
+    let (status, body) = harness
+        .post(
+            "/_matrix/client/v3/register",
+            &json!({ "username": "not valid!", "password": "hunter2" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_INVALID_USERNAME");
+
+    let (status, body) = harness
+        .post(
+            "/_matrix/client/v3/register",
+            &json!({
+                "username": "bob",
+                "password": "hunter2",
+                "auth": { "type": "m.login.dummy" },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(body["session"].is_string(), "{body}");
+}
+
+#[tokio::test]
+async fn capitals_downcase_instead_of_failing() {
+    // The localpart grammar is lowercase; a client typing "Alice" means
+    // alice, on registration and on the availability probe alike.
+    let harness = Harness::new();
+    let (status, body) = harness
+        .post(
+            "/_matrix/client/v3/register",
+            &json!({
+                "username": "Alice",
+                "password": "hunter2",
+                "auth": { "type": "m.login.dummy", "session": "register" },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["user_id"], "@alice:example.org");
+
+    let (status, body) = harness
+        .post(
+            "/_matrix/client/v3/login",
+            &json!({
+                "type": "m.login.password",
+                "identifier": { "type": "m.id.user", "user": "ALICE" },
+                "password": "hunter2",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "login folds the same way: {body}");
+    assert_eq!(body["user_id"], "@alice:example.org");
+}
+
+#[tokio::test]
+async fn availability_answers_without_registering() {
+    let harness = Harness::new();
+    harness.register("alice", "hunter2").await;
+
+    let (status, body) = harness
+        .get("/_matrix/client/v3/register/available?username=bob")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["available"], true);
+
+    let (status, body) = harness
+        .get("/_matrix/client/v3/register/available?username=alice")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_USER_IN_USE");
+
+    // Answering "available" does not register: bob still does not exist.
+    let (status, body) = harness
+        .post(
+            "/_matrix/client/v3/login",
+            &json!({
+                "type": "m.login.password",
+                "identifier": { "type": "m.id.user", "user": "bob" },
+                "password": "hunter2",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
 #[tokio::test]
@@ -211,7 +326,7 @@ async fn a_taken_username_gets_the_errcode_a_client_can_act_on() {
             &json!({
                 "username": "alice",
                 "password": "other",
-                "auth": { "type": "m.login.dummy" },
+                "auth": { "type": "m.login.dummy", "session": "register" },
             }),
         )
         .await;
@@ -314,7 +429,7 @@ async fn a_client_can_refresh_its_access_token() {
                 "username": "alice",
                 "password": "hunter2",
                 "refresh_token": true,
-                "auth": { "type": "m.login.dummy" },
+                "auth": { "type": "m.login.dummy", "session": "register" },
             }),
         )
         .await;
