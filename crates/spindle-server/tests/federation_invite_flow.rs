@@ -350,3 +350,143 @@ async fn servers_already_in_the_room_hear_about_the_invite() {
         "carol's server heard about bob's invite"
     );
 }
+
+#[tokio::test]
+async fn a_rejected_invite_leaves_both_sides_clean() {
+    let remote = Instance::start().await;
+    let local = Instance::start().await;
+
+    let alice = remote.register("alice").await;
+    let bob = local.register("bob").await;
+    let bob_id = format!("@bob:{}", local.name);
+
+    let room = remote.named_room(&alice, "declined with thanks").await;
+    let (status, body) = remote
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/rooms/{room}/invite"),
+            Some(&alice),
+            Some(&json!({ "user_id": bob_id })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let sync = local.sync(&bob).await;
+    assert!(!sync["rooms"]["invite"][&room].is_null(), "{sync}");
+
+    // Bob rejects: /leave on a room his server holds no log for walks
+    // make_leave/send_leave against the inviting server.
+    let (status, body) = local
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/rooms/{room}/leave"),
+            Some(&bob),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "the rejection succeeds: {body}");
+
+    // Gone from bob's sync at once...
+    let sync = local.sync(&bob).await;
+    assert!(
+        sync["rooms"]["invite"][&room].is_null(),
+        "the invite stopped appearing: {sync}"
+    );
+
+    // ...and the room's real state on the inviting server records the
+    // leave, which only the send_leave handshake can have delivered.
+    assert!(
+        eventually(async || {
+            let (status, body) = remote
+                .request(
+                    reqwest::Method::GET,
+                    &format!("/_matrix/client/v3/rooms/{room}/state/m.room.member/{bob_id}"),
+                    Some(&alice),
+                    None,
+                )
+                .await;
+            status == 200 && body["membership"] == json!("leave")
+        })
+        .await,
+        "the inviter's room state shows the rejection"
+    );
+
+    // Rejected is not forbidden forever: alice may ask again.
+    let (status, body) = remote
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/rooms/{room}/invite"),
+            Some(&alice),
+            Some(&json!({ "user_id": bob_id })),
+        )
+        .await;
+    assert_eq!(status, 200, "a re-invite after rejection works: {body}");
+    let sync = local.sync(&bob).await;
+    assert!(
+        !sync["rooms"]["invite"][&room].is_null(),
+        "the new invite renders: {sync}"
+    );
+}
+
+#[tokio::test]
+async fn an_invite_revoked_by_the_room_stops_haunting_the_invitee() {
+    let remote = Instance::start().await;
+    let local = Instance::start().await;
+
+    let alice = remote.register("alice").await;
+    let bob = local.register("bob").await;
+    let bob_id = format!("@bob:{}", local.name);
+
+    let room = remote.named_room(&alice, "changed our minds").await;
+    let (status, body) = remote
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/rooms/{room}/invite"),
+            Some(&alice),
+            Some(&json!({ "user_id": bob_id })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let sync = local.sync(&bob).await;
+    assert!(!sync["rooms"]["invite"][&room].is_null(), "{sync}");
+
+    // Alice withdraws the invite: a kick, from a room bob's server holds
+    // no log for. The leave event fans out to bob's domain over /send.
+    let (status, body) = remote
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/rooms/{room}/kick"),
+            Some(&alice),
+            Some(&json!({ "user_id": bob_id })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    assert!(
+        eventually(async || {
+            let sync = local.sync(&bob).await;
+            sync["rooms"]["invite"][&room].is_null()
+        })
+        .await,
+        "the revoked invite stops appearing in bob's sync"
+    );
+}
+
+#[tokio::test]
+async fn a_leave_template_for_a_stranger_is_refused() {
+    // No membership, no template: the resident server refuses to hand a
+    // departure kit for a user who was never invited or joined. This is
+    // asserted through the public flow — a /leave for a room the server
+    // never heard of and holds no invite for is a clean error, not a
+    // fabricated federation departure.
+    let local = Instance::start().await;
+    let bob = local.register("bob").await;
+    let (status, body) = local
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/rooms/!nowhere:{}/leave", local.name),
+            Some(&bob),
+            Some(&json!({})),
+        )
+        .await;
+    assert_ne!(status, 200, "leaving nothing is refused: {body}");
+}

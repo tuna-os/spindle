@@ -1056,6 +1056,109 @@ impl Rooms {
         })
     }
 
+    /// A leave-event template for a remote user, for `make_leave`.
+    ///
+    /// The mirror of [`Self::make_join_template`], with the mirrored
+    /// precondition: there must be a membership to leave — an invite being
+    /// rejected, a join being ended, a knock withdrawn. A template for a
+    /// stranger would let any server manufacture departures for users who
+    /// were never here.
+    ///
+    /// # Errors
+    ///
+    /// [`RoomError::UnknownRoom`] when the room is not here,
+    /// [`RoomError::Forbidden`] when the user has nothing to leave.
+    pub fn make_leave_template(&self, room_id: &str, user_id: &str) -> Result<Value, RoomError> {
+        self.with_room(room_id, |_, log| {
+            let head = log
+                .entries()
+                .next_back()
+                .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
+            let membership = spindle_store::ReadView::get(
+                self.store.as_ref(),
+                &spindle_core::keys::user_room(
+                    spindle_core::keys::Keyspace::Membership,
+                    user_id,
+                    room_id,
+                ),
+            )?;
+            let leavable = matches!(membership.as_deref(), Some(b"invite" | b"join" | b"knock"));
+            if !leavable {
+                return Err(RoomError::Forbidden(
+                    "the user has no membership to leave".to_owned(),
+                ));
+            }
+
+            let content = serde_json::json!({ "membership": "leave" });
+            let auth = auth_events_for(log, user_id, "m.room.member", Some(user_id), &content)?;
+            let prev: Vec<String> = log
+                .forward_extremities()
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect();
+            let depth = head.depth.saturating_add(1);
+            Ok(serde_json::json!({
+                "type": "m.room.member",
+                "sender": user_id,
+                "state_key": user_id,
+                "room_id": room_id,
+                "content": content,
+                "origin_server_ts": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+                    .unwrap_or(0),
+                "depth": depth,
+                "prev_events": prev,
+                "auth_events": auth,
+            }))
+        })
+    }
+
+    /// Erase a pending invite: the membership row and the side record.
+    ///
+    /// Deletion rather than a `leave` row, deliberately: the leave section
+    /// of `/sync` renders a departure from the room's log, and there is no
+    /// log here — a `leave` row pointing at a room this server never held
+    /// would fail every sync that touched it. An invite that was rejected
+    /// (or revoked from the other side) simply stops appearing, which is
+    /// also what a client does with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the store refuses the deletes.
+    pub fn clear_pending_invite(&self, user_id: &str, room_id: &str) -> Result<(), RoomError> {
+        let pending = spindle_store::ReadView::get(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::PendingInvite,
+                user_id,
+                room_id,
+            ),
+        )?
+        .is_some();
+        if !pending {
+            return Ok(());
+        }
+        spindle_store::Store::delete(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::Membership,
+                user_id,
+                room_id,
+            ),
+        )?;
+        spindle_store::Store::delete(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::PendingInvite,
+                user_id,
+                room_id,
+            ),
+        )?;
+        self.wake_sync_waiters();
+        Ok(())
+    }
+
     /// History walking backwards from the given events, newest first —
     /// federation backfill.
     ///
@@ -2587,9 +2690,27 @@ impl Rooms {
         event_id: &str,
         json: &Value,
     ) -> Result<(), RoomError> {
-        self.with_room(room_id, |rooms, log| {
+        let received = self.with_room(room_id, |rooms, log| {
             rooms.ingest(log, room_id, event_id, json, false)
-        })
+        });
+        // An event for a room this server never held can still say one true
+        // thing to us: our user's invite there ended. Without this, an
+        // invite revoked or kicked from the other side would haunt the
+        // user's sync forever — the resident server fans the leave out to
+        // the invitee's domain, and this is the only door it arrives by.
+        if let Err(RoomError::UnknownRoom(_)) = &received
+            && json["type"].as_str() == Some("m.room.member")
+            && matches!(
+                json["content"]["membership"].as_str(),
+                Some("leave" | "ban")
+            )
+            && let Some(target) = json["state_key"].as_str()
+            && target.split_once(':').map(|(_, domain)| domain) == Some(self.server_name.as_str())
+        {
+            self.clear_pending_invite(target, room_id)?;
+            return Ok(());
+        }
+        received
     }
 
     /// Append an event this server authored but a peer completed.
