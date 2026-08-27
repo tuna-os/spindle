@@ -244,7 +244,21 @@ impl Harness {
     }
 
     async fn deliver(&self, peer: &Peer, txn_id: &str, pdus: Vec<Value>) -> (StatusCode, Value) {
-        let body = json!({ "origin": peer.name, "origin_server_ts": now_millis(), "pdus": pdus });
+        self.deliver_with_edus(peer, txn_id, pdus, Vec::new()).await
+    }
+
+    async fn deliver_with_edus(
+        &self,
+        peer: &Peer,
+        txn_id: &str,
+        pdus: Vec<Value>,
+        edus: Vec<Value>,
+    ) -> (StatusCode, Value) {
+        let mut body =
+            json!({ "origin": peer.name, "origin_server_ts": now_millis(), "pdus": pdus });
+        if !edus.is_empty() {
+            body["edus"] = Value::Array(edus);
+        }
         let header = peer.transaction_header(txn_id, &body);
         self.call(
             Request::builder()
@@ -621,5 +635,90 @@ async fn a_message_edited_after_signing_is_refused_by_the_hash_alone() {
                     .is_some_and(serde_json::Map::is_empty)
         }),
         "{messages}"
+    );
+}
+
+/// One `m.typing` EDU, as a peer would send it.
+fn typing_edu(room: &str, user: &str, typing: bool) -> Value {
+    json!({
+        "edu_type": "m.typing",
+        "content": { "room_id": room, "user_id": user, "typing": typing },
+    })
+}
+
+#[tokio::test]
+async fn a_typing_edu_is_applied_for_the_origins_own_joined_user_only() {
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
+    let join = join_event(&peer, &room, &head);
+    let (status, _) = harness.deliver(&peer, "t1", vec![join]).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let typing_of = |body: &Value| -> Vec<String> {
+        body["rooms"]["join"][&room]["ephemeral"]["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|event| event["type"] == "m.typing")
+            .flat_map(|event| {
+                event["content"]["user_ids"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter_map(|user| user.as_str().map(str::to_owned))
+            .collect()
+    };
+
+    // The peer says its own joined user is typing: applied.
+    let (status, body) = harness
+        .deliver_with_edus(
+            &peer,
+            "t2",
+            Vec::new(),
+            vec![typing_edu(&room, &peer.user(), true)],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, sync) = harness
+        .call(
+            Request::builder()
+                .uri("/_matrix/client/v3/sync")
+                .header("authorization", format!("Bearer {alice}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert!(
+        typing_of(&sync).contains(&peer.user()),
+        "the peer's own typing lands: {sync}"
+    );
+
+    // The peer says *alice* is typing: an EDU is unsigned content inside a
+    // signed envelope, and the envelope's origin does not own alice — so
+    // no server can put words in another's hands.
+    let (status, _) = harness
+        .deliver_with_edus(
+            &peer,
+            "t3",
+            Vec::new(),
+            vec![typing_edu(&room, "@alice:example.org", true)],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "the transaction itself is fine");
+    let (_, sync) = harness
+        .call(
+            Request::builder()
+                .uri("/_matrix/client/v3/sync")
+                .header("authorization", format!("Bearer {alice}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert!(
+        !typing_of(&sync).contains(&"@alice:example.org".to_owned()),
+        "the forged claim is ignored: {sync}"
     );
 }
