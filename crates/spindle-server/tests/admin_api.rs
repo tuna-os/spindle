@@ -133,6 +133,14 @@ fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
                 format!("{prefix}/users/{user}/joined_rooms"),
             ),
             (reqwest::Method::GET, format!("{prefix}/whois/{user}")),
+            (reqwest::Method::GET, format!("{prefix}/rooms")),
+            (reqwest::Method::GET, format!("{prefix}/rooms/!r:x")),
+            (reqwest::Method::GET, format!("{prefix}/rooms/!r:x/members")),
+            (reqwest::Method::GET, format!("{prefix}/rooms/!r:x/state")),
+            (
+                reqwest::Method::GET,
+                format!("{prefix}/rooms/!r:x/timeline"),
+            ),
             (reqwest::Method::GET, format!("{prefix}/audit")),
         ]);
     }
@@ -480,4 +488,202 @@ async fn deactivation_takes_the_admin_bit_with_the_sessions() {
         )
         .await;
     assert_eq!(status, 200, "{body}");
+}
+
+/// Two rooms an admin would look at: a named public one with two members
+/// and a little traffic, and an unnamed private one. Returns the admin
+/// token and both room IDs, named one first.
+async fn rooms_fixture(server: &Instance) -> (String, String, String) {
+    let admin_token = server.register("root").await;
+    server.promote("root");
+    let alice_token = server.register("alice").await;
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/createRoom",
+            Some(&admin_token),
+            Some(&json!({ "name": "Operations", "preset": "public_chat" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let ops = body["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/join/{ops}"),
+            Some(&alice_token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    for n in 0..3 {
+        let (status, body) = server
+            .request(
+                reqwest::Method::PUT,
+                &format!("/_matrix/client/v3/rooms/{ops}/send/m.room.message/t{n}"),
+                Some(&admin_token),
+                Some(&json!({ "msgtype": "m.text", "body": format!("message {n}") })),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+    }
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/createRoom",
+            Some(&alice_token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let unnamed = body["room_id"].as_str().unwrap().to_owned();
+    (admin_token, ops, unnamed)
+}
+
+#[tokio::test]
+async fn the_room_listing_orders_filters_and_paginates() {
+    let server = Instance::start().await;
+    let (admin_token, ops, unnamed) = rooms_fixture(&server).await;
+    let list = |query: &'static str| {
+        let server = &server;
+        let token = admin_token.clone();
+        async move {
+            server
+                .request(
+                    reqwest::Method::GET,
+                    &format!("/_spindle/admin/v1/rooms{query}"),
+                    Some(&token),
+                    None,
+                )
+                .await
+        }
+    };
+
+    // Default ordering is by name; the unnamed room sorts after, not out.
+    let (status, body) = list("").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total_rooms"], 2, "{body}");
+    assert_eq!(body["rooms"][0]["room_id"], ops.as_str(), "{body}");
+    assert_eq!(body["rooms"][1]["room_id"], unnamed.as_str(), "{body}");
+    assert_eq!(body["rooms"][0]["name"], "Operations", "{body}");
+    assert_eq!(body["rooms"][0]["joined_members"], 2, "{body}");
+    assert_eq!(body["rooms"][0]["public"], true, "{body}");
+    assert_eq!(body["rooms"][1]["public"], false, "{body}");
+    assert!(body["rooms"][0]["version"].is_string(), "{body}");
+    assert_eq!(
+        body["rooms"][0]["creator"],
+        server.user("root").as_str(),
+        "{body}"
+    );
+
+    // Search matches names; the size orderings put the busy room first.
+    let (status, body) = list("?search_term=Opera").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total_rooms"], 1, "{body}");
+    let (status, body) = list("?order_by=joined_members").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["rooms"][0]["room_id"], ops.as_str(), "{body}");
+    let (status, body) = list("?order_by=shoe_size").await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["errcode"], "M_INVALID_PARAM", "{body}");
+
+    // Pagination walks the same order without overlap.
+    let (status, body) = list("?limit=1").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["rooms"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(body["next_batch"], 1, "{body}");
+    let (status, body) = list("?limit=1&from=1").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["rooms"][0]["room_id"], unnamed.as_str(), "{body}");
+    assert!(body.get("next_batch").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn room_detail_members_state_and_timeline_read_the_log() {
+    let server = Instance::start().await;
+    let (admin_token, ops, _) = rooms_fixture(&server).await;
+    let get = |path: String| {
+        let server = &server;
+        let token = admin_token.clone();
+        async move {
+            server
+                .request(reqwest::Method::GET, &path, Some(&token), None)
+                .await
+        }
+    };
+
+    let (status, body) = get(format!("/_spindle/admin/v1/rooms/{ops}")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["name"], "Operations", "{body}");
+    assert_eq!(body["joined_members"], 2, "{body}");
+    assert_eq!(body["joined_local_members"], 2, "{body}");
+    assert_eq!(body["federatable"], true, "{body}");
+    assert!(body["state_events"].as_u64().unwrap() >= 5, "{body}");
+    let (status, body) = get("/_spindle/admin/v1/rooms/!missing:nowhere".to_owned()).await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["errcode"], "M_NOT_FOUND", "{body}");
+
+    let (status, body) = get(format!("/_spindle/admin/v1/rooms/{ops}/members")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total"], 2, "{body}");
+    let members = body["members"].as_array().unwrap();
+    assert!(
+        members.iter().any(|m| m == server.user("alice").as_str()),
+        "{body}"
+    );
+
+    let (status, body) = get(format!("/_spindle/admin/v1/rooms/{ops}/state")).await;
+    assert_eq!(status, 200, "{body}");
+    let state = body["state"].as_array().unwrap();
+    assert!(
+        state.iter().any(|event| event["type"] == "m.room.create"),
+        "{body}"
+    );
+
+    // The timeline reads forward in storage order and starts at creation.
+    let (status, body) = get(format!("/_spindle/admin/v1/rooms/{ops}/timeline")).await;
+    assert_eq!(status, 200, "{body}");
+    let chunk = body["chunk"].as_array().unwrap();
+    assert_eq!(chunk[0]["event"]["type"], "m.room.create", "{body}");
+    let all_ids: Vec<Value> = chunk
+        .iter()
+        .map(|entry| entry["event_id"].clone())
+        .collect();
+    let lis: Vec<i64> = chunk
+        .iter()
+        .map(|entry| entry["li"].as_i64().unwrap())
+        .collect();
+    assert!(lis.windows(2).all(|pair| pair[0] < pair[1]), "{lis:?}");
+
+    // Paging forward re-walks exactly the same entries, no seam, no overlap.
+    let mut paged = Vec::new();
+    let mut from = String::new();
+    loop {
+        let (status, body) = get(format!(
+            "/_spindle/admin/v1/rooms/{ops}/timeline?limit=2{from}"
+        ))
+        .await;
+        assert_eq!(status, 200, "{body}");
+        for entry in body["chunk"].as_array().unwrap() {
+            paged.push(entry["event_id"].clone());
+        }
+        match body.get("next_token") {
+            Some(next) => from = format!("&from={next}"),
+            None => break,
+        }
+    }
+    assert_eq!(paged, all_ids, "pagination must not tear the log");
+
+    // Backward shows the newest first; a made-up direction is refused.
+    let (status, body) = get(format!("/_spindle/admin/v1/rooms/{ops}/timeline?dir=b")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["chunk"][0]["event"]["content"]["body"], "message 2",
+        "{body}"
+    );
+    let (status, body) = get(format!("/_spindle/admin/v1/rooms/{ops}/timeline?dir=x")).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["errcode"], "M_INVALID_PARAM", "{body}");
 }

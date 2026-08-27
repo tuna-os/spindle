@@ -1453,6 +1453,109 @@ impl Rooms {
         Ok(out)
     }
 
+    /// Every room this server holds, from the stored metadata rows.
+    ///
+    /// A scan of the `RoomMeta` keyspace rather than the open-rooms map,
+    /// for the same reason `joined` reads storage: it is correct after a
+    /// restart, when nothing is open yet. The admin listing is the caller;
+    /// nothing on the client-serving hot path enumerates every room.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the store cannot be scanned.
+    pub fn all_room_ids(&self) -> Result<Vec<String>, RoomError> {
+        let prefix = [
+            spindle_core::keys::KEY_SCHEMA_VERSION,
+            spindle_core::keys::Keyspace::RoomMeta as u8,
+        ];
+        let records = spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?;
+        let mut out = Vec::with_capacity(records.len());
+        for (key, _) in records {
+            // Key layout per `keys::room_prefix`: version, keyspace,
+            // u16 length, then the room ID bytes.
+            let Some(len) = key
+                .get(2..4)
+                .map(|bytes| usize::from(u16::from_be_bytes([bytes[0], bytes[1]])))
+            else {
+                continue;
+            };
+            if let Some(room) = key
+                .get(4..4 + len)
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            {
+                out.push(room.to_owned());
+            }
+        }
+        Ok(out)
+    }
+
+    /// The admin view of the log: entries in `li` order, either direction,
+    /// paginated by an exclusive `from` boundary.
+    ///
+    /// Unlike `/messages` this walks storage order both ways, because the
+    /// operator's question is "what does the log say" rather than "what is
+    /// new" — #83's table calls it out as the query the linear index makes
+    /// trivial. The returned token re-includes nothing: pass it back as
+    /// `from` verbatim to continue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room is unknown or its records cannot
+    /// be read.
+    pub fn admin_timeline(
+        &self,
+        room_id: &str,
+        from: Option<i64>,
+        limit: usize,
+        forward: bool,
+    ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
+        let (wanted, next) = self.with_room(room_id, |_, log| {
+            let mut wanted = Vec::new();
+            let mut next = None;
+            let mut visit = |li: i64, event_id: &str| {
+                if wanted.len() == limit {
+                    next = Some(li);
+                    return true;
+                }
+                wanted.push((li, event_id.to_owned()));
+                false
+            };
+            if forward {
+                for entry in log.entries() {
+                    let li = entry.li.get();
+                    if from.is_some_and(|from| li <= from) {
+                        continue;
+                    }
+                    if visit(li, entry.event_id.as_str()) {
+                        break;
+                    }
+                }
+                // Continuing forward from the last returned entry means
+                // "everything above it", which is that entry's own `li`.
+                next = next.map(|li| li - 1);
+            } else {
+                for entry in log.entries().rev() {
+                    let li = entry.li.get();
+                    if from.is_some_and(|from| li >= from) {
+                        continue;
+                    }
+                    if visit(li, entry.event_id.as_str()) {
+                        break;
+                    }
+                }
+                next = next.map(|li| li + 1);
+            }
+            Ok((wanted, next))
+        })?;
+
+        let mut out = Vec::with_capacity(wanted.len());
+        for (li, event_id) in wanted {
+            let json = self.read_event(room_id, &EventId::new(event_id.as_str()))?;
+            out.push(TimelineEvent { event_id, li, json });
+        }
+        Ok((out, next))
+    }
+
     /// Events in `li` order, newest first, starting below `from`.
     ///
     /// # Errors
