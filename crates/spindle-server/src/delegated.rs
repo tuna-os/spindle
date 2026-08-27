@@ -179,18 +179,8 @@ impl Delegated {
             .map_err(|error| MatrixError::internal(&error.to_string()))?
             .is_some();
         if !known {
-            let password = {
-                use rand::RngCore as _;
-                use std::fmt::Write as _;
-                let mut bytes = [0_u8; 32];
-                rand::rngs::OsRng.fill_bytes(&mut bytes);
-                bytes.iter().fold(String::new(), |mut out, byte| {
-                    let _ = write!(out, "{byte:02x}");
-                    out
-                })
-            };
             accounts
-                .register(&localpart, &password)
+                .register(&localpart, &crate::accounts::unguessable_password())
                 .map_err(|error| MatrixError::internal(&error.to_string()))?;
         }
         // The device row exists because the provider bound the token to

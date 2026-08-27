@@ -163,6 +163,14 @@ jobs:
           echo "COMPLEMENT_RUN=$(python3 scripts/complement-check.py --print-run-filter x)" >> "$GITHUB_ENV"
 
       - name: Run Complement
+        # The pipe in GOPROXY is load-bearing: it tells Go to fall back to
+        # direct module fetches on ANY proxy error, where the default comma
+        # only falls back on 404/410. proxy.golang.org has failed mid-stream
+        # ("stream error … INTERNAL_ERROR") twice on this runner class,
+        # which makes `go test` report the whole package as [setup failed]
+        # and every test in it as absent.
+        env:
+          GOPROXY: https://proxy.golang.org|direct
         run: scripts/complement.sh tmp/complement-results.jsonl
 
       - name: Enforce the allowlist
