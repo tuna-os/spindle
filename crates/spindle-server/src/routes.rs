@@ -78,6 +78,7 @@ pub fn router(state: AppState) -> Router {
         .merge(timeline_routes())
         .merge(media_routes())
         .merge(discovery_routes())
+        .merge(crate::mas::routes())
         // SPEC: an endpoint the server does not recognize answers 404
         // M_UNRECOGNIZED — a JSON verdict, not a bare status. Clients (and
         // Complement's TestUnknownEndpoints) read the errcode to tell "this
@@ -1257,19 +1258,9 @@ fn register_appservice_user(
             ),
         ));
     }
-    let password = {
-        use rand::RngCore as _;
-        use std::fmt::Write as _;
-        let mut bytes = [0_u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
-        bytes.iter().fold(String::new(), |mut out, byte| {
-            let _ = write!(out, "{byte:02x}");
-            out
-        })
-    };
     let accounts = Accounts::new(state.store.as_ref(), server_name);
     accounts
-        .register(username, &password)
+        .register(username, &crate::accounts::unguessable_password())
         .map_err(|error| match error {
             AccountError::UserInUse => MatrixError::user_in_use(),
             AccountError::InvalidUsername => MatrixError::invalid_username(),

@@ -35,6 +35,11 @@ pub struct Account {
     pub localpart: String,
     /// Argon2id PHC string, salt included.
     pub password_hash: String,
+    /// Deactivated accounts keep their row — the localpart stays taken
+    /// forever, because releasing it would let a stranger inherit the
+    /// old user's identity — but no longer authenticate.
+    #[serde(default)]
+    pub deactivated: bool,
 }
 
 /// One logged-in device.
@@ -138,10 +143,28 @@ impl<'a, S: Store> Accounts<'a, S> {
         let account = Account {
             localpart: localpart.to_owned(),
             password_hash,
+            deactivated: false,
         };
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
         Ok(account)
+    }
+
+    /// Flip an account's deactivation flag, leaving everything else.
+    /// An unknown localpart is a no-op: deactivating a user who does
+    /// not exist has nothing to do.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or decoding error.
+    pub fn set_deactivated(&self, localpart: &str, deactivated: bool) -> Result<(), AccountError> {
+        let Some(mut account) = self.account(localpart)? else {
+            return Ok(());
+        };
+        account.deactivated = deactivated;
+        self.store
+            .put(&account_key(localpart), &encode(&account)?)?;
+        Ok(())
     }
 
     /// # Errors
@@ -170,7 +193,9 @@ impl<'a, S: Store> Accounts<'a, S> {
         let matches = Argon2::default()
             .verify_password(password.as_bytes(), &parsed)
             .is_ok();
-        Ok(matches && account.is_some())
+        // A deactivated account keeps its hash (the row is the localpart
+        // reservation) but no longer authenticates.
+        Ok(matches && account.is_some_and(|account| !account.deactivated))
     }
 
     /// Create a device and an access token for it.
@@ -402,6 +427,18 @@ fn token_key(keyspace: Keyspace, token: &str) -> Vec<u8> {
     let mut key = vec![spindle_core::keys::KEY_SCHEMA_VERSION, keyspace as u8];
     key.extend_from_slice(digest.as_bytes());
     key
+}
+
+/// A password for an account nobody logs into with one: appservice
+/// ghosts, MSC3861-provisioned users. 256 bits of entropy that are
+/// hashed, stored, and never seen again — the account is entered through
+/// its own door (the `as_token`, the provider's introspection), and a
+/// guessable password would be a second door nobody watches.
+#[must_use]
+pub fn unguessable_password() -> String {
+    let mut bytes = [0_u8; TOKEN_BYTES];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex(&bytes)
 }
 
 fn random_token(prefix: &str) -> String {

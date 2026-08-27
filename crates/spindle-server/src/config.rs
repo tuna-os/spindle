@@ -56,6 +56,12 @@ pub struct DelegatedAuthConfig {
     /// Client credentials this server presents when introspecting.
     pub client_id: String,
     pub client_secret: String,
+    /// The token the provider presents when calling *us* — MAS's
+    /// `matrix.secret`, guarding the `/_synapse/mas/*` provisioning
+    /// surface. Absent, that surface answers 404 and the provider
+    /// cannot manage accounts here.
+    #[serde(default)]
+    pub homeserver_secret: Option<String>,
 }
 
 /// Which appservice registration files to load at startup.

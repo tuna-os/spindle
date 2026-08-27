@@ -20,6 +20,7 @@ pub mod directory;
 pub mod errors;
 pub mod federation;
 pub mod filters;
+pub mod mas;
 pub mod media;
 pub mod previews;
 pub mod profiles;
