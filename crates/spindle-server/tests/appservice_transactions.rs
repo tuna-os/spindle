@@ -16,12 +16,15 @@ use serde_json::{Value, json};
 use spindle_store::FjallStore;
 use tempfile::TempDir;
 
-/// One recorded delivery to the mock bridge.
+/// One recorded delivery to the mock bridge. `ephemeral` is `None` when
+/// the transaction body carried no such key at all — MSC2409 has
+/// non-opted services never see the key, so its absence is an assertion.
 #[derive(Clone, Debug)]
 struct Delivery {
     txn_id: String,
     authorization: String,
     events: Vec<Value>,
+    ephemeral: Option<Vec<Value>>,
 }
 
 /// The mock bridge: records every transaction, and can be told to fail
@@ -55,23 +58,21 @@ impl Bridge {
                             .await
                             .unwrap_or_default();
                         let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                        let delivery = Delivery {
+                            txn_id,
+                            authorization,
+                            events: as_events(&body),
+                            ephemeral: body["ephemeral"].as_array().cloned(),
+                        };
                         {
                             let mut failures = state.failures_left.lock().unwrap();
                             if *failures > 0 {
                                 *failures -= 1;
-                                state.deliveries.lock().unwrap().push(Delivery {
-                                    txn_id,
-                                    authorization,
-                                    events: as_events(&body),
-                                });
+                                state.deliveries.lock().unwrap().push(delivery);
                                 return axum::http::StatusCode::INTERNAL_SERVER_ERROR;
                             }
                         }
-                        state.deliveries.lock().unwrap().push(Delivery {
-                            txn_id,
-                            authorization,
-                            events: as_events(&body),
-                        });
+                        state.deliveries.lock().unwrap().push(delivery);
                         axum::http::StatusCode::OK
                     },
                 ),
@@ -109,6 +110,10 @@ struct Instance {
 
 impl Instance {
     async fn start(as_url: &str) -> Instance {
+        Self::start_with(as_url, false).await
+    }
+
+    async fn start_with(as_url: &str, receive_ephemeral: bool) -> Instance {
         let reg_dir = TempDir::new().unwrap();
         let reg_path = reg_dir.path().join("bridge.yaml");
         std::fs::write(
@@ -116,6 +121,7 @@ impl Instance {
             format!(
                 "id: testbridge\nurl: \"{as_url}\"\nas_token: {AS_TOKEN}\n\
                  hs_token: {HS_TOKEN}\nsender_localpart: _bridge_bot\n\
+                 receive_ephemeral: {receive_ephemeral}\n\
                  namespaces:\n  users:\n    - exclusive: true\n      regex: \"@_bridge_.*:.*\"\n"
             ),
         )
@@ -355,5 +361,109 @@ async fn uninterested_traffic_is_skipped_not_delivered() {
             .iter()
             .all(|event| event["room_id"] != Value::String(private.clone()))),
         "not even the private room's state events"
+    );
+}
+
+/// The `m.typing` ephemeral entries for one room across all deliveries.
+fn typing_for(deliveries: &[Delivery], room: &str) -> Vec<Value> {
+    deliveries
+        .iter()
+        .flat_map(|delivery| delivery.ephemeral.iter().flatten())
+        .filter(|entry| entry["type"] == "m.typing" && entry["room_id"] == room)
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn typing_rides_the_transaction_as_ephemeral() {
+    let (bridge, as_url) = Bridge::serve().await;
+    let server = Instance::start_with(&as_url, true).await;
+    let ghost = format!("@_bridge_typist:{}", server.name);
+    let room = server.ghost_room_with_message(&ghost, "warmup").await;
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{room}/typing/{ghost}?user_id={ghost}"),
+            Some(AS_TOKEN),
+            Some(&json!({ "typing": true, "timeout": 30000 })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    assert!(
+        eventually(|| {
+            typing_for(&bridge.deliveries(), &room).iter().any(|entry| {
+                entry["content"]["user_ids"]
+                    .as_array()
+                    .is_some_and(|users| users.iter().any(|user| user == ghost.as_str()))
+            })
+        })
+        .await,
+        "the typing start reaches the bridge: {:?}",
+        bridge.deliveries()
+    );
+
+    // Stopping is announced exactly once, as an empty list — and then
+    // silence, not a heartbeat of empty lists every poll.
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{room}/typing/{ghost}?user_id={ghost}"),
+            Some(AS_TOKEN),
+            Some(&json!({ "typing": false })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        eventually(|| {
+            typing_for(&bridge.deliveries(), &room)
+                .last()
+                .is_some_and(|entry| entry["content"]["user_ids"] == json!([]))
+        })
+        .await,
+        "the stop arrives: {:?}",
+        bridge.deliveries()
+    );
+    let settled = typing_for(&bridge.deliveries(), &room).len();
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(
+        typing_for(&bridge.deliveries(), &room).len(),
+        settled,
+        "no repeated announcements once reality stopped changing"
+    );
+}
+
+#[tokio::test]
+async fn a_service_that_did_not_opt_in_never_sees_the_key() {
+    let (bridge, as_url) = Bridge::serve().await;
+    let server = Instance::start(&as_url).await;
+    let ghost = format!("@_bridge_quiet:{}", server.name);
+    let room = server.ghost_room_with_message(&ghost, "hello").await;
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{room}/typing/{ghost}?user_id={ghost}"),
+            Some(AS_TOKEN),
+            Some(&json!({ "typing": true, "timeout": 30000 })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    // The room's events still arrive...
+    assert!(
+        eventually(|| bodies(&bridge.deliveries()).contains(&"hello".to_owned())).await,
+        "events flow regardless"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    // ...but no delivery ever carries the ephemeral key at all.
+    assert!(
+        bridge
+            .deliveries()
+            .iter()
+            .all(|delivery| delivery.ephemeral.is_none()),
+        "MSC2409 is opt-in; the key must be absent: {:?}",
+        bridge.deliveries()
     );
 }

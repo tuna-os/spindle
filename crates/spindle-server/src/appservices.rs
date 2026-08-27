@@ -82,6 +82,12 @@ pub struct Registration {
     /// spec's: limited like anyone else.
     #[serde(default = "default_rate_limited")]
     pub rate_limited: bool,
+    /// MSC2409, stable in the spec: whether transactions also carry
+    /// ephemeral data (typing, for now) for the service's rooms. Opt-in
+    /// because a bridge that never asked would have to parse and discard
+    /// a stream of second-by-second presence noise.
+    #[serde(default)]
+    pub receive_ephemeral: bool,
 }
 
 fn default_rate_limited() -> bool {
@@ -318,6 +324,9 @@ const TRANSACTION_LIMIT: usize = 100;
 struct PendingPush {
     txn_id: String,
     events: Vec<Value>,
+    /// MSC2409 ephemeral riders, pinned with the batch: a transaction is
+    /// immutable once its ID is assigned, retries included.
+    ephemeral: Vec<Value>,
     advance_to: u64,
 }
 
@@ -370,6 +379,59 @@ fn collect_batch(
     Ok((events, advance_to))
 }
 
+/// The typing changes a service has not yet been told about, as MSC2409
+/// ephemeral events (`m.typing` with a `room_id`, `/sync`-shaped).
+///
+/// `last_sent` is what the service currently believes, per room; the
+/// delta is every interested room where reality differs, including "the
+/// last typist stopped" — announced exactly once, as an empty
+/// `user_ids`, by removing the room from the map rather than storing an
+/// empty entry that would never stop comparing equal.
+fn typing_delta(
+    typing: &crate::typing::Typing,
+    rooms: &Rooms,
+    registration: &Registration,
+    server_name: &str,
+    last_sent: &mut HashMap<String, Vec<String>>,
+) -> Vec<Value> {
+    let mut current: HashMap<String, Vec<String>> = HashMap::new();
+    for (room_id, users) in typing.rooms_active() {
+        let members: Vec<String> = rooms
+            .joined_members(&room_id)
+            .map(|members| members.keys().cloned().collect())
+            .unwrap_or_default();
+        // Sender "" matches nothing, so this is the membership and
+        // room-namespace half of interest — exactly what an EDU has.
+        if registration.wants_event(&room_id, "", &members, server_name) {
+            current.insert(room_id, users);
+        }
+    }
+    let mut out = Vec::new();
+    let known: Vec<String> = last_sent.keys().cloned().collect();
+    for room_id in current
+        .keys()
+        .cloned()
+        .chain(known)
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        let now = current.get(&room_id).cloned().unwrap_or_default();
+        if last_sent.get(&room_id).cloned().unwrap_or_default() == now {
+            continue;
+        }
+        out.push(serde_json::json!({
+            "type": "m.typing",
+            "room_id": room_id,
+            "content": { "user_ids": now },
+        }));
+        if now.is_empty() {
+            last_sent.remove(&room_id);
+        } else {
+            last_sent.insert(room_id, now);
+        }
+    }
+    out
+}
+
 /// Deliver one transaction to the service's push URL.
 async fn deliver(
     client: &reqwest::Client,
@@ -382,12 +444,18 @@ async fn deliver(
         url.trim_end_matches('/'),
         push.txn_id
     );
+    let mut body = serde_json::json!({ "events": push.events });
+    // Only for services that opted in, and only when there is something
+    // to say — MSC2409 has non-opted services never see the key at all.
+    if !push.ephemeral.is_empty() {
+        body["ephemeral"] = Value::Array(push.ephemeral.clone());
+    }
     let response = client
         .put(target)
         .header("authorization", format!("Bearer {hs_token}"))
         .header("content-type", "application/json")
         .timeout(Duration::from_secs(30))
-        .body(serde_json::json!({ "events": push.events }).to_string())
+        .body(body.to_string())
         .send()
         .await
         .map_err(|error| error.to_string())?;
@@ -410,12 +478,18 @@ pub async fn push_loop(
     store: Arc<FjallStore>,
     appservices: Arc<Appservices>,
     rooms: Arc<Rooms>,
+    typing: Arc<crate::typing::Typing>,
     server_name: String,
     retry_base: Duration,
 ) {
     let client = reqwest::Client::new();
     let mut pending: HashMap<String, PendingPush> = HashMap::new();
     let mut backoff: HashMap<String, (u32, std::time::Instant)> = HashMap::new();
+    // What each opted-in service believes about who is typing where.
+    let mut typing_sent: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+    // Ephemeral-only transactions are fire-once, so their IDs only owe
+    // anyone uniqueness — same rule as the federation outbox's EDU IDs.
+    let mut ephemeral_txn = 0_u64;
     loop {
         tokio::time::sleep(
             retry_base
@@ -435,27 +509,51 @@ pub async fn push_loop(
             if !pending.contains_key(&registration.id) {
                 let cursor = read_cursor(&store, &registration.id);
                 let position = rooms.stream_position();
-                if position <= cursor {
-                    continue;
-                }
-                let Ok((events, advance_to)) =
-                    collect_batch(&rooms, registration, &server_name, cursor, position)
-                else {
-                    continue;
+                let (events, advance_to) = if position > cursor {
+                    match collect_batch(&rooms, registration, &server_name, cursor, position) {
+                        Ok(batch) => batch,
+                        Err(_) => continue,
+                    }
+                } else {
+                    (Vec::new(), cursor)
                 };
-                if events.is_empty() {
+                if events.is_empty() && advance_to > cursor {
                     write_cursor(&store, &registration.id, advance_to);
+                }
+                let ephemeral = if registration.receive_ephemeral {
+                    typing_delta(
+                        &typing,
+                        &rooms,
+                        registration,
+                        &server_name,
+                        typing_sent.entry(registration.id.clone()).or_default(),
+                    )
+                } else {
+                    Vec::new()
+                };
+                if events.is_empty() && ephemeral.is_empty() {
                     continue;
                 }
+                let txn_id = if events.is_empty() {
+                    ephemeral_txn += 1;
+                    format!("e{ephemeral_txn}")
+                } else {
+                    // Deterministic by range, not by attempt: the range
+                    // is pinned until acknowledged, so a retry reuses
+                    // the ID and redelivery is a no-op on the service.
+                    format!("s{}-{advance_to}", cursor + 1)
+                };
                 pending.insert(
                     registration.id.clone(),
                     PendingPush {
-                        // Deterministic by range, not by attempt: the range
-                        // is pinned until acknowledged, so a retry reuses
-                        // the ID and redelivery is a no-op on the service.
-                        txn_id: format!("s{}-{advance_to}", cursor + 1),
+                        txn_id,
+                        advance_to: if events.is_empty() {
+                            cursor
+                        } else {
+                            advance_to
+                        },
                         events,
-                        advance_to,
+                        ephemeral,
                     },
                 );
             }
@@ -470,6 +568,14 @@ pub async fn push_loop(
                 }
                 Err(error) => {
                     tracing::debug!("appservice push to {}: {error}", registration.id);
+                    // An ephemeral-only transaction is dropped, never
+                    // retried: a typing notification redelivered after a
+                    // backoff is a lie about the present, exactly the
+                    // federation outbox's rule for its EDUs. The next
+                    // real change produces a fresh delta anyway.
+                    if push.events.is_empty() {
+                        pending.remove(&registration.id);
+                    }
                     let failures = backoff.get(&registration.id).map_or(0, |(count, _)| *count) + 1;
                     let delay = retry_base * 2_u32.saturating_pow(failures.min(6));
                     backoff.insert(
