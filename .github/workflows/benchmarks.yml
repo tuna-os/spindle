@@ -53,6 +53,12 @@ jobs:
           python3 scripts/render-benchmarks.py site/latest.json site/index.html \
             --repository "${GITHUB_REPOSITORY}"
 
+      # The coverage dashboard rides along on the same site: one push to main
+      # republishes both, so neither can describe a different commit than the
+      # other.
+      - name: Render the dashboard
+        run: python3 scripts/coverage-dashboard.py --html site/dashboard.html
+
       # Keeping the per-commit file means a regression can be traced to the
       # push that caused it, rather than only observed after the fact.
       - name: Keep a per-commit copy

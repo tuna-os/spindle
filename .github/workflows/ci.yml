@@ -38,3 +38,10 @@ jobs:
       # change is in, and the site keeps serving whatever it served last.
       - name: Check the benchmark publishing tooling
         run: scripts/check-benchmark-tooling.sh
+
+      # Same reasoning for the dashboard: it claims to describe the router,
+      # and the claim is only worth reading if a stale copy cannot merge. The
+      # generator also fails outright when its curated planned-list names an
+      # endpoint the router now serves.
+      - name: Check the dashboard matches the router
+        run: python3 scripts/coverage-dashboard.py --check
