@@ -239,6 +239,19 @@ async fn capitals_downcase_instead_of_failing() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["user_id"], "@alice:example.org");
+
+    let (status, body) = harness
+        .post(
+            "/_matrix/client/v3/login",
+            &json!({
+                "type": "m.login.password",
+                "identifier": { "type": "m.id.user", "user": "ALICE" },
+                "password": "hunter2",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "login folds the same way: {body}");
+    assert_eq!(body["user_id"], "@alice:example.org");
 }
 
 #[tokio::test]

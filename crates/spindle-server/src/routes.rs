@@ -976,10 +976,13 @@ async fn whoami(Authenticated(identity): Authenticated) -> Json<Value> {
 
 /// `@alice:example.org` and `alice` both mean the same localpart.
 fn localpart_of(user: &str) -> String {
+    // Folded to lowercase for the same reason registration folds: the
+    // grammar is lowercase, and "Alice" logging in means the alice who
+    // registered.
     user.strip_prefix('@')
         .and_then(|rest| rest.split(':').next())
         .unwrap_or(user)
-        .to_owned()
+        .to_lowercase()
 }
 
 fn internal(error: &AccountError) -> MatrixError {
