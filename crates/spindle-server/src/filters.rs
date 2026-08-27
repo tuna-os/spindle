@@ -77,6 +77,13 @@ pub struct EventFilter {
     pub rooms: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_rooms: Option<Vec<String>>,
+    /// MSC1227 / spec §filtering: send only the membership events the client
+    /// needs to render this response -- the senders in the timeline -- rather
+    /// than the whole roster. Only meaningful on the `state` filter; the field
+    /// is accepted anywhere an event filter is because that is where clients
+    /// put it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lazy_load_members: Option<bool>,
 }
 
 impl EventFilter {
