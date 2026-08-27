@@ -85,6 +85,13 @@ fn account_routes() -> Router<AppState> {
         .route("/_matrix/client/v3/logout", post(logout))
         .route("/_matrix/client/v3/refresh", post(refresh))
         .route("/_matrix/client/v3/account/whoami", get(whoami))
+        .route("/_matrix/client/v3/keys/upload", post(upload_keys))
+        .route("/_matrix/client/v3/keys/query", post(query_keys))
+        .route("/_matrix/client/v3/keys/claim", post(claim_keys))
+        .route(
+            "/_matrix/client/v3/sendToDevice/{event_type}/{txn_id}",
+            axum::routing::put(send_to_device),
+        )
         .route("/_matrix/client/v3/joined_rooms", get(joined_rooms))
         .route("/_matrix/client/v3/sync", get(sync))
         .route(
@@ -1913,6 +1920,183 @@ async fn delete_tag(
     Ok(Json(json!({})))
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct UploadKeysRequest {
+    device_keys: Option<Value>,
+    one_time_keys: Option<serde_json::Map<String, Value>>,
+}
+
+/// `POST /_matrix/client/v3/keys/upload`
+async fn upload_keys(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    Json(request): Json<UploadKeysRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    if let Some(device_keys) = &request.device_keys {
+        // The claim inside must match the authenticated caller. Accepting a
+        // body that names another user or device would let any account plant
+        // keys on another's identity, and verification downstream trusts
+        // exactly this mapping.
+        let claimed_user = device_keys["user_id"].as_str();
+        let claimed_device = device_keys["device_id"].as_str();
+        if claimed_user != Some(identity.user_id.as_str())
+            || claimed_device != Some(identity.device_id.as_str())
+        {
+            return Err(MatrixError::forbidden(
+                "device_keys must belong to the uploading device",
+            ));
+        }
+        state
+            .devices
+            .upload_device_keys(&identity.user_id, &identity.device_id, device_keys)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    }
+    let counts = match &request.one_time_keys {
+        Some(one_time_keys) => state
+            .devices
+            .upload_one_time_keys(&identity.user_id, &identity.device_id, one_time_keys)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?,
+        None => state
+            .devices
+            .one_time_key_counts(&identity.user_id, &identity.device_id)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?,
+    };
+    Ok(Json(json!({ "one_time_key_counts": counts })))
+}
+
+#[derive(Debug, Deserialize)]
+struct QueryKeysRequest {
+    device_keys: serde_json::Map<String, Value>,
+}
+
+/// `POST /_matrix/client/v3/keys/query`
+async fn query_keys(
+    State(state): State<AppState>,
+    Authenticated(_identity): Authenticated,
+    Json(request): Json<QueryKeysRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    let mut device_keys = serde_json::Map::new();
+    for (user_id, wanted) in &request.device_keys {
+        let all = state
+            .devices
+            .all_device_keys(user_id)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        // An empty list means every device; a non-empty one narrows.
+        let narrowed: serde_json::Map<String, Value> = match wanted.as_array() {
+            Some(list) if !list.is_empty() => {
+                let names: Vec<&str> = list.iter().filter_map(Value::as_str).collect();
+                all.into_iter()
+                    .filter(|(device_id, _)| names.contains(&device_id.as_str()))
+                    .collect()
+            }
+            _ => all,
+        };
+        device_keys.insert(user_id.clone(), Value::Object(narrowed));
+    }
+    Ok(Json(json!({ "device_keys": device_keys, "failures": {} })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimKeysRequest {
+    one_time_keys: serde_json::Map<String, Value>,
+}
+
+/// `POST /_matrix/client/v3/keys/claim`
+async fn claim_keys(
+    State(state): State<AppState>,
+    Authenticated(_identity): Authenticated,
+    Json(request): Json<ClaimKeysRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    let mut claimed = serde_json::Map::new();
+    for (user_id, devices) in &request.one_time_keys {
+        let Some(devices) = devices.as_object() else {
+            continue;
+        };
+        let mut per_user = serde_json::Map::new();
+        for (device_id, algorithm) in devices {
+            let Some(algorithm) = algorithm.as_str() else {
+                continue;
+            };
+            if let Some((key_id, key)) = state
+                .devices
+                .claim_one_time_key(user_id, device_id, algorithm)
+                .map_err(|error| MatrixError::internal(&error.to_string()))?
+            {
+                per_user.insert(device_id.clone(), json!({ key_id: key }));
+            }
+            // A device with none left is simply absent from the response,
+            // which is the spec's shape: absence says "no key", and the
+            // caller falls back to the fallback key or fails the session.
+        }
+        if !per_user.is_empty() {
+            claimed.insert(user_id.clone(), Value::Object(per_user));
+        }
+    }
+    Ok(Json(json!({ "one_time_keys": claimed, "failures": {} })))
+}
+
+#[derive(Debug, Deserialize)]
+struct SendToDeviceRequest {
+    messages: serde_json::Map<String, Value>,
+}
+
+/// `PUT /_matrix/client/v3/sendToDevice/{event_type}/{txn_id}`
+async fn send_to_device(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((event_type, txn_id)): axum::extract::Path<(String, String)>,
+    Json(request): Json<SendToDeviceRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    // Same replay table as /send: a retried batch must not deliver twice.
+    // The stored value is unused here — presence is the answer.
+    let txn_key = spindle_core::keys::transaction(
+        &identity.user_id,
+        &identity.device_id,
+        &format!("to-device/{txn_id}"),
+    );
+    if let Ok(Some(_)) = spindle_store::ReadView::get(state.store.as_ref(), &txn_key) {
+        return Ok(Json(json!({})));
+    }
+
+    for (target_user, per_device) in &request.messages {
+        let Some(per_device) = per_device.as_object() else {
+            continue;
+        };
+        for (target_device, content) in per_device {
+            let devices: Vec<String> = if target_device == "*" {
+                state
+                    .devices
+                    .all_device_keys(target_user)
+                    .map_err(|error| MatrixError::internal(&error.to_string()))?
+                    .keys()
+                    .cloned()
+                    .collect()
+            } else {
+                vec![target_device.clone()]
+            };
+            for device_id in devices {
+                let seq = state.rooms.allocate_stream_id();
+                let message = json!({
+                    "type": event_type,
+                    "sender": identity.user_id,
+                    "content": content,
+                });
+                state
+                    .devices
+                    .queue_to_device(target_user, &device_id, seq, &message)
+                    .map_err(|error| MatrixError::internal(&error.to_string()))?;
+            }
+        }
+    }
+    spindle_store::Store::put(state.store.as_ref(), &txn_key, b"")
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    // A recipient may be blocked in a long-poll right now, and a to-device
+    // message lands in no room, so nothing else would wake them.
+    state.rooms.wake_sync_waiters();
+    Ok(Json(json!({})))
+}
+
 /// `GET /_matrix/client/v3/sync`
 ///
 /// The token is a position in the server-global stream (SPEC §10.2), because
@@ -2009,6 +2193,14 @@ async fn sync(
         );
     }
 
+    // Pending to-device messages, with `since` acknowledging earlier ones —
+    // rooms.rs explains the shared-counter protocol. Fetched before assembling
+    // the response so a crash after this point re-delivers rather than loses.
+    let to_device = state
+        .devices
+        .take_pending(&identity.user_id, &identity.device_id, since)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+
     let mut global = state
         .account_data
         .all(&identity.user_id, "")
@@ -2037,6 +2229,7 @@ async fn sync(
     Ok(Json(json!({
         "next_batch": crate::tokens::Sync(result.next_batch).to_string(),
         "rooms": { "join": join, "invite": invite, "leave": leave },
+        "to_device": { "events": to_device },
         "account_data": { "events": global },
     })))
 }

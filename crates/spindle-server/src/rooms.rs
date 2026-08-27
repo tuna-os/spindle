@@ -1072,8 +1072,31 @@ impl Rooms {
         }))
     }
 
-    /// The current global stream position.
-    #[must_use]
+    /// Wake everything blocked in [`Self::wait_for_event`].
+    ///
+    /// For appends the append itself notifies; this is for the other thing a
+    /// waiting `/sync` can be waiting on — a to-device message, which lands
+    /// outside any room and would otherwise wait out the full timeout.
+    pub fn wake_sync_waiters(&self) {
+        self.appended.notify_waiters();
+    }
+
+    /// Take the next global sequence number without writing a stream row.
+    ///
+    /// To-device messages draw from the same counter room events do, so a
+    /// sync token positions both at once — which is what lets `since`
+    /// acknowledge to-device deliveries with no second cursor. The stream
+    /// scan skips absent ids already, so a gap where a to-device message sat
+    /// costs nothing.
+    pub fn allocate_stream_id(&self) -> u64 {
+        let mut stream = self
+            .stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *stream += 1;
+        *stream
+    }
+
     pub fn stream_position(&self) -> u64 {
         *self
             .stream
@@ -1994,12 +2017,36 @@ fn highest_stream_id(store: &FjallStore) -> u64 {
     // A prefix scan rather than a stored high-water mark: one number that has
     // to be kept in step with the rows it describes is one number that can
     // disagree with them, and the rows are the truth.
-    spindle_store::ReadView::scan_prefix(store, &spindle_core::keys::stream_prefix())
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|(key, _)| spindle_core::keys::stream_from_key(key))
-        .max()
-        .unwrap_or(0)
+    let from_stream =
+        spindle_store::ReadView::scan_prefix(store, &spindle_core::keys::stream_prefix())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|(key, _)| spindle_core::keys::stream_from_key(key))
+            .max()
+            .unwrap_or(0);
+    // Pending to-device messages drew from this counter without writing a
+    // stream row, so their sequence numbers are invisible to the scan above.
+    // A counter resumed below them would eventually re-allocate a pending
+    // message's sequence for the same device and overwrite it — silent loss
+    // of session-establishment ciphertext. Their keys end in the big-endian
+    // sequence, so the maximum is read off the last eight bytes.
+    let from_to_device = spindle_store::ReadView::scan_prefix(
+        store,
+        &[
+            spindle_core::keys::KEY_SCHEMA_VERSION,
+            spindle_core::keys::Keyspace::ToDevice as u8,
+        ],
+    )
+    .unwrap_or_default()
+    .iter()
+    .filter_map(|(key, _)| {
+        key.get(key.len().checked_sub(8)?..)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_be_bytes)
+    })
+    .max()
+    .unwrap_or(0);
+    from_stream.max(from_to_device)
 }
 
 #[cfg(test)]

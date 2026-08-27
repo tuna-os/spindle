@@ -11,6 +11,7 @@ pub mod accounts;
 pub mod auth;
 pub mod authorize;
 pub mod config;
+pub mod devices;
 pub mod directory;
 pub mod errors;
 pub mod filters;
@@ -44,6 +45,7 @@ pub struct AppState {
     pub directory: Arc<directory::Directory>,
     pub filters: Arc<filters::Filters>,
     pub media: Arc<media::Media>,
+    pub devices: Arc<devices::Devices>,
 }
 
 /// Build the HTTP application.
@@ -64,6 +66,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, signing::Si
         config.ratelimit.enabled,
     ));
     let store_for_filters = Arc::clone(&store);
+    let store_for_devices = Arc::clone(&store);
     let account_data = Arc::new(account_data::AccountData::new(Arc::clone(&store)));
     let media = Arc::new(media::Media::new(
         Arc::clone(&store),
@@ -85,6 +88,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, signing::Si
         directory,
         filters: Arc::new(filters::Filters::new(Arc::clone(&store_for_filters))),
         media,
+        devices: Arc::new(devices::Devices::new(store_for_devices)),
     };
     Ok(routes::router(state))
 }
