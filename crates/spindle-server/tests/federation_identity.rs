@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use ruma::signatures::{Ed25519KeyPair, KeyPair};
+use ruma::signatures::Ed25519KeyPair;
 use serde_json::{Value, json};
 use spindle_store::FjallStore;
 use tempfile::TempDir;
