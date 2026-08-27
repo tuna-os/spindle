@@ -80,6 +80,7 @@ pub fn router(state: AppState) -> Router {
         .merge(discovery_routes())
         .merge(crate::mas::routes())
         .merge(crate::admin::routes())
+        .merge(crate::oidc::routes())
         // SPEC: an endpoint the server does not recognize answers 404
         // M_UNRECOGNIZED — a JSON verdict, not a bare status. Clients (and
         // Complement's TestUnknownEndpoints) read the errcode to tell "this
@@ -911,6 +912,12 @@ async fn well_known_client(State(state): State<AppState>) -> Json<Value> {
             "issuer": delegated.issuer(),
             "account": format!("{}/account", delegated.issuer().trim_end_matches('/')),
         });
+    } else if state.oidc.is_some() {
+        // The built-in provider is its own issuer; there is no account
+        // management UI to point at, so none is advertised.
+        body["org.matrix.msc2965.authentication"] = json!({
+            "issuer": format!("{}/", crate::oidc::issuer(&state)),
+        });
     }
     Json(body)
 }
@@ -922,6 +929,9 @@ async fn well_known_client(State(state): State<AppState>) -> Json<Value> {
 /// `M_UNRECOGNIZED` — the endpoint's absence is how a client learns this
 /// server does its own auth.
 async fn auth_metadata(State(state): State<AppState>) -> Result<Json<Value>, MatrixError> {
+    if state.oidc.is_some() {
+        return Ok(Json(crate::oidc::metadata(&state)));
+    }
     let Some(delegated) = &state.delegated else {
         return Err(MatrixError::new(
             StatusCode::NOT_FOUND,

@@ -246,6 +246,8 @@ pub enum Keyspace {
     /// modelled as one it would sit in a timeline and federate. Exempt
     /// from purge: the record of deletions must survive the deletions.
     AuditLog = 0x25,
+    /// `client_id` → a dynamically registered OAuth 2.0 client (#159).
+    OidcClient = 0x26,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -279,6 +281,14 @@ pub fn appservice_cursor(appservice_id: &str) -> Vec<u8> {
 pub fn audit_entry(seq: u64) -> Vec<u8> {
     let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::AuditLog as u8];
     key.extend_from_slice(&seq.to_be_bytes());
+    key
+}
+
+/// One dynamically registered OAuth 2.0 client.
+#[must_use]
+pub fn oidc_client(client_id: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::OidcClient as u8];
+    key.extend_from_slice(client_id.as_bytes());
     key
 }
 

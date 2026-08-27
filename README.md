@@ -86,10 +86,12 @@ OpenAPI schemas, plus the three things we have to build ourselves (a
 heterogeneous Spindle↔Synapse interop rig, fork injection, and a property-test
 oracle for the equivalence claim).
 
-**[docs/delegated-auth.md](docs/delegated-auth.md)** — running Spindle
-behind the Matrix Authentication Service (MSC3861): the config on both
-sides, what turns off, the revocation window, and what an unmodified MAS
-release binary has been proven to do against it.
+**[docs/delegated-auth.md](docs/delegated-auth.md)** — modern (MSC3861)
+authentication, both ways to get it: the built-in OIDC provider that
+gives Element X login from one binary with nothing else deployed, and
+running Spindle behind a real Matrix Authentication Service — the config
+on both sides, what turns off, the revocation window, and what an
+unmodified MAS release binary has been proven to do against it.
 
 **[docs/divergence.md](docs/divergence.md)** — the seam: what we inherit
 unchanged from the Matrix spec, ruma and Complement, what is genuinely ours
