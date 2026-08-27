@@ -864,8 +864,16 @@ async fn wait_up(client: &reqwest::Client, name: &str) {
 
 #[tokio::test]
 async fn a_restart_mid_push_redelivers_under_the_same_transaction_id() {
+    // The bridge starts out WORKING. Refusing from the start races the
+    // push loop's first collection against the test's own HTTP calls:
+    // if the loop pins a batch in the gap between room creation and the
+    // message send, that pre-message range is what retries forever, the
+    // wait below can never mature, and the test fails on any horizon —
+    // exactly what a loaded CI runner produced twice. Accepting until
+    // the room's birth is delivered moves the cursor past it, so the
+    // batch pinned after the refusals begin necessarily starts at (and
+    // carries) the message.
     let (bridge, as_url) = Bridge::serve().await;
-    bridge.fail_next(u32::MAX);
 
     // A real spindle process over a durable store, so the restart is a
     // process death, not a polite shutdown.
@@ -909,6 +917,21 @@ async fn a_restart_mid_push_redelivers_under_the_same_transaction_id() {
     .await;
     assert_eq!(status, 200, "{body}");
     let room = body["room_id"].as_str().unwrap().to_owned();
+    // A sentinel, delivered while the bridge still accepts: once it has
+    // arrived, the cursor provably covers everything before it — there
+    // is no straggling creation batch left to be pinned pre-message.
+    let (status, body) = send(
+        reqwest::Method::PUT,
+        format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/t-0?user_id={ghost}"),
+        json!({ "msgtype": "m.text", "body": "sentinel" }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        eventually(|| bodies(&bridge.deliveries()).contains(&"sentinel".to_owned())).await,
+        "the sentinel was delivered while the bridge accepted"
+    );
+    bridge.fail_next(u32::MAX);
     let (status, body) = send(
         reqwest::Method::PUT,
         format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/t-1?user_id={ghost}"),
@@ -918,10 +941,7 @@ async fn a_restart_mid_push_redelivers_under_the_same_transaction_id() {
     assert_eq!(status, 200, "{body}");
     // Wait for a refused attempt that carries the message itself: only
     // then does the pinned range cover it, and only a matching range
-    // makes the post-restart recomputation produce the same ID. (An
-    // earlier attempt pinned mid-room-creation redelivers under a wider
-    // fresh ID — at-least-once either way, but the strong assertion
-    // needs the ranges equal.)
+    // makes the post-restart recomputation produce the same ID.
     assert!(
         eventually(|| {
             bridge.deliveries().last().is_some_and(|delivery| {
