@@ -37,7 +37,8 @@ stale on a runner change. Wall times do.
 | Our fast path vs `ruma-state-res`, **correctness** | Done (#55), below |
 | Our fast path vs `ruma-state-res`, performance | Done, below — and the result is narrower than the spec implies |
 | `/messages`, `/sync`, join latency vs **Synapse** | Done at M1, below (#42) |
-| The same vs **Tuwunel** | Not yet — no build in the sandbox (#42) |
+| The same vs **Continuwuity** (conduwuit lineage) | Done, below (#42) |
+| The same vs **Tuwunel** | Blocked: GitHub release downloads 403 through the sandbox proxy, and a source build compiles RocksDB against the disk allowance. Continuwuity stands in as the same-lineage bar. |
 
 Everything here is **algorithmic**, measured inside the library. None of it is a
 server throughput figure and none of it should be quoted as one. Server-to-
@@ -137,6 +138,42 @@ practice today", not as evidence for the architecture.
 Tuwunel is not in this table. It needs a build the sandbox does not have; the
 script is server-agnostic and takes a base URL, so adding it is a matter of
 getting a binary rather than of writing code.
+
+## Client-server API vs Continuwuity, at M1
+
+The user's framing is the right one: Synapse is the API reference, but the
+conduwuit-lineage Rust servers are the performance bar. Continuwuity 26.8.1,
+**their `maxperf` release build**, same host, same driver, same sitting
+(`--registration-token`, because continuwuity refuses open registration —
+the driver adapting at the front door is what keeps the workload identical
+behind it).
+
+Milliseconds, mean of 15 samples, at 3 200 events:
+
+| operation | spindle | continuwuity | ratio |
+|---|---|---|---|
+| join | 1.233 | 6.218 | **5.0× faster** |
+| send | 1.350 | 4.530 | **3.4× faster** |
+| context_deep | 1.189 | 3.543 | **3.0× faster** |
+| messages_page | 0.929 | 2.769 | **3.0× faster** |
+| state | 0.694 | 1.054 | **1.5× faster** |
+| sync_initial | 2.077 | 2.518 | **1.2× faster** |
+
+Two readings matter more than the ratios.
+
+**Continuwuity's `send` grows 2.56× from 200 to 3 200 events while ours holds
+1.07×.** This is the first competitor curve that bends on this workload —
+Synapse's stayed flat everywhere — and `send` is the hot path the linear log
+exists for. Against the sibling whose architecture is closest to ours, the
+flat-cost claim finally has a comparative data point, not just an absolute
+one.
+
+**`sync_initial` is the closest race** (1.0× at 800 events — a tie inside
+noise). If any operation deserves the next look, it is that one; #12's
+sliding sync will reshape it anyway.
+
+Same caveat as the Synapse table: no forks, so no state resolution on either
+side. The curves compare storage and read-path shape, not the exception path.
 
 ## Fork window: bounded search vs exhaustive walk
 
