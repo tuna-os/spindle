@@ -112,6 +112,16 @@ pub struct Rooms {
     /// Lock order: `open` before `unread_index`, always. The fast path takes
     /// only `unread_index`; the build and append paths already hold `open`.
     unread_index: Mutex<HashMap<String, UnreadIndex>>,
+    /// Head-event timestamp per room, kept warm on append.
+    ///
+    /// The sliding-sync room list sorts by recency, so every request reads
+    /// this for every joined room. Uncached, that was a stored-body read
+    /// and a full JSON parse per room per request — the M3-progress
+    /// benchmark measured it as the per-room marginal cost that let the
+    /// `sliding_window` cells drift below the noise floor against
+    /// Continuwuity across two sittings. A sort key is one i64; it lives
+    /// in memory and is refreshed by the append that changes it.
+    last_activity: Mutex<HashMap<String, i64>>,
     /// The server-global order `/sync` needs (SPEC §10.2). The linear index
     /// orders events within one room; nothing orders them across rooms, so
     /// this is the one counter that exists purely because a per-room order is
@@ -209,6 +219,7 @@ impl Rooms {
             server_name: server_name.into(),
             open: Mutex::new(HashMap::new()),
             unread_index: Mutex::new(HashMap::new()),
+            last_activity: Mutex::new(HashMap::new()),
             // Resumed, not reset. A counter that restarted at zero would
             // re-issue stream ids already on disk, overwriting the entries
             // they point at -- the same shape of bug as a room registry that
@@ -1834,6 +1845,14 @@ impl Rooms {
     ///
     /// Returns [`RoomError`] if the room or its head event cannot be read.
     pub fn last_activity(&self, room_id: &str) -> Result<i64, RoomError> {
+        if let Some(&cached) = self
+            .last_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(room_id)
+        {
+            return Ok(cached);
+        }
         let head = self.with_room(room_id, |_, log| {
             Ok(log
                 .entries()
@@ -1844,7 +1863,12 @@ impl Rooms {
             return Ok(0);
         };
         let event = self.event(room_id, &event_id)?;
-        Ok(event["origin_server_ts"].as_i64().unwrap_or(0))
+        let activity = event["origin_server_ts"].as_i64().unwrap_or(0);
+        self.last_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(room_id.to_owned(), activity);
+        Ok(activity)
     }
 
     /// Room IDs with at least one event in the stream range `(since, until]`.
@@ -2166,6 +2190,18 @@ impl Rooms {
                 index.push(entry.li.get(), input.sender);
             }
         }
+
+        // The append that changes a room's recency refreshes the cached
+        // sort key, so the sliding-sync room list never re-reads a body
+        // for it. Unconditional: an absent entry is filled lazily, a
+        // present one must not go stale.
+        self.last_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                room_id.to_owned(),
+                input.json["origin_server_ts"].as_i64().unwrap_or(0),
+            );
 
         // The signed JSON is stored beside the log entry. The log holds
         // ordering and state; the event body is what a client actually reads

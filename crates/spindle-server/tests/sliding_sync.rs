@@ -277,3 +277,32 @@ async fn ranges_past_the_end_are_clipped_not_refused() {
     assert_eq!(response["rooms"].as_object().unwrap().len(), 1);
     assert_eq!(response["lists"]["main"]["count"], 1);
 }
+
+#[tokio::test]
+async fn a_bump_after_a_sync_still_reorders_the_window() {
+    // Same claim as activity_reorders_the_window, but with a sync in
+    // between: the first request warms whatever the server caches about
+    // room recency, and the bump must invalidate it. A recency cache that
+    // is filled on read and never refreshed on append passes the other
+    // test and fails this one.
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let first = harness.named_room(&alice, "first").await;
+    let _second = harness.named_room(&alice, "second").await;
+    let _third = harness.named_room(&alice, "third").await;
+
+    let before = harness.sliding(&alice, None, &window()).await;
+    assert!(
+        !room_names(&before).contains(&"first".to_owned()),
+        "the oldest room starts outside a two-room window: {before}"
+    );
+
+    harness.say(&first, &alice, "bump", "t-after").await;
+
+    let after = harness.sliding(&alice, None, &window()).await;
+    assert!(
+        room_names(&after).contains(&"first".to_owned()),
+        "the bump moves the room into the window even though its old \
+         recency was already read once: {after}"
+    );
+}
