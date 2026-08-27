@@ -300,6 +300,46 @@ async fn interested_events_arrive_bearing_the_hs_token() {
 }
 
 #[tokio::test]
+async fn an_invite_to_the_bot_reaches_the_service() {
+    let (bridge, as_url) = Bridge::serve().await;
+    let server = Instance::start(&as_url).await;
+
+    // A human's room, nowhere near the namespaces, and an invite to the
+    // service's own bot. The bot is not a *joined* member and the sender
+    // is not the service's — the membership event is interesting purely
+    // for whom it is about. A bridge that never hears its own invites
+    // can never join anything; matrix-hookshot found this for real.
+    let alice = server.register("alice").await;
+    let bot = format!("@_bridge_bot:{}", server.name);
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(&json!({ "invite": [bot] })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+
+    assert!(
+        eventually(|| {
+            bridge.deliveries().iter().any(|delivery| {
+                delivery.events.iter().any(|event| {
+                    event["type"] == "m.room.member"
+                        && event["state_key"] == bot.as_str()
+                        && event["content"]["membership"] == "invite"
+                        && event["room_id"] == room.as_str()
+                })
+            })
+        })
+        .await,
+        "the invite membership event is pushed: {:?}",
+        bridge.deliveries()
+    );
+}
+
+#[tokio::test]
 async fn a_failed_delivery_retries_under_the_same_transaction_id() {
     let (bridge, as_url) = Bridge::serve().await;
     bridge.fail_next(1);
