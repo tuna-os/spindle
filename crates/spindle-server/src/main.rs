@@ -49,6 +49,12 @@ async fn main() -> ExitCode {
 
     let bind = config.server.bind.clone();
     let name = config.server.name.clone();
+    let federation_bind = config.federation.bind.clone();
+    let federation_tls = config
+        .federation
+        .tls_cert
+        .clone()
+        .zip(config.federation.tls_key.clone());
     let listener = match TcpListener::bind(&bind).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -72,6 +78,19 @@ async fn main() -> ExitCode {
     // addresses. Without it every request looks like it came from nowhere and
     // the per-source limit collapses onto one key.
     let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+
+    // The federation listener is the same router over TLS: peers speak https
+    // to 8448 and check the certificate against our name, so this listener
+    // exists exactly when there is TLS material to answer them with. Failing
+    // to bind or to load the material is fatal, not a warning — a server
+    // configured to federate that silently cannot is worse than one that
+    // says so and exits.
+    if let Some(fed_bind) = federation_bind
+        && !serve_federation(&fed_bind, federation_tls, &name, service.clone()).await
+    {
+        return ExitCode::FAILURE;
+    }
+
     if let Err(error) = axum::serve(listener, service)
         .with_graceful_shutdown(shutdown())
         .await
@@ -82,6 +101,61 @@ async fn main() -> ExitCode {
 
     tracing::info!("shut down cleanly");
     ExitCode::SUCCESS
+}
+
+/// Bring up the TLS federation listener, spawned beside the main service.
+///
+/// Returns false when the configuration cannot be served — missing TLS
+/// material, unloadable PEM, an unparseable bind — because each of those is
+/// a server that was told to federate and cannot.
+async fn serve_federation(
+    bind: &str,
+    tls_material: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    name: &str,
+    service: axum::extract::connect_info::IntoMakeServiceWithConnectInfo<
+        axum::Router,
+        std::net::SocketAddr,
+    >,
+) -> bool {
+    let Some((cert, key)) = tls_material else {
+        tracing::error!("[federation] bind is set without tls_cert and tls_key");
+        return false;
+    };
+    // The ring provider, installed explicitly: the default provider is
+    // aws-lc, whose C build both bloats the image build and links a newer
+    // glibc than the runtime image carries. Everything else in the tree
+    // (reqwest, ruma) already speaks ring.
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        tracing::debug!("a rustls crypto provider was already installed");
+    }
+    let tls = match axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key).await {
+        Ok(tls) => tls,
+        Err(error) => {
+            tracing::error!(
+                "cannot load federation TLS material from {} and {}: {error}",
+                cert.display(),
+                key.display()
+            );
+            return false;
+        }
+    };
+    let address: std::net::SocketAddr = match bind.parse() {
+        Ok(address) => address,
+        Err(error) => {
+            tracing::error!("cannot parse federation bind {bind}: {error}");
+            return false;
+        }
+    };
+    tracing::info!("federation listening on {bind} as {name}");
+    tokio::spawn(async move {
+        if let Err(error) = axum_server::bind_rustls(address, tls).serve(service).await {
+            tracing::error!("federation listener stopped: {error}");
+        }
+    });
+    true
 }
 
 /// Resolve on the first shutdown signal.
