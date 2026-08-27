@@ -2414,6 +2414,75 @@ impl Rooms {
         Ok(())
     }
 
+    /// Every remote domain with a live member in the room — the EDU
+    /// audience, same liveness rule as event fan-out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room or membership rows cannot be read.
+    pub fn remote_domains(&self, room_id: &str) -> Result<Vec<String>, RoomError> {
+        let members = self.with_room(room_id, |_, log| {
+            let Some(state) = log
+                .entries()
+                .next_back()
+                .map(|entry| entry.li)
+                .and_then(|li| log.state_after(li))
+            else {
+                return Ok(Vec::new());
+            };
+            let mut members = Vec::new();
+            state.for_each(|state_key, _| {
+                if state_key.event_type().as_str() == "m.room.member" {
+                    members.push(state_key.state_key().to_owned());
+                }
+            });
+            Ok(members)
+        })?;
+        let mut destinations = std::collections::BTreeSet::new();
+        for user_id in members {
+            let Some((_, domain)) = user_id.split_once(':') else {
+                continue;
+            };
+            if domain == self.server_name || destinations.contains(domain) {
+                continue;
+            }
+            let membership = spindle_store::ReadView::get(
+                self.store.as_ref(),
+                &spindle_core::keys::user_room(
+                    spindle_core::keys::Keyspace::Membership,
+                    &user_id,
+                    room_id,
+                ),
+            )?;
+            let live = membership.as_deref().is_some_and(|value| {
+                value == JOIN_STR.as_bytes() || value == INVITE_STR.as_bytes()
+            });
+            if live {
+                destinations.insert(domain.to_owned());
+            }
+        }
+        Ok(destinations.into_iter().collect())
+    }
+
+    /// Whether `user_id` is currently joined to `room_id`, by the
+    /// membership index alone — the cheap read inbound EDU checks want.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the store cannot be read.
+    pub fn is_joined(&self, user_id: &str, room_id: &str) -> Result<bool, RoomError> {
+        Ok(spindle_store::ReadView::get(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::Membership,
+                user_id,
+                room_id,
+            ),
+        )?
+        .as_deref()
+            == Some(JOIN_STR.as_bytes()))
+    }
+
     /// The stripped state an invited user may see: enough to render the
     /// invite (what room, whose, how it admits), nothing they are not yet
     /// entitled to.
