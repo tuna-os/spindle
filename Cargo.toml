@@ -10,6 +10,7 @@ repository = "https://github.com/tuna-os/spindle"
 [workspace.dependencies]
 argon2 = "0.5"
 axum = "0.8"
+form_urlencoded = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "gzip", "stream"] }
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }

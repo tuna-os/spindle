@@ -64,8 +64,9 @@ MILESTONES = [
      "handshake admits remote users — template previews the real "
      "authorization, the sent join faces the same judgement chain as any "
      "PDU, and the response carries the state before the join with its "
-     "transitive auth chain. Next: backfill and get_missing_events off the "
-     "linear log, then #16's fork-proof rig — where the no-state-resolution claim meets "
+     "transitive auth chain. Backfill and get_missing_events serve history "
+     "as bounded range reads on the linear log, and 8448 serves TLS. "
+     "Next: #16's fork-proof rig — where the no-state-resolution claim meets "
      "adversarial evidence."),
     ("M4", "Ecosystem integration", "Not started", "#18 appservices, #17 MAS/OIDC."),
     ("M5", "Production lifecycle", "Not started",
@@ -121,8 +122,6 @@ PLANNED = {
     "Media": [],
     "Server, discovery & operations": [],
     "Federation": [
-        ("GET", "/_matrix/federation/v1/backfill/{roomId}", "history (#15)"),
-        ("POST", "/_matrix/federation/v1/get_missing_events/{roomId}", "catch-up (#15)"),
         ("PUT", "/_matrix/federation/v2/invite/{roomId}/{eventId}", "federated invites (#15)"),
     ],
     "VoIP & MatrixRTC": [

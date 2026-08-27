@@ -606,6 +606,14 @@ fn discovery_routes() -> Router<AppState> {
             get(federation_event),
         )
         .route(
+            "/_matrix/federation/v1/backfill/{room_id}",
+            get(federation_backfill),
+        )
+        .route(
+            "/_matrix/federation/v1/get_missing_events/{room_id}",
+            post(federation_missing_events),
+        )
+        .route(
             "/_matrix/federation/v1/make_join/{room_id}/{user_id}",
             get(federation_make_join),
         )
@@ -1286,9 +1294,10 @@ async fn federation_room_origin(
     headers: &axum::http::HeaderMap,
     method: &str,
     uri: &str,
+    content: Option<&Value>,
     room_id: &str,
 ) -> Result<String, MatrixError> {
-    let origin = federation_origin(state, headers, method, uri, None).await?;
+    let origin = federation_origin(state, headers, method, uri, content).await?;
     let joined = state
         .rooms
         .server_in_room(room_id, &origin)
@@ -1313,7 +1322,7 @@ async fn federation_state(
         .uri()
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
-    federation_room_origin(&state, &headers, "GET", &uri, &room_id).await?;
+    federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
     let (pdus, auth_chain) = state
         .rooms
         .federation_state(&room_id, &query.event_id)
@@ -1342,7 +1351,7 @@ async fn federation_state_ids(
         .uri()
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
-    federation_room_origin(&state, &headers, "GET", &uri, &room_id).await?;
+    federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
     let (pdus, auth_chain) = state
         .rooms
         .federation_state(&room_id, &query.event_id)
@@ -1378,7 +1387,7 @@ async fn federation_event(
             "no such event".to_owned(),
         ));
     };
-    federation_room_origin(&state, &headers, "GET", &uri, &room_id).await?;
+    federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
     let event = state.rooms.event(&room_id, &event_id).map_err(room_error)?;
     Ok(Json(json!({
         "origin": state.config.server.name,
@@ -1388,6 +1397,99 @@ async fn federation_event(
             .unwrap_or(0),
         "pdus": [event],
     })))
+}
+
+/// `GET /_matrix/federation/v1/backfill/{roomId}?v=&limit=`
+///
+/// History walking backwards from the named events. On a DAG server this
+/// is a traversal; on the linear log it is a bounded range read, newest
+/// first, starting events included.
+async fn federation_backfill(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
+    // `v` repeats; serde's map-shaped Query cannot carry that, so the pairs
+    // are read directly.
+    let mut from = Vec::new();
+    let mut limit = 100_usize;
+    for (key, value) in form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
+    {
+        match key.as_ref() {
+            "v" => from.push(value.into_owned()),
+            "limit" => limit = value.parse().unwrap_or(limit),
+            _ => {}
+        }
+    }
+    // The cap is ours: a peer that asks for the whole room gets a page.
+    let limit = limit.clamp(1, 100);
+    let pdus = state
+        .rooms
+        .backfill(&room_id, &from, limit)
+        .map_err(room_error)?;
+    Ok(Json(json!({
+        "origin": state.config.server.name,
+        "origin_server_ts": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0),
+        "pdus": pdus,
+    })))
+}
+
+/// `POST /_matrix/federation/v1/get_missing_events/{roomId}`
+///
+/// The catch-up call a server makes when a received event cites parents it
+/// does not hold: fill the gap between what they have and what they got.
+async fn federation_missing_events(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let body: Value =
+        serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    federation_room_origin(&state, &headers, "POST", &uri, Some(&body), &room_id).await?;
+    let ids = |key: &str| -> Vec<String> {
+        body[key]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let limit = usize::try_from(body["limit"].as_u64().unwrap_or(10))
+        .unwrap_or(10)
+        .clamp(1, 100);
+    let min_depth = body["min_depth"].as_u64().unwrap_or(0);
+    let events = state
+        .rooms
+        .missing_events(
+            &room_id,
+            &ids("earliest_events"),
+            &ids("latest_events"),
+            limit,
+            min_depth,
+        )
+        .map_err(room_error)?;
+    Ok(Json(json!({ "events": events })))
 }
 
 /// `GET /_matrix/federation/v1/make_join/{roomId}/{userId}`
