@@ -248,6 +248,23 @@ impl Appservices {
         })
     }
 
+    /// The service (with a URL) that *exclusively* claims `user_id`, if
+    /// any — the gate MSC3983/3984 key proxying runs behind. Exclusive,
+    /// because that is the claim "these accounts exist only through me",
+    /// which is exactly when the homeserver's own key tables can be
+    /// empty while the service's are not.
+    #[must_use]
+    pub fn exclusive_claimant(&self, user_id: &str) -> Option<&Arc<Registration>> {
+        self.list.iter().find(|registration| {
+            registration.url.is_some()
+                && registration
+                    .namespaces
+                    .users
+                    .iter()
+                    .any(|namespace| namespace.exclusive && namespace.matches(user_id))
+        })
+    }
+
     /// The classic user query: ask the services claiming `user_id`
     /// whether it exists (`GET {url}/_matrix/app/v1/users/{userId}`).
     ///
@@ -295,6 +312,65 @@ impl Appservices {
         }
         false
     }
+}
+
+/// One MSC3983/3984 proxy call: POST `body` to the service's unstable
+/// `endpoint`, answering `{}` on any failure — the callers' own
+/// absence-handling (fallback keys, "unknown device") already covers an
+/// empty answer, so a broken bridge degrades to exactly the behaviour
+/// the server had before these MSCs existed.
+async fn proxy_post(registration: &Registration, endpoint: &str, body: &Value) -> Value {
+    let Some(url) = &registration.url else {
+        return serde_json::json!({});
+    };
+    let target = format!(
+        "{}/_matrix/app/v1/unstable/{endpoint}",
+        url.trim_end_matches('/')
+    );
+    let response = reqwest::Client::new()
+        .post(target)
+        .header("authorization", format!("Bearer {}", registration.hs_token))
+        .header("content-type", "application/json")
+        .timeout(Duration::from_secs(10))
+        .body(body.to_string())
+        .send()
+        .await;
+    match response {
+        Ok(response) if response.status().is_success() => response
+            .bytes()
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_else(|| serde_json::json!({})),
+        _ => serde_json::json!({}),
+    }
+}
+
+/// MSC3983: ask the claiming service for one-time keys the homeserver
+/// does not hold. `wanted` maps device to a *list* of algorithms, per
+/// the MSC; the answer is the claim response's `one_time_keys` shape.
+pub async fn proxy_otk_claim(registration: &Registration, wanted: &Value) -> Value {
+    let answer = proxy_post(registration, "org.matrix.msc3983/keys/claim", wanted).await;
+    // Tolerate both the bare map and a wrapped `one_time_keys` — the MSC
+    // says bare, some implementations echo the claim response.
+    if answer.get("one_time_keys").is_some() {
+        answer["one_time_keys"].clone()
+    } else {
+        answer
+    }
+}
+
+/// MSC3984: ask the claiming service to answer a `/keys/query` for its
+/// own users. The request and the useful part of the response are the
+/// endpoint's own `device_keys` shape.
+pub async fn proxy_key_query(registration: &Registration, device_keys: &Value) -> Value {
+    let answer = proxy_post(
+        registration,
+        "org.matrix.msc3984/keys/query",
+        &serde_json::json!({ "device_keys": device_keys }),
+    )
+    .await;
+    answer["device_keys"].clone()
 }
 
 /// One existence probe. `id` is percent-encoded for the path — an alias
