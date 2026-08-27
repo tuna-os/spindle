@@ -20,6 +20,7 @@ pub mod federation;
 pub mod filters;
 pub mod media;
 pub mod previews;
+pub mod profiles;
 pub mod push_rules;
 pub mod ratelimit;
 pub mod rooms;
@@ -54,6 +55,7 @@ pub struct AppState {
     pub devices: Arc<devices::Devices>,
     pub backups: Arc<backups::Backups>,
     pub previews: Arc<previews::Previews>,
+    pub profiles: Arc<profiles::Profiles>,
     pub federation: Arc<federation::Federation>,
 }
 
@@ -119,6 +121,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
         Arc::clone(&store),
         config.server.name.clone(),
     ));
+    let profiles = Arc::new(profiles::Profiles::new(Arc::clone(&store)));
     let previews = Arc::new(
         previews::Previews::new(
             Arc::clone(&store),
@@ -147,6 +150,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
         devices: Arc::new(devices::Devices::new(store_for_devices)),
         backups: Arc::new(backups::Backups::new(store_for_backups)),
         previews,
+        profiles,
         federation,
     };
     // The outbound drain runs for the life of the process. Spawned only
