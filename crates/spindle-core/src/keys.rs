@@ -134,6 +134,21 @@ pub enum Keyspace {
     /// after a crash -- the case where the client cannot know whether its
     /// send landed is exactly the case where the server must.
     Transaction = 0x14,
+    /// `(user_id, device_id)` -> the device's identity keys, as uploaded.
+    DeviceKeys = 0x15,
+    /// `(user_id, device_id, key_id)` -> one one-time key.
+    ///
+    /// Claiming is a take: the row is deleted as it is handed out, because a
+    /// one-time key used twice is the compromise Olm's forward secrecy exists
+    /// to prevent. The count a client sees is a scan of what remains.
+    OneTimeKeys = 0x16,
+    /// `(user_id, device_id, seq)` -> one pending to-device message.
+    ///
+    /// `seq` is drawn from the same global stream counter `/sync` tokens
+    /// position against. That identity is the deletion protocol: a client
+    /// presenting `since` has durably received every batch up to it, so every
+    /// message with `seq <= since` is acknowledged and can be dropped.
+    ToDevice = 0x17,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -395,6 +410,23 @@ pub fn transaction(user_id: &str, device_id: &str, txn_id: &str) -> Vec<u8> {
         key.extend_from_slice(&len.to_be_bytes());
         key.extend_from_slice(&bytes[..len as usize]);
     }
+    key
+}
+
+/// `(user_id, device_id, suffix)` key for the device-scoped keyspaces.
+///
+/// The shared shape of [`Keyspace::DeviceKeys`] (empty suffix),
+/// [`Keyspace::OneTimeKeys`] (key id) and [`Keyspace::ToDevice`] (big-endian
+/// sequence). Every component is length-prefixed except the suffix, which is
+/// last and therefore unambiguous.
+#[must_use]
+pub fn device_scoped(keyspace: Keyspace, user_id: &str, device_id: &str, suffix: &[u8]) -> Vec<u8> {
+    let mut key = user_prefix(keyspace, user_id);
+    let device = device_id.as_bytes();
+    let len = u16::try_from(device.len()).unwrap_or(u16::MAX);
+    key.extend_from_slice(&len.to_be_bytes());
+    key.extend_from_slice(&device[..len as usize]);
+    key.extend_from_slice(suffix);
     key
 }
 

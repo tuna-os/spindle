@@ -161,6 +161,9 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::Filter, 0x12),
         (Keyspace::Media, 0x13),
         (Keyspace::Transaction, 0x14),
+        (Keyspace::DeviceKeys, 0x15),
+        (Keyspace::OneTimeKeys, 0x16),
+        (Keyspace::ToDevice, 0x17),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(
