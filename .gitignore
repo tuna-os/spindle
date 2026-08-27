@@ -6,3 +6,6 @@
 # a homeserver.db and a signing key here, and a Spindle run leaves a fjall
 # store -- all of it reproducible, and one of it secret.
 /tmp/
+
+# Python bytecode from the helper scripts.
+__pycache__/

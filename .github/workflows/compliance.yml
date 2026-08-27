@@ -155,7 +155,26 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: 'stable'
+          # setup-go's own cache keys off a go.sum, and this repository has
+          # none: the Go code under test is Complement's, cloned at a pin by
+          # scripts/complement.sh. The cache below does the same job keyed on
+          # that pin instead.
           cache: false
+
+      # Complement is the same source at the same revision on every run, so
+      # recompiling it every run is pure waste — roughly a minute of module
+      # downloads and compilation before a single test can start. Keyed on
+      # complement.sh because that is where COMPLEMENT_REV lives: bump the
+      # pin and the key changes with it, so a stale build is never reused.
+      - name: Cache the Complement checkout and Go build
+        uses: actions/cache@v4
+        with:
+          path: |
+            tmp/complement-src
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: complement-${{ runner.os }}-${{ hashFiles('scripts/complement.sh') }}
+          restore-keys: complement-${{ runner.os }}-
 
       - name: Compute the protected-subset filter for pull requests
         if: github.event_name == 'pull_request'

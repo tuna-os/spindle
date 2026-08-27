@@ -54,3 +54,20 @@ COMPLEMENT_BASE_IMAGE=complement-spindle:latest \
 COMPLEMENT_BASE_IMAGE_hs2=ghcr.io/element-hq/synapse/complement-synapse:latest \
   go test -v ./tests/...
 ```
+
+`scripts/complement.sh` is the wrapper CI runs: it builds the image, clones
+the pinned suite, and writes the ledger. The same stream passes through
+`scripts/complement-progress.py`, so a run prints one line per test as it
+lands and the log of a full suite reads as progress rather than ten minutes
+of silence:
+
+```
+[   16.8s] PASS TestFetchEvent (15.8s)
+[   22.4s] PASS TestSendMessageWithTxn (5.6s)
+[   22.7s] ==== 2 passed, 0 failed, 0 skipped
+```
+
+Failures print the test's captured log underneath, which is where the
+per-request traffic lives (`[CSAPI] PUT hs1/…/send/m.room.message => 200 OK`).
+The ledger keeps every line either way — the printer renders, it never
+judges, and `scripts/complement-check.py` remains the gate.
