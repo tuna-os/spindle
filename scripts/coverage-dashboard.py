@@ -118,11 +118,8 @@ PLANNED = {
     "Federation": [
         ("GET", "/_matrix/federation/v1/make_join/{roomId}/{userId}", "join handshake (#15)"),
         ("PUT", "/_matrix/federation/v1/send_join/{roomId}/{eventId}", "join handshake (#15)"),
-        ("GET", "/_matrix/federation/v1/state/{roomId}", "state answers (#15)"),
-        ("GET", "/_matrix/federation/v1/state_ids/{roomId}", "state answers (#15)"),
         ("GET", "/_matrix/federation/v1/backfill/{roomId}", "history (#15)"),
         ("POST", "/_matrix/federation/v1/get_missing_events/{roomId}", "catch-up (#15)"),
-        ("GET", "/_matrix/federation/v1/event/{eventId}", "event fetch (#15)"),
         ("PUT", "/_matrix/federation/v2/invite/{roomId}/{eventId}", "federated invites (#15)"),
     ],
     "VoIP & MatrixRTC": [

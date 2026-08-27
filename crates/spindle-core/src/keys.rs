@@ -209,6 +209,12 @@ pub enum Keyspace {
     /// transaction ID being derived from the first row's sequence means
     /// the peer's replay table absorbs the duplicate.
     FederationOutbox = 0x20,
+    /// `event_id` -> `room_id`.
+    ///
+    /// Federation asks for events by ID alone (`GET /event/{eventId}`,
+    /// `/get_missing_events`), and the body rows are room-scoped; without
+    /// this reverse index answering would mean scanning every room.
+    EventRoom = 0x21,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -520,6 +526,14 @@ pub fn key_backup_data(user_id: &str, version: u64, room_id: &str, session_id: &
 pub fn cross_signing(user_id: &str, key_type: &str) -> Vec<u8> {
     let mut key = user_prefix(Keyspace::CrossSigning, user_id);
     key.extend_from_slice(key_type.as_bytes());
+    key
+}
+
+/// `event_id` key for [`Keyspace::EventRoom`].
+#[must_use]
+pub fn event_room(event_id: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::EventRoom as u8];
+    key.extend_from_slice(event_id.as_bytes());
     key
 }
 

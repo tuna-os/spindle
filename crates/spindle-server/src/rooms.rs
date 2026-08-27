@@ -725,6 +725,167 @@ impl Rooms {
         })
     }
 
+    /// The room an event lives in, from the reverse index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the read fails.
+    pub fn room_of_event(&self, event_id: &str) -> Result<Option<String>, RoomError> {
+        Ok(spindle_store::ReadView::get(
+            self.store.as_ref(),
+            &spindle_core::keys::event_room(event_id),
+        )?
+        .and_then(|bytes| String::from_utf8(bytes).ok()))
+    }
+
+    /// Whether `domain` has a joined member in the room right now.
+    ///
+    /// The federation read paths gate on this: room state and history
+    /// belong to the servers in the room, and "in" means a joined member,
+    /// not an invite and not a memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room or its indexes cannot be read.
+    pub fn server_in_room(&self, room_id: &str, domain: &str) -> Result<bool, RoomError> {
+        let members = self.with_room(room_id, |_, log| {
+            let Some(state) = log
+                .entries()
+                .next_back()
+                .map(|entry| entry.li)
+                .and_then(|li| log.state_after(li))
+            else {
+                return Ok(Vec::new());
+            };
+            let mut members = Vec::new();
+            state.for_each(|state_key, _| {
+                if state_key.event_type().as_str() == "m.room.member"
+                    && state_key
+                        .state_key()
+                        .split_once(':')
+                        .is_some_and(|(_, d)| d == domain)
+                {
+                    members.push(state_key.state_key().to_owned());
+                }
+            });
+            Ok(members)
+        })?;
+        for user_id in members {
+            let membership = spindle_store::ReadView::get(
+                self.store.as_ref(),
+                &spindle_core::keys::user_room(
+                    spindle_core::keys::Keyspace::Membership,
+                    &user_id,
+                    room_id,
+                ),
+            )?;
+            if membership.as_deref() == Some(JOIN_STR.as_bytes()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The room's state *before* `event_id`, with the auth chain, for
+    /// federation's `/state` and `/state_ids`.
+    ///
+    /// Before rather than after, matching what a joining or backfilling
+    /// server needs: the state its new event was authorized against. This
+    /// is the read SPEC §18.1 is about — the state at an arbitrary
+    /// historical point is one content-addressed rehydration, not a
+    /// resolution: the entry already carries the root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::MissingBody`] for an event the room does not
+    /// hold, or [`RoomError`] if bodies cannot be read.
+    pub fn federation_state(
+        &self,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<(Vec<IdentifiedEvent>, Vec<IdentifiedEvent>), RoomError> {
+        let previous_root = self.with_room(room_id, |_, log| {
+            let Some(entry) = log.get(&EventId::new(event_id)) else {
+                return Err(RoomError::MissingBody(event_id.to_owned()));
+            };
+            let target = entry.li;
+            Ok(log
+                .entries()
+                .rev()
+                .find(|entry| entry.li < target)
+                .map(|entry| entry.state_root))
+        })?;
+
+        let pdus = match previous_root {
+            Some(root) => self.state_pairs_at(room_id, root)?,
+            // The first event: the state before it is no state at all.
+            None => Vec::new(),
+        };
+
+        // The auth chain is every event the state transitively cites: a
+        // walk over stored bodies, deduplicated, no network.
+        let mut seen = std::collections::BTreeSet::new();
+        let mut frontier: Vec<String> = pdus
+            .iter()
+            .flat_map(|(_, event)| {
+                event["auth_events"]
+                    .as_array()
+                    .map(|ids| {
+                        ids.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        let mut auth_chain = Vec::new();
+        while let Some(id) = frontier.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let Ok(event) = self.event(room_id, &id) else {
+                continue;
+            };
+            if let Some(ids) = event["auth_events"].as_array() {
+                frontier.extend(ids.iter().filter_map(Value::as_str).map(str::to_owned));
+            }
+            auth_chain.push((id, event));
+        }
+        Ok((pdus, auth_chain))
+    }
+
+    /// Like [`Self::state_at`], but keeping each event's ID beside it —
+    /// federation answers want both, and the ID is known before the body
+    /// is read.
+    fn state_pairs_at(
+        &self,
+        room_id: &str,
+        root: spindle_core::StateRoot,
+    ) -> Result<Vec<IdentifiedEvent>, RoomError> {
+        let mut load = |address: &spindle_core::StateRoot| {
+            spindle_store::ReadView::get(
+                self.store.as_ref(),
+                &spindle_core::keys::content_addressed(
+                    spindle_core::keys::Keyspace::StateNode,
+                    address.as_bytes(),
+                ),
+            )
+            .ok()
+            .flatten()
+        };
+        let snapshot = spindle_core::StateSnapshot::rehydrate(root, &mut load)
+            .map_err(|error| RoomError::Build(format!("cannot rebuild state: {error:?}")))?;
+        let mut ids = Vec::with_capacity(snapshot.len());
+        snapshot.for_each(|_, event_id| ids.push(event_id.to_owned()));
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let event = self.event(room_id, &id)?;
+            out.push((id, event));
+        }
+        Ok(out)
+    }
+
     /// The room's state at a past point, rebuilt from its content address.
     ///
     /// Not from the resident window: that bounds what is kept *materialized*,
@@ -1863,6 +2024,14 @@ impl Rooms {
             ));
         }
 
+        // The event->room reverse index rides the same batch: federation
+        // asks for events by ID alone, and an index row that outlived a
+        // failed commit would point at an event the room does not have.
+        extra.push((
+            spindle_core::keys::event_room(event_id),
+            room_id.as_bytes().to_vec(),
+        ));
+
         // The stream id goes in the entry's own batch, so an event is either
         // in the global order or not stored at all. Assigned under the same
         // lock that serialises appends, which is what makes the watermark the
@@ -1997,6 +2166,10 @@ struct PersistInput<'a> {
     content: &'a Value,
     json: &'a Value,
 }
+
+/// An event ID with its stored body — federation answers want both, and
+/// the ID is known before the body is read.
+pub type IdentifiedEvent = (String, Value);
 
 /// Read back the `(rel_type, event_id)` a relation row stores.
 fn decode_relation(value: &[u8]) -> Option<(String, String)> {
