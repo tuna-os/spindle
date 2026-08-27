@@ -580,6 +580,62 @@ impl RoomLog {
         Ok(&self.entries[&li])
     }
 
+    /// Append an event whose state is supplied rather than derived — the
+    /// seeding path for a room joined over federation.
+    ///
+    /// A remote join hands this server a state set and a join event with no
+    /// shared history behind them: the parents the events name live on the
+    /// resident server, not here. Deriving state by folding parents is
+    /// therefore impossible, and the caller supplies each event's
+    /// state-after instead, built by replaying the remote state in
+    /// dependency order. `chain` stays `None` for the same reason it does
+    /// on backfill: this history was sequenced by somebody else.
+    ///
+    /// The appended event becomes the sole forward extremity, so seeding a
+    /// room is a run of these calls ending with the join, after which
+    /// ordinary appends continue from it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppendError::DuplicateEvent`] for an event already held,
+    /// or [`AppendError::IndexSpaceExhausted`].
+    pub fn append_seeded(
+        &mut self,
+        input: EventInput,
+        state_after: StateSnapshot,
+        depth: u64,
+    ) -> Result<&LogEntry, AppendError> {
+        if self.positions.contains_key(&input.event_id) {
+            return Err(AppendError::DuplicateEvent(input.event_id));
+        }
+        if input.prev_events.len() > MAX_PREV_EVENTS {
+            return Err(AppendError::TooManyPredecessors(input.prev_events.len()));
+        }
+
+        let li = self.next_forward;
+        self.next_forward = self
+            .next_forward
+            .checked_add(1)
+            .ok_or(AppendError::IndexSpaceExhausted)?;
+
+        let entry = LogEntry {
+            li: LinearIndex(li),
+            event_id: input.event_id,
+            prev_events: input.prev_events,
+            depth,
+            state_key: input.state_key,
+            chain: None,
+            state_root: state_after.root(),
+        };
+
+        self.forward_extremities.clear();
+        self.forward_extremities.insert(entry.event_id.clone());
+        self.positions.insert(entry.event_id.clone(), li);
+        self.entries.insert(li, entry);
+        self.make_resident(li, state_after);
+        Ok(&self.entries[&li])
+    }
+
     /// Place one backfilled event before everything currently held.
     ///
     /// Backfill walks strictly backwards from the earliest event we have, so

@@ -492,3 +492,66 @@ async fn paginating_a_large_room_costs_what_paginating_a_small_one_does() {
     assert!(small.starts_with('t') && large.starts_with('t'));
     assert_ne!(small, large);
 }
+
+#[tokio::test]
+async fn create_room_honours_preset_invites_initial_state_and_alias() {
+    let harness = Harness::new();
+    let alice = harness.register().await;
+    let bob = harness.register_as("bob").await;
+
+    let (status, body) = harness
+        .post(
+            "/_matrix/client/v3/createRoom",
+            &alice,
+            &json!({
+                "preset": "public_chat",
+                "invite": ["@bob:example.org"],
+                "room_alias_name": "the-room",
+                "initial_state": [
+                    { "type": "m.room.topic", "state_key": "", "content": { "topic": "seeded" } },
+                ],
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+
+    // public_chat opened the door...
+    let (status, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.join_rules"),
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["join_rule"], "public");
+
+    // ...initial_state landed after the bundle...
+    let (_, topic) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.topic"),
+            &alice,
+        )
+        .await;
+    assert_eq!(topic["topic"], "seeded");
+
+    // ...the invite is real enough for bob to act on...
+    let (status, body) = harness
+        .post(
+            &format!("/_matrix/client/v3/rooms/{room}/join"),
+            &bob,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // ...and the alias resolves to the room.
+    let (status, body) = harness
+        .get(
+            "/_matrix/client/v3/directory/room/%23the-room%3Aexample.org",
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["room_id"].as_str(), Some(room.as_str()));
+}

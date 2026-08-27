@@ -46,13 +46,16 @@ pub const SPEC_VERSIONS: &[SpecVersion] = &[
 
 /// Room versions this server can create and join.
 ///
-/// Empty until rooms exist (#7). An empty list is a true statement; a populated
-/// one would not be, and `/capabilities` is exactly where a client looks to
-/// decide what to attempt.
-pub const ROOM_VERSIONS: &[&str] = &[];
+/// Exactly v11 — the one version the whole implementation is built
+/// against. Staying silent here is not a safe default: a client that
+/// finds no `m.room_versions` in `/capabilities` assumes room version 1
+/// (the spec's fallback), and a federated peer told to make a v1 room
+/// for us hands back events our v11 machinery rightly refuses — which is
+/// how Complement’s `TestJoinViaRoomIDAndServerName` found this.
+pub const ROOM_VERSIONS: &[&str] = &["11"];
 
-/// The default room version, once there is one.
-pub const DEFAULT_ROOM_VERSION: Option<&str> = None;
+/// The default room version.
+pub const DEFAULT_ROOM_VERSION: Option<&str> = Some("11");
 
 /// Routes that must be mounted before *any* room version may be advertised.
 ///

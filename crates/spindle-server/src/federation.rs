@@ -278,6 +278,137 @@ impl Federation {
 }
 
 impl Federation {
+    /// Ask a resident server for a join template — the client half of the
+    /// handshake our own `make_join` route serves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] if the request cannot be signed or sent,
+    /// or the peer refuses.
+    pub async fn remote_make_join(
+        &self,
+        destination: &str,
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<Value, FederationError> {
+        let uri = format!("/_matrix/federation/v1/make_join/{room_id}/{user_id}?ver=11");
+        let authorization = self.sign_request("GET", &uri, destination, None)?;
+        let response = self
+            .client
+            .get(format!(
+                "{}{uri}",
+                base_url(destination, self.insecure_http)
+            ))
+            .header("authorization", authorization)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|error| FederationError::Refused(format!("make_join: {error}")))?;
+        let status = response.status();
+        let body: Value = response
+            .bytes()
+            .await
+            .map_err(|error| FederationError::Refused(format!("make_join body: {error}")))
+            .and_then(|bytes| {
+                serde_json::from_slice(&bytes)
+                    .map_err(|error| FederationError::Refused(format!("make_join body: {error}")))
+            })?;
+        if !status.is_success() {
+            return Err(FederationError::Refused(format!(
+                "{destination} refused make_join: {status} {body}"
+            )));
+        }
+        Ok(body)
+    }
+
+    /// Resolve a room alias on the server that owns it — the client half
+    /// of `query/directory`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] if the request cannot be signed or sent,
+    /// or the peer refuses.
+    pub async fn remote_query_directory(
+        &self,
+        destination: &str,
+        alias: &str,
+    ) -> Result<Value, FederationError> {
+        let encoded: String = form_urlencoded::byte_serialize(alias.as_bytes()).collect();
+        let uri = format!("/_matrix/federation/v1/query/directory?room_alias={encoded}");
+        let authorization = self.sign_request("GET", &uri, destination, None)?;
+        let response = self
+            .client
+            .get(format!(
+                "{}{uri}",
+                base_url(destination, self.insecure_http)
+            ))
+            .header("authorization", authorization)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|error| FederationError::Refused(format!("query/directory: {error}")))?;
+        let status = response.status();
+        let body: Value = response
+            .bytes()
+            .await
+            .map_err(|error| FederationError::Refused(format!("directory body: {error}")))
+            .and_then(|bytes| {
+                serde_json::from_slice(&bytes)
+                    .map_err(|error| FederationError::Refused(format!("directory body: {error}")))
+            })?;
+        if !status.is_success() {
+            return Err(FederationError::Refused(format!(
+                "{destination} refused query/directory: {status} {body}"
+            )));
+        }
+        Ok(body)
+    }
+
+    /// Send the signed join back — the client half of `send_join`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] if the request cannot be signed or sent,
+    /// or the peer refuses.
+    pub async fn remote_send_join(
+        &self,
+        destination: &str,
+        room_id: &str,
+        event_id: &str,
+        join: &Value,
+    ) -> Result<Value, FederationError> {
+        let uri = format!("/_matrix/federation/v2/send_join/{room_id}/{event_id}");
+        let authorization = self.sign_request("PUT", &uri, destination, Some(join))?;
+        let response = self
+            .client
+            .put(format!(
+                "{}{uri}",
+                base_url(destination, self.insecure_http)
+            ))
+            .header("authorization", authorization)
+            .header("content-type", "application/json")
+            .timeout(Duration::from_secs(60))
+            .body(join.to_string())
+            .send()
+            .await
+            .map_err(|error| FederationError::Refused(format!("send_join: {error}")))?;
+        let status = response.status();
+        let body: Value = response
+            .bytes()
+            .await
+            .map_err(|error| FederationError::Refused(format!("send_join body: {error}")))
+            .and_then(|bytes| {
+                serde_json::from_slice(&bytes)
+                    .map_err(|error| FederationError::Refused(format!("send_join body: {error}")))
+            })?;
+        if !status.is_success() {
+            return Err(FederationError::Refused(format!(
+                "{destination} refused send_join: {status} {body}"
+            )));
+        }
+        Ok(body)
+    }
+
     /// Deliver one signed transaction to a peer.
     ///
     /// # Errors
