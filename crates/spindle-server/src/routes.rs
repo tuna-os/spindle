@@ -2392,7 +2392,15 @@ fn sync_device_sections(
     identity: &crate::accounts::Identity,
     since: Option<u64>,
     next_batch: u64,
-) -> Result<(Vec<Value>, Vec<String>, serde_json::Map<String, Value>, Vec<String>), MatrixError> {
+) -> Result<
+    (
+        Vec<Value>,
+        Vec<String>,
+        serde_json::Map<String, Value>,
+        Vec<String>,
+    ),
+    MatrixError,
+> {
     let to_device = state
         .devices
         .take_pending(&identity.user_id, &identity.device_id, since)
