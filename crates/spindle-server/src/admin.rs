@@ -13,9 +13,9 @@
 //! sternest form: an admin endpoint that is routed must work, because a
 //! stub returning `{}` is indistinguishable from success to the tooling
 //! that calls it. This module carries the groups of #83's spec that are
-//! built — users, the rooms group's read side, `state_at`, and history
-//! purge — and routes nothing beyond what it serves: room deletion and
-//! `make_room_admin` land as their own slices.
+//! built — the users group and the rooms group entire — and routes
+//! nothing beyond what it serves: event reports, registration tokens and
+//! server notices are not here because they are not built.
 
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::StatusCode;
@@ -60,7 +60,10 @@ pub fn routes() -> Router<AppState> {
             )
             .route(&format!("{prefix}/whois/{{user_id}}"), get(whois))
             .route(&format!("{prefix}/rooms"), get(list_rooms))
-            .route(&format!("{prefix}/rooms/{{room_id}}"), get(room_detail))
+            .route(
+                &format!("{prefix}/rooms/{{room_id}}"),
+                get(room_detail).delete(delete_room),
+            )
             .route(
                 &format!("{prefix}/rooms/{{room_id}}/members"),
                 get(room_members),
@@ -80,6 +83,10 @@ pub fn routes() -> Router<AppState> {
             .route(
                 &format!("{prefix}/rooms/{{room_id}}/purge_history"),
                 post(purge_history),
+            )
+            .route(
+                &format!("{prefix}/rooms/{{room_id}}/make_room_admin"),
+                post(make_room_admin),
             )
             .route(&format!("{prefix}/audit"), get(audit_log))
     };
@@ -803,6 +810,224 @@ async fn purge_history(
     Ok(Json(
         json!({ "purged_up_to": before_li, "events_purged": purged }),
     ))
+}
+
+#[derive(Deserialize)]
+struct DeleteRoom {
+    #[serde(default)]
+    block: bool,
+    #[serde(default)]
+    purge: bool,
+    new_room_user_id: Option<String>,
+    message: Option<String>,
+}
+
+/// `DELETE /rooms/{roomId}` — `{block, purge, new_room_user_id, message}`.
+///
+/// Every departure is a real leave event through the ordinary append
+/// path (#83 §2) — the log records the eviction the same way it records
+/// any other membership change, so a peer replaying it computes the
+/// same room. The block row is written first so nobody rejoins between
+/// the eviction and the block; `purge` reuses `purge_history` over the
+/// whole log, so the spine and the chain survive even total deletion.
+async fn delete_room(
+    State(state): State<AppState>,
+    AdminActor(actor): AdminActor,
+    Path(room_id): Path<String>,
+    Json(request): Json<DeleteRoom>,
+) -> Result<Json<Value>, MatrixError> {
+    let members = state
+        .rooms
+        .joined_members(&room_id)
+        .map_err(crate::routes::room_error)?;
+    let local_suffix = format!(":{}", state.config.server.name);
+    let locals: Vec<String> = members
+        .keys()
+        .filter(|user| user.ends_with(&local_suffix))
+        .cloned()
+        .collect();
+
+    if request.block {
+        state
+            .rooms
+            .set_room_block(&room_id, &json!({ "actor": actor.user_id }))
+            .map_err(crate::routes::room_error)?;
+    }
+
+    // The replacement room, when asked for: created by the named local
+    // user, opening with the administrator's message, every evicted
+    // local user invited into it.
+    let new_room = match &request.new_room_user_id {
+        Some(creator) => {
+            local_localpart(&state, creator).ok_or_else(|| {
+                MatrixError::new(
+                    StatusCode::BAD_REQUEST,
+                    "M_INVALID_PARAM",
+                    "new_room_user_id must be a user of this server",
+                )
+            })?;
+            let new_room = state
+                .rooms
+                .create(creator, state.key.pair(), None, None, None, &[])
+                .map_err(crate::routes::room_error)?;
+            if let Some(message) = &request.message {
+                state
+                    .rooms
+                    .send(
+                        &new_room,
+                        creator,
+                        state.key.pair(),
+                        "m.room.message",
+                        &json!({ "msgtype": "m.text", "body": message }),
+                    )
+                    .map_err(crate::routes::room_error)?;
+            }
+            Some(new_room)
+        }
+        None => None,
+    };
+
+    let mut kicked = Vec::new();
+    let mut failed = Vec::new();
+    for user in &locals {
+        if let (Some(new_room), Some(creator)) = (&new_room, &request.new_room_user_id)
+            && user != creator
+        {
+            // Best-effort: an invite the new room refuses must not stop
+            // the eviction from the old one.
+            let _ = state.rooms.set_membership(
+                new_room,
+                creator,
+                user,
+                "invite",
+                None,
+                state.key.pair(),
+            );
+        }
+        match state.rooms.set_membership(
+            &room_id,
+            user,
+            user,
+            "leave",
+            request.message.as_deref(),
+            state.key.pair(),
+        ) {
+            Ok(_) => kicked.push(user.clone()),
+            Err(_) => failed.push(user.clone()),
+        }
+    }
+
+    if request.purge {
+        state
+            .rooms
+            .purge_history(&room_id, i64::MAX)
+            .map_err(crate::routes::room_error)?;
+    }
+
+    audit(
+        &state,
+        &actor.user_id,
+        "delete_room",
+        &room_id,
+        &json!({
+            "block": request.block,
+            "purge": request.purge,
+            "kicked": kicked.len(),
+            "new_room_id": new_room,
+        }),
+    )?;
+    Ok(Json(json!({
+        "kicked_users": kicked,
+        "failed_to_kick_users": failed,
+        "new_room_id": new_room,
+    })))
+}
+
+#[derive(Deserialize)]
+struct MakeRoomAdmin {
+    user_id: Option<String>,
+}
+
+/// `POST /rooms/{roomId}/make_room_admin` — `{user_id}`, default caller.
+///
+/// Authors a real `m.room.power_levels` event *as a local user who has
+/// the power to* (#83 §2), never by writing state directly: state here
+/// is the fold of the log, and surgery would produce a room whose state
+/// no peer could recompute. The grant is the author's own level — the
+/// auth rules cap a grant at the granter's power, and this endpoint
+/// works inside the rules rather than around them. When no local user
+/// can author the event, it says so.
+async fn make_room_admin(
+    State(state): State<AppState>,
+    AdminActor(actor): AdminActor,
+    Path(room_id): Path<String>,
+    Json(request): Json<MakeRoomAdmin>,
+) -> Result<Json<Value>, MatrixError> {
+    let target = request.user_id.unwrap_or_else(|| actor.user_id.clone());
+    let members = state
+        .rooms
+        .joined_members(&room_id)
+        .map_err(crate::routes::room_error)?;
+    let levels = state
+        .rooms
+        .state_event(&room_id, "m.room.power_levels", "")
+        .unwrap_or_else(|_| json!({}));
+    let users_default = levels["users_default"].as_i64().unwrap_or(0);
+    let level_of = |user: &str| -> i64 { levels["users"][user].as_i64().unwrap_or(users_default) };
+    let required = levels["events"]["m.room.power_levels"]
+        .as_i64()
+        .or_else(|| levels["state_default"].as_i64())
+        .unwrap_or(50);
+
+    let local_suffix = format!(":{}", state.config.server.name);
+    let author = members
+        .keys()
+        .filter(|user| user.ends_with(&local_suffix))
+        .max_by_key(|user| level_of(user))
+        .filter(|user| level_of(user) >= required)
+        .cloned()
+        .ok_or_else(|| {
+            MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_UNKNOWN",
+                "no local user has the power to author m.room.power_levels here",
+            )
+        })?;
+    let granted = level_of(&author);
+    if level_of(&target) >= granted {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_UNKNOWN",
+            "the user is already at or above the highest local power level",
+        ));
+    }
+
+    let mut content = levels;
+    content["users"][&target] = json!(granted);
+    let event_id = state
+        .rooms
+        .set_state(
+            &room_id,
+            &author,
+            state.key.pair(),
+            "m.room.power_levels",
+            "",
+            &content,
+        )
+        .map_err(crate::routes::room_error)?;
+
+    audit(
+        &state,
+        &actor.user_id,
+        "make_room_admin",
+        &room_id,
+        &json!({ "user_id": target, "granted": granted, "authored_by": author }),
+    )?;
+    Ok(Json(json!({
+        "event_id": event_id,
+        "user_id": target,
+        "power_level": granted,
+    })))
 }
 
 /// `GET /audit?from&limit&actor&action`

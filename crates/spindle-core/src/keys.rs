@@ -255,6 +255,12 @@ pub enum Keyspace {
     /// purpose, and is rendered as a marker rather than a hole (#83 §3).
     /// It only ever moves forward.
     PurgeWatermark = 0x27,
+    /// `room_id` → why an administrator blocked the room (JSON).
+    ///
+    /// A blocked room refuses every join, local or federated, until the
+    /// block is lifted. Its presence is the block; the value records who
+    /// and when, for the audit trail's benefit.
+    RoomBlock = 0x28,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -303,6 +309,12 @@ pub fn oidc_client(client_id: &str) -> Vec<u8> {
 #[must_use]
 pub fn purge_watermark(room_id: &str) -> Vec<u8> {
     room_prefix(Keyspace::PurgeWatermark, room_id)
+}
+
+/// A room's administrative block row.
+#[must_use]
+pub fn room_block(room_id: &str) -> Vec<u8> {
+    room_prefix(Keyspace::RoomBlock, room_id)
 }
 
 /// Map an `i64` onto `u64` so that big-endian byte order matches numeric order.

@@ -149,6 +149,11 @@ fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
                 reqwest::Method::POST,
                 format!("{prefix}/rooms/!r:x/purge_history"),
             ),
+            (
+                reqwest::Method::POST,
+                format!("{prefix}/rooms/!r:x/make_room_admin"),
+            ),
+            (reqwest::Method::DELETE, format!("{prefix}/rooms/!r:x")),
             (reqwest::Method::GET, format!("{prefix}/audit")),
         ]);
     }
@@ -1030,4 +1035,301 @@ async fn purge_resolves_time_and_refuses_ambiguity() {
     assert_eq!(status, 400);
     let (status, _) = purge("!missing:nowhere", json!({ "before_li": 1 })).await;
     assert_eq!(status, 404);
+}
+
+/// The replacement room a deletion offers must actually take the evicted
+/// users in and say why they are there — otherwise it is a room ID in a
+/// response body and nothing more.
+async fn assert_replacement_room_took_them_in(
+    server: &Instance,
+    admin_token: &str,
+    new_room: &str,
+    evicted: &str,
+) {
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_spindle/admin/v1/rooms/{new_room}/state"),
+            Some(admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let invited = body["state"].as_array().unwrap().iter().any(|event| {
+        event["type"] == "m.room.member"
+            && event["state_key"] == evicted
+            && event["content"]["membership"] == "invite"
+    });
+    assert!(invited, "{evicted} is invited to the replacement: {body}");
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_spindle/admin/v1/rooms/{new_room}/timeline"),
+            Some(admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["chunk"].as_array().unwrap().iter().any(|entry| {
+            entry["event"]["content"]["body"]
+                .as_str()
+                .is_some_and(|text| text.contains("closed by an administrator"))
+        }),
+        "the administrator's message opens the room: {body}"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_room_evicts_through_real_events_and_blocks_return() {
+    let server = Instance::start().await;
+    let (admin_token, ops, _) = rooms_fixture(&server).await;
+    let alice = server.user("alice");
+    let root = server.user("root");
+
+    // The eviction: block it, move everyone to a replacement room, and
+    // say why. Both locals leave; nobody fails.
+    let (status, body) = server
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/_spindle/admin/v1/rooms/{ops}"),
+            Some(&admin_token),
+            Some(&json!({
+                "block": true,
+                "new_room_user_id": root,
+                "message": "This room has been closed by an administrator.",
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let kicked = body["kicked_users"].as_array().unwrap();
+    assert_eq!(kicked.len(), 2, "{body}");
+    assert!(kicked.iter().any(|user| user == alice.as_str()), "{body}");
+    assert!(
+        body["failed_to_kick_users"].as_array().unwrap().is_empty(),
+        "{body}"
+    );
+    let new_room = body["new_room_id"].as_str().unwrap().to_owned();
+
+    // The room is empty and the departures are real leave events in the
+    // log — not state surgery — so the timeline records the eviction.
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_spindle/admin/v1/rooms/{ops}/members"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total"], 0, "{body}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_spindle/admin/v1/rooms/{ops}/timeline?dir=b&limit=3"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let leaves = body["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| {
+            entry["event"]["type"] == "m.room.member"
+                && entry["event"]["content"]["membership"] == "leave"
+        })
+        .count();
+    assert!(leaves >= 2, "the leaves are events in the log: {body}");
+
+    // Blocked means blocked: rejoining is refused, for the evicted user
+    // and for the administrator alike.
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/join/{ops}"),
+            Some(&admin_token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["errcode"], "M_FORBIDDEN", "{body}");
+
+    assert_replacement_room_took_them_in(&server, &admin_token, &new_room, &alice).await;
+
+    // And the deletion is audited.
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_spindle/admin/v1/audit?action=delete_room",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["entries"][0]["target"], ops.as_str(), "{body}");
+    assert_eq!(body["entries"][0]["detail"]["block"], true, "{body}");
+}
+
+#[tokio::test]
+async fn deleting_with_purge_keeps_the_verifiable_spine() {
+    let server = Instance::start().await;
+    let (admin_token, ops, _) = rooms_fixture(&server).await;
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/_spindle/admin/v1/rooms/{ops}"),
+            Some(&admin_token),
+            Some(&json!({ "purge": true })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    // Even a full purge leaves a chain that verifies — the property
+    // #83 §3 asks for, here through the deletion path rather than
+    // purge_history directly.
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_spindle/admin/v1/rooms/{ops}/timeline"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let chunk = body["chunk"].as_array().unwrap();
+    assert_chain_verifies(chunk);
+    assert!(
+        chunk.iter().any(|entry| entry["purged"] == true),
+        "message bodies are gone: {body}"
+    );
+}
+
+#[tokio::test]
+async fn make_room_admin_authors_a_real_event() {
+    let server = Instance::start().await;
+    let (admin_token, ops, _) = rooms_fixture(&server).await;
+    let alice = server.user("alice");
+
+    // alice joined an existing room, so she is an ordinary member.
+    let power_of = |user: String| {
+        let server = &server;
+        let token = admin_token.clone();
+        let ops = ops.clone();
+        async move {
+            let (status, body) = server
+                .request(
+                    reqwest::Method::GET,
+                    &format!("/_spindle/admin/v1/rooms/{ops}/state"),
+                    Some(&token),
+                    None,
+                )
+                .await;
+            assert_eq!(status, 200, "{body}");
+            body["state"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|event| event["type"] == "m.room.power_levels")
+                .and_then(|event| event["content"]["users"][&user].as_i64())
+        }
+    };
+    assert_eq!(power_of(alice.clone()).await, None, "alice starts ordinary");
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_spindle/admin/v1/rooms/{ops}/make_room_admin"),
+            Some(&admin_token),
+            Some(&json!({ "user_id": alice })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["user_id"], alice.as_str(), "{body}");
+    assert_eq!(body["power_level"], 100, "{body}");
+    let event_id = body["event_id"].as_str().unwrap().to_owned();
+
+    // The grant is a real m.room.power_levels event in the log, authored
+    // by the local user who had the power — not a state write.
+    assert_eq!(power_of(alice.clone()).await, Some(100), "alice is now op");
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_spindle/admin/v1/rooms/{ops}/timeline?dir=b&limit=1"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["chunk"][0]["event_id"], event_id.as_str(), "{body}");
+    assert_eq!(
+        body["chunk"][0]["event"]["type"], "m.room.power_levels",
+        "{body}"
+    );
+    assert_eq!(
+        body["chunk"][0]["event"]["sender"],
+        server.user("root").as_str(),
+        "authored by the user who could: {body}"
+    );
+
+    // Asking again is refused rather than writing a no-op event.
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_spindle/admin/v1/rooms/{ops}/make_room_admin"),
+            Some(&admin_token),
+            Some(&json!({ "user_id": alice })),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+
+    // And the grant is audited.
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_spindle/admin/v1/audit?action=make_room_admin",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["entries"][0]["detail"]["user_id"], alice.as_str());
+}
+
+#[tokio::test]
+async fn make_room_admin_says_so_when_nobody_local_can_author() {
+    let server = Instance::start().await;
+    let (admin_token, ops, _) = rooms_fixture(&server).await;
+
+    // Empty the room: with no local member left, there is nobody whose
+    // power level could authorize an m.room.power_levels event. Saying
+    // so is the honest answer; writing the state directly is not (#83 §2).
+    let (status, body) = server
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/_spindle/admin/v1/rooms/{ops}"),
+            Some(&admin_token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_spindle/admin/v1/rooms/{ops}/make_room_admin"),
+            Some(&admin_token),
+            Some(&json!({ "user_id": server.user("alice") })),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|text| text.contains("no local user")),
+        "{body}"
+    );
 }
