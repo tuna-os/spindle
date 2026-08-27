@@ -636,6 +636,87 @@ impl Federation {
         Ok(())
     }
 
+    /// Fetch a peer's media over authenticated federation (MSC3916),
+    /// falling back to the legacy public endpoint for older peers.
+    ///
+    /// The modern response is `multipart/mixed`: a JSON metadata part, then
+    /// the file. The legacy response is the file alone. Either way the
+    /// caller gets `(content_type, filename, bytes)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] if neither endpoint yields the file, or
+    /// the multipart body cannot be parsed.
+    pub async fn remote_media_download(
+        &self,
+        destination: &str,
+        media_id: &str,
+    ) -> Result<(String, Option<String>, Vec<u8>), FederationError> {
+        let uri = format!("/_matrix/federation/v1/media/download/{media_id}");
+        let authorization = self.sign_request("GET", &uri, destination, None)?;
+        let response = self
+            .client
+            .get(format!(
+                "{}{uri}",
+                base_url(destination, self.insecure_http)
+            ))
+            .header("authorization", authorization)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(|error| FederationError::Refused(format!("media download: {error}")))?;
+        if response.status().is_success() {
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            let body = response
+                .bytes()
+                .await
+                .map_err(|error| FederationError::Refused(format!("media body: {error}")))?;
+            return parse_multipart_media(&content_type, &body);
+        }
+        let status = response.status();
+
+        // Legacy fallback: the public v3 endpoint, no signature. Kept for
+        // peers predating authenticated media; a 404 there is final.
+        let legacy = format!(
+            "{}/_matrix/media/v3/download/{destination}/{media_id}?allow_redirect=false",
+            base_url(destination, self.insecure_http)
+        );
+        let response = self
+            .client
+            .get(legacy)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(|error| FederationError::Refused(format!("legacy media: {error}")))?;
+        if !response.status().is_success() {
+            return Err(FederationError::Refused(format!(
+                "{destination} refused media {media_id}: {status} then {}",
+                response.status()
+            )));
+        }
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        let filename = response
+            .headers()
+            .get("content-disposition")
+            .and_then(|value| value.to_str().ok())
+            .and_then(disposition_filename);
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| FederationError::Refused(format!("legacy media body: {error}")))?;
+        Ok((content_type, filename, bytes.to_vec()))
+    }
+
     /// Deliver one signed transaction to a peer.
     ///
     /// # Errors
@@ -852,6 +933,88 @@ fn base_url(name: &str, insecure_http: bool) -> String {
     } else {
         format!("{scheme}://{name}:8448")
     }
+}
+
+/// Pull `filename="..."` (or bare filename=) out of a Content-Disposition.
+fn disposition_filename(header: &str) -> Option<String> {
+    let (_, rest) = header.split_once("filename=")?;
+    let rest = rest.trim();
+    let name = rest
+        .strip_prefix('"')
+        .and_then(|inner| inner.split_once('"').map(|(name, _)| name))
+        .unwrap_or_else(|| rest.split(';').next().unwrap_or(rest).trim());
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// Take the file part out of an MSC3916 `multipart/mixed` media response.
+///
+/// The format is fixed by the MSC: a JSON metadata part first, the file
+/// second. Parsed by boundary split rather than a multipart crate — two
+/// known parts with known roles do not need a streaming parser, and the
+/// body is already bounded by the media size cap.
+fn parse_multipart_media(
+    content_type: &str,
+    body: &[u8],
+) -> Result<(String, Option<String>, Vec<u8>), FederationError> {
+    let boundary = content_type
+        .split(';')
+        .find_map(|param| param.trim().strip_prefix("boundary="))
+        .map(|value| value.trim_matches('"').to_owned())
+        .ok_or_else(|| {
+            FederationError::Refused(format!("media response is not multipart: {content_type}"))
+        })?;
+    let marker = format!("--{boundary}");
+    let marker = marker.as_bytes();
+    // Split the body at each boundary marker.
+    let mut parts: Vec<&[u8]> = Vec::new();
+    let mut cursor = 0;
+    while let Some(at) = find(&body[cursor..], marker) {
+        let start = cursor + at + marker.len();
+        // The final marker is `--boundary--`.
+        if body[start..].starts_with(b"--") {
+            break;
+        }
+        let from = start
+            + body[start..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(0, |i| i + 1);
+        let end = find(&body[from..], marker).map_or(body.len(), |i| from + i);
+        parts.push(&body[from..end]);
+        cursor = end;
+    }
+    // The file is the last part: metadata first, file second, by the MSC.
+    let part = parts
+        .last()
+        .ok_or_else(|| FederationError::Refused("multipart media had no parts".to_owned()))?;
+    let split = find(part, b"\r\n\r\n")
+        .map(|i| (&part[..i], &part[i + 4..]))
+        .or_else(|| find(part, b"\n\n").map(|i| (&part[..i], &part[i + 2..])));
+    let (headers, content) = split
+        .ok_or_else(|| FederationError::Refused("multipart part had no header break".to_owned()))?;
+    let headers = String::from_utf8_lossy(headers);
+    let mut content_type = "application/octet-stream".to_owned();
+    let mut filename = None;
+    for line in headers.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        match name.trim().to_ascii_lowercase().as_str() {
+            "content-type" => value.trim().clone_into(&mut content_type),
+            "content-disposition" => filename = disposition_filename(value),
+            _ => {}
+        }
+    }
+    // The part ends with the CRLF that precedes the next boundary.
+    let content = content.strip_suffix(b"\r\n").unwrap_or(content);
+    Ok((content_type, filename, content.to_vec()))
+}
+
+/// First position of `needle` in `haystack`, if any.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// Parse `X-Matrix origin="…",destination="…",key="…",sig="…"`.
