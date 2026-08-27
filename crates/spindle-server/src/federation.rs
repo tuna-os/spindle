@@ -34,6 +34,13 @@ pub struct Federation {
     /// federation authentication in all but name, and the config comment
     /// says so.
     insecure_http: bool,
+    /// EDUs waiting for the next transaction to each destination.
+    ///
+    /// In memory and nowhere else, deliberately: an EDU is ephemeral by
+    /// contract, and one that failed to deliver is dropped rather than
+    /// retried — stale typing redelivered late is a lie about the present,
+    /// and whoever is still typing says so again within seconds.
+    edu_queue: std::sync::Mutex<std::collections::HashMap<String, Vec<Value>>>,
 }
 
 #[derive(Debug)]
@@ -78,7 +85,48 @@ impl Federation {
             key,
             client: reqwest::Client::new(),
             insecure_http,
+            edu_queue: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Queue one EDU for `destination`'s next transaction.
+    ///
+    /// Bounded per destination: past a hundred waiting, the oldest are
+    /// dropped — the spec caps a transaction at a hundred EDUs, and an
+    /// unreachable peer must not grow an unbounded queue of claims about
+    /// a present it keeps missing.
+    pub fn queue_edu(&self, destination: &str, edu: Value) {
+        let mut queue = self
+            .edu_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pending = queue.entry(destination.to_owned()).or_default();
+        pending.push(edu);
+        if pending.len() > 100 {
+            let excess = pending.len() - 100;
+            pending.drain(..excess);
+        }
+    }
+
+    /// Take everything queued for `destination`, leaving it empty.
+    #[must_use]
+    pub fn take_edus(&self, destination: &str) -> Vec<Value> {
+        self.edu_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(destination)
+            .unwrap_or_default()
+    }
+
+    /// The destinations with EDUs waiting.
+    #[must_use]
+    pub fn edu_destinations(&self) -> Vec<String> {
+        self.edu_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /// Sign an outbound request, returning the `Authorization` header value.
@@ -653,9 +701,6 @@ pub async fn drain_outbox(
         let Ok(rows) = ReadView::scan_prefix(store.as_ref(), &keys::federation_outbox_all()) else {
             continue;
         };
-        if rows.is_empty() {
-            continue;
-        }
         let mut by_destination: std::collections::BTreeMap<String, Vec<OutboxRow>> =
             std::collections::BTreeMap::new();
         for (key, value) in rows {
@@ -665,6 +710,14 @@ pub async fn drain_outbox(
                     .or_default()
                     .push((key, value));
             }
+        }
+        // A destination with only EDUs waiting still gets a transaction:
+        // typing must not wait for the next event.
+        for destination in federation.edu_destinations() {
+            by_destination.entry(destination).or_default();
+        }
+        if by_destination.is_empty() {
+            continue;
         }
         for (destination, rows) in by_destination {
             if let Some((_, until)) = backoff.get(&destination)
@@ -679,20 +732,40 @@ pub async fn drain_outbox(
                 .iter()
                 .filter_map(|(_, value)| serde_json::from_slice(value).ok())
                 .collect();
-            let first_seq = batch
-                .first()
-                .and_then(|(key, _)| key.get(key.len() - 8..))
-                .and_then(|bytes| bytes.try_into().ok())
-                .map_or(0, u64::from_be_bytes);
-            // Deterministic by content, not by attempt: a retry after a
-            // crash reuses the same ID, which is what makes redelivery a
-            // no-op on the peer.
-            let txn_id = format!("o{first_seq}");
-            let body = serde_json::json!({
+            // EDUs ride whatever transaction goes out next; on failure they
+            // are dropped, never retried — a stale ephemeral redelivered
+            // late is a lie about the present.
+            let edus = federation.take_edus(&destination);
+            if pdus.is_empty() && edus.is_empty() {
+                continue;
+            }
+            let txn_id = if let Some((key, _)) = batch.first() {
+                let first_seq = key
+                    .get(key.len() - 8..)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map_or(0, u64::from_be_bytes);
+                // Deterministic by content, not by attempt: a retry after a
+                // crash reuses the same ID, which is what makes redelivery
+                // a no-op on the peer.
+                format!("o{first_seq}")
+            } else {
+                // EDU-only: fire-once by design, so uniqueness is all the
+                // ID owes anyone.
+                static EDU_TXN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                format!(
+                    "e{}-{}",
+                    now_millis(),
+                    EDU_TXN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                )
+            };
+            let mut body = serde_json::json!({
                 "origin": federation.server_name,
                 "origin_server_ts": now_millis(),
                 "pdus": pdus,
             });
+            if !edus.is_empty() {
+                body["edus"] = Value::Array(edus);
+            }
             match federation
                 .send_transaction(&destination, &txn_id, &body)
                 .await

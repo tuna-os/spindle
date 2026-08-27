@@ -1187,10 +1187,10 @@ async fn federation_query_profile(
 /// is judged alone — hash and signature against the origin's published
 /// keys, then the same authorization predicate local events pass — and a
 /// refusal soft-fails into the per-PDU results without poisoning the
-/// batch. EDUs are accepted and dropped for now: they are ephemeral by
-/// contract, and pretending to process them would be worse than the honest
-/// gap (typing and receipts over federation arrive with #15's catch-up
-/// work).
+/// batch. Of the EDUs, `m.typing` is applied — for the origin's own
+/// joined users only, so no server can put words in another's hands —
+/// and the rest are still accepted and dropped (receipts, presence and
+/// device lists arrive with later slices).
 async fn federation_send(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -1255,6 +1255,39 @@ async fn federation_send(
                 Err(reason) => json!({ "error": reason }),
             },
         );
+    }
+
+    // EDUs after PDUs, so a join and the typing that follows it land in
+    // order within one transaction. `m.typing` only, and only about the
+    // origin's own joined users: an EDU is unsigned content inside a
+    // signed envelope, so the envelope's origin is the whole authority.
+    for edu in body["edus"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .take(100)
+    {
+        if edu["edu_type"].as_str() != Some("m.typing") {
+            continue;
+        }
+        let content = &edu["content"];
+        let (Some(room_id), Some(user_id), Some(typing)) = (
+            content["room_id"].as_str(),
+            content["user_id"].as_str(),
+            content["typing"].as_bool(),
+        ) else {
+            continue;
+        };
+        if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin.as_str()) {
+            continue;
+        }
+        if !state.rooms.is_joined(user_id, room_id).unwrap_or(false) {
+            continue;
+        }
+        state
+            .typing
+            .set(room_id, user_id, typing, crate::typing::DEFAULT_TIMEOUT);
     }
 
     let response = json!({ "pdus": results });
@@ -2955,6 +2988,24 @@ async fn set_typing(
     state
         .typing
         .set(&room_id, &user_id, request.typing, timeout);
+    // The room's remote members hear about it as an m.typing EDU on the
+    // next transaction out — and a start or stop with no event traffic
+    // still goes, because the drain sends EDU-only transactions.
+    if let Ok(domains) = state.rooms.remote_domains(&room_id) {
+        for destination in domains {
+            state.federation.queue_edu(
+                &destination,
+                json!({
+                    "edu_type": "m.typing",
+                    "content": {
+                        "room_id": room_id,
+                        "user_id": user_id,
+                        "typing": request.typing,
+                    },
+                }),
+            );
+        }
+    }
     Ok(Json(json!({})))
 }
 
