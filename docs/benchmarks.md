@@ -277,6 +277,64 @@ are not enough — **same load** is part of the method, and that run was
 discarded rather than averaged. The final sitting above ran on an idle
 machine.
 
+## M3 progress: the four-way re-run mid-milestone, and the sort key that hid in a body read
+
+Measured 2026-08-27 on the M3-in-progress tree (main through #123: the
+whole inbound/outbound federation surface, TLS on 8448, backfill,
+`get_missing_events`; remote joins were on a branch and not in the
+measured binary). Same method as the M2 close-out: Synapse 1.159.0,
+Continuwuity 26.8.1 and Tuwunel 1.9.0 built from source, one idle sitting,
+cold databases per leg, serving binaries pgrep-verified, sizes 200/800/3,200.
+Raw results: `docs/benchmarks/data/m3-progress.*.json`; the rendered
+matrix and charts are on the site's comparisons page.
+
+The sweep, 63 cells:
+
+- **vs Synapse: 21 of 21 faster**, 2.0×–34.8× (join 27–35×, send ~21×,
+  pagination 7–8×).
+- **vs Tuwunel: 21 of 21 faster or within noise** — up to 3.1×, with
+  send/sync_initial at 200 events and state at 200 sitting on the 1.0×
+  line inside the noise band.
+- **vs Continuwuity: 19 of 21**, with `sliding_window` at 800 and 3,200
+  events reading 0.90× and 0.88× — just under the noise floor.
+
+### The investigation the two red cells earned
+
+The same cell sat at 0.83× in the M2 close-out and was published then as
+within-variance-adjacent, to be watched. Two sittings agreeing on the
+direction ends that: repeatable, so a defect until explained.
+
+A component probe on the live bench server split the endpoint into its
+pieces, and the piece that scaled with the observer's room count was the
+room list's recency sort: `last_activity` answered by reading each room's
+**head event body from the store and parsing its JSON — per room, on
+every request — to extract one i64**. The fix (#126) makes the sort key a
+per-room in-memory value, filled lazily on first read and refreshed by
+the append that changes it, on the shared persist spine so local,
+federated and seeded-join appends all keep it honest. A cache that could
+go stale earned its own mutation test: filled-on-read-never-refreshed
+passes every pre-existing test (the only reorder test bumped a room
+before anything was warm) and dies on the new sync-then-bump test.
+
+Re-measured with the fixed binary, same sitting conditions, fresh cold
+database: the two cells recover to **0.96× and 1.00×** — parity — and
+Spindle's own `sliding_window` growth flattens from 1.28× to 1.13×
+across a 16× room-size increase. No other operation moved outside
+run-to-run variance. The published `m3-progress` files keep the loss
+exactly as measured; the fix's numbers become the baseline the M3
+close-out sitting has to confirm.
+
+### What the driver had to learn first
+
+The first attempt at this sitting failed against Spindle itself: #120
+made registration refuse an auth dict that names no session, and the
+driver had been skipping the UIA dance. It now registers the way a real
+client does — unauthenticated first, then citing the session from the
+401 challenge — which also left it working unchanged against the other
+three servers. A conformance fix breaking our own tooling is the system
+working, and it is recorded here because the method promises the same
+workload through every front door.
+
 ## Fork window: bounded search vs exhaustive walk
 
 | Room history | Bounded | Exhaustive | Ratio |

@@ -92,6 +92,17 @@ OPERATIONS = {
 # live. Keyed by (group, operation) — a note renders under the group's
 # heatmap and any red cell links down to it.
 INVESTIGATIONS = {
+    ("m3-progress", "sliding_window"): (
+        "0.90× and 0.88× vs Continuwuity at 800 and 3,200 events — and the "
+        "same cell sat at 0.83× in the M2 close-out, so two sittings agreed "
+        "this was repeatable, not noise. A component probe on the live bench "
+        "server found the room list's recency sort reading each room's head "
+        "event body from the store and parsing its JSON on every request, "
+        "for one i64. #126 moved the sort key into memory, refreshed by the "
+        "append that changes it; re-measured on the same idle machine the "
+        "cells recover to 0.96× and 1.00×, and Spindle's own growth curve "
+        "flattens from 1.28× to 1.13× across a 16× room-size increase.",
+    ),
     ("m2-final", "sliding_window"): (
         "0.87× vs Continuwuity at 3,200 events was the one real loss of the "
         "M2 close-out, and the only curve growing with room size. Bisecting "
