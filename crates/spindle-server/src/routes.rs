@@ -88,6 +88,7 @@ fn account_routes() -> Router<AppState> {
         .route("/_matrix/client/v3/keys/upload", post(upload_keys))
         .route("/_matrix/client/v3/keys/query", post(query_keys))
         .route("/_matrix/client/v3/keys/claim", post(claim_keys))
+        .route("/_matrix/client/v3/keys/changes", get(key_changes))
         .route(
             "/_matrix/client/v3/sendToDevice/{event_type}/{txn_id}",
             axum::routing::put(send_to_device),
@@ -1927,9 +1928,13 @@ async fn delete_tag(
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
+// The postfix repetition is the spec's: these are `/keys/upload`'s three
+// wire field names, verbatim.
+#[allow(clippy::struct_field_names)]
 struct UploadKeysRequest {
     device_keys: Option<Value>,
     one_time_keys: Option<serde_json::Map<String, Value>>,
+    fallback_keys: Option<serde_json::Map<String, Value>>,
 }
 
 /// `POST /_matrix/client/v3/keys/upload`
@@ -1955,6 +1960,23 @@ async fn upload_keys(
         state
             .devices
             .upload_device_keys(&identity.user_id, &identity.device_id, device_keys)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        // Identity keys changing is what "device list changed" means — other
+        // users must re-query before encrypting to this user again. One-time
+        // and fallback keys are consumables and do not move the watermark.
+        let seq = state.rooms.allocate_stream_id();
+        state
+            .devices
+            .mark_device_list_changed(&identity.user_id, seq)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        // Anyone long-polling `/sync` should hear about it now, not at the
+        // timeout: encrypting to a stale device set is the failure mode.
+        state.rooms.wake_sync_waiters();
+    }
+    if let Some(fallback_keys) = &request.fallback_keys {
+        state
+            .devices
+            .upload_fallback_keys(&identity.user_id, &identity.device_id, fallback_keys)
             .map_err(|error| MatrixError::internal(&error.to_string()))?;
     }
     let counts = match &request.one_time_keys {
@@ -2025,7 +2047,7 @@ async fn claim_keys(
             };
             if let Some((key_id, key)) = state
                 .devices
-                .claim_one_time_key(user_id, device_id, algorithm)
+                .claim_key(user_id, device_id, algorithm)
                 .map_err(|error| MatrixError::internal(&error.to_string()))?
             {
                 per_user.insert(device_id.clone(), json!({ key_id: key }));
@@ -2039,6 +2061,37 @@ async fn claim_keys(
         }
     }
     Ok(Json(json!({ "one_time_keys": claimed, "failures": {} })))
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyChangesQuery {
+    from: String,
+    to: String,
+}
+
+/// `GET /_matrix/client/v3/keys/changes`
+///
+/// The catch-up form of `device_lists.changed`: a client that was offline
+/// asks for the window between the token it went to sleep on and the token
+/// its first sync just returned. Same computation, same visibility rule —
+/// only the window is caller-chosen.
+async fn key_changes(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Query(query): axum::extract::Query<KeyChangesQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    let from = query
+        .from
+        .parse::<crate::tokens::Sync>()
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?
+        .0;
+    let to = query
+        .to
+        .parse::<crate::tokens::Sync>()
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?
+        .0;
+    let changed = visible_device_changes(&state, &identity, from, to)?;
+    Ok(Json(json!({ "changed": changed, "left": [] })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2287,6 +2340,86 @@ fn sliding_room_entry(
     ))
 }
 
+/// The device-list changes in `(since, until]` that `identity` may see.
+///
+/// The watermark scan names everyone; this narrows it to the asker's own
+/// account plus users they share a room with. Not an optimization — an
+/// unnarrowed list would tell any account which strangers reprovisioned a
+/// device and when, which is surveillance the room graph never granted.
+fn visible_device_changes(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    since: u64,
+    until: u64,
+) -> Result<Vec<String>, MatrixError> {
+    let changed = state
+        .devices
+        .device_lists_changed(since, Some(until))
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    if changed.is_empty() {
+        return Ok(changed);
+    }
+    let mine = state.rooms.joined(&identity.user_id).map_err(room_error)?;
+    let mut visible = Vec::new();
+    for user_id in changed {
+        // One's own changes are always visible: the account that grew a new
+        // device is exactly the account whose other devices must hear it,
+        // rooms or no rooms.
+        if user_id == identity.user_id {
+            visible.push(user_id);
+            continue;
+        }
+        let theirs = state.rooms.joined(&user_id).map_err(room_error)?;
+        if theirs.iter().any(|room_id| mine.contains(room_id)) {
+            visible.push(user_id);
+        }
+    }
+    Ok(visible)
+}
+
+/// The E2EE sections of a `/sync` response, fetched before assembly.
+///
+/// To-device messages come first and destructively (`since` acknowledges the
+/// previous batch — devices.rs explains the shared-counter protocol), so a
+/// crash after this point re-delivers rather than loses. Device-list changes
+/// are a diff and so exist only for an incremental sync — an initial sync's
+/// client queries every key it cares about anyway. Their window is capped at
+/// this response's own token so a change landing mid-assembly is reported by
+/// the sync that owns it, exactly once.
+#[allow(clippy::type_complexity)]
+fn sync_device_sections(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    since: Option<u64>,
+    next_batch: u64,
+) -> Result<
+    (
+        Vec<Value>,
+        Vec<String>,
+        serde_json::Map<String, Value>,
+        Vec<String>,
+    ),
+    MatrixError,
+> {
+    let to_device = state
+        .devices
+        .take_pending(&identity.user_id, &identity.device_id, since)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    let device_changes = match since {
+        Some(since) => visible_device_changes(state, identity, since, next_batch)?,
+        None => Vec::new(),
+    };
+    let key_counts = state
+        .devices
+        .one_time_key_counts(&identity.user_id, &identity.device_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    let unused_fallback = state
+        .devices
+        .unused_fallback_algorithms(&identity.user_id, &identity.device_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    Ok((to_device, device_changes, key_counts, unused_fallback))
+}
+
 /// `GET /_matrix/client/v3/sync`
 ///
 /// The token is a position in the server-global stream (SPEC §10.2), because
@@ -2383,13 +2516,8 @@ async fn sync(
         );
     }
 
-    // Pending to-device messages, with `since` acknowledging earlier ones —
-    // rooms.rs explains the shared-counter protocol. Fetched before assembling
-    // the response so a crash after this point re-delivers rather than loses.
-    let to_device = state
-        .devices
-        .take_pending(&identity.user_id, &identity.device_id, since)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    let (to_device, device_changes, key_counts, unused_fallback) =
+        sync_device_sections(&state, &identity, since, result.next_batch)?;
 
     let mut global = state
         .account_data
@@ -2420,6 +2548,11 @@ async fn sync(
         "next_batch": crate::tokens::Sync(result.next_batch).to_string(),
         "rooms": { "join": join, "invite": invite, "leave": leave },
         "to_device": { "events": to_device },
+        // `left` is honestly empty until room departures update the
+        // watermark; a wrong name here would make clients drop sessions.
+        "device_lists": { "changed": device_changes, "left": [] },
+        "device_one_time_keys_count": key_counts,
+        "device_unused_fallback_key_types": unused_fallback,
         "account_data": { "events": global },
     })))
 }

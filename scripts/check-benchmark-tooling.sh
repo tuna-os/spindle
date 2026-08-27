@@ -66,3 +66,18 @@ if python3 "$here/collect-benchmarks.py" "$empty" "$work/nope.json" 2>/dev/null;
     exit 1
 fi
 echo "collect: an empty run is refused"
+
+# The comparisons page renders from the committed milestone results, so the
+# committed results themselves are the fixture: every group must have its
+# spindle side, every file must parse, and the page must actually carry rows.
+python3 "$here/render-comparisons.py" "$here/../docs/benchmarks/data" "$work/comparisons.html"
+grep -q "per milestone" "$work/comparisons.html"
+grep -q "m2-progress" "$work/comparisons.html"
+echo "comparisons: page built from committed milestone data"
+
+# And an empty data directory must refuse, same reasoning as the collector.
+if python3 "$here/render-comparisons.py" "$empty" "$work/nope.html" 2>/dev/null; then
+    echo "comparisons renderer accepted an empty directory" >&2
+    exit 1
+fi
+echo "comparisons: an empty data directory is refused"

@@ -100,6 +100,12 @@ the algorithm. See [§3](SPEC.md#3-design-thesis-where-the-time-actually-goes)
 and [docs/benchmarks.md](docs/benchmarks.md), which publishes the losses
 alongside the wins.
 
+Where everything stands — milestones, endpoint coverage parsed from the
+router, and how each benchmark is published — is on the generated
+[dashboard](docs/dashboard.md), kept in step with main by a CI drift gate
+and republished to the [benchmark site](https://tuna-os.github.io/spindle/dashboard.html)
+on every push.
+
 Server-to-server numbers remain **design targets, not measurements** (§18.3):
 everything measured so far is algorithmic, inside the library. Synapse and
 Tuwunel under protocol workload needs a server and starts at M1.
