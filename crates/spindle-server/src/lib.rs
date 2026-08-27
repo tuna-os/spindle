@@ -14,6 +14,7 @@ pub mod authorize;
 pub mod backups;
 pub mod blobs;
 pub mod config;
+pub mod delegated;
 pub mod devices;
 pub mod directory;
 pub mod errors;
@@ -58,6 +59,9 @@ pub struct AppState {
     pub previews: Arc<previews::Previews>,
     pub profiles: Arc<profiles::Profiles>,
     pub appservices: Arc<appservices::Appservices>,
+    /// Present exactly when MSC3861 delegation is configured; its
+    /// absence is what "local auth" means everywhere else.
+    pub delegated: Option<Arc<delegated::Delegated>>,
     pub federation: Arc<federation::Federation>,
 }
 
@@ -144,6 +148,11 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
         Arc::clone(&key),
         config.federation.insecure_http,
     ));
+    let delegated = config
+        .auth
+        .delegated
+        .clone()
+        .map(|delegated| Arc::new(delegated::Delegated::new(delegated)));
     let state = AppState {
         config: Arc::new(config),
         store,
@@ -160,37 +169,43 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
         previews,
         profiles,
         appservices,
+        delegated,
         federation,
     };
-    // The outbound drain runs for the life of the process. Spawned only
-    // when a runtime is running — which is every real caller; a build
-    // outside one gets a router that serves but never sends, and the
-    // absence of a runtime is that caller's own statement of intent.
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::spawn(federation::drain_outbox(
+    spawn_delivery_loops(&state);
+    Ok(routes::router(state))
+}
+
+/// The delivery loops that run for the life of the process. Spawned only
+/// when a runtime is running — which is every real caller; a build
+/// outside one gets a router that serves but never sends, and the
+/// absence of a runtime is that caller's own statement of intent.
+fn spawn_delivery_loops(state: &AppState) {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    tokio::spawn(federation::drain_outbox(
+        Arc::clone(&state.store),
+        Arc::clone(&state.federation),
+        std::time::Duration::from_millis(state.config.federation.retry_base_ms),
+    ));
+    // The appservice push shares the outbox's retry base: both are
+    // at-least-once delivery loops, and one knob for "how patient is
+    // this server with a peer" is one knob to explain.
+    if state
+        .appservices
+        .all()
+        .iter()
+        .any(|registration| registration.url.is_some())
+    {
+        tokio::spawn(appservices::push_loop(
             Arc::clone(&state.store),
-            Arc::clone(&state.federation),
+            Arc::clone(&state.appservices),
+            Arc::clone(&state.rooms),
+            Arc::clone(&state.typing),
+            Arc::clone(&state.devices),
+            state.config.server.name.clone(),
             std::time::Duration::from_millis(state.config.federation.retry_base_ms),
         ));
-        // The appservice push shares the outbox's retry base: both are
-        // at-least-once delivery loops, and one knob for "how patient is
-        // this server with a peer" is one knob to explain.
-        if state
-            .appservices
-            .all()
-            .iter()
-            .any(|registration| registration.url.is_some())
-        {
-            tokio::spawn(appservices::push_loop(
-                Arc::clone(&state.store),
-                Arc::clone(&state.appservices),
-                Arc::clone(&state.rooms),
-                Arc::clone(&state.typing),
-                Arc::clone(&state.devices),
-                state.config.server.name.clone(),
-                std::time::Duration::from_millis(state.config.federation.retry_base_ms),
-            ));
-        }
     }
-    Ok(routes::router(state))
 }

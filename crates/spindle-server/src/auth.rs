@@ -27,7 +27,19 @@ impl FromRequestParts<AppState> for Authenticated {
         let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
         match accounts.identify(&token) {
             Ok(Some(identity)) => Ok(Self(identity)),
-            Ok(None) => appservice_identity(parts, state, &token).map(Self),
+            // Not a local session: an appservice's skeleton key, or —
+            // under MSC3861 delegation — a token only the provider can
+            // vouch for. The order is cheapest-check-first.
+            Ok(None) if state.appservices.by_token(&token).is_some() => {
+                appservice_identity(parts, state, &token).map(Self)
+            }
+            Ok(None) => match &state.delegated {
+                Some(delegated) => delegated
+                    .identify(state.store.as_ref(), &state.config.server.name, &token)
+                    .await
+                    .map(Self),
+                None => Err(MatrixError::unknown_token()),
+            },
             Err(error) => Err(MatrixError::internal(&error.to_string())),
         }
     }
