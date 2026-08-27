@@ -4368,7 +4368,7 @@ async fn query_keys(
             .all_device_keys(user_id)
             .map_err(|error| MatrixError::internal(&error.to_string()))?;
         // An empty list means every device; a non-empty one narrows.
-        let narrowed: serde_json::Map<String, Value> = match wanted.as_array() {
+        let mut narrowed: serde_json::Map<String, Value> = match wanted.as_array() {
             Some(list) if !list.is_empty() => {
                 let names: Vec<&str> = list.iter().filter_map(Value::as_str).collect();
                 all.into_iter()
@@ -4377,6 +4377,20 @@ async fn query_keys(
             }
             _ => all,
         };
+        // A user the store knows nothing about, who exists only through
+        // an appservice, gets MSC3984's second chance: the service
+        // answers for its own users' keys. Local keys win when present —
+        // the store is what this server vouched for.
+        if narrowed.is_empty()
+            && let Some(registration) = state.appservices.exclusive_claimant(user_id)
+        {
+            let answer =
+                crate::appservices::proxy_key_query(registration, &json!({ user_id: wanted }))
+                    .await;
+            if let Some(theirs) = answer[user_id].as_object() {
+                narrowed.clone_from(theirs);
+            }
+        }
         device_keys.insert(user_id.clone(), Value::Object(narrowed));
     }
     // Cross-signing keys ride along for every queried user. The
@@ -4440,10 +4454,26 @@ async fn claim_keys(
                 .map_err(|error| MatrixError::internal(&error.to_string()))?
             {
                 per_user.insert(device_id.clone(), json!({ key_id: key }));
+                continue;
             }
             // A device with none left is simply absent from the response,
             // which is the spec's shape: absence says "no key", and the
             // caller falls back to the fallback key or fails the session.
+            // Unless the user exists only through an appservice — then
+            // MSC3983 gives that service the chance to hand over a key
+            // directly, because its key store is the real one.
+            if let Some(registration) = state.appservices.exclusive_claimant(user_id) {
+                let answer = crate::appservices::proxy_otk_claim(
+                    registration,
+                    &json!({ user_id: { device_id: [algorithm] } }),
+                )
+                .await;
+                if let Some(keys) = answer[user_id][device_id].as_object()
+                    && !keys.is_empty()
+                {
+                    per_user.insert(device_id.clone(), Value::Object(keys.clone()));
+                }
+            }
         }
         if !per_user.is_empty() {
             claimed.insert(user_id.clone(), Value::Object(per_user));
