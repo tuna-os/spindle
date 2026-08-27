@@ -224,6 +224,81 @@ impl Appservices {
                 .any(|namespace| namespace.exclusive && namespace.matches(user_id))
         })
     }
+
+    /// The classic user query: ask the services claiming `user_id`
+    /// whether it exists (`GET {url}/_matrix/app/v1/users/{userId}`).
+    ///
+    /// A 200 is the service saying "it does now" — the expected
+    /// implementation provisions the ghost through the register endpoint
+    /// before answering. Returns whether any claimant said yes; when no
+    /// service claims the ID this returns false without a request, so
+    /// the common path costs nothing.
+    pub async fn query_user(&self, user_id: &str, server_name: &str) -> bool {
+        let client = reqwest::Client::new();
+        for registration in &self.list {
+            let Some(url) = &registration.url else {
+                continue;
+            };
+            if !registration.may_masquerade_as(user_id, server_name) {
+                continue;
+            }
+            if query_existence(&client, url, &registration.hs_token, "users", user_id).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The room-alias twin (`GET {url}/_matrix/app/v1/rooms/{roomAlias}`):
+    /// a 200 means the service has created the room and mapped the alias,
+    /// so a re-resolution will find it.
+    pub async fn query_alias(&self, alias: &str) -> bool {
+        let client = reqwest::Client::new();
+        for registration in &self.list {
+            let Some(url) = &registration.url else {
+                continue;
+            };
+            if !registration
+                .namespaces
+                .aliases
+                .iter()
+                .any(|namespace| namespace.matches(alias))
+            {
+                continue;
+            }
+            if query_existence(&client, url, &registration.hs_token, "rooms", alias).await {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// One existence probe. `id` is percent-encoded for the path — an alias
+/// starts with `#`, which unencoded would become a URL fragment and the
+/// service would see a request for nothing.
+async fn query_existence(
+    client: &reqwest::Client,
+    url: &str,
+    hs_token: &str,
+    kind: &str,
+    id: &str,
+) -> bool {
+    let encoded = id
+        .replace('%', "%25")
+        .replace('#', "%23")
+        .replace('?', "%3F");
+    let target = format!(
+        "{}/_matrix/app/v1/{kind}/{encoded}",
+        url.trim_end_matches('/')
+    );
+    client
+        .get(target)
+        .header("authorization", format!("Bearer {hs_token}"))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success())
 }
 
 /// At most this many events ride one transaction; the rest wait for the

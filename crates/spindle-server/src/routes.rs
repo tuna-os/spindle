@@ -2510,10 +2510,23 @@ async fn profile_of(state: &AppState, user_id: &str) -> Result<Value, MatrixErro
             rest.split_once(':')
                 .map_or(rest, |(localpart, _)| localpart)
         });
-        let known = Accounts::new(state.store.as_ref(), &state.config.server.name)
+        let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+        let known = accounts
             .account(localpart)
             .map_err(|error| MatrixError::internal(&error.to_string()))?
             .is_some();
+        // The classic appservice user query: a namespace ghost may exist
+        // the moment its service is asked, so an unknown local user gets
+        // one chance to be provisioned before the 404 stands.
+        let known = known
+            || (state
+                .appservices
+                .query_user(user_id, &state.config.server.name)
+                .await
+                && accounts
+                    .account(localpart)
+                    .map_err(|error| MatrixError::internal(&error.to_string()))?
+                    .is_some());
         if !known {
             return Err(MatrixError::new(
                 StatusCode::NOT_FOUND,
@@ -2717,6 +2730,15 @@ async fn invite_user(
         return Err(MatrixError::bad_json(format!("{target} is not a user ID")));
     };
     if domain == state.config.server.name {
+        // An invite is the event that most often names a ghost that does
+        // not exist yet; the user query gives its service the chance to
+        // provision before the membership is written. The verdict is
+        // deliberately unchecked — inviting an unclaimed unknown user is
+        // still legal Matrix, and only IDs a service claims cost a request.
+        let _ = state
+            .appservices
+            .query_user(target, &state.config.server.name)
+            .await;
         state
             .rooms
             .set_membership(room_id, sender, target, "invite", reason, state.key.pair())
@@ -2963,6 +2985,21 @@ async fn resolve_alias(
         .directory
         .resolve(&room_alias)
         .map_err(|error| directory_error(&error))?
+    {
+        return Ok(Json(json!({
+            "room_id": record.room_id,
+            "servers": [state.config.server.name.clone()],
+        })));
+    }
+    // The classic appservice room query: an alias inside a service's
+    // namespace may spring into being when asked — the service creates
+    // the room and maps the alias before answering 200, so the second
+    // resolution finds what the first could not.
+    if state.appservices.query_alias(&room_alias).await
+        && let Some(record) = state
+            .directory
+            .resolve(&room_alias)
+            .map_err(|error| directory_error(&error))?
     {
         return Ok(Json(json!({
             "room_id": record.room_id,
