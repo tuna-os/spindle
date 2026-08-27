@@ -235,6 +235,7 @@ impl Previews {
         let media_id = self
             .media
             .put(&bytes, &content_type, None, "url-preview")
+            .await
             .map_err(|error| PreviewError::Storage(error.to_string()))?;
         Ok((self.media.mxc(&media_id), size))
     }

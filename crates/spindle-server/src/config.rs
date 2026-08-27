@@ -100,14 +100,41 @@ impl Default for PreviewConfig {
 pub struct StorageConfig {
     #[serde(default = "default_data_dir")]
     pub path: PathBuf,
+    /// When present, media blobs live in this bucket instead of on disk.
+    /// The metadata store stays local either way — it is the index, and an
+    /// index a network hop away would put a round trip in front of every
+    /// media request before a byte moves.
+    #[serde(default)]
+    pub s3: Option<S3Config>,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             path: default_data_dir(),
+            s3: None,
         }
     }
+}
+
+/// An S3-compatible object store for media blobs.
+///
+/// `endpoint` is explicit rather than derived from a region, because the
+/// point of speaking the S3 protocol is that `MinIO`, Garage and friends
+/// speak it too, and only AWS's endpoints are derivable.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct S3Config {
+    pub endpoint: String,
+    pub bucket: String,
+    #[serde(default = "default_region")]
+    pub region: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+}
+
+fn default_region() -> String {
+    "us-east-1".to_owned()
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

@@ -44,8 +44,8 @@ MILESTONES = [
      "Landed: authenticated media + thumbnails (#99, #104), Simplified Sliding Sync "
      "(#105), E2EE key/to-device transport (#106), fallback keys + device-list "
      "tracking (#107), key backup + cross-signing (#108), URL previews with an "
-     "SSRF vetting resolver. Remaining: S3 media backend, then the M2 close-out "
-     "benchmark."),
+     "SSRF vetting resolver (#109), S3 media backend behind the blob boundary. "
+     "Remaining: the M2 close-out competitive benchmark."),
     ("M3", "Ordinary Matrix federation", "Not started",
      "#14 #15 #16 — includes the federated fork-proof rig, which is where the "
      "no-state-resolution claim meets adversarial evidence."),
