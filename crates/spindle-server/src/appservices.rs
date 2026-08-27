@@ -11,10 +11,16 @@
 //! bridge receiving nothing, which is the failure mode worth the loudest
 //! possible error.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use regex::Regex;
 use serde::Deserialize;
+use serde_json::Value;
+use spindle_store::{FjallStore, ReadView, Store};
+
+use crate::rooms::Rooms;
 
 /// One namespace claim: a regex over full IDs, and whether the claim is
 /// exclusive to this service.
@@ -100,6 +106,33 @@ impl Registration {
                 .iter()
                 .any(|namespace| namespace.matches(user_id))
     }
+
+    /// Whether the service hears about an event: its sender or any joined
+    /// member inside the user namespaces (the sender user included), or
+    /// the room itself inside the room namespaces.
+    ///
+    /// Alias namespaces deliberately do not gate the push — deciding
+    /// interest by alias would mean resolving every event's room against
+    /// the directory on the hot path, and a service that cares about a
+    /// room it aliased is in that room through a namespace user anyway.
+    #[must_use]
+    pub fn wants_event(
+        &self,
+        room_id: &str,
+        sender: &str,
+        members: &[String],
+        server_name: &str,
+    ) -> bool {
+        self.may_masquerade_as(sender, server_name)
+            || self
+                .namespaces
+                .rooms
+                .iter()
+                .any(|namespace| namespace.matches(room_id))
+            || members
+                .iter()
+                .any(|member| self.may_masquerade_as(member, server_name))
+    }
 }
 
 /// Why registrations could not be loaded. All startup-fatal.
@@ -175,6 +208,187 @@ impl Appservices {
     #[must_use]
     pub fn all(&self) -> &[Arc<Registration>] {
         &self.list
+    }
+}
+
+/// At most this many events ride one transaction; the rest wait for the
+/// next pass. The cap bounds the request the receiving bridge has to
+/// swallow, not our scan — `stream_events` stops reading at the cap too.
+const TRANSACTION_LIMIT: usize = 100;
+
+/// One computed-but-unacknowledged transaction: its ID, its events, and
+/// the stream position an acknowledgement advances the cursor to.
+///
+/// Held in memory until delivered so that every retry re-sends *this*
+/// batch under *this* ID — recomputing on retry would fold newly arrived
+/// events into the batch and change the ID, and the service's replay
+/// table can only absorb a duplicate that is actually a duplicate. A
+/// crash loses the struct and recomputes from the durable cursor, which
+/// re-delivers under a fresh ID: at-least-once, exactly as promised.
+struct PendingPush {
+    txn_id: String,
+    events: Vec<Value>,
+    advance_to: u64,
+}
+
+/// The acknowledged stream position for one service, 0 for never-pushed.
+fn read_cursor(store: &FjallStore, appservice_id: &str) -> u64 {
+    ReadView::get(store, &spindle_core::keys::appservice_cursor(appservice_id))
+        .ok()
+        .flatten()
+        .and_then(|raw| raw.get(..8).and_then(|bytes| bytes.try_into().ok()))
+        .map_or(0, u64::from_be_bytes)
+}
+
+fn write_cursor(store: &FjallStore, appservice_id: &str, position: u64) {
+    let _ = Store::put(
+        store,
+        &spindle_core::keys::appservice_cursor(appservice_id),
+        &position.to_be_bytes(),
+    );
+}
+
+/// The next batch for one service: interested events in
+/// `(cursor, position]`, and the stream position the batch covers.
+fn collect_batch(
+    rooms: &Rooms,
+    registration: &Registration,
+    server_name: &str,
+    cursor: u64,
+    position: u64,
+) -> Result<(Vec<Value>, u64), crate::rooms::RoomError> {
+    let (records, advance_to) = rooms.stream_events(cursor, position, TRANSACTION_LIMIT)?;
+    // Membership is asked once per room per batch, not once per event —
+    // a busy room would otherwise pay a full member scan per message.
+    let mut members_of: HashMap<String, Vec<String>> = HashMap::new();
+    let mut events = Vec::new();
+    for (room_id, event) in records {
+        let members = match members_of.entry(room_id.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                rooms
+                    .joined_members(&room_id)
+                    .map(|members| members.keys().cloned().collect())
+                    .unwrap_or_default(),
+            ),
+        };
+        let sender = event["sender"].as_str().unwrap_or_default();
+        if registration.wants_event(&room_id, sender, members, server_name) {
+            events.push(event);
+        }
+    }
+    Ok((events, advance_to))
+}
+
+/// Deliver one transaction to the service's push URL.
+async fn deliver(
+    client: &reqwest::Client,
+    url: &str,
+    hs_token: &str,
+    push: &PendingPush,
+) -> Result<(), String> {
+    let target = format!(
+        "{}/_matrix/app/v1/transactions/{}",
+        url.trim_end_matches('/'),
+        push.txn_id
+    );
+    let response = client
+        .put(target)
+        .header("authorization", format!("Bearer {hs_token}"))
+        .header("content-type", "application/json")
+        .timeout(Duration::from_secs(30))
+        .body(serde_json::json!({ "events": push.events }).to_string())
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("answered {}", response.status()));
+    }
+    Ok(())
+}
+
+/// Push transactions to every service with a URL, forever.
+///
+/// The same polling shape as the federation outbox drain, and for the
+/// same reason: the empty-case scan is a bounded read, and the poll
+/// interval doubles as the floor of the retry backoff. The cursor row
+/// advances only on acknowledgement; a batch nothing in which interested
+/// the service still advances the cursor durably — otherwise a service
+/// whose rooms went quiet would re-scan the same dead range every pass,
+/// forever.
+pub async fn push_loop(
+    store: Arc<FjallStore>,
+    appservices: Arc<Appservices>,
+    rooms: Arc<Rooms>,
+    server_name: String,
+    retry_base: Duration,
+) {
+    let client = reqwest::Client::new();
+    let mut pending: HashMap<String, PendingPush> = HashMap::new();
+    let mut backoff: HashMap<String, (u32, std::time::Instant)> = HashMap::new();
+    loop {
+        tokio::time::sleep(
+            retry_base
+                .min(Duration::from_millis(500))
+                .max(Duration::from_millis(25)),
+        )
+        .await;
+        for registration in appservices.all() {
+            let Some(url) = &registration.url else {
+                continue;
+            };
+            if let Some((_, until)) = backoff.get(&registration.id)
+                && *until > std::time::Instant::now()
+            {
+                continue;
+            }
+            if !pending.contains_key(&registration.id) {
+                let cursor = read_cursor(&store, &registration.id);
+                let position = rooms.stream_position();
+                if position <= cursor {
+                    continue;
+                }
+                let Ok((events, advance_to)) =
+                    collect_batch(&rooms, registration, &server_name, cursor, position)
+                else {
+                    continue;
+                };
+                if events.is_empty() {
+                    write_cursor(&store, &registration.id, advance_to);
+                    continue;
+                }
+                pending.insert(
+                    registration.id.clone(),
+                    PendingPush {
+                        // Deterministic by range, not by attempt: the range
+                        // is pinned until acknowledged, so a retry reuses
+                        // the ID and redelivery is a no-op on the service.
+                        txn_id: format!("s{}-{advance_to}", cursor + 1),
+                        events,
+                        advance_to,
+                    },
+                );
+            }
+            let Some(push) = pending.get(&registration.id) else {
+                continue;
+            };
+            match deliver(&client, url, &registration.hs_token, push).await {
+                Ok(()) => {
+                    write_cursor(&store, &registration.id, push.advance_to);
+                    pending.remove(&registration.id);
+                    backoff.remove(&registration.id);
+                }
+                Err(error) => {
+                    tracing::debug!("appservice push to {}: {error}", registration.id);
+                    let failures = backoff.get(&registration.id).map_or(0, |(count, _)| *count) + 1;
+                    let delay = retry_base * 2_u32.saturating_pow(failures.min(6));
+                    backoff.insert(
+                        registration.id.clone(),
+                        (failures, std::time::Instant::now() + delay),
+                    );
+                }
+            }
+        }
     }
 }
 

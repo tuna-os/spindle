@@ -176,6 +176,7 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::EventRoom, 0x21),
         (Keyspace::PendingInvite, 0x22),
         (Keyspace::Profile, 0x23),
+        (Keyspace::AppserviceCursor, 0x24),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(

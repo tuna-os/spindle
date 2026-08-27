@@ -172,6 +172,23 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
             Arc::clone(&state.federation),
             std::time::Duration::from_millis(state.config.federation.retry_base_ms),
         ));
+        // The appservice push shares the outbox's retry base: both are
+        // at-least-once delivery loops, and one knob for "how patient is
+        // this server with a peer" is one knob to explain.
+        if state
+            .appservices
+            .all()
+            .iter()
+            .any(|registration| registration.url.is_some())
+        {
+            tokio::spawn(appservices::push_loop(
+                Arc::clone(&state.store),
+                Arc::clone(&state.appservices),
+                Arc::clone(&state.rooms),
+                state.config.server.name.clone(),
+                std::time::Duration::from_millis(state.config.federation.retry_base_ms),
+            ));
+        }
     }
     Ok(routes::router(state))
 }
