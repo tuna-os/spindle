@@ -179,6 +179,7 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::AppserviceCursor, 0x24),
         (Keyspace::AuditLog, 0x25),
         (Keyspace::OidcClient, 0x26),
+        (Keyspace::PurgeWatermark, 0x27),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(

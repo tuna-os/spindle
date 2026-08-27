@@ -145,6 +145,10 @@ fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
                 reqwest::Method::GET,
                 format!("{prefix}/rooms/!r:x/timeline"),
             ),
+            (
+                reqwest::Method::POST,
+                format!("{prefix}/rooms/!r:x/purge_history"),
+            ),
             (reqwest::Method::GET, format!("{prefix}/audit")),
         ]);
     }
@@ -833,4 +837,197 @@ async fn state_at_refuses_what_it_cannot_answer() {
     assert_eq!(status, 404, "{body}");
     let (status, body) = get("!missing:nowhere", "li=1").await;
     assert_eq!(status, 404, "{body}");
+}
+
+/// Recompute the log chain the way `ChainHash` defines it and demand the
+/// stored values match — the §3 acceptance property, asserted literally.
+fn assert_chain_verifies(chunk: &[Value]) {
+    use std::fmt::Write as _;
+    let mut running = spindle_core::ChainHash::seed();
+    for entry in chunk {
+        let event_id = entry["event_id"].as_str().unwrap();
+        running = running.extend(&spindle_core::EventId::new(event_id));
+        let expected =
+            running
+                .as_bytes()
+                .iter()
+                .fold(String::with_capacity(64), |mut out, byte| {
+                    let _ = write!(out, "{byte:02x}");
+                    out
+                });
+        assert_eq!(
+            entry["chain"].as_str(),
+            Some(expected.as_str()),
+            "chain mismatch at {entry}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn purge_keeps_the_spine_and_the_chain_still_verifies() {
+    let server = Instance::start().await;
+    let (admin_token, ops, _) = rooms_fixture(&server).await;
+    let timeline = || {
+        let server = &server;
+        let token = admin_token.clone();
+        let ops = ops.clone();
+        async move {
+            let (status, body) = server
+                .request(
+                    reqwest::Method::GET,
+                    &format!("/_spindle/admin/v1/rooms/{ops}/timeline"),
+                    Some(&token),
+                    None,
+                )
+                .await;
+            assert_eq!(status, 200, "{body}");
+            body["chunk"].as_array().unwrap().clone()
+        }
+    };
+
+    let before = timeline().await;
+    assert_chain_verifies(&before);
+    let last_li = before.last().unwrap()["li"].as_i64().unwrap();
+
+    // Purge everything before the newest message: the two older message
+    // bodies die, every state event body survives.
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_spindle/admin/v1/rooms/{ops}/purge_history"),
+            Some(&admin_token),
+            Some(&json!({ "before_li": last_li })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["events_purged"], 2, "{body}");
+
+    // The spine is unchanged — same lis, same event IDs, same chain
+    // values — and the chain still verifies over the purged range.
+    let after = timeline().await;
+    assert_chain_verifies(&after);
+    for (was, is) in before.iter().zip(after.iter()) {
+        assert_eq!(was["li"], is["li"]);
+        assert_eq!(was["event_id"], is["event_id"]);
+        assert_eq!(was["chain"], is["chain"]);
+    }
+    let purged: Vec<&Value> = after.iter().filter(|e| e["purged"] == true).collect();
+    assert_eq!(purged.len(), 2, "{after:?}");
+    assert!(purged.iter().all(|e| e["event"].is_null()));
+    assert!(
+        after
+            .iter()
+            .filter(|e| e["event"]["type"] == "m.room.create")
+            .all(|e| e["purged"] == false),
+        "state bodies survive a purge"
+    );
+
+    // A client sees markers, not holes: same entry count, the purged
+    // slots typed unmistakably, the newest message intact.
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_matrix/client/v3/rooms/{ops}/messages?dir=b&limit=100"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let chunk = body["chunk"].as_array().unwrap();
+    assert_eq!(chunk.len(), after.len(), "markers, not holes: {body}");
+    assert_eq!(
+        chunk
+            .iter()
+            .filter(|e| e["type"] == "org.spindle.purged")
+            .count(),
+        2,
+        "{body}"
+    );
+    assert_eq!(chunk[0]["content"]["body"], "message 2", "{body}");
+
+    // The room is not a museum: state still folds, and new events extend
+    // the same chain the purge preserved.
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_spindle/admin/v1/rooms/{ops}/state_at?li={last_li}"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(name_in(&body), Some("Operations"), "{body}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{ops}/send/m.room.message/after-purge"),
+            Some(&admin_token),
+            Some(&json!({ "msgtype": "m.text", "body": "life goes on" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_chain_verifies(&timeline().await);
+}
+
+#[tokio::test]
+async fn purge_resolves_time_and_refuses_ambiguity() {
+    let server = Instance::start().await;
+    let (admin_token, ops, _) = rooms_fixture(&server).await;
+    let purge = |room: &str, body: Value| {
+        let path = format!("/_spindle/admin/v1/rooms/{room}/purge_history");
+        let server = &server;
+        let token = admin_token.clone();
+        async move {
+            server
+                .request(reqwest::Method::POST, &path, Some(&token), Some(&body))
+                .await
+        }
+    };
+
+    // Anchored by time: everything at or before the newest message dies,
+    // and the audit log names the purge.
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_spindle/admin/v1/rooms/{ops}/timeline?dir=b&limit=1"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let newest_ts = body["chunk"][0]["event"]["origin_server_ts"]
+        .as_u64()
+        .unwrap();
+    let (status, body) = purge(&ops, json!({ "before_ts": newest_ts })).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["events_purged"], 3, "all three messages: {body}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_spindle/admin/v1/audit?action=purge_history",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["entries"][0]["target"], ops.as_str(), "{body}");
+    assert_eq!(
+        body["entries"][0]["actor"],
+        server.user("root").as_str(),
+        "{body}"
+    );
+
+    // Purging again is honest about there being nothing left to delete.
+    let (status, body) = purge(&ops, json!({ "before_ts": newest_ts })).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["events_purged"], 0, "{body}");
+
+    // Ambiguity and unknown rooms are refused.
+    let (status, body) = purge(&ops, json!({})).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["errcode"], "M_INVALID_PARAM", "{body}");
+    let (status, _) = purge(&ops, json!({ "before_li": 1, "before_ts": 5 })).await;
+    assert_eq!(status, 400);
+    let (status, _) = purge("!missing:nowhere", json!({ "before_li": 1 })).await;
+    assert_eq!(status, 404);
 }

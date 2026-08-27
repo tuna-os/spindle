@@ -248,6 +248,13 @@ pub enum Keyspace {
     AuditLog = 0x25,
     /// `client_id` → a dynamically registered OAuth 2.0 client (#159).
     OidcClient = 0x26,
+    /// `room_id` → the first `li` NOT covered by a history purge (i64 be).
+    ///
+    /// The watermark is what lets a reader tell "purged" from "never
+    /// existed": an entry below it whose body is gone was deleted on
+    /// purpose, and is rendered as a marker rather than a hole (#83 §3).
+    /// It only ever moves forward.
+    PurgeWatermark = 0x27,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -290,6 +297,12 @@ pub fn oidc_client(client_id: &str) -> Vec<u8> {
     let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::OidcClient as u8];
     key.extend_from_slice(client_id.as_bytes());
     key
+}
+
+/// A room's purge watermark row.
+#[must_use]
+pub fn purge_watermark(room_id: &str) -> Vec<u8> {
+    room_prefix(Keyspace::PurgeWatermark, room_id)
 }
 
 /// Map an `i64` onto `u64` so that big-endian byte order matches numeric order.

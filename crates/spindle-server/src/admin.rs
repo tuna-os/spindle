@@ -13,9 +13,9 @@
 //! sternest form: an admin endpoint that is routed must work, because a
 //! stub returning `{}` is indistinguishable from success to the tooling
 //! that calls it. This module carries the groups of #83's spec that are
-//! built — users, and the rooms group's read side — and routes nothing
-//! beyond what it serves: `state_at`, room deletion and purge land as
-//! their own slices.
+//! built — users, the rooms group's read side, `state_at`, and history
+//! purge — and routes nothing beyond what it serves: room deletion and
+//! `make_room_admin` land as their own slices.
 
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::StatusCode;
@@ -76,6 +76,10 @@ pub fn routes() -> Router<AppState> {
             .route(
                 &format!("{prefix}/rooms/{{room_id}}/timeline"),
                 get(room_timeline),
+            )
+            .route(
+                &format!("{prefix}/rooms/{{room_id}}/purge_history"),
+                post(purge_history),
             )
             .route(&format!("{prefix}/audit"), get(audit_log))
     };
@@ -717,13 +721,88 @@ async fn room_timeline(
         .map_err(crate::routes::room_error)?;
     let chunk: Vec<Value> = events
         .into_iter()
-        .map(|event| json!({ "li": event.li, "event_id": event.event_id, "event": event.json }))
+        .map(|entry| {
+            json!({
+                "li": entry.li,
+                "event_id": entry.event_id,
+                "chain": entry.chain.map(hex),
+                "purged": entry.json.is_none(),
+                "event": entry.json,
+            })
+        })
         .collect();
     let mut body = json!({ "chunk": chunk });
     if let Some(next) = next {
         body["next_token"] = json!(next);
     }
     Ok(Json(body))
+}
+
+/// Lowercase hex, for the 32-byte chain values the admin timeline shows.
+fn hex(bytes: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
+#[derive(Deserialize)]
+struct PurgeRequest {
+    before_li: Option<i64>,
+    before_ts: Option<u64>,
+}
+
+/// `POST /rooms/{roomId}/purge_history` — `{before_li}` or `{before_ts}`.
+///
+/// Deletes the bodies, keeps the spine (#83 §3): entries below the cutoff
+/// lose their content but keep `(li, event_id, chain)`, so the chain
+/// still verifies over the purged range and a reader can tell "purged"
+/// from "never existed". State event bodies survive — current state and
+/// `state_at` keep folding from the log. The one audit record names how
+/// far and how many.
+async fn purge_history(
+    State(state): State<AppState>,
+    AdminActor(actor): AdminActor,
+    Path(room_id): Path<String>,
+    Json(request): Json<PurgeRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    use crate::rooms::StateAtAnchor;
+    let before_li = match (request.before_li, request.before_ts) {
+        (Some(li), None) => li,
+        (None, Some(ts)) => {
+            // "Everything at or before this time" purges up to, and
+            // including, the entry that anchor resolves to.
+            let (li, _) = state
+                .rooms
+                .resolve_anchor(&room_id, &StateAtAnchor::Ts(ts))
+                .map_err(crate::routes::room_error)?;
+            li + 1
+        }
+        _ => {
+            return Err(MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                "exactly one of before_li, before_ts",
+            ));
+        }
+    };
+    let purged = state
+        .rooms
+        .purge_history(&room_id, before_li)
+        .map_err(crate::routes::room_error)?;
+    audit(
+        &state,
+        &actor.user_id,
+        "purge_history",
+        &room_id,
+        &json!({ "before_li": before_li, "events_purged": purged }),
+    )?;
+    Ok(Json(
+        json!({ "purged_up_to": before_li, "events_purged": purged }),
+    ))
 }
 
 /// `GET /audit?from&limit&actor&action`
