@@ -385,6 +385,13 @@ fn timeline_routes() -> Router<AppState> {
             "/_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}",
             get(room_state_event).put(set_room_state),
         )
+        // …and the trailing-slash spelling: matrix-bot-sdk — hookshot
+        // and most Node bots — writes the empty state key as an empty
+        // final segment, which axum matches to neither pattern above.
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/state/{event_type}/",
+            get(room_state_event_default).put(set_room_state_default),
+        )
         .route(
             "/_matrix/client/v3/rooms/{room_id}/event/{event_id}",
             get(room_event),

@@ -492,7 +492,17 @@ fn collect_batch(
             ),
         };
         let sender = event["sender"].as_str().unwrap_or_default();
-        if registration.wants_event(&room_id, sender, members, server_name) {
+        // A membership event *about* an interesting user is interesting,
+        // whatever the sender: the invite that summons the service's bot
+        // into a room is sent by a human, to a bot that is not a joined
+        // member yet — the two checks below both miss it, and a bridge
+        // that never hears its own invites can never join anything.
+        // matrix-hookshot, invited and waiting forever, found this.
+        let about_ours = event["type"] == "m.room.member"
+            && event["state_key"]
+                .as_str()
+                .is_some_and(|user| registration.may_masquerade_as(user, server_name));
+        if about_ours || registration.wants_event(&room_id, sender, members, server_name) {
             batch_rooms.insert(room_id);
             events.push(event);
         }

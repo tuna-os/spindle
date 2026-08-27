@@ -371,3 +371,45 @@ async fn a_state_change_is_visible_in_the_very_next_full_state_read() {
         "a warmed render must not outlive its state root: {body}"
     );
 }
+
+#[tokio::test]
+async fn an_empty_state_key_may_be_spelled_as_a_trailing_slash() {
+    // matrix-bot-sdk — hookshot and most Node bots — URL-encodes the
+    // empty state key as an empty final path segment. Complement's Go
+    // client drops the segment instead, which is why only a real bridge
+    // could find the 404; hookshot crashed on it.
+    let harness = Harness::new();
+    let token = harness.register("alice").await;
+    let room_id = harness.create_room(&token).await;
+
+    let (status, with_slash) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.create/"),
+            &token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{with_slash}");
+    let (_, without) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.create"),
+            &token,
+        )
+        .await;
+    assert_eq!(with_slash, without, "the two spellings are one endpoint");
+
+    let (status, body) = harness
+        .put(
+            &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.topic/"),
+            &token,
+            &json!({ "topic": "set through the trailing slash" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, read_back) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.topic"),
+            &token,
+        )
+        .await;
+    assert_eq!(read_back["topic"], "set through the trailing slash");
+}
