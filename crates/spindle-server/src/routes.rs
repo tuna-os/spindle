@@ -8,6 +8,7 @@ use axum::{
     Json, Router,
     extract::State,
     http::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
 };
 use serde::Deserialize;
@@ -4621,9 +4622,15 @@ async fn room_state(
     State(state): State<AppState>,
     Authenticated(_identity): Authenticated,
     axum::extract::Path(room_id): axum::extract::Path<String>,
-) -> Result<Json<Value>, MatrixError> {
-    let events = state.rooms.state(&room_id).map_err(room_error)?;
-    Ok(Json(Value::Array(events)))
+) -> Result<axum::response::Response, MatrixError> {
+    // Pre-serialized: the body comes from the state-render cache, keyed by
+    // the state root, so a hot room costs no reads, parses or serializing.
+    let body = state.rooms.state_serialized(&room_id).map_err(room_error)?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.as_str().to_owned(),
+    )
+        .into_response())
 }
 
 /// `GET /_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}`

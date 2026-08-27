@@ -105,6 +105,9 @@ impl UnreadIndex {
     }
 }
 
+/// One cached `/state` render: the root it was rendered from, and the body.
+type StateRender = ([u8; 32], Arc<String>);
+
 pub struct Rooms {
     store: Arc<FjallStore>,
     server_name: String,
@@ -122,6 +125,18 @@ pub struct Rooms {
     /// Continuwuity across two sittings. A sort key is one i64; it lives
     /// in memory and is refreshed by the append that changes it.
     last_activity: Mutex<HashMap<String, i64>>,
+    /// The rendered `/state` body per room, keyed by the state root it was
+    /// rendered from.
+    ///
+    /// The state is content-addressed, so the root *is* the render's
+    /// identity: a hit is provably current and a mismatch is the only
+    /// invalidation needed. What it buys is the whole marginal cost of the
+    /// endpoint — per-event body reads, JSON parses and re-serialization —
+    /// which the M3 comparison against Tuwunel measured as the one cell
+    /// where a `RocksDB` block cache beat our per-request reads across two
+    /// sittings. Serving a memcpy of a proven-current render beats warming
+    /// a page cache.
+    state_render: Mutex<HashMap<String, StateRender>>,
     /// The server-global order `/sync` needs (SPEC §10.2). The linear index
     /// orders events within one room; nothing orders them across rooms, so
     /// this is the one counter that exists purely because a per-room order is
@@ -220,6 +235,7 @@ impl Rooms {
             open: Mutex::new(HashMap::new()),
             unread_index: Mutex::new(HashMap::new()),
             last_activity: Mutex::new(HashMap::new()),
+            state_render: Mutex::new(HashMap::new()),
             // Resumed, not reset. A counter that restarted at zero would
             // re-issue stream ids already on disk, overwriting the entries
             // they point at -- the same shape of bug as a room registry that
@@ -521,9 +537,52 @@ impl Rooms {
         let ids = self.with_room(room_id, |_, log| Ok(current_state(log)))?;
         let mut events = Vec::with_capacity(ids.len());
         for (_, event_id) in ids {
-            events.push(self.event(room_id, &event_id)?);
+            // `read_event` directly rather than `event()`: the room's
+            // existence is already established, and `event()` would take
+            // the room lock once per state event just to re-prove it.
+            let mut event = self.read_event(room_id, &EventId::new(event_id.as_str()))?;
+            if let Some(object) = event.as_object_mut() {
+                object.insert("event_id".to_owned(), Value::String(event_id));
+            }
+            events.push(event);
         }
         Ok(events)
+    }
+
+    /// The full room state as one serialized JSON array, served from the
+    /// render cache when the state root still matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room is unknown or a body is missing.
+    pub fn state_serialized(&self, room_id: &str) -> Result<Arc<String>, RoomError> {
+        let root = self.with_room(room_id, |_, log| {
+            Ok(log
+                .entries()
+                .next_back()
+                .and_then(|head| log.state_after(head.li))
+                .map(|state| *state.root().as_bytes()))
+        })?;
+        let Some(root) = root else {
+            // A room with no state renders as the empty array; not worth a
+            // cache row.
+            return Ok(Arc::new("[]".to_owned()));
+        };
+        if let Some((cached_root, body)) = self
+            .state_render
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(room_id)
+            && *cached_root == root
+        {
+            return Ok(Arc::clone(body));
+        }
+        let rendered = Arc::new(Value::Array(self.state(room_id)?).to_string());
+        self.state_render
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(room_id.to_owned(), (root, Arc::clone(&rendered)));
+        Ok(rendered)
     }
 
     /// The content of one current state event.
