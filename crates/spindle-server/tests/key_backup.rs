@@ -573,3 +573,88 @@ async fn signature_uploads_merge_and_cannot_alter_the_signed_key() {
         json!("M_NOT_FOUND")
     );
 }
+
+#[tokio::test]
+async fn deletes_trim_exactly_the_named_scope() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let version = harness.create_backup(&alice.token).await;
+    harness
+        .send(
+            "PUT",
+            &format!("/_matrix/client/v3/room_keys/keys?version={version}"),
+            &alice.token,
+            &json!({ "rooms": {
+                "!a:example.org": { "sessions": {
+                    "s1": session(false, 0, 0, "a1"),
+                    "s2": session(false, 0, 0, "a2"),
+                } },
+                "!b:example.org": { "sessions": {
+                    "s3": session(false, 0, 0, "b1"),
+                } },
+            } }),
+        )
+        .await;
+
+    // One session: the sibling in the same room survives.
+    let (status, body) = harness
+        .send(
+            "DELETE",
+            &format!("/_matrix/client/v3/room_keys/keys/!a:example.org/s1?version={version}"),
+            &alice.token,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["count"], json!(2));
+    let (status, _) = harness
+        .get(
+            &format!("/_matrix/client/v3/room_keys/keys/!a:example.org/s2?version={version}"),
+            &alice.token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "the sibling session survives");
+
+    // One room: the other room survives.
+    let (_, body) = harness
+        .send(
+            "DELETE",
+            &format!("/_matrix/client/v3/room_keys/keys/!a:example.org?version={version}"),
+            &alice.token,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(body["count"], json!(1));
+    let (status, _) = harness
+        .get(
+            &format!("/_matrix/client/v3/room_keys/keys/!b:example.org/s3?version={version}"),
+            &alice.token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "the other room survives");
+
+    // Everything.
+    let (_, body) = harness
+        .send(
+            "DELETE",
+            &format!("/_matrix/client/v3/room_keys/keys?version={version}"),
+            &alice.token,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(body["count"], json!(0));
+
+    // And a delete against a superseded version is refused like a write: the
+    // client thinks it is trimming the live backup.
+    harness.create_backup(&alice.token).await;
+    let (status, body) = harness
+        .send(
+            "DELETE",
+            &format!("/_matrix/client/v3/room_keys/keys?version={version}"),
+            &alice.token,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["errcode"], json!("M_WRONG_ROOM_KEYS_VERSION"));
+}

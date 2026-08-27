@@ -222,6 +222,46 @@ impl Backups {
         Ok(rooms)
     }
 
+    /// Delete backed-up keys: everything, one room, or one session.
+    ///
+    /// Deletion is not subject to the replacement rule — the rule guards
+    /// against *degrading* a key, and the owner erasing their own backup is
+    /// not a degradation but a decision. Returns how many rows went.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the scan or a delete fails.
+    pub fn delete_keys(
+        &self,
+        user_id: &str,
+        version: u64,
+        room_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<u64, StoreError> {
+        let mut prefix = data_prefix(user_id, version);
+        if let Some(room_id) = room_id {
+            let bytes = room_id.as_bytes();
+            let len = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
+            prefix.extend_from_slice(&len.to_be_bytes());
+            prefix.extend_from_slice(&bytes[..len as usize]);
+            if let Some(session_id) = session_id {
+                let bytes = session_id.as_bytes();
+                let len = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
+                prefix.extend_from_slice(&len.to_be_bytes());
+                prefix.extend_from_slice(&bytes[..len as usize]);
+            }
+        }
+        let mut deleted = 0;
+        for (key, _) in ReadView::scan_prefix(self.store.as_ref(), &prefix)? {
+            Store::delete(self.store.as_ref(), &key)?;
+            deleted += 1;
+        }
+        if deleted > 0 {
+            self.bump_etag(user_id, version)?;
+        }
+        Ok(deleted)
+    }
+
     fn highest_version(&self, user_id: &str) -> Result<Option<u64>, StoreError> {
         let prefix = keys::user_prefix(keys::Keyspace::KeyBackup, user_id);
         Ok(ReadView::scan_prefix(self.store.as_ref(), &prefix)?

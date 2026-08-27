@@ -44,7 +44,7 @@ MILESTONES = [
      "Landed: authenticated media + thumbnails (#99, #104), Simplified Sliding Sync "
      "(#105), E2EE key/to-device transport (#106), fallback keys + device-list "
      "tracking (#107), key backup + cross-signing. Remaining: S3 media backend, "
-     "URL previews, backup bulk deletes."),
+     "URL previews."),
     ("M3", "Ordinary Matrix federation", "Not started",
      "#14 #15 #16 — includes the federated fork-proof rig, which is where the "
      "no-state-resolution claim meets adversarial evidence."),
@@ -98,9 +98,7 @@ PLANNED = {
         ("GET", "/_matrix/client/v3/pushers", "pusher list (#7)"),
         ("POST", "/_matrix/client/v3/pushers/set", "pusher registration (#7)"),
     ],
-    "End-to-end encryption": [
-        ("DELETE", "/_matrix/client/v3/room_keys/keys", "backup bulk delete (M2 tail)"),
-    ],
+    "End-to-end encryption": [],
     "Media": [
         ("GET", "/_matrix/client/v1/media/preview_url", "URL previews (M2, SSRF-gated)"),
     ],

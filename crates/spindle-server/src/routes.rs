@@ -109,15 +109,21 @@ fn account_routes() -> Router<AppState> {
         )
         .route(
             "/_matrix/client/v3/room_keys/keys",
-            axum::routing::put(put_backup_keys).get(get_backup_keys),
+            axum::routing::put(put_backup_keys)
+                .get(get_backup_keys)
+                .delete(delete_backup_keys),
         )
         .route(
             "/_matrix/client/v3/room_keys/keys/{room_id}",
-            axum::routing::put(put_backup_room).get(get_backup_room),
+            axum::routing::put(put_backup_room)
+                .get(get_backup_room)
+                .delete(delete_backup_room),
         )
         .route(
             "/_matrix/client/v3/room_keys/keys/{room_id}/{session_id}",
-            axum::routing::put(put_backup_session).get(get_backup_session),
+            axum::routing::put(put_backup_session)
+                .get(get_backup_session)
+                .delete(delete_backup_session),
         )
         .route(
             "/_matrix/client/v3/sendToDevice/{event_type}/{txn_id}",
@@ -2542,6 +2548,67 @@ async fn put_backup_session(
         .put_key(&identity.user_id, version, &room_id, &session_id, &data)
         .map_err(|error| backup_error(&error))?;
     Ok(Json(backup_summary(&state, &identity.user_id, version)?))
+}
+
+/// The shared body of the three DELETE granularities.
+///
+/// Deletes go through the current-version rule like writes do: a client
+/// deleting from a superseded version thinks it is trimming the live
+/// backup, and quietly deleting somewhere else would let it believe it did.
+fn delete_backup(
+    state: &AppState,
+    user_id: &str,
+    requested: &str,
+    room_id: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<Json<Value>, MatrixError> {
+    let version = require_current_version(state, user_id, requested)?;
+    state
+        .backups
+        .delete_keys(user_id, version, room_id, session_id)
+        .map_err(|error| backup_error(&error))?;
+    Ok(Json(backup_summary(state, user_id, version)?))
+}
+
+/// `DELETE /_matrix/client/v3/room_keys/keys`
+async fn delete_backup_keys(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Query(query): axum::extract::Query<BackupQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    delete_backup(&state, &identity.user_id, &query.version, None, None)
+}
+
+/// `DELETE /_matrix/client/v3/room_keys/keys/{room_id}`
+async fn delete_backup_room(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<BackupQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    delete_backup(
+        &state,
+        &identity.user_id,
+        &query.version,
+        Some(&room_id),
+        None,
+    )
+}
+
+/// `DELETE /_matrix/client/v3/room_keys/keys/{room_id}/{session_id}`
+async fn delete_backup_session(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((room_id, session_id)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<BackupQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    delete_backup(
+        &state,
+        &identity.user_id,
+        &query.version,
+        Some(&room_id),
+        Some(&session_id),
+    )
 }
 
 /// `GET /_matrix/client/v3/room_keys/keys/{room_id}/{session_id}`
