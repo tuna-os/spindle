@@ -329,6 +329,17 @@ impl RoomLog {
             .and_then(|li| self.entries.get(li))
     }
 
+    /// The newest entry at or before `li` — the seek behind "what did
+    /// this room look like at that point" (SPEC §17.4). One `BTreeMap`
+    /// range probe; `None` means the log starts after that point.
+    #[must_use]
+    pub fn entry_at_or_before(&self, li: i64) -> Option<&LogEntry> {
+        self.entries
+            .range(..=li)
+            .next_back()
+            .map(|(_, entry)| entry)
+    }
+
     #[must_use]
     pub fn forward_extremities(&self) -> &BTreeSet<EventId> {
         &self.forward_extremities
