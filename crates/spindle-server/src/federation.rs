@@ -463,6 +463,88 @@ impl Federation {
         Ok(body)
     }
 
+    /// Ask the resident server for a leave template — the client half of
+    /// `make_leave`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] if the request cannot be signed or sent,
+    /// or the peer refuses.
+    pub async fn remote_make_leave(
+        &self,
+        destination: &str,
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<Value, FederationError> {
+        let uri = format!("/_matrix/federation/v1/make_leave/{room_id}/{user_id}");
+        let authorization = self.sign_request("GET", &uri, destination, None)?;
+        let response = self
+            .client
+            .get(format!(
+                "{}{uri}",
+                base_url(destination, self.insecure_http)
+            ))
+            .header("authorization", authorization)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|error| FederationError::Refused(format!("make_leave: {error}")))?;
+        let status = response.status();
+        let body: Value = response
+            .bytes()
+            .await
+            .map_err(|error| FederationError::Refused(format!("make_leave body: {error}")))
+            .and_then(|bytes| {
+                serde_json::from_slice(&bytes)
+                    .map_err(|error| FederationError::Refused(format!("make_leave body: {error}")))
+            })?;
+        if !status.is_success() {
+            return Err(FederationError::Refused(format!(
+                "{destination} refused make_leave: {status} {body}"
+            )));
+        }
+        Ok(body)
+    }
+
+    /// Send the signed leave back — the client half of `send_leave`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] if the request cannot be signed or sent,
+    /// or the peer refuses.
+    pub async fn remote_send_leave(
+        &self,
+        destination: &str,
+        room_id: &str,
+        event_id: &str,
+        leave: &Value,
+    ) -> Result<(), FederationError> {
+        let uri = format!("/_matrix/federation/v2/send_leave/{room_id}/{event_id}");
+        let authorization = self.sign_request("PUT", &uri, destination, Some(leave))?;
+        let response = self
+            .client
+            .put(format!(
+                "{}{uri}",
+                base_url(destination, self.insecure_http)
+            ))
+            .header("authorization", authorization)
+            .header("content-type", "application/json")
+            .timeout(Duration::from_secs(30))
+            .body(leave.to_string())
+            .send()
+            .await
+            .map_err(|error| FederationError::Refused(format!("send_leave: {error}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.bytes().await.unwrap_or_default();
+            return Err(FederationError::Refused(format!(
+                "{destination} refused send_leave: {status} {}",
+                String::from_utf8_lossy(&body)
+            )));
+        }
+        Ok(())
+    }
+
     /// Deliver one signed transaction to a peer.
     ///
     /// # Errors

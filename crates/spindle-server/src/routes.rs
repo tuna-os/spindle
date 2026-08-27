@@ -633,6 +633,14 @@ fn discovery_routes() -> Router<AppState> {
             get(federation_make_join),
         )
         .route(
+            "/_matrix/federation/v1/make_leave/{room_id}/{user_id}",
+            get(federation_make_leave),
+        )
+        .route(
+            "/_matrix/federation/v2/send_leave/{room_id}/{event_id}",
+            axum::routing::put(federation_send_leave),
+        )
+        .route(
             "/_matrix/federation/v2/send_join/{room_id}/{event_id}",
             axum::routing::put(federation_send_join),
         )
@@ -1553,6 +1561,94 @@ async fn federation_make_join(
     })))
 }
 
+/// `GET /_matrix/federation/v1/make_leave/{roomId}/{userId}`
+///
+/// The mirror of `make_join`, and how an invited user's server rejects an
+/// invite to a room it holds no log for: it fetches this template, signs
+/// it, and brings it back through `send_leave`.
+async fn federation_make_leave(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path((room_id, user_id)): axum::extract::Path<(String, String)>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let origin = federation_origin(&state, &headers, "GET", &uri, None).await?;
+    // A server makes leaves for its own users only, same as joins: a
+    // template for someone else's user would be a forgery kit.
+    if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin.as_str()) {
+        return Err(MatrixError::forbidden(
+            "the user does not live on the requesting server",
+        ));
+    }
+    let event = state
+        .rooms
+        .make_leave_template(&room_id, &user_id)
+        .map_err(room_error)?;
+    Ok(Json(json!({
+        "room_version": crate::rooms::ROOM_VERSION,
+        "event": event,
+    })))
+}
+
+/// `PUT /_matrix/federation/v2/send_leave/{roomId}/{eventId}`
+async fn federation_send_leave(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let leave: Value =
+        serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&leave)).await?;
+
+    // Shape first, same reasoning as send_join: this door admits exactly
+    // one kind of event, and anything else through it is smuggling.
+    let is_leave = leave["type"] == json!("m.room.member")
+        && leave["content"]["membership"] == json!("leave")
+        && leave["state_key"] == leave["sender"]
+        && leave["room_id"].as_str() == Some(room_id.as_str());
+    if !is_leave {
+        return Err(MatrixError::bad_json(
+            "send_leave carries exactly a leave event for this room".to_owned(),
+        ));
+    }
+
+    let key_map = state
+        .federation
+        .public_key_map(&origin)
+        .await
+        .map_err(|error| {
+            tracing::debug!("cannot fetch {origin} keys: {error}");
+            MatrixError::new(
+                StatusCode::UNAUTHORIZED,
+                "M_UNAUTHORIZED",
+                "the origin's keys cannot be verified".to_owned(),
+            )
+        })?;
+    let (computed_id, outcome) = receive_one_pdu(&state, &origin, Some(&key_map), &leave);
+    if computed_id != event_id {
+        return Err(MatrixError::bad_json(format!(
+            "the event hashes to {computed_id}, not {event_id}"
+        )));
+    }
+    if let Err(reason) = outcome {
+        return Err(MatrixError::forbidden(&reason));
+    }
+    state.rooms.wake_sync_waiters();
+    Ok(Json(json!({})))
+}
+
 /// `PUT /_matrix/federation/v2/send_join/{roomId}/{eventId}`
 async fn federation_send_join(
     State(state): State<AppState>,
@@ -2305,6 +2401,44 @@ async fn join(
     }
 }
 
+/// Finish a membership template: stamp a timestamp if the resident server
+/// left it out, content-hash and sign it as ours, and name it by its
+/// reference hash — exactly what the resident's `send_join`/`send_leave`
+/// will verify.
+fn sign_membership_template(state: &AppState, template: &Value) -> Result<(String, Value), String> {
+    let Ok(ruma::CanonicalJsonValue::Object(mut canonical)) =
+        ruma::CanonicalJsonValue::try_from(template.clone())
+    else {
+        return Err("the template does not canonicalize".to_owned());
+    };
+    if !canonical.contains_key("origin_server_ts") {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        canonical.insert(
+            "origin_server_ts".to_owned(),
+            ruma::CanonicalJsonValue::Integer(ruma::Int::try_from(now).unwrap_or_default()),
+        );
+    }
+    let rules = ruma::RoomVersionId::try_from(crate::rooms::ROOM_VERSION)
+        .ok()
+        .and_then(|version| version.rules())
+        .ok_or_else(|| "the room version rules are unavailable".to_owned())?;
+    ruma::signatures::hash_and_sign_event(
+        &state.config.server.name,
+        state.key.pair(),
+        &mut canonical,
+        &rules.redaction,
+    )
+    .map_err(|error| format!("the template cannot be signed: {error}"))?;
+    let hash = ruma::signatures::reference_hash(&canonical, &rules)
+        .map_err(|error| format!("the signed event cannot be hashed: {error}"))?;
+    let event = serde_json::to_value(&canonical)
+        .map_err(|error| format!("the signed event cannot be serialized: {error}"))?;
+    Ok((format!("${hash}"), event))
+}
+
 /// Every server worth asking to broker a join, most-specific first.
 ///
 /// The client's own `server_name`/`via` hints lead; the domain in the room
@@ -2364,49 +2498,15 @@ async fn join_remote(
             }
         };
 
-        // Finish the template: content-hash and sign it as ours, exactly
-        // what a resident server's send_join will verify. The timestamp is
-        // ours to stamp — the spec has the joining server date its own
-        // join, and some resident servers (Complement's reference one
-        // among them) hand back a template without one.
-        let Ok(ruma::CanonicalJsonValue::Object(mut canonical)) =
-            ruma::CanonicalJsonValue::try_from(template.clone())
-        else {
-            last_refusal = format!("{server} sent a template that does not canonicalize");
-            continue;
+        // Finish the template: timestamp, content hash, our signature —
+        // exactly what a resident server's send_join will verify.
+        let (join_id, join) = match sign_membership_template(state, &template) {
+            Ok(signed) => signed,
+            Err(error) => {
+                last_refusal = format!("{server}: {error}");
+                continue;
+            }
         };
-        if !canonical.contains_key("origin_server_ts") {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
-                .unwrap_or(0);
-            canonical.insert(
-                "origin_server_ts".to_owned(),
-                ruma::CanonicalJsonValue::Integer(ruma::Int::try_from(now).unwrap_or_default()),
-            );
-        }
-        let rules = ruma::RoomVersionId::try_from(crate::rooms::ROOM_VERSION)
-            .ok()
-            .and_then(|version| version.rules())
-            .ok_or_else(|| MatrixError::internal("the room version rules are unavailable"))?;
-        if ruma::signatures::hash_and_sign_event(
-            &state.config.server.name,
-            state.key.pair(),
-            &mut canonical,
-            &rules.redaction,
-        )
-        .is_err()
-        {
-            last_refusal = format!("the {server} template cannot be signed");
-            continue;
-        }
-        let Ok(hash) = ruma::signatures::reference_hash(&canonical, &rules) else {
-            "the signed join cannot be hashed".clone_into(&mut last_refusal);
-            continue;
-        };
-        let join_id = format!("${hash}");
-        let join = serde_json::to_value(&canonical)
-            .map_err(|error| MatrixError::internal(&error.to_string()))?;
 
         let response = match state
             .federation
@@ -2451,18 +2551,74 @@ async fn leave_room(
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, MatrixError> {
     let request: SelfMembershipRequest = optional_body(&body)?;
-    state
-        .rooms
-        .set_membership(
-            &room_id,
-            &identity.user_id,
-            &identity.user_id,
-            "leave",
-            request.reason.as_deref(),
-            state.key.pair(),
-        )
-        .map_err(room_error)?;
-    Ok(Json(json!({})))
+    match state.rooms.set_membership(
+        &room_id,
+        &identity.user_id,
+        &identity.user_id,
+        "leave",
+        request.reason.as_deref(),
+        state.key.pair(),
+    ) {
+        Ok(_) => Ok(Json(json!({}))),
+        // A room this server holds no log for can still be left in the one
+        // way that matters here: rejecting the pending invite that named it.
+        Err(crate::rooms::RoomError::UnknownRoom(_))
+            if state
+                .rooms
+                .pending_invite(&identity.user_id, &room_id)
+                .ok()
+                .flatten()
+                .is_some() =>
+        {
+            reject_remote_invite(&state, &identity.user_id, &room_id).await;
+            state
+                .rooms
+                .clear_pending_invite(&identity.user_id, &room_id)
+                .map_err(room_error)?;
+            Ok(Json(json!({})))
+        }
+        Err(error) => Err(room_error(error)),
+    }
+}
+
+/// Walk `make_leave`/`send_leave` against whoever holds the room.
+///
+/// Best-effort by design, which is Synapse's behavior too: the user must be
+/// able to clear an invite even when the inviting server is gone, so a
+/// handshake that fails on every candidate is logged and the local record
+/// is cleared anyway. The room's own state ends up stale on the resident
+/// side only in the case where the resident is unreachable — the one case
+/// where it cannot be helped.
+async fn reject_remote_invite(state: &AppState, user_id: &str, room_id: &str) {
+    for server in join_candidates(state, user_id, room_id, &[]) {
+        let template = match state
+            .federation
+            .remote_make_leave(&server, room_id, user_id)
+            .await
+        {
+            Ok(body) => body["event"].clone(),
+            Err(error) => {
+                tracing::debug!("make_leave via {server}: {error}");
+                continue;
+            }
+        };
+        let (event_id, leave) = match sign_membership_template(state, &template) {
+            Ok(signed) => signed,
+            Err(error) => {
+                tracing::debug!("leave template via {server}: {error}");
+                continue;
+            }
+        };
+        match state
+            .federation
+            .remote_send_leave(&server, room_id, &event_id, &leave)
+            .await
+        {
+            Ok(()) => return,
+            Err(error) => tracing::debug!("send_leave via {server}: {error}"),
+        }
+    }
+    tracing::debug!("no server accepted the rejection of {room_id}; clearing locally");
 }
 
 /// `GET /_matrix/client/v3/rooms/{room_id}/joined_members`
