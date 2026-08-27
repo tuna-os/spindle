@@ -84,6 +84,19 @@ fn appservice_identity(
             "an appservice may only act as users of this server",
         ));
     };
+    // MSC3202 device masquerading: `?org.matrix.msc3202.device_id=` names
+    // which of the masqueraded user's devices this request acts as, which
+    // is what lets a bridge upload E2E keys for a ghost's device through
+    // the ordinary `/keys/upload`. Absent, the stable synthetic ID stands.
+    let device_id = parts
+        .uri
+        .query()
+        .and_then(|query| {
+            form_urlencoded::parse(query.as_bytes())
+                .find(|(key, _)| key == "org.matrix.msc3202.device_id")
+                .map(|(_, value)| value.into_owned())
+        })
+        .unwrap_or_else(|| format!("appservice_{}", registration.id));
     let accounts = Accounts::new(state.store.as_ref(), server_name);
     let known = accounts
         .account(localpart)
@@ -106,10 +119,10 @@ fn appservice_identity(
     }
     Ok(Identity {
         user_id,
-        // Appservices have no device of their own until MSC4190 device
-        // management lands; a stable synthetic ID keeps everything keyed
-        // by device (transaction replay, to-device) coherent.
-        device_id: format!("appservice_{}", registration.id),
+        // Without MSC3202's masquerade above, a stable synthetic ID keeps
+        // everything keyed by device (transaction replay, to-device)
+        // coherent.
+        device_id,
     })
 }
 

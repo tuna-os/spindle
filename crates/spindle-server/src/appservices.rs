@@ -66,6 +66,10 @@ pub struct Namespaces {
 }
 
 /// One appservice, as its registration file declares it.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the flags mirror the registration file's wire format, one per MSC"
+)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Registration {
     pub id: String,
@@ -95,6 +99,12 @@ pub struct Registration {
     /// accepted because that is what shipping bridges still write.
     #[serde(default, alias = "io.element.msc4190")]
     pub device_management: bool,
+    /// MSC3202: transactions also carry device-list changes for users
+    /// the service is interested in, and one-time-key counts for its own
+    /// ghosts' devices — the signal an encrypting bridge replenishes
+    /// keys on. The unstable name is what shipping bridges write.
+    #[serde(default, alias = "org.matrix.msc3202")]
+    pub receive_device_lists: bool,
 }
 
 fn default_rate_limited() -> bool {
@@ -334,6 +344,15 @@ struct PendingPush {
     /// MSC2409 ephemeral riders, pinned with the batch: a transaction is
     /// immutable once its ID is assigned, retries included.
     ephemeral: Vec<Value>,
+    /// MSC3202: users whose device lists changed in the batch's range.
+    /// Cursor-advancing like events — a missed change means encrypting
+    /// to a stale device set, so it gets at-least-once, not fire-once.
+    device_lists_changed: Vec<String>,
+    /// MSC3202: `{user: {device: {algorithm: count}}}` for the service's
+    /// key-holding ghost devices in the batch's rooms.
+    otk_counts: Value,
+    /// MSC3202: the same shape over unused fallback key algorithms.
+    fallback_keys: Value,
     advance_to: u64,
 }
 
@@ -355,19 +374,21 @@ fn write_cursor(store: &FjallStore, appservice_id: &str, position: u64) {
 }
 
 /// The next batch for one service: interested events in
-/// `(cursor, position]`, and the stream position the batch covers.
+/// `(cursor, position]`, the rooms they came from, and the stream
+/// position the batch covers.
 fn collect_batch(
     rooms: &Rooms,
     registration: &Registration,
     server_name: &str,
     cursor: u64,
     position: u64,
-) -> Result<(Vec<Value>, u64), crate::rooms::RoomError> {
+) -> Result<(Vec<Value>, std::collections::BTreeSet<String>, u64), crate::rooms::RoomError> {
     let (records, advance_to) = rooms.stream_events(cursor, position, TRANSACTION_LIMIT)?;
     // Membership is asked once per room per batch, not once per event —
     // a busy room would otherwise pay a full member scan per message.
     let mut members_of: HashMap<String, Vec<String>> = HashMap::new();
     let mut events = Vec::new();
+    let mut batch_rooms = std::collections::BTreeSet::new();
     for (room_id, event) in records {
         let members = match members_of.entry(room_id.clone()) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -380,10 +401,104 @@ fn collect_batch(
         };
         let sender = event["sender"].as_str().unwrap_or_default();
         if registration.wants_event(&room_id, sender, members, server_name) {
+            batch_rooms.insert(room_id);
             events.push(event);
         }
     }
-    Ok((events, advance_to))
+    Ok((events, batch_rooms, advance_to))
+}
+
+/// Whether the service cares about `user_id`'s devices: its own
+/// namespaces, or any room they share with the service's interest.
+fn interesting_user(
+    rooms: &Rooms,
+    registration: &Registration,
+    server_name: &str,
+    user_id: &str,
+) -> bool {
+    if registration.may_masquerade_as(user_id, server_name) {
+        return true;
+    }
+    let Ok(joined) = rooms.joined(user_id) else {
+        return false;
+    };
+    joined.iter().any(|room_id| {
+        let members: Vec<String> = rooms
+            .joined_members(room_id)
+            .map(|members| members.keys().cloned().collect())
+            .unwrap_or_default();
+        registration.wants_event(room_id, "", &members, server_name)
+    })
+}
+
+/// MSC3202's key-count payloads for the service's ghost devices in the
+/// batch's rooms: `{user: {device: {algorithm: count}}}` for one-time
+/// keys, and the same shape over unused fallback algorithms.
+///
+/// Only devices that uploaded identity keys are reported — a device
+/// without them has no E2E to replenish, and reporting zeros for every
+/// ghost would drown the one zero that matters.
+fn key_counts(
+    store: &FjallStore,
+    devices: &crate::devices::Devices,
+    rooms: &Rooms,
+    registration: &Registration,
+    server_name: &str,
+    batch_rooms: &std::collections::BTreeSet<String>,
+) -> (Value, Value) {
+    let accounts = crate::accounts::Accounts::new(store, server_name);
+    let mut otk = serde_json::Map::new();
+    let mut fallback = serde_json::Map::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for room_id in batch_rooms {
+        let members: Vec<String> = rooms
+            .joined_members(room_id)
+            .map(|members| members.keys().cloned().collect())
+            .unwrap_or_default();
+        for user_id in members {
+            if !registration.may_masquerade_as(&user_id, server_name)
+                || !seen.insert(user_id.clone())
+            {
+                continue;
+            }
+            let Some(localpart) = user_id
+                .strip_prefix('@')
+                .and_then(|rest| rest.split(':').next())
+            else {
+                continue;
+            };
+            let Ok(user_devices) = accounts.devices_of(localpart) else {
+                continue;
+            };
+            let mut user_otk = serde_json::Map::new();
+            let mut user_fallback = serde_json::Map::new();
+            for device in user_devices {
+                if devices
+                    .device_keys(&user_id, &device.device_id)
+                    .ok()
+                    .flatten()
+                    .is_none()
+                {
+                    continue;
+                }
+                if let Ok(counts) = devices.one_time_key_counts(&user_id, &device.device_id) {
+                    user_otk.insert(device.device_id.clone(), Value::Object(counts));
+                }
+                if let Ok(algorithms) =
+                    devices.unused_fallback_algorithms(&user_id, &device.device_id)
+                {
+                    user_fallback.insert(device.device_id.clone(), serde_json::json!(algorithms));
+                }
+            }
+            if !user_otk.is_empty() {
+                otk.insert(user_id.clone(), Value::Object(user_otk));
+            }
+            if !user_fallback.is_empty() {
+                fallback.insert(user_id.clone(), Value::Object(user_fallback));
+            }
+        }
+    }
+    (Value::Object(otk), Value::Object(fallback))
 }
 
 /// The typing changes a service has not yet been told about, as MSC2409
@@ -453,9 +568,31 @@ async fn deliver(
     );
     let mut body = serde_json::json!({ "events": push.events });
     // Only for services that opted in, and only when there is something
-    // to say — MSC2409 has non-opted services never see the key at all.
+    // to say — MSC2409 has non-opted services never see the key at all,
+    // and the MSC3202 payloads follow the same rule under their unstable
+    // names, which are what shipping bridges parse.
     if !push.ephemeral.is_empty() {
         body["ephemeral"] = Value::Array(push.ephemeral.clone());
+    }
+    if !push.device_lists_changed.is_empty() {
+        body["org.matrix.msc3202.device_lists"] = serde_json::json!({
+            "changed": push.device_lists_changed,
+            "left": [],
+        });
+    }
+    if push
+        .otk_counts
+        .as_object()
+        .is_some_and(|map| !map.is_empty())
+    {
+        body["org.matrix.msc3202.device_one_time_keys_count"] = push.otk_counts.clone();
+    }
+    if push
+        .fallback_keys
+        .as_object()
+        .is_some_and(|map| !map.is_empty())
+    {
+        body["org.matrix.msc3202.device_unused_fallback_key_types"] = push.fallback_keys.clone();
     }
     let response = client
         .put(target)
@@ -472,6 +609,109 @@ async fn deliver(
     Ok(())
 }
 
+/// Everything [`compute_pending`] reads, bundled so the loop body stays
+/// a loop body.
+struct PushSources<'a> {
+    store: &'a FjallStore,
+    devices: &'a crate::devices::Devices,
+    rooms: &'a Rooms,
+    typing: &'a crate::typing::Typing,
+    server_name: &'a str,
+}
+
+/// The next transaction one service is owed, if any. Advances the cursor
+/// durably past a range nothing in which interested the service — a
+/// service whose rooms went quiet must not re-scan the same dead range
+/// every pass, forever.
+fn compute_pending(
+    sources: &PushSources<'_>,
+    registration: &Registration,
+    typing_sent: &mut HashMap<String, Vec<String>>,
+    ephemeral_txn: &mut u64,
+) -> Option<PendingPush> {
+    let cursor = read_cursor(sources.store, &registration.id);
+    let position = sources.rooms.stream_position();
+    let (events, batch_rooms, advance_to) = if position > cursor {
+        collect_batch(
+            sources.rooms,
+            registration,
+            sources.server_name,
+            cursor,
+            position,
+        )
+        .ok()?
+    } else {
+        (Vec::new(), std::collections::BTreeSet::new(), cursor)
+    };
+    let device_lists_changed: Vec<String> =
+        if registration.receive_device_lists && advance_to > cursor {
+            sources
+                .devices
+                .device_lists_changed(cursor, Some(advance_to))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|user_id| {
+                    interesting_user(sources.rooms, registration, sources.server_name, user_id)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+    if events.is_empty() && device_lists_changed.is_empty() && advance_to > cursor {
+        write_cursor(sources.store, &registration.id, advance_to);
+    }
+    let (otk_counts, fallback_keys) =
+        if registration.receive_device_lists && !batch_rooms.is_empty() {
+            key_counts(
+                sources.store,
+                sources.devices,
+                sources.rooms,
+                registration,
+                sources.server_name,
+                &batch_rooms,
+            )
+        } else {
+            (serde_json::json!({}), serde_json::json!({}))
+        };
+    let ephemeral = if registration.receive_ephemeral {
+        typing_delta(
+            sources.typing,
+            sources.rooms,
+            registration,
+            sources.server_name,
+            typing_sent,
+        )
+    } else {
+        Vec::new()
+    };
+    // A batch advances the cursor when it carries anything at-least-once:
+    // events, or a device-list change a bridge must not miss (encrypting
+    // to a stale device set is the failure mode). Ephemeral alone stays
+    // fire-once.
+    let advancing = !events.is_empty() || !device_lists_changed.is_empty();
+    if !advancing && ephemeral.is_empty() {
+        return None;
+    }
+    let txn_id = if advancing {
+        // Deterministic by range, not by attempt: the range is pinned
+        // until acknowledged, so a retry reuses the ID and redelivery is
+        // a no-op on the service.
+        format!("s{}-{advance_to}", cursor + 1)
+    } else {
+        *ephemeral_txn += 1;
+        format!("e{ephemeral_txn}")
+    };
+    Some(PendingPush {
+        txn_id,
+        advance_to: if advancing { advance_to } else { cursor },
+        events,
+        ephemeral,
+        device_lists_changed,
+        otk_counts,
+        fallback_keys,
+    })
+}
+
 /// Push transactions to every service with a URL, forever.
 ///
 /// The same polling shape as the federation outbox drain, and for the
@@ -486,10 +726,18 @@ pub async fn push_loop(
     appservices: Arc<Appservices>,
     rooms: Arc<Rooms>,
     typing: Arc<crate::typing::Typing>,
+    devices: Arc<crate::devices::Devices>,
     server_name: String,
     retry_base: Duration,
 ) {
     let client = reqwest::Client::new();
+    let sources = PushSources {
+        store: &store,
+        devices: &devices,
+        rooms: &rooms,
+        typing: &typing,
+        server_name: &server_name,
+    };
     let mut pending: HashMap<String, PendingPush> = HashMap::new();
     let mut backoff: HashMap<String, (u32, std::time::Instant)> = HashMap::new();
     // What each opted-in service believes about who is typing where.
@@ -513,56 +761,15 @@ pub async fn push_loop(
             {
                 continue;
             }
-            if !pending.contains_key(&registration.id) {
-                let cursor = read_cursor(&store, &registration.id);
-                let position = rooms.stream_position();
-                let (events, advance_to) = if position > cursor {
-                    match collect_batch(&rooms, registration, &server_name, cursor, position) {
-                        Ok(batch) => batch,
-                        Err(_) => continue,
-                    }
-                } else {
-                    (Vec::new(), cursor)
-                };
-                if events.is_empty() && advance_to > cursor {
-                    write_cursor(&store, &registration.id, advance_to);
-                }
-                let ephemeral = if registration.receive_ephemeral {
-                    typing_delta(
-                        &typing,
-                        &rooms,
-                        registration,
-                        &server_name,
-                        typing_sent.entry(registration.id.clone()).or_default(),
-                    )
-                } else {
-                    Vec::new()
-                };
-                if events.is_empty() && ephemeral.is_empty() {
-                    continue;
-                }
-                let txn_id = if events.is_empty() {
-                    ephemeral_txn += 1;
-                    format!("e{ephemeral_txn}")
-                } else {
-                    // Deterministic by range, not by attempt: the range
-                    // is pinned until acknowledged, so a retry reuses
-                    // the ID and redelivery is a no-op on the service.
-                    format!("s{}-{advance_to}", cursor + 1)
-                };
-                pending.insert(
-                    registration.id.clone(),
-                    PendingPush {
-                        txn_id,
-                        advance_to: if events.is_empty() {
-                            cursor
-                        } else {
-                            advance_to
-                        },
-                        events,
-                        ephemeral,
-                    },
-                );
+            if !pending.contains_key(&registration.id)
+                && let Some(push) = compute_pending(
+                    &sources,
+                    registration,
+                    typing_sent.entry(registration.id.clone()).or_default(),
+                    &mut ephemeral_txn,
+                )
+            {
+                pending.insert(registration.id.clone(), push);
             }
             let Some(push) = pending.get(&registration.id) else {
                 continue;
@@ -580,7 +787,7 @@ pub async fn push_loop(
                     // backoff is a lie about the present, exactly the
                     // federation outbox's rule for its EDUs. The next
                     // real change produces a fresh delta anyway.
-                    if push.events.is_empty() {
+                    if push.events.is_empty() && push.device_lists_changed.is_empty() {
                         pending.remove(&registration.id);
                     }
                     let failures = backoff.get(&registration.id).map_or(0, |(count, _)| *count) + 1;
