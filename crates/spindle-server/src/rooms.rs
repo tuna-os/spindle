@@ -858,6 +858,108 @@ impl Rooms {
         })
     }
 
+    /// History walking backwards from the given events, newest first —
+    /// federation backfill.
+    ///
+    /// The linear log makes this a range read: the starting point is the
+    /// newest of the named events, and "backwards" is the log itself. The
+    /// named events are included, the way a paginating server expects.
+    ///
+    /// # Errors
+    ///
+    /// [`RoomError::UnknownRoom`] for a room this server has no log for,
+    /// [`RoomError::MissingBody`] when none of the named events are in it.
+    pub fn backfill(
+        &self,
+        room_id: &str,
+        from: &[String],
+        limit: usize,
+    ) -> Result<Vec<Value>, RoomError> {
+        self.with_room(room_id, |rooms, log| {
+            let start = from
+                .iter()
+                .filter_map(|id| log.get(&EventId::new(id.as_str())))
+                .map(|entry| entry.li)
+                .max()
+                .ok_or_else(|| RoomError::MissingBody(from.join(", ")))?;
+            log.entries()
+                .rev()
+                .filter(|entry| entry.li <= start)
+                .take(limit)
+                .map(|entry| {
+                    let mut event = rooms.read_event(room_id, &entry.event_id)?;
+                    if let Some(object) = event.as_object_mut() {
+                        object.insert(
+                            "event_id".to_owned(),
+                            Value::String(entry.event_id.as_str().to_owned()),
+                        );
+                    }
+                    Ok(event)
+                })
+                .collect()
+        })
+    }
+
+    /// The events between `earliest` (theirs) and `latest` (the ones whose
+    /// ancestry they are missing) — federation catch-up.
+    ///
+    /// Exclusive on both ends: they have `earliest`, and they are holding
+    /// `latest`. When the gap is wider than `limit`, the events closest to
+    /// `latest` win — those are the ones that let the requester connect the
+    /// history they are actually holding; the rest they can backfill.
+    /// Returned oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`RoomError::UnknownRoom`] for a room this server has no log for.
+    pub fn missing_events(
+        &self,
+        room_id: &str,
+        earliest: &[String],
+        latest: &[String],
+        limit: usize,
+        min_depth: u64,
+    ) -> Result<Vec<Value>, RoomError> {
+        self.with_room(room_id, |rooms, log| {
+            let floor = earliest
+                .iter()
+                .filter_map(|id| log.get(&EventId::new(id.as_str())))
+                .map(|entry| entry.li)
+                .max();
+            let Some(ceiling) = latest
+                .iter()
+                .filter_map(|id| log.get(&EventId::new(id.as_str())))
+                .map(|entry| entry.li)
+                .min()
+            else {
+                // Nothing they name is ours: there is no gap to fill.
+                return Ok(Vec::new());
+            };
+            let mut newest_first: Vec<Value> = log
+                .entries()
+                .rev()
+                .filter(|entry| {
+                    entry.li < ceiling
+                        && floor.is_none_or(|floor| entry.li > floor)
+                        && entry.depth >= min_depth
+                })
+                .take(limit)
+                .map(|entry| {
+                    let mut event = rooms.read_event(room_id, &entry.event_id)?;
+                    if let Some(object) = event.as_object_mut() {
+                        object.insert(
+                            "event_id".to_owned(),
+                            Value::String(entry.event_id.as_str().to_owned()),
+                        );
+                    }
+                    Ok(event)
+                })
+                .collect::<Result<_, RoomError>>()?;
+            newest_first.reverse();
+            Ok(newest_first)
+        })
+    }
+
     /// The room's state *before* `event_id`, with the auth chain, for
     /// federation's `/state` and `/state_ids`.
     ///
