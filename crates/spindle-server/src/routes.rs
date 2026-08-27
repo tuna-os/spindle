@@ -71,6 +71,7 @@ pub const MOUNTED: &[&str] = &[
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(account_routes())
+        .merge(profile_routes())
         .merge(room_routes())
         .merge(timeline_routes())
         .merge(media_routes())
@@ -93,6 +94,20 @@ async fn unknown_endpoint() -> MatrixError {
 }
 
 /// Registration, login, and the per-user data that is not in any room.
+/// The global-profile surface: read anyone's, write your own.
+fn profile_routes() -> Router<AppState> {
+    Router::new()
+        .route("/_matrix/client/v3/profile/{user_id}", get(get_profile))
+        .route(
+            "/_matrix/client/v3/profile/{user_id}/displayname",
+            get(get_profile_displayname).put(put_profile_displayname),
+        )
+        .route(
+            "/_matrix/client/v3/profile/{user_id}/avatar_url",
+            get(get_profile_avatar).put(put_profile_avatar),
+        )
+}
+
 fn account_routes() -> Router<AppState> {
     Router::new()
         .route("/_matrix/client/v3/register", post(register))
@@ -603,6 +618,10 @@ fn discovery_routes() -> Router<AppState> {
         .route(
             "/_matrix/federation/v1/query/directory",
             get(federation_query_directory),
+        )
+        .route(
+            "/_matrix/federation/v1/query/profile",
+            get(federation_query_profile),
         )
         .route(
             "/_matrix/federation/v1/send/{txn_id}",
@@ -1121,6 +1140,37 @@ async fn federation_query_directory(
         "room_id": room_id.room_id,
         "servers": [state.config.server.name],
     })))
+}
+
+#[derive(Debug, Deserialize)]
+struct FederationProfileQuery {
+    user_id: String,
+}
+
+/// `GET /_matrix/federation/v1/query/profile`
+async fn federation_query_profile(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<FederationProfileQuery>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    federation_origin(&state, &headers, "GET", &uri, None).await?;
+    // Local users only: proxying another server's profile through this
+    // endpoint would let any server launder queries through us.
+    if query.user_id.split_once(':').map(|(_, domain)| domain)
+        != Some(state.config.server.name.as_str())
+    {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            format!("{} is not here", query.user_id),
+        ));
+    }
+    profile_of(&state, &query.user_id).await.map(Json)
 }
 
 /// `PUT /_matrix/federation/v1/send/{txnId}`
@@ -1868,6 +1918,169 @@ async fn joined_rooms(
         .joined(&identity.user_id)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
     Ok(Json(json!({ "joined_rooms": rooms })))
+}
+
+/// Read a profile, wherever the user lives.
+///
+/// A local user's profile is the stored row. A remote user's is their
+/// server's to answer, over `query/profile` — which is how a client here
+/// renders the name of someone it has never shared a room with.
+async fn profile_of(state: &AppState, user_id: &str) -> Result<Value, MatrixError> {
+    let domain = user_id.split_once(':').map(|(_, domain)| domain);
+    if domain == Some(state.config.server.name.as_str()) {
+        let localpart = user_id.strip_prefix('@').map_or(user_id, |rest| {
+            rest.split_once(':')
+                .map_or(rest, |(localpart, _)| localpart)
+        });
+        let known = Accounts::new(state.store.as_ref(), &state.config.server.name)
+            .account(localpart)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?
+            .is_some();
+        if !known {
+            return Err(MatrixError::new(
+                StatusCode::NOT_FOUND,
+                "M_NOT_FOUND",
+                format!("{user_id} is not here"),
+            ));
+        }
+        let profile = state
+            .profiles
+            .get(user_id)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        return serde_json::to_value(profile)
+            .map_err(|error| MatrixError::internal(&error.to_string()));
+    }
+    let Some(domain) = domain else {
+        return Err(MatrixError::bad_json(format!("{user_id} is not a user ID")));
+    };
+    state
+        .federation
+        .remote_query_profile(domain, user_id)
+        .await
+        .map_err(|error| {
+            MatrixError::new(
+                StatusCode::NOT_FOUND,
+                "M_NOT_FOUND",
+                format!("{domain} did not answer for {user_id}: {error}"),
+            )
+        })
+}
+
+/// `GET /_matrix/client/v3/profile/{userId}`
+async fn get_profile(
+    State(state): State<AppState>,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    Ok(Json(profile_of(&state, &user_id).await?))
+}
+
+/// `GET /_matrix/client/v3/profile/{userId}/displayname`
+async fn get_profile_displayname(
+    State(state): State<AppState>,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    let profile = profile_of(&state, &user_id).await?;
+    let mut body = serde_json::Map::new();
+    if let Some(name) = profile.get("displayname").filter(|v| !v.is_null()) {
+        body.insert("displayname".to_owned(), name.clone());
+    }
+    Ok(Json(Value::Object(body)))
+}
+
+/// `GET /_matrix/client/v3/profile/{userId}/avatar_url`
+async fn get_profile_avatar(
+    State(state): State<AppState>,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    let profile = profile_of(&state, &user_id).await?;
+    let mut body = serde_json::Map::new();
+    if let Some(url) = profile.get("avatar_url").filter(|v| !v.is_null()) {
+        body.insert("avatar_url".to_owned(), url.clone());
+    }
+    Ok(Json(Value::Object(body)))
+}
+
+#[derive(Debug, Deserialize)]
+struct DisplaynameRequest {
+    displayname: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AvatarRequest {
+    avatar_url: Option<String>,
+}
+
+/// Store one profile field and copy it into every joined room's member
+/// event — the propagation the spec asks for, and the step that carries a
+/// renamed user across federation, because member events fan out and
+/// profile rows do not.
+fn propagate_profile(state: &AppState, user_id: &str) -> Result<(), MatrixError> {
+    let profile = state
+        .profiles
+        .get(user_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    let rooms = state
+        .rooms
+        .joined(user_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    for room_id in rooms {
+        let mut content = json!({ "membership": "join" });
+        if let Some(name) = &profile.displayname {
+            content["displayname"] = json!(name);
+        }
+        if let Some(url) = &profile.avatar_url {
+            content["avatar_url"] = json!(url);
+        }
+        state
+            .rooms
+            .set_state(
+                &room_id,
+                user_id,
+                state.key.pair(),
+                "m.room.member",
+                user_id,
+                &content,
+            )
+            .map_err(room_error)?;
+    }
+    state.rooms.wake_sync_waiters();
+    Ok(())
+}
+
+/// `PUT /_matrix/client/v3/profile/{userId}/displayname`
+async fn put_profile_displayname(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+    Json(request): Json<DisplaynameRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    if identity.user_id != user_id {
+        return Err(MatrixError::forbidden("a profile belongs to its user"));
+    }
+    state
+        .profiles
+        .set(&user_id, Some(request.displayname), None)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    propagate_profile(&state, &user_id)?;
+    Ok(Json(json!({})))
+}
+
+/// `PUT /_matrix/client/v3/profile/{userId}/avatar_url`
+async fn put_profile_avatar(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+    Json(request): Json<AvatarRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    if identity.user_id != user_id {
+        return Err(MatrixError::forbidden("a profile belongs to its user"));
+    }
+    state
+        .profiles
+        .set(&user_id, None, Some(request.avatar_url))
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    propagate_profile(&state, &user_id)?;
+    Ok(Json(json!({})))
 }
 
 /// The body every membership endpoint that names a target shares.
