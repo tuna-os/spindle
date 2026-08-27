@@ -90,6 +90,42 @@ fn account_routes() -> Router<AppState> {
         .route("/_matrix/client/v3/keys/claim", post(claim_keys))
         .route("/_matrix/client/v3/keys/changes", get(key_changes))
         .route(
+            "/_matrix/client/v3/keys/device_signing/upload",
+            post(upload_cross_signing),
+        )
+        .route(
+            "/_matrix/client/v3/keys/signatures/upload",
+            post(upload_signatures),
+        )
+        .route(
+            "/_matrix/client/v3/room_keys/version",
+            post(create_backup_version).get(latest_backup_version),
+        )
+        .route(
+            "/_matrix/client/v3/room_keys/version/{version}",
+            get(get_backup_version)
+                .put(update_backup_version)
+                .delete(delete_backup_version),
+        )
+        .route(
+            "/_matrix/client/v3/room_keys/keys",
+            axum::routing::put(put_backup_keys)
+                .get(get_backup_keys)
+                .delete(delete_backup_keys),
+        )
+        .route(
+            "/_matrix/client/v3/room_keys/keys/{room_id}",
+            axum::routing::put(put_backup_room)
+                .get(get_backup_room)
+                .delete(delete_backup_room),
+        )
+        .route(
+            "/_matrix/client/v3/room_keys/keys/{room_id}/{session_id}",
+            axum::routing::put(put_backup_session)
+                .get(get_backup_session)
+                .delete(delete_backup_session),
+        )
+        .route(
             "/_matrix/client/v3/sendToDevice/{event_type}/{txn_id}",
             axum::routing::put(send_to_device),
         )
@@ -2000,7 +2036,7 @@ struct QueryKeysRequest {
 /// `POST /_matrix/client/v3/keys/query`
 async fn query_keys(
     State(state): State<AppState>,
-    Authenticated(_identity): Authenticated,
+    Authenticated(identity): Authenticated,
     Json(request): Json<QueryKeysRequest>,
 ) -> Result<Json<Value>, MatrixError> {
     let mut device_keys = serde_json::Map::new();
@@ -2021,7 +2057,38 @@ async fn query_keys(
         };
         device_keys.insert(user_id.clone(), Value::Object(narrowed));
     }
-    Ok(Json(json!({ "device_keys": device_keys, "failures": {} })))
+    // Cross-signing keys ride along for every queried user. The
+    // user-signing key is the exception: it exists to sign *other people*,
+    // which is nobody else's business — only its owner gets it back.
+    let mut master_keys = serde_json::Map::new();
+    let mut self_signing_keys = serde_json::Map::new();
+    let mut user_signing_keys = serde_json::Map::new();
+    for user_id in request.device_keys.keys() {
+        let fetch = |key_type: &str| {
+            state
+                .devices
+                .cross_signing_key(user_id, key_type)
+                .map_err(|error| MatrixError::internal(&error.to_string()))
+        };
+        if let Some(key) = fetch("master")? {
+            master_keys.insert(user_id.clone(), key);
+        }
+        if let Some(key) = fetch("self_signing")? {
+            self_signing_keys.insert(user_id.clone(), key);
+        }
+        if user_id == &identity.user_id
+            && let Some(key) = fetch("user_signing")?
+        {
+            user_signing_keys.insert(user_id.clone(), key);
+        }
+    }
+    Ok(Json(json!({
+        "device_keys": device_keys,
+        "master_keys": master_keys,
+        "self_signing_keys": self_signing_keys,
+        "user_signing_keys": user_signing_keys,
+        "failures": {},
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2092,6 +2159,481 @@ async fn key_changes(
         .0;
     let changed = visible_device_changes(&state, &identity, from, to)?;
     Ok(Json(json!({ "changed": changed, "left": [] })))
+}
+
+// The postfix repetition is the spec's: these are the endpoint's three wire
+// field names, verbatim.
+#[allow(clippy::struct_field_names)]
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct CrossSigningUpload {
+    master_key: Option<Value>,
+    self_signing_key: Option<Value>,
+    user_signing_key: Option<Value>,
+}
+
+/// `POST /_matrix/client/v3/keys/device_signing/upload`
+async fn upload_cross_signing(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    Json(request): Json<CrossSigningUpload>,
+) -> Result<Json<Value>, MatrixError> {
+    let uploads = [
+        ("master", &request.master_key),
+        ("self_signing", &request.self_signing_key),
+        ("user_signing", &request.user_signing_key),
+    ];
+    for (key_type, key) in uploads {
+        let Some(key) = key else { continue };
+        // The same rule as /keys/upload: the body's claim must match the
+        // authenticated caller, or any account could plant a master key on
+        // another's identity and own every verification derived from it.
+        if key["user_id"].as_str() != Some(identity.user_id.as_str()) {
+            return Err(MatrixError::forbidden(
+                "cross-signing keys must belong to the uploading user",
+            ));
+        }
+        state
+            .devices
+            .upload_cross_signing(&identity.user_id, key_type, key)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    }
+    // New cross-signing keys are a device-list change: peers must re-query
+    // before they can trust (or distrust) the new signing tree.
+    let seq = state.rooms.allocate_stream_id();
+    state
+        .devices
+        .mark_device_list_changed(&identity.user_id, seq)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    state.rooms.wake_sync_waiters();
+    Ok(Json(json!({})))
+}
+
+/// `POST /_matrix/client/v3/keys/signatures/upload`
+async fn upload_signatures(
+    State(state): State<AppState>,
+    Authenticated(_identity): Authenticated,
+    Json(request): Json<serde_json::Map<String, Value>>,
+) -> Result<Json<Value>, MatrixError> {
+    let mut failures = serde_json::Map::new();
+    for (user_id, targets) in &request {
+        let Some(targets) = targets.as_object() else {
+            continue;
+        };
+        for (target, signed) in targets {
+            let added = state
+                .devices
+                .add_signatures(user_id, target, signed)
+                .map_err(|error| MatrixError::internal(&error.to_string()))?;
+            if !added {
+                // The spec's failure shape: per-target errors, not a failed
+                // request — the other signatures in the batch still landed.
+                failures
+                    .entry(user_id.clone())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()))
+                    .as_object_mut()
+                    .expect("just inserted an object")
+                    .insert(
+                        target.clone(),
+                        json!({ "errcode": "M_NOT_FOUND", "error": "no such key" }),
+                    );
+            }
+        }
+    }
+    Ok(Json(json!({ "failures": failures })))
+}
+
+/// The API's version is a string; storage counts. Anything non-numeric can
+/// name no stored version, and "no such version" is 404 territory.
+fn parse_backup_version(version: &str) -> Result<u64, MatrixError> {
+    version.parse::<u64>().map_err(|_| {
+        MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            format!("no backup version {version}"),
+        )
+    })
+}
+
+fn backup_version_body(info: &crate::backups::VersionInfo) -> Value {
+    json!({
+        "algorithm": info.algorithm,
+        "auth_data": info.auth_data,
+        "count": info.count,
+        "etag": info.etag.to_string(),
+        "version": info.version.to_string(),
+    })
+}
+
+fn backup_error(error: &spindle_store::StoreError) -> MatrixError {
+    MatrixError::internal(&error.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateBackupRequest {
+    algorithm: String,
+    auth_data: Value,
+}
+
+/// `POST /_matrix/client/v3/room_keys/version`
+async fn create_backup_version(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    Json(request): Json<CreateBackupRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    let version = state
+        .backups
+        .create_version(&identity.user_id, &request.algorithm, &request.auth_data)
+        .map_err(|error| backup_error(&error))?;
+    Ok(Json(json!({ "version": version.to_string() })))
+}
+
+/// `GET /_matrix/client/v3/room_keys/version`
+async fn latest_backup_version(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+) -> Result<Json<Value>, MatrixError> {
+    let Some(info) = state
+        .backups
+        .latest_version(&identity.user_id)
+        .map_err(|error| backup_error(&error))?
+    else {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "no backup exists".to_owned(),
+        ));
+    };
+    Ok(Json(backup_version_body(&info)))
+}
+
+/// `GET /_matrix/client/v3/room_keys/version/{version}`
+async fn get_backup_version(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(version): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    let version = parse_backup_version(&version)?;
+    let Some(info) = state
+        .backups
+        .version(&identity.user_id, version)
+        .map_err(|error| backup_error(&error))?
+    else {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            format!("no backup version {version}"),
+        ));
+    };
+    Ok(Json(backup_version_body(&info)))
+}
+
+/// `PUT /_matrix/client/v3/room_keys/version/{version}`
+async fn update_backup_version(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(version): axum::extract::Path<String>,
+    Json(request): Json<CreateBackupRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    let version = parse_backup_version(&version)?;
+    let Some(info) = state
+        .backups
+        .version(&identity.user_id, version)
+        .map_err(|error| backup_error(&error))?
+    else {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            format!("no backup version {version}"),
+        ));
+    };
+    // Same algorithm only: changing the algorithm mid-version would leave a
+    // backup whose entries no one recipe decrypts. A new algorithm is a new
+    // version.
+    if request.algorithm != info.algorithm {
+        return Err(MatrixError::bad_json(
+            "the algorithm of an existing backup cannot change".to_owned(),
+        ));
+    }
+    state
+        .backups
+        .update_version(
+            &identity.user_id,
+            version,
+            &request.algorithm,
+            &request.auth_data,
+        )
+        .map_err(|error| backup_error(&error))?;
+    Ok(Json(json!({})))
+}
+
+/// `DELETE /_matrix/client/v3/room_keys/version/{version}`
+async fn delete_backup_version(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(version): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    let version = parse_backup_version(&version)?;
+    state
+        .backups
+        .delete_version(&identity.user_id, version)
+        .map_err(|error| backup_error(&error))?;
+    // Deleting the already-deleted succeeds quietly: the state the caller
+    // asked for is the state that holds.
+    Ok(Json(json!({})))
+}
+
+#[derive(Debug, Deserialize)]
+struct BackupQuery {
+    version: String,
+}
+
+/// Reads may name any *live* version; a deleted or never-created one is 404.
+///
+/// Returning an empty backup instead would be worse than the error: a
+/// restoring client would conclude its history is simply gone.
+fn require_live_version(
+    state: &AppState,
+    user_id: &str,
+    requested: &str,
+) -> Result<u64, MatrixError> {
+    let version = parse_backup_version(requested)?;
+    state
+        .backups
+        .version(user_id, version)
+        .map_err(|error| backup_error(&error))?
+        .ok_or_else(|| {
+            MatrixError::new(
+                StatusCode::NOT_FOUND,
+                "M_NOT_FOUND",
+                format!("no backup version {version}"),
+            )
+        })?;
+    Ok(version)
+}
+
+/// The version every write must name: the *current* one.
+///
+/// A client writing to an old version is a client that missed a reset —
+/// its recovery key no longer opens the live backup, and accepting the
+/// write would strand those keys where no restore will look. 403 with the
+/// current version is the spec's way of saying "re-fetch and re-encrypt".
+fn require_current_version(
+    state: &AppState,
+    user_id: &str,
+    requested: &str,
+) -> Result<u64, MatrixError> {
+    let requested = parse_backup_version(requested)?;
+    let current = state
+        .backups
+        .latest_version(user_id)
+        .map_err(|error| backup_error(&error))?
+        .ok_or_else(|| {
+            MatrixError::new(
+                StatusCode::NOT_FOUND,
+                "M_NOT_FOUND",
+                "no backup exists".to_owned(),
+            )
+        })?;
+    if requested != current.version {
+        return Err(MatrixError::new(
+            StatusCode::FORBIDDEN,
+            "M_WRONG_ROOM_KEYS_VERSION",
+            format!("the current backup version is {}", current.version),
+        ));
+    }
+    Ok(requested)
+}
+
+fn backup_summary(state: &AppState, user_id: &str, version: u64) -> Result<Value, MatrixError> {
+    let info = state
+        .backups
+        .version(user_id, version)
+        .map_err(|error| backup_error(&error))?
+        .ok_or_else(|| MatrixError::internal("backup vanished mid-request"))?;
+    Ok(json!({ "etag": info.etag.to_string(), "count": info.count }))
+}
+
+/// `PUT /_matrix/client/v3/room_keys/keys`
+async fn put_backup_keys(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Query(query): axum::extract::Query<BackupQuery>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, MatrixError> {
+    let version = require_current_version(&state, &identity.user_id, &query.version)?;
+    if let Some(rooms) = request["rooms"].as_object() {
+        for (room_id, room) in rooms {
+            store_backup_room(&state, &identity.user_id, version, room_id, room)?;
+        }
+    }
+    Ok(Json(backup_summary(&state, &identity.user_id, version)?))
+}
+
+fn store_backup_room(
+    state: &AppState,
+    user_id: &str,
+    version: u64,
+    room_id: &str,
+    room: &Value,
+) -> Result<(), MatrixError> {
+    if let Some(sessions) = room["sessions"].as_object() {
+        for (session_id, data) in sessions {
+            state
+                .backups
+                .put_key(user_id, version, room_id, session_id, data)
+                .map_err(|error| backup_error(&error))?;
+        }
+    }
+    Ok(())
+}
+
+/// `GET /_matrix/client/v3/room_keys/keys`
+async fn get_backup_keys(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Query(query): axum::extract::Query<BackupQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    let version = require_live_version(&state, &identity.user_id, &query.version)?;
+    let rooms = state
+        .backups
+        .keys(&identity.user_id, version)
+        .map_err(|error| backup_error(&error))?;
+    Ok(Json(json!({ "rooms": rooms })))
+}
+
+/// `PUT /_matrix/client/v3/room_keys/keys/{room_id}`
+async fn put_backup_room(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<BackupQuery>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, MatrixError> {
+    let version = require_current_version(&state, &identity.user_id, &query.version)?;
+    store_backup_room(&state, &identity.user_id, version, &room_id, &request)?;
+    Ok(Json(backup_summary(&state, &identity.user_id, version)?))
+}
+
+/// `GET /_matrix/client/v3/room_keys/keys/{room_id}`
+async fn get_backup_room(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<BackupQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    let version = require_live_version(&state, &identity.user_id, &query.version)?;
+    let rooms = state
+        .backups
+        .keys(&identity.user_id, version)
+        .map_err(|error| backup_error(&error))?;
+    let sessions = rooms
+        .get(&room_id)
+        .cloned()
+        .unwrap_or_else(|| json!({ "sessions": {} }));
+    Ok(Json(sessions))
+}
+
+/// `PUT /_matrix/client/v3/room_keys/keys/{room_id}/{session_id}`
+async fn put_backup_session(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((room_id, session_id)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<BackupQuery>,
+    Json(data): Json<Value>,
+) -> Result<Json<Value>, MatrixError> {
+    let version = require_current_version(&state, &identity.user_id, &query.version)?;
+    state
+        .backups
+        .put_key(&identity.user_id, version, &room_id, &session_id, &data)
+        .map_err(|error| backup_error(&error))?;
+    Ok(Json(backup_summary(&state, &identity.user_id, version)?))
+}
+
+/// The shared body of the three DELETE granularities.
+///
+/// Deletes go through the current-version rule like writes do: a client
+/// deleting from a superseded version thinks it is trimming the live
+/// backup, and quietly deleting somewhere else would let it believe it did.
+fn delete_backup(
+    state: &AppState,
+    user_id: &str,
+    requested: &str,
+    room_id: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<Json<Value>, MatrixError> {
+    let version = require_current_version(state, user_id, requested)?;
+    state
+        .backups
+        .delete_keys(user_id, version, room_id, session_id)
+        .map_err(|error| backup_error(&error))?;
+    Ok(Json(backup_summary(state, user_id, version)?))
+}
+
+/// `DELETE /_matrix/client/v3/room_keys/keys`
+async fn delete_backup_keys(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Query(query): axum::extract::Query<BackupQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    delete_backup(&state, &identity.user_id, &query.version, None, None)
+}
+
+/// `DELETE /_matrix/client/v3/room_keys/keys/{room_id}`
+async fn delete_backup_room(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<BackupQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    delete_backup(
+        &state,
+        &identity.user_id,
+        &query.version,
+        Some(&room_id),
+        None,
+    )
+}
+
+/// `DELETE /_matrix/client/v3/room_keys/keys/{room_id}/{session_id}`
+async fn delete_backup_session(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((room_id, session_id)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<BackupQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    delete_backup(
+        &state,
+        &identity.user_id,
+        &query.version,
+        Some(&room_id),
+        Some(&session_id),
+    )
+}
+
+/// `GET /_matrix/client/v3/room_keys/keys/{room_id}/{session_id}`
+async fn get_backup_session(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((room_id, session_id)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<BackupQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    let version = require_live_version(&state, &identity.user_id, &query.version)?;
+    let rooms = state
+        .backups
+        .keys(&identity.user_id, version)
+        .map_err(|error| backup_error(&error))?;
+    let Some(data) = rooms
+        .get(&room_id)
+        .and_then(|room| room["sessions"].get(&session_id))
+    else {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "no such session in the backup".to_owned(),
+        ));
+    };
+    Ok(Json(data.clone()))
 }
 
 #[derive(Debug, Deserialize)]

@@ -163,6 +163,22 @@ pub enum Keyspace {
     /// `/sync` asks is "who changed since my token" — a watermark answers it
     /// and a history would only say the same name more times.
     DeviceListChange = 0x19,
+    /// `(user_id, version)` -> a key backup version's metadata.
+    ///
+    /// `version` is big-endian so the latest is the last row of a prefix
+    /// scan. Deleting a version keeps the row as a tombstone: version
+    /// numbers must never be reused, because a client still holding the
+    /// deleted version's number must get "gone", not someone new wearing it.
+    KeyBackup = 0x1a,
+    /// `(user_id, version, room_id, session_id)` -> one backed-up room key.
+    ///
+    /// The server cannot read these (they are encrypted to the backup's
+    /// recovery key); what it enforces is the *replacement rule* — a stored
+    /// key is only overwritten by a strictly better one — so a malicious or
+    /// confused client cannot degrade a backup it can write to.
+    KeyBackupData = 0x1b,
+    /// `(user_id, key_type)` -> a cross-signing key (master, self, user).
+    CrossSigning = 0x1c,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -441,6 +457,39 @@ pub fn device_scoped(keyspace: Keyspace, user_id: &str, device_id: &str, suffix:
     key.extend_from_slice(&len.to_be_bytes());
     key.extend_from_slice(&device[..len as usize]);
     key.extend_from_slice(suffix);
+    key
+}
+
+/// `(user_id, version)` key for [`Keyspace::KeyBackup`].
+#[must_use]
+pub fn key_backup_version(user_id: &str, version: u64) -> Vec<u8> {
+    let mut key = user_prefix(Keyspace::KeyBackup, user_id);
+    key.extend_from_slice(&version.to_be_bytes());
+    key
+}
+
+/// `(user_id, version, room_id, session_id)` key for [`Keyspace::KeyBackupData`].
+///
+/// Room and session are length-prefixed, as everywhere else: a raw join
+/// would let `("ab", "c")` and `("a", "bc")` collide.
+#[must_use]
+pub fn key_backup_data(user_id: &str, version: u64, room_id: &str, session_id: &str) -> Vec<u8> {
+    let mut key = user_prefix(Keyspace::KeyBackupData, user_id);
+    key.extend_from_slice(&version.to_be_bytes());
+    for part in [room_id, session_id] {
+        let bytes = part.as_bytes();
+        let len = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
+        key.extend_from_slice(&len.to_be_bytes());
+        key.extend_from_slice(&bytes[..len as usize]);
+    }
+    key
+}
+
+/// `(user_id, key_type)` key for [`Keyspace::CrossSigning`].
+#[must_use]
+pub fn cross_signing(user_id: &str, key_type: &str) -> Vec<u8> {
+    let mut key = user_prefix(Keyspace::CrossSigning, user_id);
+    key.extend_from_slice(key_type.as_bytes());
     key
 }
 
