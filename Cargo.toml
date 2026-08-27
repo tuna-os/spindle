@@ -33,6 +33,11 @@ im = "15"
 ruma = { version = "0.16", features = ["signatures", "state-res", "events"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Appservice registration files are YAML by spec, and their namespaces are
+# anchored regular expressions — both formats arrive from the operator, not
+# the network.
+serde_yaml = "0.9"
+regex = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
 toml = "0.8"

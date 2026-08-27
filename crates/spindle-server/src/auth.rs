@@ -27,10 +27,90 @@ impl FromRequestParts<AppState> for Authenticated {
         let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
         match accounts.identify(&token) {
             Ok(Some(identity)) => Ok(Self(identity)),
-            Ok(None) => Err(MatrixError::unknown_token()),
+            Ok(None) => appservice_identity(parts, state, &token).map(Self),
             Err(error) => Err(MatrixError::internal(&error.to_string())),
         }
     }
+}
+
+/// Resolve an appservice's token into the identity it is acting as.
+///
+/// An appservice is a client with a skeleton key over its namespaces: the
+/// token names the *service*, and `?user_id=` names who it speaks as this
+/// request — its own sender user when absent. The authorization check is
+/// namespace membership, not "is an appservice"; outside its namespaces
+/// the service is a stranger and the spec's `M_EXCLUSIVE` says so.
+///
+/// Virtual users are provisioned on first use. A bridge's users exist
+/// because the bridge speaks as them — demanding a registration round-trip
+/// first would only make every bridge implement one, badly, with a forged
+/// login. The account is created with an unguessable password nobody
+/// holds, because these accounts are entered through this door only.
+fn appservice_identity(
+    parts: &Parts,
+    state: &AppState,
+    token: &str,
+) -> Result<Identity, MatrixError> {
+    let Some(registration) = state.appservices.by_token(token) else {
+        return Err(MatrixError::unknown_token());
+    };
+    let server_name = &state.config.server.name;
+    let user_id = parts
+        .uri
+        .query()
+        .and_then(|query| {
+            form_urlencoded::parse(query.as_bytes())
+                .find(|(key, _)| key == "user_id")
+                .map(|(_, value)| value.into_owned())
+        })
+        .unwrap_or_else(|| registration.sender_user(server_name));
+    if !registration.may_masquerade_as(&user_id, server_name) {
+        return Err(MatrixError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            "M_EXCLUSIVE",
+            format!(
+                "{user_id} is outside the {} appservice's namespaces",
+                registration.id
+            ),
+        ));
+    }
+    let Some(localpart) = user_id
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(':'))
+        .filter(|(_, domain)| domain == server_name)
+        .map(|(localpart, _)| localpart)
+    else {
+        return Err(MatrixError::forbidden(
+            "an appservice may only act as users of this server",
+        ));
+    };
+    let accounts = Accounts::new(state.store.as_ref(), server_name);
+    let known = accounts
+        .account(localpart)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+        .is_some();
+    if !known {
+        let password = {
+            use rand::RngCore as _;
+            use std::fmt::Write as _;
+            let mut bytes = [0_u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut bytes);
+            bytes.iter().fold(String::new(), |mut out, byte| {
+                let _ = write!(out, "{byte:02x}");
+                out
+            })
+        };
+        accounts
+            .register(localpart, &password)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    }
+    Ok(Identity {
+        user_id,
+        // Appservices have no device of their own until MSC4190 device
+        // management lands; a stable synthetic ID keeps everything keyed
+        // by device (transaction replay, to-device) coherent.
+        device_id: format!("appservice_{}", registration.id),
+    })
 }
 
 /// A caller who may or may not have presented a token.
@@ -59,7 +139,7 @@ impl FromRequestParts<AppState> for MaybeAuthenticated {
         let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
         match accounts.identify(&token) {
             Ok(Some(identity)) => Ok(Self(Some(identity))),
-            Ok(None) => Err(MatrixError::unknown_token()),
+            Ok(None) => appservice_identity(parts, state, &token).map(|id| Self(Some(id))),
             Err(error) => Err(MatrixError::internal(&error.to_string())),
         }
     }
