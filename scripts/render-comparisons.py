@@ -763,8 +763,27 @@ SCRIPT = """
 """
 
 
+def sitting_order(group: str) -> tuple[int, int, str]:
+    """Chronological rank of a sitting name like `m3-final`.
+
+    Plain reverse-lexicographic sorting filed the M3 close-out *under* the
+    M3 progress sitting, because "p" > "f" — a bug the page shipped with.
+    A sitting's place in time is its milestone number first and its phase
+    within the milestone second; anything unparseable sorts last and keeps
+    its name as the tiebreak, so an unexpected file cannot displace the
+    real latest sitting.
+    """
+    milestone, _, phase = group.partition("-")
+    try:
+        number = int(milestone.lstrip("m"))
+    except ValueError:
+        return (-1, -1, group)
+    ranks = {"progress": 0, "final": 1}
+    return (number, ranks.get(phase, -1), group)
+
+
 def render(groups: dict[str, list[dict]]) -> str:
-    ordered = sorted(groups, reverse=True)
+    ordered = sorted(groups, key=sitting_order, reverse=True)
     latest, older = ordered[0], ordered[1:]
 
     documents = groups[latest]
