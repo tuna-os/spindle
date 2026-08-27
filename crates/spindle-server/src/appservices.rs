@@ -88,6 +88,13 @@ pub struct Registration {
     /// a stream of second-by-second presence noise.
     #[serde(default)]
     pub receive_ephemeral: bool,
+    /// MSC4190: the service manages devices itself. Registration mints
+    /// no session (the `as_token` is the only credential), and the
+    /// service creates and deletes devices through `PUT`/`DELETE
+    /// /devices/{deviceId}` under masquerade. The unstable name is
+    /// accepted because that is what shipping bridges still write.
+    #[serde(default, alias = "io.element.msc4190")]
+    pub device_management: bool,
 }
 
 fn default_rate_limited() -> bool {

@@ -72,6 +72,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(account_routes())
         .merge(appservice_routes())
+        .merge(device_routes())
         .merge(profile_routes())
         .merge(room_routes())
         .merge(timeline_routes())
@@ -115,6 +116,17 @@ fn appservice_routes() -> Router<AppState> {
         "/_matrix/client/v1/appservice/{appservice_id}/ping",
         post(appservice_ping),
     )
+}
+
+/// Device management: listing, renaming, deletion — and MSC4190's
+/// appservice half, where PUT mints a device with no session behind it.
+fn device_routes() -> Router<AppState> {
+    Router::new()
+        .route("/_matrix/client/v3/devices", get(list_devices))
+        .route(
+            "/_matrix/client/v3/devices/{device_id}",
+            get(get_device).put(put_device).delete(delete_device),
+        )
 }
 
 fn account_routes() -> Router<AppState> {
@@ -1211,7 +1223,10 @@ fn register_appservice_user(
             AccountError::InvalidUsername => MatrixError::invalid_username(),
             other => MatrixError::internal(&other.to_string()),
         })?;
-    if request.inhibit_login {
+    // MSC4190: a device-managing service gets no session even when it did
+    // not ask to inhibit one — the as_token is its only credential, and
+    // devices are minted through PUT /devices/{deviceId} instead.
+    if request.inhibit_login || registration.device_management {
         return Ok((StatusCode::OK, Json(json!({ "user_id": user_id }))));
     }
     let session = accounts
@@ -1326,6 +1341,183 @@ async fn appservice_ping(
             "duration_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         }))),
     }
+}
+
+/// The registration behind this request's bearer token, if it is an
+/// appservice token. Deliberately not derived from the authenticated
+/// identity: device IDs are client-chosen at login, so anything derived
+/// from them can be worn as a costume by an ordinary account.
+fn appservice_of<'a>(
+    state: &'a AppState,
+    headers: &axum::http::HeaderMap,
+) -> Option<&'a std::sync::Arc<crate::appservices::Registration>> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)?;
+    state.appservices.by_token(token)
+}
+
+/// A device as the spec's `Device` object. Spindle does not track
+/// last-seen data, and the spec has those fields optional, so they are
+/// absent rather than present-and-wrong.
+fn device_body(device: &crate::accounts::Device) -> Value {
+    json!({
+        "device_id": device.device_id,
+        "display_name": device.display_name,
+    })
+}
+
+/// `GET /_matrix/client/v3/devices`
+async fn list_devices(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+) -> Result<Json<Value>, MatrixError> {
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let devices = accounts
+        .devices_of(&localpart_of(&identity.user_id))
+        .map_err(|error| internal(&error))?;
+    Ok(Json(json!({
+        "devices": devices.iter().map(device_body).collect::<Vec<_>>(),
+    })))
+}
+
+/// `GET /_matrix/client/v3/devices/{deviceId}`
+async fn get_device(
+    State(state): State<AppState>,
+    axum::extract::Path(device_id): axum::extract::Path<String>,
+    Authenticated(identity): Authenticated,
+) -> Result<Json<Value>, MatrixError> {
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    accounts
+        .device(&localpart_of(&identity.user_id), &device_id)
+        .map_err(|error| internal(&error))?
+        .map(|device| Json(device_body(&device)))
+        .ok_or_else(|| MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such device"))
+}
+
+/// `PUT /_matrix/client/v3/devices/{deviceId}`
+///
+/// For everyone, this renames an existing device. For a service whose
+/// registration declares MSC4190 device management, a PUT on a device
+/// that does not exist *creates* it — the deviceless registration's way
+/// of minting the device its encryption keys will hang off, with no
+/// access token behind it because the `as_token` is the only credential.
+async fn put_device(
+    State(state): State<AppState>,
+    axum::extract::Path(device_id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    Authenticated(identity): Authenticated,
+    body: Option<Json<Value>>,
+) -> Result<(StatusCode, Json<Value>), MatrixError> {
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let localpart = localpart_of(&identity.user_id);
+    let named = body
+        .as_ref()
+        .and_then(|Json(body)| body.get("display_name").cloned());
+    let display_of = |named: Option<Value>, unchanged: Option<String>| match named {
+        None => Ok(unchanged),
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(name)) => Ok(Some(name)),
+        Some(_) => Err(MatrixError::bad_json("display_name must be a string")),
+    };
+    if let Some(existing) = accounts
+        .device(&localpart, &device_id)
+        .map_err(|error| internal(&error))?
+    {
+        let display_name = display_of(named, existing.display_name)?;
+        accounts
+            .put_device(&localpart, &device_id, display_name)
+            .map_err(|error| internal(&error))?;
+        return Ok((StatusCode::OK, Json(json!({}))));
+    }
+    if !appservice_of(&state, &headers).is_some_and(|registration| registration.device_management) {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "no such device",
+        ));
+    }
+    let display_name = display_of(named, None)?;
+    accounts
+        .put_device(&localpart, &device_id, display_name)
+        .map_err(|error| internal(&error))?;
+    let seq = state.rooms.allocate_stream_id();
+    state
+        .devices
+        .mark_device_list_changed(&identity.user_id, seq)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    state.rooms.wake_sync_waiters();
+    Ok((StatusCode::CREATED, Json(json!({}))))
+}
+
+/// `DELETE /_matrix/client/v3/devices/{deviceId}`
+///
+/// A person re-proves their password (single-stage UIA); a service with
+/// MSC4190 device management deletes outright — its `as_token` outranks a
+/// password that, for a ghost, nobody holds. Deletion takes the sessions
+/// and the E2E material with it, and marks the device list changed so
+/// peers stop encrypting to the dead device.
+async fn delete_device(
+    State(state): State<AppState>,
+    axum::extract::Path(device_id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    Authenticated(identity): Authenticated,
+    body: Option<Json<Value>>,
+) -> Result<(StatusCode, Json<Value>), MatrixError> {
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let localpart = localpart_of(&identity.user_id);
+    if accounts
+        .device(&localpart, &device_id)
+        .map_err(|error| internal(&error))?
+        .is_none()
+    {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "no such device",
+        ));
+    }
+    let manages =
+        appservice_of(&state, &headers).is_some_and(|registration| registration.device_management);
+    if !manages {
+        let auth = body
+            .as_ref()
+            .and_then(|Json(body)| body.get("auth").cloned())
+            .filter(|auth| auth["session"].is_string() && auth["type"] == "m.login.password");
+        let Some(auth) = auth else {
+            return Ok((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "flows": [{ "stages": ["m.login.password"] }],
+                    "params": {},
+                    "session": "delete_device",
+                })),
+            ));
+        };
+        let password = auth["password"].as_str().unwrap_or_default();
+        if !accounts
+            .verify_password(&localpart, password)
+            .map_err(|error| internal(&error))?
+        {
+            return Err(MatrixError::forbidden("wrong password"));
+        }
+    }
+    accounts
+        .delete_device(&localpart, &device_id)
+        .map_err(|error| internal(&error))?;
+    state
+        .devices
+        .remove_device_material(&identity.user_id, &device_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    let seq = state.rooms.allocate_stream_id();
+    state
+        .devices
+        .mark_device_list_changed(&identity.user_id, seq)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    state.rooms.wake_sync_waiters();
+    Ok((StatusCode::OK, Json(json!({}))))
 }
 
 /// `@alice:example.org` and `alice` both mean the same localpart.
