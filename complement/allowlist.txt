@@ -1,21 +1,133 @@
-# Complement tests Spindle is expected to pass.
+# Complement tests Spindle must pass — the conformance ratchet.
 #
-# A ratchet, not a wish list: a test named here must pass, and CI fails if it
-# stops passing. Adding a name before the feature exists inverts that -- it
-# turns the file into a list of aspirations that are always red, which everyone
-# then learns to ignore.
+# Every name here must pass; CI fails naming whatever regressed
+# (scripts/complement-check.py). Pull requests run exactly this protected
+# subset; pushes to main run the whole suite and print newly passing tests
+# as candidates. Promotion into this list is a reviewed decision: a test
+# enters after passing two consecutive full local runs (the baseline and a
+# verification re-run), never automatically — a flaky test promoted by a
+# script would teach everyone to ignore this gate.
 #
-# It is empty, and that is the accurate state of things. #62 builds the server
-# shell: discovery answers, the container starts, the health check passes.
-# Nothing else exists yet, so no Complement test can pass. The image is here to
-# satisfy the *startup* contract and to make the next milestone's tests runnable
-# the day they can pass, not because anything passes today.
+# Names are Go test names as Complement reports them, one per line;
+# subtests are protected individually, so a parent whose other children
+# still fail does not block protecting the children that pass.
 #
-# Names are Go test names, one per line, as Complement reports them:
-#   TestLogin
-#   TestCreateRoom/parallel/Parallel
-#
-# What unblocks the first entries, in order:
-#   #11  registration and login          -> TestLogin, TestRegistration
-#   #7   rooms, state, timelines         -> TestCreateRoom, TestRoomState
-#   #10  sync                            -> TestSync*
+# Seeded 2026-08-27 against matrix-org/complement @ the revision pinned in
+# scripts/complement.sh (image: complement/Dockerfile at this commit).
+TestAddAccountData
+TestAddAccountData/Can_add_global_account_data
+TestAddAccountData/Can_add_room_account_data
+TestChangePassword/After_changing_password,_existing_session_still_works
+TestContentCSAPIMediaV1
+TestDeviceManagement/GET_/device/{deviceId}_gives_a_404_for_unknown_devices
+TestDeviceManagement/PUT_/device/{deviceId}_gives_a_404_for_unknown_devices
+TestE2EKeyBackupReplaceRoomKeyRules
+TestE2EKeyBackupReplaceRoomKeyRules/parallel
+TestE2EKeyBackupReplaceRoomKeyRules/parallel/{isVerified:false_firstMessageIndex:10_forwardedCount:5}
+TestE2EKeyBackupReplaceRoomKeyRules/parallel/{isVerified:true_firstMessageIndex:10_forwardedCount:5}
+TestFetchEventWorldReadable
+TestGappedSyncLeaveSection
+TestLocalPngThumbnail/test_/_matrix/client/v1/media_endpoint
+TestLogin
+TestLogin/parallel
+TestLogin/parallel/GET_/login_yields_a_set_of_flows
+TestLogin/parallel/Login_with_uppercase_username_works_and_GET_/whoami_afterwards_also
+TestLogin/parallel/POST_/login_as_non-existing_user_is_rejected
+TestLogin/parallel/POST_/login_can_log_in_as_a_user_with_just_the_local_part_of_the_id
+TestLogin/parallel/POST_/login_can_login_as_user
+TestLogin/parallel/POST_/login_returns_the_same_device_id_as_that_in_the_request
+TestLogin/parallel/POST_/login_wrong_password_is_rejected
+TestLogout/Request_to_logout_with_invalid_an_access_token_is_rejected
+TestLogout/Request_to_logout_without_an_access_token_is_rejected
+TestMSC4289PrivilegedRoomCreators_AdditionalValidation/additional_creators_are_valid
+TestMediaConfig
+TestMediaFilenames/Parallel/ASCII/Can_download_file_'ascii'_over_/_matrix/client/v1/media/download
+TestMediaFilenames/Parallel/ASCII/Can_download_file_'name;with;semicolons'_over_/_matrix/client/v1/media/download
+TestMediaFilenames/Parallel/ASCII/Can_download_file_'name_with_spaces'_over_/_matrix/client/v1/media/download
+TestMediaFilenames/Parallel/ASCII/Can_upload_with_ASCII_file_name
+TestMediaFilenames/Parallel/Unicode/Can_download_with_Unicode_file_name_locally_over__matrix/client/v1/media/download
+TestMediaFilenames/Parallel/Unicode/Can_upload_with_Unicode_file_name
+TestMediaWithoutFileName/parallel/Can_upload_without_a_file_name
+TestMediaWithoutFileNameCSMediaV1/parallel/Can_download_without_a_file_name_locally
+TestMediaWithoutFileNameCSMediaV1/parallel/Can_upload_without_a_file_name
+TestPushRuleCacheHealth
+TestRegistration
+TestRegistration/parallel
+TestRegistration/parallel/GET_/register/available_returns_M_INVALID_USERNAME_for_invalid_user_name
+TestRegistration/parallel/GET_/register/available_returns_M_USER_IN_USE_for_registered_user_name
+TestRegistration/parallel/GET_/register/available_returns_available_for_unregistered_user_name
+TestRegistration/parallel/POST_/register_allows_registration_of_usernames_with_
+TestRegistration/parallel/POST_/register_allows_registration_of_usernames_with_/-
+TestRegistration/parallel/POST_/register_allows_registration_of_usernames_with_/.
+TestRegistration/parallel/POST_/register_allows_registration_of_usernames_with_//
+TestRegistration/parallel/POST_/register_allows_registration_of_usernames_with_/3
+TestRegistration/parallel/POST_/register_allows_registration_of_usernames_with_/=
+TestRegistration/parallel/POST_/register_allows_registration_of_usernames_with_/_
+TestRegistration/parallel/POST_/register_allows_registration_of_usernames_with_/q
+TestRegistration/parallel/POST_/register_can_create_a_user
+TestRegistration/parallel/POST_/register_downcases_capitals_in_usernames
+TestRegistration/parallel/POST_/register_rejects_if_user_already_exists
+TestRegistration/parallel/POST_/register_rejects_usernames_with_special_characters
+TestRegistration/parallel/POST_/register_returns_the_same_device_id_as_that_in_the_request
+TestRegistration/parallel/POST_{}_returns_a_set_of_flows
+TestRegistration/parallel/Registration_accepts_non-ascii_passwords
+TestRegistration/parallel/Registration_without_a_session_fails
+TestRelations
+TestRestrictedRoomsLocalJoin/Join_should_fail_initially
+TestRestrictedRoomsLocalJoin/Join_should_succeed_when_invited
+TestRestrictedRoomsLocalJoinInMSC3787Room/Join_should_fail_initially
+TestRestrictedRoomsLocalJoinInMSC3787Room/Join_should_succeed_when_invited
+TestRestrictedRoomsRemoteJoin/Join_should_fail_initially
+TestRestrictedRoomsRemoteJoinInMSC3787Room/Join_should_fail_initially
+TestRoomAlias
+TestRoomAlias/Parallel
+TestRoomAlias/Parallel/GET_/rooms/:room_id/aliases_lists_aliases
+TestRoomAlias/Parallel/Only_room_members_can_list_aliases_of_a_room
+TestRoomAlias/Parallel/PUT_/directory/room/:room_alias_creates_alias
+TestRoomAlias/Parallel/Room_aliases_can_contain_Unicode
+TestRoomCreate/Parallel/Can_/sync_newly_created_room
+TestRoomCreate/Parallel/POST_/createRoom_makes_a_private_room
+TestRoomCreate/Parallel/POST_/createRoom_makes_a_private_room_with_invites
+TestRoomCreate/Parallel/POST_/createRoom_makes_a_public_room
+TestRoomCreationReportsEventsToMyself/parallel/Room_creation_reports_m.room.create_to_myself
+TestRoomCreationReportsEventsToMyself/parallel/Room_creation_reports_m.room.member_to_myself
+TestRoomDeleteAlias/Parallel/Deleting_a_non-existent_alias_should_return_a_404
+TestRoomDeleteAlias/Parallel/Regular_users_can_add_and_delete_aliases_in_the_default_room_configuration
+TestRoomDeleteAlias/Parallel/Users_can't_delete_other's_aliases
+TestRoomForget/Parallel/Can_forget_room_we_weren't_an_actual_member
+TestRoomForget/Parallel/Can_re-join_room_if_re-invited
+TestRoomMembers/Parallel/POST_/rooms/:room_id/invite_can_send_an_invite
+TestRoomState/Parallel/GET_/joined_rooms_lists_newly-created_room
+TestRoomState/Parallel/GET_/rooms/:room_id/joined_members_fetches_my_membership
+TestRoomState/Parallel/GET_/rooms/:room_id/state/m.room.member/:user_id_fetches_my_membership
+TestRoomState/Parallel/GET_/rooms/:room_id/state/m.room.name_gets_name
+TestRoomState/Parallel/GET_/rooms/:room_id/state/m.room.topic_gets_topic
+TestRoomState/Parallel/GET_/rooms/:room_id/state_fetches_entire_room_state
+TestRoomState/Parallel/POST_/rooms/:room_id/state/m.room.name_sets_name
+TestRoomState/Parallel/PUT_/rooms/:room_id/state/m.room.topic_sets_topic
+TestRoomSummaryAllowedRoomIDs/non-restricted_room_omits_allowed_room_ids
+TestRoomsInvite/Parallel/Uninvited_users_cannot_join_the_room
+TestRoomsInvite/Parallel/Users_cannot_invite_themselves_to_a_room
+TestSendMessageWithTxn
+TestSync/parallel/Can_sync_a_joined_room
+TestSync/parallel/Full_state_sync_includes_joined_rooms
+TestSync/parallel/Newly_joined_room_is_included_in_an_incremental_sync
+TestSyncFilter
+TestSyncFilter/Can_create_filter
+TestSyncFilter/Can_download_filter
+TestSyncLeaveSection
+TestSyncLeaveSection/Left_rooms_appear_in_the_leave_section_of_full_state_sync
+TestSyncLeaveSection/Left_rooms_appear_in_the_leave_section_of_sync
+TestSyncLeaveSection/Newly_left_rooms_appear_in_the_leave_section_of_incremental_sync
+TestToDeviceMessages
+TestTxnIdempotencyScopedToDevice
+TestUploadKey/Parallel/Can_claim_one_time_key_using_POST
+TestUploadKey/Parallel/Can_query_device_keys_using_POST
+TestUploadKey/Parallel/Can_query_specific_device_keys_using_POST
+TestUploadKey/Parallel/Can_upload_device_keys
+TestUploadKey/Parallel/query_for_user_with_no_keys_returns_empty_key_dict
+TestUploadKeyIdempotency
+TestUploadKeyIdempotencyOverlap
+TestVersionStructure
+TestVersionStructure/Version_responds_200_OK_with_valid_structure
+TestWriteMDirectAccountData

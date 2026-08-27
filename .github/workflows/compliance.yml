@@ -138,3 +138,40 @@ jobs:
       - name: Collect logs on failure
         if: failure()
         run: docker logs spindle-ci || true
+
+  # The Complement ratchet (#62, docs/conformance-testing.md §3): the real
+  # suite, upstream and pinned, against the real image. Pull requests run the
+  # protected subset — every allowlisted test must pass, and quickly, because
+  # this gates every merge. Pushes to main run the whole suite, so newly
+  # passing tests surface as candidates on a cadence where a human promotes
+  # them deliberately; a flaky test promoted automatically would teach
+  # everyone to ignore this gate.
+  complement-suite:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: false
+
+      - name: Compute the protected-subset filter for pull requests
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "COMPLEMENT_RUN=$(python3 scripts/complement-check.py --print-run-filter x)" >> "$GITHUB_ENV"
+
+      - name: Run Complement
+        run: scripts/complement.sh tmp/complement-results.jsonl
+
+      - name: Enforce the allowlist
+        run: python3 scripts/complement-check.py tmp/complement-results.jsonl
+
+      - name: Keep the ledger
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: complement-results
+          path: tmp/complement-results.jsonl
+          if-no-files-found: ignore

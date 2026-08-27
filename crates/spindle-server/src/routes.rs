@@ -74,7 +74,21 @@ pub fn router(state: AppState) -> Router {
         .merge(timeline_routes())
         .merge(media_routes())
         .merge(discovery_routes())
+        // SPEC: an endpoint the server does not recognize answers 404
+        // M_UNRECOGNIZED — a JSON verdict, not a bare status. Clients (and
+        // Complement's TestUnknownEndpoints) read the errcode to tell "this
+        // server does not speak that" from "the thing was not found".
+        .fallback(unknown_endpoint)
         .with_state(state)
+}
+
+/// Any `/_matrix` path no route above claimed.
+async fn unknown_endpoint() -> MatrixError {
+    MatrixError::new(
+        StatusCode::NOT_FOUND,
+        "M_UNRECOGNIZED",
+        "unrecognized endpoint".to_owned(),
+    )
 }
 
 /// Registration, login, and the per-user data that is not in any room.

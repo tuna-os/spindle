@@ -614,3 +614,21 @@ async fn the_uia_challenge_does_not_consume_the_registration_budget() {
     // And a real registration still goes through afterwards.
     harness.register("alice", "hunter2").await;
 }
+
+#[tokio::test]
+async fn unknown_endpoints_answer_m_unrecognized_json() {
+    // A bare 404 tells a client nothing; the errcode distinguishes "this
+    // server does not speak that" from "the thing was not found".
+    let harness = Harness::new();
+    for path in [
+        "/_matrix/unknown",
+        "/_matrix/client/unknown",
+        "/_matrix/federation/unknown",
+        "/_matrix/key/unknown",
+        "/_matrix/media/unknown",
+    ] {
+        let (status, body) = harness.get(path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+        assert_eq!(body["errcode"], "M_UNRECOGNIZED", "{path}: {body}");
+    }
+}
