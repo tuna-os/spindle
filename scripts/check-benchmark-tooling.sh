@@ -75,7 +75,14 @@ grep -q "Spindle vs the field" "$work/comparisons.html"
 grep -q "m2-progress" "$work/comparisons.html"
 grep -q 'class="heatmap"' "$work/comparisons.html"
 grep -q "svg" "$work/comparisons.html"
-echo "comparisons: page built from committed milestone data, charts and heatmap present"
+# The page's interactive layer: the animated architecture race, the styled
+# heatmap tooltips, and the script that drives counters and chart isolation.
+grep -q 'class="archgrid anim"' "$work/comparisons.html"
+grep -q 'data-tip=' "$work/comparisons.html"
+grep -q 'data-count=' "$work/comparisons.html"
+grep -q 'serverchip" data-server=' "$work/comparisons.html"
+grep -q "prefers-reduced-motion" "$work/comparisons.html"
+echo "comparisons: page built from committed milestone data, charts, heatmap, animation and interactions present"
 
 # And an empty data directory must refuse, same reasoning as the collector.
 if python3 "$here/render-comparisons.py" "$empty" "$work/nope.html" 2>/dev/null; then
