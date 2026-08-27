@@ -2304,6 +2304,35 @@ async fn join(
     }
 }
 
+/// Every server worth asking to broker a join, most-specific first.
+///
+/// The client's own `server_name`/`via` hints lead; the domain in the room
+/// ID follows; and a pending invite's origin closes the list — an invited
+/// user accepting knows one server that certainly holds the room, the one
+/// that sent the invite, and clients do not pass `via` when accepting.
+fn join_candidates(
+    state: &AppState,
+    user_id: &str,
+    room_id: &str,
+    servers: &[String],
+) -> Vec<String> {
+    let mut candidates: Vec<String> = servers.to_vec();
+    let push = |domain: &str, candidates: &mut Vec<String>| {
+        if !candidates.iter().any(|server| server == domain) && domain != state.config.server.name {
+            candidates.push(domain.to_owned());
+        }
+    };
+    if let Some((_, domain)) = room_id.split_once(':') {
+        push(domain, &mut candidates);
+    }
+    if let Ok(Some(record)) = state.rooms.pending_invite(user_id, room_id)
+        && let Some(origin) = record["origin"].as_str()
+    {
+        push(origin, &mut candidates);
+    }
+    candidates
+}
+
 /// Walk the `make_join`/`send_join` handshake as the joining server.
 async fn join_remote(
     state: &AppState,
@@ -2311,23 +2340,7 @@ async fn join_remote(
     room_id: &str,
     servers: &[String],
 ) -> Result<Json<Value>, MatrixError> {
-    let mut candidates: Vec<String> = servers.to_vec();
-    if let Some((_, domain)) = room_id.split_once(':')
-        && !candidates.iter().any(|server| server == domain)
-        && domain != state.config.server.name
-    {
-        candidates.push(domain.to_owned());
-    }
-    // An invited user accepting the invite knows one server that certainly
-    // holds the room: the one that sent the invite. Often it is the only
-    // lead — clients do not pass `via` when accepting.
-    if let Ok(Some(record)) = state.rooms.pending_invite(user_id, room_id)
-        && let Some(origin) = record["origin"].as_str()
-        && !candidates.iter().any(|server| server == origin)
-        && origin != state.config.server.name
-    {
-        candidates.push(origin.to_owned());
-    }
+    let candidates = join_candidates(state, user_id, room_id, servers);
     if candidates.is_empty() {
         return Err(MatrixError::new(
             StatusCode::NOT_FOUND,

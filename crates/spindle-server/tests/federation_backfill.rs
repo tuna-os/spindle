@@ -245,12 +245,16 @@ impl Harness {
             .send("POST", "/_matrix/client/v3/createRoom", alice, &json!({}))
             .await;
         let room = body["room_id"].as_str().unwrap().to_owned();
+        // Public join rules rather than an invite: inviting the peer's user
+        // would walk the real `v2/invite` handshake against a peer that is
+        // only a signing identity, and all this room needs is for the
+        // peer's join to authorize.
         let (status, body) = self
             .send(
-                "POST",
-                &format!("/_matrix/client/v3/rooms/{room}/invite"),
+                "PUT",
+                &format!("/_matrix/client/v3/rooms/{room}/state/m.room.join_rules"),
                 alice,
-                &json!({ "user_id": peer.user() }),
+                &json!({ "join_rule": "public" }),
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");

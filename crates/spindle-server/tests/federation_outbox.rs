@@ -44,37 +44,51 @@ impl Stub {
         let record = Arc::clone(&deliveries);
         let gate = Arc::clone(&refuse);
         let refused_log = Arc::clone(&refused_ids);
-        let router = axum::Router::new().route(
-            "/_matrix/federation/v1/send/{txn}",
-            axum::routing::put(
-                move |axum::extract::Path(txn): axum::extract::Path<String>,
-                      headers: axum::http::HeaderMap,
-                      body: String| {
-                    let record = Arc::clone(&record);
-                    let gate = Arc::clone(&gate);
-                    let refused_log = Arc::clone(&refused_log);
-                    async move {
-                        if gate
-                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                                (left > 0).then(|| left - 1)
-                            })
-                            .is_ok()
-                        {
-                            refused_log.lock().unwrap().push(txn);
-                            return (StatusCode::INTERNAL_SERVER_ERROR, "{}".to_owned());
+        let router = axum::Router::new()
+            .route(
+                "/_matrix/federation/v1/send/{txn}",
+                axum::routing::put(
+                    move |axum::extract::Path(txn): axum::extract::Path<String>,
+                          headers: axum::http::HeaderMap,
+                          body: String| {
+                        let record = Arc::clone(&record);
+                        let gate = Arc::clone(&gate);
+                        let refused_log = Arc::clone(&refused_log);
+                        async move {
+                            if gate
+                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                                    (left > 0).then(|| left - 1)
+                                })
+                                .is_ok()
+                            {
+                                refused_log.lock().unwrap().push(txn);
+                                return (StatusCode::INTERNAL_SERVER_ERROR, "{}".to_owned());
+                            }
+                            let authorization = headers
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_owned();
+                            let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                            record.lock().unwrap().push((txn, authorization, parsed));
+                            (StatusCode::OK, json!({ "pdus": {} }).to_string())
                         }
-                        let authorization = headers
-                            .get("authorization")
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or_default()
-                            .to_owned();
-                        let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-                        record.lock().unwrap().push((txn, authorization, parsed));
-                        (StatusCode::OK, json!({ "pdus": {} }).to_string())
-                    }
-                },
-            ),
-        );
+                    },
+                ),
+            )
+            // The invite handshake's other half: the harness invites the
+            // stub's user to give the room a remote member, and the inviting
+            // server will not append the invite until this server answers.
+            // Echoing the event back is a valid answer — the reference hash
+            // is what the inviter checks, and signatures sit outside it.
+            .route(
+                "/_matrix/federation/v2/invite/{_room_id}/{_event_id}",
+                axum::routing::put(
+                    |axum::extract::Json(body): axum::extract::Json<Value>| async move {
+                        axum::Json(json!({ "event": body["event"] }))
+                    },
+                ),
+            );
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });

@@ -2126,6 +2126,7 @@ impl Rooms {
         Ok((event_id, json))
     }
 
+    #[allow(clippy::too_many_arguments, reason = "an event is what it is")]
     fn append(
         &self,
         log: &mut RoomLog,

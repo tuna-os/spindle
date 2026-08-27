@@ -40,13 +40,27 @@ impl Peer {
             "verify_keys": { "ed25519:0": { "key": unpadded(&public_key(&pair)) } },
         });
         sign_value(&name, &signing, &mut key_document);
-        let router = axum::Router::new().route(
-            "/_matrix/key/v2/server",
-            axum::routing::get(move || {
-                let body = key_document.clone();
-                async move { axum::Json(body) }
-            }),
-        );
+        let router = axum::Router::new()
+            .route(
+                "/_matrix/key/v2/server",
+                axum::routing::get(move || {
+                    let body = key_document.clone();
+                    async move { axum::Json(body) }
+                }),
+            )
+            // The invite handshake's other half: the harness invites this
+            // peer's user, and the inviting server will not append the
+            // invite until the peer answers. Echoing the event back is a
+            // valid answer — the reference hash is what the inviter
+            // checks, and signatures sit outside it.
+            .route(
+                "/_matrix/federation/v2/invite/{_room_id}/{_event_id}",
+                axum::routing::put(
+                    |axum::extract::Json(body): axum::extract::Json<Value>| async move {
+                        axum::Json(json!({ "event": body["event"] }))
+                    },
+                ),
+            );
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
