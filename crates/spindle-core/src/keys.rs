@@ -224,6 +224,13 @@ pub enum Keyspace {
     /// room when the user accepts. Both go stale the moment a real membership
     /// row for the pair is written, which is when this row is deleted.
     PendingInvite = 0x22,
+    /// `user_id` -> `{displayname, avatar_url}`.
+    ///
+    /// The global profile, distinct from any room's member event: the spec
+    /// has the member events *copy* it at set time, so this row is the
+    /// source and the rooms are the propagation. Keyed by the full user ID
+    /// because federation asks by full user ID.
+    Profile = 0x23,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -234,6 +241,14 @@ const _: () = assert!(
     Keyspace::Account as u8 > Keyspace::RoomMeta as u8,
     "new keyspaces take fresh discriminants; they never reuse an existing one"
 );
+
+/// The global-profile row for one user.
+#[must_use]
+pub fn profile(user_id: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::Profile as u8];
+    key.extend_from_slice(user_id.as_bytes());
+    key
+}
 
 /// Map an `i64` onto `u64` so that big-endian byte order matches numeric order.
 ///

@@ -364,6 +364,49 @@ impl Federation {
         Ok(body)
     }
 
+    /// Ask a peer for one of its users' profiles — the client half of
+    /// `query/profile`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] if the request cannot be signed or sent,
+    /// or the peer refuses.
+    pub async fn remote_query_profile(
+        &self,
+        destination: &str,
+        user_id: &str,
+    ) -> Result<Value, FederationError> {
+        let encoded: String = form_urlencoded::byte_serialize(user_id.as_bytes()).collect();
+        let uri = format!("/_matrix/federation/v1/query/profile?user_id={encoded}");
+        let authorization = self.sign_request("GET", &uri, destination, None)?;
+        let response = self
+            .client
+            .get(format!(
+                "{}{uri}",
+                base_url(destination, self.insecure_http)
+            ))
+            .header("authorization", authorization)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|error| FederationError::Refused(format!("query/profile: {error}")))?;
+        let status = response.status();
+        let body: Value = response
+            .bytes()
+            .await
+            .map_err(|error| FederationError::Refused(format!("profile body: {error}")))
+            .and_then(|bytes| {
+                serde_json::from_slice(&bytes)
+                    .map_err(|error| FederationError::Refused(format!("profile body: {error}")))
+            })?;
+        if !status.is_success() {
+            return Err(FederationError::Refused(format!(
+                "{destination} refused query/profile: {status} {body}"
+            )));
+        }
+        Ok(body)
+    }
+
     /// Send the signed join back — the client half of `send_join`.
     ///
     /// # Errors

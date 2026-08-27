@@ -26,12 +26,12 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**87 routes implemented; 24 known gaps in scope.**
+**91 routes implemented; 21 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
 
-### Federation — 14 implemented, 1 planned
+### Federation — 15 implemented, 1 planned
 
 - `GET /_matrix/federation/v1/backfill/{room_id}`
 - `GET /_matrix/federation/v1/event/{event_id}`
@@ -40,6 +40,7 @@ neither implemented nor counted.
 - `GET /_matrix/federation/v1/make_leave/{room_id}/{user_id}`
 - `GET /_matrix/federation/v1/media/download/{media_id}`
 - `GET /_matrix/federation/v1/query/directory`
+- `GET /_matrix/federation/v1/query/profile`
 - `PUT /_matrix/federation/v1/send/{txn_id}`
 - `GET /_matrix/federation/v1/state/{room_id}`
 - `GET /_matrix/federation/v1/state_ids/{room_id}`
@@ -149,11 +150,14 @@ neither implemented nor counted.
 - ⏳ `DELETE /_matrix/client/v3/devices/{device_id}` — device logout (M2)
 - ⏳ `POST /_matrix/client/v3/delete_devices` — bulk device logout (M2)
 
-### Server, discovery & operations — 12 implemented, 0 planned
+### Server, discovery & operations — 15 implemented, 0 planned
 
 - `GET /.well-known/matrix/client`
 - `GET /.well-known/matrix/server`
 - `GET /_matrix/client/v3/capabilities`
+- `GET /_matrix/client/v3/profile/{user_id}`
+- `GET/PUT /_matrix/client/v3/profile/{user_id}/avatar_url`
+- `GET/PUT /_matrix/client/v3/profile/{user_id}/displayname`
 - `PUT/GET/DELETE /_matrix/client/v3/room_keys/keys`
 - `PUT/GET/DELETE /_matrix/client/v3/room_keys/keys/{room_id}`
 - `PUT/GET/DELETE /_matrix/client/v3/room_keys/keys/{room_id}/{session_id}`
