@@ -277,6 +277,59 @@ are not enough — **same load** is part of the method, and that run was
 discarded rather than averaged. The final sitting above ran on an idle
 machine.
 
+## M3: reading Tuwunel's code for the one cell it kept winning
+
+`state` at 200 events was the only cell Tuwunel held across two sittings —
+0.85× at the M2 close-out, 0.93× at M3 progress. Two sittings, same
+direction, one below the noise floor: by the roadmap's rule, a defect until
+explained. So this investigation started in *their* tree, not ours.
+
+**What their code does.** Tuwunel's `/state` handler
+(`state_accessor.room_state_full_pdus`) resolves the room's compressed
+state (short IDs), then fetches each PDU through RocksDB reads whose hot
+path is a block-cache hit — no disk, but still a deserialization per event
+per request. Ours resolved the current state from the materialized
+snapshot, then paid a room-lock acquisition, a stored-body read and a JSON
+parse **per state event**, plus a re-serialization of the whole response —
+per request.
+
+**What the probes actually said.** A component probe against both servers,
+same host, same minute, split every request into fixed cost (an
+authenticated no-op) and marginal cost (the state machinery):
+
+|                       | spindle before | spindle after | tuwunel |
+| --------------------- | -------------- | ------------- | ------- |
+| fixed (whoami)        | 0.48 ms        | 0.52 ms       | 0.30 ms |
+| `/state` minus fixed  | 0.22 ms        | **0.01 ms**   | 0.60 ms |
+
+Two findings, one expected and one not. The unexpected one: Tuwunel's
+*state machinery* was never faster than ours — their per-request pipeline
+is simply leaner (raw-socket probes bound the true server-side gap at
+~30 µs on fresh connections; the rest of the fixed-cost spread is
+benchmark-client overhead, paid identically by every server the driver
+measures). Their block cache was hiding a marginal cost six times ours
+behind a cheaper front door.
+
+**The fix reads like the design.** The state snapshot is content-addressed:
+its BLAKE3 root *is* the identity of the full-state answer. So the rendered
+`/state` body is cached per room, keyed by the root it was rendered from —
+a hit is provably current, a root mismatch is the only invalidation, and
+there is no TTL or write-hook to get wrong. The same read now skips the
+per-event room-lock round-trip the old path paid (`event()` re-proved the
+room's existence once per state event).
+
+Re-measured with the sitting's own driver, two rounds, same host:
+`state/200` went from **0.85×/0.93× against to 1.91×/1.33× for** —
+0.45–0.54 ms against Tuwunel's 0.72–0.87 ms. The staleness mutant — a
+cache that serves a warmed render without comparing roots — dies on a
+dedicated test (warm the render, change the state, the very next read
+must show it).
+
+The honest caveat, kept as measured: the published m2-final and
+m3-progress tables retain the losses. This section is what those cells
+link to, and the M3 close-out sitting is where the fix gets its four-way
+number.
+
 ## Fork window: bounded search vs exhaustive walk
 
 | Room history | Bounded | Exhaustive | Ratio |

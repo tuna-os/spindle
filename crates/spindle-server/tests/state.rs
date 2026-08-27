@@ -332,3 +332,42 @@ async fn a_single_event_can_be_fetched_by_id() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["error"], "no such room");
 }
+
+#[tokio::test]
+async fn a_state_change_is_visible_in_the_very_next_full_state_read() {
+    // The full-state response is served from a render cache keyed by the
+    // state root. The mutant this test exists to kill is the cache that
+    // serves a render without comparing roots: read once to warm it, change
+    // the state, and the very next read must show the change.
+    let harness = Harness::new();
+    let token = harness.register("alice").await;
+    let room_id = harness.create_room(&token).await;
+
+    let (status, body) = harness
+        .get(&format!("/_matrix/client/v3/rooms/{room_id}/state"), &token)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    harness
+        .put(
+            &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.topic"),
+            &token,
+            &json!({ "topic": "after the warm read" }),
+        )
+        .await;
+
+    let (status, body) = harness
+        .get(&format!("/_matrix/client/v3/rooms/{room_id}/state"), &token)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let topic = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "m.room.topic")
+        .expect("the topic is state");
+    assert_eq!(
+        topic["content"]["topic"], "after the warm read",
+        "a warmed render must not outlive its state root: {body}"
+    );
+}
