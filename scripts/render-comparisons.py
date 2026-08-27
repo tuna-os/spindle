@@ -103,6 +103,19 @@ INVESTIGATIONS = {
         "cells recover to 0.96× and 1.00×, and Spindle's own growth curve "
         "flattens from 1.28× to 1.13× across a 16× room-size increase.",
     ),
+    ("m2-final", "state"): (
+        "0.85× vs Tuwunel at 200 events, and 0.93× again at M3 progress — "
+        "the one cell Tuwunel held across two sittings, so the investigation "
+        "started in their tree. Their /state serves each event through "
+        "RocksDB's block cache; ours paid a room-lock acquisition, a body "
+        "read and a JSON parse per state event, per request. Component "
+        "probes showed their state machinery was never actually faster — "
+        "their per-request pipeline is just leaner. #129 caches the rendered "
+        "/state body under its BLAKE3 state root (content-addressed, so a "
+        "hit is provably current and a root mismatch is the only "
+        "invalidation); re-measured against the live Tuwunel binary the "
+        "cell flips to 1.91× and 1.33× in Spindle's favour.",
+    ),
     ("m2-final", "sliding_window"): (
         "0.87× vs Continuwuity at 3,200 events was the one real loss of the "
         "M2 close-out, and the only curve growing with room size. Bisecting "
