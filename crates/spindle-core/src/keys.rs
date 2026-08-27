@@ -194,6 +194,13 @@ pub enum Keyspace {
     /// days, so a compromised key ages out of the cache regardless of what
     /// its owner claims.
     ServerKeys = 0x1e,
+    /// `(origin, txn_id)` -> the response a federation transaction got.
+    ///
+    /// Same contract as the client-side replay table: a retried `/send`
+    /// must answer what the first delivery answered, not process twice —
+    /// at-least-once delivery is the sender's retry loop, and this row is
+    /// what makes redelivery idempotent on our side.
+    FederationTxn = 0x1f,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -505,6 +512,19 @@ pub fn key_backup_data(user_id: &str, version: u64, room_id: &str, session_id: &
 pub fn cross_signing(user_id: &str, key_type: &str) -> Vec<u8> {
     let mut key = user_prefix(Keyspace::CrossSigning, user_id);
     key.extend_from_slice(key_type.as_bytes());
+    key
+}
+
+/// `(origin, txn_id)` key for [`Keyspace::FederationTxn`].
+#[must_use]
+pub fn federation_txn(origin: &str, txn_id: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::FederationTxn as u8];
+    for part in [origin, txn_id] {
+        let bytes = part.as_bytes();
+        let len = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
+        key.extend_from_slice(&len.to_be_bytes());
+        key.extend_from_slice(&bytes[..len as usize]);
+    }
     key
 }
 

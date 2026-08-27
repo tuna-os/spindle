@@ -585,6 +585,10 @@ fn discovery_routes() -> Router<AppState> {
             "/_matrix/federation/v1/query/directory",
             get(federation_query_directory),
         )
+        .route(
+            "/_matrix/federation/v1/send/{txn_id}",
+            axum::routing::put(federation_send),
+        )
         .route("/.well-known/matrix/client", get(well_known_client))
         .route("/.well-known/matrix/server", get(well_known_server))
         .route("/health", get(health))
@@ -1018,6 +1022,181 @@ async fn federation_query_directory(
         "room_id": room_id.room_id,
         "servers": [state.config.server.name],
     })))
+}
+
+/// `PUT /_matrix/federation/v1/send/{txnId}`
+///
+/// One transaction from one peer: up to fifty PDUs and some EDUs. Each PDU
+/// is judged alone — hash and signature against the origin's published
+/// keys, then the same authorization predicate local events pass — and a
+/// refusal soft-fails into the per-PDU results without poisoning the
+/// batch. EDUs are accepted and dropped for now: they are ephemeral by
+/// contract, and pretending to process them would be worse than the honest
+/// gap (typing and receipts over federation arrive with #15's catch-up
+/// work).
+async fn federation_send(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(txn_id): axum::extract::Path<String>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let body: Value =
+        serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
+
+    let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&body)).await?;
+
+    // The replay table answers a retried transaction with its first answer:
+    // the peer's retry loop is at-least-once, and this row is what makes
+    // redelivery idempotent on our side.
+    let txn_key = spindle_core::keys::federation_txn(&origin, &txn_id);
+    if let Ok(Some(stored)) = spindle_store::ReadView::get(state.store.as_ref(), &txn_key)
+        && let Ok(response) = serde_json::from_slice::<Value>(&stored)
+    {
+        return Ok(Json(response));
+    }
+
+    let pdus = body["pdus"].as_array().cloned().unwrap_or_default();
+    if pdus.len() > 50 {
+        return Err(MatrixError::bad_json(
+            "a transaction carries at most 50 PDUs".to_owned(),
+        ));
+    }
+
+    let key_map = if pdus.is_empty() {
+        None
+    } else {
+        Some(
+            state
+                .federation
+                .public_key_map(&origin)
+                .await
+                .map_err(|error| {
+                    tracing::debug!("cannot fetch {origin} keys: {error}");
+                    MatrixError::new(
+                        StatusCode::UNAUTHORIZED,
+                        "M_UNAUTHORIZED",
+                        "the origin's keys cannot be verified".to_owned(),
+                    )
+                })?,
+        )
+    };
+
+    let mut results = serde_json::Map::new();
+    for pdu in &pdus {
+        let (event_id, outcome) = receive_one_pdu(&state, &origin, key_map.as_ref(), pdu);
+        results.insert(
+            event_id,
+            match outcome {
+                Ok(()) => json!({}),
+                Err(reason) => json!({ "error": reason }),
+            },
+        );
+    }
+
+    let response = json!({ "pdus": results });
+    spindle_store::Store::put(
+        state.store.as_ref(),
+        &txn_key,
+        response.to_string().as_bytes(),
+    )
+    .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    state.rooms.wake_sync_waiters();
+    Ok(Json(response))
+}
+
+/// Judge and, if it holds up, apply one received PDU.
+///
+/// Returns the event ID this server *computed* (never one the peer
+/// claimed) with the outcome. A PDU too malformed to even hash is keyed by
+/// a placeholder, because the response shape needs a key and inventing a
+/// plausible-looking ID for garbage would be worse.
+fn receive_one_pdu(
+    state: &AppState,
+    origin: &str,
+    key_map: Option<&ruma::signatures::PublicKeyMap>,
+    pdu: &Value,
+) -> (String, Result<(), String>) {
+    use ruma::CanonicalJsonValue;
+
+    let Ok(CanonicalJsonValue::Object(canonical)) = CanonicalJsonValue::try_from(pdu.clone())
+    else {
+        return (
+            "$malformed".to_owned(),
+            Err("not canonicalizable".to_owned()),
+        );
+    };
+
+    // The sender must live on the origin: a transaction is a server
+    // speaking for its own users, and accepting someone else's would let
+    // any peer forge any server's events into our rooms.
+    let sender_domain = pdu["sender"]
+        .as_str()
+        .and_then(|sender| sender.split_once(':'))
+        .map(|(_, domain)| domain);
+    if sender_domain != Some(origin) {
+        return (
+            "$foreign-sender".to_owned(),
+            Err("the sender does not live on the origin".to_owned()),
+        );
+    }
+
+    let pdu_parsed = match spindle_core::Pdu::from_remote(
+        ruma::RoomVersionId::try_from(crate::rooms::ROOM_VERSION)
+            .expect("the supported room version parses"),
+        canonical.clone(),
+    ) {
+        Ok(parsed) => parsed,
+        Err(error) => return ("$malformed".to_owned(), Err(format!("{error:?}"))),
+    };
+    let event_id = pdu_parsed.event_id().as_str().to_owned();
+
+    if let Some(key_map) = key_map {
+        let rules = ruma::RoomVersionId::try_from(crate::rooms::ROOM_VERSION)
+            .expect("the supported room version parses")
+            .rules()
+            .expect("the supported room version has rules");
+        match ruma::signatures::verify_event(key_map, &canonical, &rules) {
+            Ok(ruma::signatures::Verified::All) => {}
+            // The signature holds but the content hash does not: someone
+            // altered the body after signing. The spec's answer is redact,
+            // not drop — the event's *position* is authentic (its ID is the
+            // reference hash over the redacted form, which is what peers
+            // agree on), only its content is not, so the room keeps the
+            // event and loses the tampering.
+            Ok(ruma::signatures::Verified::Signatures) => {
+                let redacted =
+                    match ruma::canonical_json::redact(canonical.clone(), &rules.redaction, None) {
+                        Ok(redacted) => redacted,
+                        Err(error) => return (event_id, Err(format!("redaction: {error}"))),
+                    };
+                let json = serde_json::to_value(&redacted).unwrap_or(Value::Null);
+                return match state.rooms.receive_remote(
+                    pdu["room_id"].as_str().unwrap_or_default(),
+                    &event_id,
+                    &json,
+                ) {
+                    Ok(()) => (event_id, Ok(())),
+                    Err(error) => (event_id, Err(error.to_string())),
+                };
+            }
+            Err(error) => return (event_id, Err(format!("signature: {error}"))),
+        }
+    }
+
+    let Some(room_id) = pdu["room_id"].as_str() else {
+        return (event_id, Err("no room_id".to_owned()));
+    };
+    match state.rooms.receive_remote(room_id, &event_id, pdu) {
+        Ok(()) => (event_id, Ok(())),
+        Err(error) => (event_id, Err(error.to_string())),
+    }
 }
 
 /// `GET /_matrix/key/v2/server`

@@ -23,11 +23,11 @@ use ruma::room_version_rules::RoomVersionRules;
 use ruma::signatures::Ed25519KeyPair;
 use ruma::{CanonicalJsonObject, CanonicalJsonValue, RoomVersionId};
 use serde_json::{Map, Value};
-use spindle_core::{EventId, EventInput, Pdu, RoomLog, StateKey};
+use spindle_core::{EventId, EventInput, LogEntry, Pdu, RoomLog, StateKey};
 use spindle_store::{Durability, FjallStore, RoomStore, StoreError};
 
 /// Native rooms are v11 (SPEC §11.6).
-const ROOM_VERSION: &str = "11";
+pub const ROOM_VERSION: &str = "11";
 
 /// The membership index stores the membership verbatim, not a flag. `join` and
 /// `leave` are two of six states, and a boolean would have to be recomputed
@@ -1644,16 +1644,115 @@ impl Rooms {
             .map_err(|error| RoomError::Append(format!("{error:?}")))?
             .clone();
 
+        self.persist_entry(
+            log,
+            room_id,
+            &entry,
+            &event_id,
+            &PersistInput {
+                event_type,
+                state_key,
+                sender,
+                content,
+                json: &json,
+            },
+        )?;
+        Ok(event_id)
+    }
+
+    /// Accept one event another server created, after the caller verified
+    /// its signatures against the origin's published keys.
+    ///
+    /// The same authorization predicate local events pass, against the same
+    /// materialized state — SPEC §5's whole point is that a received event
+    /// costs an index lookup to authorize, not a state computation. A PDU
+    /// that fails it soft-fails: refused with a reason the transaction
+    /// response carries, poisoning nothing else in the batch. A PDU naming
+    /// predecessors this server has never seen is refused too — filling
+    /// that gap is `/get_missing_events` and backfill (#15), not guessing.
+    ///
+    /// # Errors
+    ///
+    /// [`RoomError::UnknownRoom`] for a room this server is not in,
+    /// [`RoomError::Forbidden`] when authorization refuses, and
+    /// [`RoomError::Append`] when the log cannot place the event.
+    pub fn receive_remote(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        json: &Value,
+    ) -> Result<(), RoomError> {
+        self.with_room(room_id, |rooms, log| {
+            // Redelivery is not an error: transactions retry, and the event
+            // is already exactly where it would go.
+            if log.get(&EventId::new(event_id)).is_some() {
+                return Ok(());
+            }
+            rooms.authorize(log, room_id, event_id, json)?;
+
+            let event_type = json["type"].as_str().unwrap_or_default().to_owned();
+            let state_key = json["state_key"].as_str().map(str::to_owned);
+            let sender = json["sender"].as_str().unwrap_or_default().to_owned();
+            let prev: Vec<EventId> = json["prev_events"]
+                .as_array()
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(Value::as_str)
+                        .map(EventId::new)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let input = EventInput::new(event_id, prev);
+            let input = match &state_key {
+                Some(state_key) => {
+                    input.with_state_key(StateKey::new(event_type.as_str(), state_key.as_str()))
+                }
+                None => input,
+            };
+            let entry = log
+                .append_remote(input)
+                .map_err(|error| RoomError::Append(format!("{error:?}")))?
+                .clone();
+
+            let content = json["content"].clone();
+            rooms.persist_entry(
+                log,
+                room_id,
+                &entry,
+                event_id,
+                &PersistInput {
+                    event_type: &event_type,
+                    state_key: state_key.as_deref(),
+                    sender: &sender,
+                    content: &content,
+                    json,
+                },
+            )
+        })
+    }
+
+    /// Everything an appended entry writes beside itself, shared by the
+    /// local and federation paths so neither can forget an index the other
+    /// maintains.
+    fn persist_entry(
+        &self,
+        log: &mut RoomLog,
+        room_id: &str,
+        entry: &LogEntry,
+        event_id: &str,
+        input: &PersistInput<'_>,
+    ) -> Result<(), RoomError> {
         // Keep the unread index current while it is warm. Only if cached:
         // a cold room's index is built from the log on first use, so there
         // is nothing to maintain until someone asks.
-        if state_key.is_none() {
+        if input.state_key.is_none() {
             let mut cache = self
                 .unread_index
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(index) = cache.get_mut(room_id) {
-                index.push(entry.li.get(), sender);
+                index.push(entry.li.get(), input.sender);
             }
         }
 
@@ -1664,15 +1763,15 @@ impl Rooms {
         let room_store = RoomStore::new(self.store.as_ref(), room_id);
         spindle_store::Store::put(
             self.store.as_ref(),
-            &event_body_key(room_id, &event_id),
-            &serde_json::to_vec(&json)?,
+            &event_body_key(room_id, event_id),
+            &serde_json::to_vec(input.json)?,
         )?;
         // A relation is indexed in the entry's own batch too, and for the same
         // reason: an index entry written separately can outlive a commit that
         // failed, leaving `/relations` pointing at an event the room does not
         // have.
         let mut extra = Vec::new();
-        if let Some((rel_type, target)) = relates_to(content) {
+        if let Some((rel_type, target)) = relates_to(input.content) {
             // The type goes in the value, not the key -- see `keys::relation`.
             let mut value = Vec::with_capacity(2 + rel_type.len() + event_id.len());
             value.extend_from_slice(
@@ -1705,18 +1804,18 @@ impl Rooms {
             }
             .encode(),
         ));
-        room_store.commit_entry_with(&entry, log, &extra, Durability::Group)?;
+        room_store.commit_entry_with(entry, log, &extra, Durability::Group)?;
         *stream = stream_id;
         drop(stream);
 
         // The index is derived from the event that just landed, and only from
         // an event that landed: writing it before the commit would leave a
         // user joined to a room whose membership event was never stored.
-        if event_type == "m.room.member" {
-            self.index_membership(room_id, state_key, content)?;
+        if input.event_type == "m.room.member" {
+            self.index_membership(room_id, input.state_key, input.content)?;
         }
         self.appended.notify_waiters();
-        Ok(event_id)
+        Ok(())
     }
 
     /// Record `(user, room) -> membership` so `/joined_rooms` need not open
@@ -1811,6 +1910,16 @@ impl Rooms {
         .ok_or_else(|| RoomError::MissingBody(event_id.as_str().to_owned()))?;
         Ok(serde_json::from_slice(&raw)?)
     }
+}
+
+/// The event-shaped arguments `persist_entry` needs, in one carrier so the
+/// two call sites cannot drift on argument order.
+struct PersistInput<'a> {
+    event_type: &'a str,
+    state_key: Option<&'a str>,
+    sender: &'a str,
+    content: &'a Value,
+    json: &'a Value,
 }
 
 /// Read back the `(rel_type, event_id)` a relation row stores.

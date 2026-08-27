@@ -49,6 +49,36 @@ impl Pdu {
         })
     }
 
+    /// Accept a received event: validate its shape and derive its ID.
+    ///
+    /// No signing — the event carries someone else's signatures, and the
+    /// caller verifies them (with ruma, against the origin's published
+    /// keys) before anything trusts this PDU. What this does establish is
+    /// the event ID, by the same reference hash a signing path uses: an ID
+    /// computed rather than claimed, so a peer cannot name its event
+    /// whatever it likes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PduError`] if required fields or protocol bounds are
+    /// invalid, the room version is unknown, or the hash cannot be taken.
+    pub fn from_remote(
+        room_version: RoomVersionId,
+        canonical: CanonicalJsonObject,
+    ) -> Result<Self, PduError> {
+        validate(&canonical)?;
+        let rules = room_version
+            .rules()
+            .ok_or_else(|| PduError::UnsupportedRoomVersion(room_version.to_string()))?;
+        let hash = reference_hash(&canonical, &rules)
+            .map_err(|error| PduError::Signing(error.to_string()))?;
+        Ok(Self {
+            room_version,
+            event_id: EventId::new(format!("${hash}")),
+            canonical,
+        })
+    }
+
     #[must_use]
     pub fn room_version(&self) -> &RoomVersionId {
         &self.room_version
