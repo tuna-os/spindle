@@ -1,0 +1,138 @@
+{
+  "base_url": "http://127.0.0.1:8099",
+  "benchmarks": {
+    "context_deep/200": {
+      "lower_ns": 666652.0,
+      "mean_ns": 847812.0,
+      "samples": 25,
+      "upper_ns": 1222528.0
+    },
+    "context_deep/3200": {
+      "lower_ns": 935558.0,
+      "mean_ns": 1265273.0,
+      "samples": 25,
+      "upper_ns": 2069089.0
+    },
+    "context_deep/800": {
+      "lower_ns": 838919.0,
+      "mean_ns": 1183770.0,
+      "samples": 25,
+      "upper_ns": 1428245.0
+    },
+    "join/200": {
+      "lower_ns": 1369581.0,
+      "mean_ns": 1682412.0,
+      "samples": 25,
+      "upper_ns": 2209714.0
+    },
+    "join/3200": {
+      "lower_ns": 1279545.0,
+      "mean_ns": 1764527.0,
+      "samples": 25,
+      "upper_ns": 2396431.0
+    },
+    "join/800": {
+      "lower_ns": 1353746.0,
+      "mean_ns": 1776798.0,
+      "samples": 25,
+      "upper_ns": 2423273.0
+    },
+    "messages_page/200": {
+      "lower_ns": 791598.0,
+      "mean_ns": 1090040.0,
+      "samples": 25,
+      "upper_ns": 1290710.0
+    },
+    "messages_page/3200": {
+      "lower_ns": 1130691.0,
+      "mean_ns": 1296556.0,
+      "samples": 25,
+      "upper_ns": 1743804.0
+    },
+    "messages_page/800": {
+      "lower_ns": 877284.0,
+      "mean_ns": 1246773.0,
+      "samples": 25,
+      "upper_ns": 1578487.0
+    },
+    "send/200": {
+      "lower_ns": 976947.0,
+      "mean_ns": 1496757.0,
+      "samples": 25,
+      "upper_ns": 2175259.0
+    },
+    "send/3200": {
+      "lower_ns": 1576991.0,
+      "mean_ns": 1962948.0,
+      "samples": 25,
+      "upper_ns": 2713154.0
+    },
+    "send/800": {
+      "lower_ns": 1477885.0,
+      "mean_ns": 1905741.0,
+      "samples": 25,
+      "upper_ns": 2333164.0
+    },
+    "sliding_window/200": {
+      "lower_ns": 1060827.0,
+      "mean_ns": 1357499.0,
+      "samples": 25,
+      "upper_ns": 1796366.0
+    },
+    "sliding_window/3200": {
+      "lower_ns": 1022702.0,
+      "mean_ns": 1286185.0,
+      "samples": 25,
+      "upper_ns": 1724153.0
+    },
+    "sliding_window/800": {
+      "lower_ns": 912691.0,
+      "mean_ns": 1140478.0,
+      "samples": 25,
+      "upper_ns": 1599523.0
+    },
+    "state/200": {
+      "lower_ns": 506845.0,
+      "mean_ns": 656479.0,
+      "samples": 25,
+      "upper_ns": 1575356.0
+    },
+    "state/3200": {
+      "lower_ns": 574733.0,
+      "mean_ns": 718908.0,
+      "samples": 25,
+      "upper_ns": 1014894.0
+    },
+    "state/800": {
+      "lower_ns": 569806.0,
+      "mean_ns": 813096.0,
+      "samples": 25,
+      "upper_ns": 1152393.0
+    },
+    "sync_initial/200": {
+      "lower_ns": 1645348.0,
+      "mean_ns": 2044991.0,
+      "samples": 25,
+      "upper_ns": 2788489.0
+    },
+    "sync_initial/3200": {
+      "lower_ns": 1815027.0,
+      "mean_ns": 2092466.0,
+      "samples": 25,
+      "upper_ns": 2786717.0
+    },
+    "sync_initial/800": {
+      "lower_ns": 1566791.0,
+      "mean_ns": 1870174.0,
+      "samples": 25,
+      "upper_ns": 2315914.0
+    }
+  },
+  "samples": 25,
+  "server": "spindle-m4final",
+  "sizes": [
+    200,
+    800,
+    3200
+  ]
+}
