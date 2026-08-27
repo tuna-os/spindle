@@ -53,10 +53,12 @@ MILESTONES = [
      "Started with #14's identity layer: X-Matrix request signing and "
      "verification against fetched-and-cached peer keys (self-signature, "
      "name binding, capped validity all enforced; every failure a uniform "
-     "401), /version, and the first authenticated query. Next: inbound "
-     "/send and the outbound transaction queue, then #15 joins/state/"
-     "history, then #16's fork-proof rig — where the no-state-resolution "
-     "claim meets adversarial evidence."),
+     "401), /version, and the first authenticated query. Inbound /send "
+     "receives foreign PDUs through the same authorization predicate local "
+     "events pass, with per-origin transaction replay and spec-correct "
+     "redact-on-hash-mismatch. Next: the outbound transaction queue, then "
+     "#15 joins/state/history, then #16's fork-proof rig — where the "
+     "no-state-resolution claim meets adversarial evidence."),
     ("M4", "Ecosystem integration", "Not started", "#18 appservices, #17 MAS/OIDC."),
     ("M5", "Production lifecycle", "Not started",
      "#19 #20 #21; #42's parity gate vs Synapse and Tuwunel is part of the "
@@ -111,7 +113,6 @@ PLANNED = {
     "Media": [],
     "Server, discovery & operations": [],
     "Federation": [
-        ("PUT", "/_matrix/federation/v1/send/{txnId}", "inbound transactions (#14)"),
         ("GET", "/_matrix/federation/v1/make_join/{roomId}/{userId}", "join handshake (#15)"),
         ("PUT", "/_matrix/federation/v1/send_join/{roomId}/{eventId}", "join handshake (#15)"),
         ("GET", "/_matrix/federation/v1/state/{roomId}", "state answers (#15)"),

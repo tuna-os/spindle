@@ -18,7 +18,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 | M0 | Prove the core | **Done** | Fork resolution vs ruma-state-res and HAMT-vs-im benchmarks published on the [benchmark site](https://tuna-os.github.io/spindle/); durability and recovery covered by restart and torn-write tests. |
 | M1 | Usable local homeserver | **Done** | Full local CS-API surface with classic `/sync`; leftovers tracked on #7 (room upgrade, spaces, search, pushers, OpenAPI validation, Element Web rig). Benchmarked vs Synapse and Continuwuity — see docs/benchmarks.md. |
 | M2 | Modern encrypted clients | **Done** | Media + thumbnails (#99, #104), Simplified Sliding Sync (#105), E2EE transport (#106), fallback keys + device lists (#107), key backup + cross-signing (#108), URL previews (#109), S3 media backend (#110). Close-out benchmark: four-way vs Synapse, Continuwuity and Tuwunel (built from source) — 60 of 63 cells won; the one real loss became #113's unread-index fix (11.79 ms → 1.00 ms); the three residual cells are within measured noise. See docs/benchmarks.md and the comparisons page. Element X client-gate work continues as #112. |
-| M3 | Ordinary Matrix federation | In progress | Started with #14's identity layer: X-Matrix request signing and verification against fetched-and-cached peer keys (self-signature, name binding, capped validity all enforced; every failure a uniform 401), /version, and the first authenticated query. Next: inbound /send and the outbound transaction queue, then #15 joins/state/history, then #16's fork-proof rig — where the no-state-resolution claim meets adversarial evidence. |
+| M3 | Ordinary Matrix federation | In progress | Started with #14's identity layer: X-Matrix request signing and verification against fetched-and-cached peer keys (self-signature, name binding, capped validity all enforced; every failure a uniform 401), /version, and the first authenticated query. Inbound /send receives foreign PDUs through the same authorization predicate local events pass, with per-origin transaction replay and spec-correct redact-on-hash-mismatch. Next: the outbound transaction queue, then #15 joins/state/history, then #16's fork-proof rig — where the no-state-resolution claim meets adversarial evidence. |
 | M4 | Ecosystem integration | Not started | #18 appservices, #17 MAS/OIDC. |
 | M5 | Production lifecycle | Not started | #19 #20 #21; #42's parity gate vs Synapse and Tuwunel is part of the definition of done. |
 | M6 | Optional differentiators | Not started | #22 hub mode, #23 MLS. |
@@ -26,16 +26,16 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**74 routes implemented; 32 known gaps in scope.**
+**75 routes implemented; 31 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
 
-### Federation — 2 implemented, 9 planned
+### Federation — 3 implemented, 8 planned
 
 - `GET /_matrix/federation/v1/query/directory`
+- `PUT /_matrix/federation/v1/send/{txn_id}`
 - `GET /_matrix/federation/v1/version`
-- ⏳ `PUT /_matrix/federation/v1/send/{txnId}` — inbound transactions (#14)
 - ⏳ `GET /_matrix/federation/v1/make_join/{roomId}/{userId}` — join handshake (#15)
 - ⏳ `PUT /_matrix/federation/v1/send_join/{roomId}/{eventId}` — join handshake (#15)
 - ⏳ `GET /_matrix/federation/v1/state/{roomId}` — state answers (#15)

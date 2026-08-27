@@ -174,6 +174,43 @@ impl Federation {
         Ok(parsed.origin)
     }
 
+    /// Every verify key the origin currently publishes, as ruma's map —
+    /// for verifying whole events, which may carry any of its keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] if the document cannot be fetched or is
+    /// not credible.
+    pub async fn public_key_map(
+        &self,
+        origin: &str,
+    ) -> Result<ruma::signatures::PublicKeyMap, FederationError> {
+        // A fetch-if-stale pass first: `server_key` refreshes the cache as
+        // a side effect, and the throwaway id keeps "stale" and "missing"
+        // from conflating.
+        let _ = self.server_key(origin, "ed25519:_warm").await;
+        let cache_key = server_keys_row(origin);
+        let bytes = ReadView::get(self.store.as_ref(), &cache_key)
+            .map_err(|error| FederationError::Storage(error.to_string()))?
+            .ok_or_else(|| FederationError::Refused(format!("no keys for {origin}")))?;
+        let cached: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| FederationError::Storage(error.to_string()))?;
+        let mut key_map = ruma::signatures::PublicKeyMap::new();
+        let entry = key_map.entry(origin.to_owned()).or_default();
+        if let Some(keys) = cached["document"]["verify_keys"].as_object() {
+            for (key_id, key) in keys {
+                if let Some(key) = key["key"].as_str() {
+                    entry.insert(
+                        key_id.clone(),
+                        ruma::serde::Base64::parse(key)
+                            .map_err(|error| FederationError::Refused(error.to_string()))?,
+                    );
+                }
+            }
+        }
+        Ok(key_map)
+    }
+
     /// The origin's public key (unpadded base64), from cache or fetched.
     async fn server_key(&self, origin: &str, key_id: &str) -> Result<String, FederationError> {
         let cache_key = server_keys_row(origin);
