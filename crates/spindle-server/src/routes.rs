@@ -902,6 +902,10 @@ struct RegisterRequest {
     #[serde(default)]
     refresh_token: bool,
     auth: Option<Value>,
+    /// `m.login.application_service` switches registration to the
+    /// appservice path: no UIA, the `as_token` is the whole proof.
+    #[serde(rename = "type")]
+    login_type: Option<String>,
 }
 
 /// The login/register/refresh response body.
@@ -1046,6 +1050,7 @@ async fn register_available(
 async fn register(
     State(state): State<AppState>,
     source: ClientAddr,
+    headers: axum::http::HeaderMap,
     Json(request): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<Value>), MatrixError> {
     // Counted after the UIA hand-shake, so the mandatory first 401 does not
@@ -1074,6 +1079,28 @@ async fn register(
                 return Err(MatrixError::invalid_username());
             }
             Err(other) => return Err(MatrixError::internal(&other.to_string())),
+        }
+    }
+
+    // SPEC (appservice §registration): `m.login.application_service` skips
+    // UIA entirely — the as_token in the Authorization header is the whole
+    // proof, so it branches before the challenge below.
+    if request.login_type.as_deref() == Some("m.login.application_service") {
+        return register_appservice_user(&state, &headers, username.as_deref(), &request);
+    }
+
+    // An exclusive namespace is a reservation: only its service may create
+    // these accounts, through the branch above. Refused before the UIA
+    // dance for the same reason the username checks are — a client should
+    // not complete auth for a name it can never have.
+    if let Some(name) = username.as_deref() {
+        let user_id = format!("@{name}:{}", state.config.server.name);
+        if state.appservices.exclusively_claims(&user_id) {
+            return Err(MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_EXCLUSIVE",
+                "this localpart is reserved by an application service",
+            ));
         }
     }
 
@@ -1124,6 +1151,74 @@ async fn register(
             username,
             request.device_id,
             request.initial_device_display_name,
+            request.refresh_token,
+        )
+        .map_err(|error| internal(&error))?;
+    Ok((StatusCode::OK, Json(session_body(&user_id, &session))))
+}
+
+/// The `m.login.application_service` branch of registration.
+///
+/// The account is born with an unguessable password held by nobody,
+/// exactly like a ghost provisioned on first masquerade — the appservice
+/// door is the only door either kind of account should have. The session
+/// returned (unless `inhibit_login`) is a real one; MSC4190's deviceless
+/// registration comes later.
+fn register_appservice_user(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    username: Option<&str>,
+    request: &RegisterRequest,
+) -> Result<(StatusCode, Json<Value>), MatrixError> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .unwrap_or_default();
+    let registration = state
+        .appservices
+        .by_token(token)
+        .ok_or_else(MatrixError::unknown_token)?;
+    let username = username.ok_or_else(|| MatrixError::bad_json("no username"))?;
+    let server_name = &state.config.server.name;
+    let user_id = format!("@{username}:{server_name}");
+    if !registration.may_masquerade_as(&user_id, server_name) {
+        return Err(MatrixError::new(
+            StatusCode::FORBIDDEN,
+            "M_EXCLUSIVE",
+            format!(
+                "{user_id} is outside the {} appservice's namespaces",
+                registration.id
+            ),
+        ));
+    }
+    let password = {
+        use rand::RngCore as _;
+        use std::fmt::Write as _;
+        let mut bytes = [0_u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        bytes.iter().fold(String::new(), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+    };
+    let accounts = Accounts::new(state.store.as_ref(), server_name);
+    accounts
+        .register(username, &password)
+        .map_err(|error| match error {
+            AccountError::UserInUse => MatrixError::user_in_use(),
+            AccountError::InvalidUsername => MatrixError::invalid_username(),
+            other => MatrixError::internal(&other.to_string()),
+        })?;
+    if request.inhibit_login {
+        return Ok((StatusCode::OK, Json(json!({ "user_id": user_id }))));
+    }
+    let session = accounts
+        .create_session(
+            username,
+            request.device_id.clone(),
+            request.initial_device_display_name.clone(),
             request.refresh_token,
         )
         .map_err(|error| internal(&error))?;
