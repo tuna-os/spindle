@@ -409,6 +409,60 @@ impl Federation {
         Ok(body)
     }
 
+    /// Ask the invited user's server to co-sign an invite — the client
+    /// half of `v2/invite`.
+    ///
+    /// The body carries the signed invite event, the room version, and the
+    /// stripped state the invited user may render the invite from. What
+    /// comes back is the same event with the invitee's server's signature
+    /// added, which is what makes the invite provable to every other
+    /// server in the room.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] if the request cannot be signed or sent,
+    /// or the peer refuses — a refusal here fails the invite, because an
+    /// invite the target's server never co-signed is one its user will
+    /// never see.
+    pub async fn remote_invite(
+        &self,
+        destination: &str,
+        room_id: &str,
+        event_id: &str,
+        body: &Value,
+    ) -> Result<Value, FederationError> {
+        let uri = format!("/_matrix/federation/v2/invite/{room_id}/{event_id}");
+        let authorization = self.sign_request("PUT", &uri, destination, Some(body))?;
+        let response = self
+            .client
+            .put(format!(
+                "{}{uri}",
+                base_url(destination, self.insecure_http)
+            ))
+            .header("authorization", authorization)
+            .header("content-type", "application/json")
+            .timeout(Duration::from_secs(30))
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|error| FederationError::Refused(format!("invite: {error}")))?;
+        let status = response.status();
+        let body: Value = response
+            .bytes()
+            .await
+            .map_err(|error| FederationError::Refused(format!("invite body: {error}")))
+            .and_then(|bytes| {
+                serde_json::from_slice(&bytes)
+                    .map_err(|error| FederationError::Refused(format!("invite body: {error}")))
+            })?;
+        if !status.is_success() {
+            return Err(FederationError::Refused(format!(
+                "{destination} refused invite: {status} {body}"
+            )));
+        }
+        Ok(body)
+    }
+
     /// Deliver one signed transaction to a peer.
     ///
     /// # Errors

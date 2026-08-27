@@ -215,6 +215,15 @@ pub enum Keyspace {
     /// `/get_missing_events`), and the body rows are room-scoped; without
     /// this reverse index answering would mean scanning every room.
     EventRoom = 0x21,
+    /// `(user_id, room_id)` -> `{origin, invite_state}` for an invite into a
+    /// room this server holds no log for.
+    ///
+    /// A federated invite arrives before (and possibly without) any room
+    /// history: the inviting server hands over stripped state so the invite
+    /// can be rendered, and its own name is the one server known to hold the
+    /// room when the user accepts. Both go stale the moment a real membership
+    /// row for the pair is written, which is when this row is deleted.
+    PendingInvite = 0x22,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
