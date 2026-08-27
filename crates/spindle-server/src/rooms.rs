@@ -217,6 +217,18 @@ pub struct RoomSummary {
     pub encryption: Option<String>,
 }
 
+/// How a `state_at` query names its point in the log (#83 §4).
+#[derive(Clone, Debug)]
+pub enum StateAtAnchor {
+    /// A linear index; resolves to the newest entry at or before it.
+    Li(i64),
+    /// A unix-milliseconds timestamp; resolves to the last entry whose
+    /// `origin_server_ts` is at or under it.
+    Ts(u64),
+    /// An event ID; resolves to exactly that entry.
+    Event(String),
+}
+
 /// One stored event, as a client sees it.
 #[derive(Clone, Debug)]
 pub struct TimelineEvent {
@@ -1451,6 +1463,111 @@ impl Rooms {
             out.push(self.event(room_id, &id)?);
         }
         Ok(out)
+    }
+
+    /// The room's state at a past point (#83 §4): the query the linear
+    /// index turns from a forensic exercise into one seek.
+    ///
+    /// The anchor resolves to a log entry — the newest at or before an
+    /// `li`, the entry of an event ID, or (for a timestamp) the last
+    /// entry whose `origin_server_ts` is at or under it, found by binary
+    /// search because in a linearized room the storage order *is* the
+    /// temporal order. Every entry keeps its 32-byte `state_root`
+    /// forever and the log records persist it, so the sparse per-`li`
+    /// index #83 anticipated is unnecessary: any entry's state is the
+    /// resident snapshot when the window still holds it, and a rehydrate
+    /// of shared trie nodes when it does not — slower, never refused.
+    ///
+    /// Returns the resolved `(li, event_id, resident, state events)` so
+    /// the caller can say exactly which point it answered for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] for a room that does not
+    /// exist, and [`RoomError::UnknownState`] when the log starts after
+    /// the requested point or the event is not in this room.
+    pub fn admin_state_at(
+        &self,
+        room_id: &str,
+        anchor: &StateAtAnchor,
+    ) -> Result<(i64, String, bool, Vec<Value>), RoomError> {
+        let resolve = |li: i64| -> Result<(i64, String), RoomError> {
+            self.with_room(room_id, |_, log| {
+                log.entry_at_or_before(li)
+                    .map(|entry| (entry.li.get(), entry.event_id.as_str().to_owned()))
+                    .ok_or_else(|| RoomError::UnknownState("entry at or before that point".into()))
+            })
+        };
+        let (li, event_id) = match anchor {
+            StateAtAnchor::Li(li) => resolve(*li)?,
+            StateAtAnchor::Event(id) => self.with_room(room_id, |_, log| {
+                log.get(&EventId::new(id.as_str()))
+                    .map(|entry| (entry.li.get(), entry.event_id.as_str().to_owned()))
+                    .ok_or_else(|| RoomError::UnknownState("such an event in this room".into()))
+            })?,
+            StateAtAnchor::Ts(wanted) => {
+                let (mut low, high) = self.with_room(room_id, |_, log| {
+                    let mut entries = log.entries();
+                    let first = entries.next().map(|entry| entry.li.get());
+                    let last = entries.next_back().map(|entry| entry.li.get());
+                    Ok((first, last.or(first)))
+                })?;
+                let (Some(mut low_li), Some(mut high_li)) = (low.take(), high) else {
+                    return Err(RoomError::UnknownState("entries in this room".into()));
+                };
+                let ts_of = |li: i64| -> Result<(i64, u64), RoomError> {
+                    let (li, event_id) = resolve(li)?;
+                    let event = self.event(room_id, &event_id)?;
+                    Ok((li, event["origin_server_ts"].as_u64().unwrap_or(0)))
+                };
+                let (first_li, first_ts) = ts_of(low_li)?;
+                if first_ts > *wanted {
+                    return Err(RoomError::UnknownState(
+                        "entry at or before that time".into(),
+                    ));
+                }
+                // Invariant: the entry at or before `low_li` is at or
+                // under the wanted time. Probe above the midpoint so the
+                // range always narrows; a probe landing in a gap between
+                // entries resolves to the nearest entry below it, which
+                // both branches handle.
+                low_li = first_li;
+                while low_li < high_li {
+                    let probe = low_li + (high_li - low_li + 1) / 2;
+                    let (entry_li, entry_ts) = ts_of(probe)?;
+                    if entry_ts <= *wanted {
+                        low_li = probe;
+                    } else {
+                        high_li = entry_li - 1;
+                    }
+                }
+                resolve(low_li)?
+            }
+        };
+
+        let root_or_resident = self.with_room(room_id, |_, log| {
+            if let Some(snapshot) = log.state_after(spindle_core::LinearIndex::from_raw(li)) {
+                let mut ids = Vec::with_capacity(snapshot.len());
+                snapshot.for_each(|_, id| ids.push(id.to_owned()));
+                Ok(Ok(ids))
+            } else {
+                let entry = log
+                    .entry_at_or_before(li)
+                    .ok_or_else(|| RoomError::UnknownState("that entry".into()))?;
+                Ok(Err(entry.state_root))
+            }
+        })?;
+        let (resident, state) = match root_or_resident {
+            Ok(ids) => {
+                let mut out = Vec::with_capacity(ids.len());
+                for id in ids {
+                    out.push(self.event(room_id, &id)?);
+                }
+                (true, out)
+            }
+            Err(root) => (false, self.state_at(room_id, root)?),
+        };
+        Ok((li, event_id, resident, state))
     }
 
     /// Every room this server holds, from the stored metadata rows.

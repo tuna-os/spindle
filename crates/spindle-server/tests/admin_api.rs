@@ -139,6 +139,10 @@ fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
             (reqwest::Method::GET, format!("{prefix}/rooms/!r:x/state")),
             (
                 reqwest::Method::GET,
+                format!("{prefix}/rooms/!r:x/state_at"),
+            ),
+            (
+                reqwest::Method::GET,
                 format!("{prefix}/rooms/!r:x/timeline"),
             ),
             (reqwest::Method::GET, format!("{prefix}/audit")),
@@ -686,4 +690,147 @@ async fn room_detail_members_state_and_timeline_read_the_log() {
     let (status, body) = get(format!("/_spindle/admin/v1/rooms/{ops}/timeline?dir=x")).await;
     assert_eq!(status, 400, "{body}");
     assert_eq!(body["errcode"], "M_INVALID_PARAM", "{body}");
+}
+
+/// Current state of a `state_at` response, folded down to the one field
+/// the assertions care about.
+fn name_in(body: &Value) -> Option<&str> {
+    body["state"]
+        .as_array()?
+        .iter()
+        .find(|event| event["type"] == "m.room.name")
+        .and_then(|event| event["content"]["name"].as_str())
+}
+
+#[tokio::test]
+async fn state_at_answers_for_any_point_in_the_log() {
+    let server = Instance::start().await;
+    let admin_token = server.register("root").await;
+    server.promote("root");
+
+    // A room whose name changes after a log deep enough that the early
+    // entries have left the 512-entry resident window: create, name it
+    // "One", drop a marker, bury both under filler, rename to "Two".
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/createRoom",
+            Some(&admin_token),
+            Some(&json!({ "name": "One" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/marker"),
+            Some(&admin_token),
+            Some(&json!({ "msgtype": "m.text", "body": "the marker" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let marker = body["event_id"].as_str().unwrap().to_owned();
+    for n in 0..520 {
+        let (status, body) = server
+            .request(
+                reqwest::Method::PUT,
+                &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/f{n}"),
+                Some(&admin_token),
+                Some(&json!({ "msgtype": "m.text", "body": "filler" })),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+    }
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.name/"),
+            Some(&admin_token),
+            Some(&json!({ "name": "Two" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let get = |query: String| {
+        let server = &server;
+        let token = admin_token.clone();
+        let room = room.clone();
+        async move {
+            server
+                .request(
+                    reqwest::Method::GET,
+                    &format!("/_spindle/admin/v1/rooms/{room}/state_at?{query}"),
+                    Some(&token),
+                    None,
+                )
+                .await
+        }
+    };
+
+    // Anchored by event ID, deep in the log: the answer predates the
+    // rename, and the window no longer holds it — rehydrated, honestly.
+    let (status, body) = get(format!("event_id={marker}")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(name_in(&body), Some("One"), "{body}");
+    assert_eq!(body["event_id"], marker.as_str(), "{body}");
+    assert_eq!(body["source"], "rehydrated", "{body}");
+    let marker_li = body["li"].as_i64().unwrap();
+    let marker_ts = body["origin_server_ts"].as_u64().unwrap();
+
+    // The same point by li, and by any li in the buried filler.
+    let (status, body) = get(format!("li={marker_li}")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(name_in(&body), Some("One"), "{body}");
+
+    // Near the head the window still holds the answer.
+    let (status, body) = get("li=9999999".to_owned()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(name_in(&body), Some("Two"), "{body}");
+    assert_eq!(body["source"], "resident", "{body}");
+
+    // By time: at the marker's stamp the room is still "One" (filler
+    // sharing the millisecond changes nothing it asserts), and any
+    // future time answers the present.
+    let (status, body) = get(format!("ts={marker_ts}")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(name_in(&body), Some("One"), "{body}");
+    assert!(body["li"].as_i64().unwrap() >= marker_li, "{body}");
+    let (status, body) = get("ts=99999999999999".to_owned()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(name_in(&body), Some("Two"), "{body}");
+}
+
+#[tokio::test]
+async fn state_at_refuses_what_it_cannot_answer() {
+    let server = Instance::start().await;
+    let (admin_token, ops, _) = rooms_fixture(&server).await;
+    let get = |room: &str, query: &str| {
+        let path = format!("/_spindle/admin/v1/rooms/{room}/state_at?{query}");
+        let server = &server;
+        let token = admin_token.clone();
+        async move {
+            server
+                .request(reqwest::Method::GET, &path, Some(&token), None)
+                .await
+        }
+    };
+
+    // No anchor, or two, is ambiguous — refused, not guessed.
+    let (status, body) = get(&ops, "").await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["errcode"], "M_INVALID_PARAM", "{body}");
+    let (status, body) = get(&ops, "li=1&ts=5").await;
+    assert_eq!(status, 400, "{body}");
+
+    // Points the log cannot answer for are 404s that say so.
+    let (status, body) = get(&ops, "li=-9999999").await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["errcode"], "M_NOT_FOUND", "{body}");
+    let (status, body) = get(&ops, "ts=1").await;
+    assert_eq!(status, 404, "{body}");
+    let (status, body) = get(&ops, "event_id=$nowhere:x").await;
+    assert_eq!(status, 404, "{body}");
+    let (status, body) = get("!missing:nowhere", "li=1").await;
+    assert_eq!(status, 404, "{body}");
 }

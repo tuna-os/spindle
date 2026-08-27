@@ -70,6 +70,10 @@ pub fn routes() -> Router<AppState> {
                 get(room_state),
             )
             .route(
+                &format!("{prefix}/rooms/{{room_id}}/state_at"),
+                get(room_state_at),
+            )
+            .route(
                 &format!("{prefix}/rooms/{{room_id}}/timeline"),
                 get(room_timeline),
             )
@@ -622,6 +626,59 @@ async fn room_state(
         .state(&room_id)
         .map_err(crate::routes::room_error)?;
     Ok(Json(json!({ "state": events })))
+}
+
+#[derive(Deserialize)]
+struct StateAtQuery {
+    li: Option<i64>,
+    ts: Option<u64>,
+    event_id: Option<String>,
+}
+
+/// `GET /rooms/{roomId}/state_at?li|ts|event_id`
+///
+/// The capability #83 §4 gives its own endpoint: "what did this room
+/// look like at that point" as one seek plus a trie root, rather than a
+/// forensic exercise. Exactly one anchor is required — a request naming
+/// two is ambiguous about which point it means, and refused rather than
+/// second-guessed. The response says which entry it resolved to and
+/// whether the answer came from the resident window or was rehydrated.
+async fn room_state_at(
+    State(state): State<AppState>,
+    _actor: AdminActor,
+    Path(room_id): Path<String>,
+    Query(query): Query<StateAtQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    use crate::rooms::StateAtAnchor;
+    let anchor = match (query.li, query.ts, query.event_id) {
+        (Some(li), None, None) => StateAtAnchor::Li(li),
+        (None, Some(ts), None) => StateAtAnchor::Ts(ts),
+        (None, None, Some(event_id)) => StateAtAnchor::Event(event_id),
+        _ => {
+            return Err(MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                "exactly one of li, ts, event_id",
+            ));
+        }
+    };
+    let (li, event_id, resident, events) = state
+        .rooms
+        .admin_state_at(&room_id, &anchor)
+        .map_err(crate::routes::room_error)?;
+    let ts = state
+        .rooms
+        .event(&room_id, &event_id)
+        .ok()
+        .and_then(|event| event["origin_server_ts"].as_u64());
+    Ok(Json(json!({
+        "room_id": room_id,
+        "li": li,
+        "event_id": event_id,
+        "origin_server_ts": ts,
+        "source": if resident { "resident" } else { "rehydrated" },
+        "state": events,
+    })))
 }
 
 #[derive(Deserialize)]
