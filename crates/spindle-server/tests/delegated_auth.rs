@@ -268,6 +268,45 @@ async fn a_provider_token_becomes_a_real_local_identity() {
 }
 
 #[tokio::test]
+async fn device_deletion_needs_no_uia_the_user_cannot_complete() {
+    let (_provider, url) = Provider::serve().await;
+    let server = Instance::start(Some(&url)).await;
+
+    // First sight provisions the account and the device the provider
+    // named. The user's local password is unguessable by construction,
+    // so a password UIA challenge here would be unanswerable — the
+    // provider's live vouching is the proof of identity instead.
+    let (status, _) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(MAS_TOKEN),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::DELETE,
+            "/_matrix/client/v3/devices/MASDEV1",
+            Some(MAS_TOKEN),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "no UIA challenge under delegation: {body}");
+    let (status, _) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/devices/MASDEV1",
+            Some(MAS_TOKEN),
+            None,
+        )
+        .await;
+    assert_eq!(status, 404, "and the device is really gone");
+}
+
+#[tokio::test]
 async fn an_inactive_token_buys_nothing() {
     let (_provider, url) = Provider::serve().await;
     let server = Instance::start(Some(&url)).await;
