@@ -95,6 +95,18 @@ fn account_routes() -> Router<AppState> {
             "/_matrix/client/v3/user/{user_id}/rooms/{room_id}/account_data/{event_type}",
             get(get_room_account_data).put(set_room_account_data),
         )
+        // Tags are not their own storage: the spec models them as the `m.tag`
+        // room account-data event, and these endpoints are views over it.
+        // That is what makes them appear in /sync's per-room account data
+        // with no extra wiring -- there is only one value to keep true.
+        .route(
+            "/_matrix/client/v3/user/{user_id}/rooms/{room_id}/tags",
+            get(get_tags),
+        )
+        .route(
+            "/_matrix/client/v3/user/{user_id}/rooms/{room_id}/tags/{tag}",
+            axum::routing::put(set_tag).delete(delete_tag),
+        )
         .route(
             "/_matrix/client/v3/user/{user_id}/filter",
             post(create_filter),
@@ -1768,6 +1780,84 @@ fn requested_filter(
                 format!("no filter {raw}"),
             )
         })
+}
+
+/// `GET /_matrix/client/v3/user/{user_id}/rooms/{room_id}/tags`
+async fn get_tags(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((user_id, room_id)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    own_account(&identity, &user_id)?;
+    let tags = state
+        .account_data
+        .get(&user_id, &room_id, "m.tag")
+        .map_err(|error| account_data_error(&error))?
+        .unwrap_or_else(|| json!({ "tags": {} }));
+    // A user who never tagged anything gets an empty map, not a 404: "no
+    // tags" is an ordinary answer here, where for general account data an
+    // unset type is a 404. The difference is that this endpoint's shape is
+    // fixed by the spec and a client iterates the map unconditionally.
+    Ok(Json(tags))
+}
+
+/// `PUT /_matrix/client/v3/user/{user_id}/rooms/{room_id}/tags/{tag}`
+async fn set_tag(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((user_id, room_id, tag)): axum::extract::Path<(String, String, String)>,
+    Json(content): Json<Value>,
+) -> Result<Json<Value>, MatrixError> {
+    own_account(&identity, &user_id)?;
+    let mut tags = state
+        .account_data
+        .get(&user_id, &room_id, "m.tag")
+        .map_err(|error| account_data_error(&error))?
+        .unwrap_or_else(|| json!({ "tags": {} }));
+    if !tags["tags"].is_object() {
+        tags["tags"] = json!({});
+    }
+    // The body is the tag's content -- `order` and whatever else the client
+    // keeps there. Stored as given: the server has no opinion about tag
+    // content for the same reason it has none about account data generally.
+    tags["tags"][&tag] = content;
+    state
+        .account_data
+        .put(&user_id, &room_id, "m.tag", &tags)
+        .map_err(|error| account_data_error(&error))?;
+    Ok(Json(json!({})))
+}
+
+/// `DELETE /_matrix/client/v3/user/{user_id}/rooms/{room_id}/tags/{tag}`
+async fn delete_tag(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((user_id, room_id, tag)): axum::extract::Path<(String, String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    own_account(&identity, &user_id)?;
+    let mut tags = state
+        .account_data
+        .get(&user_id, &room_id, "m.tag")
+        .map_err(|error| account_data_error(&error))?
+        .unwrap_or_else(|| json!({ "tags": {} }));
+    let removed = tags["tags"]
+        .as_object_mut()
+        .is_some_and(|map| map.remove(&tag).is_some());
+    if !removed {
+        // The spec's own answer for deleting a tag that is not there. Quietly
+        // returning {} would be defensible; 404 is what Synapse does and what
+        // clients therefore already handle.
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            format!("{room_id} is not tagged {tag}"),
+        ));
+    }
+    state
+        .account_data
+        .put(&user_id, &room_id, "m.tag", &tags)
+        .map_err(|error| account_data_error(&error))?;
+    Ok(Json(json!({})))
 }
 
 /// `GET /_matrix/client/v3/sync`
