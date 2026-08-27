@@ -56,9 +56,12 @@ MILESTONES = [
      "401), /version, and the first authenticated query. Inbound /send "
      "receives foreign PDUs through the same authorization predicate local "
      "events pass, with per-origin transaction replay and spec-correct "
-     "redact-on-hash-mismatch. Next: the outbound transaction queue, then "
-     "#15 joins/state/history, then #16's fork-proof rig — where the "
-     "no-state-resolution claim meets adversarial evidence."),
+     "redact-on-hash-mismatch; the outbound queue delivers local events to "
+     "every live-member server with ack-before-delete, deterministic "
+     "transaction IDs and per-destination backoff — #14 is functionally "
+     "complete. Next: #15 joins/state/history/backfill, then #16's "
+     "fork-proof rig — where the no-state-resolution claim meets "
+     "adversarial evidence."),
     ("M4", "Ecosystem integration", "Not started", "#18 appservices, #17 MAS/OIDC."),
     ("M5", "Production lifecycle", "Not started",
      "#19 #20 #21; #42's parity gate vs Synapse and Tuwunel is part of the "

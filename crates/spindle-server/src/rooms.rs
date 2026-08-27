@@ -1657,7 +1657,83 @@ impl Rooms {
                 json: &json,
             },
         )?;
+        self.enqueue_outbound(log, room_id, &json)?;
         Ok(event_id)
+    }
+
+    /// Queue a locally-created event for every remote server with a live
+    /// member in the room.
+    ///
+    /// Only the local path enqueues: each server fans out its own events,
+    /// and forwarding what we received would deliver everything twice.
+    /// Membership is checked per member — a domain whose only members have
+    /// left or been banned gets nothing, because "we used to share a room"
+    /// is not an entitlement to what is said now.
+    fn enqueue_outbound(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        json: &Value,
+    ) -> Result<(), RoomError> {
+        // Domains come from member state keys; liveness from the membership
+        // index — a point read per member, no body parses.
+        let Some(state) = log
+            .entries()
+            .next_back()
+            .map(|entry| entry.li)
+            .and_then(|li| log.state_after(li))
+        else {
+            return Ok(());
+        };
+        let mut members = Vec::new();
+        state.for_each(|state_key, _| {
+            if state_key.event_type().as_str() == "m.room.member" {
+                members.push(state_key.state_key().to_owned());
+            }
+        });
+        let mut destinations = std::collections::BTreeSet::new();
+        for user_id in members {
+            let Some((_, domain)) = user_id.split_once(':') else {
+                continue;
+            };
+            if domain == self.server_name || destinations.contains(domain) {
+                continue;
+            }
+            let membership = spindle_store::ReadView::get(
+                self.store.as_ref(),
+                &spindle_core::keys::user_room(
+                    spindle_core::keys::Keyspace::Membership,
+                    &user_id,
+                    room_id,
+                ),
+            )?;
+            let live = membership.as_deref().is_some_and(|value| {
+                value == JOIN_STR.as_bytes() || value == INVITE_STR.as_bytes()
+            });
+            if live {
+                destinations.insert(domain.to_owned());
+            }
+        }
+        // A membership event still goes to the domain it is *about*, live
+        // or not: the kick is the one event the removed server must hear,
+        // and by this point the membership index already says "leave" — the
+        // liveness check above would skip exactly the notification that
+        // matters.
+        if json["type"].as_str() == Some("m.room.member")
+            && let Some((_, domain)) = json["state_key"].as_str().and_then(|u| u.split_once(':'))
+            && domain != self.server_name
+        {
+            destinations.insert(domain.to_owned());
+        }
+        for destination in destinations {
+            let seq = self.allocate_stream_id();
+            spindle_store::Store::put(
+                self.store.as_ref(),
+                &spindle_core::keys::federation_outbox(&destination, seq),
+                json.to_string().as_bytes(),
+            )?;
+        }
+        Ok(())
     }
 
     /// Accept one event another server created, after the caller verified
@@ -2299,7 +2375,25 @@ fn highest_stream_id(store: &FjallStore) -> u64 {
     .filter_map(|(_, value)| value.as_slice().try_into().map(u64::from_be_bytes).ok())
     .max()
     .unwrap_or(0);
-    from_stream.max(from_to_device).max(from_device_lists)
+    // The federation outbox is the fourth drawer: its rows carry the
+    // sequence in the key's last eight bytes and have no stream row, and a
+    // counter resumed below one would eventually overwrite a pending
+    // delivery for the same destination.
+    let from_outbox =
+        spindle_store::ReadView::scan_prefix(store, &spindle_core::keys::federation_outbox_all())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|(key, _)| {
+                key.get(key.len().checked_sub(8)?..)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u64::from_be_bytes)
+            })
+            .max()
+            .unwrap_or(0);
+    from_stream
+        .max(from_to_device)
+        .max(from_device_lists)
+        .max(from_outbox)
 }
 
 #[cfg(test)]

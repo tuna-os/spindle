@@ -275,6 +275,131 @@ impl Federation {
     }
 }
 
+impl Federation {
+    /// Deliver one signed transaction to a peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] if the request cannot be signed or sent,
+    /// or the peer answers anything but success.
+    pub async fn send_transaction(
+        &self,
+        destination: &str,
+        txn_id: &str,
+        body: &Value,
+    ) -> Result<(), FederationError> {
+        let uri = format!("/_matrix/federation/v1/send/{txn_id}");
+        let authorization = self.sign_request("PUT", &uri, destination, Some(body))?;
+        let scheme = if self.insecure_http { "http" } else { "https" };
+        let response = self
+            .client
+            .put(format!("{scheme}://{destination}{uri}"))
+            .header("authorization", authorization)
+            .header("content-type", "application/json")
+            .timeout(Duration::from_secs(30))
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|error| FederationError::Refused(format!("send: {error}")))?;
+        if !response.status().is_success() {
+            return Err(FederationError::Refused(format!(
+                "{destination} answered {}",
+                response.status()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// One pending delivery: its store key and the PDU it carries.
+type OutboxRow = (Vec<u8>, Vec<u8>);
+
+/// Drain the outbound queue, forever.
+///
+/// A polling loop rather than a wakeup protocol: the scan of an empty
+/// keyspace is a bounded prefix read, and the poll interval doubles as the
+/// floor of the retry backoff. Rows are deleted only after the destination
+/// acknowledged the transaction carrying them — a crash between send and
+/// delete re-sends, and the transaction ID being derived from the first
+/// row's sequence lets the peer's replay table absorb the duplicate.
+pub async fn drain_outbox(
+    store: Arc<FjallStore>,
+    federation: Arc<Federation>,
+    retry_base: Duration,
+) {
+    let mut backoff: std::collections::HashMap<String, (u32, std::time::Instant)> =
+        std::collections::HashMap::new();
+    loop {
+        tokio::time::sleep(
+            retry_base
+                .min(Duration::from_millis(500))
+                .max(Duration::from_millis(25)),
+        )
+        .await;
+        let Ok(rows) = ReadView::scan_prefix(store.as_ref(), &keys::federation_outbox_all()) else {
+            continue;
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        let mut by_destination: std::collections::BTreeMap<String, Vec<OutboxRow>> =
+            std::collections::BTreeMap::new();
+        for (key, value) in rows {
+            if let Some(destination) = keys::federation_outbox_destination(&key) {
+                by_destination
+                    .entry(destination)
+                    .or_default()
+                    .push((key, value));
+            }
+        }
+        for (destination, rows) in by_destination {
+            if let Some((_, until)) = backoff.get(&destination)
+                && *until > std::time::Instant::now()
+            {
+                continue;
+            }
+            // At most fifty PDUs per transaction, by spec; the rest wait
+            // for the next pass.
+            let batch: Vec<_> = rows.into_iter().take(50).collect();
+            let pdus: Vec<Value> = batch
+                .iter()
+                .filter_map(|(_, value)| serde_json::from_slice(value).ok())
+                .collect();
+            let first_seq = batch
+                .first()
+                .and_then(|(key, _)| key.get(key.len() - 8..))
+                .and_then(|bytes| bytes.try_into().ok())
+                .map_or(0, u64::from_be_bytes);
+            // Deterministic by content, not by attempt: a retry after a
+            // crash reuses the same ID, which is what makes redelivery a
+            // no-op on the peer.
+            let txn_id = format!("o{first_seq}");
+            let body = serde_json::json!({
+                "origin": federation.server_name,
+                "origin_server_ts": now_millis(),
+                "pdus": pdus,
+            });
+            match federation
+                .send_transaction(&destination, &txn_id, &body)
+                .await
+            {
+                Ok(()) => {
+                    for (key, _) in &batch {
+                        let _ = Store::delete(store.as_ref(), key);
+                    }
+                    backoff.remove(&destination);
+                }
+                Err(error) => {
+                    tracing::debug!("outbox to {destination}: {error}");
+                    let failures = backoff.get(&destination).map_or(0, |(count, _)| *count) + 1;
+                    let delay = retry_base * 2_u32.saturating_pow(failures.min(6));
+                    backoff.insert(destination, (failures, std::time::Instant::now() + delay));
+                }
+            }
+        }
+    }
+}
+
 /// The object the X-Matrix signature covers.
 fn request_object(
     method: &str,
