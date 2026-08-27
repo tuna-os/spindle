@@ -25,6 +25,8 @@ struct Delivery {
     authorization: String,
     events: Vec<Value>,
     ephemeral: Option<Vec<Value>>,
+    /// The whole body, for MSC3202 payloads keyed by unstable names.
+    raw: Value,
 }
 
 /// The mock bridge: records every transaction, and can be told to fail
@@ -63,6 +65,7 @@ impl Bridge {
                             authorization,
                             events: as_events(&body),
                             ephemeral: body["ephemeral"].as_array().cloned(),
+                            raw: body.clone(),
                         };
                         {
                             let mut failures = state.failures_left.lock().unwrap();
@@ -114,18 +117,33 @@ impl Instance {
     }
 
     async fn start_with(as_url: &str, receive_ephemeral: bool) -> Instance {
+        // The MSC3202/MSC4190 flags under their unstable names, which is
+        // what shipping bridge registrations actually contain — so the
+        // aliases are what this suite exercises.
+        Self::start_yaml(&format!(
+            "id: testbridge\nurl: \"{as_url}\"\nas_token: {AS_TOKEN}\n\
+             hs_token: {HS_TOKEN}\nsender_localpart: _bridge_bot\n\
+             receive_ephemeral: {receive_ephemeral}\n\
+             namespaces:\n  users:\n    - exclusive: true\n      regex: \"@_bridge_.*:.*\"\n"
+        ))
+        .await
+    }
+
+    async fn start_msc3202(as_url: &str) -> Instance {
+        Self::start_yaml(&format!(
+            "id: testbridge\nurl: \"{as_url}\"\nas_token: {AS_TOKEN}\n\
+             hs_token: {HS_TOKEN}\nsender_localpart: _bridge_bot\n\
+             io.element.msc4190: true\n\
+             org.matrix.msc3202: true\n\
+             namespaces:\n  users:\n    - exclusive: true\n      regex: \"@_bridge_.*:.*\"\n"
+        ))
+        .await
+    }
+
+    async fn start_yaml(registration: &str) -> Instance {
         let reg_dir = TempDir::new().unwrap();
         let reg_path = reg_dir.path().join("bridge.yaml");
-        std::fs::write(
-            &reg_path,
-            format!(
-                "id: testbridge\nurl: \"{as_url}\"\nas_token: {AS_TOKEN}\n\
-                 hs_token: {HS_TOKEN}\nsender_localpart: _bridge_bot\n\
-                 receive_ephemeral: {receive_ephemeral}\n\
-                 namespaces:\n  users:\n    - exclusive: true\n      regex: \"@_bridge_.*:.*\"\n"
-            ),
-        )
-        .unwrap();
+        std::fs::write(&reg_path, registration).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let dir = TempDir::new().unwrap();
@@ -464,6 +482,141 @@ async fn a_service_that_did_not_opt_in_never_sees_the_key() {
             .iter()
             .all(|delivery| delivery.ephemeral.is_none()),
         "MSC2409 is opt-in; the key must be absent: {:?}",
+        bridge.deliveries()
+    );
+}
+
+#[tokio::test]
+async fn device_lists_and_key_counts_ride_the_transaction_for_msc3202() {
+    let (bridge, as_url) = Bridge::serve().await;
+    let server = Instance::start_msc3202(&as_url).await;
+    let ghost = format!("@_bridge_keyed:{}", server.name);
+    let room = server.ghost_room_with_message(&ghost, "warmup").await;
+    assert!(
+        eventually(|| bodies(&bridge.deliveries()).contains(&"warmup".to_owned())).await,
+        "the warmup batch lands first"
+    );
+
+    // The bridge mints the ghost's device (MSC4190) and uploads identity
+    // keys plus one OTK through the ordinary endpoints, device-masqueraded
+    // per MSC3202.
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/devices/GHOSTDEV?user_id={ghost}"),
+            Some(AS_TOKEN),
+            Some(&json!({ "display_name": "ghost shell" })),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!(
+                "/_matrix/client/v3/keys/upload?user_id={ghost}&org.matrix.msc3202.device_id=GHOSTDEV"
+            ),
+            Some(AS_TOKEN),
+            Some(&json!({
+                "device_keys": {
+                    "user_id": ghost,
+                    "device_id": "GHOSTDEV",
+                    "algorithms": ["m.olm.v1.curve25519-aes-sha2"],
+                    "keys": {},
+                    "signatures": {},
+                },
+                "one_time_keys": { "signed_curve25519:AAAA": { "key": "k" } },
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    // Another message closes the window; the batch carrying it must also
+    // carry the device-list change and the ghost device's key counts.
+    server
+        .request(
+            reqwest::Method::PUT,
+            &format!(
+                "/_matrix/client/v3/rooms/{room}/send/m.room.message/t-trigger?user_id={ghost}"
+            ),
+            Some(AS_TOKEN),
+            Some(&json!({ "msgtype": "m.text", "body": "trigger" })),
+        )
+        .await;
+
+    assert!(
+        eventually(|| {
+            bridge.deliveries().iter().any(|delivery| {
+                delivery.raw["org.matrix.msc3202.device_lists"]["changed"]
+                    .as_array()
+                    .is_some_and(|changed| changed.iter().any(|user| user == ghost.as_str()))
+            })
+        })
+        .await,
+        "the device-list change reaches the bridge: {:?}",
+        bridge.deliveries()
+    );
+    assert!(
+        eventually(|| {
+            bridge.deliveries().iter().any(|delivery| {
+                delivery.raw["org.matrix.msc3202.device_one_time_keys_count"][&ghost]["GHOSTDEV"]
+                    ["signed_curve25519"]
+                    == json!(1)
+            })
+        })
+        .await,
+        "the ghost device's OTK count says exactly one key: {:?}",
+        bridge.deliveries()
+    );
+}
+
+#[tokio::test]
+async fn a_service_without_msc3202_never_sees_its_keys() {
+    let (bridge, as_url) = Bridge::serve().await;
+    let server = Instance::start(&as_url).await;
+    let ghost = format!("@_bridge_plain:{}", server.name);
+
+    // A human's key upload marks their device list changed inside the
+    // window the next batch covers...
+    let alice = server.register("alice").await;
+    let (_, whoami) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(&alice),
+            None,
+        )
+        .await;
+    let device = whoami["device_id"].as_str().unwrap().to_owned();
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/keys/upload",
+            Some(&alice),
+            Some(&json!({
+                "device_keys": {
+                    "user_id": format!("@alice:{}", server.name),
+                    "device_id": device,
+                    "algorithms": [], "keys": {}, "signatures": {},
+                },
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    // ...and the batch itself still arrives, without a single MSC3202 key.
+    server.ghost_room_with_message(&ghost, "plain").await;
+    assert!(
+        eventually(|| bodies(&bridge.deliveries()).contains(&"plain".to_owned())).await,
+        "events flow regardless"
+    );
+    assert!(
+        bridge.deliveries().iter().all(|delivery| {
+            delivery.raw.as_object().is_some_and(|body| {
+                body.keys()
+                    .all(|key| !key.starts_with("org.matrix.msc3202"))
+            })
+        }),
+        "MSC3202 is opt-in; its keys must be absent: {:?}",
         bridge.deliveries()
     );
 }

@@ -186,6 +186,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
                 Arc::clone(&state.appservices),
                 Arc::clone(&state.rooms),
                 Arc::clone(&state.typing),
+                Arc::clone(&state.devices),
                 state.config.server.name.clone(),
                 std::time::Duration::from_millis(state.config.federation.retry_base_ms),
             ));
