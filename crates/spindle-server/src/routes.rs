@@ -2276,14 +2276,47 @@ async fn set_room_state_default(
     .await
 }
 
+/// Attach `unsigned.m.relations` to an event a response is about to carry.
+///
+/// `unsigned` is the right home because it is the one part of the body the
+/// event ID does not cover: an aggregate changes every time someone reacts,
+/// and anything under the hash must never change.
+fn with_bundle(state: &AppState, room_id: &str, viewer: &str, mut event: Value) -> Value {
+    let Some(event_id) = event["event_id"].as_str().map(str::to_owned) else {
+        return event;
+    };
+    match state.rooms.bundle_relations(room_id, &event_id, viewer) {
+        Ok(Some(bundle)) => {
+            let unsigned = event
+                .as_object_mut()
+                .expect("a stored event is an object")
+                .entry("unsigned")
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(unsigned) = unsigned.as_object_mut() {
+                unsigned.insert("m.relations".to_owned(), bundle);
+            }
+            event
+        }
+        // No relations, or a read failure. The event itself is the answer the
+        // client asked for; a bundle that cannot be computed must not turn a
+        // working /messages into an error.
+        _ => event,
+    }
+}
+
 /// `GET /_matrix/client/v3/rooms/{room_id}/event/{event_id}`
 async fn room_event(
     State(state): State<AppState>,
-    Authenticated(_identity): Authenticated,
+    Authenticated(identity): Authenticated,
     axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, MatrixError> {
     let event = state.rooms.event(&room_id, &event_id).map_err(room_error)?;
-    Ok(Json(event))
+    Ok(Json(with_bundle(
+        &state,
+        &room_id,
+        &identity.user_id,
+        event,
+    )))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2297,7 +2330,7 @@ struct ContextQuery {
 /// it, and the room's state as it stood there.
 async fn room_context(
     State(state): State<AppState>,
-    Authenticated(_identity): Authenticated,
+    Authenticated(identity): Authenticated,
     axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
     axum::extract::Query(query): axum::extract::Query<ContextQuery>,
 ) -> Result<Json<Value>, MatrixError> {
@@ -2311,7 +2344,7 @@ async fn room_context(
         .map_err(room_error)?;
 
     Ok(Json(json!({
-        "event": context.event,
+        "event": with_bundle(&state, &room_id, &identity.user_id, context.event),
         "events_before": context.events_before,
         "events_after": context.events_after,
         "state": context.state,
@@ -2426,7 +2459,7 @@ struct MessagesQuery {
 /// is nothing to sort at read time and nothing to maintain alongside.
 async fn room_messages(
     State(state): State<AppState>,
-    Authenticated(_identity): Authenticated,
+    Authenticated(identity): Authenticated,
     axum::extract::Path(room_id): axum::extract::Path<String>,
     axum::extract::Query(query): axum::extract::Query<MessagesQuery>,
 ) -> Result<Json<Value>, MatrixError> {
@@ -2459,7 +2492,7 @@ async fn room_messages(
             if let Some(object) = json.as_object_mut() {
                 object.insert("event_id".to_owned(), json!(event.event_id));
             }
-            json
+            with_bundle(&state, &room_id, &identity.user_id, json)
         })
         .collect();
 

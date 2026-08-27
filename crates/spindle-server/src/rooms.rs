@@ -1311,6 +1311,111 @@ impl Rooms {
         Ok(out)
     }
 
+    /// Bundle an event's relations into `unsigned.m.relations` (MSC2675).
+    ///
+    /// Read-time aggregation, which is the shape SPEC §10.5 already committed
+    /// to for edits: the original is never mutated, so anything derived from
+    /// its relations has to be computed when asked. The index scan is in
+    /// timeline order for free — the key ends in `li` — which is what makes
+    /// "latest edit" a last-write scan rather than a sort.
+    ///
+    /// Three aggregations, the ones the spec defines:
+    /// - `m.replace`: the latest edit, whole, so a client can render the
+    ///   replacement without a second fetch.
+    /// - `m.annotation`: `(type, key)` reaction counts. Senders are not
+    ///   listed — a client that needs them pages `/relations`.
+    /// - `m.thread`: count and the latest event, whole, plus whether the
+    ///   asking user has participated — which is why this takes `viewer`.
+    ///
+    /// A redacted relation stops relating here for the same reason it does in
+    /// `/relations`: `m.relates_to` lives in content and redaction strips it,
+    /// so the check is reading the event rather than trusting the index row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the index or an event body cannot be read.
+    pub fn bundle_relations(
+        &self,
+        room_id: &str,
+        target: &str,
+        viewer: &str,
+    ) -> Result<Option<Value>, RoomError> {
+        let prefix = spindle_core::keys::relation_prefix(room_id, target);
+        let rows = spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?;
+
+        let mut latest_edit: Option<Value> = None;
+        let mut annotations: Vec<(String, String, u64)> = Vec::new();
+        let mut thread_count: u64 = 0;
+        let mut thread_latest: Option<Value> = None;
+        let mut viewer_in_thread = false;
+
+        for (_, value) in rows {
+            let Some((rel_type, event_id)) = decode_relation(&value) else {
+                continue;
+            };
+            let event = self.event(room_id, &event_id)?;
+            // Redacted: the relation is gone from the content, so it is gone
+            // from the aggregate.
+            if relates_to(&event["content"]).is_none() {
+                continue;
+            }
+            match rel_type.as_str() {
+                "m.replace" => latest_edit = Some(event),
+                "m.annotation" => {
+                    let key = event["content"]["m.relates_to"]["key"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned();
+                    let event_type = event["type"].as_str().unwrap_or_default().to_owned();
+                    match annotations
+                        .iter_mut()
+                        .find(|(existing_type, existing_key, _)| {
+                            existing_type == &event_type && existing_key == &key
+                        }) {
+                        Some((_, _, count)) => *count += 1,
+                        None => annotations.push((event_type, key, 1)),
+                    }
+                }
+                "m.thread" => {
+                    thread_count += 1;
+                    if event["sender"].as_str() == Some(viewer) {
+                        viewer_in_thread = true;
+                    }
+                    thread_latest = Some(event);
+                }
+                _ => {}
+            }
+        }
+
+        let mut bundle = Map::new();
+        if let Some(edit) = latest_edit {
+            bundle.insert("m.replace".to_owned(), edit);
+        }
+        if !annotations.is_empty() {
+            let chunk: Vec<Value> = annotations
+                .into_iter()
+                .map(|(event_type, key, count)| {
+                    serde_json::json!({ "type": event_type, "key": key, "count": count })
+                })
+                .collect();
+            bundle.insert(
+                "m.annotation".to_owned(),
+                serde_json::json!({ "chunk": chunk }),
+            );
+        }
+        if let Some(latest) = thread_latest {
+            bundle.insert(
+                "m.thread".to_owned(),
+                serde_json::json!({
+                    "count": thread_count,
+                    "latest_event": latest,
+                    "current_user_participated": viewer_in_thread,
+                }),
+            );
+        }
+        Ok((!bundle.is_empty()).then_some(Value::Object(bundle)))
+    }
+
     fn membership_rooms(&self, user_id: &str, wanted: &[u8]) -> Result<Vec<String>, RoomError> {
         let prefix =
             spindle_core::keys::user_prefix(spindle_core::keys::Keyspace::Membership, user_id);

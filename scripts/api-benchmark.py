@@ -22,6 +22,13 @@ a benchmark to be wrong in. Any non-2xx response aborts the whole run.
 from __future__ import annotations
 
 import argparse
+
+# How `register` satisfies user-interactive auth. Overridden by
+# --registration-token, because the servers this driver must treat equally do
+# not agree: Synapse and Spindle take m.login.dummy on an open server, while
+# continuwuity refuses open registration outright and gates on a token. The
+# driver adapting is what keeps the workload identical past the front door.
+REGISTRATION_AUTH: dict = {"type": "m.login.dummy"}
 import json
 import pathlib
 import statistics
@@ -67,7 +74,7 @@ class Client:
             {
                 "username": username,
                 "password": password,
-                "auth": {"type": "m.login.dummy"},
+                "auth": REGISTRATION_AUTH,
             },
         )
         self.token = body["access_token"]
@@ -154,7 +161,7 @@ def measure(base: str, sizes: list[int], samples: int, warmup: int) -> dict:
         # misbehaves on DAG servers, so it is the one most worth a curve.
         def paginate() -> None:
             alice.request(
-                "GET", f"/_matrix/client/v3/rooms/{room_id}/messages?limit=20"
+                "GET", f"/_matrix/client/v3/rooms/{room_id}/messages?limit=20&dir=b"
             )
 
         def read_state() -> None:
@@ -277,9 +284,19 @@ def main() -> int:
         default="10,100,1000",
         help="room sizes, in events, to measure at (default: 10,100,1000)",
     )
+    parser.add_argument(
+        "--registration-token",
+        help="satisfy m.login.registration_token instead of m.login.dummy",
+    )
     parser.add_argument("--samples", type=int, default=25)
     parser.add_argument("--warmup", type=int, default=5)
     arguments = parser.parse_args()
+    if arguments.registration_token:
+        global REGISTRATION_AUTH
+        REGISTRATION_AUTH = {
+            "type": "m.login.registration_token",
+            "token": arguments.registration_token,
+        }
 
     sizes = [int(size) for size in arguments.sizes.split(",") if size]
     if not sizes:
