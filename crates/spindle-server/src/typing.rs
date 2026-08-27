@@ -131,6 +131,33 @@ impl Typing {
         let _ = tokio::time::timeout(timeout, notified).await;
     }
 
+    /// Every room with someone still typing, each with its sorted typists.
+    ///
+    /// The whole-map read the appservice ephemeral push needs: it cannot
+    /// know which rooms to ask about, and the map holds only rooms where
+    /// someone has typed, so this is bounded by conversations actually in
+    /// motion rather than by rooms that exist.
+    #[must_use]
+    pub fn rooms_active(&self) -> Vec<(String, Vec<String>)> {
+        let now = Instant::now();
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out = Vec::new();
+        for (room_id, room) in active.iter_mut() {
+            room.retain(|_, expiry| *expiry > now);
+            if room.is_empty() {
+                continue;
+            }
+            let mut users: Vec<String> = room.keys().cloned().collect();
+            users.sort();
+            out.push((room_id.clone(), users));
+        }
+        out.sort();
+        out
+    }
+
     /// The `m.typing` event for a room, or `None` when nobody is typing.
     ///
     /// `None` rather than an event with an empty list, so a caller can leave
