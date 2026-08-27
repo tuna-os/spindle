@@ -808,6 +808,7 @@ fn discovery_routes() -> Router<AppState> {
             get(federation_media_download),
         )
         .route("/.well-known/matrix/client", get(well_known_client))
+        .route("/_matrix/client/v1/auth_metadata", get(auth_metadata))
         .route("/.well-known/matrix/server", get(well_known_server))
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -848,9 +849,46 @@ async fn capabilities() -> Json<Value> {
 
 /// `GET /.well-known/matrix/client`
 async fn well_known_client(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({
+    let mut body = json!({
         "m.homeserver": { "base_url": state.config.client_base_url() },
-    }))
+    });
+    // MSC2965: a delegated deployment names its issuer here, which is
+    // how a client knows to speak OIDC before it ever hits /login.
+    if let Some(delegated) = &state.delegated {
+        body["org.matrix.msc2965.authentication"] = json!({
+            "issuer": delegated.issuer(),
+            "account": format!("{}/account", delegated.issuer().trim_end_matches('/')),
+        });
+    }
+    Json(body)
+}
+
+/// `GET /_matrix/client/v1/auth_metadata`
+///
+/// MSC2965's discovery endpoint: the provider's own `OpenID Connect`
+/// metadata document, relayed. A non-delegated deployment answers 404
+/// `M_UNRECOGNIZED` — the endpoint's absence is how a client learns this
+/// server does its own auth.
+async fn auth_metadata(State(state): State<AppState>) -> Result<Json<Value>, MatrixError> {
+    let Some(delegated) = &state.delegated else {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_UNRECOGNIZED",
+            "authentication is not delegated",
+        ));
+    };
+    Ok(Json(delegated.metadata().await?))
+}
+
+/// The 404 every legacy auth endpoint answers under MSC3861 delegation:
+/// the provider owns login, and a working password path beside it would
+/// be a second door with its own keys.
+fn delegated_refusal() -> MatrixError {
+    MatrixError::new(
+        StatusCode::NOT_FOUND,
+        "M_UNRECOGNIZED",
+        "authentication is delegated to the OIDC provider",
+    )
 }
 
 /// `GET /.well-known/matrix/server`
@@ -944,8 +982,11 @@ fn session_body(user_id: &str, session: &crate::accounts::Session) -> Value {
 /// Only password login. SSO and token login are advertised by servers that
 /// implement them; listing a flow we cannot complete would send a client down
 /// a path that dead-ends.
-async fn login_flows() -> Json<Value> {
-    Json(json!({ "flows": [{ "type": "m.login.password" }] }))
+async fn login_flows(State(state): State<AppState>) -> Result<Json<Value>, MatrixError> {
+    if state.delegated.is_some() {
+        return Err(delegated_refusal());
+    }
+    Ok(Json(json!({ "flows": [{ "type": "m.login.password" }] })))
 }
 
 /// `POST /_matrix/client/v3/login`
@@ -954,6 +995,9 @@ async fn login(
     source: ClientAddr,
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<Value>, MatrixError> {
+    if state.delegated.is_some() {
+        return Err(delegated_refusal());
+    }
     if request.kind != "m.login.password" {
         return Err(MatrixError::new(
             StatusCode::BAD_REQUEST,
@@ -1065,6 +1109,14 @@ async fn register(
     headers: axum::http::HeaderMap,
     Json(request): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<Value>), MatrixError> {
+    // Under MSC3861 delegation, humans register at the provider — but an
+    // appservice still provisions its ghosts here, because the as_token
+    // is an authority delegation never displaced.
+    if state.delegated.is_some()
+        && request.login_type.as_deref() != Some("m.login.application_service")
+    {
+        return Err(delegated_refusal());
+    }
     // Counted after the UIA hand-shake, so the mandatory first 401 does not
     // spend a client's budget on the flow the server itself required.
     if request.auth.is_some()

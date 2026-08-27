@@ -25,6 +25,37 @@ pub struct Config {
     pub federation: FederationConfig,
     #[serde(default)]
     pub appservices: AppservicesConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
+}
+
+/// How callers prove who they are.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AuthConfig {
+    /// MSC3861 delegation: when set, an OIDC provider (typically the
+    /// Matrix Authentication Service) owns identity, and this server
+    /// validates its access tokens by introspection. Local password
+    /// login and registration turn off — one identity provider is the
+    /// point, and two is how accounts drift apart.
+    #[serde(default)]
+    pub delegated: Option<DelegatedAuthConfig>,
+}
+
+/// The delegated provider, named explicitly rather than discovered at
+/// startup: a server that cannot start because an idP was briefly
+/// unreachable is an outage nobody asked for. The metadata document is
+/// still fetched (and cached) lazily for `/auth_metadata`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegatedAuthConfig {
+    /// The OIDC issuer, e.g. `https://mas.example.org/`.
+    pub issuer: String,
+    /// The OAuth 2.0 token introspection endpoint. MAS serves it at
+    /// `{issuer}/oauth2/introspect`.
+    pub introspection_endpoint: String,
+    /// Client credentials this server presents when introspecting.
+    pub client_id: String,
+    pub client_secret: String,
 }
 
 /// Which appservice registration files to load at startup.
