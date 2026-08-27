@@ -230,12 +230,15 @@ impl Rooms {
     /// # Errors
     ///
     /// Returns [`RoomError`] if an event cannot be signed or stored.
+    #[allow(clippy::too_many_arguments, reason = "a room's birth options")]
     pub fn create(
         &self,
         creator: &str,
         key: &Ed25519KeyPair,
         name: Option<&str>,
         topic: Option<&str>,
+        preset: Option<&str>,
+        initial_state: &[(String, String, Value)],
     ) -> Result<String, RoomError> {
         let room_id = format!("!{}:{}", random_id(), self.server_name);
         let mut log = RoomLog::new();
@@ -265,7 +268,11 @@ impl Rooms {
             (
                 "m.room.join_rules",
                 String::new(),
-                serde_json::json!({ "join_rule": "invite" }),
+                // The preset names the spec's bundles: public_chat opens the
+                // door, everything else keeps the default invite-only.
+                serde_json::json!({
+                    "join_rule": if preset == Some("public_chat") { "public" } else { "invite" },
+                }),
             ),
         ];
         if let Some(name) = name {
@@ -292,6 +299,19 @@ impl Rooms {
                 event_type,
                 Some(state_key.as_str()),
                 &content,
+            )?;
+        }
+        // The client's initial_state, after the bundle so it can override
+        // any of it — that is what the field is for.
+        for (event_type, state_key, content) in initial_state {
+            self.append(
+                &mut log,
+                &room_id,
+                creator,
+                key,
+                event_type,
+                Some(state_key.as_str()),
+                content,
             )?;
         }
 
@@ -2071,6 +2091,64 @@ impl Rooms {
         Ok(())
     }
 
+    /// The stripped state an invited user may see: enough to render the
+    /// invite (what room, whose, how it admits), nothing they are not yet
+    /// entitled to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if state cannot be read; an unknown room is an
+    /// empty list, because an invite can outlive this server's knowledge of
+    /// the room behind it.
+    pub fn stripped_state(&self, room_id: &str, user_id: &str) -> Result<Vec<Value>, RoomError> {
+        const SHOWN: &[&str] = &[
+            "m.room.create",
+            "m.room.join_rules",
+            "m.room.canonical_alias",
+            "m.room.name",
+            "m.room.avatar",
+            "m.room.topic",
+            "m.room.encryption",
+        ];
+        let ids = match self.with_room(room_id, |_, log| {
+            let Some(head) = log.entries().next_back() else {
+                return Ok(Vec::new());
+            };
+            let Some(state) = log.state_after(head.li) else {
+                return Ok(Vec::new());
+            };
+            let mut ids: Vec<(String, String, String)> = Vec::new();
+            state.for_each(|key, id| {
+                let event_type = key.event_type().as_str();
+                let shown = SHOWN.contains(&event_type)
+                    || (event_type == "m.room.member" && key.state_key() == user_id);
+                if shown {
+                    ids.push((
+                        event_type.to_owned(),
+                        key.state_key().to_owned(),
+                        id.to_owned(),
+                    ));
+                }
+            });
+            Ok(ids)
+        }) {
+            Ok(ids) => ids,
+            Err(RoomError::UnknownRoom(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut stripped = Vec::with_capacity(ids.len());
+        for (event_type, state_key, id) in ids {
+            let event = self.read_event(room_id, &EventId::new(id.as_str()))?;
+            stripped.push(serde_json::json!({
+                "type": event_type,
+                "state_key": state_key,
+                "sender": event["sender"],
+                "content": event["content"],
+            }));
+        }
+        Ok(stripped)
+    }
+
     /// Seed a room this server has never held from a `send_join` response,
     /// ending with our own join event — the receiving half of joining a
     /// room that lives on another server.
@@ -2125,8 +2203,11 @@ impl Rooms {
             else {
                 return Err(RoomError::Append("event is not an object".to_owned()));
             };
-            let pdu = Pdu::from_remote(version.clone(), canonical)
-                .map_err(|error| RoomError::Append(format!("{error:?}")))?;
+            let pdu = Pdu::from_remote(version.clone(), canonical).map_err(|error| {
+                let mut shown = event.to_string();
+                shown.truncate(400);
+                RoomError::Append(format!("seeded event refused: {error:?}: {shown}"))
+            })?;
             Ok((pdu.event_id().as_str().to_owned(), event.clone()))
         };
 

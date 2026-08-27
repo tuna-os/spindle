@@ -363,7 +363,7 @@ async fn a_non_member_has_nothing_to_be_behind_on() {
     let key = spindle_server::signing::ServerKey::load_or_create(store.as_ref()).unwrap();
     let rooms = spindle_server::rooms::Rooms::new(Arc::clone(&store), "example.org");
     let room = rooms
-        .create("@alice:example.org", key.pair(), None, None)
+        .create("@alice:example.org", key.pair(), None, None, None, &[])
         .unwrap();
     for index in 0..25 {
         rooms
