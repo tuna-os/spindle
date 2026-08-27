@@ -16,6 +16,8 @@ path = "src/main.rs"
 [dependencies]
 argon2.workspace = true
 axum.workspace = true
+axum-server.workspace = true
+rustls.workspace = true
 reqwest.workspace = true
 sha2.workspace = true
 hmac.workspace = true

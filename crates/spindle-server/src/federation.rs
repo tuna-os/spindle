@@ -230,8 +230,10 @@ impl Federation {
         // all three refetch. Delegation (.well-known, SRV) is not resolved
         // yet — the server name is used as the host directly, which the
         // federation test rig satisfies and docs/dashboard record as a gap.
-        let scheme = if self.insecure_http { "http" } else { "https" };
-        let url = format!("{scheme}://{origin}/_matrix/key/v2/server");
+        let url = format!(
+            "{}/_matrix/key/v2/server",
+            base_url(origin, self.insecure_http)
+        );
         let document: Value = self
             .client
             .get(&url)
@@ -290,10 +292,12 @@ impl Federation {
     ) -> Result<(), FederationError> {
         let uri = format!("/_matrix/federation/v1/send/{txn_id}");
         let authorization = self.sign_request("PUT", &uri, destination, Some(body))?;
-        let scheme = if self.insecure_http { "http" } else { "https" };
         let response = self
             .client
-            .put(format!("{scheme}://{destination}{uri}"))
+            .put(format!(
+                "{}{uri}",
+                base_url(destination, self.insecure_http)
+            ))
             .header("authorization", authorization)
             .header("content-type", "application/json")
             .timeout(Duration::from_secs(30))
@@ -452,6 +456,21 @@ fn verify_self_signed(origin: &str, document: &Value) -> Result<(), FederationEr
         .map_err(|error| FederationError::Refused(format!("key document signature: {error}")))
 }
 
+/// The URL a server name resolves to, before any request path.
+///
+/// A name with no explicit port speaks federation on 8448 (SPEC: server
+/// discovery's final fallback), not 443 — `https://hs1/` would knock on a
+/// door nothing is behind. Delegation (.well-known, SRV) is still not
+/// resolved; the name is the host, which docs/dashboard records as a gap.
+fn base_url(name: &str, insecure_http: bool) -> String {
+    let scheme = if insecure_http { "http" } else { "https" };
+    if name.contains(':') {
+        format!("{scheme}://{name}")
+    } else {
+        format!("{scheme}://{name}:8448")
+    }
+}
+
 /// Parse `X-Matrix origin="…",destination="…",key="…",sig="…"`.
 ///
 /// # Errors
@@ -503,6 +522,26 @@ fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::base_url;
+
+    #[test]
+    fn a_portless_name_gets_the_federation_port_not_443() {
+        assert_eq!(base_url("hs1", false), "https://hs1:8448");
+        assert_eq!(
+            base_url("matrix.example.org", false),
+            "https://matrix.example.org:8448"
+        );
+    }
+
+    #[test]
+    fn an_explicit_port_is_the_peer_telling_us_where_to_knock() {
+        assert_eq!(base_url("hs1:443", false), "https://hs1:443");
+        assert_eq!(base_url("127.0.0.1:8099", true), "http://127.0.0.1:8099");
+    }
 }
 
 #[cfg(test)]

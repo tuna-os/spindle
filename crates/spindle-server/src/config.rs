@@ -82,6 +82,19 @@ pub struct FederationConfig {
     /// operators should not need to touch it.
     #[serde(default = "default_retry_base_ms")]
     pub retry_base_ms: u64,
+    /// Where the federation TLS listener binds, e.g. `0.0.0.0:8448`. Unset
+    /// means no federation listener: a deployment behind a reverse proxy
+    /// terminates TLS there and serves federation on the main bind.
+    #[serde(default)]
+    pub bind: Option<String>,
+    /// PEM certificate chain for the federation listener. Required with
+    /// `bind`: federation peers speak https to port 8448 and a listener
+    /// that cannot prove its name is unreachable in practice.
+    #[serde(default)]
+    pub tls_cert: Option<std::path::PathBuf>,
+    /// PEM private key for `tls_cert`.
+    #[serde(default)]
+    pub tls_key: Option<std::path::PathBuf>,
 }
 
 fn default_retry_base_ms() -> u64 {
@@ -93,6 +106,9 @@ impl Default for FederationConfig {
         Self {
             insecure_http: false,
             retry_base_ms: default_retry_base_ms(),
+            bind: None,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }

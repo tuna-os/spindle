@@ -155,3 +155,29 @@ fn rate_limiting_defaults_on_and_is_switched_off_explicitly() {
     let typo = Config::parse("[server]\nname = \"example.org\"\n\n[ratelimit]\nenable = false\n");
     assert!(typo.is_err(), "a misspelled key was accepted: {typo:?}");
 }
+
+/// The federation listener is opt-in and all-or-nothing: a bind with no TLS
+/// material is a misconfiguration `main()` refuses at startup, so the parse
+/// itself only carries the fields faithfully.
+#[test]
+fn federation_tls_fields_parse_and_default_off() {
+    let default = Config::parse("[server]\nname = \"example.org\"\n").unwrap();
+    assert!(default.federation.bind.is_none());
+    assert!(default.federation.tls_cert.is_none());
+
+    let configured = Config::parse(
+        "[server]\nname = \"example.org\"\n\n[federation]\n\
+         bind = \"0.0.0.0:8448\"\n\
+         tls_cert = \"/certs/hs1.crt\"\ntls_key = \"/certs/hs1.key\"\n",
+    )
+    .unwrap();
+    assert_eq!(configured.federation.bind.as_deref(), Some("0.0.0.0:8448"));
+    assert_eq!(
+        configured.federation.tls_cert.as_deref(),
+        Some(std::path::Path::new("/certs/hs1.crt"))
+    );
+    assert_eq!(
+        configured.federation.tls_key.as_deref(),
+        Some(std::path::Path::new("/certs/hs1.key"))
+    );
+}

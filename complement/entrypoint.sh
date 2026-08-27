@@ -30,10 +30,8 @@ update-ca-certificates || {
     exit 1
 }
 
-# Sign our own federation certificate. Nothing serves TLS yet -- 8448 arrives
-# with federation in M3 (#14) -- but the material is generated here so that
-# turning the listener on is a config change rather than a rework of this
-# script, and so a mis-mounted CA fails now rather than a milestone later.
+# Sign our own federation certificate: the 8448 listener serves TLS with it,
+# and Complement's peers check it against the CA they minted.
 say "generating a key and CSR for ${SERVER_NAME}"
 openssl req -new -newkey rsa:2048 -nodes \
     -keyout "/certs/${SERVER_NAME}.key" \
@@ -69,6 +67,10 @@ openssl x509 -req -sha256 -days 1 \
     -extfile /certs/cert.ext \
     -out "/certs/${SERVER_NAME}.crt"
 
+# The certificate material was written by root; the server reads it as
+# uid 10001 after the drop below.
+chown spindle:spindle /certs/*
+
 cat > /data/spindle.toml <<TOML
 [server]
 name = "${SERVER_NAME}"
@@ -91,6 +93,13 @@ filter = "${SPINDLE_LOG:-info}"
 # (see config.rs); this is a test image and says so.
 [ratelimit]
 enabled = false
+
+# Federation over TLS on the port peers actually knock on. The certificate
+# is the one signed by Complement's CA above; peers were told to trust it.
+[federation]
+bind = "0.0.0.0:8448"
+tls_cert = "/certs/${SERVER_NAME}.crt"
+tls_key = "/certs/${SERVER_NAME}.key"
 TOML
 
 # Everything above needed root: the trust store, and Complement's 0600 CA key.
