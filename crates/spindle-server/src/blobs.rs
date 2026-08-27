@@ -40,6 +40,7 @@ impl Blobs {
     ///
     /// Returns [`BlobError`] if the write fails.
     pub async fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), BlobError> {
+        static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         match self {
             Self::Local { root } => {
                 let path = local_path(root, hash);
@@ -63,8 +64,6 @@ impl Blobs {
                 // rename because the file already moved. With unique names
                 // both writers stage complete files and rename atomically;
                 // whichever lands second replaces byte-identical content.
-                static WRITE_SEQ: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
                 let staging = path.with_extension(format!(
                     "partial-{}-{}",
                     std::process::id(),
