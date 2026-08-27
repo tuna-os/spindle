@@ -61,7 +61,7 @@ impl Harness {
                         json!({
                             "username": username,
                             "password": "hunter2",
-                            "auth": { "type": "m.login.dummy" },
+                            "auth": { "type": "m.login.dummy", "session": "register" },
                         })
                         .to_string(),
                     ))

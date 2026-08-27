@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**80 routes implemented; 26 known gaps in scope.**
+**81 routes implemented; 26 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -130,13 +130,14 @@ neither implemented nor counted.
 - ⏳ `POST /_matrix/client/v3/rooms/{room_id}/report/{event_id}` — reporting (M5)
 - ⏳ `GET /_matrix/client/v1/rooms/{room_id}/timestamp_to_event` — jump-to-date
 
-### Accounts, devices & auth — 5 implemented, 6 planned
+### Accounts, devices & auth — 6 implemented, 6 planned
 
 - `GET /_matrix/client/v3/account/whoami`
 - `GET/POST /_matrix/client/v3/login`
 - `POST /_matrix/client/v3/logout`
 - `POST /_matrix/client/v3/refresh`
 - `POST /_matrix/client/v3/register`
+- `GET /_matrix/client/v3/register/available`
 - ⏳ `POST /_matrix/client/v3/account/password` — password change (M1 leftover)
 - ⏳ `POST /_matrix/client/v3/account/deactivate` — deactivation (M1 leftover)
 - ⏳ `GET /_matrix/client/v3/devices` — device management (M2)

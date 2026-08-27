@@ -103,6 +103,20 @@ impl<'a, S: Store> Accounts<'a, S> {
         format!("@{localpart}:{}", self.server_name)
     }
 
+    /// Would this localpart register? Valid grammar and not taken.
+    ///
+    /// # Errors
+    ///
+    /// [`AccountError::InvalidUsername`], [`AccountError::UserInUse`], or a
+    /// storage error.
+    pub fn availability(&self, localpart: &str) -> Result<(), AccountError> {
+        validate_localpart(localpart)?;
+        if self.account(localpart)?.is_some() {
+            return Err(AccountError::UserInUse);
+        }
+        Ok(())
+    }
+
     /// Register a new account.
     ///
     /// # Errors

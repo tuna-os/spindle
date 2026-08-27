@@ -82,6 +82,10 @@ fn account_routes() -> Router<AppState> {
     Router::new()
         .route("/_matrix/client/v3/register", post(register))
         .route("/_matrix/client/v3/login", get(login_flows).post(login))
+        .route(
+            "/_matrix/client/v3/register/available",
+            get(register_available),
+        )
         .route("/_matrix/client/v3/logout", post(logout))
         .route("/_matrix/client/v3/refresh", post(refresh))
         .route("/_matrix/client/v3/account/whoami", get(whoami))
@@ -830,6 +834,27 @@ async fn refresh(
     Ok(Json(session_body(&user_id, &session)))
 }
 
+/// `GET /_matrix/client/v3/register/available`
+///
+/// The same verdicts registration itself would give, without spending a UIA
+/// flow to hear them.
+async fn register_available(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, MatrixError> {
+    let username = query
+        .get("username")
+        .ok_or_else(|| MatrixError::bad_json("no username"))?
+        .to_lowercase();
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    match accounts.availability(&username) {
+        Ok(()) => Ok(Json(json!({ "available": true }))),
+        Err(AccountError::UserInUse) => Err(MatrixError::user_in_use()),
+        Err(AccountError::InvalidUsername) => Err(MatrixError::invalid_username()),
+        Err(other) => Err(MatrixError::internal(&other.to_string())),
+    }
+}
+
 /// `POST /_matrix/client/v3/register`
 ///
 /// One UIA stage, `m.login.dummy`: the first request without `auth` gets a 401
@@ -840,7 +865,7 @@ async fn register(
     State(state): State<AppState>,
     source: ClientAddr,
     Json(request): Json<RegisterRequest>,
-) -> Result<Json<Value>, MatrixError> {
+) -> Result<(StatusCode, Json<Value>), MatrixError> {
     // Counted after the UIA hand-shake, so the mandatory first 401 does not
     // spend a client's budget on the flow the server itself required.
     if request.auth.is_some()
@@ -851,30 +876,54 @@ async fn register(
         return Err(MatrixError::limit_exceeded(retry.as_millis()));
     }
 
-    if request.auth.is_none() {
-        return Err(MatrixError {
-            status: StatusCode::UNAUTHORIZED,
-            errcode: "M_FORBIDDEN",
-            retry_after_ms: None,
-            error: serde_json::to_string(&json!({
+    // Username problems outrank the UIA dance (SPEC: a client should learn
+    // M_INVALID_USERNAME or M_USER_IN_USE on its *first* request, before
+    // being sent through auth it would complete for nothing), so the checks
+    // run even when no auth has been presented yet. Capitals are folded
+    // down rather than refused: the localpart grammar is lowercase, and a
+    // client typing "Alice" means alice.
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let username = request.username.as_deref().map(str::to_lowercase);
+    if let Some(name) = username.as_deref() {
+        match accounts.availability(name) {
+            Ok(()) => {}
+            Err(AccountError::UserInUse) => return Err(MatrixError::user_in_use()),
+            Err(AccountError::InvalidUsername) => {
+                return Err(MatrixError::invalid_username());
+            }
+            Err(other) => return Err(MatrixError::internal(&other.to_string())),
+        }
+    }
+
+    // The challenge is the *body* of the 401, not an error wrapping it:
+    // SPEC (client-server §UIA) has clients read `flows`/`params`/`session`
+    // at the top level, and a challenge folded into an `error` string is
+    // invisible to every generic UIA implementation. Complement's
+    // RegisterUser is what caught this. An auth dict that names no session
+    // gets the same challenge — the session is how a completed stage is
+    // tied back to the flow it completed.
+    let session_named = request
+        .auth
+        .as_ref()
+        .is_some_and(|auth| auth["session"].is_string());
+    if !session_named {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
                 "flows": [{ "stages": ["m.login.dummy"] }],
                 "params": {},
                 "session": "register",
-            }))
-            .unwrap_or_default(),
-        });
+            })),
+        ));
     }
 
-    let username = request
-        .username
-        .as_deref()
-        .ok_or_else(|| MatrixError::bad_json("no username"))?;
+    let username = username.ok_or_else(|| MatrixError::bad_json("no username"))?;
+    let username = username.as_str();
     let password = request
         .password
         .as_deref()
         .ok_or_else(|| MatrixError::bad_json("no password"))?;
 
-    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     accounts
         .register(username, password)
         .map_err(|error| match error {
@@ -885,7 +934,7 @@ async fn register(
 
     let user_id = accounts.user_id(username);
     if request.inhibit_login {
-        return Ok(Json(json!({ "user_id": user_id })));
+        return Ok((StatusCode::OK, Json(json!({ "user_id": user_id }))));
     }
 
     let session = accounts
@@ -896,7 +945,7 @@ async fn register(
             request.refresh_token,
         )
         .map_err(|error| internal(&error))?;
-    Ok(Json(session_body(&user_id, &session)))
+    Ok((StatusCode::OK, Json(session_body(&user_id, &session))))
 }
 
 /// `POST /_matrix/client/v3/logout`
