@@ -170,6 +170,7 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::KeyBackupData, 0x1b),
         (Keyspace::CrossSigning, 0x1c),
         (Keyspace::UrlPreview, 0x1d),
+        (Keyspace::ServerKeys, 0x1e),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(

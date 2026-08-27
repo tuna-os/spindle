@@ -186,6 +186,14 @@ pub enum Keyspace {
     /// of a public page is the same for everyone, and a per-user copy would
     /// multiply fetches of third-party sites by the user count.
     UrlPreview = 0x1d,
+    /// `server_name` -> a peer's cached `/key/v2/server` document.
+    ///
+    /// Cached because every inbound federation request needs the origin's
+    /// key, and refetching per request would let a peer's key server rate
+    /// our whole inbound path; bounded by `valid_until_ts` capped at seven
+    /// days, so a compromised key ages out of the cache regardless of what
+    /// its owner claims.
+    ServerKeys = 0x1e,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes

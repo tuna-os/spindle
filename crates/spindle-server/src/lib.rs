@@ -16,6 +16,7 @@ pub mod config;
 pub mod devices;
 pub mod directory;
 pub mod errors;
+pub mod federation;
 pub mod filters;
 pub mod media;
 pub mod previews;
@@ -53,6 +54,7 @@ pub struct AppState {
     pub devices: Arc<devices::Devices>,
     pub backups: Arc<backups::Backups>,
     pub previews: Arc<previews::Previews>,
+    pub federation: Arc<federation::Federation>,
 }
 
 /// Why the application cannot be built. Both are startup-fatal on purpose:
@@ -125,6 +127,12 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
         )
         .map_err(|error| AppError::PreviewConfig(error.to_string()))?,
     );
+    let federation = Arc::new(federation::Federation::new(
+        Arc::clone(&store),
+        config.server.name.clone(),
+        Arc::clone(&key),
+        config.federation.insecure_http,
+    ));
     let state = AppState {
         config: Arc::new(config),
         store,
@@ -139,6 +147,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
         devices: Arc::new(devices::Devices::new(store_for_devices)),
         backups: Arc::new(backups::Backups::new(store_for_backups)),
         previews,
+        federation,
     };
     Ok(routes::router(state))
 }
