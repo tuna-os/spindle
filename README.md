@@ -2,19 +2,31 @@
 
 **A Matrix homeserver with no state resolution on the hot path.**
 
+**[Benchmarks vs Synapse, Continuwuity and Tuwunel](https://tuna-os.github.io/spindle/comparisons.html)**
+— animated architecture explainer, per-operation latency curves, and a
+color-coded heatmap where every slower cell links to its investigation.
+Also on the site: [micro-benchmarks](https://tuna-os.github.io/spindle/) ·
+[spec coverage dashboard](https://tuna-os.github.io/spindle/dashboard.html).
+
 Status: implementation in progress. The M1 client-server surface — rooms,
 timelines, state, membership and moderation, relations, redaction, receipts,
 typing, account data, push rules, aliases, filters, `/context`, MSC3266
-summaries, MSC4222 `state_after` — is implemented and tested, on an append-only
-log with materialized state (`spindle-core`, `spindle-store`,
-`spindle-server`). M2 (media, sliding sync, E2EE) has begun. Federation is not
-implemented yet; SPEC.md remains the design the code is held against.
+summaries, MSC4222 `state_after` — and the M2 surface (media, sliding sync,
+E2EE transport) are implemented and tested, on an append-only log with
+materialized state (`spindle-core`, `spindle-store`, `spindle-server`).
+M3 federation is under way and interoperating: the join, invite and leave
+handshakes, backfill, and event fetching work against real peers
+(including live Spindle↔Synapse rooms in both directions), gated by a
+169-test Complement ratchet in CI. SPEC.md remains the design the code is
+held against.
 
-Measured against Synapse 1.159.0 on the same host and driver
-([method](docs/benchmarks.md)): joins 26–30× faster, sends 17–21×,
-`/messages` 5×, initial `/sync` ~2× — with the honest caveat that this is a
-constant-factor win on an unforked workload; the architectural claim needs the
-M3 federation rig to test.
+Measured every milestone against Synapse and both Rust siblings on the same
+host and driver ([method](docs/benchmarks.md), [live results](https://tuna-os.github.io/spindle/comparisons.html)):
+at M3-progress, 61 of 63 cells faster or within noise — joins 27–35× and
+sends ~21× vs Synapse — and the two slower cells were investigated and
+fixed, with the losses published as measured. The honest caveat stands:
+these are unforked workloads; the architectural claim gets its full test as
+the federation rig grows.
 
 ## The idea
 
