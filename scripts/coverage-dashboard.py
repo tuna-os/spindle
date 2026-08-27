@@ -97,9 +97,6 @@ PLANNED = {
         ("POST", "/_matrix/client/v3/delete_devices", "bulk device logout (M2)"),
     ],
     "Profiles & presence": [
-        ("GET", "/_matrix/client/v3/profile/{user_id}", "profile read (M1 leftover)"),
-        ("PUT", "/_matrix/client/v3/profile/{user_id}/displayname", "display name"),
-        ("PUT", "/_matrix/client/v3/profile/{user_id}/avatar_url", "avatar"),
         ("GET", "/_matrix/client/v3/presence/{user_id}/status", "presence (M2/M3)"),
     ],
     "Rooms & membership": [
