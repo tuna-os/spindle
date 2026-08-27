@@ -170,6 +170,55 @@ impl Media {
         Ok(media_id)
     }
 
+    /// The internal ID a remote server's media is cached under.
+    ///
+    /// Local IDs are 32 hex characters, so the `/` makes collision with a
+    /// minted ID impossible by construction.
+    #[must_use]
+    pub fn remote_id(server_name: &str, media_id: &str) -> String {
+        format!("{server_name}/{media_id}")
+    }
+
+    /// Cache a remote server's media under its [`Self::remote_id`].
+    ///
+    /// Re-fetching identical bytes is free twice over: the blob store is
+    /// content-addressed, and the record write is idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError::TooLarge`] past [`MAX_UPLOAD`], or
+    /// [`MediaError`] if the blob or its record cannot be written.
+    pub async fn put_remote(
+        &self,
+        server_name: &str,
+        media_id: &str,
+        bytes: &[u8],
+        content_type: &str,
+        filename: Option<&str>,
+    ) -> Result<(), MediaError> {
+        if bytes.len() > MAX_UPLOAD {
+            return Err(MediaError::TooLarge {
+                size: bytes.len(),
+                limit: MAX_UPLOAD,
+            });
+        }
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        self.blobs.put(&hash, bytes).await?;
+        let record = MediaRecord {
+            hash,
+            content_type: content_type.to_owned(),
+            filename: filename.map(str::to_owned),
+            size: bytes.len(),
+            uploaded_by: format!("federation:{server_name}"),
+        };
+        Store::put(
+            self.store.as_ref(),
+            &keys::media(&Self::remote_id(server_name, media_id)),
+            &serde_json::to_vec(&record)?,
+        )?;
+        Ok(())
+    }
+
     /// What is known about `media_id`, or `None`.
     ///
     /// # Errors
