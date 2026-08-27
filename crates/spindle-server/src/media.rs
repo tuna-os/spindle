@@ -11,7 +11,6 @@
 //! not become an addressing one. The ID is random and opaque, and the mapping
 //! from ID to hash lives in the store.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -110,10 +109,10 @@ fn escape_quoted(name: &str) -> String {
         .collect()
 }
 
-/// Blobs on disk, metadata in the store.
+/// Blobs in the configured backend, metadata in the store.
 pub struct Media {
     store: Arc<FjallStore>,
-    root: PathBuf,
+    blobs: crate::blobs::Blobs,
     server_name: String,
 }
 
@@ -121,12 +120,12 @@ impl Media {
     #[must_use]
     pub fn new(
         store: Arc<FjallStore>,
-        root: impl Into<PathBuf>,
+        blobs: crate::blobs::Blobs,
         server_name: impl Into<String>,
     ) -> Self {
         Self {
             store,
-            root: root.into(),
+            blobs,
             server_name: server_name.into(),
         }
     }
@@ -137,7 +136,7 @@ impl Media {
     ///
     /// Returns [`MediaError::TooLarge`] past [`MAX_UPLOAD`], or
     /// [`MediaError`] if the blob or its record cannot be written.
-    pub fn put(
+    pub async fn put(
         &self,
         bytes: &[u8],
         content_type: &str,
@@ -151,20 +150,9 @@ impl Media {
             });
         }
         let hash = blake3::hash(bytes).to_hex().to_string();
-        let path = self.blob_path(&hash);
-        // Written only if absent: identical bytes are one blob, and rewriting
-        // them would be work done to produce a file that already exists.
-        if !path.exists() {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            // Written beside and renamed, so a reader can never observe a
-            // half-written blob under its final name. The name is the content
-            // hash, so a truncated file under it would be a permanent lie.
-            let staging = path.with_extension("partial");
-            std::fs::write(&staging, bytes)?;
-            std::fs::rename(&staging, &path)?;
-        }
+        // Identical bytes are one blob: the backend skips or overwrites with
+        // the same content, whichever it finds cheaper.
+        self.blobs.put(&hash, bytes).await?;
 
         let media_id = random_media_id();
         let record = MediaRecord {
@@ -202,15 +190,18 @@ impl Media {
     /// [`MediaError::Missing`] if the record exists but its blob does not --
     /// which means the store and the filesystem disagree, and is worth saying
     /// rather than reporting as "no such file".
-    pub fn bytes(&self, media_id: &str) -> Result<(MediaRecord, Vec<u8>), MediaError> {
+    pub async fn bytes(&self, media_id: &str) -> Result<(MediaRecord, Vec<u8>), MediaError> {
         let record = self
             .record(media_id)?
             .ok_or_else(|| MediaError::Unknown(media_id.to_owned()))?;
-        let path = self.blob_path(&record.hash);
-        let bytes = std::fs::read(&path).map_err(|_| MediaError::Missing {
-            media_id: media_id.to_owned(),
-            hash: record.hash.clone(),
-        })?;
+        let bytes = self
+            .blobs
+            .get(&record.hash)
+            .await?
+            .ok_or_else(|| MediaError::Missing {
+                media_id: media_id.to_owned(),
+                hash: record.hash.clone(),
+            })?;
         Ok((record, bytes))
     }
 
@@ -237,7 +228,7 @@ impl Media {
     /// [`MediaError::Unreadable`] when the bytes do not decode as the format
     /// they were declared to be — the uploader's claim, checked exactly at
     /// the moment it is first relied upon.
-    pub fn thumbnail(
+    pub async fn thumbnail(
         &self,
         media_id: &str,
         width: u32,
@@ -260,13 +251,15 @@ impl Media {
             if crop { "crop" } else { "scale" }
         );
         let cache_hash = blake3::hash(cache_key.as_bytes()).to_hex().to_string();
-        let cached = self.blob_path(&cache_hash);
-        if let Ok(bytes) = std::fs::read(&cached) {
+        if let Some(bytes) = self.blobs.get(&cache_hash).await? {
             return Ok(("image/png".to_owned(), bytes));
         }
 
-        let source =
-            std::fs::read(self.blob_path(&record.hash)).map_err(|_| MediaError::Missing {
+        let source = self
+            .blobs
+            .get(&record.hash)
+            .await?
+            .ok_or_else(|| MediaError::Missing {
                 media_id: media_id.to_owned(),
                 hash: record.hash.clone(),
             })?;
@@ -285,14 +278,10 @@ impl Media {
             )
             .map_err(|error| MediaError::Unreadable(error.to_string()))?;
 
-        // Cached exactly like an upload: staging name, then rename, so a
-        // concurrent request never reads a half-written thumbnail.
-        if let Some(parent) = cached.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let staging = cached.with_extension("partial");
-        std::fs::write(&staging, &bytes)?;
-        std::fs::rename(&staging, &cached)?;
+        // Cached exactly like an upload — the backend's atomicity story
+        // (rename locally, atomic object PUT on S3) means a concurrent
+        // request never reads a half-written thumbnail.
+        self.blobs.put(&cache_hash, &bytes).await?;
         Ok(("image/png".to_owned(), bytes))
     }
 
@@ -306,18 +295,6 @@ impl Media {
     #[must_use]
     pub fn is_ours(&self, server_name: &str) -> bool {
         server_name == self.server_name
-    }
-
-    /// Two levels of fan-out from the hash, so no directory holds every blob.
-    ///
-    /// Filesystems degrade with very large directories, and a media store is
-    /// exactly the thing that grows without bound. The prefix comes from the
-    /// hash rather than from the upload time, so the distribution is uniform
-    /// by construction rather than by hoping uploads are.
-    fn blob_path(&self, hash: &str) -> PathBuf {
-        let (first, rest) = hash.split_at(2);
-        let (second, _) = rest.split_at(2);
-        Path::new(&self.root).join(first).join(second).join(hash)
     }
 }
 
@@ -375,6 +352,12 @@ pub enum MediaError {
     Storage(StoreError),
     Io(String),
     Codec(String),
+}
+
+impl From<crate::blobs::BlobError> for MediaError {
+    fn from(error: crate::blobs::BlobError) -> Self {
+        Self::Io(error.to_string())
+    }
 }
 
 impl From<StoreError> for MediaError {

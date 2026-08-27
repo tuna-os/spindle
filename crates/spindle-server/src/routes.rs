@@ -373,6 +373,7 @@ async fn upload_media(
             query.filename.as_deref(),
             &identity.user_id,
         )
+        .await
         .map_err(|error| media_error(&error))?;
     Ok(Json(json!({
         "content_uri": format!("mxc://{}/{media_id}", state.config.server.name),
@@ -439,7 +440,7 @@ async fn download_media(
     Authenticated(identity): Authenticated,
     axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
 ) -> Result<axum::response::Response, MatrixError> {
-    serve_media(&state, &identity, &server_name, &media_id)
+    serve_media(&state, &identity, &server_name, &media_id).await
 }
 
 /// The same, with a filename the client would like the browser to use.
@@ -457,10 +458,10 @@ async fn download_media_named(
         String,
     )>,
 ) -> Result<axum::response::Response, MatrixError> {
-    serve_media(&state, &identity, &server_name, &media_id)
+    serve_media(&state, &identity, &server_name, &media_id).await
 }
 
-fn serve_media(
+async fn serve_media(
     state: &AppState,
     _identity: &crate::accounts::Identity,
     server_name: &str,
@@ -479,6 +480,7 @@ fn serve_media(
     let (record, bytes) = state
         .media
         .bytes(media_id)
+        .await
         .map_err(|error| media_error(&error))?;
 
     let mut response = axum::response::Response::builder()
@@ -539,6 +541,7 @@ async fn thumbnail_media(
     let (content_type, bytes) = state
         .media
         .thumbnail(&media_id, query.width, query.height, crop)
+        .await
         .map_err(|error| media_error(&error))?;
     axum::response::Response::builder()
         .status(StatusCode::OK)

@@ -11,6 +11,7 @@ pub mod accounts;
 pub mod auth;
 pub mod authorize;
 pub mod backups;
+pub mod blobs;
 pub mod config;
 pub mod devices;
 pub mod directory;
@@ -22,6 +23,7 @@ pub mod push_rules;
 pub mod ratelimit;
 pub mod rooms;
 pub mod routes;
+pub mod s3;
 pub mod signing;
 pub mod sliding;
 pub mod surface;
@@ -94,9 +96,21 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
     let store_for_devices = Arc::clone(&store);
     let store_for_backups = Arc::clone(&store);
     let account_data = Arc::new(account_data::AccountData::new(Arc::clone(&store)));
+    let blobs = match &config.storage.s3 {
+        Some(s3) => blobs::Blobs::S3(s3::S3Client::new(
+            s3.endpoint.clone(),
+            s3.bucket.clone(),
+            s3.region.clone(),
+            s3.access_key_id.clone(),
+            s3.secret_access_key.clone(),
+        )),
+        None => blobs::Blobs::Local {
+            root: config.storage.path.join("media"),
+        },
+    };
     let media = Arc::new(media::Media::new(
         Arc::clone(&store),
-        config.storage.path.join("media"),
+        blobs,
         config.server.name.clone(),
     ));
     let directory = Arc::new(directory::Directory::new(
