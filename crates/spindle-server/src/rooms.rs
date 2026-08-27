@@ -397,6 +397,114 @@ impl Rooms {
         })
     }
 
+    /// Build and sign the invite event for a user on another server,
+    /// without appending it.
+    ///
+    /// The event is authorized against the room's head — an invite this
+    /// server's own rules would refuse is refused before any network is
+    /// touched — but it does not enter the log here: the invited user's
+    /// server must co-sign it first, and [`Self::commit_cosigned`] appends
+    /// what comes back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] if the room does not exist, or
+    /// [`RoomError::Forbidden`] if the rules refuse the invite.
+    pub fn build_invite_event(
+        &self,
+        room_id: &str,
+        sender: &str,
+        target: &str,
+        reason: Option<&str>,
+        key: &Ed25519KeyPair,
+    ) -> Result<(String, Value), RoomError> {
+        let mut content = serde_json::json!({ "membership": INVITE_STR });
+        if let Some(reason) = reason {
+            content["reason"] = Value::String(reason.to_owned());
+        }
+        self.with_room(room_id, |rooms, log| {
+            rooms.build_event(
+                log,
+                room_id,
+                sender,
+                key,
+                "m.room.member",
+                Some(target),
+                &content,
+            )
+        })
+    }
+
+    /// Record an invite into a room this server holds no log for.
+    ///
+    /// A federated invite arrives alone: no history, no state, just the
+    /// signed event and whatever stripped state the inviting server chose
+    /// to share. What makes it real for the invited user is a membership
+    /// row — the same row `/sync` reads for every other invite — plus this
+    /// side record holding the stripped state to render it from and the
+    /// origin to try first when the user accepts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the store refuses the writes.
+    pub fn record_pending_invite(
+        &self,
+        user_id: &str,
+        room_id: &str,
+        origin: &str,
+        invite_state: &[Value],
+    ) -> Result<(), RoomError> {
+        spindle_store::Store::put(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::PendingInvite,
+                user_id,
+                room_id,
+            ),
+            serde_json::json!({ "origin": origin, "invite_state": invite_state })
+                .to_string()
+                .as_bytes(),
+        )?;
+        spindle_store::Store::put(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::Membership,
+                user_id,
+                room_id,
+            ),
+            INVITE,
+        )?;
+        // An invite un-forgets, here as in `index_membership`: the user is
+        // being asked back in, and a forgotten room would swallow the ask.
+        spindle_store::Store::delete(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::Forgotten,
+                user_id,
+                room_id,
+            ),
+        )?;
+        self.wake_sync_waiters();
+        Ok(())
+    }
+
+    /// The pending-invite record for a user and room, if one stands.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the store cannot be read.
+    pub fn pending_invite(&self, user_id: &str, room_id: &str) -> Result<Option<Value>, RoomError> {
+        let row = spindle_store::ReadView::get(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::PendingInvite,
+                user_id,
+                room_id,
+            ),
+        )?;
+        Ok(row.and_then(|bytes| serde_json::from_slice(&bytes).ok()))
+    }
+
     /// Every current state event of a room, as full events.
     ///
     /// This is the one read that is `O(state)` rather than `O(1)`, and it is
@@ -1971,16 +2079,23 @@ impl Rooms {
 
     /// Build, sign, append and persist one event.
     #[allow(clippy::too_many_arguments, reason = "an event is what it is")]
-    fn append(
+    /// Build, sign and authorize one event against the log's head, without
+    /// appending it.
+    ///
+    /// This is the front half of [`Self::append`], split out because the
+    /// federated invite handshake needs exactly it: the event must exist and
+    /// be signed before the invited user's server has co-signed it, and it
+    /// must not be in the log until that server has.
+    fn build_event(
         &self,
-        log: &mut RoomLog,
+        log: &RoomLog,
         room_id: &str,
         sender: &str,
         key: &Ed25519KeyPair,
         event_type: &str,
         state_key: Option<&str>,
         content: &Value,
-    ) -> Result<String, RoomError> {
+    ) -> Result<(String, Value), RoomError> {
         let depth = log
             .entries()
             .next_back()
@@ -2008,11 +2123,32 @@ impl Rooms {
         // refused event and buys something worth more: what gets authorized is
         // exactly the bytes a peer would receive, event ID included.
         self.authorize(log, room_id, &event_id, &json)?;
+        Ok((event_id, json))
+    }
 
-        let input = EventInput::new(
-            event_id.clone(),
-            prev.into_iter().map(EventId::new).collect(),
-        );
+    fn append(
+        &self,
+        log: &mut RoomLog,
+        room_id: &str,
+        sender: &str,
+        key: &Ed25519KeyPair,
+        event_type: &str,
+        state_key: Option<&str>,
+        content: &Value,
+    ) -> Result<String, RoomError> {
+        let (event_id, json) =
+            self.build_event(log, room_id, sender, key, event_type, state_key, content)?;
+        let prev: Vec<EventId> = json["prev_events"]
+            .as_array()
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .map(EventId::new)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let input = EventInput::new(event_id.clone(), prev);
         let input = match state_key {
             Some(state_key) => input.with_state_key(StateKey::new(event_type, state_key)),
             None => input,
@@ -2157,7 +2293,15 @@ impl Rooms {
             Ok(ids)
         }) {
             Ok(ids) => ids,
-            Err(RoomError::UnknownRoom(_)) => return Ok(Vec::new()),
+            // A room this server was never in still renders as an invite:
+            // the inviting server handed over stripped state exactly for
+            // this moment, and it was recorded beside the membership row.
+            Err(RoomError::UnknownRoom(_)) => {
+                return Ok(self
+                    .pending_invite(user_id, room_id)?
+                    .and_then(|record| record["invite_state"].as_array().cloned())
+                    .unwrap_or_default());
+            }
             Err(error) => return Err(error),
         };
         let mut stripped = Vec::with_capacity(ids.len());
@@ -2384,53 +2528,96 @@ impl Rooms {
         json: &Value,
     ) -> Result<(), RoomError> {
         self.with_room(room_id, |rooms, log| {
-            // Redelivery is not an error: transactions retry, and the event
-            // is already exactly where it would go.
-            if log.get(&EventId::new(event_id)).is_some() {
-                return Ok(());
-            }
-            rooms.authorize(log, room_id, event_id, json)?;
-
-            let event_type = json["type"].as_str().unwrap_or_default().to_owned();
-            let state_key = json["state_key"].as_str().map(str::to_owned);
-            let sender = json["sender"].as_str().unwrap_or_default().to_owned();
-            let prev: Vec<EventId> = json["prev_events"]
-                .as_array()
-                .map(|ids| {
-                    ids.iter()
-                        .filter_map(Value::as_str)
-                        .map(EventId::new)
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let input = EventInput::new(event_id, prev);
-            let input = match &state_key {
-                Some(state_key) => {
-                    input.with_state_key(StateKey::new(event_type.as_str(), state_key.as_str()))
-                }
-                None => input,
-            };
-            let entry = log
-                .append_remote(input)
-                .map_err(|error| RoomError::Append(format!("{error:?}")))?
-                .clone();
-
-            let content = json["content"].clone();
-            rooms.persist_entry(
-                log,
-                room_id,
-                &entry,
-                event_id,
-                &PersistInput {
-                    event_type: &event_type,
-                    state_key: state_key.as_deref(),
-                    sender: &sender,
-                    content: &content,
-                    json,
-                },
-            )
+            rooms.ingest(log, room_id, event_id, json, false)
         })
+    }
+
+    /// Append an event this server authored but a peer completed.
+    ///
+    /// The federated invite is the one event with two authors: built and
+    /// signed here, co-signed by the invited user's server, and only the
+    /// co-signed version is worth storing — it is what proves to every other
+    /// server in the room that the invitee's server took part. It fans out
+    /// like any local event, because this server originated it; the invited
+    /// server already holds it and absorbs the redelivery.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room is unknown or the rules refuse the
+    /// event — the log may have moved while the peer was co-signing, and the
+    /// event is re-authorized against whatever the head is now.
+    pub fn commit_cosigned(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        json: &Value,
+    ) -> Result<(), RoomError> {
+        self.with_room(room_id, |rooms, log| {
+            rooms.ingest(log, room_id, event_id, json, true)
+        })
+    }
+
+    /// The shared back half of receiving a complete, signed event: dedupe,
+    /// authorize, append, persist — and fan out only when this server is the
+    /// event's origin, because each server fans out its own events.
+    fn ingest(
+        &self,
+        log: &mut RoomLog,
+        room_id: &str,
+        event_id: &str,
+        json: &Value,
+        fan_out: bool,
+    ) -> Result<(), RoomError> {
+        // Redelivery is not an error: transactions retry, and the event
+        // is already exactly where it would go.
+        if log.get(&EventId::new(event_id)).is_some() {
+            return Ok(());
+        }
+        self.authorize(log, room_id, event_id, json)?;
+
+        let event_type = json["type"].as_str().unwrap_or_default().to_owned();
+        let state_key = json["state_key"].as_str().map(str::to_owned);
+        let sender = json["sender"].as_str().unwrap_or_default().to_owned();
+        let prev: Vec<EventId> = json["prev_events"]
+            .as_array()
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .map(EventId::new)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let input = EventInput::new(event_id, prev);
+        let input = match &state_key {
+            Some(state_key) => {
+                input.with_state_key(StateKey::new(event_type.as_str(), state_key.as_str()))
+            }
+            None => input,
+        };
+        let entry = log
+            .append_remote(input)
+            .map_err(|error| RoomError::Append(format!("{error:?}")))?
+            .clone();
+
+        let content = json["content"].clone();
+        self.persist_entry(
+            log,
+            room_id,
+            &entry,
+            event_id,
+            &PersistInput {
+                event_type: &event_type,
+                state_key: state_key.as_deref(),
+                sender: &sender,
+                content: &content,
+                json,
+            },
+        )?;
+        if fan_out {
+            self.enqueue_outbound(log, room_id, json)?;
+        }
+        Ok(())
     }
 
     /// Everything an appended entry writes beside itself, shared by the
@@ -2577,6 +2764,17 @@ impl Rooms {
                 ),
             )?;
         }
+        // A membership event in a log this server holds supersedes any
+        // out-of-room invite record: the room is here now, and stripped
+        // state read from a live log beats a snapshot from the inviter.
+        spindle_store::Store::delete(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::PendingInvite,
+                user_id,
+                room_id,
+            ),
+        )?;
         Ok(())
     }
 
