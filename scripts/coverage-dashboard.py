@@ -66,7 +66,10 @@ MILESTONES = [
      "PDU, and the response carries the state before the join with its "
      "transitive auth chain. Backfill and get_missing_events serve history "
      "as bounded range reads on the linear log, and 8448 serves TLS. "
-     "Next: #16's fork-proof rig — where the no-state-resolution claim meets "
+     "Remote joins work in both roles: the server walks "
+     "make_join/send_join as the joining side and seeds the room from the "
+     "response — proven by a two-instance Spindle-to-Spindle test with "
+     "messages flowing both ways. Next: #16's fork-proof rig — where the no-state-resolution claim meets "
      "adversarial evidence."),
     ("M4", "Ecosystem integration", "Not started", "#18 appservices, #17 MAS/OIDC."),
     ("M5", "Production lifecycle", "Not started",

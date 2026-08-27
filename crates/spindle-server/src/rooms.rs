@@ -2071,6 +2071,191 @@ impl Rooms {
         Ok(())
     }
 
+    /// Seed a room this server has never held from a `send_join` response,
+    /// ending with our own join event — the receiving half of joining a
+    /// room that lives on another server.
+    ///
+    /// The response carries the room's state before the join and its auth
+    /// chain, but none of the history between those events: their parents
+    /// live on the resident server. So the events are replayed in
+    /// dependency order (depth, then timestamp) with each snapshot built by
+    /// applying the event to its predecessor's — `append_seeded`, not a
+    /// fold over parents this log does not hold.
+    ///
+    /// Every event's ID is **recomputed from its content**: v11 IDs are
+    /// reference hashes, so the resident server cannot hand us a body that
+    /// does not match the ID the rest of the room cites. Per-event origin
+    /// signature verification is deliberately deferred to the roadmap's
+    /// federation-hardening pass; the hash check is what keeps the seeded
+    /// room internally consistent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] when an event fails validation or the room is
+    /// already held (join a room we are in through the local path instead).
+    #[allow(clippy::too_many_lines, reason = "one seeding, in one place")]
+    pub fn join_remote(
+        &self,
+        room_id: &str,
+        state: &[Value],
+        auth_chain: &[Value],
+        join: &Value,
+        join_id: &str,
+    ) -> Result<(), RoomError> {
+        let mut open = self
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let already_held = open.contains_key(room_id)
+            || RoomStore::new(self.store.as_ref(), room_id)
+                .load()?
+                .is_some();
+        if already_held {
+            return Err(RoomError::Append(format!(
+                "{room_id} is already on this server"
+            )));
+        }
+
+        let version = RoomVersionId::try_from(ROOM_VERSION)
+            .map_err(|error| RoomError::Append(error.to_string()))?;
+        let identify = |event: &Value| -> Result<(String, Value), RoomError> {
+            let ruma::CanonicalJsonValue::Object(canonical) =
+                ruma::CanonicalJsonValue::try_from(event.clone())
+                    .map_err(|error| RoomError::Append(error.to_string()))?
+            else {
+                return Err(RoomError::Append("event is not an object".to_owned()));
+            };
+            let pdu = Pdu::from_remote(version.clone(), canonical)
+                .map_err(|error| RoomError::Append(format!("{error:?}")))?;
+            Ok((pdu.event_id().as_str().to_owned(), event.clone()))
+        };
+
+        // State and auth chain overlap heavily; dedup by recomputed ID, then
+        // order by dependency. Depth is the room's own topological measure;
+        // the timestamp and ID only break ties deterministically.
+        let mut events: std::collections::BTreeMap<String, Value> =
+            std::collections::BTreeMap::new();
+        for event in state.iter().chain(auth_chain) {
+            let (id, body) = identify(event)?;
+            events.insert(id, body);
+        }
+        if events.contains_key(join_id) {
+            return Err(RoomError::Append(
+                "the join must not be part of the state before it".to_owned(),
+            ));
+        }
+        let mut ordered: Vec<(String, Value)> = events.into_iter().collect();
+        ordered.sort_by_key(|(id, event)| {
+            (
+                event["depth"].as_u64().unwrap_or(0),
+                event["origin_server_ts"].as_u64().unwrap_or(0),
+                id.clone(),
+            )
+        });
+
+        let (computed_join_id, join_body) = identify(join)?;
+        if computed_join_id != join_id {
+            return Err(RoomError::Append(format!(
+                "the join hashes to {computed_join_id}, not {join_id}"
+            )));
+        }
+
+        let mut log = RoomLog::new();
+        let mut snapshot = spindle_core::StateSnapshot::new();
+        let room_store = RoomStore::new(self.store.as_ref(), room_id);
+        let seed = |log: &mut RoomLog,
+                    snapshot: &mut spindle_core::StateSnapshot,
+                    id: &str,
+                    event: &Value|
+         -> Result<LogEntry, RoomError> {
+            let state_key = event["state_key"].as_str().map(|state_key| {
+                StateKey::new(event["type"].as_str().unwrap_or_default(), state_key)
+            });
+            if let Some(key) = state_key.clone() {
+                *snapshot = snapshot.apply(key, id);
+            }
+            let prev: Vec<EventId> = event["prev_events"]
+                .as_array()
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(Value::as_str)
+                        .map(EventId::new)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let input = match state_key {
+                Some(key) => EventInput::new(id, prev).with_state_key(key),
+                None => EventInput::new(id, prev),
+            };
+            match log.append_seeded(
+                input,
+                snapshot.clone(),
+                event["depth"].as_u64().unwrap_or(0),
+            ) {
+                Ok(entry) => Ok(entry.clone()),
+                Err(error) => Err(RoomError::Append(format!("{error:?}"))),
+            }
+        };
+
+        for (id, event) in &ordered {
+            let entry = seed(&mut log, &mut snapshot, id, event)?;
+            // Body and reverse index ride the entry's own commit, exactly as
+            // on the ordinary receive path; seeded history takes no stream
+            // row because it is not new activity on this server.
+            spindle_store::Store::put(
+                self.store.as_ref(),
+                &event_body_key(room_id, id),
+                &serde_json::to_vec(event)?,
+            )?;
+            let extra = vec![(
+                spindle_core::keys::event_room(id),
+                room_id.as_bytes().to_vec(),
+            )];
+            room_store.commit_entry_with(&entry, &log, &extra, Durability::Group)?;
+        }
+
+        // The join itself is new activity: it goes through the shared
+        // persistence spine, so it gets a stream row (the joiner's sync must
+        // surface the room), the membership index, and waiter notification.
+        let join_entry = seed(&mut log, &mut snapshot, join_id, &join_body)?;
+        let content = join_body["content"].clone();
+        let sender = join_body["sender"].as_str().unwrap_or_default().to_owned();
+        let state_key_owned = join_body["state_key"].as_str().map(str::to_owned);
+        self.persist_entry(
+            &mut log,
+            room_id,
+            &join_entry,
+            join_id,
+            &PersistInput {
+                event_type: join_body["type"].as_str().unwrap_or_default(),
+                state_key: state_key_owned.as_deref(),
+                sender: &sender,
+                content: &content,
+                json: &join_body,
+            },
+        )?;
+
+        // Membership rows for everyone already in the room, from the final
+        // state: `/joined_members`, sync and the outbound queue all read
+        // this index instead of walking state.
+        let mut member_rows: Vec<(String, String)> = Vec::new();
+        snapshot.for_each(|key, id| {
+            if key.event_type().as_str() == "m.room.member" {
+                member_rows.push((key.state_key().to_owned(), id.to_owned()));
+            }
+        });
+        for (user, id) in member_rows {
+            if user == sender {
+                continue; // persist_entry indexed the join itself
+            }
+            let event = self.read_event(room_id, &EventId::new(id.as_str()))?;
+            self.index_membership(room_id, Some(&user), &event["content"])?;
+        }
+
+        open.insert(room_id.to_owned(), log);
+        Ok(())
+    }
+
     /// Accept one event another server created, after the caller verified
     /// its signatures against the origin's published keys.
     ///

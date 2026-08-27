@@ -1636,7 +1636,7 @@ async fn server_keys(State(state): State<AppState>) -> Json<Value> {
         .map(|since| since.as_millis().saturating_add(24 * 60 * 60 * 1000))
         .unwrap_or_default();
 
-    Json(json!({
+    let document = json!({
         "server_name": state.config.server.name,
         "valid_until_ts": u64::try_from(valid_until).unwrap_or(u64::MAX),
         "verify_keys": {
@@ -1646,7 +1646,29 @@ async fn server_keys(State(state): State<AppState>) -> Json<Value> {
         // omitting it: a peer reads this to decide whether a signature made
         // with an old key should still be honoured.
         "old_verify_keys": {},
-    }))
+    });
+    // Self-signed, with the very key inside it: that circularity is the
+    // spec's design — the document proves possession of the key it
+    // publishes, and a peer that skips this check would trust anyone on
+    // the network path. Our own verifier refuses unsigned documents, so an
+    // unsigned one here would mean no other Spindle could ever trust us —
+    // which is exactly how the first server-to-server test found this.
+    let signed = ruma::CanonicalJsonValue::try_from(document.clone())
+        .ok()
+        .and_then(|canonical| match canonical {
+            ruma::CanonicalJsonValue::Object(mut object) => {
+                ruma::signatures::sign_json(
+                    &state.config.server.name,
+                    state.key.pair(),
+                    &mut object,
+                )
+                .ok()?;
+                serde_json::to_value(&object).ok()
+            }
+            _ => None,
+        })
+        .unwrap_or(document);
+    Json(signed)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1786,8 +1808,23 @@ async fn join_room(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
     axum::extract::Path(room_id): axum::extract::Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Result<Json<Value>, MatrixError> {
-    join(&state, &identity.user_id, &room_id)
+    join(
+        &state,
+        &identity.user_id,
+        &room_id,
+        &server_name_params(query.as_deref()),
+    )
+    .await
+}
+
+/// The repeatable `server_name` query parameters a join may carry.
+fn server_name_params(query: Option<&str>) -> Vec<String> {
+    form_urlencoded::parse(query.unwrap_or_default().as_bytes())
+        .filter(|(key, _)| key == "server_name" || key == "via")
+        .map(|(_, value)| value.into_owned())
+        .collect()
 }
 
 /// `POST /_matrix/client/v3/join/{room_id_or_alias}`
@@ -1803,6 +1840,7 @@ async fn join_room_by_id_or_alias(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
     axum::extract::Path(room_id_or_alias): axum::extract::Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Result<Json<Value>, MatrixError> {
     let room_id = if room_id_or_alias.starts_with('#') {
         state
@@ -1820,7 +1858,13 @@ async fn join_room_by_id_or_alias(
     } else {
         room_id_or_alias
     };
-    join(&state, &identity.user_id, &room_id)
+    join(
+        &state,
+        &identity.user_id,
+        &room_id,
+        &server_name_params(query.as_deref()),
+    )
+    .await
 }
 
 /// `GET /_matrix/client/v3/directory/room/{room_alias}`
@@ -1937,12 +1981,126 @@ fn directory_error(error: &crate::directory::DirectoryError) -> MatrixError {
     }
 }
 
-fn join(state: &AppState, user_id: &str, room_id: &str) -> Result<Json<Value>, MatrixError> {
-    state
+async fn join(
+    state: &AppState,
+    user_id: &str,
+    room_id: &str,
+    servers: &[String],
+) -> Result<Json<Value>, MatrixError> {
+    match state
         .rooms
         .set_membership(room_id, user_id, user_id, "join", None, state.key.pair())
-        .map_err(room_error)?;
-    Ok(Json(json!({ "room_id": room_id })))
+    {
+        Ok(_) => Ok(Json(json!({ "room_id": room_id }))),
+        // A room this server has never held may still be joinable: through
+        // the servers the client named, or the one in the room ID itself.
+        Err(crate::rooms::RoomError::UnknownRoom(_)) => {
+            join_remote(state, user_id, room_id, servers).await
+        }
+        Err(error) => Err(room_error(error)),
+    }
+}
+
+/// Walk the `make_join`/`send_join` handshake as the joining server.
+async fn join_remote(
+    state: &AppState,
+    user_id: &str,
+    room_id: &str,
+    servers: &[String],
+) -> Result<Json<Value>, MatrixError> {
+    let mut candidates: Vec<String> = servers.to_vec();
+    if let Some((_, domain)) = room_id.split_once(':')
+        && !candidates.iter().any(|server| server == domain)
+        && domain != state.config.server.name
+    {
+        candidates.push(domain.to_owned());
+    }
+    if candidates.is_empty() {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            format!("{room_id} is not on this server and no server_name was given"),
+        ));
+    }
+
+    let mut last_refusal = String::new();
+    for server in &candidates {
+        let template = match state
+            .federation
+            .remote_make_join(server, room_id, user_id)
+            .await
+        {
+            Ok(body) => body["event"].clone(),
+            Err(error) => {
+                last_refusal = error.to_string();
+                continue;
+            }
+        };
+
+        // Finish the template: content-hash and sign it as ours, exactly
+        // what a resident server's send_join will verify.
+        let Ok(ruma::CanonicalJsonValue::Object(mut canonical)) =
+            ruma::CanonicalJsonValue::try_from(template.clone())
+        else {
+            last_refusal = format!("{server} sent a template that does not canonicalize");
+            continue;
+        };
+        let rules = ruma::RoomVersionId::try_from(crate::rooms::ROOM_VERSION)
+            .ok()
+            .and_then(|version| version.rules())
+            .ok_or_else(|| MatrixError::internal("the room version rules are unavailable"))?;
+        if ruma::signatures::hash_and_sign_event(
+            &state.config.server.name,
+            state.key.pair(),
+            &mut canonical,
+            &rules.redaction,
+        )
+        .is_err()
+        {
+            last_refusal = format!("the {server} template cannot be signed");
+            continue;
+        }
+        let Ok(hash) = ruma::signatures::reference_hash(&canonical, &rules) else {
+            "the signed join cannot be hashed".clone_into(&mut last_refusal);
+            continue;
+        };
+        let join_id = format!("${hash}");
+        let join = serde_json::to_value(&canonical)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+
+        let response = match state
+            .federation
+            .remote_send_join(server, room_id, &join_id, &join)
+            .await
+        {
+            Ok(body) => body,
+            Err(error) => {
+                last_refusal = error.to_string();
+                continue;
+            }
+        };
+
+        let arrays =
+            |key: &str| -> Vec<Value> { response[key].as_array().cloned().unwrap_or_default() };
+        state
+            .rooms
+            .join_remote(
+                room_id,
+                &arrays("state"),
+                &arrays("auth_chain"),
+                &join,
+                &join_id,
+            )
+            .map_err(room_error)?;
+        state.rooms.wake_sync_waiters();
+        return Ok(Json(json!({ "room_id": room_id })));
+    }
+
+    Err(MatrixError::new(
+        StatusCode::BAD_GATEWAY,
+        "M_UNKNOWN",
+        format!("no server admitted the join: {last_refusal}"),
+    ))
 }
 
 /// `POST /_matrix/client/v3/rooms/{room_id}/leave`
