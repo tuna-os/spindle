@@ -102,8 +102,9 @@ details { margin-top: .75rem; }
 code { font-size: .85em; }
 """)
     add("</style></head><body>")
-    add("<h1>Spindle benchmarks</h1>")
-    add('<nav><a href="./dashboard.html">coverage &amp; feature dashboard</a> · <a href="./comparisons.html">milestone comparisons vs siblings</a></nav>')
+    add('<nav><a href="./comparisons.html"><strong>Spindle vs the field</strong> — the competitive story, with charts</a> · <a href="./dashboard.html">coverage &amp; feature dashboard</a></nav>')
+    add("<h1>Spindle micro-benchmarks</h1>")
+    add('<p>Criterion measurements of Spindle alone, per commit. For the four-way comparison against Synapse, Continuwuity and Tuwunel — including every loss and its investigation — see <a href="./comparisons.html">Spindle vs the field</a>.</p>')
     add(
         f"<p class=\"meta\">Commit <code>{html.escape(document.get('commit','?')[:12])}</code> "
         f"on <code>{html.escape(document.get('ref','?'))}</code> · "

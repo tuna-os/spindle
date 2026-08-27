@@ -62,21 +62,35 @@ class Client:
                 return json.loads(response.read() or b"{}")
         except urllib.error.HTTPError as error:
             detail = error.read().decode(errors="replace")[:300]
-            raise Failed(f"{method} {path} -> {error.code}: {detail}") from error
+            refusal = Failed(f"{method} {path} -> {error.code}: {detail}")
+            try:
+                refusal.body = json.loads(detail)
+            except json.JSONDecodeError:
+                refusal.body = None
+            raise refusal from error
         except urllib.error.URLError as error:
             raise Failed(f"{method} {path} -> {error.reason}") from error
 
     def register(self, username: str, password: str = "benchmark-password") -> str:
-        """Register, hold the token, and return the full user ID."""
-        body = self.request(
-            "POST",
-            "/_matrix/client/v3/register",
-            {
-                "username": username,
-                "password": password,
-                "auth": REGISTRATION_AUTH,
-            },
-        )
+        """Register through the UIA dance, hold the token, return the user ID.
+
+        The first request carries no auth: a conformant server answers 401
+        with the flows and a session, and the retry cites that session. A
+        server that skips the challenge and registers outright (some do on
+        an open server) is accepted as-is — the driver measures homeservers,
+        it does not referee their UIA strictness.
+        """
+        request = {"username": username, "password": password}
+        try:
+            body = self.request("POST", "/_matrix/client/v3/register", request)
+        except Failed as refusal:
+            challenge = getattr(refusal, "body", None)
+            session = (challenge or {}).get("session") if isinstance(challenge, dict) else None
+            auth = dict(REGISTRATION_AUTH)
+            if session:
+                auth["session"] = session
+            request["auth"] = auth
+            body = self.request("POST", "/_matrix/client/v3/register", request)
         self.token = body["access_token"]
         return body["user_id"]
 
