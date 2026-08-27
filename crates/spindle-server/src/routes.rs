@@ -664,6 +664,22 @@ fn discovery_routes() -> Router<AppState> {
             axum::routing::put(federation_send_join),
         )
         .route(
+            "/_matrix/federation/v1/send_join/{room_id}/{event_id}",
+            axum::routing::put(federation_send_join_v1),
+        )
+        .route(
+            "/_matrix/federation/v1/send_leave/{room_id}/{event_id}",
+            axum::routing::put(federation_send_leave_v1),
+        )
+        .route(
+            "/_matrix/federation/v1/make_knock/{room_id}/{user_id}",
+            get(federation_make_knock),
+        )
+        .route(
+            "/_matrix/federation/v1/send_knock/{room_id}/{event_id}",
+            axum::routing::put(federation_send_knock),
+        )
+        .route(
             "/_matrix/federation/v2/invite/{room_id}/{event_id}",
             axum::routing::put(federation_invite),
         )
@@ -1677,6 +1693,101 @@ async fn federation_make_leave(
     })))
 }
 
+/// `GET /_matrix/federation/v1/make_knock/{roomId}/{userId}`
+///
+/// A knock template, for a room whose join rule invites them: the same
+/// preview-then-verify shape as `make_join`, and the same auth rules judge
+/// the signed event on the way back through `send_knock`.
+async fn federation_make_knock(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path((room_id, user_id)): axum::extract::Path<(String, String)>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let origin = federation_origin(&state, &headers, "GET", &uri, None).await?;
+    if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin.as_str()) {
+        return Err(MatrixError::forbidden(
+            "the user does not live on the requesting server",
+        ));
+    }
+    let event = state
+        .rooms
+        .make_knock_template(&room_id, &user_id)
+        .map_err(room_error)?;
+    Ok(Json(json!({
+        "room_version": crate::rooms::ROOM_VERSION,
+        "event": event,
+    })))
+}
+
+/// `PUT /_matrix/federation/v1/send_knock/{roomId}/{eventId}`
+async fn federation_send_knock(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let knock: Value =
+        serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&knock)).await?;
+
+    // Same smuggling rule as send_join and send_leave: this door admits
+    // exactly one kind of event.
+    let is_knock = knock["type"] == json!("m.room.member")
+        && knock["content"]["membership"] == json!("knock")
+        && knock["state_key"] == knock["sender"]
+        && knock["room_id"].as_str() == Some(room_id.as_str());
+    if !is_knock {
+        return Err(MatrixError::bad_json(
+            "send_knock carries exactly a knock event for this room".to_owned(),
+        ));
+    }
+    let Some(knocker) = knock["sender"].as_str().map(str::to_owned) else {
+        return Err(MatrixError::bad_json("the knock has no sender".to_owned()));
+    };
+
+    let key_map = state
+        .federation
+        .public_key_map(&origin)
+        .await
+        .map_err(|error| {
+            tracing::debug!("cannot fetch {origin} keys: {error}");
+            MatrixError::new(
+                StatusCode::UNAUTHORIZED,
+                "M_UNAUTHORIZED",
+                "the origin's keys cannot be verified".to_owned(),
+            )
+        })?;
+    let (computed_id, outcome) = receive_one_pdu(&state, &origin, Some(&key_map), &knock);
+    if computed_id != event_id {
+        return Err(MatrixError::bad_json(format!(
+            "the event hashes to {computed_id}, not {event_id}"
+        )));
+    }
+    if let Err(reason) = outcome {
+        return Err(MatrixError::forbidden(&reason));
+    }
+    state.rooms.wake_sync_waiters();
+    // The stripped state a knocker may see: what room they knocked on and
+    // how it admits — the same subset an invitee gets.
+    let events = state
+        .rooms
+        .stripped_state(&room_id, &knocker)
+        .unwrap_or_default();
+    Ok(Json(json!({ "knock_room_state": events })))
+}
+
 /// `PUT /_matrix/federation/v2/send_leave/{roomId}/{eventId}`
 async fn federation_send_leave(
     State(state): State<AppState>,
@@ -1684,6 +1795,32 @@ async fn federation_send_leave(
     axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
     request: axum::http::Request<axum::body::Body>,
 ) -> Result<Json<Value>, MatrixError> {
+    send_leave_common(state, headers, room_id, event_id, request)
+        .await
+        .map(Json)
+}
+
+/// `PUT /_matrix/federation/v1/send_leave/{roomId}/{eventId}`
+///
+/// The v1 `[200, {}]` envelope, same fossil rule as `send_join` v1.
+async fn federation_send_leave_v1(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    send_leave_common(state, headers, room_id, event_id, request)
+        .await
+        .map(|answer| Json(json!([200, answer])))
+}
+
+async fn send_leave_common(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    room_id: String,
+    event_id: String,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Value, MatrixError> {
     let uri = request
         .uri()
         .path_and_query()
@@ -1729,7 +1866,7 @@ async fn federation_send_leave(
         return Err(MatrixError::forbidden(&reason));
     }
     state.rooms.wake_sync_waiters();
-    Ok(Json(json!({})))
+    Ok(json!({}))
 }
 
 /// `PUT /_matrix/federation/v2/send_join/{roomId}/{eventId}`
@@ -1739,6 +1876,34 @@ async fn federation_send_join(
     axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
     request: axum::http::Request<axum::body::Body>,
 ) -> Result<Json<Value>, MatrixError> {
+    send_join_common(state, headers, room_id, event_id, request)
+        .await
+        .map(Json)
+}
+
+/// `PUT /_matrix/federation/v1/send_join/{roomId}/{eventId}`
+///
+/// The v1 shape: the same answer inside a `[200, {...}]` envelope — a
+/// fossil the spec keeps for servers that predate v2, and cheap to serve
+/// since the body is the v2 body.
+async fn federation_send_join_v1(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    send_join_common(state, headers, room_id, event_id, request)
+        .await
+        .map(|answer| Json(json!([200, answer])))
+}
+
+async fn send_join_common(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    room_id: String,
+    event_id: String,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Value, MatrixError> {
     let uri = request
         .uri()
         .path_and_query()
@@ -1797,12 +1962,12 @@ async fn federation_send_join(
         events.into_iter().map(|(_, event)| event).collect()
     };
     state.rooms.wake_sync_waiters();
-    Ok(Json(json!({
+    Ok(json!({
         "origin": state.config.server.name,
         "event": join,
         "state": bodies(state_pairs),
         "auth_chain": bodies(auth_pairs),
-    })))
+    }))
 }
 
 /// `PUT /_matrix/federation/v2/invite/{roomId}/{eventId}`
