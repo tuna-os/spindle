@@ -44,9 +44,25 @@ jobs:
       # that the image builds, comes up from SERVER_NAME and a mounted CA, and
       # answers /_matrix/client/versions -- so that is what is checked, rather
       # than that somebody committed a Dockerfile.
+      - uses: docker/setup-buildx-action@v3
+        if: hashFiles('crates/spindle-server/Cargo.toml') != ''
+
+      # The image's dependency layer is keyed on Cargo.lock alone, so it is
+      # the same layer on every run until a dependency actually moves. A
+      # runner has no layer cache of its own, so without exporting one the
+      # split in complement/Dockerfile buys nothing: this is the half that
+      # makes it pay. Shared scope with complement-suite — same context,
+      # same Dockerfile, same layers.
       - name: Build the Complement image
         if: hashFiles('crates/spindle-server/Cargo.toml') != ''
-        run: docker build -f complement/Dockerfile -t complement-spindle:ci .
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: complement/Dockerfile
+          tags: complement-spindle:ci
+          load: true
+          cache-from: type=gha,scope=complement-image
+          cache-to: type=gha,mode=max,scope=complement-image
 
       - name: Start it the way Complement does
         if: hashFiles('crates/spindle-server/Cargo.toml') != ''
@@ -176,6 +192,21 @@ jobs:
           key: complement-${{ runner.os }}-${{ hashFiles('scripts/complement.sh') }}
           restore-keys: complement-${{ runner.os }}-
 
+      - uses: docker/setup-buildx-action@v3
+
+      # Built here rather than inside complement.sh so the layer cache
+      # applies; the script skips its own build when COMPLEMENT_IMAGE is
+      # already set, which is exactly what that variable is for.
+      - name: Build the Complement image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: complement/Dockerfile
+          tags: complement-spindle:latest
+          load: true
+          cache-from: type=gha,scope=complement-image
+          cache-to: type=gha,mode=max,scope=complement-image
+
       - name: Compute the protected-subset filter for pull requests
         if: github.event_name == 'pull_request'
         run: |
@@ -190,6 +221,7 @@ jobs:
         # and every test in it as absent.
         env:
           GOPROXY: https://proxy.golang.org|direct
+          COMPLEMENT_IMAGE: complement-spindle:latest
         run: scripts/complement.sh tmp/complement-results.jsonl
 
       - name: Enforce the allowlist

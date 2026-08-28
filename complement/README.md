@@ -38,6 +38,29 @@ Tuwunel use. TLS on 8448 is served with the Complement-CA-signed
 certificate; the remaining large gaps (outbound remote joins, federated
 invites, EDUs over federation) are tracked on the M3 issues.
 
+## Why the image builds in two stages
+
+`complement/Dockerfile` compiles the workspace's dependencies in a layer
+that sees only `Cargo.toml`/`Cargo.lock` and placeholder sources, then the
+real sources in a second layer. Every CI run changes our own code and
+nothing else, and without the split that recompiles the entire dependency
+graph — measured locally:
+
+| | one-line source change | cold, no cache |
+|---|---|---|
+| single layer | 2m11s | 2m27s |
+| split | **40s** | 2m36s |
+
+Cold is 9s slower (two cargo invocations); the case that actually happens
+is 3.3× faster. A runner has no layer cache of its own, so CI exports one
+(`cache-to: type=gha` in `compliance.yml`) — without that export the split
+buys nothing there.
+
+Adding a crate without adding its manifest to the dependency layer is not
+a correctness problem: that layer simply will not cover it and the real
+build compiles it from scratch. The failure mode is a slower build, not a
+wrong one.
+
 ## Running it
 
 ```bash
