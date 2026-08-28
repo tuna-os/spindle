@@ -7,6 +7,7 @@
 pub mod codec;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fjall::{
     Config, Keyspace as FjallKeyspace, PartitionCreateOptions, PartitionHandle, PersistMode,
@@ -125,9 +126,43 @@ pub trait Store: ReadView {
 pub struct FjallStore {
     keyspace: FjallKeyspace,
     partition: PartitionHandle,
+    /// Point reads and scanned rows served since this store was opened.
+    ///
+    /// Here so that "how much work does this request do" can be *asserted*
+    /// rather than timed. Every performance defect this project has actually
+    /// shipped was algorithmic -- a read per member where a point lookup
+    /// would do -- and a count catches that deterministically, on any
+    /// machine, in a unit test, where a wall clock on a shared CI runner
+    /// could not tell the regression from the runner's mood.
+    ///
+    /// Two relaxed atomics on the read path. They are always compiled in
+    /// rather than hidden behind a feature, because a counter that only
+    /// exists in test builds cannot be read from a running server, and the
+    /// increment is far cheaper than the read it is counting.
+    reads: AtomicU64,
+    scanned: AtomicU64,
 }
 
 impl FjallStore {
+    /// Point reads served since this store was opened.
+    ///
+    /// Monotonic and never reset: a caller measures a span by subtracting
+    /// two readings, which composes under concurrency in a way a resettable
+    /// counter does not.
+    #[must_use]
+    pub fn reads(&self) -> u64 {
+        self.reads.load(Ordering::Relaxed)
+    }
+
+    /// Rows returned by prefix scans since this store was opened.
+    ///
+    /// Counted as rows rather than scans because that is the cost: one scan
+    /// returning ten thousand rows is not one unit of work.
+    #[must_use]
+    pub fn scanned(&self) -> u64 {
+        self.scanned.load(Ordering::Relaxed)
+    }
+
     /// Open or create a store at `path`.
     ///
     /// # Errors
@@ -137,6 +172,8 @@ impl FjallStore {
         let keyspace = Config::new(path).open()?;
         let partition = keyspace.open_partition("spindle", PartitionCreateOptions::default())?;
         let store = Self {
+            reads: AtomicU64::new(0),
+            scanned: AtomicU64::new(0),
             keyspace,
             partition,
         };
@@ -220,6 +257,7 @@ const MARKER_VERSION: u8 = 1;
 
 impl ReadView for FjallStore {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
         Ok(self.partition.get(key)?.map(|slice| slice.to_vec()))
     }
 
@@ -229,6 +267,7 @@ impl ReadView for FjallStore {
             let (key, value) = pair?;
             out.push((key.to_vec(), value.to_vec()));
         }
+        self.scanned.fetch_add(out.len() as u64, Ordering::Relaxed);
         Ok(out)
     }
 }
