@@ -20,8 +20,11 @@
 //! *deltas* rather than absolute values — which is what a scrape does
 //! anyway.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, RwLock};
+use std::time::Duration;
 
 /// Which of §9.2's three cases an append took.
 ///
@@ -154,7 +157,210 @@ pub fn render() -> String {
         );
     }
 
+    out.push_str(
+        "# HELP spindle_append_duration_seconds Time to commit one event to a room log.\n\
+         # TYPE spindle_append_duration_seconds histogram\n",
+    );
+    if let Ok(read) = APPEND_LATENCY.read() {
+        for (durability, histogram) in read.iter() {
+            histogram.render_into(
+                &mut out,
+                "spindle_append_duration_seconds",
+                &format!("durability=\"{}\"", escape(durability)),
+            );
+        }
+    }
+
+    out.push_str(
+        "# HELP spindle_http_request_duration_seconds Time to serve one request, by matched route.\n\
+         # TYPE spindle_http_request_duration_seconds histogram\n",
+    );
+    if let Ok(read) = HTTP_LATENCY.read() {
+        for (route, histogram) in read.iter() {
+            histogram.render_into(
+                &mut out,
+                "spindle_http_request_duration_seconds",
+                &format!("route=\"{}\"", escape(route)),
+            );
+        }
+    }
+
+    out.push_str(
+        "# HELP spindle_http_requests_total Requests served, by matched route, method and status.\n\
+         # TYPE spindle_http_requests_total counter\n",
+    );
+    if let Ok(read) = HTTP_REQUESTS.read() {
+        for (key, counter) in read.iter() {
+            let mut parts = key.split('\u{1}');
+            let (Some(route), Some(method), Some(status)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let _ = writeln!(
+                out,
+                "spindle_http_requests_total{{route=\"{}\",method=\"{}\",status=\"{}\"}} {}",
+                escape(route),
+                escape(method),
+                escape(status),
+                counter.load(Ordering::Relaxed)
+            );
+        }
+    }
+
     out
+}
+
+/// Bucket bounds, in seconds.
+///
+/// Weighted to where SPEC §18.3 puts its targets — local send p50 under
+/// 2 ms and p99 under 10 ms — because buckets that straddle the target
+/// are the ones that can tell you whether you met it. The default set
+/// most libraries ship starts at 5 ms, which would put every one of
+/// those appends in the first bucket and answer nothing.
+const BUCKETS: [f64; 12] = [
+    0.000_5, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+];
+
+/// A Prometheus histogram: per-bucket counts, a sum and a total.
+///
+/// Counts are per-bucket here and made cumulative at render, which is
+/// what the exposition format wants; doing it the other way would mean
+/// touching every bucket above the observation on the hot path.
+#[derive(Debug)]
+struct Histogram {
+    buckets: [AtomicU64; BUCKETS.len()],
+    /// Microseconds, so the sum needs no float atomic. Rendered as
+    /// seconds, which is the unit the metric name promises.
+    sum_micros: AtomicU64,
+    count: AtomicU64,
+}
+
+impl Histogram {
+    const fn new() -> Self {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const ZERO: AtomicU64 = AtomicU64::new(0);
+        Self {
+            buckets: [ZERO; BUCKETS.len()],
+            sum_micros: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    /// A [`Duration`] rather than seconds, so the microsecond sum is an
+    /// integer conversion the type system checks rather than a float
+    /// cast that has to be reasoned about.
+    fn observe(&self, elapsed: Duration) {
+        let seconds = elapsed.as_secs_f64();
+        let slot = BUCKETS
+            .iter()
+            .position(|bound| seconds <= *bound)
+            .unwrap_or(BUCKETS.len());
+        if let Some(bucket) = self.buckets.get(slot) {
+            bucket.fetch_add(1, Ordering::Relaxed);
+        }
+        // Saturating: a duration past u64 microseconds is 584,000 years,
+        // which is a clock fault rather than a measurement — and a
+        // wrapped sum would misreport every observation after it.
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.sum_micros.fetch_add(micros, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Render as `name{labels,le="..."}` triples plus `_sum` and `_count`.
+    fn render_into(&self, out: &mut String, name: &str, labels: &str) {
+        let mut cumulative = 0;
+        let separator = if labels.is_empty() { "" } else { "," };
+        for (index, bound) in BUCKETS.iter().enumerate() {
+            cumulative += self.buckets[index].load(Ordering::Relaxed);
+            let _ = writeln!(
+                out,
+                "{name}_bucket{{{labels}{separator}le=\"{bound}\"}} {cumulative}"
+            );
+        }
+        // The overflow slot lives past the named bounds, so +Inf is the
+        // total rather than the last cumulative sum.
+        let count = self.count.load(Ordering::Relaxed);
+        let _ = writeln!(
+            out,
+            "{name}_bucket{{{labels}{separator}le=\"+Inf\"}} {count}"
+        );
+        // Exact until the accumulated total passes f64's 52-bit
+        // mantissa, which for microseconds is about 142 years of
+        // measured time in one series.
+        #[allow(clippy::cast_precision_loss)]
+        let sum = self.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        let _ = writeln!(out, "{name}_sum{{{labels}}} {sum}");
+        let _ = writeln!(out, "{name}_count{{{labels}}} {count}");
+    }
+}
+
+/// A histogram per label value.
+///
+/// Read-mostly: after the first request through a route the entry
+/// exists, so the hot path takes a read lock and nothing else. The key
+/// sets are bounded by code — the durability modes the store offers,
+/// and the router's own matched paths — never by anything a caller
+/// chooses, which is the cardinality rule #166 sets.
+type Family = LazyLock<RwLock<HashMap<String, Histogram>>>;
+
+static APPEND_LATENCY: Family = LazyLock::new(RwLock::default);
+static HTTP_LATENCY: Family = LazyLock::new(RwLock::default);
+static HTTP_REQUESTS: LazyLock<RwLock<HashMap<String, AtomicU64>>> = LazyLock::new(RwLock::default);
+
+fn observe_in(family: &Family, key: &str, elapsed: Duration) {
+    if let Ok(read) = family.read()
+        && let Some(histogram) = read.get(key)
+    {
+        histogram.observe(elapsed);
+        return;
+    }
+    if let Ok(mut write) = family.write() {
+        write
+            .entry(key.to_owned())
+            .or_insert_with(Histogram::new)
+            .observe(elapsed);
+    }
+}
+
+/// Record how long a commit took, by the durability it was asked for.
+///
+/// SPEC §18.3's local-send targets are stated against `group`, so the
+/// label is what makes the number comparable to the target rather than
+/// an average over settings nobody runs together.
+pub fn observe_append(durability: &str, elapsed: Duration) {
+    observe_in(&APPEND_LATENCY, durability, elapsed);
+}
+
+/// Record one served request.
+///
+/// `route` must be the router's matched path (`/rooms/{room_id}/...`),
+/// never the raw URI: the raw path carries room and user IDs, and a
+/// label taking values from the request would let any caller mint
+/// series until the scrape falls over.
+pub fn observe_request(route: &str, method: &str, status: u16, elapsed: Duration) {
+    observe_in(&HTTP_LATENCY, route, elapsed);
+    let key = format!("{route}\u{1}{method}\u{1}{status}");
+    if let Ok(read) = HTTP_REQUESTS.read()
+        && let Some(counter) = read.get(&key)
+    {
+        counter.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if let Ok(mut write) = HTTP_REQUESTS.write() {
+        write
+            .entry(key)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Escape a label value per the exposition format.
+fn escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// Read one counter, for tests that assert a metric actually moved.

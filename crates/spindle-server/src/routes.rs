@@ -87,7 +87,38 @@ pub fn router(state: AppState) -> Router {
         // server does not speak that" from "the thing was not found".
         .fallback(unknown_endpoint)
         .layer(axum::middleware::from_fn(cors))
+        .layer(axum::middleware::from_fn(observe))
         .with_state(state)
+}
+
+/// Time every request and count it, by the route the router matched.
+///
+/// `MatchedPath` rather than the URI: the raw path carries room and user
+/// IDs, so a label taken from it would let any caller mint series until
+/// the scrape falls over. The matched path is the template the router
+/// holds, so the label set is bounded by the code (#166).
+///
+/// A request that matched no route has no template, and is counted under
+/// a single `unmatched` label rather than by whatever it asked for —
+/// otherwise a scanner walking random URLs is an unbounded label source.
+async fn observe(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map_or_else(|| "unmatched".to_owned(), |path| path.as_str().to_owned());
+    let method = request.method().to_string();
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    crate::metrics::observe_request(
+        &route,
+        &method,
+        response.status().as_u16(),
+        started.elapsed(),
+    );
+    response
 }
 
 /// SPEC (client-server, Web Browser Clients): every response carries the
