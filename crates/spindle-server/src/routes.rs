@@ -1884,13 +1884,14 @@ async fn federation_send(
     let mut results = serde_json::Map::new();
     for pdu in &pdus {
         let (event_id, outcome) = receive_one_pdu(&state, &origin, key_map.as_ref(), pdu);
-        results.insert(
-            event_id,
-            match outcome {
-                Ok(()) => json!({}),
-                Err(reason) => json!({ "error": reason }),
-            },
-        );
+        let result = match outcome {
+            Ok(()) => json!({}),
+            Err(reason) => {
+                report_refused_pdu(&origin, &event_id, pdu, &reason);
+                json!({ "error": reason })
+            }
+        };
+        results.insert(event_id, result);
     }
 
     // EDUs after PDUs, so a join and the typing that follows it land in
@@ -1943,6 +1944,32 @@ async fn federation_send(
 /// claimed) with the outcome. A PDU too malformed to even hash is keyed by
 /// a placeholder, because the response shape needs a key and inventing a
 /// plausible-looking ID for garbage would be worse.
+/// Say that a peer's event was refused, and name what it was refused over.
+///
+/// Otherwise this is silent. The transaction still answers 200 -- one bad
+/// event must not poison a batch of fifty -- and the rejection lives only
+/// in the per-event result the sending server reads and usually discards.
+/// So the moment two servers start disagreeing about a room is the one
+/// moment neither one's logs mention, which is exactly backwards.
+///
+/// The two user IDs are here because they are the only ones a signature
+/// check parses, so they are the only ones "could not parse user ID" can
+/// be about -- and without them that sentence has no subject.
+fn report_refused_pdu(origin: &str, event_id: &str, pdu: &Value, reason: &str) {
+    tracing::warn!(
+        origin = %origin,
+        room_id = pdu["room_id"].as_str().unwrap_or("?"),
+        event_id = %event_id,
+        event_type = pdu["type"].as_str().unwrap_or("?"),
+        sender = pdu["sender"].as_str().unwrap_or("?"),
+        state_key = pdu["state_key"].as_str().unwrap_or("-"),
+        authorised_via = pdu["content"]["join_authorised_via_users_server"]
+            .as_str()
+            .unwrap_or("-"),
+        "refused a PDU from a peer: {reason}"
+    );
+}
+
 fn receive_one_pdu(
     state: &AppState,
     origin: &str,
@@ -2560,7 +2587,7 @@ async fn send_join_common(
         ));
     }
 
-    let key_map = state
+    let mut key_map = state
         .federation
         .public_key_map(&origin)
         .await
@@ -2572,6 +2599,37 @@ async fn send_join_common(
                 "the origin's keys cannot be verified".to_owned(),
             )
         })?;
+
+    // A restricted join is signed by two servers, and this is the second.
+    // The joiner's server signs the event as its sender; the *authorising*
+    // user's server signs it as the one making the claim, because the
+    // nomination is a statement about a room only that server can see into
+    // (MSC3083, and `required_server_signatures_to_verify_event` enforces
+    // it from v8). We put the nomination in the template, so the signature
+    // it needs is ours -- and without it the event we handed out fails
+    // verification here, on our own doorstep, before any peer sees it.
+    let join = match join["content"]["join_authorised_via_users_server"].as_str() {
+        Some(nominee)
+            if nominee.split_once(':').map(|(_, domain)| domain)
+                == Some(state.config.server.name.as_str()) =>
+        {
+            key_map
+                .entry(state.config.server.name.clone())
+                .or_default()
+                .insert(
+                    state.key.key_id(),
+                    ruma::serde::Base64::parse(state.key.public_key_base64())
+                        .map_err(|error| MatrixError::internal(&error.to_string()))?,
+                );
+            let version = state.rooms.room_version(&room_id).map_err(room_error)?;
+            countersign(&state, &join, &version)?
+        }
+        // Someone else's user, or nobody's: not ours to vouch for. The
+        // signature check below will ask for that server's key and fail if
+        // the joining server did not collect it, which is the right answer
+        // -- a nomination this server did not make is not one it endorses.
+        _ => join,
+    };
     let (computed_id, outcome) = receive_one_pdu(&state, &origin, Some(&key_map), &join);
     // The path names the event the peer computed; disagreement means one
     // side hashed a different event than the other signed.
@@ -2724,16 +2782,68 @@ async fn federation_invite(
     let signed = serde_json::to_value(&canonical)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
 
+    // An invite for a room this server already holds is not a notification
+    // about somewhere else -- it is an event in a log we have, and it has to
+    // go in. It arrives out of band precisely because the invitee's server
+    // is usually *not* in the room, so the inviter cannot reach it through
+    // an ordinary transaction; when we are in the room, that reasoning does
+    // not apply and skipping the append leaves our copy saying the user is
+    // still gone. Their own join is then refused by the rules reading our
+    // state, while the inviting server believes it told us. Synapse and
+    // Continuwuity both add the invite to a room they hold, for this reason.
+    //
+    // Idempotent against the copy that may also arrive in a transaction:
+    // `ingest` returns early for an event already in the log.
+    record_invite(
+        &state, &origin, &room_id, &event_id, &target, &body, &signed,
+    )?;
+
+    Ok(Json(json!({ "event": signed })))
+}
+
+/// Put an accepted federated invite where the invitee's server will find it.
+///
+/// Two shapes, because there are two situations. An invite arrives out of
+/// band precisely because the invitee's server is usually *not* in the room,
+/// so the inviter cannot reach it through an ordinary transaction; then the
+/// pending record and its stripped state are the whole of what the invitee's
+/// client has to render the room from.
+///
+/// When this server *is* in the room, that reasoning does not apply and the
+/// invite is an event in a log we hold. Recording only the pending row would
+/// leave our copy saying the user is still gone, so their own join is refused
+/// by the rules reading our state while the inviting server believes it told
+/// us. Synapse and Continuwuity both add the invite to a room they hold.
+///
+/// Idempotent against the copy that may also arrive in a transaction:
+/// `ingest` returns early for an event already in the log.
+fn record_invite(
+    state: &AppState,
+    origin: &str,
+    room_id: &str,
+    event_id: &str,
+    target: &str,
+    body: &Value,
+    signed: &Value,
+) -> Result<(), MatrixError> {
+    if state
+        .rooms
+        .receive_remote(room_id, event_id, signed)
+        .is_ok()
+    {
+        state.rooms.wake_sync_waiters();
+        return Ok(());
+    }
     let invite_state: Vec<Value> = body["invite_room_state"]
         .as_array()
         .cloned()
         .unwrap_or_default();
     state
         .rooms
-        .record_pending_invite(&target, &room_id, &origin, &invite_state)
+        .record_pending_invite(target, room_id, origin, &invite_state)
         .map_err(room_error)?;
-
-    Ok(Json(json!({ "event": signed })))
+    state.rooms.wake_sync_waiters();
+    Ok(())
 }
 
 /// `GET /_matrix/key/v2/server`
@@ -3553,6 +3663,83 @@ fn sign_membership_template(state: &AppState, template: &Value) -> Result<(Strin
     Ok((format!("${hash}"), event))
 }
 
+/// Add this server's signature to an event another server built.
+///
+/// Used where this server has something to attest that the builder could
+/// not: that an invited user's server was told (`federation_invite`), or
+/// that the authorising user of a restricted join really is a member here
+/// who could have invited the joiner (`send_join`). In both cases the
+/// signature is the attestation -- peers verify it, they do not take the
+/// field's presence as proof.
+///
+/// Signing does not disturb the event ID: the reference hash is taken over
+/// the redacted form, from which `signatures` is stripped.
+fn countersign(
+    state: &AppState,
+    event: &Value,
+    version: &ruma::RoomVersionId,
+) -> Result<Value, MatrixError> {
+    let Ok(ruma::CanonicalJsonValue::Object(mut canonical)) =
+        ruma::CanonicalJsonValue::try_from(event.clone())
+    else {
+        return Err(MatrixError::bad_json(
+            "the event does not canonicalize".to_owned(),
+        ));
+    };
+    let rules = version
+        .rules()
+        .ok_or_else(|| MatrixError::internal("the room version rules are unavailable"))?;
+    ruma::signatures::hash_and_sign_event(
+        &state.config.server.name,
+        state.key.pair(),
+        &mut canonical,
+        &rules.redaction,
+    )
+    .map_err(|error| MatrixError::internal(&format!("the event cannot be co-signed: {error}")))?;
+    serde_json::to_value(&canonical).map_err(|error| MatrixError::internal(&error.to_string()))
+}
+
+/// Take on the signatures a resident server added to our own join event.
+///
+/// MSC3083's `send_join` response returns the event the resident accepted,
+/// and for a restricted join that copy carries *its* signature as well as
+/// ours -- the attestation that the authorising user really is a member
+/// there. Keeping only our singly-signed copy would leave this server
+/// relaying an event the next peer rejects.
+///
+/// Signatures are merged rather than the event adopted wholesale, and the
+/// merge happens only if the two bodies are identical once signatures are
+/// set aside. A resident that returns a *different* event is not to be
+/// believed about it: what we signed is what we signed, and the event ID
+/// everyone else computes is the hash of that.
+fn merge_returned_signatures(join: &mut Value, returned: &Value) {
+    let without_signatures = |event: &Value| -> Value {
+        let mut copy = event.clone();
+        if let Some(object) = copy.as_object_mut() {
+            object.remove("signatures");
+        }
+        copy
+    };
+    if !returned.is_object() || without_signatures(returned) != without_signatures(join) {
+        return;
+    }
+    let Some(theirs) = returned["signatures"].as_object().cloned() else {
+        return;
+    };
+    if !join["signatures"].is_object() {
+        join["signatures"] = json!({});
+    }
+    let Some(ours) = join["signatures"].as_object_mut() else {
+        return;
+    };
+    for (server, keys) in theirs {
+        // Never overwrite: our own entry is the one we can vouch for, and a
+        // resident replacing it would be substituting a signature we did
+        // not make for one we did.
+        ours.entry(server).or_insert(keys);
+    }
+}
+
 /// Every server worth asking to broker a join, most-specific first.
 ///
 /// The client's own `server_name`/`via` hints lead; the domain in the room
@@ -3633,6 +3820,9 @@ async fn join_remote(
                 continue;
             }
         };
+
+        let mut join = join;
+        merge_returned_signatures(&mut join, &response["event"]);
 
         let arrays =
             |key: &str| -> Vec<Value> { response[key].as_array().cloned().unwrap_or_default() };

@@ -1274,6 +1274,7 @@ impl Rooms {
         state_key: &str,
         content: &Value,
     ) -> Result<String, RoomError> {
+        let content = &sanitized_member_content(event_type, content);
         self.with_room(room_id, |rooms, log| {
             rooms.append(
                 log,
@@ -1636,10 +1637,16 @@ impl Rooms {
     ///
     /// The template is everything but the signature: the caller's server
     /// signs it and brings it back through `send_join`. Authorization is
-    /// previewed here — public join rule, or a standing invite — so a
-    /// refused server learns at the cheap step, but the template is not a
-    /// promise: the signed event is authorized again on the way in, against
-    /// whatever the state is *then*.
+    /// previewed here — public join rule, a standing invite, or a
+    /// restricted room this server can vouch the joiner into — so a refused
+    /// server learns at the cheap step, but the template is not a promise:
+    /// the signed event is authorized again on the way in, against whatever
+    /// the state is *then*.
+    ///
+    /// The restricted case is the one where the preview carries something
+    /// the joining server could not have worked out: `restricted_join_nominee`
+    /// puts the authorising user into the content, and that field is the
+    /// entire basis on which the rules will accept the join.
     ///
     /// # Errors
     ///
@@ -1678,13 +1685,24 @@ impl Rooms {
             )?
             .as_deref()
                 == Some(INVITE_STR.as_bytes());
-            if join_rule != "public" && !invited {
+            // A restricted room is the third way in, and it was missing:
+            // the joiner is in a room this room admits, and this server can
+            // see that. The nomination is the *only* record of it, so it
+            // goes into the template -- the joining server signs what we
+            // hand back, and `send_join` and every peer after it check the
+            // nomination rather than taking our word for the join.
+            let nominee = rooms.restricted_join_nominee(log, room_id, user_id)?;
+            if join_rule != "public" && !invited && nominee.is_none() {
                 return Err(RoomError::Forbidden(
-                    "the room is not public and the user holds no invite".to_owned(),
+                    "the room is not public, and the user holds no invite and                      is in no room it admits"
+                        .to_owned(),
                 ));
             }
 
-            let content = serde_json::json!({ "membership": "join" });
+            let mut content = serde_json::json!({ "membership": "join" });
+            if let Some(nominee) = nominee {
+                content["join_authorised_via_users_server"] = Value::String(nominee);
+            }
             let auth = auth_events_for(
                 log,
                 &rooms.rules_in(log, room_id)?.authorization,
@@ -4578,6 +4596,40 @@ fn event_body_key(room_id: &str, event_id: &str) -> Vec<u8> {
 ///
 /// Missing state is an error rather than an empty list, because the two are
 /// indistinguishable on the wire and only one of them is correct.
+/// Client-supplied member content, with the one field a client may not set.
+///
+/// `join_authorised_via_users_server` is this server's claim that it saw the
+/// joiner in a room this one admits (MSC3083). It is not a claim a client
+/// can make, and a client that makes it anyway does real damage: the field
+/// is inside the signed event, so every server that receives it asks for a
+/// signature from the named user's server. A value that is not a user ID
+/// cannot even be asked about -- `verify_event` fails to parse it and the
+/// event is refused by every peer, while the sending server, which never
+/// verifies its own events, sees nothing wrong.
+///
+/// That is not hypothetical. Complement sends exactly `"unused"` here on a
+/// join -> join transition to check it is ignored, and the resulting member
+/// event was refused by the far side, taking the *next* event in the same
+/// transaction with it -- `UnknownPredecessor` -- so a later leave never
+/// applied and the two servers disagreed about a membership from then on.
+///
+/// Synapse strips it unconditionally on the client path for this reason
+/// ("it won't be properly signed... there should be no reason for a client
+/// to include it"); Continuwuity clears it on a join -> join transition and
+/// refuses it elsewhere. Stripping is the same answer with a shorter
+/// argument: the only thing that may write this field is
+/// [`Rooms::restricted_join_nominee`].
+fn sanitized_member_content(event_type: &str, content: &Value) -> Value {
+    if event_type != "m.room.member" {
+        return content.clone();
+    }
+    let mut content = content.clone();
+    if let Some(object) = content.as_object_mut() {
+        object.remove("join_authorised_via_users_server");
+    }
+    content
+}
+
 fn auth_events_for(
     log: &RoomLog,
     rules: &ruma::room_version_rules::AuthorizationRules,

@@ -125,6 +125,64 @@ impl Instance {
         room
     }
 
+    /// A room whose join rule admits members of `allowed`.
+    async fn restricted_room(&self, token: &str, allowed: &str) -> String {
+        let (status, body) = self
+            .request(
+                reqwest::Method::POST,
+                "/_matrix/client/v3/createRoom",
+                Some(token),
+                Some(&json!({})),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        let room = body["room_id"].as_str().unwrap().to_owned();
+        let (status, body) = self
+            .request(
+                reqwest::Method::PUT,
+                &format!("/_matrix/client/v3/rooms/{room}/state/m.room.join_rules"),
+                Some(token),
+                Some(&json!({
+                    "join_rule": "restricted",
+                    "allow": [{ "type": "m.room_membership", "room_id": allowed }],
+                })),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        room
+    }
+
+    /// Join a room this server may have to fetch from `via` first.
+    async fn join_via(&self, room: &str, token: &str, via: &str) -> (u16, Value) {
+        self.request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/join/{room}?server_name={via}"),
+            Some(token),
+            Some(&json!({})),
+        )
+        .await
+    }
+
+    /// One member event as this server holds it, PDU and all.
+    async fn member_event(&self, room: &str, token: &str, user_id: &str) -> Value {
+        let (status, body) = self
+            .request(
+                reqwest::Method::GET,
+                &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=100"),
+                Some(token),
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        body["chunk"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["type"] == "m.room.member" && event["state_key"] == json!(user_id))
+            .unwrap_or_else(|| panic!("no member event for {user_id} in {body}"))
+            .clone()
+    }
+
     async fn say(&self, room: &str, token: &str, text: &str) -> String {
         let (status, body) = self
             .request(
@@ -357,4 +415,201 @@ async fn a_join_with_no_server_to_ask_is_a_clean_404() {
         )
         .await;
     assert_eq!(status, 404, "{body}");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one story, told end to end")]
+async fn a_restricted_room_admits_a_remote_member_of_a_room_it_allows() {
+    let remote = Instance::start().await;
+    let local = Instance::start().await;
+
+    let alice = remote.register("alice").await;
+    let bob = local.register("bob").await;
+    let alice_id = format!("@alice:{}", remote.name);
+    let bob_id = format!("@bob:{}", local.name);
+
+    // The allowed room has to be one the *resident* server can see Bob in:
+    // it is the resident that vouches, and it can only vouch for what it
+    // holds. So Bob federates into the space first.
+    let space = remote.public_room(&alice).await;
+    let (status, body) = local.join_via(&space, &bob, &remote.name).await;
+    assert_eq!(status, 200, "{body}");
+
+    let room = remote.restricted_room(&alice, &space).await;
+
+    // Before this slice, `make_join` refused here: the room is not public
+    // and Bob holds no invite, which is exactly the pair of cases a
+    // restricted rule exists to add a third to.
+    let (status, body) = local.join_via(&room, &bob, &remote.name).await;
+    assert_eq!(status, 200, "{body}");
+
+    // Both sides agree Bob is in, which means the resident authorized the
+    // signed event and not merely the template it handed out.
+    assert!(
+        local
+            .joined_members(&room, &bob)
+            .await
+            .get(&bob_id)
+            .is_some(),
+        "the joining server records the join"
+    );
+    assert!(
+        eventually(async || {
+            remote
+                .joined_members(&room, &alice)
+                .await
+                .get(&bob_id)
+                .is_some()
+        })
+        .await,
+        "the resident server records the join"
+    );
+
+    // The nomination is the whole basis of the join, so it must be on the
+    // event both servers hold -- not an understanding between them.
+    for (side, event) in [
+        ("joining", local.member_event(&room, &bob, &bob_id).await),
+        (
+            "resident",
+            remote.member_event(&room, &alice, &bob_id).await,
+        ),
+    ] {
+        assert_eq!(
+            event["content"]["join_authorised_via_users_server"], alice_id,
+            "the {side} server's copy names the authorising user: {event}"
+        );
+        // Two servers signed it, and they signed it for different reasons:
+        // the joiner's server because the sender lives there, the
+        // resident's because the nomination is a claim only it can make.
+        // A peer checking this event asks for both keys.
+        let signatures = event["signatures"]
+            .as_object()
+            .unwrap_or_else(|| panic!("the {side} server's copy has no signatures: {event}"));
+        assert!(
+            signatures.contains_key(&local.name),
+            "the {side} copy carries the joining server's signature: {event}"
+        );
+        assert!(
+            signatures.contains_key(&remote.name),
+            "the {side} copy carries the authorising server's signature: {event}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_restricted_room_refuses_a_remote_stranger() {
+    let remote = Instance::start().await;
+    let local = Instance::start().await;
+
+    let alice = remote.register("alice").await;
+    let bob = local.register("bob").await;
+
+    // Bob never joins the space, so there is nothing to vouch for. The
+    // refusal has to happen at `make_join`: handing out a template and
+    // rejecting the signed event would tell the peer the join was possible.
+    let space = remote.public_room(&alice).await;
+    let room = remote.restricted_room(&alice, &space).await;
+
+    let (status, body) = local.join_via(&room, &bob, &remote.name).await;
+    assert_ne!(status, 200, "{body}");
+    assert!(
+        remote
+            .joined_members(&room, &alice)
+            .await
+            .get(format!("@bob:{}", local.name).as_str())
+            .is_none(),
+        "no membership is left behind"
+    );
+}
+
+/// Complement's `checkRestrictedRoom`, end to end, across two real servers.
+///
+/// Every step is here because a shorter version of this test passed twelve
+/// times while the real suite failed. The two that mattered and were missing:
+/// the displayname change Bob makes *after* joining, which Complement uses to
+/// check that a join -> join transition ignores a client-supplied
+/// `join_authorised_via_users_server`; and the join he makes immediately
+/// after being invited, with no wait, which only works if the invite reached
+/// his server's copy of the room rather than only its pending-invite row.
+#[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one sequence, told end to end")]
+async fn the_whole_restricted_room_sequence_holds_across_two_servers() {
+    let remote = Instance::start().await;
+    let local = Instance::start().await;
+    let alice = remote.register("alice").await;
+    let bob = local.register("bob").await;
+    let bob_id = format!("@bob:{}", local.name);
+
+    let space = remote.public_room(&alice).await;
+    let room = remote.restricted_room(&alice, &space).await;
+
+    // 1. fail initially
+    assert_ne!(local.join_via(&room, &bob, &remote.name).await.0, 200);
+
+    // 2. succeed when joined to allowed room -- including the displayname
+    // change Complement makes in both rooms, which is the step my earlier
+    // replica dropped.
+    assert_eq!(local.join_via(&space, &bob, &remote.name).await.0, 200);
+    let (status, body) = local
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{space}/state/m.room.member/{bob_id}"),
+            Some(&bob),
+            Some(&json!({ "membership": "join", "displayname": "Bobby" })),
+        )
+        .await;
+    assert_eq!(status, 200, "displayname in the allowed room: {body}");
+    assert_eq!(local.join_via(&room, &bob, &remote.name).await.0, 200);
+    let (status, body) = local
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.member/{bob_id}"),
+            Some(&bob),
+            Some(&json!({
+                "membership": "join",
+                "displayname": "Bobby",
+                "join_authorised_via_users_server": "unused",
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "displayname in the restricted room: {body}");
+
+    // 3. fail when left allowed room
+    for target in [&room, &space] {
+        let (status, body) = local
+            .request(
+                reqwest::Method::POST,
+                &format!("/_matrix/client/v3/rooms/{target}/leave"),
+                Some(&bob),
+                Some(&json!({})),
+            )
+            .await;
+        assert_eq!(status, 200, "leaving {target}: {body}");
+    }
+    assert!(
+        eventually(async || {
+            remote
+                .joined_members(&space, &alice)
+                .await
+                .get(bob_id.as_str())
+                .is_none()
+        })
+        .await,
+        "the allowed room's leave arrives"
+    );
+    assert_ne!(local.join_via(&room, &bob, &remote.name).await.0, 200);
+
+    // 4. succeed when invited -- the step CI fails on
+    let (status, body) = remote
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/rooms/{room}/invite"),
+            Some(&alice),
+            Some(&json!({ "user_id": bob_id })),
+        )
+        .await;
+    assert_eq!(status, 200, "PROBE invite: {body}");
+    // Complement joins immediately after inviting, with no wait.
+    let (status, body) = local.join_via(&room, &bob, &remote.name).await;
+    assert_eq!(status, 200, "PROBE join right after the invite: {body}");
 }
