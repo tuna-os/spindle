@@ -1,0 +1,27 @@
+# Thresholds chosen rather than inherited.
+#
+# `clippy::all` and `clippy::pedantic` are denied workspace-wide, so several
+# of these lints are already running at whatever default the toolchain ships.
+# Writing the numbers down makes them reviewable, and makes a future
+# toolchain quietly changing one visible in a diff rather than in a red CI
+# run nobody expected.
+
+# An async server moves futures around constantly: every await point in a
+# boxed future costs its whole size, and a fat future is a per-request cost
+# that no profiler attributes to anything in particular. The toolchain's
+# default is 16384; this is deliberately tighter, because our futures are
+# request handlers rather than long-lived tasks.
+future-size-threshold = 8192
+
+# Deep recursion on a stored structure is how a hostile room becomes a
+# crash. The state trie is the obvious candidate.
+stack-size-threshold = 262144
+
+# `too_many_lines` at the toolchain default. Pinned rather than raised: the
+# sync handler crossed it once during M5 and the right answer was to split
+# the handler, not to move the line.
+too-many-lines-threshold = 100
+
+# Tests may unwrap. A test that unwraps and panics has failed, which is the
+# outcome we wanted; the ceremony buys nothing.
+allow-unwrap-in-tests = true
