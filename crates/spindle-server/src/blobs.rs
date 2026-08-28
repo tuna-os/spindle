@@ -83,6 +83,24 @@ impl Blobs {
         }
     }
 
+    /// Whether the backend holds `hash`, without reading it.
+    ///
+    /// Presence is a different question from content, and asking it cheaply
+    /// is what makes auditing a whole deployment's media possible: locally
+    /// a stat, remotely a HEAD. `get` would answer the same question by
+    /// transferring every byte the answer is about.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BlobError`] only for S3 transport failures. A missing
+    /// local file is `false`, not an error -- see [`Self::get`].
+    pub async fn has(&self, hash: &str) -> Result<bool, BlobError> {
+        match self {
+            Self::Local { root } => Ok(local_path(root, hash).is_file()),
+            Self::S3(client) => client.exists(&s3_key(hash)).await.map_err(BlobError::S3),
+        }
+    }
+
     /// The bytes under `hash`, or `None`.
     ///
     /// # Errors

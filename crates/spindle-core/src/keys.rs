@@ -553,6 +553,20 @@ pub fn media(media_id: &str) -> Vec<u8> {
     key
 }
 
+/// Every [`Keyspace::Media`] key, for a scan over all uploaded files.
+#[must_use]
+pub fn media_all() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::Media as u8]
+}
+
+/// The media ID a [`Keyspace::Media`] key names.
+#[must_use]
+pub fn media_id(key: &[u8]) -> Option<String> {
+    let rest = key.strip_prefix(media_all().as_slice())?;
+    let len = usize::from(u16::from_be_bytes(rest.get(..2)?.try_into().ok()?));
+    String::from_utf8(rest.get(2..2 + len)?.to_vec()).ok()
+}
+
 /// One transaction's key: who sent it, from which device, under what name.
 ///
 /// All three components are length-prefixed. `txn_id` is client-chosen text,

@@ -95,6 +95,27 @@ impl S3Client {
             .map_err(|error| S3Error::Transport(error.to_string()))
     }
 
+    /// Whether an object exists under `key`, without fetching it.
+    ///
+    /// A HEAD rather than a GET because the caller only wants presence: an
+    /// audit of a bucket holding a deployment's media would otherwise
+    /// download the deployment. Signing is unchanged -- `SigV4` hashes the
+    /// (empty) payload the same way for both verbs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`S3Error`] for anything other than success or a clean 404.
+    pub async fn exists(&self, key: &str) -> Result<bool, S3Error> {
+        let response = self.request("HEAD", key, Vec::new()).await?;
+        if response.status().as_u16() == 404 {
+            return Ok(false);
+        }
+        if !response.status().is_success() {
+            return Err(rejected(response).await);
+        }
+        Ok(true)
+    }
+
     async fn request(
         &self,
         method: &str,
