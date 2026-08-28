@@ -139,9 +139,12 @@ PLANNED = {
     "End-to-end encryption": [],
     "Media": [],
     "Server, discovery & operations": [],
-    "Federation": [
-        ("PUT", "/_matrix/federation/v2/invite/{roomId}/{eventId}", "federated invites (#15)"),
-    ],
+    # Federated invites came out of this list, not because the gap was
+    # waived but because #15 shipped it — `federation_invite` has been
+    # routed all along, and only the placeholder spelling
+    # (`{roomId}` here against `{room_id}` in the router) kept the
+    # stale-entry check from saying so.
+    "Federation": [],
     "VoIP & MatrixRTC": [
         ("GET", "/_matrix/client/v3/voip/turnServer", "TURN discovery (M7)"),
     ],
@@ -338,6 +341,17 @@ def _routes_in(source: str) -> list[tuple[str, list[str]]]:
     return routes
 
 
+def _shape(path: str) -> str:
+    """A path with its parameter names erased.
+
+    `/rooms/{room_id}/state` and `/rooms/{roomId}/state` are the same
+    endpoint; only the placeholder spelling differs, and the spec and this
+    router disagree about it in places. Comparing shapes rather than strings
+    is what makes the stale-gap check actually catch a stale gap.
+    """
+    return re.sub(r"\{[^}]*\}", "{}", path)
+
+
 def area_of(path: str) -> str:
     for area, prefixes in AREA_RULES:
         if any(path.startswith(prefix) for prefix in prefixes):
@@ -359,10 +373,19 @@ def survey() -> tuple[list[tuple[str, list[str]]], dict[str, list[tuple[str, lis
 
     # A planned entry that the router now serves is stale curation; refuse to
     # publish it. Silently dropping it instead would let the list rot quietly.
-    served = {(method, path) for path, methods in routes for method in methods}
+    #
+    # Compared with parameter *names* erased, because that guarantee already
+    # failed once on spelling alone: the router registers
+    # `/_matrix/federation/v2/invite/{room_id}/{event_id}` and this list said
+    # `{roomId}/{eventId}`, so an endpoint #15 had shipped went on being
+    # published as a known gap. A list that "can only rot loudly" must not be
+    # defeated by camelCase.
+    served = {
+        (method, _shape(path)) for path, methods in routes for method in methods
+    }
     for area, entries in PLANNED.items():
         for method, path, _ in entries:
-            if (method, path) in served:
+            if (method, _shape(path)) in served:
                 raise SystemExit(
                     f"coverage-dashboard: PLANNED lists {method} {path} "
                     f"({area}) but the router serves it — remove the entry"
