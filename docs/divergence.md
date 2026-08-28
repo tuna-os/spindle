@@ -80,6 +80,20 @@ that the siblings compute or look up the state to check against, and we index
 into a snapshot already hanging off the previous log entry. Same predicate,
 different cost to reach its inputs. That is the project's thesis in one row.
 
+One decision sits outside the predicate, and the spec puts it there. A
+restricted room (MSC3083) admits a user because of their membership in
+*another* room, which `auth_check` — judging one room's state — cannot see.
+So the spec has the server that can see both rooms decide, and record the
+decision on the event as `join_authorised_via_users_server`, naming a member
+who could have invited the joiner; the rules then check that nomination, and
+so does every server the event reaches. `Rooms::restricted_join_nominee`
+makes it, and makes only it: whether the nominee actually outranks the room's
+invite level is `auth_check`'s call, unread here. It is worth naming because
+a reader auditing the row above will find rooms.rs reading join rules and
+power levels, and the distinction between filling in a field the rules
+require and deciding what the rules decide is the whole of why that is not a
+divergence.
+
 ## 4. What is genuinely ours today
 
 The load-bearing pieces are in `spindle-core` and `spindle-store`; since M1
