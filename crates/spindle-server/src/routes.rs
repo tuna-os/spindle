@@ -1884,13 +1884,27 @@ async fn federation_send(
     let mut results = serde_json::Map::new();
     for pdu in &pdus {
         let (event_id, outcome) = receive_one_pdu(&state, &origin, key_map.as_ref(), pdu);
-        results.insert(
-            event_id,
-            match outcome {
-                Ok(()) => json!({}),
-                Err(reason) => json!({ "error": reason }),
-            },
-        );
+        let result = match outcome {
+            Ok(()) => json!({}),
+            Err(reason) => {
+                // A refused PDU is otherwise silent. The transaction still
+                // answers 200 -- one bad event must not poison the batch --
+                // and the rejection lives only in the per-event result the
+                // peer reads and typically discards. So the moment this
+                // server and a peer start disagreeing about a room is the
+                // one moment the logs say nothing about, which is exactly
+                // backwards.
+                tracing::warn!(
+                    origin = %origin,
+                    room_id = pdu["room_id"].as_str().unwrap_or("?"),
+                    event_id = %event_id,
+                    event_type = pdu["type"].as_str().unwrap_or("?"),
+                    "refused a PDU from a peer: {reason}"
+                );
+                json!({ "error": reason })
+            }
+        };
+        results.insert(event_id, result);
     }
 
     // EDUs after PDUs, so a join and the typing that follows it land in
