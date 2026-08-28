@@ -365,6 +365,69 @@ async fn a_server_whose_members_all_left_hears_the_kick_and_nothing_after() {
     );
 }
 
+/// A server that was in the audience leaves it when its last member does.
+///
+/// The audience is cached against the room's state root, so this is the
+/// direction that can go silently wrong: a stale entry keeps a departed
+/// server on the list and it goes on receiving a room it is no longer in.
+///
+/// `a_server_whose_members_all_left_hears_the_kick_and_nothing_after` looks
+/// like it covers this and does not. Breaking the cache's invalidation
+/// leaves it green, because the kick reaches the stub through the
+/// membership bypass rather than the cache, and "nothing after" is
+/// satisfied for free by a room that never delivered anything. The
+/// difference here is the assertion *before* the kick: it proves the domain
+/// really was in the cached audience, so a stale entry would deliver the
+/// message that follows.
+#[tokio::test]
+async fn a_kicked_servers_audience_entry_does_not_survive_in_cache() {
+    let stub = Stub::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.room_with_remote_invite(&alice, &stub.user()).await;
+
+    // Before: the domain is in the audience, and the cache now holds it.
+    harness
+        .say(&room, &alice, "while the door was open", "t1")
+        .await;
+    assert!(
+        stub.wait_for(|stub| {
+            stub.pdus()
+                .iter()
+                .any(|pdu| pdu["content"]["body"] == json!("while the door was open"))
+        })
+        .await,
+        "the stub must receive events while its member is live, or the rest of \
+         this test proves nothing: {:?}",
+        stub.delivered()
+    );
+
+    let (status, body) = harness
+        .send(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room}/kick"),
+            &alice,
+            &json!({ "user_id": stub.user() }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // After: the membership change moved the state root, so the cached
+    // audience is not reused.
+    harness
+        .say(&room, &alice, "after the door closed", "t2")
+        .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !stub
+            .pdus()
+            .iter()
+            .any(|pdu| pdu["content"]["body"] == json!("after the door closed")),
+        "a departed server kept receiving the room: {:?}",
+        stub.delivered()
+    );
+}
+
 #[tokio::test]
 async fn pending_rows_survive_a_rebuild_and_deliver_after() {
     let stub = Stub::start().await;

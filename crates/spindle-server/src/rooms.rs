@@ -129,6 +129,8 @@ pub enum StateBlock {
 
 /// A room's joined user IDs, with the state root they were read from.
 type MemberIds = ([u8; 32], Arc<Vec<String>>);
+/// Remote domains to fan out to, and the state root they were read from.
+type Destinations = ([u8; 32], Arc<Vec<String>>);
 
 pub struct Rooms {
     store: Arc<FjallStore>,
@@ -183,6 +185,22 @@ pub struct Rooms {
     /// this server accepts -- the same "narrow question answered with a
     /// whole read" shape that #172, #173 and #175 were about, freshly
     /// introduced.
+    /// Which remote servers an event in this room must be sent to, keyed by
+    /// the state root the answer was read from.
+    ///
+    /// The audience is a function of membership, and membership is part of
+    /// the state -- so the root is the answer's identity here exactly as it
+    /// is for `state_render` and `member_ids`.
+    ///
+    /// What makes this one worth caching is the shape of the miss. Answering
+    /// it walks every member in the room and then does a **point read per
+    /// member** into the membership index, and that ran on every single
+    /// append: an N-member room paid N store reads to send one message. The
+    /// hit rate is the good part -- a non-state event leaves the state root
+    /// untouched, so every message between two membership changes shares a
+    /// root, and a busy room recomputes only when who-is-in-it actually
+    /// moves.
+    destinations: Mutex<HashMap<String, Destinations>>,
     room_versions: Mutex<HashMap<String, RoomVersionId>>,
     /// The server-global order `/sync` needs (SPEC §10.2). The linear index
     /// orders events within one room; nothing orders them across rooms, so
@@ -309,6 +327,7 @@ impl Rooms {
             last_activity: Mutex::new(HashMap::new()),
             state_render: Mutex::new(HashMap::new()),
             member_ids: Mutex::new(HashMap::new()),
+            destinations: Mutex::new(HashMap::new()),
             room_versions: Mutex::new(HashMap::new()),
             // Resumed, not reset. A counter that restarted at zero would
             // re-issue stream ids already on disk, overwriting the entries
@@ -3385,97 +3404,78 @@ impl Rooms {
         room_id: &str,
         json: &Value,
     ) -> Result<(), RoomError> {
-        // Domains come from member state keys; liveness from the membership
-        // index — a point read per member, no body parses.
-        let Some(state) = log
-            .entries()
-            .next_back()
-            .map(|entry| entry.li)
-            .and_then(|li| log.state_after(li))
-        else {
-            return Ok(());
-        };
-        let mut members = Vec::new();
-        state.for_each(|state_key, _| {
-            if state_key.event_type().as_str() == "m.room.member" {
-                members.push(state_key.state_key().to_owned());
-            }
-        });
-        let mut destinations = std::collections::BTreeSet::new();
-        for user_id in members {
-            let Some((_, domain)) = user_id.split_once(':') else {
-                continue;
-            };
-            if domain == self.server_name || destinations.contains(domain) {
-                continue;
-            }
-            let membership = spindle_store::ReadView::get(
-                self.store.as_ref(),
-                &spindle_core::keys::user_room(
-                    spindle_core::keys::Keyspace::Membership,
-                    &user_id,
-                    room_id,
-                ),
-            )?;
-            let live = membership.as_deref().is_some_and(|value| {
-                value == JOIN_STR.as_bytes() || value == INVITE_STR.as_bytes()
-            });
-            if live {
-                destinations.insert(domain.to_owned());
-            }
-        }
+        let live = self.destinations_in(log, room_id)?;
+
         // A membership event still goes to the domain it is *about*, live
         // or not: the kick is the one event the removed server must hear,
         // and by this point the membership index already says "leave" — the
-        // liveness check above would skip exactly the notification that
-        // matters.
-        if json["type"].as_str() == Some("m.room.member")
-            && let Some((_, domain)) = json["state_key"].as_str().and_then(|u| u.split_once(':'))
-            && domain != self.server_name
-        {
-            destinations.insert(domain.to_owned());
-        }
-        for destination in destinations {
+        // liveness rule would skip exactly the notification that matters.
+        //
+        // Kept outside the cached set deliberately. It is a property of
+        // *this event*, not of the room's state, so caching it would send
+        // every later message to a server that has left.
+        let departing = json["state_key"]
+            .as_str()
+            .filter(|_| json["type"].as_str() == Some("m.room.member"))
+            .and_then(|user| user.split_once(':'))
+            .map(|(_, domain)| domain)
+            .filter(|domain| *domain != self.server_name)
+            .filter(|domain| !live.iter().any(|known| known == *domain));
+
+        for destination in live.iter().map(String::as_str).chain(departing) {
             let seq = self.allocate_stream_id();
             spindle_store::Store::put(
                 self.store.as_ref(),
-                &spindle_core::keys::federation_outbox(&destination, seq),
+                &spindle_core::keys::federation_outbox(destination, seq),
                 json.to_string().as_bytes(),
             )?;
         }
         Ok(())
     }
 
-    /// Every remote domain with a live member in the room — the EDU
-    /// audience, same liveness rule as event fan-out.
+    /// Every remote domain with a live member, from a log the caller holds.
     ///
-    /// # Errors
+    /// Domains come from member state keys; liveness from the membership
+    /// index — a point read per member, no body parses. That per-member read
+    /// is why the answer is cached against the state root: it ran on every
+    /// append, so an N-member room paid N reads to send one message.
     ///
-    /// Returns [`RoomError`] if the room or membership rows cannot be read.
-    pub fn remote_domains(&self, room_id: &str) -> Result<Vec<String>, RoomError> {
-        let members = self.with_room(room_id, |_, log| {
-            let Some(state) = log
-                .entries()
-                .next_back()
-                .map(|entry| entry.li)
-                .and_then(|li| log.state_after(li))
-            else {
-                return Ok(Vec::new());
-            };
-            let mut members = Vec::new();
-            state.for_each(|state_key, _| {
-                if state_key.event_type().as_str() == "m.room.member" {
-                    members.push(state_key.state_key().to_owned());
-                }
-            });
-            Ok(members)
-        })?;
-        let mut destinations = std::collections::BTreeSet::new();
+    /// Takes the log rather than reaching for it, because [`Self::append`]
+    /// calls this from inside [`Self::with_room`] and the `open` lock is not
+    /// reentrant. Same rule as [`Self::rules_in`], and the same deadlock if
+    /// it is broken.
+    fn destinations_in(&self, log: &RoomLog, room_id: &str) -> Result<Arc<Vec<String>>, RoomError> {
+        let Some(state) = log
+            .entries()
+            .next_back()
+            .map(|entry| entry.li)
+            .and_then(|li| log.state_after(li))
+        else {
+            return Ok(Arc::new(Vec::new()));
+        };
+        let root = *state.root().as_bytes();
+        if let Some((cached, domains)) = self
+            .destinations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(room_id)
+            && *cached == root
+        {
+            return Ok(Arc::clone(domains));
+        }
+
+        let mut members = Vec::new();
+        state.for_each(|state_key, _| {
+            if state_key.event_type().as_str() == "m.room.member" {
+                members.push(state_key.state_key().to_owned());
+            }
+        });
+        let mut domains = std::collections::BTreeSet::new();
         for user_id in members {
             let Some((_, domain)) = user_id.split_once(':') else {
                 continue;
             };
-            if domain == self.server_name || destinations.contains(domain) {
+            if domain == self.server_name || domains.contains(domain) {
                 continue;
             }
             let membership = spindle_store::ReadView::get(
@@ -3490,10 +3490,31 @@ impl Rooms {
                 value == JOIN_STR.as_bytes() || value == INVITE_STR.as_bytes()
             });
             if live {
-                destinations.insert(domain.to_owned());
+                domains.insert(domain.to_owned());
             }
         }
-        Ok(destinations.into_iter().collect())
+        let domains = Arc::new(domains.into_iter().collect::<Vec<_>>());
+        self.destinations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(room_id.to_owned(), (root, Arc::clone(&domains)));
+        Ok(domains)
+    }
+
+    /// Every remote domain with a live member in the room — the EDU
+    /// audience, same liveness rule as event fan-out.
+    ///
+    /// Literally the same rule now. This and the fan-out in
+    /// [`Self::enqueue_outbound`] were two copies of one computation, which
+    /// is how one liveness rule becomes two that disagree. Both go through
+    /// [`Self::destinations_in`], and so share its cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room or membership rows cannot be read.
+    pub fn remote_domains(&self, room_id: &str) -> Result<Vec<String>, RoomError> {
+        let domains = self.with_room(room_id, |rooms, log| rooms.destinations_in(log, room_id))?;
+        Ok(domains.as_ref().clone())
     }
 
     /// Whether `user_id` is currently joined to `room_id`, by the
