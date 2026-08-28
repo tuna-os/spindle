@@ -73,10 +73,29 @@ MILESTONES = [
      "response — proven by a two-instance Spindle-to-Spindle test with "
      "messages flowing both ways. Next: #16's fork-proof rig — where the no-state-resolution claim meets "
      "adversarial evidence."),
-    ("M4", "Ecosystem integration", "Not started", "#18 appservices, #17 MAS/OIDC."),
-    ("M5", "Production lifecycle", "Not started",
-     "#19 #20 #21; #42's parity gate vs Synapse and Tuwunel is part of the "
-     "definition of done."),
+    ("M4", "Ecosystem integration", "In progress",
+     "Both halves are built and under test, which is why this no longer reads "
+     "*not started*. #18: appservice registration, authentication and "
+     "namespaces, transactions with per-appservice queues, MSC2409 to-device "
+     "delivery with restart redelivery, MSC4190 deviceless clients, ping "
+     "(MSC2659), queries and the key proxy — six test files. #17: MSC3861 "
+     "delegated authentication with introspection and gating, the "
+     "`/_synapse/mas/*` homeserver-connection surface MAS drives, and a "
+     "built-in OIDC provider (#159) for deployments that do not want a "
+     "separate MAS. 17 of the router's endpoints come from `mas.rs` and "
+     "`oidc.rs`. #17 and #18 stay open for the remaining bridge evidence."),
+    ("M5", "Production lifecycle", "In progress",
+     "#83's admin API is served: 18 endpoints under `/_spindle/admin/v1`, "
+     "each also mounted at `/_synapse/admin/v1` for existing tooling — users, "
+     "rooms, state-at, purge_history, room deletion, make_room_admin and the "
+     "audit log. #166's observability landed too: a `/metrics` exposition on "
+     "its own listener with the fork-case counter, append and HTTP "
+     "histograms. #21 has its counting performance gate (`read_budget.rs`, "
+     "#177), which asserts flat-in-membership rather than timing on CI. "
+     "**#20 has not started** — backup, restore, upgrades and Synapse "
+     "migration; `backups.rs` is M2's E2EE key backup and not this. #42's "
+     "parity gate vs Synapse and Tuwunel remains part of the definition of "
+     "done."),
     ("M6", "Optional differentiators", "Not started", "#22 hub mode, #23 MLS."),
     ("M7", "MatrixRTC", "Not started",
      "#36–#41 — delayed events (MSC4140) first; no Rust homeserver has them."),
@@ -131,6 +150,23 @@ PLANNED = {
 # How implemented paths are grouped. First match wins, so more specific
 # prefixes come first.
 AREA_RULES = [
+    # Widening the parser to follow the router's merges (admin, MAS, OIDC)
+    # put 73 of 154 endpoints into the catch-all, which is not a breakdown --
+    # it is a pile. These four areas are the milestones those endpoints
+    # belong to, so the page shows M4's and M5's surfaces as their own rows
+    # instead of burying them under "server and operations".
+    ("Admin & moderation", ("/_spindle/admin/", "/_synapse/admin/")),
+    ("Delegated auth & OIDC", (
+        "/_synapse/mas/",
+        "/_matrix/client/v1/auth_metadata",
+        "/_matrix/client/unstable/org.matrix.msc2965/",
+        "/.well-known/openid-configuration",
+        "/_matrix/client/unstable/org.matrix.msc2964/",
+        "/oauth2/",
+        "/_spindle/oidc/",
+    )),
+    ("Appservices", ("/_matrix/app/", "/_matrix/client/v1/appservice/")),
+    ("Key backup", ("/_matrix/client/v3/room_keys/",)),
     ("Federation", ("/_matrix/federation/",)),
     ("End-to-end encryption", ("/_matrix/client/v3/keys/", "/_matrix/client/v3/sendToDevice/")),
     ("Sync", ("/_matrix/client/v3/sync", "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync")),
@@ -156,12 +192,22 @@ AREA_RULES = [
         "/_matrix/client/v1/room_summary/",
         "/_matrix/client/unstable/im.nheko.summary/",
     )),
+    # `profile/` had no rule at all, so three served endpoints fell into the
+    # catch-all and "Profiles & presence" drew a 0%% bar next to its one
+    # planned entry -- an area reading as untouched while three quarters of
+    # it shipped.
+    ("Profiles & presence", (
+        "/_matrix/client/v3/profile/",
+        "/_matrix/client/v3/presence/",
+    )),
     ("Accounts, devices & auth", (
         "/_matrix/client/v3/register",
         "/_matrix/client/v3/login",
         "/_matrix/client/v3/logout",
         "/_matrix/client/v3/refresh",
         "/_matrix/client/v3/account/",
+        "/_matrix/client/v3/devices",
+        "/_matrix/client/v3/delete_devices",
     )),
     ("Server, discovery & operations", (
         "/_matrix/client/versions",
@@ -174,14 +220,92 @@ AREA_RULES = [
 ]
 
 
+def route_sources() -> list[pathlib.Path]:
+    """Every file that contributes routes to the merged router.
+
+    `routes.rs` is not the whole router. It ends by merging sibling modules
+    that register their own:
+
+        .merge(crate::mas::routes())
+        .merge(crate::admin::routes())
+
+    Reading only `routes.rs` missed 35 of 136 endpoints -- the entire admin
+    API, the whole MAS surface, and the built-in OIDC provider. On a page
+    whose premise is that the implemented column is parsed rather than
+    typed, so it "cannot claim a surface the server does not serve",
+    failing to show a surface it *does* serve is the same misrepresentation
+    pointed the other way -- and worse here, because the page exists to say
+    what is left to build.
+
+    Derived from the merge calls rather than hand-listed, for the same
+    reason `areas()` is: a hand-list is a second place to forget.
+
+    `main.rs` is deliberately excluded. Its one `.route` is the `/metrics`
+    exposition, which runs on its own listener (`[metrics] bind`) and is not
+    part of the client-server surface this page inventories.
+    """
+    source = ROUTES.read_text()
+    files = [ROUTES]
+    for module in re.findall(r"\.merge\(crate::(\w+)::routes\(\)\)", source):
+        path = ROUTES.parent / f"{module}.rs"
+        if path.exists() and path not in files:
+            files.append(path)
+    return files
+
+
 def parse_routes() -> list[tuple[str, list[str]]]:
-    """Every `.route("path", …)` in the router, with all chained methods.
+    """Every `.route("path", …)` the merged router registers.
 
     A balanced-paren scan rather than a one-line regex, because a third of
     the registrations chain methods (`get(x).put(y)`) across lines and a
     regex that stops at the first method under-reports the surface.
     """
-    source = ROUTES.read_text()
+    routes = []
+    for source_file in route_sources():
+        routes.extend(_routes_in(source_file.read_text()))
+
+    # Nothing may reach the page with an unexpanded interpolation in it. A
+    # path like `{prefix}/users` is not an endpoint; publishing one would be
+    # worse than the undercount this parser was widened to fix, because it
+    # reads as a real route until someone tries it.
+    for path, _ in routes:
+        if "{prefix}" in path or path.startswith("{"):
+            raise SystemExit(
+                f"coverage-dashboard: {path!r} still holds an unexpanded "
+                "format argument; teach `_prefixes_in` how that router is built"
+            )
+    return sorted(routes)
+
+
+def _prefixes_in(source: str) -> list[str]:
+    """The literal path prefixes a file applies its route group under.
+
+    `admin.rs` builds one group of routes from a `format!("{prefix}/…")`
+    template and mounts it twice --
+
+        group("/_spindle/admin/v1").merge(group("/_synapse/admin/v1"))
+
+    -- because the `/_synapse/admin/v1` alias is what existing tooling
+    drives. Reading the template literally yields nine `{prefix}/…`
+    non-paths instead of eighteen real ones, so the interpolation has to be
+    resolved rather than printed.
+
+    Returns an empty list for the ordinary case, where paths are literals.
+    """
+    closure = re.search(r"let\s+(\w+)\s*=\s*\|\s*\w+\s*:\s*&str\s*\|", source)
+    if not closure:
+        return []
+    calls = re.findall(rf"\b{closure.group(1)}\(\s*\"(/[^\"]*)\"\s*\)", source)
+    return list(dict.fromkeys(calls))
+
+
+def _routes_in(source: str) -> list[tuple[str, list[str]]]:
+    """The `.route(…)` registrations in one file's text.
+
+    A templated path is emitted once per prefix the file mounts the group
+    under, because that is how many endpoints the router ends up serving.
+    """
+    prefixes = _prefixes_in(source)
     routes = []
     index = 0
     while True:
@@ -200,9 +324,18 @@ def parse_routes() -> list[tuple[str, list[str]]]:
         call = source[index : end + 1]
         path = re.search(r'"([^"]+)"', call).group(1)
         methods = [m.upper() for m in re.findall(r"\b(get|post|put|delete|patch)\(", call)]
-        routes.append((path, methods))
+        if "{prefix}" in path and prefixes:
+            # Inside a `format!` a literal brace is doubled, so the path
+            # parameters in the template read `{{room_id}}`. Undo that, or
+            # every templated route is published with braces the router
+            # never had.
+            path = path.replace("{{", "{").replace("}}", "}")
+            for prefix in prefixes:
+                routes.append((path.replace("{prefix}", prefix), methods))
+        else:
+            routes.append((path, methods))
         index = end
-    return sorted(routes)
+    return routes
 
 
 def area_of(path: str) -> str:
