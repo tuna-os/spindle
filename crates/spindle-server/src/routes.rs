@@ -1887,20 +1887,7 @@ async fn federation_send(
         let result = match outcome {
             Ok(()) => json!({}),
             Err(reason) => {
-                // A refused PDU is otherwise silent. The transaction still
-                // answers 200 -- one bad event must not poison the batch --
-                // and the rejection lives only in the per-event result the
-                // peer reads and typically discards. So the moment this
-                // server and a peer start disagreeing about a room is the
-                // one moment the logs say nothing about, which is exactly
-                // backwards.
-                tracing::warn!(
-                    origin = %origin,
-                    room_id = pdu["room_id"].as_str().unwrap_or("?"),
-                    event_id = %event_id,
-                    event_type = pdu["type"].as_str().unwrap_or("?"),
-                    "refused a PDU from a peer: {reason}"
-                );
+                report_refused_pdu(&origin, &event_id, pdu, &reason);
                 json!({ "error": reason })
             }
         };
@@ -1957,6 +1944,32 @@ async fn federation_send(
 /// claimed) with the outcome. A PDU too malformed to even hash is keyed by
 /// a placeholder, because the response shape needs a key and inventing a
 /// plausible-looking ID for garbage would be worse.
+/// Say that a peer's event was refused, and name what it was refused over.
+///
+/// Otherwise this is silent. The transaction still answers 200 -- one bad
+/// event must not poison a batch of fifty -- and the rejection lives only
+/// in the per-event result the sending server reads and usually discards.
+/// So the moment two servers start disagreeing about a room is the one
+/// moment neither one's logs mention, which is exactly backwards.
+///
+/// The two user IDs are here because they are the only ones a signature
+/// check parses, so they are the only ones "could not parse user ID" can
+/// be about -- and without them that sentence has no subject.
+fn report_refused_pdu(origin: &str, event_id: &str, pdu: &Value, reason: &str) {
+    tracing::warn!(
+        origin = %origin,
+        room_id = pdu["room_id"].as_str().unwrap_or("?"),
+        event_id = %event_id,
+        event_type = pdu["type"].as_str().unwrap_or("?"),
+        sender = pdu["sender"].as_str().unwrap_or("?"),
+        state_key = pdu["state_key"].as_str().unwrap_or("-"),
+        authorised_via = pdu["content"]["join_authorised_via_users_server"]
+            .as_str()
+            .unwrap_or("-"),
+        "refused a PDU from a peer: {reason}"
+    );
+}
+
 fn receive_one_pdu(
     state: &AppState,
     origin: &str,
