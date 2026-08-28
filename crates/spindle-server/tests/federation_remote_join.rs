@@ -521,3 +521,95 @@ async fn a_restricted_room_refuses_a_remote_stranger() {
         "no membership is left behind"
     );
 }
+
+/// Complement's `checkRestrictedRoom`, end to end, across two real servers.
+///
+/// Every step is here because a shorter version of this test passed twelve
+/// times while the real suite failed. The two that mattered and were missing:
+/// the displayname change Bob makes *after* joining, which Complement uses to
+/// check that a join -> join transition ignores a client-supplied
+/// `join_authorised_via_users_server`; and the join he makes immediately
+/// after being invited, with no wait, which only works if the invite reached
+/// his server's copy of the room rather than only its pending-invite row.
+#[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one sequence, told end to end")]
+async fn the_whole_restricted_room_sequence_holds_across_two_servers() {
+    let remote = Instance::start().await;
+    let local = Instance::start().await;
+    let alice = remote.register("alice").await;
+    let bob = local.register("bob").await;
+    let bob_id = format!("@bob:{}", local.name);
+
+    let space = remote.public_room(&alice).await;
+    let room = remote.restricted_room(&alice, &space).await;
+
+    // 1. fail initially
+    assert_ne!(local.join_via(&room, &bob, &remote.name).await.0, 200);
+
+    // 2. succeed when joined to allowed room -- including the displayname
+    // change Complement makes in both rooms, which is the step my earlier
+    // replica dropped.
+    assert_eq!(local.join_via(&space, &bob, &remote.name).await.0, 200);
+    let (status, body) = local
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{space}/state/m.room.member/{bob_id}"),
+            Some(&bob),
+            Some(&json!({ "membership": "join", "displayname": "Bobby" })),
+        )
+        .await;
+    assert_eq!(status, 200, "displayname in the allowed room: {body}");
+    assert_eq!(local.join_via(&room, &bob, &remote.name).await.0, 200);
+    let (status, body) = local
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.member/{bob_id}"),
+            Some(&bob),
+            Some(&json!({
+                "membership": "join",
+                "displayname": "Bobby",
+                "join_authorised_via_users_server": "unused",
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "displayname in the restricted room: {body}");
+
+    // 3. fail when left allowed room
+    for target in [&room, &space] {
+        let (status, body) = local
+            .request(
+                reqwest::Method::POST,
+                &format!("/_matrix/client/v3/rooms/{target}/leave"),
+                Some(&bob),
+                Some(&json!({})),
+            )
+            .await;
+        assert_eq!(status, 200, "leaving {target}: {body}");
+    }
+    assert!(
+        eventually(async || {
+            remote
+                .joined_members(&space, &alice)
+                .await
+                .get(bob_id.as_str())
+                .is_none()
+        })
+        .await,
+        "the allowed room's leave arrives"
+    );
+    assert_ne!(local.join_via(&room, &bob, &remote.name).await.0, 200);
+
+    // 4. succeed when invited -- the step CI fails on
+    let (status, body) = remote
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/rooms/{room}/invite"),
+            Some(&alice),
+            Some(&json!({ "user_id": bob_id })),
+        )
+        .await;
+    assert_eq!(status, 200, "PROBE invite: {body}");
+    // Complement joins immediately after inviting, with no wait.
+    let (status, body) = local.join_via(&room, &bob, &remote.name).await;
+    assert_eq!(status, 200, "PROBE join right after the invite: {body}");
+}

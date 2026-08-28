@@ -2782,16 +2782,68 @@ async fn federation_invite(
     let signed = serde_json::to_value(&canonical)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
 
+    // An invite for a room this server already holds is not a notification
+    // about somewhere else -- it is an event in a log we have, and it has to
+    // go in. It arrives out of band precisely because the invitee's server
+    // is usually *not* in the room, so the inviter cannot reach it through
+    // an ordinary transaction; when we are in the room, that reasoning does
+    // not apply and skipping the append leaves our copy saying the user is
+    // still gone. Their own join is then refused by the rules reading our
+    // state, while the inviting server believes it told us. Synapse and
+    // Continuwuity both add the invite to a room they hold, for this reason.
+    //
+    // Idempotent against the copy that may also arrive in a transaction:
+    // `ingest` returns early for an event already in the log.
+    record_invite(
+        &state, &origin, &room_id, &event_id, &target, &body, &signed,
+    )?;
+
+    Ok(Json(json!({ "event": signed })))
+}
+
+/// Put an accepted federated invite where the invitee's server will find it.
+///
+/// Two shapes, because there are two situations. An invite arrives out of
+/// band precisely because the invitee's server is usually *not* in the room,
+/// so the inviter cannot reach it through an ordinary transaction; then the
+/// pending record and its stripped state are the whole of what the invitee's
+/// client has to render the room from.
+///
+/// When this server *is* in the room, that reasoning does not apply and the
+/// invite is an event in a log we hold. Recording only the pending row would
+/// leave our copy saying the user is still gone, so their own join is refused
+/// by the rules reading our state while the inviting server believes it told
+/// us. Synapse and Continuwuity both add the invite to a room they hold.
+///
+/// Idempotent against the copy that may also arrive in a transaction:
+/// `ingest` returns early for an event already in the log.
+fn record_invite(
+    state: &AppState,
+    origin: &str,
+    room_id: &str,
+    event_id: &str,
+    target: &str,
+    body: &Value,
+    signed: &Value,
+) -> Result<(), MatrixError> {
+    if state
+        .rooms
+        .receive_remote(room_id, event_id, signed)
+        .is_ok()
+    {
+        state.rooms.wake_sync_waiters();
+        return Ok(());
+    }
     let invite_state: Vec<Value> = body["invite_room_state"]
         .as_array()
         .cloned()
         .unwrap_or_default();
     state
         .rooms
-        .record_pending_invite(&target, &room_id, &origin, &invite_state)
+        .record_pending_invite(target, room_id, origin, &invite_state)
         .map_err(room_error)?;
-
-    Ok(Json(json!({ "event": signed })))
+    state.rooms.wake_sync_waiters();
+    Ok(())
 }
 
 /// `GET /_matrix/key/v2/server`
