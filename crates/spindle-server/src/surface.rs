@@ -52,36 +52,40 @@ pub const SPEC_VERSIONS: &[SpecVersion] = &[
 /// hands back events our machinery rightly refuses — which is how
 /// Complement's `TestJoinViaRoomIDAndServerName` found this.
 ///
-/// # Where the line is, and why it is there
+/// # Why not the older versions, when they appear to work
 ///
-/// **v4 and up, because that is where the event ID format settles.**
-/// `ruma` reports `event_id_format` per version:
+/// They create. Driving `Rooms::create` at v6 through v12 with this list
+/// widened, every one creates, authorizes and accepts messages, and
+/// `ruma` reports `event_id_format = V3` for everything from v4 up — the
+/// same event IDs this server computes. On that evidence v4–v12 looks
+/// advertisable, and this list was briefly widened to say so.
 ///
-/// | versions | event ID format |
-/// |---|---|
-/// | v1, v2 | `V1` — IDs are server-chosen, not hashes |
-/// | v3 | `V2` |
-/// | **v4 – v12** | **`V3` — what this server computes** |
+/// **Complement says otherwise, and it is right.** With v7 actually
+/// served, `make_join` truthfully answers "7", the peer builds a
+/// v7-shaped join, and `send_join` rejects it:
 ///
-/// Everything from v4 up mints and recognises the same event IDs this
-/// implementation already produces. The differences that remain —
-/// knocking (v7), restricted joins (v8), knock-restricted (v10), the v11
-/// redaction changes, v12's create-event-derived room IDs — are all rule
-/// flags `ruma` carries, and every one of them is read *per room* rather
-/// than from a constant, which is what #195 and #203 were for.
+/// ```text
+/// MustJoinRoom: send_join failed: {"errcode":"M_BAD_JSON", …}
+/// ```
 ///
-/// v1–v3 are a different matter and deliberately absent: their event IDs
-/// are not the reference hashes this server computes, so claiming them
-/// would be claiming machinery that does not exist. That is the
-/// distinction this module exists to keep honest.
+/// Restricted joins fail the same way at v8–v10:
+/// `TestRestrictedRooms*/Join_should_succeed_when_joined_to_allowed_room`.
 ///
-/// The evidence is Complement. Thirty of its allowlisted tests create
-/// rooms at v7, v8 and v9 to reach knocking and restricted joins; before
-/// this they silently received a v11 room that happened to have those
-/// features, and passed on the substitution. Now they get the version
-/// they asked for, and the same tests are the check on whether that is
-/// true.
-pub const ROOM_VERSIONS: &[&str] = &["4", "5", "6", "7", "8", "9", "10", "11", "12"];
+/// So `ruma`'s per-version rules are necessary and not sufficient. The
+/// federation join path carries v11-shaped assumptions that held only
+/// because every room was quietly v11 — which is exactly what made those
+/// thirty allowlisted tests pass on a substitution. Creating a room at a
+/// version is not the same as *joining* one over federation at it, and
+/// only the second is what advertising promises.
+///
+/// Advertising v4–v10 before that path is fixed would move the
+/// substitution's dishonesty rather than remove it: clients would be told
+/// the version is available and then fail to federate into it.
+///
+/// The work is real and tracked separately. This list moves when
+/// Complement's knock and restricted-join tests pass at the versions they
+/// ask for, and not before.
+pub const ROOM_VERSIONS: &[&str] = &["11", "12"];
 
 /// The default room version.
 pub const DEFAULT_ROOM_VERSION: Option<&str> = Some("11");
