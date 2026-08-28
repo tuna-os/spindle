@@ -23,6 +23,8 @@ import pathlib
 import re
 import sys
 
+import sitetheme
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 ROUTES = REPO / "crates" / "spindle-server" / "src" / "routes.rs"
 DASHBOARD = REPO / "docs" / "dashboard.md"
@@ -210,7 +212,13 @@ def area_of(path: str) -> str:
     return "Server, discovery & operations"
 
 
-def build_markdown() -> str:
+def survey() -> tuple[list[tuple[str, list[str]]], dict[str, list[tuple[str, list[str]]]]]:
+    """The routes the server serves, and the same grouped by area.
+
+    Shared by the markdown and the HTML so the published page and the
+    committed file cannot describe different surfaces — the whole reason the
+    implemented column is parsed rather than typed.
+    """
     routes = parse_routes()
     implemented: dict[str, list[tuple[str, list[str]]]] = {}
     for path, methods in routes:
@@ -226,6 +234,29 @@ def build_markdown() -> str:
                     f"coverage-dashboard: PLANNED lists {method} {path} "
                     f"({area}) but the router serves it — remove the entry"
                 )
+    return routes, implemented
+
+
+def areas() -> list[str]:
+    """Every area, in the order the page presents them.
+
+    Derived from both tables rather than hand-listed. It was hand-listed --
+    `AREA_RULES` plus a literal `"VoIP & MatrixRTC"` -- and the cost of that
+    was `Profiles & presence`, which exists only in `PLANNED` and so was
+    never rendered at all. Its one endpoint counted toward the headline gap
+    total and appeared in none of the lists below it, which is the specific
+    failure a coverage page must not have: a gap it knows about and does not
+    show.
+    """
+    ordered = [area for area, _ in AREA_RULES]
+    for area in PLANNED:
+        if area not in ordered:
+            ordered.append(area)
+    return ordered
+
+
+def build_markdown() -> str:
+    routes, implemented = survey()
 
     lines = [
         "# Spindle dashboard",
@@ -261,9 +292,7 @@ def build_markdown() -> str:
         "neither implemented nor counted.",
         "",
     ]
-    for area, _ in AREA_RULES + [("VoIP & MatrixRTC", ())]:
-        if area in ("Server, discovery & operations",) and area not in implemented:
-            continue
+    for area in areas():
         have = implemented.get(area, [])
         missing = PLANNED.get(area, [])
         lines.append(f"### {area} — {len(have)} implemented, {len(missing)} planned")
@@ -298,73 +327,190 @@ def build_markdown() -> str:
     return "\n".join(lines)
 
 
-def to_html(markdown: str) -> str:
-    """A deliberately dumb page: tables and lists, no client-side anything.
+DASHBOARD_CSS = """
+.bars { display: grid; gap: 10px; margin: 16px 0 0; }
+.bar { display: grid; grid-template-columns: minmax(11rem, 15rem) 1fr auto;
+  gap: 12px; align-items: center; }
+.bar .name { font-size: .92rem; }
+/* `display: block` is load-bearing: these are spans, and an inline box
+   ignores width and height, which rendered every bar as an empty sliver --
+   including the areas that are complete. */
+.bar .track { display: block; height: 20px; border-radius: 6px;
+  background: var(--loss-bg); overflow: hidden;
+  border: 1px solid var(--line); }
+.bar .fill { display: block; height: 100%; min-width: 2px;
+  background: var(--win-fg); opacity: .85; }
+.bar .count { font-size: .85rem; color: var(--muted);
+  font-variant-numeric: tabular-nums; white-space: nowrap; }
 
-    Enough markdown for this file's own structure, converted line by line —
-    pulling in a renderer for one page would be a dependency with one caller.
-    """
-    body: list[str] = []
-    in_list = False
-    in_table = False
-    for line in markdown.splitlines():
-        if line.startswith("<!--"):
-            continue
-        if line.startswith("|"):
-            cells = [c.strip() for c in line.strip("|").split("|")]
-            if all(set(c) <= {"-"} for c in cells):
-                continue
-            if not in_table:
-                body.append("<table>")
-                in_table = True
-                tag = "th"
-            else:
-                tag = "td"
-            row = "".join(f"<{tag}>{inline(c)}</{tag}>" for c in cells)
-            body.append(f"<tr>{row}</tr>")
-            continue
-        if in_table:
-            body.append("</table>")
-            in_table = False
-        if line.startswith("- "):
-            if not in_list:
-                body.append("<ul>")
-                in_list = True
-            body.append(f"<li>{inline(line[2:])}</li>")
-            continue
-        if line.startswith("  ") and in_list and line.strip():
-            body[-1] = body[-1][: -len("</li>")] + " " + inline(line.strip()) + "</li>"
-            continue
-        if in_list:
-            body.append("</ul>")
-            in_list = False
-        if line.startswith("### "):
-            body.append(f"<h3>{inline(line[4:])}</h3>")
-        elif line.startswith("## "):
-            body.append(f"<h2>{inline(line[3:])}</h2>")
-        elif line.startswith("# "):
-            body.append(f"<h1>{inline(line[2:])}</h1>")
-        elif line.strip():
-            body.append(f"<p>{inline(line)}</p>")
-    if in_list:
-        body.append("</ul>")
-    if in_table:
-        body.append("</table>")
-    content = "\n".join(body)
-    return f"""<!doctype html>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Spindle dashboard</title>
-<style>
-body {{ font: 15px/1.5 system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }}
-table {{ border-collapse: collapse; margin: 1rem 0; }}
-th, td {{ border: 1px solid #ccc; padding: .4rem .6rem; text-align: left; vertical-align: top; }}
-code {{ background: #f3f3f3; padding: .1rem .3rem; border-radius: 3px; font-size: .9em; }}
-nav {{ margin-bottom: 1rem; }}
-</style>
-<nav><a href="./comparisons.html"><strong>Spindle vs the field</strong></a> · <a href="./index.html">micro-benchmarks</a></nav>
-{content}
+.remaining { display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 16px; margin-top: 16px; }
+.remaining h3 { margin: 0 0 8px; font-size: .95rem; }
+.remaining ul { margin: 0; padding-left: 0; list-style: none; }
+.remaining li { padding: 5px 0; border-top: 1px solid var(--line);
+  font-size: .87rem; }
+.remaining li:first-child { border-top: 0; }
+.remaining .m { display: inline-block; min-width: 3.2em; font-weight: 600;
+  color: var(--loss-fg); font-size: .78rem; }
+.remaining .note { color: var(--muted); display: block; margin-left: 3.2em; }
+
+.ms { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 14px; margin-top: 16px; }
+.ms .card h3 { margin: 0 0 4px; font-size: 1rem; }
+.ms .card p { margin: 6px 0 0; font-size: .85rem; color: var(--muted); }
+.ms .done { border-left: 4px solid var(--win-fg); }
+.ms .wip { border-left: 4px solid var(--accent); }
+.ms .todo { border-left: 4px solid var(--line); }
+
+details.area { margin: 8px 0; }
+details.area summary { cursor: pointer; padding: 6px 0; font-weight: 600; }
+details.area .paths { columns: 2 22rem; column-gap: 24px; margin: 6px 0 12px; }
+details.area .paths div { break-inside: avoid; font-size: .82rem;
+  padding: 2px 0; color: var(--muted); }
+details.area .paths .verb { color: var(--win-fg); font-weight: 600; }
 """
+
+
+def status_class(status: str) -> str:
+    """Which accent a milestone card carries, from its curated status."""
+    plain = status.replace("*", "").strip().lower()
+    if plain.startswith("done"):
+        return "done"
+    if "progress" in plain:
+        return "wip"
+    return "todo"
+
+
+def build_html() -> str:
+    """The coverage dashboard.
+
+    Rendered from the same survey the markdown uses rather than by parsing
+    the markdown back out -- the previous version did that, and it meant the
+    page could only ever show what a line-by-line markdown converter could
+    express, which is why it was a wall of bullet lists.
+
+    The headline it leads with is *in-scope* coverage: implemented over
+    implemented-plus-planned. That is deliberately not "percent of the Matrix
+    spec", and the page says so, because the denominator here is a curated
+    list of what this roadmap intends to build. Reaching 100% would mean
+    nothing we have scoped is missing -- not that the spec is finished.
+    """
+    routes, implemented = survey()
+    total_impl = len(routes)
+    total_planned = sum(len(v) for v in PLANNED.values())
+    total = total_impl + total_planned
+    pct = round(100 * total_impl / total) if total else 100
+
+    out: list[str] = [
+        sitetheme.head("Spindle coverage", DASHBOARD_CSS),
+        sitetheme.nav("dashboard.html"),
+        "<main>",
+        '<div class="hero"><h1>Coverage</h1>',
+        '<p class="sub">Every endpoint below is read out of the router at build '
+        "time, so this page cannot claim a surface the server does not serve. "
+        "What is <em>missing</em> is curated, reviewed in pull requests, and "
+        "cross-checked against the router — a gap that gets implemented and "
+        "left listed here fails the build.</p>",
+        '<div class="scoreline">',
+        f'<div class="score win"><b>{total_impl}</b>routes served</div>',
+        f'<div class="score loss"><b>{total_planned}</b>known gaps</div>',
+        f'<div class="score"><b>{pct}%</b>of scoped surface</div>',
+        "</div></div>",
+    ]
+
+    out.append("<h2>Where the gaps are</h2>")
+    out.append(
+        '<p class="legend">Implemented against implemented-plus-planned, per '
+        "area. The denominator is what this roadmap has scoped, not the whole "
+        "specification: a full bar means nothing we intend to build in that "
+        "area is outstanding.</p>"
+    )
+    out.append('<div class="bars">')
+    rows = []
+    for area in areas():
+        have, missing = len(implemented.get(area, [])), len(PLANNED.get(area, []))
+        if have + missing:
+            rows.append((area, have, missing))
+    # Least-complete first: the page exists to show what is left.
+    for area, have, missing in sorted(rows, key=lambda r: (r[1] / (r[1] + r[2]), -r[2])):
+        share = round(100 * have / (have + missing))
+        out.append(
+            '<div class="bar">'
+            f'<span class="name">{html.escape(area)}</span>'
+            f'<span class="track"><span class="fill" style="width:{share}%"></span></span>'
+            f'<span class="count">{have} served · {missing} left</span>'
+            "</div>"
+        )
+    out.append("</div>")
+
+    out.append("<h2>What is still missing</h2>")
+    outstanding = [(a, PLANNED.get(a, [])) for a in areas() if PLANNED.get(a)]
+    if outstanding:
+        out.append('<div class="remaining">')
+        for area, entries in outstanding:
+            out.append('<div class="card">')
+            out.append(f"<h3>{html.escape(area)}</h3><ul>")
+            for method, path, note in entries:
+                out.append(
+                    f'<li><span class="m">{html.escape(method)}</span>'
+                    f"<code>{html.escape(path)}</code>"
+                    f'<span class="note">{inline(note)}</span></li>'
+                )
+            out.append("</ul></div>")
+        out.append("</div>")
+    else:
+        out.append("<p>Nothing in scope is outstanding.</p>")
+    out.append(
+        '<p class="legend">Deprecated surfaces and deliberately-unbundled '
+        "services — TURN, the push gateway, an identity server; see #4's "
+        "<em>what not to build early</em> — are neither implemented nor "
+        "counted here.</p>"
+    )
+
+    out.append("<h2>Milestones</h2>")
+    out.append(
+        '<p class="legend">Roadmap: #4. These are the current standing rather '
+        "than the plan.</p>"
+    )
+    out.append('<div class="ms">')
+    for name, scope, status, evidence in MILESTONES:
+        out.append(
+            f'<div class="card {status_class(status)}">'
+            f"<h3>{html.escape(name)} — {html.escape(scope)}</h3>"
+            f"<div>{inline(status)}</div>"
+            f"<p>{inline(evidence)}</p></div>"
+        )
+    out.append("</div>")
+
+    out.append("<h2>Every endpoint</h2>")
+    out.append(
+        '<p class="legend">The served surface in full, by area, as parsed from '
+        "<code>routes.rs</code>.</p>"
+    )
+    for area in areas():
+        have = implemented.get(area, [])
+        if not have:
+            continue
+        out.append(
+            f'<details class="area"><summary>{html.escape(area)} '
+            f"({len(have)})</summary><div class=\"paths\">"
+        )
+        for path, methods in have:
+            verbs = html.escape("/".join(methods))
+            out.append(
+                f'<div><span class="verb">{verbs}</span> {html.escape(path)}</div>'
+            )
+        out.append("</div></details>")
+
+    out.append("</main>")
+    out.append(
+        sitetheme.footer(
+            "endpoints parsed from <code>routes.rs</code>; gaps and milestones "
+            "curated in <code>scripts/coverage-dashboard.py</code>"
+        )
+    )
+    return "\n".join(out) + "\n"
 
 
 def inline(text: str) -> str:
@@ -404,7 +550,7 @@ def main() -> int:
         print(f"coverage-dashboard: wrote {DASHBOARD}")
     if arguments.html:
         arguments.html.parent.mkdir(parents=True, exist_ok=True)
-        arguments.html.write_text(to_html(markdown))
+        arguments.html.write_text(build_html())
         print(f"coverage-dashboard: wrote {arguments.html}")
     return 0
 

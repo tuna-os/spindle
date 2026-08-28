@@ -22,6 +22,8 @@ from __future__ import annotations
 import argparse
 import os
 import html
+
+import sitetheme
 import json
 import pathlib
 
@@ -72,39 +74,46 @@ def comparison_rows(benchmarks: dict, ours_key: str, theirs_key: str, sizes: lis
         yield size, ours, theirs, ratio
 
 
+MICRO_CSS = """
+/* Only what the shared base does not already provide. The rest -- body, nav,
+   tables, code, the palette -- now comes from sitetheme, which is why this
+   page stopped having its own idea of what grey is. */
+h1 { font-size: 1.6rem; margin-bottom: .25rem; }
+h2 { font-size: 1.15rem; }
+.meta { color: var(--muted); font-size: .85rem; }
+table { font-variant-numeric: tabular-nums; }
+th { font-weight: 600; font-size: .8rem; text-transform: uppercase;
+  letter-spacing: .03em; color: var(--muted); }
+.win { color: var(--win-fg); font-weight: 600; }
+.loss { color: var(--loss-fg); font-weight: 600; }
+.note { color: var(--muted); font-size: .85rem;
+  border-left: 3px solid var(--accent); padding-left: .8rem; margin: .75rem 0 0; }
+details { margin-top: .75rem; }
+"""
+
+
 def render(document: dict, repository: str) -> str:
     benchmarks = document.get("benchmarks", {})
     parts: list[str] = []
     add = parts.append
 
-    add("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">")
-    add("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">")
-    add("<title>Spindle benchmarks</title><style>")
-    add("""
-:root { color-scheme: light dark; --fg:#111; --muted:#666; --line:#ddd; --bg:#fff; }
-@media (prefers-color-scheme: dark) {
-  :root { --fg:#e8e8e8; --muted:#9a9a9a; --line:#333; --bg:#111; }
-}
-body { font: 15px/1.55 ui-sans-serif, system-ui, sans-serif; margin: 0 auto; padding: 2rem 1rem 4rem;
-       max-width: 60rem; color: var(--fg); background: var(--bg); }
-h1 { font-size: 1.6rem; margin-bottom: .25rem; }
-h2 { font-size: 1.1rem; margin-top: 2.5rem; }
-.meta { color: var(--muted); font-size: .85rem; }
-table { border-collapse: collapse; width: 100%; margin: .75rem 0 0; font-variant-numeric: tabular-nums; }
-th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid var(--line); }
-th { font-weight: 600; font-size: .8rem; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); }
-td.num { text-align: right; }
-.win { color: #1a7f37; font-weight: 600; }
-.loss { color: #b35900; font-weight: 600; }
-.note { color: var(--muted); font-size: .85rem; border-left: 3px solid var(--line);
-        padding-left: .8rem; margin: .75rem 0 0; }
-details { margin-top: .75rem; }
-code { font-size: .85em; }
-""")
-    add("</style></head><body>")
-    add('<nav><a href="./comparisons.html"><strong>Spindle vs the field</strong> — the competitive story, with charts</a> · <a href="./dashboard.html">coverage &amp; feature dashboard</a></nav>')
-    add("<h1>Spindle micro-benchmarks</h1>")
-    add('<p>Criterion measurements of Spindle alone, per commit. For the four-way comparison against Synapse, Continuwuity and Tuwunel — including every loss and its investigation — see <a href="./comparisons.html">Spindle vs the field</a>.</p>')
+    add(sitetheme.head("Spindle micro-benchmarks", MICRO_CSS))
+    add(sitetheme.nav("index.html", repository=repository))
+    add("<main>")
+    add('<div class="hero"><h1>Micro-benchmarks</h1>')
+    add(
+        '<p class="sub">Criterion measurements of Spindle alone, per commit — '
+        "the algorithmic layer, measured inside the library. For the four-way "
+        "comparison against Synapse, Continuwuity and Tuwunel, including every "
+        'loss and its investigation, see <a href="./comparisons.html">Spindle '
+        'vs the field</a>.</p>'
+    )
+    add(
+        '<div class="scoreline">'
+        f'<div class="score"><b>{len(benchmarks)}</b>measurements</div>'
+        f'<div class="score"><b>{len(COMPARISONS)}</b>comparisons</div>'
+        "</div></div>"
+    )
     add(
         f"<p class=\"meta\">Commit <code>{html.escape(document.get('commit','?')[:12])}</code> "
         f"on <code>{html.escape(document.get('ref','?'))}</code> · "
@@ -167,7 +176,13 @@ code { font-size: .85em; }
         f"<a href=\"https://github.com/{repository}/blob/main/docs/benchmarks.md\">"
         "docs/benchmarks.md</a>.</p>"
     )
-    add("</body></html>")
+    add("</main>")
+    add(sitetheme.footer(
+        "Criterion output from every push to <code>main</code> · "
+        f'<a href="https://github.com/{repository}/blob/main/docs/benchmarks.md">'
+        "method and caveats</a>",
+        repository=repository,
+    ))
     return "\n".join(parts)
 
 

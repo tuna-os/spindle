@@ -28,7 +28,13 @@ PY
 
 python3 "$here/render-benchmarks.py" "$work/latest.json" "$work/index.html" \
     --repository example/fixture
-grep -q "Spindle benchmarks" "$work/index.html"
+# The title matches the h1 and the nav label, which both said
+# "micro-benchmarks" while the title said "benchmarks" — this page is
+# specifically not the four-way comparison, and the tab should say so.
+grep -q "Spindle micro-benchmarks" "$work/index.html"
+# The shared theme really is shared: tokens present, nav marking this page.
+grep -q -- "--accent: #7c3aed" "$work/index.html"
+grep -q 'href="./index.html" aria-current="page"' "$work/index.html"
 grep -q "demo group/ours/1" "$work/index.html"
 # The humanising must not silently drop precision to zero.
 grep -q "100 ns" "$work/index.html"

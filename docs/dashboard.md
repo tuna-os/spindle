@@ -175,6 +175,10 @@ neither implemented nor counted.
 - `GET /health`
 - `GET /ready`
 
+### Profiles & presence — 0 implemented, 1 planned
+
+- ⏳ `GET /_matrix/client/v3/presence/{user_id}/status` — presence (M2/M3)
+
 ### VoIP & MatrixRTC — 0 implemented, 1 planned
 
 - ⏳ `GET /_matrix/client/v3/voip/turnServer` — TURN discovery (M7)

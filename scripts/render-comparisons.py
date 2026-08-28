@@ -33,6 +33,8 @@ import pathlib
 import statistics
 import sys
 
+import sitetheme
+
 # Cells whose ratio lands inside this band are called what they are: within
 # the run-to-run variance this host measures (docs/benchmarks.md records the
 # variance evidence), not a win for either side.
@@ -41,12 +43,7 @@ import sys
 # marked unresolved rather than recoloured after the fact.
 NOISE_LOW_SINGLE_ROUND = (0.90, 1.10)
 
-SERVER_COLORS = {
-    "spindle": "#7c3aed",
-    "synapse": "#e05252",
-    "continuwuity": "#d9930d",
-    "tuwunel": "#0d9d6d",
-}
+SERVER_COLORS = sitetheme.SERVER_COLORS
 
 # What each benchmarked operation actually asks the server to do, and why the
 # storage architecture shows up in it. Rendered beside the latest charts so a
@@ -391,7 +388,13 @@ def svg_chart(
         f'<text x="{left + plot_w / 2:.0f}" y="{height - 4}" class="tick" '
         f'text-anchor="middle">{html.escape(AXIS[dimension])}</text>'
     )
-    for server, values in series.items():
+    # Spindle last, so it draws over the rivals rather than under them, and
+    # heavier. Every line used to be 2.2px in its own colour, which left the
+    # reader matching hues against a legend to find the one line the page
+    # exists to show. Ours is the subject; theirs is the context.
+    ordered = sorted(series.items(), key=lambda item: item[0].startswith("spindle"))
+    for server, values in ordered:
+        mine = server.startswith("spindle")
         color = color_for(server)
         points = [
             (x(i), y(v)) for i, v in enumerate(values) if v is not None
@@ -403,14 +406,37 @@ def svg_chart(
             for i, (px, py) in enumerate(points)
         )
         safe = html.escape(server, quote=True)
+        group = "series mine" if mine else "series"
+        stroke = "3.4" if mine else "1.6"
+        radius = "3.2" if mine else "2.2"
+        fade = "" if mine else ' opacity="0.62"'
         parts.append(
-            f'<g class="series" data-server="{safe}">'
-            f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2.2"/>'
+            f'<g class="{group}" data-server="{safe}">'
+            f'<path d="{path}" fill="none" stroke="{color}" '
+            f'stroke-width="{stroke}" stroke-linejoin="round" '
+            f'stroke-linecap="round"{fade}/>'
         )
         for (px, py), value in zip(points, (v for v in values if v is not None)):
+            # Ours get a halo so the marker reads against a crossing line.
+            if mine:
+                parts.append(
+                    f'<circle cx="{px:.1f}" cy="{py:.1f}" r="4.6" '
+                    f'fill="var(--bg)"/>'
+                )
             parts.append(
-                f'<circle cx="{px:.1f}" cy="{py:.1f}" r="3" fill="{color}">'
+                f'<circle cx="{px:.1f}" cy="{py:.1f}" r="{radius}" '
+                f'fill="{color}"{fade}>'
                 f"<title>{safe}: {value / 1e6:.2f} ms</title></circle>"
+            )
+        # Named on the line itself, at its last point: the one series worth
+        # identifying without a trip to the legend.
+        if mine:
+            end_x, end_y = points[-1]
+            anchor = "end" if end_x > left + plot_w * 0.6 else "start"
+            nudge = -6 if anchor == "end" else 6
+            parts.append(
+                f'<text x="{end_x + nudge:.1f}" y="{end_y - 8:.1f}" '
+                f'class="mine-label" text-anchor="{anchor}">Spindle</text>'
             )
         parts.append("</g>")
     parts.append("</svg>")
@@ -666,11 +692,14 @@ def render_charts(documents: list[dict]) -> list[str]:
             lines.append(f"<figcaption>{html.escape(explainer)}</figcaption>")
         lines.append("</figure>")
     lines.append("</div>")
+    # Ours first and marked, matching the charts: the reader should meet the
+    # subject before the field it is being compared against.
     legend = " ".join(
-        f'<span class="serverchip" data-server="{html.escape(server, quote=True)}">'
+        f'<span class="serverchip{" mine" if server.startswith("spindle") else ""}" '
+        f'data-server="{html.escape(server, quote=True)}">'
         f'<span class="dot" style="background:{color_for(server)}"></span>'
         f"{html.escape(server)}</span>"
-        for server in servers
+        for server in sorted(servers, key=lambda s: not s.startswith("spindle"))
     )
     legend += (
         '<span class="legend"> — hover a server to isolate its line in every '
@@ -802,40 +831,6 @@ docs/benchmarks.md</a>.</p>
 """
 
 STYLE = """
-<style>
-:root {
-  --bg: #ffffff; --fg: #1a1a20; --muted: #667; --line: #e2e2ea;
-  --card: #f7f7fb; --win-bg: #e7f6ec; --win-fg: #14683a;
-  --loss-bg: #fdeaea; --loss-fg: #a02020; --noise-bg: #f0f0f4;
-  --noise-fg: #556; --accent: #7c3aed; --accent2: #06b6d4;
-  --hero-a: #ede9fe; --hero-b: #cffafe; --shadow: 0 1px 3px rgba(20,20,40,.07);
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #131318; --fg: #e8e8ee; --muted: #99a; --line: #2c2c36;
-    --card: #1b1b23; --win-bg: #12301e; --win-fg: #6fd39a;
-    --loss-bg: #391616; --loss-fg: #ef9a9a; --noise-bg: #22222c;
-    --noise-fg: #99a; --accent: #a78bfa; --accent2: #22d3ee;
-    --hero-a: #1e1836; --hero-b: #082f3a; --shadow: 0 1px 3px rgba(0,0,0,.4);
-  }
-}
-* { box-sizing: border-box; }
-html { scroll-behavior: smooth; }
-body { margin: 0; background: var(--bg); color: var(--fg);
-  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; }
-main { max-width: 1080px; margin: 0 auto; padding: 0 20px 60px; }
-nav { position: sticky; top: 0; z-index: 5; display: flex; gap: 18px;
-  padding: 12px 20px; border-bottom: 1px solid var(--line);
-  align-items: baseline; flex-wrap: wrap;
-  background: color-mix(in srgb, var(--bg) 86%, transparent);
-  backdrop-filter: blur(8px); }
-nav .inner { max-width: 1080px; margin: 0 auto; width: 100%;
-  display: flex; gap: 18px; align-items: baseline; flex-wrap: wrap; }
-nav .brand { font-weight: 700; color: var(--accent); }
-nav a { color: var(--fg); text-decoration: none; position: relative; }
-nav a:hover { color: var(--accent); }
-h2 { margin-top: 48px; border-bottom: 1px solid var(--line); padding-bottom: 6px; }
-
 /* ---------- hero ---------- */
 .hero { position: relative; overflow: hidden; border-radius: 0 0 18px 18px;
   background: linear-gradient(135deg, var(--hero-a), var(--hero-b));
@@ -888,6 +883,13 @@ h2 { margin-top: 48px; border-bottom: 1px solid var(--line); padding-bottom: 6px
 .grid { stroke: var(--line); stroke-width: 1; }
 .series { transition: opacity .18s ease; }
 .series.dim { opacity: .14; }
+/* Ours is named on the line. The rivals stay in the legend, where context
+   belongs; the subject of the chart should not need looking up. */
+.mine-label { font-size: 10px; font-weight: 700; fill: var(--accent);
+  paint-order: stroke; stroke: var(--bg); stroke-width: 3px;
+  stroke-linejoin: round; }
+.serverchip.mine { color: var(--fg); font-weight: 650;
+  border-color: var(--accent); background: var(--card); }
 .serverlegend { margin: 6px 0 0; }
 .serverchip { margin-right: 12px; font-size: 0.9rem; color: var(--muted);
   cursor: pointer; border: 1px solid transparent; border-radius: 8px;
@@ -898,10 +900,6 @@ h2 { margin-top: 48px; border-bottom: 1px solid var(--line); padding-bottom: 6px
   margin-right: 6px; }
 
 /* ---------- heatmap ---------- */
-.scroll { overflow-x: auto; }
-table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.92rem; }
-th, td { border: 1px solid var(--line); padding: 6px 9px; text-align: left; }
-th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .heatmap tbody tr:hover td { filter: brightness(1.06); }
 .heatmap td.win { background: var(--win-bg); color: var(--win-fg); }
 .heatmap td.loss { background: var(--loss-bg); color: var(--loss-fg); }
@@ -914,10 +912,6 @@ th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
   background: var(--fg); color: var(--bg); padding: 5px 10px;
   border-radius: 8px; font-size: .8rem; white-space: nowrap;
   box-shadow: var(--shadow); pointer-events: none; }
-.chip { padding: 1px 8px; border-radius: 6px; font-size: 0.85rem; }
-.chip.win { background: var(--win-bg); color: var(--win-fg); }
-.chip.loss { background: var(--loss-bg); color: var(--loss-fg); }
-.chip.noise { background: var(--noise-bg); color: var(--noise-fg); }
 /* A called cell with no agreeing call at another size. Marked rather than
    recoloured: the arithmetic says roughly how many calls in a table are
    chance, never which, so overriding the verdict would be inventing a
@@ -928,7 +922,6 @@ th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
   45deg, transparent, transparent 5px,
   rgba(127, 127, 127, 0.22) 5px, rgba(127, 127, 127, 0.22) 10px); }
 .lone-mark { opacity: 0.75; font-size: 0.85em; vertical-align: super; }
-.legend, .provenance { color: var(--muted); font-size: 0.88rem; }
 .investigation { background: var(--card); border-left: 4px solid var(--accent);
   padding: 10px 14px; border-radius: 6px; }
 
@@ -1008,7 +1001,6 @@ th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
 details { margin: 16px 0; }
 summary { cursor: pointer; font-weight: 600; }
 code { background: var(--card); padding: 1px 5px; border-radius: 4px; font-size: 0.85em; }
-</style>
 """
 
 
@@ -1093,18 +1085,12 @@ def render(groups: dict[str, list[dict]]) -> str:
         + '<span class="root-chip">state root &#10003;</span></div>'
     )
     parts = [
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
-        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
-        "<title>Spindle vs the field</title>",
-        STYLE,
-        "</head><body>",
-        '<nav><span class="brand">Spindle</span>'
-        '<a href="#architecture">How it works</a>'
-        '<a href="#latest">Latest sitting</a>'
-        '<a href="#method">Method</a>'
-        '<a href="index.html">Micro-benchmarks</a>'
-        '<a href="dashboard.html">Coverage dashboard</a>'
-        '<a href="https://github.com/tuna-os/spindle">GitHub</a></nav>',
+        sitetheme.head("Spindle vs the field", STYLE),
+        sitetheme.nav("comparisons.html", [
+            ("#architecture", "How it works"),
+            ("#latest", "Latest sitting"),
+            ("#method", "Method"),
+        ]),
         "<main>",
         '<header class="hero">',
         ticker,
@@ -1153,8 +1139,10 @@ def render(groups: dict[str, list[dict]]) -> str:
 
     parts.append(METHOD)
     parts.append("</main>")
+    parts.append(sitetheme.footer(
+        "numbers from the raw results committed under docs/benchmarks/data/"
+    ))
     parts.append(SCRIPT)
-    parts.append("</body></html>")
     return "\n".join(parts)
 
 
