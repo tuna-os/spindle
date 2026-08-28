@@ -46,6 +46,10 @@ SERVER_COLORS = {
 # What each benchmarked operation actually asks the server to do, and why the
 # storage architecture shows up in it. Rendered beside the latest charts so a
 # reader never has to guess what a row measures.
+# What the x-axis counts, per dimension. The driver records which one it
+# measured; this is how that reaches the label.
+AXIS = {"events": "events in room", "members": "joined members in room"}
+
 OPERATIONS = {
     "send": (
         "Send a message",
@@ -189,8 +193,18 @@ def cells_for(documents: list[dict]):
     return table
 
 
-def svg_chart(operation: str, sizes: list[int], series: dict[str, list[float | None]]) -> str:
+def svg_chart(
+    operation: str,
+    sizes: list[int],
+    series: dict[str, list[float | None]],
+    dimension: str = "events",
+) -> str:
     """One small-multiple: mean latency across room sizes, a line per server.
+
+    `dimension` is what the x-axis counts -- events in the room, or joined
+    members in it. It is read from the results rather than assumed, because
+    the two are different questions and a chart that labels one as the other
+    is a wrong chart, not a mislabelled one.
 
     Linear y from zero, per-chart scale: honest about relative gaps within an
     operation, labelled so charts are never compared to each other by eye
@@ -213,7 +227,8 @@ def svg_chart(operation: str, sizes: list[int], series: dict[str, list[float | N
 
     parts = [
         f'<svg viewBox="0 0 {width} {height}" role="img" '
-        f'aria-label="{html.escape(operation)} latency by room size">'
+        f'aria-label="{html.escape(operation)} latency by "'
+        f'{html.escape(AXIS[dimension])}">'
     ]
     title = OPERATIONS.get(operation, (operation, ""))[0]
     parts.append(
@@ -241,7 +256,7 @@ def svg_chart(operation: str, sizes: list[int], series: dict[str, list[float | N
         )
     parts.append(
         f'<text x="{left + plot_w / 2:.0f}" y="{height - 4}" class="tick" '
-        f'text-anchor="middle">events in room</text>'
+        f'text-anchor="middle">{html.escape(AXIS[dimension])}</text>'
     )
     for server, values in series.items():
         color = color_for(server)
@@ -368,6 +383,23 @@ def render_heatmap(group: str, documents: list[dict]) -> list[str]:
     return lines
 
 
+def dimension_of(documents: list[dict]) -> str:
+    """What this group's x-axis counts.
+
+    Absent from every file written before the members sweep existed, and
+    those all measured events -- so the default is not a guess, it is what
+    those runs did.
+    """
+    found = {document.get("dimension", "events") for document in documents}
+    if len(found) != 1:
+        sys.exit(
+            "render-comparisons: one group mixes "
+            f"{', '.join(sorted(found))} on one axis -- they are different "
+            "questions and cannot share a chart"
+        )
+    return found.pop()
+
+
 def render_charts(documents: list[dict]) -> list[str]:
     table = cells_for(documents)
     sizes = sorted({size for _, size in table})
@@ -384,7 +416,7 @@ def render_charts(documents: list[dict]) -> list[str]:
         }
         explainer = OPERATIONS.get(operation, (operation, ""))[1]
         lines.append('<figure class="chart">')
-        lines.append(svg_chart(operation, sizes, series))
+        lines.append(svg_chart(operation, sizes, series, dimension_of(documents)))
         if explainer:
             lines.append(f"<figcaption>{html.escape(explainer)}</figcaption>")
         lines.append("</figure>")
@@ -497,14 +529,26 @@ from an empty store, and the serving process is pgrep-verified before
 measuring — a stale process once served an old binary on the right port.</li>
 <li><strong>Curves, not points.</strong> Every operation is measured at
 200, 800 and 3,200 events per room, because the failure mode worth catching
-is the cost that grows with the room.</li>
+is the cost that grows with the room. Room size has a second axis —
+<em>joined members</em> — and the sweep held it at two until M5, which hid
+a sliding-window read that grew linearly with the member list. Membership
+is now its own sweep, on its own chart, labelled by what it counts.</li>
 <li><strong>Means over 25 samples after warmup</strong>, raw results
 committed to the repository exactly as the driver wrote them
 (<code>docs/benchmarks/data/</code>); this page is regenerated from those
 files and cannot change a measurement.</li>
 <li><strong>Losses publish with the same prominence as wins.</strong>
-Cells within the measured noise band say so; cells below it link to their
-investigation.</li>
+Cells outside the ±10% band are printed as wins or losses, and a loss
+links to its investigation.</li>
+<li><strong>That ±10% band is narrower than this harness can currently
+resolve, and saying so is part of the method.</strong> Six rounds of the
+same binary on the same idle host move the median cell by 1.38× and the
+worst by 2.80× — so every cell here varies more between runs of identical
+code than the band that colours it. The large ratios clear that floor
+comfortably and the conclusions rest on those; the cells near 1.0× should
+be read as "not measured", whichever way they lean. Making a sitting
+several rounds and deriving the band from the observed spread is
+<a href="https://github.com/tuna-os/spindle/issues/171">#171</a>.</li>
 </ul>
 <p>Versions measured, ports, registration quirks and the full narrative per
 sitting: <a href="https://github.com/tuna-os/spindle/blob/main/docs/benchmarks.md">

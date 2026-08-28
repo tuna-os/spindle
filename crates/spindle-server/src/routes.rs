@@ -5328,8 +5328,38 @@ fn sliding_room_entry(
         .state_event(room_id, "m.room.name", "")
         .ok()
         .and_then(|content| content["name"].as_str().map(str::to_owned));
+    // A wildcard has to be answered by looking at everything; a list of
+    // named keys does not. Element X asks for a handful of concrete keys
+    // and gets sent the whole room state to filter down — a stored-body
+    // read and a JSON parse per state event, per room in the window, per
+    // request, to return three of them.
+    let concrete = !required_state.is_empty()
+        && required_state
+            .iter()
+            .all(|(event_type, state_key)| event_type != "*" && state_key != "*");
     let state_events: Vec<Value> = if required_state.is_empty() {
         Vec::new()
+    } else if concrete {
+        // Deduplicated, because state is a map and the wildcard path reads
+        // it as one: a client that names `m.room.name` twice must not be
+        // sent the event twice merely because it asked twice.
+        let mut seen = std::collections::HashSet::new();
+        required_state
+            .iter()
+            .filter_map(|(event_type, state_key)| {
+                let key = if state_key == "$ME" {
+                    identity.user_id.as_str()
+                } else {
+                    state_key.as_str()
+                };
+                if !seen.insert((event_type.as_str(), key)) {
+                    return None;
+                }
+                // Absent state is absent, not an error: a room with no
+                // name simply has no m.room.name to send.
+                state.rooms.state_event_full(room_id, event_type, key).ok()
+            })
+            .collect()
     } else {
         state
             .rooms
@@ -5358,9 +5388,8 @@ fn sliding_room_entry(
     };
     let joined_count = state
         .rooms
-        .joined_members(room_id)
-        .map_err(room_error)?
-        .len();
+        .joined_member_count(room_id)
+        .map_err(room_error)?;
     let unread = state
         .rooms
         .unread(room_id, &identity.user_id)

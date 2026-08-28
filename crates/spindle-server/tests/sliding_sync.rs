@@ -113,6 +113,42 @@ impl Harness {
         assert_eq!(status, StatusCode::OK, "{body}");
     }
 
+    async fn invite(&self, room: &str, token: &str, username: &str) {
+        let (status, body) = self
+            .request(
+                "POST",
+                &format!("/_matrix/client/v3/rooms/{room}/invite"),
+                token,
+                &json!({ "user_id": format!("@{username}:example.org") }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    async fn join(&self, room: &str, token: &str) {
+        let (status, body) = self
+            .request(
+                "POST",
+                &format!("/_matrix/client/v3/rooms/{room}/join"),
+                token,
+                &json!({}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    async fn leave(&self, room: &str, token: &str) {
+        let (status, body) = self
+            .request(
+                "POST",
+                &format!("/_matrix/client/v3/rooms/{room}/leave"),
+                token,
+                &json!({}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
     async fn sliding(&self, token: &str, pos: Option<&str>, body: &Value) -> Value {
         let path = match pos {
             Some(pos) => {
@@ -124,6 +160,13 @@ impl Harness {
         assert_eq!(status, StatusCode::OK, "{response}");
         response
     }
+}
+
+async fn joined_count(harness: &Harness, token: &str, room: &str) -> u64 {
+    let response = harness.sliding(token, None, &window()).await;
+    response["rooms"][room]["joined_count"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("joined_count is reported: {response}"))
 }
 
 fn window() -> Value {
@@ -215,6 +258,109 @@ async fn required_state_is_honoured_and_me_resolves() {
         "timeline_limit honoured: {entry}"
     );
     assert_eq!(entry["initial"], true);
+}
+
+#[tokio::test]
+async fn naming_keys_returns_what_a_wildcard_would_have_selected() {
+    // The reason this test exists: naming keys and asking for everything are
+    // now two different code paths, and they were one. A room with several
+    // members is where they would diverge -- the targeted path reads the
+    // three events it was asked for, the wildcard path reads every state
+    // event and filters. Same answer, or the optimisation is a bug.
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.named_room(&alice, "shared").await;
+    for name in ["bob", "carol", "dave"] {
+        let member = harness.register(name).await;
+        harness.invite(&room, &alice, name).await;
+        harness.join(&room, &member).await;
+    }
+
+    let ask = |required_state: Value| {
+        json!({
+            "lists": {
+                "main": {
+                    "ranges": [[0, 0]],
+                    "required_state": required_state,
+                    "timeline_limit": 0,
+                }
+            }
+        })
+    };
+    let named = harness
+        .sliding(
+            &alice,
+            None,
+            &ask(json!([["m.room.name", ""], ["m.room.create", ""]])),
+        )
+        .await;
+    let wildcard = harness
+        .sliding(
+            &alice,
+            None,
+            &ask(json!([["m.room.name", "*"], ["m.room.create", "*"]])),
+        )
+        .await;
+
+    let key = |response: &Value| {
+        let mut events: Vec<(String, String)> = response["rooms"][&room]["required_state"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| {
+                (
+                    event["type"].as_str().unwrap().to_owned(),
+                    event["event_id"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        events.sort();
+        events
+    };
+    assert_eq!(key(&named), key(&wildcard), "{named}\n{wildcard}");
+    assert_eq!(key(&named).len(), 2, "both keys came back: {named}");
+
+    // Asking twice is still one event: state is a map, and the wildcard
+    // path reads it as one.
+    let twice = harness
+        .sliding(
+            &alice,
+            None,
+            &ask(json!([["m.room.name", ""], ["m.room.name", ""]])),
+        )
+        .await;
+    assert_eq!(
+        key(&twice).len(),
+        1,
+        "a repeated key is not a repeated event: {twice}"
+    );
+}
+
+#[tokio::test]
+async fn the_joined_count_follows_membership_rather_than_a_stale_cache() {
+    // `joined_count` is served from a cache keyed on the state root. The
+    // failure mode a root key is chosen to prevent is exactly this sequence:
+    // count, change the membership, count again. A cache keyed on the room
+    // id alone passes every test that only ever counts once.
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness.named_room(&alice, "counted").await;
+
+    assert_eq!(joined_count(&harness, &alice, &room).await, 1);
+    harness.invite(&room, &alice, "bob").await;
+    harness.join(&room, &bob).await;
+    assert_eq!(
+        joined_count(&harness, &alice, &room).await,
+        2,
+        "the join is counted"
+    );
+    harness.leave(&room, &bob).await;
+    assert_eq!(
+        joined_count(&harness, &alice, &room).await,
+        1,
+        "and so is the leave"
+    );
 }
 
 #[tokio::test]

@@ -90,3 +90,51 @@ if python3 "$here/render-comparisons.py" "$empty" "$work/nope.html" 2>/dev/null;
     exit 1
 fi
 echo "comparisons: an empty data directory is refused"
+
+# A members sweep and an events sweep are different x-axes. The renderer must
+# label each from the results rather than assuming events -- and must refuse a
+# group that mixes them, because that chart would be wrong rather than merely
+# mislabelled.
+axes="$work/axes"
+mkdir -p "$axes"
+python3 - "$axes" <<'PY'
+import json, pathlib, sys
+out = pathlib.Path(sys.argv[1])
+def doc(server, dimension, sizes, value):
+    return {
+        "server": server,
+        "base_url": "http://127.0.0.1:0",
+        "dimension": dimension,
+        "sizes": sizes,
+        "samples": 1,
+        "benchmarks": {
+            f"sliding_window/{size}": {
+                "mean_ns": value, "lower_ns": value, "upper_ns": value, "samples": 1
+            }
+            for size in sizes
+        },
+    }
+for name, server, value in (("spindle", "spindle", 1e6), ("rival", "rival", 2e6)):
+    (out / f"m9-members.{name}.json").write_text(
+        json.dumps(doc(server, "members", [50, 200], value))
+    )
+# The mixed group: same sitting, two different axes.
+(out / "m9-mixed.spindle.json").write_text(json.dumps(doc("spindle", "members", [50], 1e6)))
+(out / "m9-mixed.rival.json").write_text(json.dumps(doc("rival", "events", [50], 2e6)))
+PY
+
+# With the mixed group present the renderer must refuse outright.
+if python3 "$here/render-comparisons.py" "$axes" "$work/axes.html" 2>/dev/null; then
+    echo "comparisons renderer charted two different x-axes as one" >&2
+    exit 1
+fi
+echo "comparisons: a group mixing events and members on one axis is refused"
+
+rm "$axes/m9-mixed.spindle.json" "$axes/m9-mixed.rival.json"
+python3 "$here/render-comparisons.py" "$axes" "$work/axes.html" >/dev/null
+grep -q "joined members in room" "$work/axes.html"
+if grep -q "events in room" "$work/axes.html"; then
+    echo "a members sweep was labelled as an events sweep" >&2
+    exit 1
+fi
+echo "comparisons: a members sweep is labelled by what it measured"
