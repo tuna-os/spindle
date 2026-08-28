@@ -41,6 +41,22 @@ pub struct StoredEvent {
 }
 
 impl StoredEvent {
+    /// Parse an event whose room ID the caller already knows.
+    ///
+    /// MSC4291: a v12 create event carries no `room_id` field, because the
+    /// room's ID is that event's hash. The ID is still a property of the
+    /// event -- it just lives outside the bytes, so the caller supplies it
+    /// and the field, where present, wins.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the first field that is missing or the
+    /// wrong shape.
+    pub fn parse_in(event_id: &str, room_id: &str, json: &Value) -> Result<Self, String> {
+        let named = json["room_id"].as_str().unwrap_or(room_id);
+        Self::parse_with_room_id(event_id, named, json)
+    }
+
     /// Parse persisted event JSON.
     ///
     /// The event ID is passed separately because a v11 event does not carry
@@ -53,6 +69,13 @@ impl StoredEvent {
     /// authorize against it is the only safe answer — treating it as absent
     /// would silently widen what the rules allow.
     pub fn parse(event_id: &str, json: &Value) -> Result<Self, String> {
+        let named = json["room_id"]
+            .as_str()
+            .ok_or_else(|| "`room_id` is missing or not a string".to_owned())?;
+        Self::parse_with_room_id(event_id, named, json)
+    }
+
+    fn parse_with_room_id(event_id: &str, room_id: &str, json: &Value) -> Result<Self, String> {
         let string = |field: &str| -> Result<&str, String> {
             json[field]
                 .as_str()
@@ -75,8 +98,7 @@ impl StoredEvent {
         Ok(Self {
             event_id: OwnedEventId::try_from(event_id)
                 .map_err(|error| format!("event ID: {error}"))?,
-            room_id: OwnedRoomId::try_from(string("room_id")?)
-                .map_err(|error| format!("room ID: {error}"))?,
+            room_id: OwnedRoomId::try_from(room_id).map_err(|error| format!("room ID: {error}"))?,
             sender: OwnedUserId::try_from(string("sender")?)
                 .map_err(|error| format!("sender: {error}"))?,
             origin_server_ts: MilliSecondsSinceUnixEpoch(

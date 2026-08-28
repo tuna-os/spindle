@@ -52,7 +52,7 @@ pub const SPEC_VERSIONS: &[SpecVersion] = &[
 /// (the spec's fallback), and a federated peer told to make a v1 room
 /// for us hands back events our v11 machinery rightly refuses — which is
 /// how Complement’s `TestJoinViaRoomIDAndServerName` found this.
-pub const ROOM_VERSIONS: &[&str] = &["11"];
+pub const ROOM_VERSIONS: &[&str] = &["11", "12"];
 
 /// The default room version.
 pub const DEFAULT_ROOM_VERSION: Option<&str> = Some("11");

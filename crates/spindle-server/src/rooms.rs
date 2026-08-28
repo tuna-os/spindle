@@ -350,15 +350,40 @@ impl Rooms {
         if !crate::surface::supports_room_version(version) {
             return Err(RoomError::UnsupportedVersion(version.to_owned()));
         }
-        let room_id = format!("!{}:{}", random_id(), self.server_name);
+        // MSC4289: from v12 the create event's *sender* is the creator, so
+        // repeating it in `content.creator` is redundant and the field is
+        // dropped. Before v12 it is required.
+        let privileges_creators = RoomVersionId::try_from(version)
+            .ok()
+            .and_then(|id| id.rules())
+            .is_some_and(|rules| rules.authorization.explicitly_privilege_room_creators);
+        let create_content = if privileges_creators {
+            serde_json::json!({ "room_version": version })
+        } else {
+            serde_json::json!({ "room_version": version, "creator": creator })
+        };
+        // MSC4291 inverts the order a room is born in. Before v12 the ID
+        // was chosen and the create event then named it; from v12 the ID
+        // *is* the create event's hash, so the event must be signed before
+        // there is an ID to store it under. Either way the create event is
+        // signed exactly once here and committed below -- re-signing it
+        // would move `origin_server_ts` and, for v12, break the very
+        // identity being established.
+        let (create_id, create_json, room_id) = self.birth(creator, key, &create_content)?;
         let mut log = RoomLog::new();
+        self.authorize(&log, &room_id, &create_id, &create_json)?;
+        self.commit_event(
+            &mut log,
+            &room_id,
+            creator,
+            "m.room.create",
+            Some(""),
+            &create_content,
+            &create_id,
+            &create_json,
+        )?;
 
         let mut events: Vec<(&str, String, Value)> = vec![
-            (
-                "m.room.create",
-                String::new(),
-                serde_json::json!({ "room_version": version, "creator": creator }),
-            ),
             (
                 "m.room.member",
                 creator.to_owned(),
@@ -368,7 +393,14 @@ impl Rooms {
                 "m.room.power_levels",
                 String::new(),
                 serde_json::json!({
-                    "users": { creator: 100 },
+                    // MSC4289: a v12 room privileges its creators
+                    // implicitly and *forbids* naming them here -- the
+                    // create fails authorization if they appear.
+                    "users": if privileges_creators {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::json!({ creator: 100 })
+                    },
                     "users_default": 0,
                     "events_default": 0,
                     "state_default": 50,
@@ -799,6 +831,72 @@ impl Rooms {
     /// lock at all. Same cache, same answer, no re-entry.
     fn rules_in(&self, log: &RoomLog, room_id: &str) -> Result<RoomVersionRules, RoomError> {
         rules_of(&self.version_in_log(log, room_id)?)
+    }
+
+    /// Mint a room: its create event, and the ID that event implies.
+    ///
+    /// The two are one step because from v12 they are one fact. Before
+    /// v12 the ID is chosen and the create event names it; from v12 the
+    /// ID *is* the event's hash and the event must not name it (MSC4291).
+    /// Either way the event is signed exactly once and returned for
+    /// committing -- see [`Self::sign_create`] for why signing twice is
+    /// not an option.
+    fn birth(
+        &self,
+        creator: &str,
+        key: &Ed25519KeyPair,
+        create_content: &Value,
+    ) -> Result<(String, Value, String), RoomError> {
+        if derives_room_id(create_content) {
+            let (id, json) = self.sign_create(creator, key, create_content, None)?;
+            let hash = id
+                .strip_prefix('$')
+                .ok_or_else(|| RoomError::Build(format!("event id has no sigil: {id}")))?;
+            let room_id = format!("!{hash}");
+            Ok((id, json, room_id))
+        } else {
+            let room_id = format!("!{}:{}", random_id(), self.server_name);
+            let (id, json) = self.sign_create(creator, key, create_content, Some(&room_id))?;
+            Ok((id, json, room_id))
+        }
+    }
+
+    /// Sign a room's create event, once.
+    ///
+    /// `room_id` is the ID to name inside the event, or `None` for MSC4291
+    /// versions where the event must not name it -- because the room's ID
+    /// *is* this event's hash, so naming it would be circular.
+    ///
+    /// The result is the event that gets committed, not a preview of it.
+    /// Signing a second time would move `origin_server_ts` and change the
+    /// hash, which for a v12 room means the room ID no longer matches the
+    /// create event it was derived from.
+    fn sign_create(
+        &self,
+        creator: &str,
+        key: &Ed25519KeyPair,
+        content: &Value,
+        room_id: Option<&str>,
+    ) -> Result<(String, Value), RoomError> {
+        let empty = RoomLog::new();
+        let auth = auth_events_for(&empty, creator, "m.room.create", Some(""), content)?;
+        let canonical = build_canonical(
+            room_id,
+            creator,
+            "m.room.create",
+            Some(""),
+            content,
+            &[],
+            &auth,
+            0,
+        )?;
+        let version = version_in(content)?;
+        let pdu = Pdu::sign(version, canonical, &self.server_name, key)
+            .map_err(|error| RoomError::Build(format!("{error:?}")))?;
+        Ok((
+            pdu.event_id().as_str().to_owned(),
+            canonical_to_json(pdu.canonical()),
+        ))
     }
 
     /// The room's version, resolved from a log the caller is already holding.
@@ -3138,8 +3236,19 @@ impl Rooms {
             .collect();
 
         let auth = auth_events_for(log, sender, event_type, state_key, content)?;
+        // MSC4291: the create event of a room whose ID is that event's
+        // hash cannot name the ID, so it is built without one. `create`
+        // has already derived the same ID from the same bytes.
+        let names_room_id = !(event_type == "m.room.create" && derives_room_id(content));
         let canonical = build_canonical(
-            room_id, sender, event_type, state_key, content, &prev, &auth, depth,
+            names_room_id.then_some(room_id),
+            sender,
+            event_type,
+            state_key,
+            content,
+            &prev,
+            &auth,
+            depth,
         )?;
         // Sign under the room's own version, not this build's default.
         // Event IDs are version-dependent, so signing a v12 room's event
@@ -3181,6 +3290,36 @@ impl Rooms {
     ) -> Result<String, RoomError> {
         let (event_id, json) =
             self.build_event(log, room_id, sender, key, event_type, state_key, content)?;
+        self.commit_event(
+            log, room_id, sender, event_type, state_key, content, &event_id, &json,
+        )
+    }
+
+    /// Put an already-built, already-authorized event into the log and the
+    /// store.
+    ///
+    /// Split out of [`Self::append`] because the v12 create event cannot be
+    /// built by it: the room ID is that event's hash, so the event must be
+    /// signed *before* there is a room to append it to. Rebuilding it once
+    /// the ID is known does not work -- `origin_server_ts` moves between
+    /// the two builds, so the second event hashes differently and the room
+    /// ID stops matching the create event it was derived from. (A test
+    /// caught exactly that; the two IDs agreed only when both builds landed
+    /// in the same millisecond.)
+    #[allow(clippy::too_many_arguments, reason = "one event, in one place")]
+    fn commit_event(
+        &self,
+        log: &mut RoomLog,
+        room_id: &str,
+        sender: &str,
+        event_type: &str,
+        state_key: Option<&str>,
+        content: &Value,
+        event_id: &str,
+        json: &Value,
+    ) -> Result<String, RoomError> {
+        let event_id = event_id.to_owned();
+        let json = json.clone();
         let prev: Vec<EventId> = json["prev_events"]
             .as_array()
             .map(|ids| {
@@ -3954,7 +4093,7 @@ impl Rooms {
         event_id: &str,
         json: &Value,
     ) -> Result<(), RoomError> {
-        let candidate = StoredEvent::parse(event_id, json).map_err(|error| {
+        let candidate = StoredEvent::parse_in(event_id, room_id, json).map_err(|error| {
             RoomError::Build(format!("cannot authorize a malformed event: {error}"))
         })?;
 
@@ -3968,7 +4107,7 @@ impl Rooms {
 
         let load = |id: &str| -> Option<StoredEvent> {
             let body = self.read_event(room_id, &EventId::new(id)).ok()?;
-            StoredEvent::parse(id, &body).ok()
+            StoredEvent::parse_in(id, room_id, &body).ok()
         };
 
         // Per-room, for the same reason as redaction above and with more at
@@ -4070,6 +4209,19 @@ fn stamp(mut json: Value, event_id: &str) -> Value {
 /// federated from a server old enough to omit the field genuinely *is* v1,
 /// and substituting our own default there would apply the wrong rules to
 /// someone else's room.
+/// Whether a create event with this content names a room whose ID is its
+/// own hash (MSC4291).
+///
+/// Answered from the content rather than from a version list, because this
+/// is asked while building the create event -- before the room exists, and
+/// therefore before anything else could be asked.
+fn derives_room_id(create_content: &Value) -> bool {
+    version_in(create_content)
+        .ok()
+        .and_then(|version| version.rules())
+        .is_some_and(|rules| rules.authorization.room_create_event_id_as_room_id)
+}
+
 fn version_in(content: &Value) -> Result<RoomVersionId, RoomError> {
     let named = content
         .get("room_version")
@@ -4255,7 +4407,7 @@ fn auth_events_for(
 
 #[allow(clippy::too_many_arguments, reason = "an event is what it is")]
 fn build_canonical(
-    room_id: &str,
+    room_id: Option<&str>,
     sender: &str,
     event_type: &str,
     state_key: Option<&str>,
@@ -4265,10 +4417,16 @@ fn build_canonical(
     depth: u64,
 ) -> Result<CanonicalJsonObject, RoomError> {
     let mut object = CanonicalJsonObject::new();
-    object.insert(
-        "room_id".to_owned(),
-        CanonicalJsonValue::String(room_id.to_owned()),
-    );
+    // MSC4291: a v12 create event carries no `room_id`, because the room's
+    // ID *is* that event's hash -- naming it inside the event it is
+    // computed from would be circular. Every other event, in every
+    // version, still carries it.
+    if let Some(room_id) = room_id {
+        object.insert(
+            "room_id".to_owned(),
+            CanonicalJsonValue::String(room_id.to_owned()),
+        );
+    }
     object.insert(
         "sender".to_owned(),
         CanonicalJsonValue::String(sender.to_owned()),
@@ -4575,7 +4733,7 @@ mod room_version_tests {
     fn creating_a_room_at_an_unadvertised_version_is_refused() {
         let (_dir, _store, rooms) = rooms();
         let key = key();
-        for unsupported in ["1", "10", "12"] {
+        for unsupported in ["1", "9", "10"] {
             let result = rooms.create(
                 "@alice:example.org",
                 &key,
@@ -4655,6 +4813,150 @@ mod room_version_tests {
             restarted.room_version(&room_id).unwrap(),
             RoomVersionId::V11
         );
+    }
+
+    /// MSC4291: a v12 room's ID is its create event's hash.
+    ///
+    /// This is the CVE-2025-54315 fix. A room ID nobody can name without
+    /// producing the event that hashes to it cannot be claimed by
+    /// assertion, which is what made room hijacking possible when the ID
+    /// was an unrelated random string the create event merely mentioned.
+    #[test]
+    fn a_v12_rooms_id_is_its_create_events_hash() {
+        let (_dir, _store, rooms) = rooms();
+        let key = key();
+        let room_id = rooms
+            .create(
+                "@alice:example.org",
+                &key,
+                None,
+                None,
+                None,
+                &[],
+                Some("12"),
+            )
+            .expect("v12 is advertised");
+
+        let create = rooms
+            .state(&room_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event["type"] == "m.room.create")
+            .expect("every room has a create event");
+        let event_id = create["event_id"].as_str().unwrap();
+
+        assert_eq!(
+            room_id,
+            format!("!{}", event_id.strip_prefix('$').unwrap()),
+            "the room ID must be the create event's hash",
+        );
+        assert!(
+            !room_id.contains(':'),
+            "MSC4291 drops the server suffix: {room_id}",
+        );
+    }
+
+    /// MSC4291: the create event does not name the room it creates.
+    ///
+    /// Naming it would be circular -- the ID is computed from these very
+    /// bytes. MSC4289 likewise drops `creator`, because the event's own
+    /// sender is the creator.
+    #[test]
+    fn a_v12_create_event_names_neither_the_room_nor_the_creator() {
+        let (_dir, _store, rooms) = rooms();
+        let key = key();
+        let room_id = rooms
+            .create(
+                "@alice:example.org",
+                &key,
+                None,
+                None,
+                None,
+                &[],
+                Some("12"),
+            )
+            .unwrap();
+        let create = rooms
+            .state(&room_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event["type"] == "m.room.create")
+            .unwrap();
+
+        assert!(
+            create.get("room_id").is_none(),
+            "a v12 create event carries no room_id: {create}",
+        );
+        assert!(
+            create["content"].get("creator").is_none(),
+            "MSC4289 drops content.creator: {}",
+            create["content"],
+        );
+        assert_eq!(create["sender"], "@alice:example.org");
+    }
+
+    /// v11 keeps the shape it has always had.
+    ///
+    /// The v12 work is additive: it must not quietly restyle every room
+    /// this server has already created, whose IDs are stored, cited by
+    /// peers, and bookmarked by clients.
+    #[test]
+    fn a_v11_room_keeps_its_server_suffix_and_its_create_fields() {
+        let (_dir, _store, rooms) = rooms();
+        let key = key();
+        let room_id = rooms
+            .create(
+                "@alice:example.org",
+                &key,
+                None,
+                None,
+                None,
+                &[],
+                Some("11"),
+            )
+            .unwrap();
+        assert!(room_id.ends_with(":example.org"), "{room_id}");
+
+        let create = rooms
+            .state(&room_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event["type"] == "m.room.create")
+            .unwrap();
+        assert_eq!(create["room_id"], room_id.as_str());
+        assert_eq!(create["content"]["creator"], "@alice:example.org");
+    }
+
+    /// A v12 room takes appends, not just a create event.
+    ///
+    /// The create event is the interesting one, so it is the easy one to
+    /// get right alone -- and a room nobody can speak in is not a room.
+    #[test]
+    fn a_v12_room_accepts_events_after_its_create() {
+        let (_dir, _store, rooms) = rooms();
+        let key = key();
+        let room_id = rooms
+            .create(
+                "@alice:example.org",
+                &key,
+                None,
+                None,
+                None,
+                &[],
+                Some("12"),
+            )
+            .unwrap();
+        let event_id = rooms
+            .send(
+                &room_id,
+                "@alice:example.org",
+                &key,
+                "m.room.message",
+                &serde_json::json!({ "msgtype": "m.text", "body": "hello" }),
+            )
+            .expect("a v12 room must accept messages");
+        assert!(event_id.starts_with('$'));
+        assert_eq!(rooms.room_version(&room_id).unwrap(), RoomVersionId::V12);
     }
 
     /// A create event with no `room_version` is a v1 room, per the spec.
