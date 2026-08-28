@@ -2560,7 +2560,7 @@ async fn send_join_common(
         ));
     }
 
-    let key_map = state
+    let mut key_map = state
         .federation
         .public_key_map(&origin)
         .await
@@ -2572,6 +2572,37 @@ async fn send_join_common(
                 "the origin's keys cannot be verified".to_owned(),
             )
         })?;
+
+    // A restricted join is signed by two servers, and this is the second.
+    // The joiner's server signs the event as its sender; the *authorising*
+    // user's server signs it as the one making the claim, because the
+    // nomination is a statement about a room only that server can see into
+    // (MSC3083, and `required_server_signatures_to_verify_event` enforces
+    // it from v8). We put the nomination in the template, so the signature
+    // it needs is ours -- and without it the event we handed out fails
+    // verification here, on our own doorstep, before any peer sees it.
+    let join = match join["content"]["join_authorised_via_users_server"].as_str() {
+        Some(nominee)
+            if nominee.split_once(':').map(|(_, domain)| domain)
+                == Some(state.config.server.name.as_str()) =>
+        {
+            key_map
+                .entry(state.config.server.name.clone())
+                .or_default()
+                .insert(
+                    state.key.key_id(),
+                    ruma::serde::Base64::parse(state.key.public_key_base64())
+                        .map_err(|error| MatrixError::internal(&error.to_string()))?,
+                );
+            let version = state.rooms.room_version(&room_id).map_err(room_error)?;
+            countersign(&state, &join, &version)?
+        }
+        // Someone else's user, or nobody's: not ours to vouch for. The
+        // signature check below will ask for that server's key and fail if
+        // the joining server did not collect it, which is the right answer
+        // -- a nomination this server did not make is not one it endorses.
+        _ => join,
+    };
     let (computed_id, outcome) = receive_one_pdu(&state, &origin, Some(&key_map), &join);
     // The path names the event the peer computed; disagreement means one
     // side hashed a different event than the other signed.
@@ -3553,6 +3584,83 @@ fn sign_membership_template(state: &AppState, template: &Value) -> Result<(Strin
     Ok((format!("${hash}"), event))
 }
 
+/// Add this server's signature to an event another server built.
+///
+/// Used where this server has something to attest that the builder could
+/// not: that an invited user's server was told (`federation_invite`), or
+/// that the authorising user of a restricted join really is a member here
+/// who could have invited the joiner (`send_join`). In both cases the
+/// signature is the attestation -- peers verify it, they do not take the
+/// field's presence as proof.
+///
+/// Signing does not disturb the event ID: the reference hash is taken over
+/// the redacted form, from which `signatures` is stripped.
+fn countersign(
+    state: &AppState,
+    event: &Value,
+    version: &ruma::RoomVersionId,
+) -> Result<Value, MatrixError> {
+    let Ok(ruma::CanonicalJsonValue::Object(mut canonical)) =
+        ruma::CanonicalJsonValue::try_from(event.clone())
+    else {
+        return Err(MatrixError::bad_json(
+            "the event does not canonicalize".to_owned(),
+        ));
+    };
+    let rules = version
+        .rules()
+        .ok_or_else(|| MatrixError::internal("the room version rules are unavailable"))?;
+    ruma::signatures::hash_and_sign_event(
+        &state.config.server.name,
+        state.key.pair(),
+        &mut canonical,
+        &rules.redaction,
+    )
+    .map_err(|error| MatrixError::internal(&format!("the event cannot be co-signed: {error}")))?;
+    serde_json::to_value(&canonical).map_err(|error| MatrixError::internal(&error.to_string()))
+}
+
+/// Take on the signatures a resident server added to our own join event.
+///
+/// MSC3083's `send_join` response returns the event the resident accepted,
+/// and for a restricted join that copy carries *its* signature as well as
+/// ours -- the attestation that the authorising user really is a member
+/// there. Keeping only our singly-signed copy would leave this server
+/// relaying an event the next peer rejects.
+///
+/// Signatures are merged rather than the event adopted wholesale, and the
+/// merge happens only if the two bodies are identical once signatures are
+/// set aside. A resident that returns a *different* event is not to be
+/// believed about it: what we signed is what we signed, and the event ID
+/// everyone else computes is the hash of that.
+fn merge_returned_signatures(join: &mut Value, returned: &Value) {
+    let without_signatures = |event: &Value| -> Value {
+        let mut copy = event.clone();
+        if let Some(object) = copy.as_object_mut() {
+            object.remove("signatures");
+        }
+        copy
+    };
+    if !returned.is_object() || without_signatures(returned) != without_signatures(join) {
+        return;
+    }
+    let Some(theirs) = returned["signatures"].as_object().cloned() else {
+        return;
+    };
+    if !join["signatures"].is_object() {
+        join["signatures"] = json!({});
+    }
+    let Some(ours) = join["signatures"].as_object_mut() else {
+        return;
+    };
+    for (server, keys) in theirs {
+        // Never overwrite: our own entry is the one we can vouch for, and a
+        // resident replacing it would be substituting a signature we did
+        // not make for one we did.
+        ours.entry(server).or_insert(keys);
+    }
+}
+
 /// Every server worth asking to broker a join, most-specific first.
 ///
 /// The client's own `server_name`/`via` hints lead; the domain in the room
@@ -3633,6 +3741,9 @@ async fn join_remote(
                 continue;
             }
         };
+
+        let mut join = join;
+        merge_returned_signatures(&mut join, &response["event"]);
 
         let arrays =
             |key: &str| -> Vec<Value> { response[key].as_array().cloned().unwrap_or_default() };

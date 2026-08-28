@@ -1636,10 +1636,16 @@ impl Rooms {
     ///
     /// The template is everything but the signature: the caller's server
     /// signs it and brings it back through `send_join`. Authorization is
-    /// previewed here — public join rule, or a standing invite — so a
-    /// refused server learns at the cheap step, but the template is not a
-    /// promise: the signed event is authorized again on the way in, against
-    /// whatever the state is *then*.
+    /// previewed here — public join rule, a standing invite, or a
+    /// restricted room this server can vouch the joiner into — so a refused
+    /// server learns at the cheap step, but the template is not a promise:
+    /// the signed event is authorized again on the way in, against whatever
+    /// the state is *then*.
+    ///
+    /// The restricted case is the one where the preview carries something
+    /// the joining server could not have worked out: `restricted_join_nominee`
+    /// puts the authorising user into the content, and that field is the
+    /// entire basis on which the rules will accept the join.
     ///
     /// # Errors
     ///
@@ -1678,13 +1684,24 @@ impl Rooms {
             )?
             .as_deref()
                 == Some(INVITE_STR.as_bytes());
-            if join_rule != "public" && !invited {
+            // A restricted room is the third way in, and it was missing:
+            // the joiner is in a room this room admits, and this server can
+            // see that. The nomination is the *only* record of it, so it
+            // goes into the template -- the joining server signs what we
+            // hand back, and `send_join` and every peer after it check the
+            // nomination rather than taking our word for the join.
+            let nominee = rooms.restricted_join_nominee(log, room_id, user_id)?;
+            if join_rule != "public" && !invited && nominee.is_none() {
                 return Err(RoomError::Forbidden(
-                    "the room is not public and the user holds no invite".to_owned(),
+                    "the room is not public, and the user holds no invite and                      is in no room it admits"
+                        .to_owned(),
                 ));
             }
 
-            let content = serde_json::json!({ "membership": "join" });
+            let mut content = serde_json::json!({ "membership": "join" });
+            if let Some(nominee) = nominee {
+                content["join_authorised_via_users_server"] = Value::String(nominee);
+            }
             let auth = auth_events_for(
                 log,
                 &rooms.rules_in(log, room_id)?.authorization,
