@@ -4754,7 +4754,12 @@ mod room_version_tests {
     fn creating_a_room_at_an_unadvertised_version_is_refused() {
         let (_dir, _store, rooms) = rooms();
         let key = key();
-        for unsupported in ["1", "9", "10"] {
+        // v1-v3 are the versions genuinely outside this server's reach: their
+        // event IDs are not the reference hashes it computes. v4 and up are
+        // advertised, so they belong in the acceptance test below rather than
+        // here -- this list narrowed when they were added, which is the
+        // advertised set and this test staying honest with each other.
+        for unsupported in ["1", "2", "3"] {
             let result = rooms.create(
                 "@alice:example.org",
                 &key,

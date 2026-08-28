@@ -46,13 +46,42 @@ pub const SPEC_VERSIONS: &[SpecVersion] = &[
 
 /// Room versions this server can create and join.
 ///
-/// Exactly v11 — the one version the whole implementation is built
-/// against. Staying silent here is not a safe default: a client that
-/// finds no `m.room_versions` in `/capabilities` assumes room version 1
-/// (the spec's fallback), and a federated peer told to make a v1 room
-/// for us hands back events our v11 machinery rightly refuses — which is
-/// how Complement’s `TestJoinViaRoomIDAndServerName` found this.
-pub const ROOM_VERSIONS: &[&str] = &["11", "12"];
+/// Staying silent here is not a safe default: a client that finds no
+/// `m.room_versions` in `/capabilities` assumes room version 1 (the
+/// spec's fallback), and a federated peer told to make a v1 room for us
+/// hands back events our machinery rightly refuses — which is how
+/// Complement's `TestJoinViaRoomIDAndServerName` found this.
+///
+/// # Where the line is, and why it is there
+///
+/// **v4 and up, because that is where the event ID format settles.**
+/// `ruma` reports `event_id_format` per version:
+///
+/// | versions | event ID format |
+/// |---|---|
+/// | v1, v2 | `V1` — IDs are server-chosen, not hashes |
+/// | v3 | `V2` |
+/// | **v4 – v12** | **`V3` — what this server computes** |
+///
+/// Everything from v4 up mints and recognises the same event IDs this
+/// implementation already produces. The differences that remain —
+/// knocking (v7), restricted joins (v8), knock-restricted (v10), the v11
+/// redaction changes, v12's create-event-derived room IDs — are all rule
+/// flags `ruma` carries, and every one of them is read *per room* rather
+/// than from a constant, which is what #195 and #203 were for.
+///
+/// v1–v3 are a different matter and deliberately absent: their event IDs
+/// are not the reference hashes this server computes, so claiming them
+/// would be claiming machinery that does not exist. That is the
+/// distinction this module exists to keep honest.
+///
+/// The evidence is Complement. Thirty of its allowlisted tests create
+/// rooms at v7, v8 and v9 to reach knocking and restricted joins; before
+/// this they silently received a v11 room that happened to have those
+/// features, and passed on the substitution. Now they get the version
+/// they asked for, and the same tests are the check on whether that is
+/// true.
+pub const ROOM_VERSIONS: &[&str] = &["4", "5", "6", "7", "8", "9", "10", "11", "12"];
 
 /// The default room version.
 pub const DEFAULT_ROOM_VERSION: Option<&str> = Some("11");
@@ -131,4 +160,68 @@ pub fn required_routes() -> Vec<&'static str> {
     routes.sort_unstable();
     routes.dedup();
     routes
+}
+
+#[cfg(test)]
+mod room_version_surface_tests {
+    use super::{DEFAULT_ROOM_VERSION, ROOM_VERSIONS};
+
+    /// Every advertised version mints the event IDs this server computes.
+    ///
+    /// The advertised set is a claim, and this is the part of it that is
+    /// checkable without a running room: an event ID format other than `V3`
+    /// means IDs this implementation does not produce, so advertising such a
+    /// version would promise machinery that does not exist.
+    ///
+    /// It fails in both directions on purpose. Adding v3 or below fails here
+    /// rather than in a federation trace weeks later; and if a future room
+    /// version changes the format, adding it fails here too — which is the
+    /// moment to decide deliberately rather than discover it from a peer.
+    #[test]
+    fn every_advertised_version_uses_the_event_id_format_this_server_computes() {
+        for name in ROOM_VERSIONS {
+            let version = ruma::RoomVersionId::try_from(*name)
+                .unwrap_or_else(|error| panic!("v{name} is not a room version: {error}"));
+            let rules = version
+                .rules()
+                .unwrap_or_else(|| panic!("ruma has no rules for advertised v{name}"));
+            assert_eq!(
+                rules.event_id_format,
+                ruma::room_version_rules::EventIdFormatVersion::V3,
+                "v{name} is advertised but mints event IDs in {:?}, not the V3 \
+                 reference hashes this server computes",
+                rules.event_id_format,
+            );
+        }
+    }
+
+    /// Nothing advertised is a version `ruma` calls unstable.
+    ///
+    /// Advertising an unstable version invites clients into rooms whose rules
+    /// may still change under them.
+    #[test]
+    fn nothing_advertised_is_unstable() {
+        for name in ROOM_VERSIONS {
+            let rules = ruma::RoomVersionId::try_from(*name)
+                .unwrap()
+                .rules()
+                .unwrap();
+            assert_eq!(
+                rules.disposition,
+                ruma::room_version_rules::RoomVersionDisposition::Stable,
+                "v{name} is advertised but {:?}",
+                rules.disposition,
+            );
+        }
+    }
+
+    /// The default is one of the versions actually advertised.
+    #[test]
+    fn the_default_version_is_advertised() {
+        let default = DEFAULT_ROOM_VERSION.expect("a default is set");
+        assert!(
+            ROOM_VERSIONS.contains(&default),
+            "the default room version {default} is not in the advertised set",
+        );
+    }
 }
