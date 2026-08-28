@@ -25,6 +25,28 @@ async fn main() -> ExitCode {
         return promote_admin(&config_path, &localpart);
     }
 
+    // `spindle backup <config> <file>` and `spindle restore <config> <file>`
+    // — the offline lifecycle pair (#20). Offline because the store is
+    // opened directly: fjall holds a lock, so these run with the server
+    // stopped, which is also the only way a restore can be sure nothing is
+    // writing behind it.
+    if std::env::args().nth(1).as_deref() == Some("backup") {
+        let (Some(config_path), Some(file)) = (std::env::args().nth(2), std::env::args().nth(3))
+        else {
+            eprintln!("usage: spindle backup <config> <file>");
+            return ExitCode::FAILURE;
+        };
+        return backup(&config_path, &file);
+    }
+    if std::env::args().nth(1).as_deref() == Some("restore") {
+        let (Some(config_path), Some(file)) = (std::env::args().nth(2), std::env::args().nth(3))
+        else {
+            eprintln!("usage: spindle restore <config> <file>");
+            return ExitCode::FAILURE;
+        };
+        return restore(&config_path, &file);
+    }
+
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "spindle.toml".to_owned());
@@ -167,6 +189,118 @@ fn promote_admin(config_path: &str, localpart: &str) -> ExitCode {
         Err(error) => {
             eprintln!("spindle: {error}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Write a consistent backup of the configured store.
+///
+/// Refuses to overwrite an existing file. A backup command that clobbers
+/// is one keystroke away from replacing the good copy with a bad one, and
+/// the operator finds out when they restore.
+fn backup(config_path: &str, file: &str) -> ExitCode {
+    let Some(store) = open_store(config_path) else {
+        return ExitCode::FAILURE;
+    };
+    let path = std::path::Path::new(file);
+    if path.exists() {
+        eprintln!("spindle: {file} already exists — refusing to overwrite a backup");
+        return ExitCode::FAILURE;
+    }
+    let mut out = match std::fs::File::create(path) {
+        Ok(file) => std::io::BufWriter::new(file),
+        Err(error) => {
+            eprintln!("spindle: cannot write {file}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Through a snapshot: every row from one moment, so the backup cannot
+    // hold metadata that trails its own log.
+    let snapshot = spindle_store::Store::snapshot(&store);
+    let view: &dyn spindle_store::ReadView = snapshot.as_deref().unwrap_or(&store);
+    match spindle_store::backup::write_backup(view, &mut out) {
+        Ok(rows) => {
+            println!("wrote {rows} rows to {file}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("spindle: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Restore a backup into the configured store.
+///
+/// Refuses a store that already holds rows. Writing a backup over a
+/// populated store is a *merge*, not a restore: anything the target holds
+/// and the backup does not survives, so the result matches neither the
+/// backup nor what was there before. #20 asks that a failed import never
+/// cut over partially, and the surest way to honour that is to require an
+/// empty target and let the operator move the old directory aside
+/// deliberately.
+fn restore(config_path: &str, file: &str) -> ExitCode {
+    let Some(store) = open_store(config_path) else {
+        return ExitCode::FAILURE;
+    };
+    // "Empty" means no *data*, not no rows: opening a store stamps the schema
+    // marker, so a store that has never held anything already has one row.
+    // Counting that as content would refuse every restore, including the only
+    // one that is supposed to work.
+    let marker = spindle_core::keys::store_marker();
+    match spindle_store::ReadView::scan_prefix(&store, &[]) {
+        Ok(rows) => {
+            let existing = rows.iter().filter(|(key, _)| *key != marker).count();
+            if existing > 0 {
+                eprintln!(
+                    "spindle: the store already holds {existing} rows — restore into \
+                     an empty store, so the result is the backup rather than a merge \
+                     of the two"
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+        Err(error) => {
+            eprintln!("spindle: cannot read the store: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let mut source = match std::fs::File::open(file) {
+        Ok(file) => std::io::BufReader::new(file),
+        Err(error) => {
+            eprintln!("spindle: cannot read {file}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match spindle_store::backup::read_backup(&mut source, &store) {
+        Ok(rows) => {
+            println!("restored {rows} rows from {file}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("spindle: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Open the store a config names, reporting why if it cannot be opened.
+fn open_store(config_path: &str) -> Option<FjallStore> {
+    let config = match Config::load(config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("spindle: {error}");
+            return None;
+        }
+    };
+    match FjallStore::open(&config.storage.path) {
+        Ok(store) => Some(store),
+        Err(error) => {
+            eprintln!(
+                "spindle: cannot open storage at {}: {error}",
+                config.storage.path.display()
+            );
+            None
         }
     }
 }
