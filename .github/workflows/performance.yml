@@ -23,3 +23,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run release-mode performance budgets
         run: cargo test --release --test performance -- --ignored --nocapture
+
+      # The same idea one layer up. The core budgets guard the library; these
+      # guard the request paths, where every performance defect this project
+      # has actually shipped lived (#172, #173, #175) and where nothing was
+      # asserting the shape.
+      - name: Run server read budgets
+        run: cargo test --release -p spindle-server --test read_budget -- --ignored --nocapture
