@@ -5515,9 +5515,18 @@ async fn sync(
         .unwrap_or(20)
         .clamp(1, 100);
 
+    // Asked for in the read, not filtered out of the answer: see
+    // `Rooms::sync`. The exact narrowing still happens in `sync_join`,
+    // against the filtered timeline; this is what stops the roster being
+    // read and parsed in the first place.
+    let lazy_members = filter
+        .as_ref()
+        .and_then(|filter| filter.room.state.as_ref())
+        .and_then(|state| state.lazy_load_members)
+        == Some(true);
     let mut result = state
         .rooms
-        .sync(&identity.user_id, since, timeline_limit)
+        .sync(&identity.user_id, since, timeline_limit, lazy_members)
         .map_err(room_error)?;
 
     // Long-poll, but only for an incremental sync: an initial sync always has
@@ -5537,7 +5546,7 @@ async fn sync(
             }
             result = state
                 .rooms
-                .sync(&identity.user_id, Some(since), timeline_limit)
+                .sync(&identity.user_id, Some(since), timeline_limit, lazy_members)
                 .map_err(room_error)?;
         }
     }
@@ -5550,40 +5559,8 @@ async fn sync(
         query.state_after(),
     )?;
 
-    let mut invite = serde_json::Map::new();
-    for room_id in result.invited {
-        if filter.as_ref().is_some_and(|f| !f.allows_room(&room_id)) {
-            continue;
-        }
-        // An invited user is not in the room, so there is no timeline to
-        // show them. `invite_state` is the stripped state a client renders
-        // the invite from: what room, whose, how it admits — and nothing
-        // they are not yet entitled to.
-        let events = state
-            .rooms
-            .stripped_state(&room_id, &identity.user_id)
-            .unwrap_or_default();
-        invite.insert(room_id, json!({ "invite_state": { "events": events } }));
-    }
-
-    let mut leave = serde_json::Map::new();
-    for room in result.left {
-        if filter
-            .as_ref()
-            .is_some_and(|f| !f.allows_room(&room.room_id))
-        {
-            continue;
-        }
-        // No `state` block: the state of a room you are not in is not yours to
-        // read, and the departure event in the timeline already says what a
-        // client needs -- that you are out, and how you came to be.
-        leave.insert(
-            room.room_id,
-            json!({
-                "timeline": { "events": room.events, "limited": room.limited },
-            }),
-        );
-    }
+    let invite = sync_invite(&state, &identity, result.invited, filter.as_ref());
+    let leave = sync_leave(result.left, filter.as_ref());
 
     let (to_device, device_changes, key_counts, unused_fallback) =
         sync_device_sections(&state, &identity, since, result.next_batch)?;
@@ -5631,6 +5608,52 @@ async fn sync(
 /// Lifted out of the handler because the handler had four sections to
 /// assemble and the joined one is by far the largest: it is the only one that
 /// carries state, account data, ephemeral events and an unread count at once.
+fn sync_invite(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    invited: Vec<String>,
+    filter: Option<&crate::filters::Filter>,
+) -> serde_json::Map<String, Value> {
+    let mut invite = serde_json::Map::new();
+    for room_id in invited {
+        if filter.is_some_and(|f| !f.allows_room(&room_id)) {
+            continue;
+        }
+        // An invited user is not in the room, so there is no timeline to
+        // show them. `invite_state` is the stripped state a client renders
+        // the invite from: what room, whose, how it admits — and nothing
+        // they are not yet entitled to.
+        let events = state
+            .rooms
+            .stripped_state(&room_id, &identity.user_id)
+            .unwrap_or_default();
+        invite.insert(room_id, json!({ "invite_state": { "events": events } }));
+    }
+    invite
+}
+
+fn sync_leave(
+    left: Vec<crate::rooms::SyncRoom>,
+    filter: Option<&crate::filters::Filter>,
+) -> serde_json::Map<String, Value> {
+    let mut leave = serde_json::Map::new();
+    for room in left {
+        if filter.is_some_and(|f| !f.allows_room(&room.room_id)) {
+            continue;
+        }
+        // No `state` block: the state of a room you are not in is not yours to
+        // read, and the departure event in the timeline already says what a
+        // client needs -- that you are out, and how you came to be.
+        leave.insert(
+            room.room_id,
+            json!({
+                "timeline": { "events": room.events, "limited": room.limited },
+            }),
+        );
+    }
+    leave
+}
+
 fn sync_join(
     state: &AppState,
     identity: &crate::accounts::Identity,
