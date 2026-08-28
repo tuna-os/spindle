@@ -169,3 +169,106 @@ fn restore_refuses_something_that_is_not_a_backup() {
         "the refusal names the problem: {stderr}"
     );
 }
+
+/// Put one media record in the store, and optionally its blob on disk.
+///
+/// The two are written separately on purpose: that separation is the whole
+/// subject. A record without its blob is exactly the state a row-only
+/// restore leaves behind, and it is indistinguishable from a healthy server
+/// until someone asks for the file.
+fn seed_media(config_path: &std::path::Path, bytes: &[u8], with_blob: bool) -> String {
+    let config = spindle_server::Config::load(config_path.to_str().unwrap()).unwrap();
+    let store = spindle_store::FjallStore::open(&config.storage.path).unwrap();
+    let hash = blake3::hash(bytes).to_hex().to_string();
+    let media_id = format!("media{}", &hash[..8]);
+    let record = serde_json::json!({
+        "hash": hash,
+        "content_type": "text/plain",
+        "filename": "note.txt",
+        "size": bytes.len(),
+        "uploaded_by": "@alice:example.org",
+    });
+    spindle_store::Store::put(
+        &store,
+        &spindle_core::keys::media(&media_id),
+        &serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    if with_blob {
+        let root = config.storage.path.join("media");
+        let path = root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    media_id
+}
+
+#[test]
+fn verify_media_is_silent_about_a_store_whose_blobs_are_all_there() {
+    let work = TempDir::new().unwrap();
+    let config = config_for(&work, "data");
+    seed(&config);
+    seed_media(&config, b"present", true);
+
+    let output = run(&[os("verify-media"), os(config.to_str().unwrap())]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{text}{:?}", output.stderr);
+    assert!(text.contains("1 blobs, all present"), "{text}");
+}
+
+#[test]
+fn verify_media_names_the_files_a_missing_blob_takes_down() {
+    let work = TempDir::new().unwrap();
+    let config = config_for(&work, "data");
+    seed(&config);
+    let present = seed_media(&config, b"present", true);
+    let absent = seed_media(&config, b"absent", false);
+
+    let output = run(&[os("verify-media"), os(config.to_str().unwrap())]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "a store missing a blob reported healthy: {text}"
+    );
+    assert!(text.contains("2 blobs, 1 present, 1 MISSING"), "{text}");
+    // The media ID, not just the hash: the hash is what the backend calls
+    // it, and the ID is what an operator has to look for in their other copy.
+    assert!(text.contains(&absent), "{text}");
+    assert!(
+        !text.contains(&present),
+        "the present blob was reported: {text}"
+    );
+}
+
+#[test]
+fn a_restore_says_which_media_the_rows_it_wrote_still_need() {
+    let work = TempDir::new().unwrap();
+    let source = config_for(&work, "source");
+    seed(&source);
+    let orphan = seed_media(&source, b"only a row survives this", true);
+
+    let archive = work.path().join("backup.spindle");
+    let output = run(&[
+        os("backup"),
+        os(source.to_str().unwrap()),
+        os(archive.to_str().unwrap()),
+    ]);
+    assert!(output.status.success());
+
+    // The target is a fresh directory, so the rows arrive and the blobs do
+    // not -- which is what happens to anyone who copies the backup file and
+    // forgets the media directory.
+    let target = config_for(&work, "target");
+    let output = run(&[
+        os("restore"),
+        os(target.to_str().unwrap()),
+        os(archive.to_str().unwrap()),
+    ]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("restored"), "{text}");
+    assert!(
+        text.contains("1 MISSING") && text.contains(&orphan),
+        "the restore claimed success without naming the media it is missing: {text}"
+    );
+}

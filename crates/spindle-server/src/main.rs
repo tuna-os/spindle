@@ -44,9 +44,27 @@ async fn main() -> ExitCode {
             eprintln!("usage: spindle restore <config> <file>");
             return ExitCode::FAILURE;
         };
-        return restore(&config_path, &file);
+        return restore(&config_path, &file).await;
+    }
+    // `spindle verify-media <config>` -- the same audit a restore prints,
+    // available on its own. Blobs can go missing without a restore in
+    // sight: a bucket lifecycle rule, a half-copied directory, a disk that
+    // came back smaller. The store still holds every record, so the server
+    // looks healthy right up to the moment someone opens the file.
+    if std::env::args().nth(1).as_deref() == Some("verify-media") {
+        let Some(config_path) = std::env::args().nth(2) else {
+            eprintln!("usage: spindle verify-media <config>");
+            return ExitCode::FAILURE;
+        };
+        return verify_media(&config_path).await;
     }
 
+    serve().await
+}
+
+/// Run the server itself, which is what every argument form above declines
+/// to do.
+async fn serve() -> ExitCode {
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "spindle.toml".to_owned());
@@ -239,7 +257,7 @@ fn backup(config_path: &str, file: &str) -> ExitCode {
 /// cut over partially, and the surest way to honour that is to require an
 /// empty target and let the operator move the old directory aside
 /// deliberately.
-fn restore(config_path: &str, file: &str) -> ExitCode {
+async fn restore(config_path: &str, file: &str) -> ExitCode {
     let Some(store) = open_store(config_path) else {
         return ExitCode::FAILURE;
     };
@@ -275,11 +293,93 @@ fn restore(config_path: &str, file: &str) -> ExitCode {
     match spindle_store::backup::read_backup(&mut source, &store) {
         Ok(rows) => {
             println!("restored {rows} rows from {file}");
+            // A backup carries rows; media bytes live outside it. Saying
+            // "restored" and stopping would be true about the rows and
+            // false about the server, so the restore ends by reporting what
+            // the rows still need. It is a report, not a failure: staging a
+            // bucket or rsyncing a directory after the rows is a legitimate
+            // order to do this in, and the operator is the one who knows.
+            report_media(config_path).await;
             ExitCode::SUCCESS
         }
         Err(error) => {
             eprintln!("spindle: {error}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// `spindle verify-media <config>` — audit the blob backend against the store.
+async fn verify_media(config_path: &str) -> ExitCode {
+    match audit_media(config_path).await {
+        Some(audit) if audit.complete() => {
+            println!("media: {} blobs, all present", audit.blobs);
+            ExitCode::SUCCESS
+        }
+        Some(audit) => {
+            print_missing(&audit);
+            // Unlike the restore path this *is* a failure: nobody runs
+            // `verify-media` in the middle of a copy, they run it to be told
+            // whether the deployment is whole.
+            ExitCode::FAILURE
+        }
+        None => ExitCode::FAILURE,
+    }
+}
+
+/// Print the media audit as part of another command, never failing it.
+async fn report_media(config_path: &str) {
+    match audit_media(config_path).await {
+        Some(audit) if audit.complete() => {
+            println!("media: {} blobs, all present", audit.blobs);
+        }
+        Some(audit) => print_missing(&audit),
+        None => {}
+    }
+}
+
+fn print_missing(audit: &spindle_server::media::MediaAudit) {
+    println!(
+        "media: {} blobs, {} present, {} MISSING",
+        audit.blobs,
+        audit.present,
+        audit.missing.len()
+    );
+    // Named, not counted: "some media is gone" is not something anyone can
+    // act on, and the media IDs are what an operator searches their other
+    // copy for.
+    for blob in &audit.missing {
+        println!("  {} <- {}", blob.hash, blob.media_ids.join(", "));
+    }
+}
+
+/// The audit for the store a config names, or `None` once the reason has
+/// been reported.
+async fn audit_media(config_path: &str) -> Option<spindle_server::media::MediaAudit> {
+    let config = match Config::load(config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("spindle: {error}");
+            return None;
+        }
+    };
+    let store = match FjallStore::open(&config.storage.path) {
+        Ok(store) => std::sync::Arc::new(store),
+        Err(error) => {
+            eprintln!("spindle: cannot open storage: {error}");
+            return None;
+        }
+    };
+    let media = spindle_server::media::Media::new(
+        store,
+        spindle_server::blobs_for(&config),
+        config.server.name.clone(),
+    );
+    match media.audit().await {
+        Ok(audit) => Some(audit),
+        Err(error) => {
+            eprintln!("spindle: cannot audit media: {error}");
+            None
         }
     }
 }

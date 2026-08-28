@@ -11,6 +11,7 @@
 //! not become an addressing one. The ID is random and opaque, and the mapping
 //! from ID to hash lives in the store.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -107,6 +108,33 @@ fn escape_quoted(name: &str) -> String {
             }
         })
         .collect()
+}
+
+/// What [`Media::audit`] found: how many distinct blobs the store's records
+/// require, and which of them are not there.
+#[derive(Debug)]
+pub struct MediaAudit {
+    /// Distinct content hashes the records refer to.
+    pub blobs: usize,
+    /// How many of those the backend holds.
+    pub present: usize,
+    /// The rest, each with the media IDs that resolve to it.
+    pub missing: Vec<MissingBlob>,
+}
+
+impl MediaAudit {
+    /// Whether every blob the records need is there.
+    #[must_use]
+    pub fn complete(&self) -> bool {
+        self.missing.is_empty()
+    }
+}
+
+/// One blob the store expects and the backend does not have.
+#[derive(Debug)]
+pub struct MissingBlob {
+    pub hash: String,
+    pub media_ids: Vec<String>,
 }
 
 /// Blobs in the configured backend, metadata in the store.
@@ -217,6 +245,51 @@ impl Media {
             &serde_json::to_vec(&record)?,
         )?;
         Ok(())
+    }
+
+    /// Every blob this store's media records need, and which of them the
+    /// backend actually holds.
+    ///
+    /// The two halves of media live in different places: the record is a
+    /// row in the store, the bytes are a blob in a directory or a bucket.
+    /// A backup carries rows. So a restore can report every row written and
+    /// leave a server that answers 404 to every download, with nothing in
+    /// the restore having said so -- the check was green about something
+    /// narrower than the claim resting on it.
+    ///
+    /// This is that claim made checkable. Blobs are content-addressed, so
+    /// identical uploads are one blob and the audit counts it once; the
+    /// media IDs that need a missing blob are reported with it, because
+    /// "some media is gone" is not an actionable sentence and "these four
+    /// files are gone" is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the store cannot be scanned, a record
+    /// cannot be decoded, or the blob backend fails in a way that is not
+    /// simply "absent".
+    pub async fn audit(&self) -> Result<MediaAudit, MediaError> {
+        // hash -> the media IDs that resolve to it, so a missing blob names
+        // everything it takes down with it rather than just itself.
+        let mut wanted: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (key, value) in ReadView::scan_prefix(self.store.as_ref(), &keys::media_all())? {
+            let record: MediaRecord = serde_json::from_slice(&value)?;
+            let id = keys::media_id(&key).unwrap_or_else(|| "<unreadable key>".to_owned());
+            wanted.entry(record.hash).or_default().push(id);
+        }
+        let mut audit = MediaAudit {
+            blobs: wanted.len(),
+            present: 0,
+            missing: Vec::new(),
+        };
+        for (hash, media_ids) in wanted {
+            if self.blobs.has(&hash).await? {
+                audit.present += 1;
+            } else {
+                audit.missing.push(MissingBlob { hash, media_ids });
+            }
+        }
+        Ok(audit)
     }
 
     /// What is known about `media_id`, or `None`.

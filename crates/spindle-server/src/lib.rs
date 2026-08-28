@@ -95,6 +95,28 @@ impl std::fmt::Display for AppError {
 
 impl std::error::Error for AppError {}
 
+/// The blob backend a config asks for.
+///
+/// Shared with the offline commands rather than inlined in [`app`]: a
+/// media audit run from the CLI has to look in exactly the place the
+/// server would, and a second copy of this `match` is a second chance to
+/// point one of them at the wrong directory.
+#[must_use]
+pub fn blobs_for(config: &Config) -> blobs::Blobs {
+    match &config.storage.s3 {
+        Some(s3) => blobs::Blobs::S3(s3::S3Client::new(
+            s3.endpoint.clone(),
+            s3.bucket.clone(),
+            s3.region.clone(),
+            s3.access_key_id.clone(),
+            s3.secret_access_key.clone(),
+        )),
+        None => blobs::Blobs::Local {
+            root: config.storage.path.join("media"),
+        },
+    }
+}
+
 /// Build the HTTP application.
 ///
 /// # Errors
@@ -116,18 +138,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
     let store_for_devices = Arc::clone(&store);
     let store_for_backups = Arc::clone(&store);
     let account_data = Arc::new(account_data::AccountData::new(Arc::clone(&store)));
-    let blobs = match &config.storage.s3 {
-        Some(s3) => blobs::Blobs::S3(s3::S3Client::new(
-            s3.endpoint.clone(),
-            s3.bucket.clone(),
-            s3.region.clone(),
-            s3.access_key_id.clone(),
-            s3.secret_access_key.clone(),
-        )),
-        None => blobs::Blobs::Local {
-            root: config.storage.path.join("media"),
-        },
-    };
+    let blobs = blobs_for(&config);
     let media = Arc::new(media::Media::new(
         Arc::clone(&store),
         blobs,
