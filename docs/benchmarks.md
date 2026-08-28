@@ -582,6 +582,61 @@ benchmark was wrong about two cells because it could not see the axis that
 mattered, and imprecise about all of them because it never asked itself the
 question.
 
+### The separation rule bounds one cell, and a table is many
+
+The fix for the band above (#176) was a separation rule: a cell is called
+only when the two servers' rounds do not overlap — our slowest beat their
+fastest, or the reverse. Three rounds a side is the minimum, because if the
+servers were identical the chance that one side's rounds all land below the
+other's is `2/C(2n, n)` — one in three at n=2, **one in ten at n=3**, one in
+thirty-five at n=4.
+
+That is a per-cell rate, and it took a sitting to notice the consequence.
+The #181 sitting ran 18 cells at three rounds. Expected calls from luck
+alone: `18 × 0.1 ≈ 1.8`. Observed: one. `joined_members/200` separated
+cleanly in the wrong direction — all three after-rounds above all three
+before-rounds — and by the letter of the rule that was a regression against
+our own change.
+
+It was not one. `room_joined_members` calls `Rooms::joined_members`; the
+diff touched `Rooms::sync`, `Rooms::initial_state` and the `/sync` handler.
+There is no code path from the change to that endpoint. The corroborating
+detail was that the same endpoint showed nothing at 50 or 800, and a real
+per-member cost does not skip the largest size.
+
+The right answer, reached the wrong way. The mechanism check settled it;
+the statistics did not, and could not — the arithmetic says roughly how
+many calls in a table are chance, never **which**. Had that false call
+landed on a cell the diff plausibly touched, there would have been no
+principled way to tell it from a real regression.
+
+So three things now hold, and only the first two are automated:
+
+1. **The page states the count.** Each resolved table reports how many
+   comparable cells it has and how many of them should separate by chance
+   at that many rounds, beside how many actually did. A table calling one
+   cell in eighteen has said almost nothing about that cell.
+2. **A call nothing else supports is marked.** Where an operation is
+   measured at more than one size, a call that no other size agrees with
+   carries a †: the size axis is where a real per-item cost shows itself,
+   so an isolated call is the shape a chance separation takes. It is a
+   marker, never a recolouring — overriding a verdict the arithmetic cannot
+   identify would invent a certainty the numbers do not carry. An operation
+   swept at a single size is never marked, because there the question was
+   never asked. A loss with an investigation behind it is not marked
+   either: a cause found in the other server's code outranks a neighbouring
+   cell.
+3. **A regression call against our own diff needs a code path.** Before a
+   wrong-direction cell is reported as a regression, there has to be a
+   route from the change to the endpoint. This is what actually worked on
+   #181, and writing it down makes it a rule rather than a habit.
+
+None of this changes a published cell. Every sitting on the page predates
+#171 and is single-round, so it is coloured by the old band, where
+`2/C(2n, n)` says nothing at all — the count and the marker are both
+withheld there rather than applied to numbers they do not describe. They
+take effect on the first multi-round sitting the page carries.
+
 ## Fork window: bounded search vs exhaustive walk
 
 | Room history | Bounded | Exhaustive | Ratio |

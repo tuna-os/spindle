@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import math
 import pathlib
 import statistics
 import sys
@@ -234,6 +235,60 @@ def rounds_in(documents: list[dict]) -> int:
     return min(counts.values(), default=0)
 
 
+def chance_of_separating(rounds: int) -> float:
+    """Odds two *identical* servers separate by luck, at this many rounds.
+
+    2/C(2n, n): one in three at n=2, one in ten at n=3, one in thirty-five
+    at n=4, one in a hundred and twenty-six at n=5.
+    """
+    if rounds < 1:
+        return 1.0
+    return 2 / math.comb(2 * rounds, rounds)
+
+
+def expected_false_calls(cells: int, rounds: int) -> float:
+    """How many of `cells` should separate by chance alone.
+
+    The separation rule bounds the false-call rate for *one* cell. A table
+    is many cells, and nothing in the rule accounts for that: at three
+    rounds a side the per-cell rate is one in ten, so eighteen cells expect
+    close to two spurious calls. Reading a lone called cell as a result is
+    then reading noise, which is the mistake #171 was filed for one level
+    down. Stating the number is the cheap half of the fix (#183); the other
+    half is `stands_alone` below.
+    """
+    return cells * chance_of_separating(rounds)
+
+
+def stands_alone(calls: dict[int, str], measured: set[int], size: int) -> bool:
+    """Is this call unsupported by the same operation at any other size?
+
+    A real difference in a per-item cost shows up across the size axis --
+    that is what makes it a cost rather than a coincidence. A call standing
+    alone at one size, with the same operation unresolved on either side of
+    it, is exactly the shape a multiplicity artifact takes: #181's sitting
+    called `joined_members/200` a regression while 50 and 800 showed
+    nothing, and there was no code path from the change to that endpoint at
+    all.
+
+    An operation measured at a *single* size is not evidence either way, and
+    is never marked. The question this asks is whether the size axis
+    corroborates the call, and a sweep of one has no size axis to ask -- a
+    marker there would read as doubt drawn from data that was never
+    collected.
+
+    This never overturns a call. The arithmetic says roughly how many cells
+    in a table separate by chance, never which, so the verdict stands and
+    the marker records that nothing else supports it.
+    """
+    if len(measured) < 2:
+        return False
+    mine = calls.get(size)
+    return not any(
+        other == mine for at_size, other in calls.items() if at_size != size
+    )
+
+
 def verdict(ours: list[float], theirs: list[float]) -> tuple[str, str]:
     """Colour and label for one cell, decided by whether the rounds separate.
 
@@ -386,10 +441,16 @@ def scoreboard(documents: list[dict]):
 
 def render_heatmap(group: str, documents: list[dict]) -> list[str]:
     ours = next(d for d in documents if d["server"].startswith("spindle"))
-    theirs = sorted(
-        (d for d in documents if not d["server"].startswith("spindle")),
-        key=lambda d: d["server"],
-    )
+    # One column group per *server*, not per document. A multi-round sitting
+    # contributes one file per round, and taking them all would render the
+    # same rival two or three times over -- invisible while every published
+    # group was a single round, and wrong the moment one is not. The rounds
+    # are already gathered by `cells_for`; this only needs the names.
+    seen: dict[str, dict] = {}
+    for document in documents:
+        if not document["server"].startswith("spindle"):
+            seen.setdefault(document["server"], document)
+    theirs = [seen[server] for server in sorted(seen)]
     table = cells_for(documents)
     sizes = sorted({size for _, size in table})
     operations = sorted({operation for operation, _ in table})
@@ -405,6 +466,28 @@ def render_heatmap(group: str, documents: list[dict]) -> list[str]:
             lines.append(f'<th class="num">{size:,}</th>')
     lines.append("</tr></thead><tbody>")
 
+    # Every cell's verdict up front, because whether a call stands alone is a
+    # property of its row rather than of the cell: the marker below needs the
+    # same operation's other sizes, which the emitting loop has not reached
+    # yet.
+    verdicts: dict[tuple[str, str, int], tuple[str, str]] = {}
+    for operation in operations:
+        for document in theirs:
+            for size in sizes:
+                cell = table.get((operation, size), {})
+                mine = cell.get(ours["server"])
+                other = cell.get(document["server"])
+                if mine and other:
+                    verdicts[operation, document["server"], size] = verdict(mine, other)
+    comparable = len(verdicts)
+    called = sum(1 for css, _ in verdicts.values() if css != "noise")
+    # The multiplicity arithmetic describes the *separation* rule -- it is
+    # the chance that n rounds a side fall clear of each other. A group with
+    # fewer rounds than that is coloured by the old band instead, where
+    # 2/C(2n, n) says nothing, so neither the count nor the marker applies.
+    # Every sitting published before #171 is in that case.
+    resolved = rounds_in(documents) >= 3
+
     for operation in operations:
         title = OPERATIONS.get(operation, (operation, ""))[0]
         lines.append(
@@ -412,6 +495,16 @@ def render_heatmap(group: str, documents: list[dict]) -> list[str]:
             f"<code>{html.escape(operation)}</code></td>"
         )
         for document in theirs:
+            measured = {
+                at_size
+                for at_size in sizes
+                if (operation, document["server"], at_size) in verdicts
+            }
+            calls = {
+                at_size: verdicts[operation, document["server"], at_size][0]
+                for at_size in measured
+                if verdicts[operation, document["server"], at_size][0] != "noise"
+            }
             for size in sizes:
                 cell = table.get((operation, size), {})
                 mine = cell.get(ours["server"])
@@ -423,9 +516,31 @@ def render_heatmap(group: str, documents: list[dict]) -> list[str]:
                 if (group, operation) in INVESTIGATIONS:
                     note_id = f"note-{group}-{operation}"
                 css, label = verdict(mine, other)
+                # An investigation outranks the size axis: the marker means
+                # "nothing corroborates this call", and a cell whose cause
+                # has been found in the other server's code is corroborated
+                # by something better than a neighbouring cell. `state` vs
+                # Tuwunel is a real lead with a real mechanism, not a chance
+                # separation that happens to sit at one size.
+                #
+                # Only for losses, because only losses carry notes -- the
+                # roadmap treats a loss as a defect until explained, and
+                # nothing writes an investigation for a win. Exempting wins
+                # on a note written about the losing cell in the same row
+                # would be reading someone else's evidence.
+                explained = note_id is not None and css == "loss"
+                lone = (
+                    resolved
+                    and css in ("win", "loss")
+                    and not explained
+                    and stands_alone(calls, measured, size)
+                )
                 body = html.escape(label)
                 if css == "loss" and note_id:
                     body = f'<a href="#{note_id}">{body}</a>'
+                if lone:
+                    css = f"{css} lone"
+                    body += " <span class='lone-mark'>†</span>"
                 spread = (
                     ""
                     if len(mine) < 2
@@ -437,6 +552,11 @@ def render_heatmap(group: str, documents: list[dict]) -> list[str]:
                     f'{html.escape(document["server"])} '
                     f"{statistics.median(other) / 1e6:.2f} ms"
                 )
+                if lone:
+                    tip += (
+                        " · stands alone: this operation is not called the "
+                        "same way at any other size"
+                    )
                 lines.append(
                     f'<td class="num {css}" data-tip="{tip}" title="{tip}">'
                     f"{body}</td>"
@@ -456,6 +576,22 @@ def render_heatmap(group: str, documents: list[dict]) -> list[str]:
             "such cell links to its investigation, because the roadmap treats "
             "it as a defect until explained. Hover any cell for the median and "
             "the observed spread.</p>"
+        )
+        expected = expected_false_calls(comparable, rounds)
+        lines.append(
+            f'<p class="legend">That rule bounds the false-call rate for '
+            f"<em>one</em> cell, and this table has <strong>{comparable}"
+            "</strong>. Two identical servers separate by luck "
+            f"{chance_of_separating(rounds):.1%} of the time at {rounds} "
+            f"rounds, so about <strong>{expected:.1f}</strong> of these cells "
+            f"should be called by chance alone — against {called} actually "
+            "called. The arithmetic cannot say <em>which</em> ones, so a call "
+            "marked <span class=\"chip lone\">†</span> is one that stands "
+            "alone: the same operation is not called the same way at any "
+            "other size. A cost that is real in a per-item measure normally "
+            "shows across the size axis, so an isolated call is the shape a "
+            "chance separation takes. Read those as unconfirmed rather than "
+            "as results (#183).</p>"
         )
     else:
         lines.append(
@@ -782,6 +918,16 @@ th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .chip.win { background: var(--win-bg); color: var(--win-fg); }
 .chip.loss { background: var(--loss-bg); color: var(--loss-fg); }
 .chip.noise { background: var(--noise-bg); color: var(--noise-fg); }
+/* A called cell with no agreeing call at another size. Marked rather than
+   recoloured: the arithmetic says roughly how many calls in a table are
+   chance, never which, so overriding the verdict would be inventing a
+   certainty the numbers do not carry. */
+.chip.lone { background: transparent; border: 1px dashed var(--muted);
+  color: var(--muted); }
+.heatmap td.lone { background-image: repeating-linear-gradient(
+  45deg, transparent, transparent 5px,
+  rgba(127, 127, 127, 0.22) 5px, rgba(127, 127, 127, 0.22) 10px); }
+.lone-mark { opacity: 0.75; font-size: 0.85em; vertical-align: super; }
 .legend, .provenance { color: var(--muted); font-size: 0.88rem; }
 .investigation { background: var(--card); border-left: 4px solid var(--accent);
   padding: 10px 14px; border-radius: 6px; }
