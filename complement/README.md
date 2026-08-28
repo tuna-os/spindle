@@ -67,7 +67,11 @@ of silence:
 [   22.7s] ==== 2 passed, 0 failed, 0 skipped
 ```
 
-Failures print the test's captured log underneath, which is where the
-per-request traffic lives (`[CSAPI] PUT hs1/…/send/m.room.message => 200 OK`).
-The ledger keeps every line either way — the printer renders, it never
-judges, and `scripts/complement-check.py` remains the gate.
+Only *protected* failures print their captured log underneath — the place
+the per-request traffic lives (`[CSAPI] PUT hs1/…/send/m.room.message =>
+200 OK`). A full run fails around a hundred unclaimed tests, which is the
+debt ledger working as intended; dumping each one's server tracing buried
+the failures that actually break the build, so those get one line and a
+`[not protected]` marker instead. The ledger keeps every line either way —
+the printer renders, it never judges, and `scripts/complement-check.py`
+remains the gate.
