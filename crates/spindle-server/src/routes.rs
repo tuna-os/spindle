@@ -2258,17 +2258,29 @@ async fn federation_make_join(
             "the user does not live on the requesting server",
         ));
     }
-    // The version list is the peer telling us what it can speak; if v11 is
-    // not in it, no template we produce will parse on their side.
-    let supports_v11 = request
-        .uri()
-        .query()
-        .is_some_and(|query| query.split('&').any(|pair| pair == "ver=11"));
-    if !supports_v11 {
+    // What version this room actually is, rather than what this build's
+    // default happens to be. The old check compared the peer's list against
+    // a literal `ver=11` and, on a mismatch, told them "this room is version
+    // 11" — a sentence it had no basis for, since it had never looked at the
+    // room. For a room of any other version that answer is simply false.
+    let version = state.rooms.room_version(&room_id).map_err(room_error)?;
+    let version = version.as_str();
+
+    // The `ver` list is the peer telling us what *they* can speak. If this
+    // room's version is not in it, no template we produce will parse on
+    // their side, so the refusal is correct — but it has to name the version
+    // they would have needed.
+    let offered = request.uri().query().is_some_and(|query| {
+        query
+            .split('&')
+            .filter_map(|pair| pair.strip_prefix("ver="))
+            .any(|ver| ver == version)
+    });
+    if !offered {
         return Err(MatrixError::new(
             StatusCode::BAD_REQUEST,
             "M_INCOMPATIBLE_ROOM_VERSION",
-            "this room is version 11".to_owned(),
+            format!("this room is version {version}"),
         ));
     }
     let event = state
@@ -2276,7 +2288,7 @@ async fn federation_make_join(
         .make_join_template(&room_id, &user_id)
         .map_err(room_error)?;
     Ok(Json(json!({
-        "room_version": crate::rooms::ROOM_VERSION,
+        "room_version": version,
         "event": event,
     })))
 }
@@ -2617,13 +2629,23 @@ async fn federation_invite(
 
     // The version check comes first: an event from a room version this
     // server does not speak cannot be reasoned about, let alone signed.
-    if body["room_version"].as_str() != Some(crate::rooms::ROOM_VERSION) {
+    //
+    // The question here is *can we speak this*, not *is this our default*,
+    // and the difference is not pedantry. An invite is for a remote room
+    // this server has no state for, so there is nothing to look the version
+    // up from -- the body's `room_version` is the only statement of it, and
+    // the spec puts it there for exactly that reason. Comparing it against
+    // one hardcoded version happened to behave identically only because the
+    // supported list has one entry, and would start silently refusing
+    // invites the moment it had two.
+    let offered = body["room_version"].as_str().unwrap_or_default();
+    if !crate::surface::supports_room_version(offered) {
         return Err(MatrixError::new(
             StatusCode::BAD_REQUEST,
             "M_INCOMPATIBLE_ROOM_VERSION",
             format!(
-                "this server speaks room version {} only",
-                crate::rooms::ROOM_VERSION
+                "this server speaks room versions {}",
+                crate::surface::ROOM_VERSIONS.join(", ")
             ),
         ));
     }

@@ -57,6 +57,28 @@ pub const ROOM_VERSIONS: &[&str] = &["11"];
 /// The default room version.
 pub const DEFAULT_ROOM_VERSION: Option<&str> = Some("11");
 
+/// Whether this server can speak a room version, by name.
+///
+/// The single place that question is answered, because it was previously
+/// answered three different ways: `/createRoom` ignored the client's
+/// requested version outright, `make_join` compared the peer's `ver` list
+/// against a literal `"ver=11"`, and the federated invite compared the
+/// body's version against `rooms::ROOM_VERSION`. Three spellings of one
+/// question is how they drift apart — and each of the three was really
+/// asking *is this in [`ROOM_VERSIONS`]*, which is the list
+/// `/capabilities` already advertises.
+///
+/// Keeping it here rather than in `rooms.rs` is deliberate: this is a
+/// statement about what the *server* advertises, not about what any
+/// particular room is. A room's own version comes from its create event
+/// (`Rooms::room_version`), and the two must not be confused — that
+/// confusion is what made `make_join` tell a peer "this room is version
+/// 11" about a room whose version it had never looked at.
+#[must_use]
+pub fn supports_room_version(version: &str) -> bool {
+    ROOM_VERSIONS.contains(&version)
+}
+
 /// Routes that must be mounted before *any* room version may be advertised.
 ///
 /// Without this, [`ROOM_VERSIONS`] is a bare list with nothing holding it to
