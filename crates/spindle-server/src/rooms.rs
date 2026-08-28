@@ -417,6 +417,14 @@ impl Rooms {
         reason: Option<&str>,
         key: &Ed25519KeyPair,
     ) -> Result<String, RoomError> {
+        // An administratively blocked room refuses every join. The check
+        // sits here rather than in a route so that every local join path
+        // — direct, via alias, accepting an invite — hits it.
+        if membership == JOIN_STR && self.room_block(room_id)?.is_some() {
+            return Err(RoomError::Forbidden(
+                "this room is blocked by a server administrator".to_owned(),
+            ));
+        }
         let mut content = serde_json::json!({ "membership": membership });
         // Absent rather than null when there is no reason: `reason` is part of
         // the event content, so it is covered by the signature and by the
@@ -1023,6 +1031,11 @@ impl Rooms {
     /// [`RoomError::UnknownRoom`] when the room is not here,
     /// [`RoomError::Forbidden`] when the rules do not admit the user.
     pub fn make_join_template(&self, room_id: &str, user_id: &str) -> Result<Value, RoomError> {
+        if self.room_block(room_id)?.is_some() {
+            return Err(RoomError::Forbidden(
+                "this room is blocked by a server administrator".to_owned(),
+            ));
+        }
         self.with_room(room_id, |rooms, log| {
             let head = log
                 .entries()
@@ -1732,6 +1745,36 @@ impl Rooms {
             });
         }
         Ok((out, next))
+    }
+
+    /// Why an administrator blocked this room, if one did.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the row cannot be read.
+    pub fn room_block(&self, room_id: &str) -> Result<Option<Value>, RoomError> {
+        Ok(spindle_store::ReadView::get(
+            self.store.as_ref(),
+            &spindle_core::keys::room_block(room_id),
+        )?
+        .and_then(|raw| serde_json::from_slice(&raw).ok()))
+    }
+
+    /// Record an administrative block. The row's presence is the block;
+    /// the record says who and when for the audit trail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the store cannot be written.
+    pub fn set_room_block(&self, room_id: &str, record: &Value) -> Result<(), RoomError> {
+        spindle_store::Store::put(
+            self.store.as_ref(),
+            &spindle_core::keys::room_block(room_id),
+            serde_json::to_vec(record)
+                .map_err(|error| RoomError::Codec(error.to_string()))?
+                .as_slice(),
+        )?;
+        Ok(())
     }
 
     /// The first `li` NOT covered by a history purge, if one ever ran.
