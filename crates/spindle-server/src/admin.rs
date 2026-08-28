@@ -868,7 +868,7 @@ async fn delete_room(
             })?;
             let new_room = state
                 .rooms
-                .create(creator, state.key.pair(), None, None, None, &[])
+                .create(creator, state.key.pair(), None, None, None, &[], None)
                 .map_err(crate::routes::room_error)?;
             if let Some(message) = &request.message {
                 state
