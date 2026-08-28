@@ -2342,12 +2342,13 @@ async fn federation_make_leave(
             "the user does not live on the requesting server",
         ));
     }
+    let version = state.rooms.room_version(&room_id).map_err(room_error)?;
     let event = state
         .rooms
         .make_leave_template(&room_id, &user_id)
         .map_err(room_error)?;
     Ok(Json(json!({
-        "room_version": crate::rooms::ROOM_VERSION,
+        "room_version": version.as_str(),
         "event": event,
     })))
 }
@@ -2373,12 +2374,13 @@ async fn federation_make_knock(
             "the user does not live on the requesting server",
         ));
     }
+    let version = state.rooms.room_version(&room_id).map_err(room_error)?;
     let event = state
         .rooms
         .make_knock_template(&room_id, &user_id)
         .map_err(room_error)?;
     Ok(Json(json!({
-        "room_version": crate::rooms::ROOM_VERSION,
+        "room_version": version.as_str(),
         "event": event,
     })))
 }
@@ -3629,7 +3631,17 @@ async fn join(
 /// left it out, content-hash and sign it as ours, and name it by its
 /// reference hash — exactly what the resident's `send_join`/`send_leave`
 /// will verify.
-fn sign_membership_template(state: &AppState, template: &Value) -> Result<(String, Value), String> {
+///
+/// `version` is the room's, as the resident named it in the `make_join` or
+/// `make_leave` response — not this build's default. The two agree only
+/// when the room happens to be the default version, and the hash the
+/// resident checks is computed under the room's rules, so signing under
+/// ours would produce an event nobody could name.
+fn sign_membership_template(
+    state: &AppState,
+    template: &Value,
+    version: &ruma::RoomVersionId,
+) -> Result<(String, Value), String> {
     let Ok(ruma::CanonicalJsonValue::Object(mut canonical)) =
         ruma::CanonicalJsonValue::try_from(template.clone())
     else {
@@ -3645,9 +3657,8 @@ fn sign_membership_template(state: &AppState, template: &Value) -> Result<(Strin
             ruma::CanonicalJsonValue::Integer(ruma::Int::try_from(now).unwrap_or_default()),
         );
     }
-    let rules = ruma::RoomVersionId::try_from(crate::rooms::ROOM_VERSION)
-        .ok()
-        .and_then(|version| version.rules())
+    let rules = version
+        .rules()
         .ok_or_else(|| "the room version rules are unavailable".to_owned())?;
     ruma::signatures::hash_and_sign_event(
         &state.config.server.name,
@@ -3787,12 +3798,28 @@ async fn join_remote(
 
     let mut last_refusal = String::new();
     for server in &candidates {
-        let template = match state
+        let (template, version) = match state
             .federation
             .remote_make_join(server, room_id, user_id)
             .await
         {
-            Ok(body) => body["event"].clone(),
+            Ok(body) => {
+                // The resident names the room's version, and this server
+                // asked only for versions it speaks -- but a peer is not
+                // obliged to answer with one of them, and signing under a
+                // version we cannot parse would mint an unnameable event.
+                let named = body["room_version"].as_str().unwrap_or_default();
+                match ruma::RoomVersionId::try_from(named) {
+                    Ok(version) if crate::surface::supports_room_version(named) => {
+                        (body["event"].clone(), version)
+                    }
+                    _ => {
+                        last_refusal =
+                            format!("{server}: the room is version {named}, which we do not speak");
+                        continue;
+                    }
+                }
+            }
             Err(error) => {
                 last_refusal = error.to_string();
                 continue;
@@ -3801,7 +3828,7 @@ async fn join_remote(
 
         // Finish the template: timestamp, content hash, our signature —
         // exactly what a resident server's send_join will verify.
-        let (join_id, join) = match sign_membership_template(state, &template) {
+        let (join_id, join) = match sign_membership_template(state, &template, &version) {
             Ok(signed) => signed,
             Err(error) => {
                 last_refusal = format!("{server}: {error}");
@@ -3895,18 +3922,29 @@ async fn leave_room(
 /// where it cannot be helped.
 async fn reject_remote_invite(state: &AppState, user_id: &str, room_id: &str) {
     for server in join_candidates(state, user_id, room_id, &[]) {
-        let template = match state
+        let (template, version) = match state
             .federation
             .remote_make_leave(&server, room_id, user_id)
             .await
         {
-            Ok(body) => body["event"].clone(),
+            Ok(body) => {
+                let named = body["room_version"].as_str().unwrap_or_default();
+                match ruma::RoomVersionId::try_from(named) {
+                    Ok(version) if crate::surface::supports_room_version(named) => {
+                        (body["event"].clone(), version)
+                    }
+                    _ => {
+                        tracing::debug!("make_leave via {server}: room version {named}");
+                        continue;
+                    }
+                }
+            }
             Err(error) => {
                 tracing::debug!("make_leave via {server}: {error}");
                 continue;
             }
         };
-        let (event_id, leave) = match sign_membership_template(state, &template) {
+        let (event_id, leave) = match sign_membership_template(state, &template, &version) {
             Ok(signed) => signed,
             Err(error) => {
                 tracing::debug!("leave template via {server}: {error}");

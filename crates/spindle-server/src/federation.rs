@@ -339,7 +339,18 @@ impl Federation {
         room_id: &str,
         user_id: &str,
     ) -> Result<Value, FederationError> {
-        let uri = format!("/_matrix/federation/v1/make_join/{room_id}/{user_id}?ver=11");
+        // Every version this server can actually join a room at, not one
+        // literal. The resident answers with the room's real version and
+        // refuses if it is absent from this list (#201 made it stop
+        // guessing), so a hardcoded `ver=11` is this server declaring it
+        // cannot speak a version it creates rooms at -- and it could not:
+        // no Spindle server could federate into another's v12 room.
+        let versions = crate::surface::ROOM_VERSIONS
+            .iter()
+            .map(|version| format!("ver={version}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let uri = format!("/_matrix/federation/v1/make_join/{room_id}/{user_id}?{versions}");
         let authorization = self.sign_request("GET", &uri, destination, None)?;
         let response = self
             .client

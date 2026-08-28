@@ -613,3 +613,83 @@ async fn the_whole_restricted_room_sequence_holds_across_two_servers() {
     let (status, body) = local.join_via(&room, &bob, &remote.name).await;
     assert_eq!(status, 200, "PROBE join right after the invite: {body}");
 }
+
+#[tokio::test]
+async fn a_room_at_a_version_this_server_creates_is_one_it_can_also_join() {
+    let remote = Instance::start().await;
+    let local = Instance::start().await;
+    let alice = remote.register("alice").await;
+    let bob = local.register("bob").await;
+
+    let (status, body) = remote
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(&json!({ "room_version": "12", "preset": "public_chat" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    // MSC4291: the ID is the create event's hash and names no server, so
+    // `server_name` is the only thing that can point at the resident. There
+    // is no domain in the ID to fall back on.
+    assert!(!room.contains(':'), "{room}");
+    remote.say(&room, &alice, "before the join").await;
+
+    // This is what `/capabilities` promises when it lists v12 as available:
+    // not that a room can be created at it, but that it is a room. Until
+    // the `ver=` list stopped being one literal, no Spindle server could
+    // join another Spindle server's v12 room -- the resident answered "12"
+    // truthfully and the asker had said it spoke only 11.
+    let (status, body) = local.join_via(&room, &bob, &remote.name).await;
+    assert_eq!(status, 200, "{body}");
+
+    let bob_id = format!("@bob:{}", local.name);
+    assert!(
+        local
+            .joined_members(&room, &bob)
+            .await
+            .get(&bob_id)
+            .is_some(),
+        "the joining server records the join"
+    );
+    assert!(
+        eventually(async || {
+            remote
+                .joined_members(&room, &alice)
+                .await
+                .get(&bob_id)
+                .is_some()
+        })
+        .await,
+        "the resident server records the join"
+    );
+    // The seeded state came from the resident's state and auth chain, which
+    // at v12 includes a create event carrying no `room_id` at all -- the one
+    // event whose shape MSC4291 changed. Reading it back proves the joining
+    // server stored it under the right room rather than discarding it for
+    // not naming one.
+    let (status, create) = local
+        .request(
+            reqwest::Method::GET,
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.create"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{create}");
+    assert_eq!(create["room_version"], "12", "{create}");
+
+    local.say(&room, &bob, "after the join").await;
+    assert!(
+        eventually(async || {
+            remote
+                .messages(&room, &alice)
+                .await
+                .contains(&"after the join".to_owned())
+        })
+        .await,
+        "the joiner can write into the room it joined"
+    );
+}
