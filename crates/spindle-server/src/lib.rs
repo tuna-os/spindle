@@ -32,6 +32,7 @@ pub mod ratelimit;
 pub mod rooms;
 pub mod routes;
 pub mod s3;
+pub mod secrets;
 pub mod signing;
 pub mod sliding;
 pub mod surface;

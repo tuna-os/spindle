@@ -31,7 +31,6 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Digest;
@@ -676,7 +675,7 @@ fn oauth_error(status: StatusCode, code: &'static str, description: &str) -> OAu
 
 fn random_hex(bytes: usize) -> String {
     let mut raw = vec![0_u8; bytes];
-    rand::rngs::OsRng.fill_bytes(&mut raw);
+    crate::secrets::fill(&mut raw);
     raw.iter().fold(String::new(), |mut out, byte| {
         use std::fmt::Write as _;
         let _ = write!(out, "{byte:02x}");

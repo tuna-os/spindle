@@ -368,10 +368,9 @@ fn normalize_dimensions(width: u32, height: u32) -> (u32, u32) {
 /// header gives: a hash-addressed URL is an existence oracle. 32 hex
 /// characters is 128 bits, which is not guessable by anyone.
 fn random_media_id() -> String {
-    use rand::RngCore as _;
     use std::fmt::Write as _;
     let mut bytes = [0_u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    crate::secrets::fill(&mut bytes);
     bytes
         .iter()
         .fold(String::with_capacity(32), |mut id, byte| {
