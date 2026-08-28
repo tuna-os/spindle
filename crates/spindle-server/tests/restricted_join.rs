@@ -408,3 +408,43 @@ async fn a_v12_room_nominates_a_creator_no_power_levels_event_can_name() {
          the rules refuse at invite level 60: {content}"
     );
 }
+
+#[tokio::test]
+async fn a_client_cannot_put_its_own_authorising_user_on_a_member_event() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+
+    let space = harness.public_room(&alice).await;
+    let room = harness.restricted_room(&alice, "restricted", &[&space]).await;
+    harness.join(&space, &bob).await;
+    assert_eq!(harness.join(&room, &bob).await.0, StatusCode::OK);
+
+    // Complement sends exactly this on a join -> join transition, to check
+    // it is ignored. Taken at face value it would be signed into the event,
+    // and every peer that received it would try to fetch keys for the
+    // server of a user ID that is not a user ID -- refusing the event, and
+    // then refusing whatever cited it next.
+    let (status, body) = harness
+        .put(
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.member/@bob:example.org"),
+            &bob,
+            &json!({
+                "membership": "join",
+                "displayname": "Bobby",
+                "join_authorised_via_users_server": "unused",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let content = harness
+        .member_content(&room, &alice, "@bob:example.org")
+        .await;
+    assert_eq!(content["displayname"], "Bobby", "{content}");
+    assert_eq!(
+        content["join_authorised_via_users_server"],
+        Value::Null,
+        "the client's claim reached the signed event: {content}"
+    );
+}
