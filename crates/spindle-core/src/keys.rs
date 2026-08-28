@@ -261,6 +261,15 @@ pub enum Keyspace {
     /// block is lifted. Its presence is the block; the value records who
     /// and when, for the audit trail's benefit.
     RoomBlock = 0x28,
+    /// `(user_id, room_id)` -> `{origin, knock_state}` for a knock on a room
+    /// this server holds no log for.
+    ///
+    /// The same shape as [`Keyspace::PendingInvite`] and deliberately not the
+    /// same row: a knock is a request the room has not answered, and an
+    /// invite is an answer. Filed together, a client would be shown a room
+    /// it may enter when nobody has said it may — so the two never share a
+    /// key, and `stripped_state` reads whichever one stands.
+    PendingKnock = 0x29,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes

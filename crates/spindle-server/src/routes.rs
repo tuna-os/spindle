@@ -3422,10 +3422,12 @@ async fn knock_room(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
     axum::extract::Path(room_id_or_alias): axum::extract::Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, MatrixError> {
     let request: SelfMembershipRequest = optional_body(&body)?;
-    let room_id = resolve_room_target(&state, &room_id_or_alias)?;
+    let mut servers = server_name_params(query.as_deref());
+    let room_id = resolve_room_target(&state, &room_id_or_alias, &mut servers).await?;
     match state.rooms.set_membership(
         &room_id,
         &identity.user_id,
@@ -3438,41 +3440,219 @@ async fn knock_room(
             state.rooms.wake_sync_waiters();
             Ok(Json(json!({ "room_id": room_id })))
         }
-        // A room this server does not hold needs `make_knock`/`send_knock`
-        // against a server that does, which is the next slice. Saying so is
-        // better than a 404 that reads as "no such room": the room may be
-        // perfectly real and simply elsewhere.
-        Err(crate::rooms::RoomError::UnknownRoom(_)) => Err(MatrixError::new(
-            StatusCode::NOT_FOUND,
-            "M_NOT_FOUND",
-            format!(
-                "{room_id} is not on this server, and knocking over federation is not implemented"
-            ),
-        )),
+        // A room this server does not hold is knocked on through a server
+        // that does, over `make_knock`/`send_knock`.
+        Err(crate::rooms::RoomError::UnknownRoom(_)) => {
+            knock_remote(
+                &state,
+                &identity.user_id,
+                &room_id,
+                request.reason.as_deref(),
+                &servers,
+            )
+            .await
+        }
         Err(error) => Err(room_error(error)),
     }
 }
 
-/// A room ID, or the room a local alias names.
+/// Walk the `make_knock`/`send_knock` handshake as the knocking server.
 ///
-/// Only local aliases: resolving a remote one is a federation round trip
-/// that only matters once the knock itself can cross a server boundary.
-fn resolve_room_target(state: &AppState, room_id_or_alias: &str) -> Result<String, MatrixError> {
+/// Deliberately not a smaller `join_remote`. A join ends with this server
+/// holding the room: `send_join` hands back the state and the auth chain to
+/// seed it from. A knock ends with this server holding *nothing* — the
+/// knocker is not a member, so no peer will send us the room's events, and
+/// `send_knock` hands back only the stripped view the knocker may render
+/// while they wait. What is recorded is therefore a side row, not a log.
+async fn knock_remote(
+    state: &AppState,
+    user_id: &str,
+    room_id: &str,
+    reason: Option<&str>,
+    servers: &[String],
+) -> Result<Json<Value>, MatrixError> {
+    let candidates = join_candidates(state, user_id, room_id, servers);
+    if candidates.is_empty() {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            format!("{room_id} is not on this server and no server_name was given"),
+        ));
+    }
+
+    let mut last_refusal = String::new();
+    // A status a resident *chose* outranks anything a later candidate does,
+    // because it is the room's own answer. Without this, a room that says
+    // "no" and a network that says nothing reach the client identically,
+    // and only one of them is worth retrying.
+    let mut answered: Option<MatrixError> = None;
+    for server in &candidates {
+        let (mut template, version) = match state
+            .federation
+            .remote_make_knock(server, room_id, user_id)
+            .await
+        {
+            Ok((status, body)) if !(200..300).contains(&status) => {
+                if answered.is_none() {
+                    answered = Some(relayed_refusal(status, &body));
+                }
+                last_refusal = format!("{server} refused make_knock: {status} {body}");
+                continue;
+            }
+            Ok((_, body)) => {
+                let named = body["room_version"].as_str().unwrap_or_default();
+                match ruma::RoomVersionId::try_from(named) {
+                    Ok(version) if crate::surface::supports_room_version(named) => {
+                        (body["event"].clone(), version)
+                    }
+                    _ => {
+                        last_refusal =
+                            format!("{server}: the room is version {named}, which we do not speak");
+                        continue;
+                    }
+                }
+            }
+            Err(error) => {
+                last_refusal = error.to_string();
+                continue;
+            }
+        };
+
+        // The reason is the knocker's, so it goes on after the template. A
+        // resident server has no way to know it, and a template that came
+        // back already carrying one would be the resident putting words in
+        // the knocker's mouth.
+        if let Some(reason) = reason {
+            template["content"]["reason"] = json!(reason);
+        }
+
+        let (knock_id, knock) = match sign_membership_template(state, &template, &version) {
+            Ok(signed) => signed,
+            Err(error) => {
+                last_refusal = format!("{server}: {error}");
+                continue;
+            }
+        };
+
+        let response = match state
+            .federation
+            .remote_send_knock(server, room_id, &knock_id, &knock)
+            .await
+        {
+            Ok((status, body)) if !(200..300).contains(&status) => {
+                if answered.is_none() {
+                    answered = Some(relayed_refusal(status, &body));
+                }
+                last_refusal = format!("{server} refused send_knock: {status} {body}");
+                continue;
+            }
+            Ok((_, body)) => body,
+            Err(error) => {
+                last_refusal = error.to_string();
+                continue;
+            }
+        };
+
+        let knock_state = response["knock_room_state"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        state
+            .rooms
+            .record_pending_knock(user_id, room_id, server, &knock_state)
+            .map_err(room_error)?;
+        state.rooms.wake_sync_waiters();
+        return Ok(Json(json!({ "room_id": room_id })));
+    }
+
+    Err(answered.unwrap_or_else(|| {
+        MatrixError::new(
+            StatusCode::BAD_GATEWAY,
+            "M_UNKNOWN",
+            format!("no server admitted the knock: {last_refusal}"),
+        )
+    }))
+}
+
+/// A resident server's refusal, relayed to the client as its own.
+///
+/// The knocking server has nothing to add: it asked on the user's behalf and
+/// the room said no. Re-coding that as a 502 would tell the client to retry
+/// something that will be refused every time.
+fn relayed_refusal(status: u16, body: &Value) -> MatrixError {
+    // `errcode` is a `&'static str` precisely so a code cannot be invented,
+    // and a peer's string is not static -- so it is matched against the
+    // codes this path can produce rather than passed through. Anything else
+    // becomes M_FORBIDDEN, which is what a refusal without a recognised code
+    // amounts to: the room said no and would not say why in a way we speak.
+    const RELAYED: &[&str] = &[
+        "M_FORBIDDEN",
+        "M_NOT_FOUND",
+        "M_UNSUPPORTED_ROOM_VERSION",
+        "M_INCOMPATIBLE_ROOM_VERSION",
+        "M_BAD_JSON",
+        "M_UNKNOWN",
+    ];
+    let theirs = body["errcode"].as_str().unwrap_or_default();
+    let errcode = RELAYED
+        .iter()
+        .find(|known| **known == theirs)
+        .copied()
+        .unwrap_or("M_FORBIDDEN");
+    MatrixError::new(
+        StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
+        errcode,
+        body["error"]
+            .as_str()
+            .unwrap_or("the room refused the knock")
+            .to_owned(),
+    )
+}
+
+/// A room ID, or the room an alias names — appending every server the
+/// resolution turns up to `servers`.
+///
+/// A remote alias is the owning server's to resolve, exactly as on the join
+/// path, and the servers it names are the ones that can broker the request:
+/// without them a knock on `#room:elsewhere` would resolve and then have
+/// nowhere to send the knock.
+async fn resolve_room_target(
+    state: &AppState,
+    room_id_or_alias: &str,
+    servers: &mut Vec<String>,
+) -> Result<String, MatrixError> {
     if !room_id_or_alias.starts_with('#') {
         return Ok(room_id_or_alias.to_owned());
     }
-    state
+    if let Some(record) = state
         .directory
         .resolve(room_id_or_alias)
         .map_err(|error| directory_error(&error))?
-        .map(|record| record.room_id)
-        .ok_or_else(|| {
-            MatrixError::new(
-                StatusCode::NOT_FOUND,
-                "M_NOT_FOUND",
-                format!("no room is called {room_id_or_alias}"),
-            )
-        })
+    {
+        return Ok(record.room_id);
+    }
+    if let Some((_, domain)) = room_id_or_alias.split_once(':')
+        && domain != state.config.server.name
+        && let Ok(answer) = state
+            .federation
+            .remote_query_directory(domain, room_id_or_alias)
+            .await
+        && let Some(room_id) = answer["room_id"].as_str()
+    {
+        for named in answer["servers"].as_array().into_iter().flatten() {
+            if let Some(named) = named.as_str()
+                && !servers.iter().any(|server| server == named)
+            {
+                servers.push(named.to_owned());
+            }
+        }
+        return Ok(room_id.to_owned());
+    }
+    Err(MatrixError::new(
+        StatusCode::NOT_FOUND,
+        "M_NOT_FOUND",
+        format!("no room is called {room_id_or_alias}"),
+    ))
 }
 
 /// `POST /_matrix/client/v3/join/{room_id_or_alias}`
