@@ -2254,7 +2254,9 @@ impl Rooms {
         // the caller, or an append landing in between is missed and the client
         // waits out the full timeout for news that already arrived.
         let notified = self.appended.notified();
+        crate::metrics::sync_waiter_started();
         let _ = tokio::time::timeout(timeout, notified).await;
+        crate::metrics::sync_waiter_finished();
     }
 
     /// Everything that happened after `since`, grouped by room.
@@ -2305,6 +2307,28 @@ impl Rooms {
         }
 
         let left = self.left_rooms(user_id, since, position)?;
+
+        // How stale was the freshest thing we just handed over? A client
+        // keeping up sees milliseconds; a server falling behind sees this
+        // climb, which is the symptom #19's exit criteria ask to alert
+        // on. Only when something was delivered — an empty sync is a
+        // client that is up to date, not a lagging one, and counting it
+        // as zero would flatten the average that matters.
+        if let Some(newest) = rooms
+            .iter()
+            .flat_map(|room| room.events.iter())
+            .filter_map(|event| event["origin_server_ts"].as_u64())
+            .max()
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since_epoch| {
+                    u64::try_from(since_epoch.as_millis()).unwrap_or(u64::MAX)
+                });
+            crate::metrics::observe_sync_lag(std::time::Duration::from_millis(
+                now.saturating_sub(newest),
+            ));
+        }
 
         Ok(SyncResult {
             next_batch: position,

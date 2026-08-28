@@ -797,6 +797,15 @@ pub async fn drain_outbox(
         for destination in federation.edu_destinations() {
             by_destination.entry(destination).or_default();
         }
+        // The loop already holds the whole picture, so the gauge is set
+        // from it rather than counted separately — a second traversal
+        // could disagree with the one that actually delivers.
+        crate::metrics::set_federation_queue(
+            &by_destination
+                .iter()
+                .map(|(destination, rows)| (destination.clone(), rows.len() as u64))
+                .collect::<Vec<_>>(),
+        );
         if by_destination.is_empty() {
             continue;
         }
