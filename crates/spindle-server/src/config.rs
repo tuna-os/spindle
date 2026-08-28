@@ -27,6 +27,22 @@ pub struct Config {
     pub appservices: AppservicesConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+/// The operational scrape surface (#166).
+///
+/// Off unless `bind` is set, and bound to loopback in every example,
+/// because the exposition names peers this server talks to and the
+/// volumes it carries. It is an operator's surface, not a public one —
+/// so it gets its own listener rather than a path on the one the
+/// internet reaches.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MetricsConfig {
+    /// `address:port` to serve `/metrics` on. Absent means no listener,
+    /// which is the default.
+    pub bind: Option<String>,
 }
 
 /// How callers prove who they are.

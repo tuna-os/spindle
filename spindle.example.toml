@@ -31,6 +31,13 @@ path = "./data"
 # for both options.
 # builtin_oidc = false
 
+[metrics]
+# Prometheus scrape surface, off unless this is set. Its own listener, on
+# loopback: the exposition names the peers this server federates with and
+# the volume it carries, so it is an operator's surface rather than a
+# public one. See docs/metrics.md.
+# bind = "127.0.0.1:9090"
+
 [logging]
 # A `tracing-subscriber` filter directive.
 # filter = "spindle=debug,warn"

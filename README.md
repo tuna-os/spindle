@@ -93,6 +93,11 @@ running Spindle behind a real Matrix Authentication Service — the config
 on both sides, what turns off, the revocation window, and what an
 unmodified MAS release binary has been proven to do against it.
 
+**[docs/metrics.md](docs/metrics.md)** — what Spindle exports and how to
+read it, including the one number the architecture is falsified by: the
+SPEC §9.2 fork-case split, whose case 3 is the expensive path §18.3 says
+must stay under 0.1% of federated events.
+
 **[docs/divergence.md](docs/divergence.md)** — the seam: what we inherit
 unchanged from the Matrix spec, ruma and Complement, what is genuinely ours
 (the linear index, the state trie, the bounded fork window, the log chain,

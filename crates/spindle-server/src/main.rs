@@ -64,6 +64,7 @@ async fn main() -> ExitCode {
 
     let bind = config.server.bind.clone();
     let name = config.server.name.clone();
+    let metrics_bind = config.metrics.bind.clone();
     let federation_bind = config.federation.bind.clone();
     let federation_tls = config
         .federation
@@ -102,6 +103,17 @@ async fn main() -> ExitCode {
     // says so and exits.
     if let Some(fed_bind) = federation_bind
         && !serve_federation(&fed_bind, federation_tls, &name, service.clone()).await
+    {
+        return ExitCode::FAILURE;
+    }
+
+    // The scrape surface (#166), on its own listener so it is not reachable
+    // wherever the client API is. Failing to bind is fatal for the same
+    // reason it is for federation: a server configured to be observable
+    // that silently is not will be discovered during the incident it was
+    // meant to explain.
+    if let Some(metrics_bind) = metrics_bind
+        && !serve_metrics(&metrics_bind).await
     {
         return ExitCode::FAILURE;
     }
@@ -164,6 +176,36 @@ fn promote_admin(config_path: &str, localpart: &str) -> ExitCode {
 /// Returns false when the configuration cannot be served — missing TLS
 /// material, unloadable PEM, an unparseable bind — because each of those is
 /// a server that was told to federate and cannot.
+/// Serve `GET /metrics` on its own listener.
+async fn serve_metrics(bind: &str) -> bool {
+    let listener = match TcpListener::bind(bind).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::error!("cannot bind the metrics listener {bind}: {error}");
+            return false;
+        }
+    };
+    let app = axum::Router::new().route(
+        "/metrics",
+        axum::routing::get(|| async {
+            (
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )],
+                spindle_server::metrics::render(),
+            )
+        }),
+    );
+    tracing::info!("metrics listening on {bind}");
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app).await {
+            tracing::error!("metrics listener stopped: {error}");
+        }
+    });
+    true
+}
+
 async fn serve_federation(
     bind: &str,
     tls_material: Option<(std::path::PathBuf, std::path::PathBuf)>,
