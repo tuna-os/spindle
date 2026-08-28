@@ -15,7 +15,7 @@
 //! room is loaded once and kept, which is the shape SPEC §15's per-room executor
 //! takes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::authorize::StoredEvent;
@@ -579,9 +579,66 @@ impl Rooms {
     /// Returns [`RoomError`] if the room is unknown or an event body is
     /// missing.
     pub fn state(&self, room_id: &str) -> Result<Vec<Value>, RoomError> {
+        self.state_where(room_id, |_| true)
+    }
+
+    /// The state block for one room on an initial sync.
+    ///
+    /// With `lazy_members`, membership is narrowed to the senders the
+    /// client is about to see in this room's timeline, plus the syncing
+    /// user's own — the spec permits redundant members, and a client that
+    /// cannot find itself in the state it was sent tends to conclude it is
+    /// not in the room.
+    ///
+    /// The senders here are the *unfiltered* timeline's. A client filter
+    /// may drop timeline events further up, which can only make the needed
+    /// set smaller, so this errs towards sending a member event that turns
+    /// out to be unnecessary rather than withholding one that was. The
+    /// exact narrowing still happens where the filter is applied; what this
+    /// removes is the cost of reading the bodies.
+    fn initial_state(
+        &self,
+        room_id: &str,
+        user_id: &str,
+        lazy_members: bool,
+        timeline: &[Value],
+    ) -> Result<Vec<Value>, RoomError> {
+        if !lazy_members {
+            return self.state(room_id);
+        }
+        let mut needed: HashSet<&str> = timeline
+            .iter()
+            .filter_map(|event| event["sender"].as_str())
+            .collect();
+        needed.insert(user_id);
+        self.state_where(room_id, |key| {
+            key.event_type().as_str() != "m.room.member" || needed.contains(key.state_key())
+        })
+    }
+
+    /// The current state, skipping keys the caller does not want.
+    ///
+    /// The predicate sees the state *key*, which is the whole point: the
+    /// key is already in hand from the trie, and deciding on it means an
+    /// unwanted event is never read from the store and never parsed. A
+    /// caller that filters the returned vector instead has already paid
+    /// for everything it throws away.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room is unknown or an event body is
+    /// missing.
+    pub fn state_where(
+        &self,
+        room_id: &str,
+        want: impl Fn(&StateKey) -> bool,
+    ) -> Result<Vec<Value>, RoomError> {
         let ids = self.with_room(room_id, |_, log| Ok(current_state(log)))?;
         let mut events = Vec::with_capacity(ids.len());
-        for (_, event_id) in ids {
+        for (key, event_id) in ids {
+            if !want(&key) {
+                continue;
+            }
             // `read_event` directly rather than `event()`: the room's
             // existence is already established, and `event()` would take
             // the room lock once per state event just to re-prove it.
@@ -2342,6 +2399,12 @@ impl Rooms {
     /// of the global stream from `since`, which is the cheap case and the
     /// common one.
     ///
+    /// `lazy_members` is the client's filter asking not to be sent the
+    /// roster. It is answered *here*, in the read, rather than by filtering
+    /// what this returns: in a large room the roster is the initial sync,
+    /// and a caller that narrows afterwards has already read and parsed
+    /// every member body it then discards.
+    ///
     /// # Errors
     ///
     /// Returns [`RoomError`] if the stream or an event cannot be read.
@@ -2350,6 +2413,7 @@ impl Rooms {
         user_id: &str,
         since: Option<u64>,
         timeline_limit: usize,
+        lazy_members: bool,
     ) -> Result<SyncResult, RoomError> {
         let position = self.stream_position();
         let joined = self.joined(user_id)?;
@@ -2373,7 +2437,7 @@ impl Rooms {
                 // events are in the timeline already, and sending them twice
                 // would make a client apply each one twice.
                 state: if since.is_none() {
-                    self.state(&room_id)?
+                    self.initial_state(&room_id, user_id, lazy_members, &events)?
                 } else {
                     Vec::new()
                 },
