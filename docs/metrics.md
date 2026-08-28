@@ -28,6 +28,9 @@ the incident it was supposed to explain.
 | `spindle_build_info` | gauge | `version` | Which build the dashboard is watching. Always `1`. |
 | `spindle_events_appended_total` | counter | `origin` = `local`\|`federated` | Events that reached a room log. The denominator below. |
 | `spindle_fork_resolutions_total` | counter | `case` = `1`\|`2`\|`3` | Which of SPEC §9.2's three cases carried each append. |
+| `spindle_append_duration_seconds` | histogram | `durability` | Time to commit one event, timed around the commit itself. |
+| `spindle_http_requests_total` | counter | `route`, `method`, `status` | Requests served. |
+| `spindle_http_request_duration_seconds` | histogram | `route` | Time to serve one request. |
 
 ## The one that matters
 
@@ -86,11 +89,35 @@ event before and after that lands — but until it does, a non-zero case 3
 means "a contested state event arrived and was rejected", not "a
 resolution ran".
 
+## Checking the latency targets
+
+SPEC §18.3 states local send at **p50 < 2 ms, p99 < 10 ms** against
+`group` durability, which is what `spindle_append_duration_seconds`
+measures — the commit, not the whole request, because that is what the
+target describes. Buckets are weighted to straddle those numbers
+(0.5 ms, 1 ms, 2 ms, 5 ms, 10 ms, …) rather than using the default set
+most libraries ship, which starts at 5 ms and would put every one of
+these appends in the first bucket and answer nothing.
+
+```promql
+histogram_quantile(0.99,
+  rate(spindle_append_duration_seconds_bucket{durability="group"}[5m]))
+```
+
+The HTTP histogram answers the same question one layer out, per route.
+`route` is the router's **matched path** — `/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}`,
+never the path that was requested. That is what keeps the label set
+bounded by the code (101 routes today) rather than by the room and user
+IDs a caller happens to use; a test asserts that a room ID appears
+nowhere in the exposition. Requests that match no route are counted
+under a single `unmatched` label, so a scanner walking random URLs is
+not an unbounded source of series.
+
 ## What is not here yet
 
-Per #166, in order: append-latency and HTTP histograms (slice 2);
-federation queue depth, state-trie cache hit rate, sync subscriber count
-and watermark lag (slice 3); OpenTelemetry traces (slice 4).
+Per #166, in order: federation queue depth, state-trie cache hit rate,
+sync subscriber count and watermark lag (slice 3); OpenTelemetry traces
+(slice 4).
 
 Per-room series are deliberately absent and will stay that way. A server
 with 10,000 rooms would mint tens of thousands of mostly-idle series, and

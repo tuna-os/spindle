@@ -3497,7 +3497,13 @@ impl Rooms {
             }
             .encode(),
         ));
+        // Timed here rather than around the whole handler: this is the
+        // commit SPEC §18.3's local-send target is about, and wrapping
+        // the handler would fold request parsing and authorization into
+        // a number the target does not describe.
+        let started = std::time::Instant::now();
         room_store.commit_entry_with(entry, log, &extra, Durability::Group)?;
+        crate::metrics::observe_append("group", started.elapsed());
         *stream = stream_id;
         drop(stream);
 

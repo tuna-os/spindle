@@ -184,3 +184,120 @@ fn the_contested_case_is_wired_and_visible() {
         "case 3 must have a series even at zero"
     );
 }
+
+/// Pull one counter or bucket value out of a scrape.
+///
+/// `u64` rather than `f64`: every series asserted here is a count, and
+/// comparing counts as floats is both imprecise and a lint away from
+/// being wrong. Only `_sum` is fractional, and nothing here asserts it.
+fn scrape(text: &str, needle: &str) -> Option<u64> {
+    text.lines()
+        .find(|line| line.starts_with(needle))
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse().ok())
+}
+
+#[tokio::test]
+async fn serving_a_request_times_it_under_its_matched_route() {
+    let server = Instance::start().await;
+    let token = server.register("carol").await;
+
+    // A route with parameters in it, so the label can be checked against
+    // the template rather than the path that was actually requested.
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/createRoom",
+            Some(&token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/tx1"),
+            Some(&token),
+            Some(&json!({ "msgtype": "m.text", "body": "timed" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let text = metrics::render();
+    let template = "/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}";
+    let count = scrape(
+        &text,
+        &format!("spindle_http_request_duration_seconds_count{{route=\"{template}\"}}"),
+    )
+    .unwrap_or_else(|| panic!("no histogram for {template} in {text}"));
+    assert!(count >= 1, "the send was timed: {count}");
+
+    // The label is the template, so the room ID must appear nowhere in
+    // the exposition — that is the whole cardinality argument.
+    assert!(
+        !text.contains(&room),
+        "a room ID leaked into a label: {text}"
+    );
+
+    let requests = scrape(
+        &text,
+        &format!(
+            "spindle_http_requests_total{{route=\"{template}\",method=\"PUT\",status=\"200\"}}"
+        ),
+    )
+    .unwrap_or_else(|| panic!("no request counter for {template} in {text}"));
+    assert!(requests >= 1, "{requests}");
+}
+
+#[tokio::test]
+async fn committing_an_event_times_the_append() {
+    let server = Instance::start().await;
+    let token = server.register("dave").await;
+    let before = scrape(
+        &metrics::render(),
+        "spindle_append_duration_seconds_count{durability=\"group\"}",
+    )
+    .unwrap_or(0);
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/createRoom",
+            Some(&token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let text = metrics::render();
+    let after = scrape(
+        &text,
+        "spindle_append_duration_seconds_count{durability=\"group\"}",
+    )
+    .expect("the append histogram exists once something has been appended");
+    assert!(after > before, "{before} -> {after}");
+
+    // A histogram is only usable if its buckets are cumulative and its
+    // +Inf bucket equals the count — a scraper silently mis-renders it
+    // otherwise.
+    let inf = scrape(
+        &text,
+        "spindle_append_duration_seconds_bucket{durability=\"group\",le=\"+Inf\"}",
+    )
+    .expect("an +Inf bucket");
+    assert_eq!(inf, after, "+Inf must equal the count");
+    let mut previous = 0;
+    for bound in ["0.0005", "0.001", "0.002", "0.005", "0.01", "2.5"] {
+        let value = scrape(
+            &text,
+            &format!(
+                "spindle_append_duration_seconds_bucket{{durability=\"group\",le=\"{bound}\"}}"
+            ),
+        )
+        .unwrap_or_else(|| panic!("no le={bound} bucket in {text}"));
+        assert!(value >= previous, "buckets must not decrease: {text}");
+        previous = value;
+    }
+    assert!(previous <= inf, "no bucket may exceed +Inf");
+}
