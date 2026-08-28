@@ -3379,7 +3379,7 @@ async fn create_alias(
     axum::extract::Path(room_alias): axum::extract::Path<String>,
     Json(request): Json<CreateAliasRequest>,
 ) -> Result<Json<Value>, MatrixError> {
-    state.rooms.state(&request.room_id).map_err(room_error)?;
+    state.rooms.exists(&request.room_id).map_err(room_error)?;
     state
         .directory
         .create(&room_alias, &request.room_id, &identity.user_id)
