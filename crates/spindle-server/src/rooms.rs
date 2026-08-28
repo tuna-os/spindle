@@ -170,6 +170,20 @@ pub struct Rooms {
     /// stored-body read and a JSON parse per member, per ask. The root is
     /// the answer's identity, so a hit is provably current.
     member_ids: Mutex<HashMap<String, MemberIds>>,
+    /// Each room's version, read once from its create event.
+    ///
+    /// Unlike every other cache here this one is keyed by room alone, with
+    /// no root and no invalidation, because a room's version is fixed when
+    /// it is created and there is no event that can change it. That is the
+    /// whole lifetime rule.
+    ///
+    /// It is a cache rather than a plain lookup because the authorization
+    /// path asks on every single append. Reading and parsing the create
+    /// event each time would put a stored-body read in front of every event
+    /// this server accepts -- the same "narrow question answered with a
+    /// whole read" shape that #172, #173 and #175 were about, freshly
+    /// introduced.
+    room_versions: Mutex<HashMap<String, RoomVersionId>>,
     /// The server-global order `/sync` needs (SPEC §10.2). The linear index
     /// orders events within one room; nothing orders them across rooms, so
     /// this is the one counter that exists purely because a per-room order is
@@ -295,6 +309,7 @@ impl Rooms {
             last_activity: Mutex::new(HashMap::new()),
             state_render: Mutex::new(HashMap::new()),
             member_ids: Mutex::new(HashMap::new()),
+            room_versions: Mutex::new(HashMap::new()),
             // Resumed, not reset. A counter that restarted at zero would
             // re-issue stream ids already on disk, overwriting the entries
             // they point at -- the same shape of bug as a room registry that
@@ -712,6 +727,87 @@ impl Rooms {
         Ok(rendered)
     }
 
+    /// What room version this room was created at.
+    ///
+    /// The version is a property of the *room*, recorded in its create
+    /// event's content when the room is made and unchangeable afterwards.
+    /// Everything version-dependent -- redaction, authorization, hashing --
+    /// should ask this rather than a module constant, because a constant is
+    /// only correct while every room this server has ever seen is the same
+    /// version, and the moment that stops being true it is silently wrong
+    /// rather than loudly wrong.
+    ///
+    /// A room whose create event names no version is v1, per the spec. That
+    /// is not a defensive nicety: it is what a room federated from a server
+    /// old enough to omit the field actually is, and guessing our own
+    /// default there would apply the wrong rules to someone else's room.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the create event cannot be read, or names a
+    /// version this build does not know the rules for -- which is a refusal
+    /// to guess, since applying the wrong version's rules is how a server
+    /// accepts an event it should have rejected.
+    pub fn room_version(&self, room_id: &str) -> Result<RoomVersionId, RoomError> {
+        if let Some(version) = self
+            .room_versions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(room_id)
+        {
+            return Ok(version.clone());
+        }
+        let content = self.state_event(room_id, "m.room.create", "")?;
+        let version = version_in(&content)?;
+        self.room_versions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(room_id.to_owned(), version.clone());
+        Ok(version)
+    }
+
+    /// The rule set this room's version selects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the version cannot be determined, or if it
+    /// is one `ruma` has no rules for.
+    pub fn rules(&self, room_id: &str) -> Result<RoomVersionRules, RoomError> {
+        rules_of(&self.room_version(room_id)?)
+    }
+
+    /// The room's rules, resolved from a log the caller is already holding.
+    ///
+    /// [`Self::rules`] must not be used from inside [`Self::with_room`].
+    /// It reaches the create event through [`Self::state_event`], which
+    /// takes the `open` lock, and `std::sync::Mutex` is not reentrant --
+    /// so from within the closure that already holds it, that is a
+    /// deadlock rather than a slow path. It hung the federation invite
+    /// tests, which is how this function came to exist.
+    ///
+    /// Here the log is a parameter and the event body comes from
+    /// [`Self::read_event`], which goes to the store directly and takes no
+    /// lock at all. Same cache, same answer, no re-entry.
+    fn rules_in(&self, log: &RoomLog, room_id: &str) -> Result<RoomVersionRules, RoomError> {
+        if let Some(version) = self
+            .room_versions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(room_id)
+        {
+            return rules_of(version);
+        }
+        let id = current_state_id(log, &StateKey::new("m.room.create", ""))
+            .ok_or_else(|| RoomError::UnknownState("m.room.create".to_owned()))?;
+        let event = self.read_event(room_id, &EventId::new(id.as_str()))?;
+        let version = version_in(&event["content"])?;
+        self.room_versions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(room_id.to_owned(), version.clone());
+        rules_of(&version)
+    }
+
     /// The content of one current state event.
     ///
     /// # Errors
@@ -982,7 +1078,11 @@ impl Rooms {
             ));
         };
 
-        let rules = RoomVersionRules::V11.redaction;
+        // The room's own rules, not this build's default. Redaction is where
+        // the versions differ most visibly -- which keys survive a redaction
+        // changed in v11 -- so applying ours to someone else's room would
+        // strip fields the room's own version keeps.
+        let rules = self.rules(room_id)?.redaction;
         let redacted = ruma::canonical_json::redact(object, &rules, None)
             .map_err(|error| RoomError::Build(format!("cannot redact: {error}")))?;
 
@@ -3842,8 +3942,24 @@ impl Rooms {
             StoredEvent::parse(id, &body).ok()
         };
 
+        // Per-room, for the same reason as redaction above and with more at
+        // stake: the authorization rules decide what this server accepts.
+        // Judging another version's event by v11's rules is how a server
+        // admits an event that version would have refused.
+        //
+        // The create event is its own exception, and has to be: it is the
+        // event that *establishes* the version, so at the moment it is
+        // authorized there is no create event in state to read one from.
+        // Its own content is the only place the answer exists.
+        let rules = if json["type"] == "m.room.create" {
+            rules_of(&version_in(&json["content"])?)?
+        } else {
+            // `rules_in`, not `rules`: this runs inside `with_room`, and the
+            // lock is not reentrant. See the note on `rules_in`.
+            self.rules_in(log, room_id)?
+        };
         crate::authorize::authorize(
-            &RoomVersionRules::V11.authorization,
+            &rules.authorization,
             &candidate,
             |event_type: &ruma::events::StateEventType, state_key: &str| {
                 let id = state?.get(&StateKey::new(event_type.to_string().as_str(), state_key))?;
@@ -3919,6 +4035,32 @@ fn stamp(mut json: Value, event_id: &str) -> Value {
 /// every sliding-sync `required_state` entry asks this question, and asking
 /// it by materialising the room's entire state made each of them scale with
 /// the member list.
+/// The room version named by an `m.room.create` event's content.
+///
+/// Absent means v1, per the spec. That is not defensive padding: a room
+/// federated from a server old enough to omit the field genuinely *is* v1,
+/// and substituting our own default there would apply the wrong rules to
+/// someone else's room.
+fn version_in(content: &Value) -> Result<RoomVersionId, RoomError> {
+    let named = content
+        .get("room_version")
+        .and_then(Value::as_str)
+        .unwrap_or("1");
+    RoomVersionId::try_from(named)
+        .map_err(|error| RoomError::Build(format!("unknown room version: {error}")))
+}
+
+/// The rule set a version selects, refusing rather than guessing.
+///
+/// A version `ruma` has no rules for is an error and not a fallback: running
+/// an unknown version's events through a known version's rules is how a
+/// server accepts something it should have rejected.
+fn rules_of(version: &RoomVersionId) -> Result<RoomVersionRules, RoomError> {
+    version
+        .rules()
+        .ok_or_else(|| RoomError::Build(format!("no rules for room version {version}")))
+}
+
 fn current_state_id(log: &RoomLog, wanted: &StateKey) -> Option<String> {
     log.entries()
         .next_back()
@@ -4357,5 +4499,127 @@ mod membership_index_tests {
             rooms.joined(user).unwrap(),
             vec!["!stayed:example.org".to_owned()]
         );
+    }
+}
+
+#[cfg(test)]
+mod room_version_tests {
+    use std::sync::Arc;
+
+    use ruma::RoomVersionId;
+    use spindle_store::FjallStore;
+    use tempfile::TempDir;
+
+    use super::{Rooms, version_in};
+
+    fn rooms() -> (TempDir, Arc<FjallStore>, Rooms) {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let rooms = Rooms::new(Arc::clone(&store), "example.org");
+        (dir, store, rooms)
+    }
+
+    fn key() -> ruma::signatures::Ed25519KeyPair {
+        let document = ruma::signatures::Ed25519KeyPair::generate();
+        ruma::signatures::Ed25519KeyPair::from_der(&document, "0".to_owned()).unwrap()
+    }
+
+    /// A create event with no `room_version` is a v1 room, per the spec.
+    ///
+    /// Substituting this server's own default would be the wrong answer for
+    /// the case that produces it: a room federated from a server old enough
+    /// to omit the field. Guessing there applies one version's rules to
+    /// another version's room.
+    #[test]
+    fn a_create_event_naming_no_version_is_v1() {
+        let content = serde_json::json!({ "creator": "@alice:example.org" });
+        assert_eq!(version_in(&content).unwrap(), RoomVersionId::V1);
+    }
+
+    #[test]
+    fn a_create_event_naming_a_version_is_that_version() {
+        for named in ["1", "10", "11", "12"] {
+            let content = serde_json::json!({ "room_version": named });
+            assert_eq!(
+                version_in(&content).unwrap(),
+                RoomVersionId::try_from(named).unwrap(),
+                "{named} did not round-trip",
+            );
+        }
+    }
+
+    /// The room this server creates records the version it was created at,
+    /// and reading it back gives that version rather than a constant.
+    ///
+    /// This is the property the whole slice rests on: the create event is
+    /// written with a version, so every later question about the room can be
+    /// answered from the room instead of from a module constant.
+    #[test]
+    fn a_created_room_reports_the_version_it_was_created_at() {
+        let (_dir, _store, rooms) = rooms();
+        let key = key();
+        let room_id = rooms
+            .create("@alice:example.org", &key, None, None, None, &[])
+            .unwrap();
+
+        assert_eq!(
+            rooms.room_version(&room_id).unwrap(),
+            RoomVersionId::try_from(super::ROOM_VERSION).unwrap(),
+        );
+        // Cached, and the cached answer is the same answer.
+        assert_eq!(
+            rooms.room_version(&room_id).unwrap(),
+            RoomVersionId::try_from(super::ROOM_VERSION).unwrap(),
+        );
+    }
+
+    /// The lookup is cached, and the cache must not answer for a room that
+    /// does not exist -- an unknown room is an error, not a default.
+    #[test]
+    fn an_unknown_room_has_no_version_to_report() {
+        let (_dir, _store, rooms) = rooms();
+        assert!(rooms.room_version("!nonexistent:example.org").is_err());
+    }
+
+    /// An append into a room this process has not seen before must not
+    /// deadlock on the version lookup.
+    ///
+    /// The first version of this change called `Rooms::rules` from
+    /// `authorize`. `authorize` runs inside `with_room`, holding the `open`
+    /// lock; `rules` reaches the create event through `state_event`, which
+    /// takes that same lock. `std::sync::Mutex` is not reentrant, so it
+    /// hung -- and it hung at 0% CPU rather than failing, which is the worst
+    /// way for a bug to present.
+    ///
+    /// **The second `Rooms` is the entire test.** Creating a room populates
+    /// the version cache while no lock is held, because `create` builds its
+    /// log locally rather than through `with_room`. Any append that follows
+    /// in the same process is then a cache hit and never reaches
+    /// `state_event`, so it cannot deadlock. The first attempt at this test
+    /// did exactly that and passed against the bug.
+    ///
+    /// What deadlocks is a **cold cache at an append inside the lock**: a
+    /// restarted server, or a room this process did not create. That is what
+    /// the federation invite tests were doing when they hung, and a fresh
+    /// `Rooms` over the same store is the smallest way to reproduce it.
+    #[test]
+    fn an_append_with_a_cold_version_cache_does_not_deadlock() {
+        let (_dir, store, rooms) = rooms();
+        let key = key();
+        let room_id = rooms
+            .create("@alice:example.org", &key, None, None, None, &[])
+            .unwrap();
+
+        // Same store, empty caches -- the state a server comes back up in.
+        let restarted = Rooms::new(store, "example.org");
+        restarted
+            .send(
+                &room_id,
+                "@alice:example.org",
+                &key,
+                "m.room.message",
+                &serde_json::json!({ "msgtype": "m.text", "body": "hello" }),
+            )
+            .expect("an append with a cold cache must not hang or fail");
     }
 }
