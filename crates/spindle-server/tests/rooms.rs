@@ -125,6 +125,78 @@ async fn a_user_can_create_a_room_and_it_appears_in_their_joined_rooms() {
     assert_eq!(body["joined_rooms"], json!([room_id]));
 }
 
+/// A client that asks for a version `/capabilities` advertises gets it.
+///
+/// `/capabilities` lists the versions a client may ask for, and a client
+/// reads that list precisely so it can ask for one on it. Answering with a
+/// different version and a 200 is a lie it cannot detect until something
+/// version-dependent fails -- the same defect #201 removed from
+/// `make_join`, and one that advertising v12 (#204) actively invites,
+/// because before that nothing told a client v12 was worth asking for.
+///
+/// The v12 room ID is the assertion that this is real rather than
+/// cosmetic: MSC4291 IDs are the create event's hash with no `:server`
+/// suffix, so a substituted v11 room is visible in the ID alone.
+#[tokio::test]
+async fn a_room_requested_at_an_advertised_version_is_created_at_it() {
+    let harness = Harness::new();
+    let token = harness.register().await;
+
+    let (status, body) = harness
+        .post(
+            "/_matrix/client/v3/createRoom",
+            &token,
+            &json!({ "room_version": "12" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room_id = body["room_id"].as_str().expect("a room ID").to_owned();
+    assert!(
+        !room_id.contains(':'),
+        "a v12 room ID carries no server suffix; this looks like a substituted          v11 room: {room_id}",
+    );
+
+    let (status, state) = harness
+        .get(&format!("/_matrix/client/v3/rooms/{room_id}/state"), &token)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{state}");
+    let create = state
+        .as_array()
+        .expect("state is an array")
+        .iter()
+        .find(|event| event["type"] == "m.room.create")
+        .expect("every room has a create event");
+    assert_eq!(create["content"]["room_version"], json!("12"));
+}
+
+/// An unadvertised version is still substituted, and that is not endorsed.
+///
+/// This pins today's behaviour so a change to it is visible, not because
+/// it is right. Asking for v9 and receiving v11 with a 200 is the same
+/// class of lie as the test above; it stays for now because refusing it
+/// would drop 30 allowlisted Complement tests that create rooms at
+/// v7/v8/v9 to reach knock and restricted-join features. Which versions
+/// this server carries is #178's question, not this test's.
+#[tokio::test]
+async fn an_unadvertised_version_is_substituted_rather_than_refused_for_now() {
+    let harness = Harness::new();
+    let token = harness.register().await;
+
+    let (status, body) = harness
+        .post(
+            "/_matrix/client/v3/createRoom",
+            &token,
+            &json!({ "room_version": "9" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room_id = body["room_id"].as_str().unwrap().to_owned();
+    assert!(
+        room_id.ends_with(":example.org"),
+        "the substitute is a v11 room: {room_id}",
+    );
+}
+
 #[tokio::test]
 async fn a_sent_event_comes_back_with_the_id_the_server_assigned() {
     let harness = Harness::new();
