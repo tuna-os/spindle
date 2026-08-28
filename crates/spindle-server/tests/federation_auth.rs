@@ -280,6 +280,45 @@ async fn room_as_a_peer_would_see_it() -> Vec<ServerPdu> {
     // invite does not reach it, because bob had no membership to cite yet.
     harness.post(&invite, &alice, &bob_id).await;
 
+    // A restricted join, which is the one membership whose auth events
+    // depend on the event's *content* rather than only on its type and
+    // target: `join_authorised_via_users_server` names a third user whose
+    // member event has to be cited. Nothing else in this room reaches that
+    // branch, and a peer that selects it while we do not rejects the join.
+    let carol = harness.register("carol").await;
+    let allowed = harness
+        .post(
+            "/_matrix/client/v3/createRoom",
+            &alice,
+            &json!({ "preset": "public_chat" }),
+        )
+        .await;
+    let allowed = allowed["room_id"].as_str().unwrap().to_owned();
+    harness
+        .post(
+            &format!("/_matrix/client/v3/rooms/{allowed}/join"),
+            &carol,
+            &json!({}),
+        )
+        .await;
+    harness
+        .put(
+            &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.join_rules"),
+            &alice,
+            &json!({
+                "join_rule": "restricted",
+                "allow": [{ "type": "m.room_membership", "room_id": allowed }],
+            }),
+        )
+        .await;
+    harness
+        .post(
+            &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+            &carol,
+            &json!({}),
+        )
+        .await;
+
     let body = harness
         .get(
             &format!("/_matrix/client/v3/rooms/{room_id}/messages?limit=100"),
@@ -298,8 +337,9 @@ async fn room_as_a_peer_would_see_it() -> Vec<ServerPdu> {
         .collect();
     events.reverse();
     // create, alice's join, power levels, join rules, name, topic, three
-    // messages, then bob invited, joined, left and invited again.
-    assert_eq!(events.len(), 13, "expected the full room, got {events:?}");
+    // messages, then bob invited, joined, left and invited again, then the
+    // join rules restricted and carol joining under them.
+    assert_eq!(events.len(), 15, "expected the full room, got {events:?}");
     events
 }
 

@@ -513,6 +513,14 @@ impl Rooms {
     /// divergent copy of the auth rules, which `docs/divergence.md` names as
     /// the thing that must not happen.
     ///
+    /// A restricted room is the one join the rules cannot decide alone, and
+    /// the spec says so: it turns on the joiner's membership in *another*
+    /// room, which the rules — judging one room's state — cannot see. So this
+    /// function fills in `join_authorised_via_users_server` before signing,
+    /// and the rules judge that nomination like anything else. See
+    /// [`Self::restricted_join_nominee`]; it is an addition to the event, not
+    /// a verdict on it.
+    ///
     /// # Errors
     ///
     /// Returns [`RoomError::UnknownRoom`] if the room does not exist, or
@@ -543,6 +551,16 @@ impl Rooms {
             content["reason"] = Value::String(reason.to_owned());
         }
         self.with_room(room_id, |rooms, log| {
+            // The one thing about a join this server has to work out for
+            // itself, because the rules cannot: see
+            // [`Self::restricted_join_nominee`]. It is added to the content
+            // before signing, since the nomination is part of what every
+            // other server verifies.
+            if membership == JOIN_STR
+                && let Some(nominee) = rooms.restricted_join_nominee(log, room_id, target)?
+            {
+                content["join_authorised_via_users_server"] = Value::String(nominee);
+            }
             rooms.append(
                 log,
                 room_id,
@@ -852,6 +870,157 @@ impl Rooms {
         rules_of(&self.version_in_log(log, room_id)?)
     }
 
+    /// Whether this server is the one that speaks for `user_id`.
+    fn is_local(&self, user_id: &str) -> bool {
+        user_id.split_once(':').map(|(_, domain)| domain) == Some(self.server_name.as_str())
+    }
+
+    /// The `join_authorised_via_users_server` a restricted room's join needs
+    /// from this server, or `None` when this server has nothing to say.
+    ///
+    /// MSC3083 is the one join rule the authorization rules deliberately do
+    /// not decide. Every other rule is answerable from the room's own state;
+    /// `restricted` says *you may join this room because you are in that
+    /// one*, and the rules judge one room at a time. So the spec splits it:
+    /// a server that can see both rooms decides, and records the decision by
+    /// naming a member of *this* room who could have invited the joiner --
+    /// the authorising user. The rules then check that nomination, and so
+    /// does every server the event reaches.
+    ///
+    /// That split is why this is not a second copy of the auth rules
+    /// (`docs/divergence.md` names that as the thing that must not happen).
+    /// Nothing here decides whether the join is allowed. It answers the
+    /// question the rules cannot reach -- is the joiner in an allowed room --
+    /// and nominates the strongest candidate this server can offer;
+    /// [`Self::authorize`] then judges the nomination like any other.
+    ///
+    /// Returns `None`, leaving the event unchanged, when the room is not
+    /// restricted, when the joiner is already invited or joined (the rules
+    /// admit that from the room's own state, and an unnecessary nomination
+    /// would be a claim nothing asked for), when no `allow` entry names a
+    /// room this server can see the joiner in, or when this server holds no
+    /// member to nominate.
+    fn restricted_join_nominee(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<Option<String>, RoomError> {
+        let Some(rules) = current_state_id(log, &StateKey::new("m.room.join_rules", ""))
+            .and_then(|id| self.read_event(room_id, &EventId::new(id.as_str())).ok())
+        else {
+            return Ok(None);
+        };
+        let rules = &rules["content"];
+        if !matches!(
+            rules["join_rule"].as_str(),
+            Some("restricted" | "knock_restricted")
+        ) {
+            return Ok(None);
+        }
+        let membership = |user: &str, room: &str| -> Option<Vec<u8>> {
+            spindle_store::ReadView::get(
+                self.store.as_ref(),
+                &spindle_core::keys::user_room(
+                    spindle_core::keys::Keyspace::Membership,
+                    user,
+                    room,
+                ),
+            )
+            .ok()
+            .flatten()
+        };
+        let joined = |user: &str, room: &str| -> bool {
+            membership(user, room).as_deref() == Some(JOIN_STR.as_bytes())
+        };
+        if matches!(membership(user_id, room_id).as_deref(), Some(JOIN | INVITE)) {
+            return Ok(None);
+        }
+        // An `allow` entry naming a room this server does not hold reads as
+        // "not joined" rather than as an error: we genuinely cannot see it,
+        // and guessing that the joiner is in it would forge the vouching.
+        let vouched = rules["allow"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|entry| {
+                entry["type"].as_str() == Some("m.room_membership")
+                    && entry["room_id"]
+                        .as_str()
+                        .is_some_and(|allowed| joined(user_id, allowed))
+            });
+        if !vouched {
+            return Ok(None);
+        }
+
+        // Candidates strongest first. Power levels are read to *rank* them,
+        // never to conclude that the strongest is strong enough -- whether
+        // the nominee outranks the room's invite level is the rules' call,
+        // and making it here is how the two copies would start to diverge.
+        let mut ranked: Vec<(i64, String)> = Vec::new();
+        if self
+            .rules_in(log, room_id)?
+            .authorization
+            .explicitly_privilege_room_creators
+            && let Some(create) = current_state_id(log, &StateKey::new("m.room.create", ""))
+                .and_then(|id| self.read_event(room_id, &EventId::new(id.as_str())).ok())
+        {
+            // MSC4289: a v12 room's creators hold implicit power that no
+            // `users` entry may name, so ranking by that map alone would
+            // miss the only members who can vouch in a room that raised
+            // its invite level.
+            let creators = create["sender"]
+                .as_str()
+                .into_iter()
+                .chain(
+                    create["content"]["additional_creators"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str),
+                )
+                .map(str::to_owned);
+            ranked.extend(creators.map(|creator| (i64::MAX, creator)));
+        }
+        let power = current_state_id(log, &StateKey::new("m.room.power_levels", ""))
+            .and_then(|id| self.read_event(room_id, &EventId::new(id.as_str())).ok())
+            .map_or(Value::Null, |event| event["content"].clone());
+        for (user, level) in power["users"].as_object().into_iter().flatten() {
+            if let Some(level) = level.as_i64() {
+                ranked.push((level, user.clone()));
+            }
+        }
+        ranked.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        for (_, candidate) in ranked {
+            if self.is_local(&candidate) && joined(&candidate, room_id) {
+                return Ok(Some(candidate));
+            }
+        }
+
+        // Nobody named, or nobody named is here: every remaining member sits
+        // at `users_default`, so any of them ranks the same and the lowest
+        // ID makes the choice reproducible. `for_each` yields state keys in
+        // order, so taking the first is exactly that.
+        let mut fallback = None;
+        let Some(state) = log
+            .entries()
+            .next_back()
+            .and_then(|head| log.state_after(head.li))
+        else {
+            return Ok(None);
+        };
+        state.for_each(|key, _| {
+            if fallback.is_none()
+                && key.event_type().as_str() == "m.room.member"
+                && self.is_local(key.state_key())
+                && joined(key.state_key(), room_id)
+            {
+                fallback = Some(key.state_key().to_owned());
+            }
+        });
+        Ok(fallback)
+    }
+
     /// Mint a room: its create event, and the ID that event implies.
     ///
     /// The two are one step because from v12 they are one fact. Before
@@ -898,7 +1067,14 @@ impl Rooms {
         room_id: Option<&str>,
     ) -> Result<(String, Value), RoomError> {
         let empty = RoomLog::new();
-        let auth = auth_events_for(&empty, creator, "m.room.create", Some(""), content)?;
+        let auth = auth_events_for(
+            &empty,
+            &rules_of(&version_in(content)?)?.authorization,
+            creator,
+            "m.room.create",
+            Some(""),
+            content,
+        )?;
         let canonical = build_canonical(
             room_id,
             creator,
@@ -1509,7 +1685,14 @@ impl Rooms {
             }
 
             let content = serde_json::json!({ "membership": "join" });
-            let auth = auth_events_for(log, user_id, "m.room.member", Some(user_id), &content)?;
+            let auth = auth_events_for(
+                log,
+                &rooms.rules_in(log, room_id)?.authorization,
+                user_id,
+                "m.room.member",
+                Some(user_id),
+                &content,
+            )?;
             let prev: Vec<String> = log
                 .forward_extremities()
                 .iter()
@@ -1565,7 +1748,14 @@ impl Rooms {
             }
 
             let content = serde_json::json!({ "membership": "knock" });
-            let auth = auth_events_for(log, user_id, "m.room.member", Some(user_id), &content)?;
+            let auth = auth_events_for(
+                log,
+                &rooms.rules_in(log, room_id)?.authorization,
+                user_id,
+                "m.room.member",
+                Some(user_id),
+                &content,
+            )?;
             let prev: Vec<String> = log
                 .forward_extremities()
                 .iter()
@@ -1602,7 +1792,7 @@ impl Rooms {
     /// [`RoomError::UnknownRoom`] when the room is not here,
     /// [`RoomError::Forbidden`] when the user has nothing to leave.
     pub fn make_leave_template(&self, room_id: &str, user_id: &str) -> Result<Value, RoomError> {
-        self.with_room(room_id, |_, log| {
+        self.with_room(room_id, |rooms, log| {
             let head = log
                 .entries()
                 .next_back()
@@ -1623,7 +1813,14 @@ impl Rooms {
             }
 
             let content = serde_json::json!({ "membership": "leave" });
-            let auth = auth_events_for(log, user_id, "m.room.member", Some(user_id), &content)?;
+            let auth = auth_events_for(
+                log,
+                &rooms.rules_in(log, room_id)?.authorization,
+                user_id,
+                "m.room.member",
+                Some(user_id),
+                &content,
+            )?;
             let prev: Vec<String> = log
                 .forward_extremities()
                 .iter()
@@ -3254,7 +3451,14 @@ impl Rooms {
             .map(|id| id.as_str().to_owned())
             .collect();
 
-        let auth = auth_events_for(log, sender, event_type, state_key, content)?;
+        let auth = auth_events_for(
+            log,
+            &self.rules_in(log, room_id)?.authorization,
+            sender,
+            event_type,
+            state_key,
+            content,
+        )?;
         // MSC4291: the create event of a room whose ID is that event's
         // hash cannot name the ID, so it is built without one. `create`
         // has already derived the same ID from the same bytes.
@@ -4376,6 +4580,7 @@ fn event_body_key(room_id: &str, event_id: &str) -> Vec<u8> {
 /// indistinguishable on the wire and only one of them is correct.
 fn auth_events_for(
     log: &RoomLog,
+    rules: &ruma::room_version_rules::AuthorizationRules,
     sender: &str,
     event_type: &str,
     state_key: Option<&str>,
@@ -4421,6 +4626,17 @@ fn auth_events_for(
         // allowed at all.
         if let Some(target) = state_key.filter(|target| *target != sender) {
             cite("m.room.member", target);
+        }
+        // The one selection that reads the event's *content* rather than only
+        // its type and target: a restricted join names the member who vouched
+        // for it, and the rules cannot check that nomination without their
+        // member event. The version gate is ruma's own -- a room version with
+        // no restricted join rule has no such member to cite, and citing one
+        // anyway is a longer list than the peer selects.
+        if (rules.restricted_join_rule || rules.knock_restricted_join_rule)
+            && let Some(nominee) = content["join_authorised_via_users_server"].as_str()
+        {
+            cite("m.room.member", nominee);
         }
     }
     Ok(auth)
