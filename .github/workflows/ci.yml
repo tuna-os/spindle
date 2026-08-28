@@ -52,6 +52,13 @@ jobs:
       - name: Check the dashboard matches the router
         run: python3 scripts/coverage-dashboard.py --check
 
+      # The Complement ratchet decides whether a conformance regression can
+      # merge, and its output is what somebody reads when one does. Both are
+      # worth a test: #228 is a case where the gate was right, and #231 one
+      # where what it printed was not enough to act on.
+      - name: Check the Complement ratchet
+        run: python3 scripts/complement-check-test.py
+
       # And the same idea for the example config, which had drifted furthest
       # of anything here: 22 of 37 fields had never appeared in it. A setting
       # an operator cannot discover is a setting that does not exist.

@@ -8,6 +8,14 @@ printed as candidates — they become protected the moment someone adds them,
 which is a reviewed decision, not an automatic one, because a flaky test
 promoted automatically would teach everyone to ignore this gate.
 
+When a protected test does not pass, its captured output is printed with it.
+The ledger has always carried that text -- `go test -json` emits an `output`
+record per line -- and this script used to drop it on the floor, so a red
+ratchet said *which* tests broke and never *why*. Recovering the reason then
+meant downloading the run's artifact, which is a different kind of task from
+reading a CI log and is why it usually did not happen (#231 is the case that
+forced this).
+
 Usage: scripts/complement-check.py <results.jsonl> [--allowlist FILE]
 """
 
@@ -19,9 +27,16 @@ import sys
 from pathlib import Path
 
 
-def read_ledger(path: Path) -> dict[str, str]:
-    """Test name -> final action (pass/fail/skip), later lines winning."""
+def read_ledger(path: Path) -> tuple[dict[str, str], dict[str, list[str]]]:
+    """Test name -> final action, and test name -> its captured output.
+
+    Both come from the same pass, because the ledger is large enough that
+    reading it twice to answer two questions about the same records is a
+    waste, and because the output only matters for tests the first mapping
+    says failed.
+    """
     outcomes: dict[str, str] = {}
+    output: dict[str, list[str]] = {}
     with path.open(encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
@@ -33,9 +48,40 @@ def read_ledger(path: Path) -> dict[str, str]:
                 continue  # a torn line in a crashed run is not a result
             test = record.get("Test")
             action = record.get("Action")
-            if test and action in {"pass", "fail", "skip"}:
+            if not test:
+                continue
+            if action in {"pass", "fail", "skip"}:
                 outcomes[test] = action
-    return outcomes
+            elif action == "output":
+                output.setdefault(test, []).append(record.get("Output", ""))
+    return outcomes, output
+
+
+# Enough to carry an assertion and the lines around it, and few enough that
+# eight failing tests do not bury the summary they appear under. A test that
+# needs more than this is one to open the artifact for.
+MAX_OUTPUT_LINES = 25
+
+
+def failure_detail(lines: list[str]) -> list[str]:
+    """The tail of a failed test's output, trimmed for a CI log.
+
+    The tail rather than the head: Go prints the assertion and its context at
+    the point of failure, so the end of the capture is where the reason is.
+    Blank lines and the runner's own PASS/FAIL bookkeeping are dropped, since
+    the summary above already says which test this was.
+    """
+    kept = [
+        line.rstrip()
+        for line in lines
+        if line.strip() and not line.lstrip().startswith(("=== RUN", "=== PAUSE", "=== CONT"))
+    ]
+    if len(kept) <= MAX_OUTPUT_LINES:
+        return kept
+    dropped = len(kept) - MAX_OUTPUT_LINES
+    return [f"... {dropped} earlier lines, see the complement-results artifact"] + kept[
+        -MAX_OUTPUT_LINES:
+    ]
 
 
 def read_allowlist(path: Path) -> list[str]:
@@ -69,7 +115,7 @@ def main() -> int:
         print(f"^({'|'.join(top_level)})$" if top_level else "^$")
         return 0
 
-    outcomes = read_ledger(arguments.results)
+    outcomes, output = read_ledger(arguments.results)
     allowlist = read_allowlist(arguments.allowlist)
 
     if not outcomes:
@@ -96,6 +142,15 @@ def main() -> int:
         )
         for name, action in regressed:
             print(f"  - {name} ({action})", file=sys.stderr)
+        # The reason, under the roll-call. Printed after the full list so the
+        # names stay together and readable when several tests break at once.
+        for name, action in regressed:
+            detail = failure_detail(output.get(name, []))
+            if not detail:
+                continue
+            print(f"\ncomplement-check: {name} ({action}) said:", file=sys.stderr)
+            for line in detail:
+                print(f"    {line}", file=sys.stderr)
         return 1
 
     print(
