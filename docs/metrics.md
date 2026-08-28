@@ -31,6 +31,9 @@ the incident it was supposed to explain.
 | `spindle_append_duration_seconds` | histogram | `durability` | Time to commit one event, timed around the commit itself. |
 | `spindle_http_requests_total` | counter | `route`, `method`, `status` | Requests served. |
 | `spindle_http_request_duration_seconds` | histogram | `route` | Time to serve one request. |
+| `spindle_federation_queue_depth` | gauge | `destination` | Events waiting to go out, per peer. |
+| `spindle_sync_subscribers` | gauge | — | Clients currently blocked in a long-polling `/sync`. |
+| `spindle_sync_lag_seconds` | histogram | — | Age of the newest event a `/sync` delivered. |
 
 ## The one that matters
 
@@ -113,11 +116,41 @@ nowhere in the exposition. Requests that match no route are counted
 under a single `unmatched` label, so a scanner walking random URLs is
 not an unbounded source of series.
 
+## Federation backlog and sync lag
+
+These are two of the four things #19's exit criteria say dashboards must
+cover (the other two being durability — the append histogram's
+`durability` label — and unexpected fork paths, above).
+
+`spindle_federation_queue_depth` is set from the delivery loop's own
+view of the outbox, so it cannot disagree with what is actually being
+delivered. The **twenty deepest destinations get their own series and
+the rest are summed into `other`**: a room full of fabricated server
+names must not be able to mint a series each and turn the scrape into
+the attack. The tail is added up, never dropped.
+
+```promql
+topk(5, spindle_federation_queue_depth)
+```
+
+`spindle_sync_lag_seconds` needs its definition stated, because
+"watermark lag" can mean several things. Here it is **the age of the
+newest event a `/sync` actually delivered**, measured at delivery. A
+client keeping up sees milliseconds; a server falling behind sees this
+climb. Syncs that deliver nothing are not counted — an empty sync is a
+client that is up to date, not a lagging one, and scoring it zero would
+flatten the average that matters.
+
 ## What is not here yet
 
-Per #166, in order: federation queue depth, state-trie cache hit rate,
-sync subscriber count and watermark lag (slice 3); OpenTelemetry traces
-(slice 4).
+Per #166: OpenTelemetry traces (slice 4).
+
+**State-trie cache hit rate**, which SPEC §17.2 also names, is absent for
+a reason worth writing down: there is no state-node cache to instrument.
+Nodes are read from the store through the ordinary read path. Exporting
+a hit rate would mean inventing one, and a metric that reports on
+something that does not exist is worse than a missing metric — the same
+argument the rest of this page runs on. It arrives when the cache does.
 
 Per-room series are deliberately absent and will stay that way. A server
 with 10,000 rooms would mint tens of thousands of mostly-idle series, and

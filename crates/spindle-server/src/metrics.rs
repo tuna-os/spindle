@@ -114,8 +114,16 @@ pub fn record_contested_state(origin: Origin) {
 /// The exposition, in the Prometheus text format.
 #[must_use]
 pub fn render() -> String {
-    let mut out = String::with_capacity(1024);
+    let mut out = String::with_capacity(2048);
+    render_build_info(&mut out);
+    render_appends(&mut out);
+    render_http(&mut out);
+    render_federation(&mut out);
+    render_sync(&mut out);
+    out
+}
 
+fn render_build_info(out: &mut String) {
     out.push_str(
         "# HELP spindle_build_info The version this process is running.\n\
          # TYPE spindle_build_info gauge\n",
@@ -125,7 +133,11 @@ pub fn render() -> String {
         "spindle_build_info{{version=\"{}\"}} 1",
         env!("CARGO_PKG_VERSION")
     );
+}
 
+/// The §9.2 case split, the federated-event denominator §18.3 needs, and
+/// the commit histogram those targets are stated against.
+fn render_appends(out: &mut String) {
     out.push_str(
         "# HELP spindle_events_appended_total Events appended to a room log.\n\
          # TYPE spindle_events_appended_total counter\n",
@@ -164,13 +176,15 @@ pub fn render() -> String {
     if let Ok(read) = APPEND_LATENCY.read() {
         for (durability, histogram) in read.iter() {
             histogram.render_into(
-                &mut out,
+                out,
                 "spindle_append_duration_seconds",
                 &format!("durability=\"{}\"", escape(durability)),
             );
         }
     }
+}
 
+fn render_http(out: &mut String) {
     out.push_str(
         "# HELP spindle_http_request_duration_seconds Time to serve one request, by matched route.\n\
          # TYPE spindle_http_request_duration_seconds histogram\n",
@@ -178,7 +192,7 @@ pub fn render() -> String {
     if let Ok(read) = HTTP_LATENCY.read() {
         for (route, histogram) in read.iter() {
             histogram.render_into(
-                &mut out,
+                out,
                 "spindle_http_request_duration_seconds",
                 &format!("route=\"{}\"", escape(route)),
             );
@@ -207,8 +221,44 @@ pub fn render() -> String {
             );
         }
     }
+}
 
-    out
+fn render_federation(out: &mut String) {
+    out.push_str(
+        "# HELP spindle_federation_queue_depth Events waiting to be delivered, by destination.\n\
+         # TYPE spindle_federation_queue_depth gauge\n",
+    );
+    if let Ok(read) = FEDERATION_QUEUE.read() {
+        for (destination, depth) in read.iter() {
+            let _ = writeln!(
+                out,
+                "spindle_federation_queue_depth{{destination=\"{}\"}} {depth}",
+                escape(destination)
+            );
+        }
+    }
+}
+
+fn render_sync(out: &mut String) {
+    out.push_str(
+        "# HELP spindle_sync_subscribers Clients currently blocked in a long-polling /sync.\n\
+         # TYPE spindle_sync_subscribers gauge\n",
+    );
+    let _ = writeln!(
+        out,
+        "spindle_sync_subscribers {}",
+        SYNC_SUBSCRIBERS.load(Ordering::Relaxed)
+    );
+
+    out.push_str(
+        "# HELP spindle_sync_lag_seconds Age of the newest event a /sync delivered.\n\
+         # TYPE spindle_sync_lag_seconds histogram\n",
+    );
+    if let Ok(read) = SYNC_LAG.read() {
+        for histogram in read.values() {
+            histogram.render_into(out, "spindle_sync_lag_seconds", "");
+        }
+    }
 }
 
 /// Bucket bounds, in seconds.
@@ -355,6 +405,74 @@ pub fn observe_request(route: &str, method: &str, status: u16, elapsed: Duration
     }
 }
 
+/// How many destinations get their own series before the rest are
+/// summed into `other`.
+///
+/// The label set must not be something a stranger can grow: a room full
+/// of fabricated server names would otherwise mint a series each and
+/// make the scrape the attack. Twenty is well past what a single-node
+/// deployment federates with in anger, and the tail is not lost — it is
+/// added up.
+const DESTINATION_CAP: usize = 20;
+
+static FEDERATION_QUEUE: LazyLock<RwLock<Vec<(String, u64)>>> = LazyLock::new(RwLock::default);
+static SYNC_SUBSCRIBERS: AtomicU64 = AtomicU64::new(0);
+static SYNC_LAG: Family = LazyLock::new(RwLock::default);
+
+/// Replace the federation queue depths with a fresh reading.
+///
+/// A gauge, so it is *set* rather than added to: the delivery loop knows
+/// the whole picture each pass, and carrying stale destinations forward
+/// would report a backlog for a peer that has none. Deepest first, with
+/// everything past the cap summed into `other`.
+pub fn set_federation_queue(depths: &[(String, u64)]) {
+    let mut sorted: Vec<(String, u64)> = depths.to_vec();
+    sorted.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let mut capped: Vec<(String, u64)> = sorted.iter().take(DESTINATION_CAP).cloned().collect();
+    let rest: u64 = sorted
+        .iter()
+        .skip(DESTINATION_CAP)
+        .map(|(_, depth)| depth)
+        .sum();
+    if rest > 0 {
+        capped.push(("other".to_owned(), rest));
+    }
+    if let Ok(mut write) = FEDERATION_QUEUE.write() {
+        *write = capped;
+    }
+}
+
+/// A `/sync` has started waiting.
+pub fn sync_waiter_started() {
+    SYNC_SUBSCRIBERS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A `/sync` has stopped waiting, woken or timed out.
+pub fn sync_waiter_finished() {
+    // Saturating: an unbalanced decrement would wrap to u64::MAX and
+    // report every client on earth as connected to this server.
+    let _ = SYNC_SUBSCRIBERS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(1))
+    });
+}
+
+/// How far behind the newest event a sync response was.
+///
+/// "Watermark lag" is ambiguous, so this picks the definition an
+/// operator can act on: the age of the newest event a `/sync` actually
+/// delivered, measured when it is delivered. A client keeping up sees
+/// milliseconds; a server falling behind sees it climb, which is the
+/// symptom #19's exit criteria ask to alert on.
+pub fn observe_sync_lag(elapsed: Duration) {
+    observe_in(&SYNC_LAG, "", elapsed);
+}
+
+/// Read the subscriber gauge, for tests that assert it moved.
+#[must_use]
+pub fn sync_subscribers() -> u64 {
+    SYNC_SUBSCRIBERS.load(Ordering::Relaxed)
+}
+
 /// Escape a label value per the exposition format.
 fn escape(value: &str) -> String {
     value
@@ -403,6 +521,25 @@ mod tests {
         assert_eq!(event_count(Origin::Local), before.3 + 1);
         // Two federated events: the uncontested one and the contested one.
         assert_eq!(event_count(Origin::Federated), before.4 + 2);
+    }
+
+    /// The subscriber gauge is balanced: what goes up comes back down,
+    /// and an unbalanced decrement cannot wrap it.
+    ///
+    /// Here rather than in the integration tests because this binary does
+    /// not share the gauge with a concurrently running HTTP test, which
+    /// makes it deterministic instead of merely usually right.
+    #[test]
+    fn the_subscriber_gauge_is_balanced() {
+        let before = sync_subscribers();
+        sync_waiter_started();
+        assert_eq!(sync_subscribers(), before + 1);
+        sync_waiter_finished();
+        assert_eq!(sync_subscribers(), before);
+        // One too many decrements must not wrap to u64::MAX and report
+        // every client on earth as connected to this server.
+        sync_waiter_finished();
+        assert!(sync_subscribers() <= before);
     }
 
     /// The exposition is the contract, so it is asserted rather than eyeballed.

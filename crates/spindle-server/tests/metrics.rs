@@ -301,3 +301,140 @@ async fn committing_an_event_times_the_append() {
     }
     assert!(previous <= inf, "no bucket may exceed +Inf");
 }
+
+#[tokio::test]
+async fn syncing_records_how_stale_the_newest_event_was() {
+    let server = Instance::start().await;
+    let token = server.register("erin").await;
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/createRoom",
+            Some(&token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/lag1"),
+            Some(&token),
+            Some(&json!({ "msgtype": "m.text", "body": "fresh" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let before = scrape(&metrics::render(), "spindle_sync_lag_seconds_count{}").unwrap_or(0);
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/sync",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let text = metrics::render();
+    let after = scrape(&text, "spindle_sync_lag_seconds_count{}")
+        .expect("the lag histogram exists once a sync has delivered something");
+    assert!(after > before, "{before} -> {after}");
+    // A sync that just delivered an event created moments ago must land
+    // in a low bucket; if it did not, the metric is measuring the wrong
+    // clock rather than the lag.
+    let quick =
+        scrape(&text, "spindle_sync_lag_seconds_bucket{le=\"2.5\"}").expect("a 2.5s bucket");
+    assert!(
+        quick >= after,
+        "a just-created event is not 2.5s stale: {text}"
+    );
+}
+
+#[tokio::test]
+async fn the_federation_queue_gauge_caps_its_label_set() {
+    // Set directly: standing up 25 real peers to prove a cap is a slower
+    // way to test the cap. What matters is that a large destination set
+    // cannot mint a series per destination.
+    let many: Vec<(String, u64)> = (0..25u64)
+        .map(|n| (format!("peer{n}.example"), n + 1))
+        .collect();
+    spindle_server::metrics::set_federation_queue(&many);
+
+    let text = metrics::render();
+    let series = text
+        .lines()
+        .filter(|line| line.starts_with("spindle_federation_queue_depth{"))
+        .count();
+    assert!(
+        series <= 21,
+        "capped at 20 plus other, got {series}: {text}"
+    );
+    assert!(
+        text.contains("spindle_federation_queue_depth{destination=\"other\"}"),
+        "the tail is summed, not dropped: {text}"
+    );
+    // Deepest first, so the cap keeps the destinations worth looking at.
+    assert!(
+        text.contains("spindle_federation_queue_depth{destination=\"peer24.example\"} 25"),
+        "{text}"
+    );
+    // And a fresh reading replaces rather than accumulates.
+    spindle_server::metrics::set_federation_queue(&[("solo.example".to_owned(), 3)]);
+    let text = metrics::render();
+    assert!(!text.contains("peer24.example"), "stale gauge: {text}");
+    assert!(text.contains("spindle_federation_queue_depth{destination=\"solo.example\"} 3"));
+}
+
+#[tokio::test]
+async fn a_blocked_sync_shows_up_as_a_subscriber() {
+    let server = Instance::start().await;
+    let token = server.register("frank").await;
+
+    // An initial sync returns at once — there is state to hand over, so
+    // nothing waits. Only a sync from a known position with nothing new
+    // reaches wait_for_event, which is the thing being counted.
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/sync",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let since = body["next_batch"].as_str().unwrap().to_owned();
+
+    // Sample for exactly as long as the request is in flight rather than
+    // for a fixed number of ticks: under a loaded test run a fixed window
+    // can expire before the request even reaches the server, which is a
+    // flaky test rather than a real signal.
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waiting = {
+        let done = std::sync::Arc::clone(&done);
+        async move {
+            let result = server
+                .request(
+                    reqwest::Method::GET,
+                    &format!("/_matrix/client/v3/sync?since={since}&timeout=1500"),
+                    Some(&token),
+                    None,
+                )
+                .await;
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            result
+        }
+    };
+    let observing = async {
+        let mut peak = 0;
+        while !done.load(std::sync::atomic::Ordering::Relaxed) {
+            peak = peak.max(metrics::sync_subscribers());
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        peak
+    };
+    let ((status, body), peak) = tokio::join!(waiting, observing);
+    assert_eq!(status, 200, "{body}");
+    assert!(peak >= 1, "a blocked sync is a subscriber: {peak}");
+}
