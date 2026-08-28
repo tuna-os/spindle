@@ -51,3 +51,7 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = "deny"
 pedantic = "deny"
+# Not in `all` or `pedantic`, and both are about cost rather than style: a
+# large stack frame is a crash on a deep call, and a large future is a
+# per-request allocation. See clippy.toml for the thresholds.
+large_stack_frames = "deny"

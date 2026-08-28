@@ -1,7 +1,12 @@
 # Spindle homeserver configuration.
 #
 # Only `server.name` is required. Every other value below is its default, shown
-# so you can see what you are changing rather than what you are adding.
+# so you can see what you are changing rather than what you are adding. Values
+# that have no default are commented out and shown with a plausible setting.
+#
+# Every configurable field appears here. `scripts/config-drift.py` fails CI if
+# one is added to the code and not documented here, because a setting an
+# operator cannot discover is a setting that does not exist.
 
 [server]
 # Permanent. It is baked into every user and room ID this server mints, and
@@ -21,6 +26,72 @@ bind = "127.0.0.1:8008"
 [storage]
 path = "./data"
 
+# Media blobs in an S3-compatible bucket instead of on local disk. The
+# metadata store stays local either way: it is the index, and an index a
+# network hop away would put a round trip in front of every media request
+# before a single byte moved.
+#
+# `endpoint` is explicit rather than derived from the region, because the
+# point of speaking the S3 protocol is that MinIO, Garage and friends speak
+# it too — and only AWS's endpoints are derivable.
+# [storage.s3]
+# endpoint = "https://s3.eu-west-1.amazonaws.com"
+# bucket = "spindle-media"
+# region = "us-east-1"
+# access_key_id = "..."
+# secret_access_key = "..."
+
+[ratelimit]
+# On by default, because a server exposed to the internet without it is a
+# brute-force target (#66). Turn it off only where the limiter would be
+# measuring the harness rather than the server: Complement registers users
+# faster than any human, and the API benchmark's whole job is to issue
+# requests as fast as the server will take them. Both would otherwise report
+# our own rate limit as the server's latency.
+enabled = true
+
+[previews]
+# URL previews make the server fetch attacker-chosen URLs, which is the
+# textbook server-side request forgery vector: "preview this" must never
+# become a way to read the metadata service, the loopback admin port, or
+# anything else inside the network this server sits in.
+enabled = true
+
+# Private, loopback, link-local and other non-global ranges are refused by
+# *resolved address*, always. This opens named CIDR ranges back up — for
+# tests, which serve fixtures on 127.0.0.1, and for the rare deployment that
+# genuinely wants previews of an internal wiki and says so range by range.
+allow_private = []
+
+[federation]
+# Fetch peer keys and send requests over plain http instead of https. For
+# test rigs whose "servers" are loopback stubs. A production deployment with
+# this on has disabled federation authentication in all but name: anyone on
+# the network path can answer the key fetch.
+insecure_http = false
+
+# Base retry delay for outbound delivery, in milliseconds. Doubles per
+# consecutive failure per destination, capped at 64×. Tests shrink it;
+# operators should not need to touch it.
+retry_base_ms = 1000
+
+# Where the federation TLS listener binds. Unset means no federation
+# listener at all — which is right for a deployment behind a reverse proxy
+# that terminates TLS and serves federation on the main bind.
+# bind = "0.0.0.0:8448"
+
+# PEM certificate chain and private key for that listener. Required with
+# `bind`: federation peers speak https to 8448, and a listener that cannot
+# prove its name is unreachable in practice.
+# tls_cert = "/etc/spindle/fullchain.pem"
+# tls_key = "/etc/spindle/privkey.pem"
+
+[appservices]
+# Paths to appservice registration files, in the spec's YAML shape. Every
+# file must load and validate or the server refuses to start: a bridge
+# silently not registered looks exactly like a bridge receiving nothing.
+registrations = []
+
 [auth]
 # Serve a minimal OAuth 2.0 / OIDC provider from this same process, so
 # MSC3861-native clients (Element X; Element Web's OIDC flow) can log in
@@ -30,6 +101,26 @@ path = "./data"
 # mutually exclusive with `[auth.delegated]`. See docs/delegated-auth.md
 # for both options.
 # builtin_oidc = false
+
+# MSC3861 delegation: an external OIDC provider (typically the Matrix
+# Authentication Service) owns identity, and this server validates its
+# access tokens by introspection. Local password login and registration
+# turn off when this is set — one identity provider is the point, and two
+# is how accounts drift apart.
+#
+# The provider is named explicitly rather than discovered at startup: a
+# server that cannot boot because an idP was briefly unreachable is an
+# outage nobody asked for.
+# [auth.delegated]
+# issuer = "https://mas.example.org/"
+# introspection_endpoint = "https://mas.example.org/oauth2/introspect"
+# client_id = "0000000000000000000SYNAPSE"
+# client_secret = "..."
+#
+# The token the provider presents when calling *us* — MAS's `matrix.secret`,
+# guarding the `/_synapse/mas/*` provisioning surface. Without it that
+# surface answers 404 and the provider cannot manage accounts here.
+# homeserver_secret = "..."
 
 [metrics]
 # Prometheus scrape surface, off unless this is set. Its own listener, on

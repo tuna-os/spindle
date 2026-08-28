@@ -181,3 +181,28 @@ fn federation_tls_fields_parse_and_default_off() {
         Some(std::path::Path::new("/certs/hs1.key"))
     );
 }
+
+#[test]
+fn the_shipped_example_parses() {
+    // The example config is the only place an operator learns a setting
+    // exists, and nothing held it to the code. This is the half that
+    // `deny_unknown_fields` can enforce: an example naming a field the code
+    // has since removed or renamed fails here, at `cargo test`, rather than
+    // at someone's first boot.
+    //
+    // The other half -- a field added to the code and never written down --
+    // is `scripts/config-drift.py`, because Rust cannot enumerate its own
+    // struct fields at runtime without machinery this does not need.
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../spindle.example.toml"
+    ))
+    .expect("spindle.example.toml sits at the repository root");
+
+    let config = parse(&text).expect("the shipped example must parse");
+    assert_eq!(
+        config.server.name, "example.org",
+        "the example should keep an obviously-placeholder server name, so a \
+         copied config cannot accidentally federate as something real"
+    );
+}

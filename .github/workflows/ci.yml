@@ -45,3 +45,9 @@ jobs:
       # endpoint the router now serves.
       - name: Check the dashboard matches the router
         run: python3 scripts/coverage-dashboard.py --check
+
+      # And the same idea for the example config, which had drifted furthest
+      # of anything here: 22 of 37 fields had never appeared in it. A setting
+      # an operator cannot discover is a setting that does not exist.
+      - name: Check the example config documents every setting
+        run: python3 scripts/config-drift.py
