@@ -25,7 +25,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 fjall = "2.11.2"
 proptest = "1.7"
-rand = "0.8"
+rand = "0.10"
 im = "15"
 # `state-res` is a runtime dependency, not just an oracle: SPEC 9.3 and
 # docs/divergence.md both require the local send path to use the same auth

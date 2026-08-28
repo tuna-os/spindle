@@ -15,9 +15,7 @@
 //! password is recovered from a stolen hash.
 
 use argon2::Argon2;
-use argon2::password_hash::rand_core::OsRng;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use rand::RngCore;
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt, SaltString};
 use serde::{Deserialize, Serialize};
 use spindle_core::keys::{Keyspace, room_prefix};
 use spindle_store::{Store, StoreError};
@@ -141,7 +139,7 @@ impl<'a, S: Store> Accounts<'a, S> {
             return Err(AccountError::UserInUse);
         }
 
-        let salt = SaltString::generate(&mut OsRng);
+        let salt = salt()?;
         let password_hash = Argon2::default()
             .hash_password(password.as_bytes(), &salt)
             .map_err(|error| AccountError::Hashing(error.to_string()))?
@@ -411,7 +409,7 @@ impl<'a, S: Store> Accounts<'a, S> {
         let Some(mut account) = self.account(localpart)? else {
             return Ok(false);
         };
-        let salt = SaltString::generate(&mut OsRng);
+        let salt = salt()?;
         account.password_hash = Argon2::default()
             .hash_password(password.as_bytes(), &salt)
             .map_err(|error| AccountError::Hashing(error.to_string()))?
@@ -513,6 +511,28 @@ fn token_key(keyspace: Keyspace, token: &str) -> Vec<u8> {
     key
 }
 
+/// A fresh Argon2 salt, from the same source as every other secret here.
+///
+/// This used to be `SaltString::generate(&mut OsRng)`, over the `OsRng`
+/// that `argon2` re-exports from its own `rand_core` 0.6. That name is
+/// gated behind `password-hash/getrandom`, which nothing in this
+/// workspace enables — it resolved only because `rand` 0.8 pulled the
+/// same `rand_core` with `getrandom` on, and cargo unifies features
+/// across the graph. Upgrading `rand` moved it to `rand_core` 0.10 and
+/// the salt stopped compiling, having never actually depended on the
+/// crate that appeared to provide it.
+///
+/// Reading the OS directly is what `generate` did anyway: 16 bytes —
+/// [`Salt::RECOMMENDED_LENGTH`] — and the same b64 encoding. The
+/// difference is that the entropy now comes from the one source this
+/// module already uses for tokens, rather than from a second RNG that
+/// happened to be reachable.
+fn salt() -> Result<SaltString, AccountError> {
+    let mut bytes = [0_u8; Salt::RECOMMENDED_LENGTH];
+    crate::secrets::fill(&mut bytes);
+    SaltString::encode_b64(&bytes).map_err(|error| AccountError::Hashing(error.to_string()))
+}
+
 /// A password for an account nobody logs into with one: appservice
 /// ghosts, MSC3861-provisioned users. 256 bits of entropy that are
 /// hashed, stored, and never seen again — the account is entered through
@@ -521,19 +541,19 @@ fn token_key(keyspace: Keyspace, token: &str) -> Vec<u8> {
 #[must_use]
 pub fn unguessable_password() -> String {
     let mut bytes = [0_u8; TOKEN_BYTES];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    crate::secrets::fill(&mut bytes);
     hex(&bytes)
 }
 
 fn random_token(prefix: &str) -> String {
     let mut bytes = [0_u8; TOKEN_BYTES];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    crate::secrets::fill(&mut bytes);
     format!("{prefix}_{}", hex(&bytes))
 }
 
 fn random_id(prefix: &str) -> String {
     let mut bytes = [0_u8; 8];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    crate::secrets::fill(&mut bytes);
     format!("{prefix}{}", hex(&bytes).to_uppercase())
 }
 

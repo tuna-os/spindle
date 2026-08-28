@@ -711,10 +711,9 @@ async fn federation_media_download(
     // way to occur inside the file; fixed randomness per response keeps
     // this simple and stateless.
     let boundary = {
-        use rand::RngCore as _;
         use std::fmt::Write as _;
         let mut raw = [0_u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut raw);
+        crate::secrets::fill(&mut raw);
         raw.iter().fold(String::with_capacity(32), |mut out, b| {
             let _ = write!(out, "{b:02x}");
             out

@@ -4307,9 +4307,8 @@ fn now_ms() -> u64 {
 }
 
 fn random_id() -> String {
-    use rand::RngCore as _;
     let mut bytes = [0_u8; 9];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    crate::secrets::fill(&mut bytes);
     bytes
         .iter()
         .map(|byte| char::from(b'A' + (byte % 26)))
