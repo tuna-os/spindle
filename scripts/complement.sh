@@ -37,6 +37,11 @@ fi
 
 # `go test` exiting nonzero is expected — failing tests are data, not an
 # error; the gate is scripts/complement-check.py against the allowlist.
+#
+# The ledger is the machine-readable record and goes to the file verbatim;
+# the same stream also passes through complement-progress.py so a watcher
+# sees each test land. Without that, ten minutes of testing look exactly
+# like ten minutes of hanging.
 : > "$results"
 for package in "${PACKAGES[@]}"; do
     (
@@ -44,6 +49,6 @@ for package in "${PACKAGES[@]}"; do
         COMPLEMENT_BASE_IMAGE="$COMPLEMENT_IMAGE" \
             go test "$package" -count 1 -timeout 45m -json \
             ${COMPLEMENT_RUN:+-run "$COMPLEMENT_RUN"} || true
-    ) >> "$results"
+    ) | tee -a "$results" | python3 "$toplevel/scripts/complement-progress.py" || true
 done
 echo "complement: results in $results"
