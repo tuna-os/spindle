@@ -1067,7 +1067,14 @@ impl Rooms {
         room_id: Option<&str>,
     ) -> Result<(String, Value), RoomError> {
         let empty = RoomLog::new();
-        let auth = auth_events_for(&empty, creator, "m.room.create", Some(""), content)?;
+        let auth = auth_events_for(
+            &empty,
+            &rules_of(&version_in(content)?)?.authorization,
+            creator,
+            "m.room.create",
+            Some(""),
+            content,
+        )?;
         let canonical = build_canonical(
             room_id,
             creator,
@@ -1678,7 +1685,14 @@ impl Rooms {
             }
 
             let content = serde_json::json!({ "membership": "join" });
-            let auth = auth_events_for(log, user_id, "m.room.member", Some(user_id), &content)?;
+            let auth = auth_events_for(
+                log,
+                &rooms.rules_in(log, room_id)?.authorization,
+                user_id,
+                "m.room.member",
+                Some(user_id),
+                &content,
+            )?;
             let prev: Vec<String> = log
                 .forward_extremities()
                 .iter()
@@ -1734,7 +1748,14 @@ impl Rooms {
             }
 
             let content = serde_json::json!({ "membership": "knock" });
-            let auth = auth_events_for(log, user_id, "m.room.member", Some(user_id), &content)?;
+            let auth = auth_events_for(
+                log,
+                &rooms.rules_in(log, room_id)?.authorization,
+                user_id,
+                "m.room.member",
+                Some(user_id),
+                &content,
+            )?;
             let prev: Vec<String> = log
                 .forward_extremities()
                 .iter()
@@ -1771,7 +1792,7 @@ impl Rooms {
     /// [`RoomError::UnknownRoom`] when the room is not here,
     /// [`RoomError::Forbidden`] when the user has nothing to leave.
     pub fn make_leave_template(&self, room_id: &str, user_id: &str) -> Result<Value, RoomError> {
-        self.with_room(room_id, |_, log| {
+        self.with_room(room_id, |rooms, log| {
             let head = log
                 .entries()
                 .next_back()
@@ -1792,7 +1813,14 @@ impl Rooms {
             }
 
             let content = serde_json::json!({ "membership": "leave" });
-            let auth = auth_events_for(log, user_id, "m.room.member", Some(user_id), &content)?;
+            let auth = auth_events_for(
+                log,
+                &rooms.rules_in(log, room_id)?.authorization,
+                user_id,
+                "m.room.member",
+                Some(user_id),
+                &content,
+            )?;
             let prev: Vec<String> = log
                 .forward_extremities()
                 .iter()
@@ -3423,7 +3451,14 @@ impl Rooms {
             .map(|id| id.as_str().to_owned())
             .collect();
 
-        let auth = auth_events_for(log, sender, event_type, state_key, content)?;
+        let auth = auth_events_for(
+            log,
+            &self.rules_in(log, room_id)?.authorization,
+            sender,
+            event_type,
+            state_key,
+            content,
+        )?;
         // MSC4291: the create event of a room whose ID is that event's
         // hash cannot name the ID, so it is built without one. `create`
         // has already derived the same ID from the same bytes.
@@ -4545,6 +4580,7 @@ fn event_body_key(room_id: &str, event_id: &str) -> Vec<u8> {
 /// indistinguishable on the wire and only one of them is correct.
 fn auth_events_for(
     log: &RoomLog,
+    rules: &ruma::room_version_rules::AuthorizationRules,
     sender: &str,
     event_type: &str,
     state_key: Option<&str>,
@@ -4590,6 +4626,17 @@ fn auth_events_for(
         // allowed at all.
         if let Some(target) = state_key.filter(|target| *target != sender) {
             cite("m.room.member", target);
+        }
+        // The one selection that reads the event's *content* rather than only
+        // its type and target: a restricted join names the member who vouched
+        // for it, and the rules cannot check that nomination without their
+        // member event. The version gate is ruma's own -- a room version with
+        // no restricted join rule has no such member to cite, and citing one
+        // anyway is a longer list than the peer selects.
+        if (rules.restricted_join_rule || rules.knock_restricted_join_rule)
+            && let Some(nominee) = content["join_authorised_via_users_server"].as_str()
+        {
+            cite("m.room.member", nominee);
         }
     }
     Ok(auth)
