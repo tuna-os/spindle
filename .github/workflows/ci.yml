@@ -18,12 +18,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: 1.85.0
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Check code
@@ -56,4 +56,12 @@ jobs:
       # this repository is unusually prose-heavy: the SPEC, the ADRs and the
       # benchmark write-ups are the artefact as much as the code is.
       - name: Check spelling
-        uses: crate-ci/typos@v1
+        uses: crate-ci/typos@a8168dc2984a9e2352f183ffe788f0f23a300389 # v1
+
+      # A tag is a pointer somebody else can move, and every action here runs
+      # before our code does, in a job holding a token. This ran
+      # `dtolnay/rust-toolchain@master` -- a mutable *branch* installing a
+      # toolchain -- for its whole history. Pins drift back the moment nothing
+      # is watching, so the check ships with them.
+      - name: Check actions are pinned to commit SHAs
+        run: python3 scripts/actions-pinned.py
