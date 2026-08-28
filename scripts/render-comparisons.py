@@ -35,13 +35,24 @@ import sys
 
 import sitetheme
 
-# Cells whose ratio lands inside this band are called what they are: within
-# the run-to-run variance this host measures (docs/benchmarks.md records the
-# variance evidence), not a win for either side.
-# Only for sittings that ran a single round, where there is no spread to
-# read. Kept so the pre-#171 groups still render as they were published,
-# marked unresolved rather than recoloured after the fact.
-NOISE_LOW_SINGLE_ROUND = (0.90, 1.10)
+# For a sitting that ran a single round there is no spread to read, so the
+# band has to be assumed rather than measured -- and the assumption is the
+# one docs/benchmarks.md actually measured: six rounds of the *same binary*
+# on the same idle host moved the median cell by 1.38x, and 21 of 21 cells
+# varied by more than the +/-10% band that used to colour this page.
+#
+# So a single-round cell below 1.38x is not a result in either direction,
+# and colouring it was the page contradicting its own caption -- the legend
+# said "treat anything inside roughly +/-0.4x as unmeasured" directly under
+# cells painted green at 1.19x and red at 0.90x. The band now matches the
+# evidence: only ratios that clear this host's own repeatability get a
+# colour. Nothing about the underlying numbers changes, and the large
+# ratios are untouched; what changes is which of them the page claims.
+#
+# A sitting with three rounds or more never reaches this: it has a real
+# spread, and `verdict` reads it instead of assuming one.
+SINGLE_ROUND_REPEATABILITY = 1.38
+NOISE_LOW_SINGLE_ROUND = (1 / SINGLE_ROUND_REPEATABILITY, SINGLE_ROUND_REPEATABILITY)
 
 SERVER_COLORS = sitetheme.SERVER_COLORS
 
@@ -306,8 +317,9 @@ def verdict(ours: list[float], theirs: list[float]) -> tuple[str, str]:
     difference gets resolved.
 
     With fewer than three rounds each -- every sitting committed before
-    #171 -- the old band is used and the group is labelled unresolved
-    rather than silently recoloured.
+    #171 -- there is no spread to read, so the band is the repeatability
+    this host was measured to have (see `SINGLE_ROUND_REPEATABILITY`) and
+    the group is labelled unresolved.
     """
     ratio = statistics.median(theirs) / statistics.median(ours)
     if len(ours) < 3 or len(theirs) < 3:
@@ -625,19 +637,41 @@ def render_heatmap(group: str, documents: list[dict]) -> list[str]:
             "resolved.</strong> Three rounds a side is the minimum that means "
             "anything: if two servers were identical, all of one side's rounds "
             "landing below all of the other's happens by chance 2/C(2n, n) of "
-            "the time — one in three at two rounds, one in ten at three. The "
-            "cells below are therefore coloured by the old &plusmn;10% "
-            "band: <span class=\"chip win\">&ge;1.10&times;</span> · "
-            '<span class="chip noise">0.90–1.10×</span> · '
-            '<span class="chip loss">&le;0.90&times;</span>. That band is '
-            "narrower than this host's own run-to-run variance (median cell "
-            "1.38×), so treat anything inside roughly &plusmn;0.4&times; as "
-            "unmeasured in either direction. The large ratios are unaffected. "
-            "Hover any cell for the raw milliseconds.</p>"
+            "the time — one in three at two rounds, one in ten at three. "
+            "With no spread to read, the cells below are coloured by the "
+            "repeatability this host was <em>measured</em> to have: six "
+            "rounds of the same binary moved the median cell "
+            f"<strong>{SINGLE_ROUND_REPEATABILITY:.2f}&times;</strong>, and "
+            "21 of 21 cells varied by more than the &plusmn;10% band this "
+            "page used to use. So: "
+            f'<span class="chip win">&ge;{SINGLE_ROUND_REPEATABILITY:.2f}'
+            "&times;</span> · "
+            f'<span class="chip noise">{1 / SINGLE_ROUND_REPEATABILITY:.2f}'
+            f'–{SINGLE_ROUND_REPEATABILITY:.2f}×</span> · '
+            f'<span class="chip loss">&le;'
+            f'{1 / SINGLE_ROUND_REPEATABILITY:.2f}&times;</span>. '
+            "A grey cell is not a tie — it is a difference this sitting "
+            "cannot see, and only more rounds can (#171). The large ratios "
+            "are unaffected. Hover any cell for the raw milliseconds.</p>"
         )
-    for (note_group, operation), (text,) in sorted(INVESTIGATIONS.items()):
-        if note_group != group:
-            continue
+    notes = [
+        (operation, text)
+        for (note_group, operation), (text,) in sorted(INVESTIGATIONS.items())
+        if note_group == group
+    ]
+    # A note exists because a cell read red and the roadmap treats that as a
+    # defect until explained. Under the measured band some of those cells no
+    # longer read as anything, and two of these notes concluded exactly that
+    # on their own evidence -- so the notes stay, and say why they stay.
+    # Dropping them would delete the reason we know the cell was not real.
+    if notes and not any(css == "loss" for css, _ in verdicts.values()):
+        lines.append(
+            '<p class="legend">Nothing in this sitting reads as a loss under '
+            "the band above. The investigations below were written when it "
+            "did, and are kept because they are the evidence for the "
+            "conclusion, not a footnote to it.</p>"
+        )
+    for operation, text in notes:
         title = OPERATIONS.get(operation, (operation, ""))[0]
         lines.append(
             f'<p class="investigation" id="note-{group}-{operation}">'

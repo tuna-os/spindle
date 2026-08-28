@@ -193,6 +193,58 @@ assert overlap and overlap[0][0] == "noise", f"a 1.50x overlap was coloured: {ov
 print("rounds: overlapping rounds are not called; separated rounds are")
 PY
 
+# A single-round sitting has no spread to read, so the band is assumed --
+# and the assumption has to be the one the host was measured to have. Six
+# rounds of the same binary moved the median cell 1.38x (docs/benchmarks.md),
+# so a 1.2x single-round cell is not a result in either direction, and the
+# page used to print it green while its own caption said to ignore it.
+single="$work/single"
+mkdir -p "$single"
+python3 - "$single" <<'PY'
+import json, pathlib, sys
+out = pathlib.Path(sys.argv[1])
+def write(server, values):
+    (out / f"m9-single.{server}.json").write_text(json.dumps({
+        "server": server,
+        "base_url": "http://127.0.0.1:0",
+        "dimension": "events",
+        "sizes": [200],
+        "samples": 1,
+        "benchmarks": {
+            f"{operation}/200": {
+                "mean_ns": value, "lower_ns": value,
+                "upper_ns": value, "samples": 1,
+            }
+            for operation, value in values.items()
+        },
+    }))
+# inside: 1.20x, under this host's repeatability. clears: 3.00x, well over.
+# behind: 0.83x, a "loss" the old band printed red and no round can support.
+write("spindle", {"inside": 1.0e6, "clears": 1.0e6, "behind": 1.2e6})
+write("rival", {"inside": 1.2e6, "clears": 3.0e6, "behind": 1.0e6})
+PY
+python3 "$here/render-comparisons.py" "$single" "$work/single.html" >/dev/null
+python3 - "$work/single.html" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+rows = {}
+for row in re.findall(r"<tr><td><strong>.*?</tr>", text, re.S):
+    name = re.search(r"<code>(.*?)</code>", row)
+    if name:
+        rows[name.group(1)] = re.findall(r'<td class="num ([a-z ]+)"[^>]*>([^<]*)', row)
+assert rows["inside"] == [("noise", "1.20×")], (
+    f"a 1.20x single-round cell was coloured: {rows['inside']}"
+)
+assert rows["behind"] == [("noise", "0.83×")], (
+    f"a 0.83x single-round cell was called a loss: {rows['behind']}"
+)
+assert rows["clears"][0][0] == "win", (
+    f"a 3.00x single-round cell was not called: {rows['clears']}"
+)
+assert "1 round(s) per server" in text, "the sitting was not labelled unresolved"
+print("comparisons: a single round colours only what clears the host's own variance")
+PY
+
 # Multiplicity. The separation rule bounds the false-call rate for one cell,
 # and a table is many cells: at three rounds a side it is one in ten, so
 # eighteen cells expect nearly two calls from luck alone (#183). The page has
