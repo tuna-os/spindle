@@ -4,6 +4,7 @@
 //! per ADR 0002: the linear log and the state trie are the parts that are
 //! actually ours, and they remain independently testable and benchmarkable.
 
+pub mod backup;
 pub mod codec;
 
 use std::path::Path;
