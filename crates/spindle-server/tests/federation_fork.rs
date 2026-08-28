@@ -647,32 +647,30 @@ async fn a_fork_on_the_same_slot_is_counted_as_the_expensive_case() {
     );
 }
 
-/// Disjoint slots that both already held a value: **the bug in #225**.
+/// Disjoint slots that both already held a value: the case #225 got wrong.
 ///
-/// This is the same fork as the test above — our branch writes the topic,
-/// theirs writes the name, two different slots — with one difference: both
-/// slots already had a value at the fork point. Nothing is in conflict.
-/// Under state resolution v2 the conflicted set here is empty, because
-/// neither branch disagrees with the other about anything.
+/// The same fork as the test above — our branch writes the topic, theirs
+/// writes the name — with one difference: both slots already had a value at
+/// the fork point. Nothing is in conflict either way. Matrix's own state
+/// resolution builds its conflicted set from events that differ from the
+/// base, so a key only one branch moved is unconflicted there too.
 ///
-/// `merge_states` disagrees, because it unions the parents' *full* state
-/// snapshots: the branch that left the topic alone still contributes the
-/// old topic event, so the key has two candidates and is called contested.
-/// The merge is refused, and — because every later local append names all
-/// forward extremities — it is refused **forever**. One ordinary concurrent
-/// edit from a peer makes the room permanently unwritable for local users.
+/// `merge_states` used to disagree, because it unioned the parents' *full*
+/// snapshots: the branch that left the topic alone still contributed the old
+/// topic event, so the key had two candidates and read as contested. The
+/// merge was refused — and, because every later local append names all
+/// forward extremities, refused permanently. One ordinary concurrent edit
+/// from a peer made the room unwritable for its local users, answering 500
+/// forever with no way out.
 ///
-/// The assertions below pin the broken behaviour on purpose. A test that
-/// asserted the intended behaviour would fail today and get muted; a test
-/// that asserted nothing would let the bug change shape unnoticed. When
-/// #225 is fixed this test fails, and the failure is the signal to replace
-/// it with the version that asserts a clean merge.
+/// Both halves are asserted: the merge succeeds *and* the room keeps
+/// working afterwards, because the second is what made the first severe.
 #[tokio::test]
 #[allow(
     clippy::await_holding_lock,
     reason = "serializing the tests is the job"
 )]
-async fn a_disjoint_fork_on_preexisting_slots_wedges_the_room() {
+async fn a_disjoint_fork_on_preexisting_slots_merges_and_leaves_the_room_writable() {
     let _guard = COUNTERS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -680,8 +678,8 @@ async fn a_disjoint_fork_on_preexisting_slots_wedges_the_room() {
     let harness = Harness::new();
     let (room, alice, _) = harness.shared_room(&peer).await;
 
-    // The difference from the passing case: both slots hold a value before
-    // the branches diverge.
+    // The difference from the case that always worked: both slots hold a
+    // value before the branches diverge.
     for (event_type, content) in [
         ("m.room.topic", json!({ "topic": "t0" })),
         ("m.room.name", json!({ "name": "n0" })),
@@ -707,42 +705,50 @@ async fn a_disjoint_fork_on_preexisting_slots_wedges_the_room() {
         "",
         &json!({ "name": "theirs" }),
     );
-    harness.inject(&peer, "wedge", pdu).await;
+    harness.inject(&peer, "disjoint", pdu).await;
 
     let before = Cases::read();
     let merged = harness.say(&room, &alice, "after").await;
     let delta = Cases::read().since(before);
 
+    assert_eq!(merged, StatusCode::OK, "the disjoint fork was refused");
     assert_eq!(
-        merged,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "#225 is fixed -- replace this test with the clean-merge assertion"
-    );
-    assert_eq!(
-        delta.contested, 1,
-        "a fork on disjoint slots was counted as something other than case 3: {delta:?}"
+        delta.contested, 0,
+        "a fork with an empty conflicted set took the state-resolution path: {delta:?}"
     );
 
-    // The wedging, which is the severe half. Nothing collapses the
-    // extremities, because collapsing them is the append that fails, so
-    // there is no path out of this state.
+    // Both branches' writes survived. Taking either parent's state wholesale
+    // would keep one and drop the other, and the counter above would still
+    // read clean.
+    let (_, topic) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.topic"),
+            &alice,
+        )
+        .await;
+    let (_, name) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.name"),
+            &alice,
+        )
+        .await;
+    assert_eq!(topic["topic"], json!("ours"), "our write was lost");
+    assert_eq!(name["name"], json!("theirs"), "their write was lost");
+
+    // The severe half: the room is still writable. Before the fix every one
+    // of these was a 500, with no path back.
     for attempt in 0..3 {
         assert_eq!(
             harness.say(&room, &alice, &format!("retry{attempt}")).await,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "the room recovered on retry {attempt}; #225's wedging half is fixed"
+            StatusCode::OK,
+            "the room wedged on retry {attempt}"
         );
     }
     assert_eq!(
         harness
-            .set_state(
-                &room,
-                &alice,
-                "m.room.topic",
-                &json!({ "topic": "recover" })
-            )
+            .set_state(&room, &alice, "m.room.topic", &json!({ "topic": "later" }))
             .await,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "a state write escaped the wedge; #225's wedging half is fixed"
+        StatusCode::OK,
+        "a state write after the merge was refused"
     );
 }

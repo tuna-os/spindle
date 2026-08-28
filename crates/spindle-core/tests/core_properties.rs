@@ -43,6 +43,88 @@ fn conflicting_state_fork_requires_the_matrix_resolver() {
     ));
 }
 
+/// A fork on disjoint slots merges even when both slots already had a value.
+///
+/// The regression behind #225. A parent's snapshot describes all of that
+/// branch's state, not the part it changed, so for a key one branch wrote and
+/// the other left alone the two parents disagree on paper — one carries the
+/// new event, the other the value both inherited. Reading that as a conflict
+/// refused a merge with an empty conflicted set, and since every later local
+/// append names all forward extremities, refused it permanently.
+///
+/// The distinction lives entirely in whether the slots held a value at the
+/// fork point, so both arrangements are asserted here together; testing only
+/// the unset one is what let the bug stand.
+#[test]
+fn a_disjoint_fork_merges_whether_or_not_the_slots_were_already_set() {
+    for preset in [false, true] {
+        let mut room = RoomLog::new();
+        room.append_local("$create", Some(StateKey::new("m.room.create", "")))
+            .unwrap();
+        if preset {
+            room.append_local("$topic0", Some(StateKey::new("m.room.topic", "")))
+                .unwrap();
+            room.append_local("$name0", Some(StateKey::new("m.room.name", "")))
+                .unwrap();
+        }
+        let base = room.forward_extremities().iter().next().unwrap().clone();
+
+        room.append_local("$topic-ours", Some(StateKey::new("m.room.topic", "")))
+            .unwrap();
+        room.append_remote(
+            EventInput::new("$name-theirs", vec![base])
+                .with_state_key(StateKey::new("m.room.name", "")),
+        )
+        .unwrap();
+        assert_eq!(room.forward_extremities().len(), 2);
+
+        room.append_local("$merge", None)
+            .unwrap_or_else(|error| panic!("preset={preset}: {error:?}"));
+
+        // Both branches' writes survive. Taking either parent wholesale keeps
+        // one and drops the other, which is the mistake a merge that merely
+        // stopped erroring would make.
+        let state = room.state_after_event(&EventId::new("$merge")).unwrap();
+        assert_eq!(
+            state.get(&StateKey::new("m.room.topic", "")),
+            Some("$topic-ours"),
+            "preset={preset}"
+        );
+        assert_eq!(
+            state.get(&StateKey::new("m.room.name", "")),
+            Some("$name-theirs"),
+            "preset={preset}"
+        );
+    }
+}
+
+/// The same slot on both branches stays case 3, preset or not.
+///
+/// The counterpart to the test above, and the reason the fix is a rule about
+/// the *base* rather than a loosening: a key both branches moved away from
+/// what they inherited is a real conflict and must still reach the resolver.
+#[test]
+fn a_same_slot_fork_still_needs_the_resolver_when_the_slot_was_already_set() {
+    let mut room = RoomLog::new();
+    room.append_local("$create", Some(StateKey::new("m.room.create", "")))
+        .unwrap();
+    room.append_local("$topic0", Some(StateKey::new("m.room.topic", "")))
+        .unwrap();
+    let base = room.forward_extremities().iter().next().unwrap().clone();
+
+    room.append_local("$topic-a", Some(StateKey::new("m.room.topic", "")))
+        .unwrap();
+    room.append_remote(
+        EventInput::new("$topic-b", vec![base]).with_state_key(StateKey::new("m.room.topic", "")),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        room.append_local("$merge", None),
+        Err(AppendError::NeedsStateResolution { .. })
+    ));
+}
+
 #[test]
 fn fork_window_uses_ancestry_not_nearby_linear_indices() {
     let mut room = RoomLog::new();
