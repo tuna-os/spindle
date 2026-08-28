@@ -181,6 +181,7 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::OidcClient, 0x26),
         (Keyspace::PurgeWatermark, 0x27),
         (Keyspace::RoomBlock, 0x28),
+        (Keyspace::PendingKnock, 0x29),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(

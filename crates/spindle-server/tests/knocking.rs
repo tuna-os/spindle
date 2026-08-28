@@ -279,19 +279,23 @@ async fn a_member_can_answer_a_knock_with_an_invite() {
 }
 
 #[tokio::test]
-async fn knocking_on_a_room_this_server_does_not_hold_says_so() {
+async fn knocking_on_a_room_elsewhere_is_taken_to_the_server_that_holds_it() {
     let harness = Harness::new();
     let bob = harness.register("bob").await;
 
-    // Not a 404 that reads "no such room": the room may be perfectly real
-    // and simply elsewhere, and the federated knock is the next slice.
+    // Not a 404 that reads "no such room". The domain in the room ID names a
+    // server to ask, so the knock is carried there over
+    // `make_knock`/`send_knock` -- and `remote.example` does not resolve, so
+    // what comes back is a gateway failure. The distinction is the whole
+    // point: "nobody could be reached" is a transient fault worth retrying,
+    // and "no such room" is not.
     let (status, body) = harness.knock("!elsewhere:remote.example", &bob, None).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert!(
         body["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("federation"),
-        "the refusal does not say what is missing: {body}"
+            .contains("admitted the knock"),
+        "the refusal does not say what was attempted: {body}"
     );
 }

@@ -675,6 +675,17 @@ impl Rooms {
                 room_id,
             ),
         )?;
+        // An invite is the answer to a knock, so any standing knock record
+        // for the pair is spent. Left behind it would be a question the room
+        // has already answered, still readable beside the answer.
+        spindle_store::Store::delete(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::PendingKnock,
+                user_id,
+                room_id,
+            ),
+        )?;
         self.wake_sync_waiters();
         Ok(())
     }
@@ -689,6 +700,80 @@ impl Rooms {
             self.store.as_ref(),
             &spindle_core::keys::user_room(
                 spindle_core::keys::Keyspace::PendingInvite,
+                user_id,
+                room_id,
+            ),
+        )?;
+        Ok(row.and_then(|bytes| serde_json::from_slice(&bytes).ok()))
+    }
+
+    /// Record a knock on a room this server holds no log for.
+    ///
+    /// The federated twin of [`Self::record_pending_invite`], and separate
+    /// from it for the reason the keyspaces are separate: an invite is an
+    /// answer and a knock is a question. The membership row says `knock`, so
+    /// `/sync` renders the room in the knock section and never in the invite
+    /// one, and the `knock_state` the resident server returned from
+    /// `send_knock` is what the user sees the room as until somebody answers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the store refuses the writes.
+    pub fn record_pending_knock(
+        &self,
+        user_id: &str,
+        room_id: &str,
+        origin: &str,
+        knock_state: &[Value],
+    ) -> Result<(), RoomError> {
+        spindle_store::Store::put(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::PendingKnock,
+                user_id,
+                room_id,
+            ),
+            serde_json::json!({ "origin": origin, "knock_state": knock_state })
+                .to_string()
+                .as_bytes(),
+        )?;
+        spindle_store::Store::put(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::Membership,
+                user_id,
+                room_id,
+            ),
+            KNOCK,
+        )?;
+        // Unlike an invite, a knock does *not* un-forget: forgetting is the
+        // user saying they want the room out of their list, and asking to be
+        // let in is the same user changing their mind -- so the row goes,
+        // for the same reason. The asymmetry worth naming is that an invite
+        // un-forgets on somebody *else's* action, which is why it is written
+        // out separately there.
+        spindle_store::Store::delete(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::Forgotten,
+                user_id,
+                room_id,
+            ),
+        )?;
+        self.wake_sync_waiters();
+        Ok(())
+    }
+
+    /// The pending-knock record for a user and room, if one stands.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the store cannot be read.
+    pub fn pending_knock(&self, user_id: &str, room_id: &str) -> Result<Option<Value>, RoomError> {
+        let row = spindle_store::ReadView::get(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::PendingKnock,
                 user_id,
                 room_id,
             ),
@@ -3835,10 +3920,16 @@ impl Rooms {
             // the inviting server handed over stripped state exactly for
             // this moment, and it was recorded beside the membership row.
             Err(RoomError::UnknownRoom(_)) => {
-                return Ok(self
+                // A knock is read the same way and from its own row. Invite
+                // first: if both stand, the room answered, and the answer is
+                // the newer truth.
+                let stripped = self
                     .pending_invite(user_id, room_id)?
                     .and_then(|record| record["invite_state"].as_array().cloned())
-                    .unwrap_or_default());
+                    .or(self
+                        .pending_knock(user_id, room_id)?
+                        .and_then(|record| record["knock_state"].as_array().cloned()));
+                return Ok(stripped.unwrap_or_default());
             }
             Err(error) => return Err(error),
         };
@@ -4339,16 +4430,18 @@ impl Rooms {
             )?;
         }
         // A membership event in a log this server holds supersedes any
-        // out-of-room invite record: the room is here now, and stripped
-        // state read from a live log beats a snapshot from the inviter.
-        spindle_store::Store::delete(
-            self.store.as_ref(),
-            &spindle_core::keys::user_room(
-                spindle_core::keys::Keyspace::PendingInvite,
-                user_id,
-                room_id,
-            ),
-        )?;
+        // out-of-room invite or knock record: the room is here now, and
+        // stripped state read from a live log beats a snapshot from the
+        // inviter -- or from the server that took the knock.
+        for keyspace in [
+            spindle_core::keys::Keyspace::PendingInvite,
+            spindle_core::keys::Keyspace::PendingKnock,
+        ] {
+            spindle_store::Store::delete(
+                self.store.as_ref(),
+                &spindle_core::keys::user_room(keyspace, user_id, room_id),
+            )?;
+        }
         Ok(())
     }
 
