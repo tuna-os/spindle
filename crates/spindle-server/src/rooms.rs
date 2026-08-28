@@ -108,6 +108,9 @@ impl UnreadIndex {
 /// One cached `/state` render: the root it was rendered from, and the body.
 type StateRender = ([u8; 32], Arc<String>);
 
+/// A room's joined user IDs, with the state root they were read from.
+type MemberIds = ([u8; 32], Arc<Vec<String>>);
+
 pub struct Rooms {
     store: Arc<FjallStore>,
     server_name: String,
@@ -137,17 +140,17 @@ pub struct Rooms {
     /// sittings. Serving a memcpy of a proven-current render beats warming
     /// a page cache.
     state_render: Mutex<HashMap<String, StateRender>>,
-    /// Joined-member count per room, keyed by the state root it was counted
-    /// from.
+    /// Who is joined, per room, keyed by the state root it was read from.
     ///
-    /// Same argument as `state_render`, for the same reason: sliding sync
-    /// reports `joined_count` for every room in the window on every
-    /// request, and the only way to count joins is to read each member
-    /// event's body and look at its `membership`. That is a stored-body
-    /// read and a JSON parse per member per request to produce one
-    /// integer. The root is the count's identity, so a hit is provably
-    /// current.
-    member_count: Mutex<HashMap<String, ([u8; 32], usize)>>,
+    /// Same argument as `state_render`, for the same reason: "who is in
+    /// this room" and "how many are in this room" are asked constantly --
+    /// by sliding sync for every room in the window on every request, by
+    /// the room summary, and by the appservice transaction path for every
+    /// room in every batch -- and the only way to answer either is to read
+    /// each member event's body and look at its `membership`. That is a
+    /// stored-body read and a JSON parse per member, per ask. The root is
+    /// the answer's identity, so a hit is provably current.
+    member_ids: Mutex<HashMap<String, MemberIds>>,
     /// The server-global order `/sync` needs (SPEC §10.2). The linear index
     /// orders events within one room; nothing orders them across rooms, so
     /// this is the one counter that exists purely because a per-room order is
@@ -272,7 +275,7 @@ impl Rooms {
             unread_index: Mutex::new(HashMap::new()),
             last_activity: Mutex::new(HashMap::new()),
             state_render: Mutex::new(HashMap::new()),
-            member_count: Mutex::new(HashMap::new()),
+            member_ids: Mutex::new(HashMap::new()),
             // Resumed, not reset. A counter that restarted at zero would
             // re-issue stream ids already on disk, overwriting the entries
             // they point at -- the same shape of bug as a room registry that
@@ -754,32 +757,78 @@ impl Rooms {
     ///
     /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
     pub fn joined_member_count(&self, room_id: &str) -> Result<usize, RoomError> {
-        let root = self.with_room(room_id, |_, log| {
-            Ok(log
+        Ok(self.joined_member_ids(room_id)?.len())
+    }
+
+    /// The room exists.
+    ///
+    /// The whole answer, for callers that only need the question settled --
+    /// an alias may not point at a room that is not there. Reading the
+    /// room's state to establish it, which is what this replaced, costs a
+    /// stored-body read and a JSON parse per state event to produce a
+    /// boolean.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
+    pub fn exists(&self, room_id: &str) -> Result<(), RoomError> {
+        self.with_room(room_id, |_, _| Ok(()))
+    }
+
+    /// Who is currently joined, as user IDs, without rendering any of them.
+    ///
+    /// Cached against the state root, because who is joined only changes
+    /// when the state does. Callers that want names and avatars want
+    /// [`Self::joined_members`]; callers that want to know *who*, or just
+    /// how many, want this and should not pay to render a profile they
+    /// will throw away.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
+    pub fn joined_member_ids(&self, room_id: &str) -> Result<Arc<Vec<String>>, RoomError> {
+        let (root, members) = self.with_room(room_id, |_, log| {
+            let root = log
                 .entries()
                 .next_back()
                 .map(|entry| entry.li)
                 .and_then(|li| log.state_after(li))
-                .map(|state| *state.root().as_bytes()))
+                .map(|state| *state.root().as_bytes());
+            let members = current_state(log)
+                .into_iter()
+                .filter(|(key, _)| key.event_type().as_str() == "m.room.member")
+                .map(|(key, event_id)| (key.state_key().to_owned(), event_id))
+                .collect::<Vec<_>>();
+            Ok((root, members))
         })?;
         let Some(root) = root else {
-            return Ok(0);
+            return Ok(Arc::new(Vec::new()));
         };
-        if let Some((cached_root, count)) = self
-            .member_count
+        if let Some((cached_root, ids)) = self
+            .member_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(room_id)
             && *cached_root == root
         {
-            return Ok(*count);
+            return Ok(Arc::clone(ids));
         }
-        let count = self.joined_members(room_id)?.len();
-        self.member_count
+        let mut ids = Vec::new();
+        for (user_id, event_id) in members {
+            // `read_event`, not `event`: the room's existence is already
+            // established above, and `event` re-proves it under the room
+            // lock once per member.
+            let event = self.read_event(room_id, &EventId::new(event_id.as_str()))?;
+            if event["content"]["membership"].as_str() == Some(JOIN_STR) {
+                ids.push(user_id);
+            }
+        }
+        let ids = Arc::new(ids);
+        self.member_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(room_id.to_owned(), (root, count));
-        Ok(count)
+            .insert(room_id.to_owned(), (root, Arc::clone(&ids)));
+        Ok(ids)
     }
 
     /// Set a state event.
@@ -2068,7 +2117,11 @@ impl Rooms {
         })?;
         let mut out = Map::new();
         for (user_id, event_id) in members {
-            let event = self.event(room_id, &event_id)?;
+            // `read_event`, not `event`: `with_room` above already proved
+            // the room exists, and `event` re-proves it under the room lock
+            // once per member -- 800 lock acquisitions in an 800-member
+            // room, for a fact settled before the loop started.
+            let event = self.read_event(room_id, &EventId::new(event_id.as_str()))?;
             if event["content"]["membership"].as_str() != Some(JOIN_STR) {
                 continue;
             }
@@ -2097,7 +2150,9 @@ impl Rooms {
     pub fn summary(&self, room_id: &str) -> Result<RoomSummary, RoomError> {
         // Establishes the room exists before any of the optional reads, so an
         // unknown room is a 404 rather than a summary of nothing.
-        let joined = self.joined_members(room_id)?;
+        // The count is all this needs; it used to read and parse every
+        // member's body to render a name and an avatar, then keep `.len()`.
+        let joined = self.joined_member_count(room_id)?;
 
         let string = |event_type: &str, field: &str| -> Option<String> {
             self.state_event(room_id, event_type, "")
@@ -2112,7 +2167,7 @@ impl Rooms {
             topic: string("m.room.topic", "topic"),
             avatar_url: string("m.room.avatar", "url"),
             canonical_alias: string("m.room.canonical_alias", "alias"),
-            num_joined_members: joined.len(),
+            num_joined_members: joined,
             // `world_readable` is about *history*, not about joining, so it
             // comes from m.room.history_visibility rather than the join rules.
             // Conflating the two would report a public room whose history is
@@ -2555,21 +2610,20 @@ impl Rooms {
         user_id: &str,
     ) -> Result<Option<(Value, i64)>, RoomError> {
         let wanted = StateKey::new("m.room.member", user_id);
+        // One lookup, under one lock. This walked every state key in the
+        // room to find one, then took the room lock a second time to read
+        // that entry's position -- on a path `unread` runs for every room
+        // on every sync, which made each sync scale with the member list.
         let found = self.with_room(room_id, |_, log| {
-            Ok(current_state(log)
-                .into_iter()
-                .find(|(key, _)| key == &wanted)
-                .map(|(_, event_id)| event_id))
-        })?;
-        let Some(event_id) = found else {
-            return Ok(None);
-        };
-        let li = self.with_room(room_id, |_, log| {
-            Ok(log
+            let Some(event_id) = current_state_id(log, &wanted) else {
+                return Ok(None);
+            };
+            let li = log
                 .get(&EventId::new(event_id.as_str()))
-                .map(|entry| entry.li.get()))
+                .map(|entry| entry.li.get());
+            Ok(li.map(|li| (event_id, li)))
         })?;
-        let Some(li) = li else {
+        let Some((event_id, li)) = found else {
             return Ok(None);
         };
         Ok(Some((self.event(room_id, &event_id)?, li)))

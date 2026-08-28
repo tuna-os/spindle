@@ -486,8 +486,8 @@ fn collect_batch(
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
                 rooms
-                    .joined_members(&room_id)
-                    .map(|members| members.keys().cloned().collect())
+                    .joined_member_ids(&room_id)
+                    .map(|members| members.as_ref().clone())
                     .unwrap_or_default(),
             ),
         };
@@ -525,10 +525,7 @@ fn interesting_user(
         return false;
     };
     joined.iter().any(|room_id| {
-        let members: Vec<String> = rooms
-            .joined_members(room_id)
-            .map(|members| members.keys().cloned().collect())
-            .unwrap_or_default();
+        let members = rooms.joined_member_ids(room_id).unwrap_or_default();
         registration.wants_event(room_id, "", &members, server_name)
     })
 }
@@ -553,12 +550,9 @@ fn key_counts(
     let mut fallback = serde_json::Map::new();
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for room_id in batch_rooms {
-        let members: Vec<String> = rooms
-            .joined_members(room_id)
-            .map(|members| members.keys().cloned().collect())
-            .unwrap_or_default();
-        for user_id in members {
-            if !registration.may_masquerade_as(&user_id, server_name)
+        let members = rooms.joined_member_ids(room_id).unwrap_or_default();
+        for user_id in members.iter() {
+            if !registration.may_masquerade_as(user_id, server_name)
                 || !seen.insert(user_id.clone())
             {
                 continue;
@@ -576,18 +570,18 @@ fn key_counts(
             let mut user_fallback = serde_json::Map::new();
             for device in user_devices {
                 if devices
-                    .device_keys(&user_id, &device.device_id)
+                    .device_keys(user_id, &device.device_id)
                     .ok()
                     .flatten()
                     .is_none()
                 {
                     continue;
                 }
-                if let Ok(counts) = devices.one_time_key_counts(&user_id, &device.device_id) {
+                if let Ok(counts) = devices.one_time_key_counts(user_id, &device.device_id) {
                     user_otk.insert(device.device_id.clone(), Value::Object(counts));
                 }
                 if let Ok(algorithms) =
-                    devices.unused_fallback_algorithms(&user_id, &device.device_id)
+                    devices.unused_fallback_algorithms(user_id, &device.device_id)
                 {
                     user_fallback.insert(device.device_id.clone(), serde_json::json!(algorithms));
                 }
@@ -620,10 +614,7 @@ fn typing_delta(
 ) -> Vec<Value> {
     let mut current: HashMap<String, Vec<String>> = HashMap::new();
     for (room_id, users) in typing.rooms_active() {
-        let members: Vec<String> = rooms
-            .joined_members(&room_id)
-            .map(|members| members.keys().cloned().collect())
-            .unwrap_or_default();
+        let members = rooms.joined_member_ids(&room_id).unwrap_or_default();
         // Sender "" matches nothing, so this is the membership and
         // room-namespace half of interest — exactly what an EDU has.
         if registration.wants_event(&room_id, "", &members, server_name) {
