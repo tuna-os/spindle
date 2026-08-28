@@ -438,9 +438,9 @@ number.
 
 ## M5: the axis the sweep never varied, and what it was hiding
 
-Two findings, one caused by the other. Both came out of asking a simple
-question about the comparisons page: *can we fix the cells where we are
-slower?*
+Three findings, the first of which made the other two worth looking for.
+All came out of asking a simple question about the comparisons page:
+*can we fix the cells where we are slower?*
 
 ### The sweep held membership at two
 
@@ -495,6 +495,53 @@ members`), written to its own results document, because 800 members and 800
 events are different questions and a chart that silently mixes them is
 wrong rather than mislabelled. The renderer reads the dimension from the
 results and labels the axis from it; a group that mixes the two is refused.
+
+### The same mistake again, one layer over: lazy member loading
+
+Once the membership axis existed, it was worth asking what else it could
+see. `sync_initial` at 800 members costs ~16.9 ms, which is a tie with
+Continuwuity and is *correct* — with no filter the client asked for the
+whole roster and is entitled to it.
+
+The interesting case is the one the sweep still could not see: a client
+that asks for **less**. Lazy member loading (`lazy_load_members`) exists
+so a client is not sent a roster it will not render — in a large room the
+roster *is* the initial sync. Spindle implemented it, and implemented it
+in the wrong place. `Rooms::sync` materialized and JSON-parsed every state
+event including every member; `sync_join` then discarded the members the
+client had asked not to receive. The narrowing happened after the
+expensive part, so a lazy-loading client — which is what Element is —
+paid the full roster read and got only the serialization saving for
+asking.
+
+The fix is the same shape as the sliding-window one: decide on the state
+*key*, which is already in hand from the trie, so an unwanted member
+event is never fetched and never parsed. Two rounds, opposite order, one
+idle host:
+
+| joined members | before | after | speedup |
+|---|---|---|---|
+| 50 | 1.56 ms | 1.38 ms | 1.13× |
+| 200 | 2.65 ms | 1.73 ms | 1.54× |
+| 800 | 7.04 ms | 2.14 ms | 3.29× |
+
+The 1.13× at 50 is inside the noise floor below and is not counted.
+
+What makes the 3.29× believable is not the ratio but the **controls**.
+The sweep measures three operations this change must not touch, and a
+host that drifted between legs would have moved them too:
+`sync_initial` (no filter) 16.91 → 16.91 ms, `state` 3.77 → 3.91 ms,
+`sliding_window` 1.15 → 1.00 ms. Only the column that should have moved
+moved.
+
+Caveat that travels with the number: the probe's rooms carry no chat, so
+their timeline is join events and the lazy set is the ~20 most recent
+joiners rather than a handful of speakers. A real room narrows further,
+which makes 3.29× a floor on the benefit rather than a ceiling.
+
+Three findings, one root: **a narrow question answered with a whole-room
+read**, in three different places, none of which the benchmark could see
+because it never varied the thing that makes those reads expensive.
 
 ### The comparisons page's noise band is narrower than the harness
 
