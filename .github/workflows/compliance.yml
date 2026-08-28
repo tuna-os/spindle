@@ -49,10 +49,15 @@ jobs:
 
       # The image's dependency layer is keyed on Cargo.lock alone, so it is
       # the same layer on every run until a dependency actually moves. A
-      # runner has no layer cache of its own, so without exporting one the
+      # runner has no layer cache of its own, so without importing one the
       # split in complement/Dockerfile buys nothing: this is the half that
-      # makes it pay. Shared scope with complement-suite — same context,
-      # same Dockerfile, same layers.
+      # makes it pay.
+      #
+      # Import only. This job and complement-suite build the same image
+      # from the same context and run concurrently, so having both export
+      # means paying the upload twice and racing to write the same key for
+      # no benefit. The suite is the longer job and the one whose build
+      # blocks more, so it owns the export and this one consumes it.
       - name: Build the Complement image
         if: hashFiles('crates/spindle-server/Cargo.toml') != ''
         uses: docker/build-push-action@v6
@@ -62,7 +67,6 @@ jobs:
           tags: complement-spindle:ci
           load: true
           cache-from: type=gha,scope=complement-image
-          cache-to: type=gha,mode=max,scope=complement-image
 
       - name: Start it the way Complement does
         if: hashFiles('crates/spindle-server/Cargo.toml') != ''
