@@ -51,3 +51,9 @@ jobs:
       # an operator cannot discover is a setting that does not exist.
       - name: Check the example config documents every setting
         run: python3 scripts/config-drift.py
+
+      # Both Rust homeservers in this space run this. It costs seconds and
+      # this repository is unusually prose-heavy: the SPEC, the ADRs and the
+      # benchmark write-ups are the artefact as much as the code is.
+      - name: Check spelling
+        uses: crate-ci/typos@v1
