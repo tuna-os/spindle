@@ -13,6 +13,16 @@
 # at whatever it was the day it was pinned, security fixes included. With
 # this in place, pinning becomes safe, because these updates will move the
 # pins.
+#
+# One correction to the note above, which was written from `git log`: there
+# was no update *commit*, but Renovate's onboarding PR (#73) had been sitting
+# open and unmerged since the day before. Two bots opening the same PRs is
+# noise, so this one stays and that one closed -- but Renovate's proposal
+# found things this file had missed, and they are fixed below: the `hmac`
+# pairing `sha2` needs, and the Dockerfile and Go module nothing was
+# watching. `rust-toolchain.toml` remains unautomated; Dependabot has no
+# ecosystem for it, and the MSRV moves deliberately (#193) rather than on a
+# schedule.
 version: 2
 
 updates:
@@ -28,6 +38,17 @@ updates:
     # already exist. Grouping keeps the lockfile churn to one reviewable PR
     # a week rather than five that each half-touch it.
     groups:
+      # Crates that share a trait crate have to move together or they do not
+      # compile. #185 bumped `sha2` to 0.11 alone; it moved to `digest` 0.11
+      # while `hmac` stayed on 0.10, and `Hmac<Sha256>` in the S3 signer
+      # stopped satisfying `Mac`. One of them is never a valid update.
+      #
+      # Listed before the catch-all: the first matching group wins, so a
+      # RustCrypto crate lands here rather than in `rust-dependencies`, and
+      # a major bump of one drags its siblings along instead of arriving
+      # alone and broken.
+      rustcrypto:
+        patterns: ["sha2", "hmac", "digest", "sha1", "hkdf", "argon2", "ed25519*", "signature"]
       rust-dependencies:
         patterns: ["*"]
         update-types: [minor, patch]
@@ -40,3 +61,21 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+
+  # The Complement image. It pins a base image by tag, and nothing was
+  # watching it -- the conformance suite builds and runs against whatever
+  # that tag resolves to on the day CI happens to run.
+  - package-ecosystem: docker
+    directory: /complement
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+
+  # The mautrix bridge harness under evidence/. Small, but it is a Go module
+  # with its own lockfile, and "nothing updates it" was the finding that
+  # started all of this.
+  - package-ecosystem: gomod
+    directory: /evidence/mautrix-echo
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
