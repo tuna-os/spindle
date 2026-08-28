@@ -304,7 +304,7 @@ async fn an_edit_does_not_touch_the_event_it_edits() {
             &token,
             "m.room.message",
             "t0",
-            &json!({"msgtype":"m.text","body":"orignal"}),
+            &json!({"msgtype":"m.text","body":"original"}),
         )
         .await;
 
@@ -330,7 +330,7 @@ async fn an_edit_does_not_touch_the_event_it_edits() {
         )
         .await;
     assert_eq!(
-        event["content"]["body"], "orignal",
+        event["content"]["body"], "original",
         "the edit rewrote the original: {event}"
     );
 }

@@ -1,0 +1,45 @@
+# Spell-checking for code, comments and prose, as Tuwunel and Continuwuity
+# both run. This repository is unusually prose-heavy — the SPEC, the ADRs and
+# the benchmark write-ups are the artefact as much as the code is — so a typo
+# checker earns more here than in most codebases.
+#
+# On its first run it found nineteen things and exactly two were typos
+# (`orignal`, in a relations test fixture, twice). The rest are below, with
+# what they actually are. That ratio is worth knowing: the value of this
+# check is the next typo, not this batch.
+
+[default]
+# `mis-report`, `mis-seeded`: typos splits on the hyphen and flags the
+# prefix. Tuwunel carries the same rule for the same reason.
+extend-ignore-re = [
+    "mis-[a-z]+",
+    # The placeholder MAS client id in the delegated-auth guide: a long run
+    # of zeroes then SPINDLE in the leetspeak shape MAS uses for its own
+    # fixed client ids. `typos` reads the ND out of the middle of it.
+    "0+SP1ND1E",
+]
+
+[default.extend-words]
+# A legitimate variant spelling. `typos` prefers `unparsable`; both are in
+# the dictionaries, and this codebase has used `unparseable` consistently
+# in five places since before there was a checker to have an opinion.
+"unparseable" = "unparseable"
+# Possessives in test names, where an apostrophe cannot go:
+# `one_users_filter_is_not_anothers` reads "one user's filter is not
+# another's". Renaming these to satisfy the checker would make the English
+# worse, not better.
+"anothers" = "anothers"
+
+[default.extend-identifiers]
+# A CSS class in the comparisons page's animation: the pulsing ring.
+"pring" = "pring"
+
+[files]
+# Vendored, generated, or measured: not ours to spell-check.
+extend-exclude = [
+    "Cargo.lock",
+    "complement/allowlist.txt",
+    "docs/benchmarks/data/*.json",
+    "tmp/",
+    "evidence/",
+]

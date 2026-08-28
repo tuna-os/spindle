@@ -1,0 +1,42 @@
+# Nothing was updating this repository's dependencies.
+#
+# Not Cargo, not Actions: `git log` shows no renovate or dependabot commit in
+# the project's history, so every crate and every action moves only when
+# somebody happens to bump it by hand. For a homeserver that is a security
+# posture rather than an oversight — `ruma` alone carries the room-version,
+# redaction and authorization rules, and a fix landing there reaches us only
+# if someone notices.
+#
+# This also has to come *before* pinning actions to commit SHAs, which is the
+# other half of the advice and which Synapse does. A SHA pin with nothing
+# maintaining it is strictly worse than a version tag: it freezes the action
+# at whatever it was the day it was pinned, security fixes included. With
+# this in place, pinning becomes safe, because these updates will move the
+# pins.
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # `go.mod`/`Cargo.lock` drift is a known failure mode here: a bump that
+    # leaves the previous version's hashes in the lockfile passes `cargo
+    # build` and `cargo test`, then the release job's own tidy rewrites the
+    # files and goreleaser aborts — after the tag and the GitHub release
+    # already exist. Grouping keeps the lockfile churn to one reviewable PR
+    # a week rather than five that each half-touch it.
+    groups:
+      rust-dependencies:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
