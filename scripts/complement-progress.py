@@ -20,9 +20,20 @@ the failures that actually break the build under tens of thousands of
 lines. Unprotected failures still get their one line; the ledger keeps
 everything either way.
 
+The parent of a protected failure prints its log too, and that is not a
+tidiness point. Complement tears the deployment down at the end of the
+*top-level* test and prints each homeserver's log there, so the server's
+own account of what it refused is attributed to the parent — a name that
+is usually not in the allowlist itself, only its subtests are. Without
+this, a build fails on a protected subtest and the one log that says why
+is discarded a second later. Found the hard way, on a subtest whose
+failure said only that a homeserver returned 403.
+
 Options:
   --heartbeat SECONDS   how often to print a still-running line (0 disables)
   --fail-output LINES   log lines to show under a protected failure
+  --parent-output LINES log lines to show under its parent, which is where
+                        the homeserver logs land (0 disables)
   --allowlist FILE      which tests are protected (default: the repo's)
 """
 
@@ -64,6 +75,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--heartbeat", type=float, default=60.0)
     parser.add_argument("--fail-output", type=int, default=40)
+    parser.add_argument("--parent-output", type=int, default=400)
     parser.add_argument(
         "--allowlist",
         type=Path,
@@ -79,6 +91,10 @@ def main() -> int:
     # Only failures print theirs; passing tests would bury the log.
     buffered: dict[str, list[str]] = collections.defaultdict(list)
     running: set[str] = set()
+    # Protected subtests that have already failed, so their parent knows to
+    # surrender its log when it fails in turn. Go reports a subtest before
+    # its parent, so by then this is complete for that parent.
+    protected_failures: set[str] = set()
 
     def emit(line: str) -> None:
         elapsed = time.monotonic() - started
@@ -115,10 +131,28 @@ def main() -> int:
                 protected = action == "fail" and is_protected(test, allowlist)
                 if protected:
                     counts["protected-fail"] += 1
+                    protected_failures.add(test)
                 suffix = "" if protected or action != "fail" else "  [not protected]"
                 emit(f"{mark} {test} ({seconds:.1f}s){suffix}")
                 if protected:
                     for out in buffered[test][-args.fail_output :]:
+                        print(f"          | {out}", flush=True)
+                # The parent of a protected failure is where Complement put
+                # the homeserver logs. It is counted as unprotected -- that
+                # part is right, the subtest is the failure -- but its log
+                # is the only place the server says what it refused.
+                elif (
+                    action == "fail"
+                    and args.parent_output
+                    and any(
+                        failed.startswith(f"{test}/") for failed in protected_failures
+                    )
+                ):
+                    print(
+                        f"          | ---- deployment log for {test} ----",
+                        flush=True,
+                    )
+                    for out in buffered[test][-args.parent_output :]:
                         print(f"          | {out}", flush=True)
                 buffered.pop(test, None)
             elif action in {"pass", "fail"} and not test:
@@ -137,10 +171,9 @@ def main() -> int:
 
     # The protected count is the one that decides the build, so it is the
     # one the summary leads with when it is not zero.
-    protected_failures = counts["protected-fail"]
     summary = (
         f"==== {counts['pass']} passed, {counts['fail']} failed "
-        f"({protected_failures} protected), {counts['skip']} skipped"
+        f"({counts['protected-fail']} protected), {counts['skip']} skipped"
     )
     emit(summary)
     # Deliberately 0: this renders results, it does not judge them.
