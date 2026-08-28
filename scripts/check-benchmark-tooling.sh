@@ -186,3 +186,69 @@ overlap = [c for c in found if c[1].startswith("1.50")]
 assert overlap and overlap[0][0] == "noise", f"a 1.50x overlap was coloured: {overlap}"
 print("rounds: overlapping rounds are not called; separated rounds are")
 PY
+
+# Multiplicity. The separation rule bounds the false-call rate for one cell,
+# and a table is many cells: at three rounds a side it is one in ten, so
+# eighteen cells expect nearly two calls from luck alone (#183). The page has
+# to say so, and has to mark a call that nothing else supports -- because the
+# arithmetic says how many are spurious, never which.
+lone="$work/lone"
+mkdir -p "$lone"
+python3 - "$lone" <<'PY'
+import json, pathlib, sys
+out = pathlib.Path(sys.argv[1])
+def write(server, rnd, values):
+    (out / f"m9-lone.{server}.r{rnd}.json").write_text(json.dumps({
+        "server": server,
+        "base_url": "http://127.0.0.1:0",
+        "dimension": "events",
+        "round": rnd,
+        "sizes": sorted(values),
+        "samples": 1,
+        "benchmarks": {
+            f"{operation}/{size}": {
+                "mean_ns": value, "lower_ns": value,
+                "upper_ns": value, "samples": 1,
+            }
+            for size, ops in values.items()
+            for operation, value in ops.items()
+        },
+    }))
+# `scales` is called at both sizes and in the same direction -- the shape a
+# real per-item cost takes. `only_here` is called at 200 and overlaps at 50:
+# one call, nothing agreeing with it.
+for rnd, bump in ((1, 0.0), (2, 0.1e6), (3, 0.05e6)):
+    write("spindle", rnd, {
+        50: {"scales": 1.0e6 + bump, "only_here": 2.0e6 + bump},
+        200: {"scales": 2.0e6 + bump, "only_here": 1.0e6 + bump},
+    })
+for rnd, bump in ((1, 0.0), (2, 0.1e6), (3, 0.05e6)):
+    write("rival", rnd, {
+        50: {"scales": 5.0e6 + bump, "only_here": 2.0e6 + bump},
+        200: {"scales": 9.0e6 + bump, "only_here": 5.0e6 + bump},
+    })
+PY
+python3 "$here/render-comparisons.py" "$lone" "$work/lone.html" >/dev/null
+python3 - "$work/lone.html" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+rows = {}
+for row in re.findall(r"<tr><td><strong>.*?</tr>", text, re.S):
+    name = re.search(r"<code>(.*?)</code>", row)
+    if name:
+        rows[name.group(1)] = re.findall(r'<td class="num ([a-z ]+)"', row)
+
+assert rows["scales"] == ["win", "win"], (
+    f"a call agreeing across sizes was marked as standing alone: {rows['scales']}"
+)
+assert rows["only_here"].count("win lone") == 1, (
+    f"a call with nothing agreeing with it was not marked: {rows['only_here']}"
+)
+# The count has to be stated, not merely implied by the marker: four
+# comparable cells at three rounds expect 4 * 2/C(6,3) = 0.4 by chance.
+assert "<strong>4</strong>" in text, "the table's cell count is not reported"
+assert "<strong>0.4</strong>" in text, (
+    "the expected number of chance calls is not reported"
+)
+print("comparisons: chance-call count reported; unsupported calls are marked")
+PY
