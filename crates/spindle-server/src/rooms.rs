@@ -2829,8 +2829,21 @@ impl Rooms {
 
         let entry = log
             .append_remote(input)
-            .map_err(|error| RoomError::Append(format!("{error:?}")))?
+            .map_err(|error| {
+                // §9.2 case 3: the key is contested inside the window, so
+                // this append needs the resolver. Counted where the
+                // decision is made (#166), whether it is then resolved or
+                // — as today — refused.
+                if matches!(
+                    error,
+                    spindle_core::AppendError::NeedsStateResolution { .. }
+                ) {
+                    crate::metrics::record_contested_state(crate::metrics::Origin::Local);
+                }
+                RoomError::Append(format!("{error:?}"))
+            })?
             .clone();
+        crate::metrics::record_append(crate::metrics::Origin::Local, case_of(state_key.is_some()));
 
         self.persist_entry(
             log,
@@ -3357,8 +3370,20 @@ impl Rooms {
         };
         let entry = log
             .append_remote(input)
-            .map_err(|error| RoomError::Append(format!("{error:?}")))?
+            .map_err(|error| {
+                if matches!(
+                    error,
+                    spindle_core::AppendError::NeedsStateResolution { .. }
+                ) {
+                    crate::metrics::record_contested_state(crate::metrics::Origin::Federated);
+                }
+                RoomError::Append(format!("{error:?}"))
+            })?
             .clone();
+        crate::metrics::record_append(
+            crate::metrics::Origin::Federated,
+            case_of(state_key.is_some()),
+        );
 
         let content = json["content"].clone();
         self.persist_entry(
@@ -3690,6 +3715,18 @@ impl ReceiptRecord {
         let ts = u64::from_be_bytes(bytes.get(8..16)?.try_into().ok()?);
         let event_id = String::from_utf8(bytes.get(16..)?.to_vec()).ok()?;
         Some(Self { event_id, li, ts })
+    }
+}
+
+/// Which of SPEC §9.2's cheap cases an append took.
+///
+/// Case 3 is never returned here: a contested key does not reach a
+/// successful append, so it is counted at the error instead.
+fn case_of(is_state: bool) -> crate::metrics::ForkCase {
+    if is_state {
+        crate::metrics::ForkCase::StateUncontested
+    } else {
+        crate::metrics::ForkCase::NonState
     }
 }
 

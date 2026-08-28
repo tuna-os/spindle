@@ -23,6 +23,7 @@ pub mod federation;
 pub mod filters;
 pub mod mas;
 pub mod media;
+pub mod metrics;
 pub mod oidc;
 pub mod previews;
 pub mod profiles;
