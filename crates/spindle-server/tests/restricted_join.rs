@@ -416,7 +416,9 @@ async fn a_client_cannot_put_its_own_authorising_user_on_a_member_event() {
     let bob = harness.register("bob").await;
 
     let space = harness.public_room(&alice).await;
-    let room = harness.restricted_room(&alice, "restricted", &[&space]).await;
+    let room = harness
+        .restricted_room(&alice, "restricted", &[&space])
+        .await;
     harness.join(&space, &bob).await;
     assert_eq!(harness.join(&room, &bob).await.0, StatusCode::OK);
 
