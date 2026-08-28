@@ -228,6 +228,55 @@ fn a_disjoint_fork_resolves_the_same_way_as_the_reference_resolver() {
     assert_eq!(assert_equivalent(&base, &left, &right), 6);
 }
 
+/// The same disjoint fork, on slots the common ancestor already held.
+///
+/// The distinction #225 turned on. When both branches write slots that were
+/// *unset* before the fork, each parent snapshot simply lacks the other's
+/// key and the union is unambiguous. When the slots already had values, the
+/// branch that left a key alone still carries the inherited event, so the
+/// union has two candidates for a key nothing contested.
+///
+/// This asserts the reference resolver reaches the same answer as before —
+/// its conflicted set is built from events differing from the base, so a
+/// slot only one branch moved was never in conflict for it either. That
+/// agreement is the whole justification for the merge-base rule; without
+/// this test the rule is only self-consistent.
+#[test]
+fn a_disjoint_fork_on_slots_the_ancestor_already_held_resolves_the_same_way() {
+    let mut base = RoomBuilder::new();
+    base.add(
+        ALICE,
+        TimelineEventType::RoomTopic,
+        Some(String::new()),
+        &json!({ "topic": "before the fork" }),
+    );
+    base.add(
+        ALICE,
+        TimelineEventType::RoomName,
+        Some(String::new()),
+        &json!({ "name": "before the fork" }),
+    );
+
+    let mut left = Branch::fork(&base, "-l");
+    left.write(
+        ALICE,
+        &TimelineEventType::RoomTopic,
+        "",
+        &json!({ "topic": "left" }),
+    );
+
+    let mut right = Branch::fork(&base, "-r");
+    right.write(
+        ALICE,
+        &TimelineEventType::RoomName,
+        "",
+        &json!({ "name": "right" }),
+    );
+
+    // create, alice, PL, join_rules, topic, name.
+    assert_eq!(assert_equivalent(&base, &left, &right), 6);
+}
+
 /// A one-event fork barely exercises a *window*. This one is several events
 /// deep on both sides, so the reverse search has real ancestry to walk and the
 /// merge has more than one slot per side to reconcile.

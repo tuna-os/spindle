@@ -555,7 +555,27 @@ impl RoomLog {
             depth = depth.max(entry_depth.saturating_add(1));
         }
 
-        let mut state_after = merge_states(&parent_states)?;
+        // The merge base: the state as both branches last agreed on it.
+        // Without it a key only one branch touched looks contested, because
+        // the untouched branch still carries the older event ID -- see the
+        // rule in `merge_states`. Only forks need one; a single parent has
+        // nothing to disagree with.
+        //
+        // `fork_window` is bounded by the resident window, which is the same
+        // bound the fast path already lives inside (SPEC §9.1): a fork deeper
+        // than that has no resident snapshot to merge from anyway. When it
+        // cannot answer, `base` stays `None` and the merge falls back to the
+        // conservative rule -- refusing rather than guessing.
+        let base = if input.prev_events.len() > 1 {
+            self.fork_window(&input.prev_events, self.resident_window)
+                .ok()
+                .and_then(|window| self.positions.get(&window.nearest_common_ancestor).copied())
+                .and_then(|li| self.resident.get(&li))
+        } else {
+            None
+        };
+
+        let mut state_after = merge_states(&parent_states, base)?;
         let state_key = input.state_key;
         if let Some(state_key) = state_key.clone() {
             state_after = state_after.apply(state_key, input.event_id.as_str());
@@ -864,7 +884,12 @@ impl RoomLog {
                 .iter()
                 .filter_map(|parent| log.state_after_event(parent))
                 .collect();
-            let mut folded = match merge_states(&parents) {
+            // No merge base here, and none is needed: a reopen that cannot
+            // reproduce a fold falls through to the stored trie below, which
+            // is the authority for exactly these entries. Computing an
+            // ancestor mid-rebuild would also be asking a half-built log
+            // about ancestry it does not yet hold.
+            let mut folded = match merge_states(&parents, None) {
                 Ok(state) => state,
                 // A conflict means the fold cannot be reproduced; fall through
                 // to the stored trie rather than refusing to open the room.
@@ -937,7 +962,33 @@ impl RoomLog {
     }
 }
 
-fn merge_states(parents: &[&StateSnapshot]) -> Result<StateSnapshot, AppendError> {
+/// Fold the parents of a fork into one state, or refuse if they disagree.
+///
+/// `base` is the state at their nearest common ancestor: the last point both
+/// branches agreed. It is what separates SPEC §9.2's case 2 from case 3, and
+/// leaving it out was #225.
+///
+/// The subtlety is that a parent's snapshot describes *all* of that branch's
+/// state, not the part it changed. So for a key one branch wrote and the
+/// other never touched, the two parents disagree on paper — one carries the
+/// new event, the other the value both inherited — while nothing is actually
+/// in conflict. Matrix's own state resolution says the same thing by
+/// building its conflicted set from events that *differ from the base*; a
+/// key only one side moved is unconflicted there too, and free here.
+///
+/// So a candidate equal to the base is a branch declining to make a claim.
+/// Contested means two or more branches moved the key *away* from the base,
+/// and that alone is case 3.
+///
+/// With no base — a fork too deep for the window, or one whose ancestry the
+/// log cannot walk — nothing is known to be inherited, so every candidate
+/// counts as a claim and any disagreement is refused. That is the old
+/// behaviour, kept deliberately as the conservative fallback: refusing a
+/// merge is recoverable, and merging two branches wrongly is not.
+fn merge_states(
+    parents: &[&StateSnapshot],
+    base: Option<&StateSnapshot>,
+) -> Result<StateSnapshot, AppendError> {
     let Some(first) = parents.first() else {
         return Ok(StateSnapshot::new());
     };
@@ -957,16 +1008,26 @@ fn merge_states(parents: &[&StateSnapshot]) -> Result<StateSnapshot, AppendError
 
     let mut merged = StateSnapshot::new();
     for (key, candidates) in values {
-        if candidates.len() > 1 {
-            return Err(AppendError::NeedsStateResolution {
-                key,
-                candidates: candidates.into_iter().map(EventId).collect(),
-            });
-        }
-        let event_id = candidates
-            .into_iter()
-            .next()
-            .expect("a collected state key has a value");
+        let event_id = if candidates.len() > 1 {
+            let inherited = base.and_then(|base| base.get(&key));
+            let mut claims = candidates
+                .iter()
+                .filter(|candidate| Some(candidate.as_ref()) != inherited);
+            match (claims.next(), claims.next()) {
+                (Some(only), None) => only.clone(),
+                _ => {
+                    return Err(AppendError::NeedsStateResolution {
+                        key,
+                        candidates: candidates.into_iter().map(EventId).collect(),
+                    });
+                }
+            }
+        } else {
+            candidates
+                .into_iter()
+                .next()
+                .expect("a collected state key has a value")
+        };
         merged = merged.apply(key, event_id);
     }
     Ok(merged)
