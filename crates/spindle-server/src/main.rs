@@ -58,8 +58,83 @@ async fn main() -> ExitCode {
         };
         return verify_media(&config_path).await;
     }
+    // `spindle migrate <config> [--dry-run]` -- move a store forward to the
+    // schema this binary speaks (#20).
+    //
+    // Its own command rather than something the server does on start. An
+    // upgrade that rewrites the store the moment a new binary boots is the
+    // change an operator cannot back out of: by the time they know it
+    // happened, the old bytes are gone. So `open` refuses and names this,
+    // and the rewrite waits for somebody to ask -- having had the chance to
+    // take a backup first.
+    if std::env::args().nth(1).as_deref() == Some("migrate") {
+        let Some(config_path) = std::env::args().nth(2) else {
+            eprintln!("usage: spindle migrate <config> [--dry-run]");
+            return ExitCode::FAILURE;
+        };
+        let dry_run = std::env::args().any(|argument| argument == "--dry-run");
+        return migrate(&config_path, dry_run);
+    }
 
     serve().await
+}
+
+/// Move a store forward to the schema this binary speaks.
+fn migrate(config_path: &str, dry_run: bool) -> ExitCode {
+    let config = match Config::load(config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("cannot read {config_path}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Unchecked on purpose: the store this is being run on is one the
+    // ordinary open has already refused.
+    let store = match spindle_store::FjallStore::open_unchecked(&config.storage.path) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("cannot open store: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let report =
+        match spindle_store::migrate::run(&store, spindle_store::migrate::MIGRATIONS, dry_run) {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!("migrate: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+    if report.steps.is_empty() {
+        println!("migrate: the store is already at this binary's schema");
+        return ExitCode::SUCCESS;
+    }
+    // The irreversibility notice comes first, and on a dry run it is the
+    // whole point of the exercise: the operator is being told what they
+    // cannot undo while they can still choose not to do it.
+    if report.irreversible() {
+        println!(
+            "migrate: this plan CANNOT be undone -- going back means restoring \
+             a backup taken before it runs"
+        );
+    }
+    for (summary, reversible, rows) in &report.steps {
+        let note = match reversible {
+            spindle_store::migrate::Reversible::Yes => "reversible",
+            spindle_store::migrate::Reversible::No => "IRREVERSIBLE",
+        };
+        if dry_run {
+            println!("migrate: would apply [{note}] {summary}");
+        } else {
+            println!("migrate: applied [{note}] {summary} ({rows} rows)");
+        }
+    }
+    if dry_run {
+        println!("migrate: dry run, nothing written");
+    } else {
+        println!("migrate: done, store is now at this binary's schema");
+    }
+    ExitCode::SUCCESS
 }
 
 /// Run the server itself, which is what every argument form above declines
