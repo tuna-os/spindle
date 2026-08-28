@@ -147,7 +147,20 @@ async fn the_exposition_carries_what_the_counters_hold() {
 
     // The scrape is a rendering of the same counters, so it must agree
     // with them rather than being assembled separately.
+    //
+    // Bracketed rather than compared to a single reading. The counters are
+    // process-global and every other test in this binary is appending to
+    // them concurrently, so `render()` and a reading taken after it are
+    // two different instants: asserting they are equal asserts that
+    // nothing happened in between, which is not a property of the code.
+    // The render happened inside this window, so its value has to lie in
+    // it -- an exposition assembled from anywhere but these counters still
+    // falls outside, which is what the test is for.
+    let before_local = metrics::event_count(Origin::Local);
+    let before_case2 = metrics::fork_case_count(ForkCase::StateUncontested);
     let text = metrics::render();
+    let after_local = metrics::event_count(Origin::Local);
+    let after_case2 = metrics::fork_case_count(ForkCase::StateUncontested);
     let scraped = |needle: &str| -> u64 {
         text.lines()
             .find(|line| line.starts_with(needle))
@@ -155,13 +168,17 @@ async fn the_exposition_carries_what_the_counters_hold() {
             .and_then(|value| value.parse().ok())
             .unwrap_or_else(|| panic!("no {needle} in {text}"))
     };
-    assert_eq!(
-        scraped("spindle_events_appended_total{origin=\"local\"}"),
-        metrics::event_count(Origin::Local)
+    let local = scraped("spindle_events_appended_total{origin=\"local\"}");
+    assert!(
+        (before_local..=after_local).contains(&local),
+        "exposition says {local} local appends, counters were \
+         {before_local}..={after_local} across the render"
     );
-    assert_eq!(
-        scraped("spindle_fork_resolutions_total{case=\"2\"}"),
-        metrics::fork_case_count(ForkCase::StateUncontested)
+    let case2 = scraped("spindle_fork_resolutions_total{case=\"2\"}");
+    assert!(
+        (before_case2..=after_case2).contains(&case2),
+        "exposition says {case2} case-2 resolutions, counters were \
+         {before_case2}..={after_case2} across the render"
     );
     assert!(text.contains("spindle_build_info{version="), "{text}");
 }
