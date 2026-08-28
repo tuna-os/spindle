@@ -24,6 +24,42 @@ use crate::codec::{CodecError, EntryRecord, RECORD_VERSION, RoomRecord};
 /// Maps SPEC §8.3's three modes onto the engine. Ordering is decided before
 /// durability in every mode, so a crash can only ever lose a *suffix* of the
 /// log — never reorder it, never fork it.
+///
+/// # Is `Strict` actually stronger than `Group`?
+///
+/// Yes, and #84 was right to ask, because measurement alone said otherwise.
+/// Timing 400 commits found `Strict` at 223.5 µs and `Group` at 226.3 µs —
+/// `Strict` marginally *faster*, i.e. indistinguishable — and observed that
+/// "a mode that claims stronger durability and costs nothing is either free
+/// or not doing what its documentation says, and we currently cannot tell
+/// which."
+///
+/// The two candidate explanations were that this filesystem collapses the
+/// modes, or that `fjall` does. **`fjall` does not.** Its journal writer
+/// dispatches to genuinely different syscalls:
+///
+/// ```text
+/// PersistMode::SyncAll  => file.sync_all()    // fsync(2):     data + metadata
+/// PersistMode::SyncData => file.sync_data()   // fdatasync(2): data, and only
+///                                             // the metadata needed to
+///                                             // retrieve it
+/// ```
+///
+/// So the request really is different, and the equal timings are a property
+/// of the workload rather than of the mode. The journal is **append-only**,
+/// and appending changes the file's size — which `fdatasync` is obliged to
+/// flush anyway, because without the new size the data cannot be found.
+/// For a growing file the two calls therefore do nearly the same work, which
+/// is exactly the shape of the measurement.
+///
+/// The conclusion is that `Strict` is a real request that happens to be
+/// almost free *here*, not a mode that quietly does nothing. That distinction
+/// matters for the "regulated deployments" row in SPEC §8.3: an operator
+/// choosing `strict` gets `fsync`, and on a filesystem or workload where the
+/// two diverge they will pay for it and receive it.
+///
+/// `durability_modes_map_to_distinct_syscalls`, below, pins the mapping so
+/// it cannot drift back into ambiguity silently.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Durability {
     /// `strict`: data and metadata are fsynced before the commit returns.
@@ -47,6 +83,41 @@ impl Durability {
             Self::Strict => PersistMode::SyncAll,
             Self::Group => PersistMode::SyncData,
             Self::Relaxed => PersistMode::Buffer,
+        }
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::{Durability, PersistMode};
+
+    /// Each mode asks the engine for a different syscall.
+    ///
+    /// This is the assertion #84 wanted and could not get from a stopwatch:
+    /// `Strict` and `Group` time identically on an append-only journal, so
+    /// timing cannot distinguish "stronger" from "a no-op that happens to be
+    /// spelled differently". The mapping can be asserted; the timing cannot.
+    ///
+    /// If a future change collapses two modes onto one `PersistMode`, this
+    /// fails — which is the point. Silently serving `fdatasync` to an
+    /// operator who configured `strict` is the failure mode worth a test,
+    /// because nothing about the running system would look wrong.
+    #[test]
+    fn durability_modes_map_to_distinct_syscalls() {
+        assert_eq!(Durability::Strict.persist_mode(), PersistMode::SyncAll);
+        assert_eq!(Durability::Group.persist_mode(), PersistMode::SyncData);
+        assert_eq!(Durability::Relaxed.persist_mode(), PersistMode::Buffer);
+
+        // And they are three modes, not two wearing three names.
+        let modes = [
+            Durability::Strict.persist_mode(),
+            Durability::Group.persist_mode(),
+            Durability::Relaxed.persist_mode(),
+        ];
+        for (i, left) in modes.iter().enumerate() {
+            for right in &modes[i + 1..] {
+                assert_ne!(left, right, "two durability modes collapsed onto {left:?}");
+            }
         }
     }
 }
