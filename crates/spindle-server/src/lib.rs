@@ -21,6 +21,7 @@ pub mod directory;
 pub mod errors;
 pub mod federation;
 pub mod filters;
+pub mod import;
 pub mod mas;
 pub mod media;
 pub mod metrics;
