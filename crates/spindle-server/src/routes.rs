@@ -45,6 +45,7 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/v3/rooms/{room_id}/join",
     "/_matrix/client/v3/rooms/{room_id}/leave",
     "/_matrix/client/v3/join/{room_id_or_alias}",
+    "/_matrix/client/v3/knock/{room_id_or_alias}",
     "/_matrix/client/v3/sync",
     "/_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}",
     "/_matrix/client/v3/rooms/{room_id}/read_markers",
@@ -344,6 +345,10 @@ fn room_routes() -> Router<AppState> {
         .route(
             "/_matrix/client/v3/join/{room_id_or_alias}",
             post(join_room_by_id_or_alias),
+        )
+        .route(
+            "/_matrix/client/v3/knock/{room_id_or_alias}",
+            post(knock_room),
         )
         .route(
             "/_matrix/client/v3/directory/room/{room_alias}",
@@ -3396,6 +3401,80 @@ fn server_name_params(query: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+/// `POST /_matrix/client/v3/knock/{roomIdOrAlias}`
+///
+/// Asking to be let into a room that will not simply admit you. The server
+/// side of knocking has existed since `make_knock`/`send_knock` landed --
+/// this is the half a *local* user needs, and without it a knock could
+/// arrive from a peer and never be sent by anyone here.
+///
+/// Nothing decides whether the knock is allowed. `m.room.member` with
+/// `membership: knock` goes through the same append as any other membership,
+/// and the authorization rules refuse it unless the join rule is `knock` or
+/// `knock_restricted` -- which is why knocking on an invite-only room comes
+/// back 403 without a line here saying so.
+///
+/// Re-knocking is deliberately not special-cased. The rules allow
+/// knock -> knock, so a user who knocks twice gets a second event and a
+/// second chance to be noticed, which is what the spec's "may knock again"
+/// amounts to.
+async fn knock_room(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id_or_alias): axum::extract::Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, MatrixError> {
+    let request: SelfMembershipRequest = optional_body(&body)?;
+    let room_id = resolve_room_target(&state, &room_id_or_alias)?;
+    match state.rooms.set_membership(
+        &room_id,
+        &identity.user_id,
+        &identity.user_id,
+        "knock",
+        request.reason.as_deref(),
+        state.key.pair(),
+    ) {
+        Ok(_) => {
+            state.rooms.wake_sync_waiters();
+            Ok(Json(json!({ "room_id": room_id })))
+        }
+        // A room this server does not hold needs `make_knock`/`send_knock`
+        // against a server that does, which is the next slice. Saying so is
+        // better than a 404 that reads as "no such room": the room may be
+        // perfectly real and simply elsewhere.
+        Err(crate::rooms::RoomError::UnknownRoom(_)) => Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            format!(
+                "{room_id} is not on this server, and knocking over federation is not implemented"
+            ),
+        )),
+        Err(error) => Err(room_error(error)),
+    }
+}
+
+/// A room ID, or the room a local alias names.
+///
+/// Only local aliases: resolving a remote one is a federation round trip
+/// that only matters once the knock itself can cross a server boundary.
+fn resolve_room_target(state: &AppState, room_id_or_alias: &str) -> Result<String, MatrixError> {
+    if !room_id_or_alias.starts_with('#') {
+        return Ok(room_id_or_alias.to_owned());
+    }
+    state
+        .directory
+        .resolve(room_id_or_alias)
+        .map_err(|error| directory_error(&error))?
+        .map(|record| record.room_id)
+        .ok_or_else(|| {
+            MatrixError::new(
+                StatusCode::NOT_FOUND,
+                "M_NOT_FOUND",
+                format!("no room is called {room_id_or_alias}"),
+            )
+        })
+}
+
 /// `POST /_matrix/client/v3/join/{room_id_or_alias}`
 ///
 /// Takes either form. An alias is resolved through the directory first; a room
@@ -5855,6 +5934,7 @@ async fn sync(
     )?;
 
     let invite = sync_invite(&state, &identity, result.invited, filter.as_ref());
+    let knock = sync_knock(&state, &identity, result.knocked, filter.as_ref());
     let leave = sync_leave(result.left, filter.as_ref());
 
     let (to_device, device_changes, key_counts, unused_fallback) =
@@ -5869,6 +5949,7 @@ async fn sync(
     let mut rooms: BTreeMap<&str, Box<RawValue>> = BTreeMap::new();
     rooms.insert("join", raw(&join)?);
     rooms.insert("invite", raw(&invite)?);
+    rooms.insert("knock", raw(&knock)?);
     rooms.insert("leave", raw(&leave)?);
 
     let mut body: BTreeMap<&str, Box<RawValue>> = BTreeMap::new();
@@ -5970,6 +6051,36 @@ fn sync_invite(
         invite.insert(room_id, json!({ "invite_state": { "events": events } }));
     }
     invite
+}
+
+/// The rooms this user has knocked on, with the state a client renders the
+/// wait from.
+///
+/// Deliberately its own section and not folded into `invite`. An invite is
+/// something to accept or decline; a knock is something to wait on, and a
+/// client that showed them together would offer an accept button for a room
+/// that has not agreed to let anyone in. The spec gives it `knock_state` for
+/// the same reason it gives an invite `invite_state`: the knocker is not in
+/// the room, so there is no timeline they are entitled to -- only enough to
+/// know which room they are waiting on.
+fn sync_knock(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    knocked: Vec<String>,
+    filter: Option<&crate::filters::Filter>,
+) -> serde_json::Map<String, Value> {
+    let mut knock = serde_json::Map::new();
+    for room_id in knocked {
+        if filter.is_some_and(|f| !f.allows_room(&room_id)) {
+            continue;
+        }
+        let events = state
+            .rooms
+            .stripped_state(&room_id, &identity.user_id)
+            .unwrap_or_default();
+        knock.insert(room_id, json!({ "knock_state": { "events": events } }));
+    }
+    knock
 }
 
 fn sync_leave(

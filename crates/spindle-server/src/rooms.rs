@@ -57,6 +57,19 @@ const LEAVE: &[u8] = b"leave";
 /// is out of the room.
 const BAN: &[u8] = b"ban";
 
+/// Asked to be let in, and not yet answered. A sixth membership and its own
+/// `/sync` section: a knock is neither an invitation the user can accept nor
+/// a room they are in, and a client renders it as neither.
+const KNOCK: &[u8] = b"knock";
+
+/// [`KNOCK`] as a `str`, for the same reason [`JOIN_STR`] exists.
+const KNOCK_STR: &str = "knock";
+
+const _: () = assert!(
+    KNOCK_STR.as_bytes()[0] == KNOCK[0] && KNOCK_STR.len() == KNOCK.len(),
+    "the membership index and the event content must spell `knock` the same way"
+);
+
 /// [`INVITE`] as a `str`, for the same reason [`JOIN_STR`] exists.
 const INVITE_STR: &str = "invite";
 
@@ -249,6 +262,8 @@ pub struct SyncResult {
     pub next_batch: u64,
     pub rooms: Vec<SyncRoom>,
     pub invited: Vec<String>,
+    /// Rooms knocked on and not yet answered — see [`Rooms::knocked`].
+    pub knocked: Vec<String>,
     pub left: Vec<SyncRoom>,
 }
 
@@ -2946,6 +2961,7 @@ impl Rooms {
         let position = self.stream_position();
         let joined = self.joined(user_id)?;
         let invited = self.invited(user_id)?;
+        let knocked = self.knocked(user_id)?;
 
         let mut rooms = Vec::new();
         for room_id in joined {
@@ -3002,6 +3018,7 @@ impl Rooms {
             next_batch: position,
             rooms,
             invited,
+            knocked,
             left,
         })
     }
@@ -3013,6 +3030,20 @@ impl Rooms {
     /// Returns [`RoomError`] if the index cannot be read.
     pub fn invited(&self, user_id: &str) -> Result<Vec<String>, RoomError> {
         self.membership_rooms(user_id, INVITE)
+    }
+
+    /// Rooms this user has knocked on and not yet been answered about.
+    ///
+    /// Its own section rather than folded into the invited ones: an invite is
+    /// something to accept or decline, a knock is something to wait on, and a
+    /// client that showed them together would offer a button for a room that
+    /// has not agreed to let anyone in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the membership index cannot be scanned.
+    pub fn knocked(&self, user_id: &str) -> Result<Vec<String>, RoomError> {
+        self.membership_rooms(user_id, KNOCK)
     }
 
     /// Rooms the user is out of, and has not forgotten.

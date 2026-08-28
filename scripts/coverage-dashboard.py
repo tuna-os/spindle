@@ -118,7 +118,6 @@ PLANNED = {
         ("GET", "/_matrix/client/v3/presence/{user_id}/status", "presence (M2/M3)"),
     ],
     "Rooms & membership": [
-        ("POST", "/_matrix/client/v3/knock/{room_id_or_alias}", "knocking"),
         ("POST", "/_matrix/client/v3/rooms/{room_id}/upgrade", "room upgrade (#7)"),
         ("GET", "/_matrix/client/v3/publicRooms", "public room directory"),
         ("POST", "/_matrix/client/v3/user_directory/search", "user directory"),
@@ -190,6 +189,7 @@ AREA_RULES = [
         "/_matrix/client/v3/createRoom",
         "/_matrix/client/v3/rooms/",
         "/_matrix/client/v3/join/",
+        "/_matrix/client/v3/knock/",
         "/_matrix/client/v3/joined_rooms",
         "/_matrix/client/v3/directory/",
         "/_matrix/client/v1/room_summary/",
