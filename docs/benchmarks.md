@@ -569,7 +569,18 @@ This does not retract the published results — the large ratios (3–7× on
 `context_deep`, 2–4× on `messages_page`) clear that floor comfortably, and
 the milestone conclusions rest on those. It does mean the **±0.1 cells were
 never evidence**, in either direction, including two of the three losses
-that prompted this work. Fixing it is a change to how a sitting is
+that prompted this work.
+
+The comparisons page kept colouring them anyway. For a year it printed a
+cell green at 1.19× and red at 0.90× directly above a caption saying to
+treat anything inside roughly ±0.4× as unmeasured — the page contradicting
+its own evidence, in the same paragraph. Single-round sittings are now
+coloured by the 1.38× measured here instead of the assumed ±10%, which
+moves 45 of the page's cells to grey and leaves **no loss anywhere on it**:
+every red cell ever published was inside this host's own repeatability, and
+the two that were investigated had already concluded exactly that from
+their own probes. The large ratios are untouched. What changed is which of
+them the page claims, not any number behind them. Fixing it is a change to how a sitting is
 collected rather than to any one number: a sitting becomes N rounds, a cell
 becomes the median across them, and the band gets derived from the observed
 spread instead of assumed. That is filed separately (#171) because it
