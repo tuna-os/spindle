@@ -177,6 +177,32 @@ pub trait Store: ReadView {
         None
     }
 
+    /// Move buffered writes into the backend's on-disk segments, if it has
+    /// that distinction.
+    ///
+    /// Not [`Self::flush`], which makes writes *durable* by persisting the
+    /// journal. This makes them *resident in the segment format* — a
+    /// different file layout, written on the backend's own schedule and not
+    /// otherwise reachable from here.
+    ///
+    /// It exists for compatibility fixtures. `tests/backend_compatibility.rs`
+    /// checks that a store one `fjall` version wrote opens under the next,
+    /// and could only cover the journal, because at fixture size `fjall` had
+    /// never rotated a memtable and nothing here could make it. That left the
+    /// segment format — the half a major version of an LSM engine is most
+    /// likely to change — untested, which is exactly the gap that made the
+    /// `fjall` 3 upgrade unanswerable in #193.
+    ///
+    /// Default no-op: a backend without segments has nothing to do, and
+    /// saying so is better than pretending the concept is universal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the flush fails.
+    fn flush_to_segments(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// Apply every write together, or none of them.
     ///
     /// Atomicity is the point: an appended event, its room metadata and its
@@ -418,6 +444,15 @@ impl ReadView for FjallCheckpoint {
 impl Store for FjallStore {
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         self.partition.insert(key, value)?;
+        Ok(())
+    }
+
+    fn flush_to_segments(&self) -> Result<(), StoreError> {
+        // `_and_wait`: the point is that the segment exists when this
+        // returns. The non-waiting variant queues the rotation, which for a
+        // fixture generator means writing the directory before the segment
+        // it is supposed to contain.
+        self.partition.rotate_memtable_and_wait()?;
         Ok(())
     }
 
