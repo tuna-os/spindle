@@ -67,6 +67,20 @@ OPERATIONS = {
         "room. Materialized state makes 'the state now' one content-addressed "
         "read instead of a resolution.",
     ),
+    "sync_poll": (
+        "Incremental /sync, nothing new",
+        "The request a running client makes over and over: since=<token>, "
+        "and the answer is usually \u201cnothing\u201d. It is the most common "
+        "request a homeserver ever serves, and until M5 no sitting measured "
+        "it at all.",
+    ),
+    "sync_delta": (
+        "Incremental /sync, one event",
+        "The same request when a room does have something waiting. It takes a "
+        "different path from the empty poll -- the server skips rooms with no "
+        "new events entirely -- so the two are measured separately rather "
+        "than averaged into one misleading number.",
+    ),
     "sliding_window": (
         "Sliding sync (MSC4186)",
         "The request Element X makes where classic clients call /sync: a "

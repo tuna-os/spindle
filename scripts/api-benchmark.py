@@ -285,6 +285,46 @@ def measure(base: str, sizes: list[int], samples: int, warmup: int) -> dict:
                 },
             )
 
+        # Incremental sync: the request a running client actually spends its
+        # life making. Every sitting before this one measured only the
+        # *initial* sync -- the request a client makes once -- which left the
+        # whole steady-state path unmeasured. That gap hid a real fix and let
+        # a claim about it go out overstated (see #175): the server
+        # short-circuits an incremental sync for a room with nothing new, so
+        # work that looked like it ran "on every sync" only ran on syncs that
+        # carried an event. The two cases are therefore measured separately,
+        # because they take different paths.
+        cursor = {
+            "since": observer.request("GET", "/_matrix/client/v3/sync")["next_batch"]
+        }
+        chatter = {"count": 0}
+
+        def sync_poll() -> None:
+            """Nothing new. The most common request a homeserver serves."""
+            observer.request(
+                "GET",
+                f"/_matrix/client/v3/sync?since={cursor['since']}&timeout=0",
+            )
+
+        def say_something() -> None:
+            """Outside the timed section: give the next sync one event."""
+            chatter["count"] += 1
+            alice.request(
+                "PUT",
+                f"/_matrix/client/v3/rooms/{join_room}/send/m.room.message"
+                f"/tick{size}_{chatter['count']}",
+                {"msgtype": "m.text", "body": "tick"},
+            )
+
+        def sync_delta() -> None:
+            """One event waiting. Advances the cursor, so every sample is a
+            fresh one-event delta rather than the same backlog re-delivered."""
+            body = observer.request(
+                "GET",
+                f"/_matrix/client/v3/sync?since={cursor['since']}&timeout=0",
+            )
+            cursor["since"] = body["next_batch"]
+
         sliding_supported = True
         try:
             sliding_window()
@@ -296,6 +336,21 @@ def measure(base: str, sizes: list[int], samples: int, warmup: int) -> dict:
         results[f"sync_initial/{size}"] = summarise(
             [timed(sync_initial) for _ in range(samples)]
         )
+
+        for _ in range(warmup):
+            sync_poll()
+        results[f"sync_poll/{size}"] = summarise(
+            [timed(sync_poll) for _ in range(samples)]
+        )
+
+        for _ in range(warmup):
+            say_something()
+            sync_delta()
+        delta_samples = []
+        for _ in range(samples):
+            say_something()
+            delta_samples.append(timed(sync_delta))
+        results[f"sync_delta/{size}"] = summarise(delta_samples)
         if sliding_supported:
             for _ in range(warmup):
                 sliding_window()
