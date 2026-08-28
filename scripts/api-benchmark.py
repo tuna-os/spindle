@@ -430,6 +430,15 @@ def main() -> int:
         "members in it. Two different axes, so two different runs and two "
         "different output files -- never one chart with both on it.",
     )
+    parser.add_argument(
+        "--round",
+        type=int,
+        default=1,
+        help="which round of a repeated sitting this is, recorded in the "
+        "results. One round cannot separate a real difference from this "
+        "host's run-to-run variance (#171), so a sitting repeats and the "
+        "renderer calls a cell only when the rounds separate.",
+    )
     parser.add_argument("--samples", type=int, default=25)
     parser.add_argument("--warmup", type=int, default=5)
     arguments = parser.parse_args()
@@ -460,6 +469,7 @@ def main() -> int:
         "server": arguments.server,
         "base_url": arguments.base_url,
         "dimension": arguments.dimension,
+        "round": arguments.round,
         "sizes": sizes,
         "samples": arguments.samples,
         "benchmarks": benchmarks,

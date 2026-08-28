@@ -138,3 +138,51 @@ if grep -q "events in room" "$work/axes.html"; then
     exit 1
 fi
 echo "comparisons: a members sweep is labelled by what it measured"
+
+# Rounds. One round cannot tell a real difference from this host's run-to-run
+# variance (#171), so the renderer calls a cell only when the two servers'
+# rounds separate -- and must refuse to call one when they overlap, however
+# far apart the medians sit.
+rounds="$work/rounds"
+mkdir -p "$rounds"
+python3 - "$rounds" <<'PY'
+import json, pathlib, sys
+out = pathlib.Path(sys.argv[1])
+def write(group, server, rnd, value):
+    (out / f"{group}.{server}.r{rnd}.json").write_text(json.dumps({
+        "server": server,
+        "base_url": "http://127.0.0.1:0",
+        "dimension": "events",
+        "round": rnd,
+        "sizes": [200],
+        "samples": 1,
+        "benchmarks": {"send/200": {
+            "mean_ns": value, "lower_ns": value, "upper_ns": value, "samples": 1
+        }},
+    }))
+# Overlapping: spindle 1.0-3.0 ms, rival 2.0-4.0 ms. The medians are 2.0 and
+# 3.0 -- a 1.50x "win" a single round would have printed in green.
+for rnd, value in ((1, 1e6), (2, 3e6), (3, 2e6)):
+    write("m9-overlap", "spindle", rnd, value)
+for rnd, value in ((1, 2e6), (2, 4e6), (3, 3e6)):
+    write("m9-overlap", "rival", rnd, value)
+# Separated: spindle 1.0-1.2 ms, rival 5.0-6.0 ms. Nothing crosses.
+for rnd, value in ((1, 1.0e6), (2, 1.2e6), (3, 1.1e6)):
+    write("m9-clear", "spindle", rnd, value)
+for rnd, value in ((1, 5e6), (2, 6e6), (3, 5.5e6)):
+    write("m9-clear", "rival", rnd, value)
+PY
+python3 "$here/render-comparisons.py" "$rounds" "$work/rounds.html" >/dev/null
+grep -q "Measured over <strong>3 rounds</strong>" "$work/rounds.html"
+python3 - "$work/rounds.html" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+found = re.findall(r'<td class="num (win|loss|noise)"[^>]*>([^<]*)', text)
+kinds = {kind for kind, _ in found}
+assert "noise" in kinds, f"the overlapping cell was called, not held: {found}"
+assert "win" in kinds, f"the separated cell was not called: {found}"
+# And the overlapping one must not have been printed as a win.
+overlap = [c for c in found if c[1].startswith("1.50")]
+assert overlap and overlap[0][0] == "noise", f"a 1.50x overlap was coloured: {overlap}"
+print("rounds: overlapping rounds are not called; separated rounds are")
+PY

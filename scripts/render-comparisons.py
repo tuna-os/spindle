@@ -29,12 +29,16 @@ import argparse
 import html
 import json
 import pathlib
+import statistics
 import sys
 
 # Cells whose ratio lands inside this band are called what they are: within
 # the run-to-run variance this host measures (docs/benchmarks.md records the
 # variance evidence), not a win for either side.
-NOISE_LOW, NOISE_HIGH = 0.90, 1.10
+# Only for sittings that ran a single round, where there is no spread to
+# read. Kept so the pre-#171 groups still render as they were published,
+# marked unresolved rather than recoloured after the fact.
+NOISE_LOW_SINGLE_ROUND = (0.90, 1.10)
 
 SERVER_COLORS = {
     "spindle": "#7c3aed",
@@ -153,7 +157,10 @@ INVESTIGATIONS = {
 def load_groups(data_dir: pathlib.Path) -> dict[str, list[dict]]:
     groups: dict[str, list[dict]] = {}
     for path in sorted(data_dir.glob("*.json")):
-        group = path.name.rsplit(".", 2)[0]
+        # `group.server.json`, or `group.server.rN.json` for one round of a
+        # repeated sitting. The group is the first segment either way, which
+        # is why group names must not contain a dot.
+        group = path.name.split(".")[0]
         document = json.loads(path.read_text())
         document["_file"] = path.name
         groups.setdefault(group, []).append(document)
@@ -161,11 +168,13 @@ def load_groups(data_dir: pathlib.Path) -> dict[str, list[dict]]:
         # Refuse to render nothing: a blank page reads as "no losses".
         sys.exit(f"render-comparisons: no result files in {data_dir}")
     for group, documents in groups.items():
-        ours = [d for d in documents if d["server"].startswith("spindle")]
+        ours = {
+            d["server"] for d in documents if d["server"].startswith("spindle")
+        }
         if len(ours) != 1:
             sys.exit(
                 f"render-comparisons: group {group} needs exactly one spindle "
-                f"file, found {len(ours)} — a ratio needs a fixed side"
+                f"server, found {len(ours)} — a ratio needs a fixed side"
             )
     return groups
 
@@ -182,15 +191,70 @@ def short_name(server: str) -> str:
 
 
 def cells_for(documents: list[dict]):
-    """(operation, size) -> {server: mean_ns} across one group's documents."""
-    table: dict[tuple[str, int], dict[str, float]] = {}
+    """(operation, size) -> {server: [mean_ns per round]}.
+
+    A list, not a number, because one round cannot tell a real difference
+    from this host's run-to-run variance: six rounds of an identical binary
+    move the median cell by 1.38x and the worst by 2.80x (#171). Keeping
+    every round is what lets `verdict` below decide from the data rather
+    than from a constant.
+    """
+    table: dict[tuple[str, int], dict[str, list[float]]] = {}
     for document in documents:
         for key, entry in document["benchmarks"].items():
             operation, _, size = key.rpartition("/")
-            table.setdefault((operation, int(size)), {})[document["server"]] = entry[
-                "mean_ns"
-            ]
+            table.setdefault((operation, int(size)), {}).setdefault(
+                document["server"], []
+            ).append(entry["mean_ns"])
     return table
+
+
+def rounds_in(documents: list[dict]) -> int:
+    """How many rounds the thinnest server in this group was measured for.
+
+    A comparison is only as resolved as its least-measured side.
+    """
+    counts: dict[str, int] = {}
+    for document in documents:
+        counts[document["server"]] = counts.get(document["server"], 0) + 1
+    return min(counts.values(), default=0)
+
+
+def verdict(ours: list[float], theirs: list[float]) -> tuple[str, str]:
+    """Colour and label for one cell, decided by whether the rounds separate.
+
+    With repeated rounds there is no noise band to pick: a cell is a win
+    only if our *slowest* round beat their *fastest*, and a loss only if our
+    fastest lost to their slowest. Anything else is two overlapping ranges,
+    which is not a result however far apart the medians happen to sit. That
+    replaces a +/-10% constant that was narrower than the harness's own
+    repeatability, so every cell on the page cleared it by construction.
+
+    Three rounds a side is the minimum, and that is arithmetic rather than
+    taste. If the two servers were identical, the chance that all of one
+    side's rounds happen to land below all of the other's is 2/C(2n, n):
+    **one in three at n=2**, one in ten at n=3, one in thirty-five at n=4.
+    Calling cells on two rounds would mis-colour about a third of the ties,
+    which is the +/-10% band's mistake wearing a better disguise. So two
+    rounds is treated as unresolved, and more rounds is how a smaller
+    difference gets resolved.
+
+    With fewer than three rounds each -- every sitting committed before
+    #171 -- the old band is used and the group is labelled unresolved
+    rather than silently recoloured.
+    """
+    ratio = statistics.median(theirs) / statistics.median(ours)
+    if len(ours) < 3 or len(theirs) < 3:
+        if ratio >= NOISE_LOW_SINGLE_ROUND[1]:
+            return "win", f"{ratio:.2f}\u00d7"
+        if ratio <= NOISE_LOW_SINGLE_ROUND[0]:
+            return "loss", f"{1 / ratio:.2f}\u00d7 slower"
+        return "noise", f"{ratio:.2f}\u00d7"
+    if max(ours) < min(theirs):
+        return "win", f"{ratio:.2f}\u00d7"
+    if min(ours) > max(theirs):
+        return "loss", f"{1 / ratio:.2f}\u00d7 slower"
+    return "noise", f"{ratio:.2f}\u00d7"
 
 
 def svg_chart(
@@ -286,19 +350,20 @@ def svg_chart(
 
 def scoreboard(documents: list[dict]):
     """Count won / within-noise / lost cells for one group."""
-    ours = next(d for d in documents if d["server"].startswith("spindle"))
+    us = next(d["server"] for d in documents if d["server"].startswith("spindle"))
+    table = cells_for(documents)
     won = noise = lost = 0
-    for document in documents:
-        if document is ours:
+    for by_server in table.values():
+        mine = by_server.get(us)
+        if not mine:
             continue
-        for key, entry in document["benchmarks"].items():
-            mine = ours["benchmarks"].get(key)
-            if not mine:
+        for server, theirs in by_server.items():
+            if server == us:
                 continue
-            ratio = entry["mean_ns"] / mine["mean_ns"]
-            if ratio >= NOISE_HIGH:
+            css, _ = verdict(mine, theirs)
+            if css == "win":
                 won += 1
-            elif ratio <= NOISE_LOW:
+            elif css == "loss":
                 lost += 1
             else:
                 noise += 1
@@ -337,25 +402,26 @@ def render_heatmap(group: str, documents: list[dict]) -> list[str]:
                 cell = table.get((operation, size), {})
                 mine = cell.get(ours["server"])
                 other = cell.get(document["server"])
-                if mine is None or other is None:
+                if not mine or not other:
                     lines.append('<td class="num absent">—</td>')
                     continue
-                ratio = other / mine
                 note_id = None
                 if (group, operation) in INVESTIGATIONS:
                     note_id = f"note-{group}-{operation}"
-                if ratio >= NOISE_HIGH:
-                    css, label = "win", f"{ratio:.2f}×"
-                elif ratio <= NOISE_LOW:
-                    css, label = "loss", f"{1 / ratio:.2f}× slower"
-                else:
-                    css, label = "noise", f"{ratio:.2f}×"
+                css, label = verdict(mine, other)
                 body = html.escape(label)
                 if css == "loss" and note_id:
                     body = f'<a href="#{note_id}">{body}</a>'
+                spread = (
+                    ""
+                    if len(mine) < 2
+                    else f" (of {len(mine)} rounds, "
+                    f"{min(mine) / 1e6:.2f}–{max(mine) / 1e6:.2f} ms)"
+                )
                 tip = (
-                    f"spindle {mine / 1e6:.2f} ms · "
-                    f'{html.escape(document["server"])} {other / 1e6:.2f} ms'
+                    f"spindle {statistics.median(mine) / 1e6:.2f} ms{spread} · "
+                    f'{html.escape(document["server"])} '
+                    f"{statistics.median(other) / 1e6:.2f} ms"
                 )
                 lines.append(
                     f'<td class="num {css}" data-tip="{tip}" title="{tip}">'
@@ -363,14 +429,36 @@ def render_heatmap(group: str, documents: list[dict]) -> list[str]:
                 )
         lines.append("</tr>")
     lines.append("</tbody></table></div>")
-    lines.append(
-        '<p class="legend"><span class="chip win">≥1.10×</span> Spindle is '
-        'faster by at least the noise band · <span class="chip noise">0.90–1.10×'
-        "</span> within this host's measured run-to-run variance · "
-        '<span class="chip loss">≤0.90×</span> Spindle is slower — every such '
-        "cell links to its investigation, because the roadmap treats it as a "
-        "defect until explained. Hover any cell for the raw milliseconds.</p>"
-    )
+    rounds = rounds_in(documents)
+    if rounds >= 3:
+        lines.append(
+            f'<p class="legend">Measured over <strong>{rounds} rounds</strong> '
+            "per server. A cell is called only when the two servers' rounds "
+            '<em>separate</em>: <span class="chip win">win</span> our slowest '
+            'round beat their fastest · <span class="chip noise">overlapping'
+            "</span> the ranges cross, so the difference is not resolved by "
+            'this many rounds, whatever the medians say · <span class="chip '
+            'loss">loss</span> our fastest round lost to their slowest — every '
+            "such cell links to its investigation, because the roadmap treats "
+            "it as a defect until explained. Hover any cell for the median and "
+            "the observed spread.</p>"
+        )
+    else:
+        lines.append(
+            f'<p class="legend"><strong>{rounds} round(s) per server — not '
+            "resolved.</strong> Three rounds a side is the minimum that means "
+            "anything: if two servers were identical, all of one side's rounds "
+            "landing below all of the other's happens by chance 2/C(2n, n) of "
+            "the time — one in three at two rounds, one in ten at three. The "
+            "cells below are therefore coloured by the old &plusmn;10% "
+            "band: <span class=\"chip win\">&ge;1.10&times;</span> · "
+            '<span class="chip noise">0.90–1.10×</span> · '
+            '<span class="chip loss">&le;0.90&times;</span>. That band is '
+            "narrower than this host's own run-to-run variance (median cell "
+            "1.38×), so treat anything inside roughly &plusmn;0.4&times; as "
+            "unmeasured in either direction. The large ratios are unaffected. "
+            "Hover any cell for the raw milliseconds.</p>"
+        )
     for (note_group, operation), (text,) in sorted(INVESTIGATIONS.items()):
         if note_group != group:
             continue
@@ -411,7 +499,14 @@ def render_charts(documents: list[dict]) -> list[str]:
     lines = ['<div class="charts">']
     for operation in operations:
         series = {
-            server: [table.get((operation, size), {}).get(server) for size in sizes]
+            server: [
+                (
+                    statistics.median(rounds)
+                    if (rounds := table.get((operation, size), {}).get(server))
+                    else None
+                )
+                for size in sizes
+            ]
             for server in servers
         }
         explainer = OPERATIONS.get(operation, (operation, ""))[1]
