@@ -137,6 +137,17 @@ pub struct Rooms {
     /// sittings. Serving a memcpy of a proven-current render beats warming
     /// a page cache.
     state_render: Mutex<HashMap<String, StateRender>>,
+    /// Joined-member count per room, keyed by the state root it was counted
+    /// from.
+    ///
+    /// Same argument as `state_render`, for the same reason: sliding sync
+    /// reports `joined_count` for every room in the window on every
+    /// request, and the only way to count joins is to read each member
+    /// event's body and look at its `membership`. That is a stored-body
+    /// read and a JSON parse per member per request to produce one
+    /// integer. The root is the count's identity, so a hit is provably
+    /// current.
+    member_count: Mutex<HashMap<String, ([u8; 32], usize)>>,
     /// The server-global order `/sync` needs (SPEC §10.2). The linear index
     /// orders events within one room; nothing orders them across rooms, so
     /// this is the one counter that exists purely because a per-room order is
@@ -261,6 +272,7 @@ impl Rooms {
             unread_index: Mutex::new(HashMap::new()),
             last_activity: Mutex::new(HashMap::new()),
             state_render: Mutex::new(HashMap::new()),
+            member_count: Mutex::new(HashMap::new()),
             // Resumed, not reset. A counter that restarted at zero would
             // re-issue stream ids already on disk, overwriting the entries
             // they point at -- the same shape of bug as a room registry that
@@ -633,12 +645,7 @@ impl Rooms {
         state_key: &str,
     ) -> Result<Value, RoomError> {
         let wanted = StateKey::new(event_type, state_key);
-        let found = self.with_room(room_id, |_, log| {
-            Ok(current_state(log)
-                .into_iter()
-                .find(|(key, _)| *key == wanted)
-                .map(|(_, id)| id))
-        })?;
+        let found = self.with_room(room_id, |_, log| Ok(current_state_id(log, &wanted)))?;
         let event_id = found.ok_or_else(|| {
             RoomError::UnknownState(format!("{event_type} with state key {state_key:?}"))
         })?;
@@ -647,6 +654,75 @@ impl Rooms {
             .get("content")
             .cloned()
             .unwrap_or_else(|| Value::Object(serde_json::Map::new())))
+    }
+
+    /// One current state event, whole, rather than just its content.
+    ///
+    /// The targeted sibling of [`Self::state`]: a caller that wants three
+    /// named keys should read three events, not materialize every state
+    /// event in the room and filter the result down.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownState`] when the room has no such state.
+    pub fn state_event_full(
+        &self,
+        room_id: &str,
+        event_type: &str,
+        state_key: &str,
+    ) -> Result<Value, RoomError> {
+        let wanted = StateKey::new(event_type, state_key);
+        let found = self.with_room(room_id, |_, log| Ok(current_state_id(log, &wanted)))?;
+        let event_id = found.ok_or_else(|| {
+            RoomError::UnknownState(format!("{event_type} with state key {state_key:?}"))
+        })?;
+        let event = self.read_event(room_id, &EventId::new(event_id.as_str()))?;
+        // Stamped, because [`Self::state`] stamps: a caller that names its
+        // keys and a caller that asks for everything must not receive
+        // differently-shaped events. The stored body has no `event_id` --
+        // the id is the hash of the body, so carrying it inside would be
+        // circular -- and a client cannot redact, reply to or de-duplicate
+        // an event it cannot name.
+        Ok(stamp(event, &event_id))
+    }
+
+    /// How many users are joined, without rendering any of them.
+    ///
+    /// Cached against the state root, because the count only changes when
+    /// the state does. The uncached path is what [`Self::joined_members`]
+    /// pays — a body read and a JSON parse per member — and sliding sync
+    /// asks for this on every request for every room in the window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
+    pub fn joined_member_count(&self, room_id: &str) -> Result<usize, RoomError> {
+        let root = self.with_room(room_id, |_, log| {
+            Ok(log
+                .entries()
+                .next_back()
+                .map(|entry| entry.li)
+                .and_then(|li| log.state_after(li))
+                .map(|state| *state.root().as_bytes()))
+        })?;
+        let Some(root) = root else {
+            return Ok(0);
+        };
+        if let Some((cached_root, count)) = self
+            .member_count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(room_id)
+            && *cached_root == root
+        {
+            return Ok(*count);
+        }
+        let count = self.joined_members(room_id)?.len();
+        self.member_count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(room_id.to_owned(), (root, count));
+        Ok(count)
     }
 
     /// Set a state event.
@@ -3692,6 +3768,22 @@ fn stamp(mut json: Value, event_id: &str) -> Value {
         object.insert("event_id".to_owned(), Value::String(event_id.to_owned()));
     }
     json
+}
+
+/// The event id one state key currently points at.
+///
+/// The trie is a map, so this is a lookup in it -- not a walk of every key
+/// to find one. The difference does not show in a small room and is the
+/// whole cost in a large one: every auth check, every power-level read and
+/// every sliding-sync `required_state` entry asks this question, and asking
+/// it by materialising the room's entire state made each of them scale with
+/// the member list.
+fn current_state_id(log: &RoomLog, wanted: &StateKey) -> Option<String> {
+    log.entries()
+        .next_back()
+        .map(|entry| entry.li)
+        .and_then(|li| log.state_after(li))
+        .and_then(|state| state.get(wanted).map(str::to_owned))
 }
 
 /// The room's current state, as `(key, event_id)` pairs.

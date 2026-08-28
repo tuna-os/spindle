@@ -317,6 +317,92 @@ def measure(base: str, sizes: list[int], samples: int, warmup: int) -> dict:
     return results
 
 
+def measure_members(base: str, sizes: list[int], samples: int, warmup: int) -> dict:
+    """Time the room-list reads in rooms of N *joined members*.
+
+    `measure` varies how many events a room holds and holds membership at two,
+    which is a real dimension but only one of them. Every endpoint here is
+    answered out of room *state*, and the member list is the part of state that
+    grows without bound in the rooms people complain about. A sweep that never
+    varies it cannot see a cost that scales with it -- and did not: the
+    sliding-window read grew linearly with membership while this driver
+    reported it flat, because every room it measured had two members in it.
+
+    Same operations, same request shapes, different axis. Written to its own
+    document because the x-axis means something else here, and a chart that
+    silently mixes 800 members with 800 events is worse than no chart.
+    """
+    results: dict[str, dict] = {}
+    stamp = time.time_ns()
+    alice = Client(base)
+    alice.register(f"alice{stamp}")
+
+    for size in sorted(sizes):
+        room_id = alice.request("POST", "/_matrix/client/v3/createRoom", {})["room_id"]
+        # A fresh room per size, for the reason `measure` learned the hard way:
+        # a shared room makes each size inherit the previous size's members, so
+        # the x-axis stops describing the thing being varied.
+        for index in range(size):
+            member = Client(base)
+            user_id = member.register(f"m{size}x{index}x{stamp}")
+            alice.request(
+                "POST",
+                f"/_matrix/client/v3/rooms/{room_id}/invite",
+                {"user_id": user_id},
+            )
+            member.request("POST", f"/_matrix/client/v3/rooms/{room_id}/join", {})
+
+        # The reader is a member like any other, and not Alice: Alice is in
+        # every room this sweep has built so far, and an initial sync covers
+        # all of them.
+        observer = Client(base)
+        observer_id = observer.register(f"obs{size}x{stamp}")
+        alice.request(
+            "POST",
+            f"/_matrix/client/v3/rooms/{room_id}/invite",
+            {"user_id": observer_id},
+        )
+        observer.request("POST", f"/_matrix/client/v3/rooms/{room_id}/join", {})
+
+        def sliding_window() -> None:
+            observer.request(
+                "POST",
+                "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync",
+                {
+                    "lists": {
+                        "main": {
+                            "ranges": [[0, 10]],
+                            "required_state": [["m.room.name", ""]],
+                            "timeline_limit": 3,
+                        }
+                    }
+                },
+            )
+
+        def sync_initial() -> None:
+            observer.request("GET", "/_matrix/client/v3/sync")
+
+        def read_state(room_id: str = room_id) -> None:
+            observer.request("GET", f"/_matrix/client/v3/rooms/{room_id}/state")
+
+        operations = [("sync_initial", sync_initial), ("state", read_state)]
+        try:
+            sliding_window()
+        except Failed:
+            pass  # A server without MSC4186 gets a missing column, not a fake one.
+        else:
+            operations.insert(0, ("sliding_window", sliding_window))
+
+        for name, operation in operations:
+            for _ in range(warmup):
+                operation()
+            results[f"{name}/{size}"] = summarise(
+                [timed(operation) for _ in range(samples)]
+            )
+
+    return results
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base_url", help="e.g. http://127.0.0.1:8448")
@@ -336,6 +422,14 @@ def main() -> int:
         "--registration-token",
         help="satisfy m.login.registration_token instead of m.login.dummy",
     )
+    parser.add_argument(
+        "--dimension",
+        choices=("events", "members"),
+        default="events",
+        help="what --sizes counts: events in the room (default), or joined "
+        "members in it. Two different axes, so two different runs and two "
+        "different output files -- never one chart with both on it.",
+    )
     parser.add_argument("--samples", type=int, default=25)
     parser.add_argument("--warmup", type=int, default=5)
     arguments = parser.parse_args()
@@ -350,8 +444,9 @@ def main() -> int:
     if not sizes:
         parser.error("--sizes needs at least one room size")
 
+    driver = measure if arguments.dimension == "events" else measure_members
     try:
-        benchmarks = measure(
+        benchmarks = driver(
             arguments.base_url, sizes, arguments.samples, arguments.warmup
         )
     except Failed as error:
@@ -364,6 +459,7 @@ def main() -> int:
     document = {
         "server": arguments.server,
         "base_url": arguments.base_url,
+        "dimension": arguments.dimension,
         "sizes": sizes,
         "samples": arguments.samples,
         "benchmarks": benchmarks,

@@ -436,6 +436,105 @@ m3-progress tables retain the losses. This section is what those cells
 link to, and the M3 close-out sitting is where the fix gets its four-way
 number.
 
+## M5: the axis the sweep never varied, and what it was hiding
+
+Two findings, one caused by the other. Both came out of asking a simple
+question about the comparisons page: *can we fix the cells where we are
+slower?*
+
+### The sweep held membership at two
+
+`scripts/api-benchmark.py` measures every operation at 200, 800 and 3,200
+**events** per room. It never varied the *members*. Every room it timed
+`sliding_window` and `sync_initial` against had two people in it, at every
+size, in every sitting since M2.
+
+That is not a small omission. Every endpoint in that pair is answered out
+of room **state**, and the member list is the part of state that grows
+without bound in exactly the rooms people complain about. Holding it at
+two measures the one case where the member list costs nothing.
+
+Varying it instead — same driver, same request shapes, `--dimension
+members` — the sliding-window read was not flat at all:
+
+| joined members | before | after | Continuwuity |
+|---|---|---|---|
+| 50 | 1.28 ms | 0.67 ms | 1.22 ms |
+| 200 | 2.74 ms | 1.00 ms | 1.14 ms |
+| 800 | 9.69 ms | 1.07 ms | 1.12 ms |
+
+Linear in the member count, against a competitor that was flat. At 800
+members it was **8.7× slower than Continuwuity** — on the endpoint Element X
+calls where classic clients call `/sync`, and the page reported the same
+operation as a 0.81× loss at worst, because 0.81× is what it costs when the
+room has two members in it.
+
+Three causes, all the same mistake — answering a narrow question with a
+whole-room read:
+
+1. `required_state` naming concrete keys materialized and JSON-parsed
+   **every state event in the room**, then filtered down to the two or
+   three asked for. Now it reads the events it was asked for. A wildcard
+   still scans, because a wildcard has to.
+2. `joined_count` called `joined_members().len()` — a stored-body read and
+   a JSON parse per member, per room in the window, per request, to produce
+   one integer. Now cached against the state root, the same way the state
+   render is, so a hit is provably current.
+3. `state_event` and `state_event_full` found one key by walking the
+   materialized state. The state trie is a map and has always had a point
+   lookup; they now use it. This one is not sliding-sync-specific — every
+   auth check and every power-level read went through that walk, so all of
+   them scaled with the member list.
+
+Fixing (1) and (2) took 800 members from 9.69 ms to ~1.6 ms; (3) took the
+rest of the curve out, to 1.07 ms. The shape is now flat, which is the
+result — the absolute numbers are one host on one day.
+
+The dimension is now a first-class part of the driver (`--dimension
+members`), written to its own results document, because 800 members and 800
+events are different questions and a chart that silently mixes them is
+wrong rather than mislabelled. The renderer reads the dimension from the
+results and labels the axis from it; a group that mixes the two is refused.
+
+### The comparisons page's noise band is narrower than the harness
+
+The second finding fell out of trying to measure the first honestly. The
+page colours a cell a win above 1.10× and a loss below 0.90×, calling
+everything between them noise. So: how repeatable is a cell, actually?
+
+Six rounds, same binary, same workload, same idle host, one sitting —
+`max/min` per cell across the six:
+
+| | value |
+|---|---|
+| median cell | 1.38× |
+| p75 cell | 1.55× |
+| worst cell (`state/3200`) | 2.80× |
+| cells whose own spread exceeds the ±10% band | **21 of 21** |
+
+Every cell on the page varies more between runs of *identical code* than
+the band that decides whether it is printed green or red. The driver's
+25-samples-and-take-the-median already damps the within-round tail; this is
+between-round variance, which a single round cannot see and therefore
+cannot report.
+
+This does not retract the published results — the large ratios (3–7× on
+`context_deep`, 2–4× on `messages_page`) clear that floor comfortably, and
+the milestone conclusions rest on those. It does mean the **±0.1 cells were
+never evidence**, in either direction, including two of the three losses
+that prompted this work. Fixing it is a change to how a sitting is
+collected rather than to any one number: a sitting becomes N rounds, a cell
+becomes the median across them, and the band gets derived from the observed
+spread instead of assumed. That is filed separately (#171) because it
+re-collects every figure on the page, and it should not ride along with a
+code fix.
+
+The rule this project runs on is that a loss gets investigated rather than
+explained away. This is the same rule turned on the instrument: the
+benchmark was wrong about two cells because it could not see the axis that
+mattered, and imprecise about all of them because it never asked itself the
+question.
+
 ## Fork window: bounded search vs exhaustive walk
 
 | Room history | Bounded | Exhaustive | Ratio |
