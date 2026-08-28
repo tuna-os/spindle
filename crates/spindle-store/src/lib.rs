@@ -13,7 +13,7 @@ use fjall::{
     Config, Keyspace as FjallKeyspace, PartitionCreateOptions, PartitionHandle, PersistMode,
 };
 use spindle_core::{
-    EventId, RestoreError, RestoredEntry, RestoredLog, RoomLog, StateRoot,
+    CONTENT_DIGEST_VERSION, EventId, RestoreError, RestoredEntry, RestoredLog, RoomLog, StateRoot,
     keys::{KEY_SCHEMA_VERSION, Keyspace, content_addressed, room_li, room_prefix, store_marker},
 };
 
@@ -285,11 +285,27 @@ impl FjallStore {
 /// The schema versions a store was written under.
 ///
 /// Read before anything else, so it cannot use the record encoding it
-/// describes: a fixed three bytes, and those bytes are frozen forever.
+/// describes: a fixed few bytes, and those bytes are frozen forever.
+///
+/// Three versions, because there are three independent ways the stored bytes
+/// can change meaning:
+///
+/// | field | what moving it means |
+/// |---|---|
+/// | `key_schema` | keys are laid out differently |
+/// | `record` | records are encoded differently |
+/// | `content_digest` | content addresses are *derived* differently |
+///
+/// The third was missing until #78. A digest change leaves the key layout and
+/// the record encoding untouched, so the marker matched, the store opened, and
+/// every node address was wrong — `state_nodes` lookups missing and each
+/// entry's recorded `state_root` disagreeing with what recomputing produces,
+/// both surfacing far from the cause.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SchemaMarker {
     pub key_schema: u8,
     pub record: u8,
+    pub content_digest: u8,
 }
 
 impl SchemaMarker {
@@ -298,13 +314,20 @@ impl SchemaMarker {
         Self {
             key_schema: KEY_SCHEMA_VERSION,
             record: RECORD_VERSION,
+            content_digest: CONTENT_DIGEST_VERSION,
         }
     }
 
     #[must_use]
     pub fn encode(self) -> Vec<u8> {
-        // A marker version of its own, so even this can change shape later.
-        vec![MARKER_VERSION, self.key_schema, self.record]
+        // A marker version of its own, so even this can change shape -- which
+        // is exactly what it was for: adding `content_digest` moved it to 2.
+        vec![
+            MARKER_VERSION,
+            self.key_schema,
+            self.record,
+            self.content_digest,
+        ]
     }
 
     /// # Errors
@@ -313,9 +336,27 @@ impl SchemaMarker {
     /// marker version.
     pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
         match bytes {
-            [MARKER_VERSION, key_schema, record] => Ok(Self {
+            [MARKER_VERSION, key_schema, record, content_digest] => Ok(Self {
                 key_schema: *key_schema,
                 record: *record,
+                content_digest: *content_digest,
+            }),
+            // A marker written before `content_digest` existed. It is read,
+            // not refused, because refusing would make this change reject
+            // every store already on disk -- the precise outcome the marker
+            // exists to prevent, inflicted by the fix for it.
+            //
+            // Reading it as digest version 1 is sound for the same reason
+            // the unmarked arm below stamps rather than guesses: there has
+            // only ever been one derivation, so a store written under the
+            // old marker was written under that one. The moment a second
+            // exists, `current()` names it, this decodes to 1, and the
+            // comparison in `check_schema` refuses -- which is the whole
+            // point, and it works without rewriting anyone's marker.
+            [MARKER_V1, key_schema, record] => Ok(Self {
+                key_schema: *key_schema,
+                record: *record,
+                content_digest: 1,
             }),
             [version, ..] => Err(CodecError::UnsupportedVersion(*version)),
             [] => Err(CodecError::Truncated),
@@ -323,8 +364,15 @@ impl SchemaMarker {
     }
 }
 
-/// Version of the marker's own three-byte encoding.
-const MARKER_VERSION: u8 = 1;
+/// Version of the marker's own encoding.
+///
+/// 2 since #78 added `content_digest`. A binary older than that reads a
+/// four-byte marker, sees a marker version it does not know, and refuses --
+/// which is correct: it cannot check a derivation it has no field for.
+const MARKER_VERSION: u8 = 2;
+
+/// The three-byte marker, still readable. See [`SchemaMarker::decode`].
+const MARKER_V1: u8 = 1;
 
 impl ReadView for FjallStore {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {

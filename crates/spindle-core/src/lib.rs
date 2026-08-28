@@ -16,4 +16,6 @@ pub use log::{
     RoomLog,
 };
 pub use pdu::{Pdu, PduError};
-pub use state::{EventType, RehydrateError, StateKey, StateRoot, StateSnapshot};
+pub use state::{
+    CONTENT_DIGEST_VERSION, EventType, RehydrateError, StateKey, StateRoot, StateSnapshot,
+};

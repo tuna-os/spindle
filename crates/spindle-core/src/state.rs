@@ -1,5 +1,46 @@
 use std::{cmp::Ordering, sync::Arc};
 
+/// How the content addresses in this module are derived.
+///
+/// State roots and HAMT node addresses are BLAKE3 digests of state keys and
+/// node contents. That derivation is a *third* way stored bytes can change
+/// meaning, alongside the key layout and the record encoding — and it is the
+/// one the store marker could not previously express (#78).
+///
+/// The failure it guards is quiet. Change a domain tag, a length width or a
+/// field order here and the key layout is untouched, the record encoding is
+/// untouched, so a store written under the old derivation opens cleanly and
+/// **every node address is wrong**: `state_nodes` lookups miss, rooms cannot
+/// be rebuilt, and each `LogEntry`'s recorded `state_root` no longer matches
+/// what recomputing produces. Both surface far from the cause.
+///
+/// So: **any change to a digest below bumps this**, and the store marker
+/// carries it, so a store written under a different derivation is refused
+/// rather than misread. `the_domain_tags_carry_the_current_digest_version`
+/// holds the two together — the tags all end in `-v{VERSION}`, and that is
+/// asserted rather than trusted.
+pub const CONTENT_DIGEST_VERSION: u8 = 1;
+
+/// The domain tag separating each digest below from the others.
+///
+/// Named rather than written inline at the hasher, so each tag has exactly one
+/// definition: the digest uses it and [`DOMAIN_TAGS`] lists it, instead of a
+/// list that mirrors the literals and can drift from them.
+const STATE_KEY_TAG: &[u8] = b"spindle-state-key-v1\0";
+const EMPTY_STATE_TAG: &[u8] = b"spindle-empty-state-v1";
+const HAMT_LEAF_TAG: &[u8] = b"spindle-hamt-leaf-v1\0";
+const HAMT_BRANCH_TAG: &[u8] = b"spindle-hamt-branch-v1\0";
+
+/// Every domain tag, for the test that binds them to
+/// [`CONTENT_DIGEST_VERSION`]. A new digest belongs here, or it is not covered.
+#[cfg(test)]
+const DOMAIN_TAGS: &[&[u8]] = &[
+    STATE_KEY_TAG,
+    EMPTY_STATE_TAG,
+    HAMT_LEAF_TAG,
+    HAMT_BRANCH_TAG,
+];
+
 /// A Matrix event type used as one half of a room-state key.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct EventType(Box<str>);
@@ -44,7 +85,7 @@ impl StateKey {
 
     fn digest(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"spindle-state-key-v1\0");
+        hasher.update(STATE_KEY_TAG);
         hash_bytes(&mut hasher, self.event_type.as_str().as_bytes());
         hash_bytes(&mut hasher, self.state_key.as_bytes());
         *hasher.finalize().as_bytes()
@@ -98,7 +139,7 @@ impl StateSnapshot {
     #[must_use]
     pub fn root(&self) -> StateRoot {
         self.root.as_ref().map_or(
-            StateRoot(*blake3::hash(b"spindle-empty-state-v1").as_bytes()),
+            StateRoot(*blake3::hash(EMPTY_STATE_TAG).as_bytes()),
             |node| StateRoot(node.hash()),
         )
     }
@@ -331,7 +372,7 @@ fn digest_slot(digest: &[u8; 32], depth: usize) -> u32 {
 
 fn hash_leaf(digest: &[u8; 32], entries: &[(StateKey, Box<str>)]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"spindle-hamt-leaf-v1\0");
+    hasher.update(HAMT_LEAF_TAG);
     hasher.update(digest);
     hasher.update(&(entries.len() as u64).to_be_bytes());
     for (key, event_id) in entries {
@@ -344,7 +385,7 @@ fn hash_leaf(digest: &[u8; 32], entries: &[(StateKey, Box<str>)]) -> [u8; 32] {
 
 fn hash_branch(bitmap: u32, children: &[Arc<Node>]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"spindle-hamt-branch-v1\0");
+    hasher.update(HAMT_BRANCH_TAG);
     hasher.update(&bitmap.to_be_bytes());
     for child in children {
         hasher.update(&child.hash());
@@ -584,5 +625,54 @@ fn count_entries(node: &Node) -> usize {
     match node {
         Node::Leaf { entries, .. } => entries.len(),
         Node::Branch { children, .. } => children.iter().map(|child| count_entries(child)).sum(),
+    }
+}
+
+#[cfg(test)]
+mod digest_version_tests {
+    use super::{CONTENT_DIGEST_VERSION, DOMAIN_TAGS};
+
+    /// Every domain tag names the current digest version.
+    ///
+    /// This is what makes [`CONTENT_DIGEST_VERSION`] impossible to forget,
+    /// which #78 asked for. The two can only drift apart in two ways, and
+    /// this catches both:
+    ///
+    /// - a digest is changed and its tag bumped to `-v2`, but the constant
+    ///   is left at 1 — so a store written under the old derivation would
+    ///   still open, and every node address in it would be wrong;
+    /// - the constant is bumped without any tag moving — so stores are
+    ///   refused for a change that never happened.
+    ///
+    /// Bumping the version therefore means editing the tags *and* the
+    /// constant together, which is the intent: a domain tag is what actually
+    /// separates one derivation from another, and the constant is what the
+    /// store marker can compare.
+    #[test]
+    fn the_domain_tags_carry_the_current_digest_version() {
+        let expected = format!("-v{CONTENT_DIGEST_VERSION}");
+        for tag in DOMAIN_TAGS {
+            let text = std::str::from_utf8(tag)
+                .expect("domain tags are ASCII")
+                .trim_end_matches('\0');
+            assert!(
+                text.ends_with(&expected),
+                "{text:?} does not end with {expected:?}; a digest and \
+                 CONTENT_DIGEST_VERSION have drifted apart",
+            );
+        }
+    }
+
+    /// The tags are distinct, so one digest cannot be mistaken for another.
+    ///
+    /// Domain separation is the entire reason the tags exist: without it a
+    /// leaf and a branch with the same bytes would hash identically.
+    #[test]
+    fn the_domain_tags_are_distinct() {
+        for (i, left) in DOMAIN_TAGS.iter().enumerate() {
+            for right in &DOMAIN_TAGS[i + 1..] {
+                assert_ne!(left, right, "two digests share a domain tag");
+            }
+        }
     }
 }

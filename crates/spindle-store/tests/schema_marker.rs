@@ -71,6 +71,7 @@ fn without_the_marker_a_newer_store_is_indistinguishable_from_an_empty_one() {
     let future = SchemaMarker {
         key_schema: 2,
         record: 1,
+        content_digest: 1,
     };
     future_store
         .put(&keys::store_marker(), &future.encode())
@@ -116,6 +117,7 @@ fn a_store_from_a_newer_schema_is_refused_with_both_versions_named() {
         let future = SchemaMarker {
             key_schema: keys::KEY_SCHEMA_VERSION + 1,
             record: 7,
+            content_digest: 1,
         };
         store.put(&keys::store_marker(), &future.encode()).unwrap();
         store.flush().unwrap();
@@ -153,6 +155,96 @@ fn a_marker_from_an_unknown_marker_version_is_refused() {
         FjallStore::open(dir.path()).is_err(),
         "an unreadable marker must refuse, not fall through to the room keys"
     );
+}
+
+/// A store whose content addresses were derived differently is refused.
+///
+/// This is #78's gap. State roots and HAMT node addresses are BLAKE3 digests;
+/// change how one is computed and the key layout is untouched, the record
+/// encoding is untouched, so before this the marker matched and the store
+/// opened with **every node address wrong** — `state_nodes` lookups missing
+/// and each entry's recorded `state_root` disagreeing with what recomputing
+/// produces, both surfacing far from the cause.
+///
+/// Refusing is the whole remedy: there is nothing to do with a store whose
+/// addresses this binary cannot reproduce except decline to misread it.
+#[test]
+fn a_store_from_a_different_content_digest_is_refused() {
+    let dir = TempDir::new().unwrap();
+    {
+        let store = FjallStore::open(dir.path()).unwrap();
+        seed(&store);
+        // Everything else identical: only the derivation moved.
+        let rederived = SchemaMarker {
+            content_digest: spindle_core::CONTENT_DIGEST_VERSION + 1,
+            ..SchemaMarker::current()
+        };
+        store
+            .put(&keys::store_marker(), &rederived.encode())
+            .unwrap();
+    }
+
+    let Err(error) = FjallStore::open(dir.path()) else {
+        panic!(
+            "a store whose content addresses were derived differently must be \
+             refused, not opened with every node address wrong"
+        );
+    };
+    match &error {
+        StoreError::UnsupportedSchema { found, supported } => {
+            assert_eq!(
+                found.content_digest,
+                spindle_core::CONTENT_DIGEST_VERSION + 1
+            );
+            assert_eq!(
+                found.key_schema, supported.key_schema,
+                "only the digest moved"
+            );
+            assert_eq!(found.record, supported.record, "only the digest moved");
+            assert_eq!(supported, &SchemaMarker::current());
+        }
+        other => panic!("expected UnsupportedSchema, got {other:?}"),
+    }
+    let rendered = error_text(&error);
+    assert!(
+        rendered.contains(&spindle_core::CONTENT_DIGEST_VERSION.to_string()),
+        "the refusal names the versions: {rendered}",
+    );
+}
+
+/// A marker written before `content_digest` existed still opens.
+///
+/// The fix for #78 must not itself become #78: refusing every store already
+/// on disk, because its marker is three bytes rather than four, would be the
+/// exact failure the marker exists to prevent, delivered by the change that
+/// was meant to prevent it.
+///
+/// Reading it as digest version 1 is sound for the same reason the unmarked
+/// arm stamps rather than guesses — there has only ever been one derivation.
+/// And the protection still arrives without rewriting the marker: once a
+/// second derivation exists, `current()` names it, this decodes to 1, and the
+/// comparison refuses.
+#[test]
+fn a_marker_written_before_the_digest_field_still_opens() {
+    let dir = TempDir::new().unwrap();
+    {
+        let store = FjallStore::open(dir.path()).unwrap();
+        seed(&store);
+        // The three-byte marker exactly as an older binary wrote it.
+        let legacy = vec![1_u8, keys::KEY_SCHEMA_VERSION, 1];
+        store.put(&keys::store_marker(), &legacy).unwrap();
+    }
+
+    let store =
+        FjallStore::open(dir.path()).expect("a store from before the digest field must still open");
+    let rows = store.scan_prefix(&[keys::KEY_SCHEMA_VERSION]).unwrap();
+    assert!(!rows.is_empty(), "and its history is still there");
+
+    // Read back as digest version 1, and left as it was found: opening with a
+    // newer binary should not rewrite a marker an older one can still read.
+    let raw = store.get(&keys::store_marker()).unwrap().unwrap();
+    assert_eq!(raw.len(), 3, "the marker was not restamped: {raw:?}");
+    assert_eq!(SchemaMarker::decode(&raw).unwrap().content_digest, 1);
 }
 
 fn error_text(error: &StoreError) -> String {
