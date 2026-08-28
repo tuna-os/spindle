@@ -108,6 +108,25 @@ impl UnreadIndex {
 /// One cached `/state` render: the root it was rendered from, and the body.
 type StateRender = ([u8; 32], Arc<String>);
 
+/// How much of a room's state an initial sync needs materialized.
+///
+/// Three-way rather than two booleans, because the third case is the point:
+/// a client that asked for the whole state block and applied no filter to it
+/// is asking for exactly the bytes [`Rooms::state_serialized`] already holds,
+/// rendered and cached against the state root. Materializing 800 events into
+/// `Value`s so the caller can serialize them straight back is work done to
+/// arrive where we started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateBlock {
+    /// Materialize it. The caller has a filter to apply.
+    Rendered,
+    /// Materialize only the members this response makes the client need.
+    LazyMembers,
+    /// Do not materialize it at all: the caller will serve the cached
+    /// render. Only correct when nothing downstream narrows the block.
+    Deferred,
+}
+
 /// A room's joined user IDs, with the state root they were read from.
 type MemberIds = ([u8; 32], Arc<Vec<String>>);
 
@@ -603,11 +622,14 @@ impl Rooms {
         &self,
         room_id: &str,
         user_id: &str,
-        lazy_members: bool,
+        state_block: StateBlock,
         timeline: &[Value],
     ) -> Result<Vec<Value>, RoomError> {
-        if !lazy_members {
-            return self.state(room_id);
+        match state_block {
+            // Nothing to do: the caller serves the cached render.
+            StateBlock::Deferred => return Ok(Vec::new()),
+            StateBlock::Rendered => return self.state(room_id),
+            StateBlock::LazyMembers => {}
         }
         let mut needed: HashSet<&str> = timeline
             .iter()
@@ -2454,11 +2476,12 @@ impl Rooms {
     /// of the global stream from `since`, which is the cheap case and the
     /// common one.
     ///
-    /// `lazy_members` is the client's filter asking not to be sent the
-    /// roster. It is answered *here*, in the read, rather than by filtering
-    /// what this returns: in a large room the roster is the initial sync,
-    /// and a caller that narrows afterwards has already read and parsed
-    /// every member body it then discards.
+    /// `state_block` says how much of the state to materialize, and is
+    /// answered *here*, in the read, rather than by filtering what this
+    /// returns: in a large room the roster is the initial sync, and a caller
+    /// that narrows afterwards has already read and parsed every member body
+    /// it then discards. [`StateBlock::Deferred`] materializes nothing --
+    /// the caller serves the cached render instead.
     ///
     /// # Errors
     ///
@@ -2468,7 +2491,7 @@ impl Rooms {
         user_id: &str,
         since: Option<u64>,
         timeline_limit: usize,
-        lazy_members: bool,
+        state_block: StateBlock,
     ) -> Result<SyncResult, RoomError> {
         let position = self.stream_position();
         let joined = self.joined(user_id)?;
@@ -2492,7 +2515,7 @@ impl Rooms {
                 // events are in the timeline already, and sending them twice
                 // would make a client apply each one twice.
                 state: if since.is_none() {
-                    self.initial_state(&room_id, user_id, lazy_members, &events)?
+                    self.initial_state(&room_id, user_id, state_block, &events)?
                 } else {
                     Vec::new()
                 },

@@ -12,6 +12,9 @@ use axum::{
     routing::{get, post},
 };
 use serde::Deserialize;
+use std::collections::BTreeMap;
+
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 
 use axum::extract::ConnectInfo;
@@ -5494,7 +5497,7 @@ async fn sync(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
     axum::extract::Query(query): axum::extract::Query<SyncQuery>,
-) -> Result<Json<Value>, MatrixError> {
+) -> Result<axum::response::Response, MatrixError> {
     let since = match query.since.as_deref() {
         Some(token) => Some(
             token
@@ -5519,14 +5522,32 @@ async fn sync(
     // `Rooms::sync`. The exact narrowing still happens in `sync_join`,
     // against the filtered timeline; this is what stops the roster being
     // read and parsed in the first place.
-    let lazy_members = filter
+    let state_section = filter
         .as_ref()
-        .and_then(|filter| filter.room.state.as_ref())
-        .and_then(|state| state.lazy_load_members)
-        == Some(true);
+        .and_then(|filter| filter.room.state.as_ref());
+    let lazy_members = state_section.and_then(|state| state.lazy_load_members) == Some(true);
+    // A client that asked for the whole state block and applied no filter to
+    // it wants exactly the bytes the state-render cache already holds. In
+    // that case nothing downstream narrows the block, so materializing it
+    // into `Value`s only to serialize them straight back is work done to
+    // arrive where we started -- `sync_join` splices the cached render
+    // instead. Any state filter at all, however permissive, takes the
+    // ordinary path: deciding which filters happen to be no-ops is a way to
+    // be subtly wrong, and the win is in the unfiltered case anyway.
+    let state_block = if since.is_some() {
+        // An incremental sync carries no state block; the mode is moot, and
+        // `Rendered` is the one that materializes nothing in that case.
+        crate::rooms::StateBlock::Rendered
+    } else if lazy_members {
+        crate::rooms::StateBlock::LazyMembers
+    } else if state_section.is_some() {
+        crate::rooms::StateBlock::Rendered
+    } else {
+        crate::rooms::StateBlock::Deferred
+    };
     let mut result = state
         .rooms
-        .sync(&identity.user_id, since, timeline_limit, lazy_members)
+        .sync(&identity.user_id, since, timeline_limit, state_block)
         .map_err(room_error)?;
 
     // Long-poll, but only for an incremental sync: an initial sync always has
@@ -5546,7 +5567,7 @@ async fn sync(
             }
             result = state
                 .rooms
-                .sync(&identity.user_id, Some(since), timeline_limit, lazy_members)
+                .sync(&identity.user_id, Some(since), timeline_limit, state_block)
                 .map_err(room_error)?;
         }
     }
@@ -5557,6 +5578,7 @@ async fn sync(
         result.rooms,
         filter.as_ref(),
         query.state_after(),
+        state_block,
     )?;
 
     let invite = sync_invite(&state, &identity, result.invited, filter.as_ref());
@@ -5565,6 +5587,58 @@ async fn sync(
     let (to_device, device_changes, key_counts, unused_fallback) =
         sync_device_sections(&state, &identity, since, result.next_batch)?;
 
+    let global = sync_account_data(&state, &identity, filter.as_ref())?;
+
+    // Assembled from pre-serialized parts rather than as one `Value`, so the
+    // joined rooms' state blocks -- which `sync_join` may have taken straight
+    // from the render cache -- reach the wire without a parse and a
+    // re-serialize in between. Everything else is small and converted here.
+    let mut rooms: BTreeMap<&str, Box<RawValue>> = BTreeMap::new();
+    rooms.insert("join", raw(&join)?);
+    rooms.insert("invite", raw(&invite)?);
+    rooms.insert("leave", raw(&leave)?);
+
+    let mut body: BTreeMap<&str, Box<RawValue>> = BTreeMap::new();
+    body.insert(
+        "next_batch",
+        raw(&crate::tokens::Sync(result.next_batch).to_string())?,
+    );
+    body.insert("rooms", raw(&rooms)?);
+    body.insert("to_device", raw(&json!({ "events": to_device }))?);
+    // `left` is honestly empty until room departures update the watermark; a
+    // wrong name here would make clients drop sessions.
+    body.insert(
+        "device_lists",
+        raw(&json!({ "changed": device_changes, "left": [] }))?,
+    );
+    body.insert("device_one_time_keys_count", raw(&key_counts)?);
+    body.insert("device_unused_fallback_key_types", raw(&unused_fallback)?);
+    body.insert("account_data", raw(&json!({ "events": global }))?);
+
+    let text =
+        serde_json::to_string(&body).map_err(|error| MatrixError::internal(&error.to_string()))?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        text,
+    )
+        .into_response())
+}
+
+/// One room's entry in `rooms.join`, for every joined room the sync found.
+///
+/// Lifted out of the handler because the handler had four sections to
+/// assemble and the joined one is by far the largest: it is the only one that
+/// carries state, account data, ephemeral events and an unread count at once.
+/// The account-level account data a sync carries, defaults included.
+///
+/// Lifted out of the handler because it is the one section with a rule of
+/// its own: a user who has never edited a push rule still has a ruleset, and
+/// clients read it from here rather than from `/pushrules/`.
+fn sync_account_data(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    filter: Option<&crate::filters::Filter>,
+) -> Result<Vec<Value>, MatrixError> {
     let mut global = state
         .account_data
         .all(&identity.user_id, "")
@@ -5583,31 +5657,24 @@ async fn sync(
             "content": crate::push_rules::defaults(&identity.user_id),
         }));
     }
-    let global = crate::filters::Filter::apply(
-        filter
-            .as_ref()
-            .and_then(|filter| filter.account_data.as_ref()),
+    Ok(crate::filters::Filter::apply(
+        filter.and_then(|filter| filter.account_data.as_ref()),
         global,
-    );
-
-    Ok(Json(json!({
-        "next_batch": crate::tokens::Sync(result.next_batch).to_string(),
-        "rooms": { "join": join, "invite": invite, "leave": leave },
-        "to_device": { "events": to_device },
-        // `left` is honestly empty until room departures update the
-        // watermark; a wrong name here would make clients drop sessions.
-        "device_lists": { "changed": device_changes, "left": [] },
-        "device_one_time_keys_count": key_counts,
-        "device_unused_fallback_key_types": unused_fallback,
-        "account_data": { "events": global },
-    })))
+    ))
 }
 
-/// One room's entry in `rooms.join`, for every joined room the sync found.
+/// Pre-serialize a value so it can sit beside an already-rendered one.
 ///
-/// Lifted out of the handler because the handler had four sections to
-/// assemble and the joined one is by far the largest: it is the only one that
-/// carries state, account data, ephemeral events and an unread count at once.
+/// `serde_json::Value` cannot hold raw JSON, which is the whole reason the
+/// sync body is assembled from `RawValue`s rather than as one `Value`: the
+/// state block is served from a cache that already holds the exact bytes,
+/// and parsing them back into a `Value` so they can be serialized again is
+/// the cost this avoids.
+fn raw<T: serde::Serialize>(value: &T) -> Result<Box<RawValue>, MatrixError> {
+    serde_json::value::to_raw_value(value)
+        .map_err(|error| MatrixError::internal(&error.to_string()))
+}
+
 fn sync_invite(
     state: &AppState,
     identity: &crate::accounts::Identity,
@@ -5660,8 +5727,9 @@ fn sync_join(
     rooms: Vec<crate::rooms::SyncRoom>,
     filter: Option<&crate::filters::Filter>,
     state_after: bool,
-) -> Result<serde_json::Map<String, Value>, MatrixError> {
-    let mut join = serde_json::Map::new();
+    state_block: crate::rooms::StateBlock,
+) -> Result<BTreeMap<String, Box<RawValue>>, MatrixError> {
+    let mut join: BTreeMap<String, Box<RawValue>> = BTreeMap::new();
     for room in rooms {
         if filter.is_some_and(|f| !f.allows_room(&room.room_id)) {
             continue;
@@ -5719,10 +5787,10 @@ fn sync_join(
             room_filter.and_then(|room| room.account_data.as_ref()),
             room_data,
         );
-        let mut entry = serde_json::Map::new();
+        let mut entry: BTreeMap<&str, Box<RawValue>> = BTreeMap::new();
         entry.insert(
-            "timeline".to_owned(),
-            json!({ "events": events, "limited": room.limited }),
+            "timeline",
+            raw(&json!({ "events": events, "limited": room.limited }))?,
         );
         // MSC4222 renames the block rather than changing what is in it, *for
         // this server*. What we send is already the state at the end of the
@@ -5733,25 +5801,40 @@ fn sync_join(
         // So the flag changes the label, and the label is the part that was
         // wrong: `state` promises the state *before* the timeline, which is
         // not what this server was ever sending.
+        // The deferred case: `Rooms::sync` materialized nothing, and the
+        // cached render is already the exact bytes this block should carry.
+        // Spliced rather than parsed and re-serialized -- which is the whole
+        // point, since parsing it only to serialize it back is the cost this
+        // avoids.
+        let state_json = if state_block == crate::rooms::StateBlock::Deferred {
+            let rendered = state
+                .rooms
+                .state_serialized(&room.room_id)
+                .map_err(room_error)?;
+            RawValue::from_string(format!(r#"{{"events":{rendered}}}"#))
+                .map_err(|error| MatrixError::internal(&error.to_string()))?
+        } else {
+            raw(&json!({ "events": room_state }))?
+        };
         entry.insert(
-            if state_after { "state_after" } else { "state" }.to_owned(),
-            json!({ "events": room_state }),
+            if state_after { "state_after" } else { "state" },
+            state_json,
         );
-        entry.insert("account_data".to_owned(), json!({ "events": room_data }));
+        entry.insert("account_data", raw(&json!({ "events": room_data }))?);
         entry.insert(
-            "ephemeral".to_owned(),
-            json!({
+            "ephemeral",
+            raw(&json!({
                 "events": crate::filters::Filter::apply(
                     room_filter.and_then(|room| room.ephemeral.as_ref()),
                     typing.map(|event| vec![event]).unwrap_or_default(),
                 ),
-            }),
+            }))?,
         );
         entry.insert(
-            "unread_notifications".to_owned(),
-            json!({ "notification_count": unread.notification_count }),
+            "unread_notifications",
+            raw(&json!({ "notification_count": unread.notification_count }))?,
         );
-        join.insert(room.room_id, Value::Object(entry));
+        join.insert(room.room_id, raw(&entry)?);
     }
 
     // A room where the only news is that someone is typing has no timeline
@@ -5765,7 +5848,10 @@ fn sync_join(
         let Some(typing) = state.typing.event(&room_id) else {
             continue;
         };
-        join.insert(room_id, json!({ "ephemeral": { "events": [typing] } }));
+        join.insert(
+            room_id,
+            raw(&json!({ "ephemeral": { "events": [typing] } }))?,
+        );
     }
     Ok(join)
 }
