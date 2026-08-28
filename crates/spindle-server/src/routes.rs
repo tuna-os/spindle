@@ -2827,6 +2827,12 @@ async fn create_room(
             request.topic.as_deref(),
             request.preset.as_deref(),
             &initial_state,
+            // Not yet wired to the client's requested version: `create`
+            // can refuse one it cannot build, but this server still
+            // advertises only v11, so honouring the request means
+            // refusing every other version rather than serving it. See
+            // #178 -- the guard lands with the versions, not before.
+            None,
         )
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
     // Invites after the room stands, refused invites failing the create the

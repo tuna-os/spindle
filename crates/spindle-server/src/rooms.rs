@@ -340,7 +340,16 @@ impl Rooms {
         topic: Option<&str>,
         preset: Option<&str>,
         initial_state: &[(String, String, Value)],
+        version: Option<&str>,
     ) -> Result<String, RoomError> {
+        // The requested version, or this build's default. Refused rather
+        // than substituted: handing back a different version than was asked
+        // for, and reporting success, is a lie the client cannot detect
+        // until something that depends on the version fails.
+        let version = version.unwrap_or(ROOM_VERSION);
+        if !crate::surface::supports_room_version(version) {
+            return Err(RoomError::UnsupportedVersion(version.to_owned()));
+        }
         let room_id = format!("!{}:{}", random_id(), self.server_name);
         let mut log = RoomLog::new();
 
@@ -348,7 +357,7 @@ impl Rooms {
             (
                 "m.room.create",
                 String::new(),
-                serde_json::json!({ "room_version": ROOM_VERSION, "creator": creator }),
+                serde_json::json!({ "room_version": version, "creator": creator }),
             ),
             (
                 "m.room.member",
@@ -789,13 +798,22 @@ impl Rooms {
     /// [`Self::read_event`], which goes to the store directly and takes no
     /// lock at all. Same cache, same answer, no re-entry.
     fn rules_in(&self, log: &RoomLog, room_id: &str) -> Result<RoomVersionRules, RoomError> {
+        rules_of(&self.version_in_log(log, room_id)?)
+    }
+
+    /// The room's version, resolved from a log the caller is already holding.
+    ///
+    /// Same re-entrancy rule as [`Self::rules_in`], which it backs: never
+    /// reach this through [`Self::room_version`] from inside
+    /// [`Self::with_room`].
+    fn version_in_log(&self, log: &RoomLog, room_id: &str) -> Result<RoomVersionId, RoomError> {
         if let Some(version) = self
             .room_versions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(room_id)
         {
-            return rules_of(version);
+            return Ok(version.clone());
         }
         let id = current_state_id(log, &StateKey::new("m.room.create", ""))
             .ok_or_else(|| RoomError::UnknownState("m.room.create".to_owned()))?;
@@ -805,7 +823,7 @@ impl Rooms {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(room_id.to_owned(), version.clone());
-        rules_of(&version)
+        Ok(version)
     }
 
     /// The content of one current state event.
@@ -3123,8 +3141,19 @@ impl Rooms {
         let canonical = build_canonical(
             room_id, sender, event_type, state_key, content, &prev, &auth, depth,
         )?;
-        let version = RoomVersionId::try_from(ROOM_VERSION)
-            .map_err(|error| RoomError::Build(error.to_string()))?;
+        // Sign under the room's own version, not this build's default.
+        // Event IDs are version-dependent, so signing a v12 room's event
+        // under v11 rules mints an ID the rest of that room will not
+        // recognise -- the same class of mistake `make_join` made when it
+        // answered "this room is version 11" about a room it had never
+        // read (#201). The create event is the exception, for the reason
+        // `authorize` gives: it is the event that establishes the version,
+        // so its own content is the only place the answer exists yet.
+        let version = if event_type == "m.room.create" {
+            version_in(content)?
+        } else {
+            self.version_in_log(log, room_id)?
+        };
         let pdu = Pdu::sign(version, canonical, &self.server_name, key)
             .map_err(|error| RoomError::Build(format!("{error:?}")))?;
 
@@ -4318,6 +4347,12 @@ fn random_id() -> String {
 /// Why a room operation failed.
 #[derive(Debug)]
 pub enum RoomError {
+    /// A room version this server does not advertise. Distinct from
+    /// [`RoomError::Build`]'s "no rules for this version": `ruma` may
+    /// know a version perfectly well while this server still declines to
+    /// create rooms at it, because nothing here has been exercised
+    /// against one.
+    UnsupportedVersion(String),
     UnknownRoom(String),
     MissingBody(String),
     Build(String),
@@ -4344,6 +4379,12 @@ impl From<serde_json::Error> for RoomError {
 impl std::fmt::Display for RoomError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnsupportedVersion(version) => {
+                write!(
+                    formatter,
+                    "this server does not support room version {version}"
+                )
+            }
             Self::UnknownRoom(id) => write!(formatter, "no such room: {id}"),
             Self::MissingBody(id) => write!(formatter, "the body of {id} is missing"),
             Self::Build(message) => write!(formatter, "cannot build the event: {message}"),
@@ -4509,7 +4550,7 @@ mod room_version_tests {
     use spindle_store::FjallStore;
     use tempfile::TempDir;
 
-    use super::{Rooms, version_in};
+    use super::{RoomError, Rooms, version_in};
 
     fn rooms() -> (TempDir, Arc<FjallStore>, Rooms) {
         let dir = TempDir::new().unwrap();
@@ -4521,6 +4562,99 @@ mod room_version_tests {
     fn key() -> ruma::signatures::Ed25519KeyPair {
         let document = ruma::signatures::Ed25519KeyPair::generate();
         ruma::signatures::Ed25519KeyPair::from_der(&document, "0".to_owned()).unwrap()
+    }
+
+    /// A version this server does not advertise is refused, not substituted.
+    ///
+    /// The point is the *refusal*: `create` previously ignored the
+    /// requested version entirely and stamped its own default, so a client
+    /// asking for one version and receiving another was told it had
+    /// succeeded. A lie a client cannot detect until something that depends
+    /// on the version fails is worse than an error it can handle.
+    #[test]
+    fn creating_a_room_at_an_unadvertised_version_is_refused() {
+        let (_dir, _store, rooms) = rooms();
+        let key = key();
+        for unsupported in ["1", "10", "12"] {
+            let result = rooms.create(
+                "@alice:example.org",
+                &key,
+                None,
+                None,
+                None,
+                &[],
+                Some(unsupported),
+            );
+            assert!(
+                matches!(result, Err(RoomError::UnsupportedVersion(ref named)) if named == unsupported),
+                "v{unsupported} was not refused: {result:?}",
+            );
+        }
+    }
+
+    /// The one advertised version is accepted, and lands in the room.
+    #[test]
+    fn creating_a_room_at_an_advertised_version_is_accepted() {
+        let (_dir, _store, rooms) = rooms();
+        let key = key();
+        let room_id = rooms
+            .create(
+                "@alice:example.org",
+                &key,
+                None,
+                None,
+                None,
+                &[],
+                Some("11"),
+            )
+            .expect("v11 is advertised and must be accepted");
+        assert_eq!(rooms.room_version(&room_id).unwrap(), RoomVersionId::V11);
+    }
+
+    /// An append resolves the room's version from a cold cache.
+    ///
+    /// `build_event` now takes the signing version from the room rather
+    /// than from the `ROOM_VERSION` constant, because event IDs are
+    /// version-dependent -- signing a v12 room's event under v11 rules
+    /// mints an ID the rest of that room will not recognise. That is the
+    /// same defect `make_join` had (#201): a statement about a room made
+    /// without reading the room.
+    ///
+    /// **This test does not prove that change**, and cannot yet: only v11
+    /// is advertised, so the constant and the room's version are the same
+    /// value, and reverting `build_event` to the constant leaves every
+    /// test here green. What it does prove is the part that can fail
+    /// today -- that the lookup works from a cold cache (a second `Rooms`
+    /// over the same store), rather than deadlocking on the re-entrant
+    /// `open` lock the way the first version of this lookup did.
+    ///
+    /// Real coverage for the signing version arrives with the second
+    /// advertised version, and belongs in that slice.
+    #[test]
+    fn an_append_resolves_the_rooms_version_from_a_cold_cache() {
+        let (_dir, store, rooms) = rooms();
+        let key = key();
+        let room_id = rooms
+            .create("@alice:example.org", &key, None, None, None, &[], None)
+            .unwrap();
+
+        let restarted = Rooms::new(store, "example.org");
+        let event_id = restarted
+            .send(
+                &room_id,
+                "@alice:example.org",
+                &key,
+                "m.room.message",
+                &serde_json::json!({ "msgtype": "m.text", "body": "hello" }),
+            )
+            .expect("a cold cache must resolve the room's version, not deadlock or guess");
+
+        // v11 event IDs are URL-safe-base64 reference hashes behind `$`.
+        assert!(event_id.starts_with('$'), "unexpected event id: {event_id}");
+        assert_eq!(
+            restarted.room_version(&room_id).unwrap(),
+            RoomVersionId::V11
+        );
     }
 
     /// A create event with no `room_version` is a v1 room, per the spec.
@@ -4558,7 +4692,7 @@ mod room_version_tests {
         let (_dir, _store, rooms) = rooms();
         let key = key();
         let room_id = rooms
-            .create("@alice:example.org", &key, None, None, None, &[])
+            .create("@alice:example.org", &key, None, None, None, &[], None)
             .unwrap();
 
         assert_eq!(
@@ -4606,7 +4740,7 @@ mod room_version_tests {
         let (_dir, store, rooms) = rooms();
         let key = key();
         let room_id = rooms
-            .create("@alice:example.org", &key, None, None, None, &[])
+            .create("@alice:example.org", &key, None, None, None, &[], None)
             .unwrap();
 
         // Same store, empty caches -- the state a server comes back up in.
