@@ -6,6 +6,7 @@
 
 pub mod backup;
 pub mod codec;
+pub mod migrate;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -267,16 +268,35 @@ impl FjallStore {
     ///
     /// Returns [`StoreError`] if the keyspace cannot be opened.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let store = Self::open_unchecked(path)?;
+        store.check_schema()?;
+        Ok(store)
+    }
+
+    /// Open without checking the schema marker.
+    ///
+    /// For `spindle migrate` and nothing else. Migration has to read a store
+    /// this binary has just refused — that is the situation it exists for —
+    /// so it cannot go through the door that does the refusing.
+    ///
+    /// Every other caller wants [`Self::open`]. Reading a store at an
+    /// unknown schema through the ordinary keyspaces is the silent misread
+    /// the marker was added to prevent (see [`Self::check_schema`]): a
+    /// prefix scan under the wrong version finds nothing and reports an
+    /// empty store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the keyspace cannot be opened.
+    pub fn open_unchecked(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let keyspace = Config::new(path).open()?;
         let partition = keyspace.open_partition("spindle", PartitionCreateOptions::default())?;
-        let store = Self {
+        Ok(Self {
             reads: AtomicU64::new(0),
             scanned: AtomicU64::new(0),
             keyspace,
             partition,
-        };
-        store.check_schema()?;
-        Ok(store)
+        })
     }
 
     /// Refuse a store this binary cannot read, and stamp one that has no mark.
@@ -772,10 +792,26 @@ impl std::fmt::Display for StoreError {
             Self::Backend(message) => write!(formatter, "storage backend failed: {message}"),
             Self::Codec(error) => write!(formatter, "unreadable record: {error:?}"),
             Self::Restore(error) => write!(formatter, "could not replay log: {error:?}"),
+            // All three versions, not two. A `content_digest`-only
+            // mismatch printed through the old two-field message showed the
+            // operator two identical-looking version pairs and no reason for
+            // the refusal -- and that field is the one whose mismatch is
+            // hardest to diagnose from anywhere else (#78).
+            //
+            // The remedy is named here rather than left to the reader: this
+            // string is the entire interface between a store that will not
+            // open and the person who has to decide what to do about it.
             Self::UnsupportedSchema { found, supported } => write!(
                 formatter,
-                "store was written at key schema {}/record {}, this binary speaks {}/{}",
-                found.key_schema, found.record, supported.key_schema, supported.record
+                "store was written at key schema {}/record {}/digest {}, \
+                 this binary speaks {}/{}/{}; run `spindle migrate <config>` \
+                 to move the store forward, after taking a backup",
+                found.key_schema,
+                found.record,
+                found.content_digest,
+                supported.key_schema,
+                supported.record,
+                supported.content_digest,
             ),
             Self::StateNotResident { li } => write!(
                 formatter,
