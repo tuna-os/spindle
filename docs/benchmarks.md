@@ -750,9 +750,42 @@ idle until there was concurrency for it to coalesce.
 
 The rate column changed shape too — flat before, scaling now — while the
 one-client figure did not move, which is what a contention fix should look
-like. The eight-client row still shares four cores with the workers
-generating the load, so the shape and the `rode` column are the result and
-the magnitude is not.
+like.
+
+### And end to end, on this box, it does not show at all
+
+The table above is the *in-process* probe: no HTTP, no separate client,
+the tokio workers are the only load. Driven over HTTP by
+`api-benchmark.py` instead, two rounds each side:
+
+| clients | before r1 | before r2 | after r1 | after r2 |
+|---|---|---|---|---|
+| 1 | 964 | 940 | 955 | 888 |
+| 2 | 1 565 | 1 542 | 1 664 | 1 569 |
+| 4 | 1 687 | 1 705 | 1 500 | 1 645 |
+| 8 | 1 364 | 1 542 | 1 569 | 1 500 |
+
+The separation rule calls two of the four cells — **one in each
+direction**, two clients faster and four clients slower. At two rounds a
+side a spurious separation runs at one cell in three (#183), so across
+four cells roughly 1.3 are expected from chance alone and two were
+observed. Neither call means anything.
+
+So the honest statement has two halves and both are needed:
+
+- **The mechanism works.** `rode` moving from zero to 195 is not a
+  measurement that noise produces; two writers are in `commit()` together
+  where they never were before.
+- **The end-to-end benefit is below what this rig can resolve.** Over
+  HTTP, on four cores shared with a Python driver, the request's cost is
+  dominated by things this change does not touch. The 1 912 sends/sec in
+  the in-process table is *not* an operator-facing throughput claim, and
+  reading it as one would be the same mistake as the scaling curve
+  retracted above.
+
+What would settle it is the driver on a different machine from the
+server, which this environment does not have. Recorded rather than
+resolved.
 
 Three changes were needed for any of it to pay, and each was inert alone:
 group commit, moving the fsync out of the critical section, and the lock
