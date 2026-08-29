@@ -371,6 +371,10 @@ fn room_routes() -> Router<AppState> {
             "/_matrix/client/v3/user_directory/search",
             post(user_directory_search),
         )
+        .route(
+            "/_matrix/client/v1/rooms/{room_id}/hierarchy",
+            get(room_hierarchy),
+        )
         .route("/_matrix/client/v3/account/password", post(change_password))
         .route(
             "/_matrix/client/v3/account/deactivate",
@@ -7365,4 +7369,175 @@ async fn delete_devices(
         state.rooms.wake_sync_waiters();
     }
     Ok((StatusCode::OK, Json(json!({}))))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct HierarchyQuery {
+    from: Option<String>,
+    limit: Option<usize>,
+    max_depth: Option<usize>,
+    #[serde(default)]
+    suggested_only: bool,
+}
+
+/// How many rooms one hierarchy page returns, and the ceiling on a walk.
+///
+/// `max_depth` has no default in the spec, and an uncapped recursive walk over
+/// a graph strangers can extend is a denial of service against your own
+/// server: one request, arbitrarily many room-state reads. So the cap is the
+/// server's, not the client's, and a client asking for more gets this.
+const HIERARCHY_PAGE: usize = 50;
+const HIERARCHY_PAGE_MAX: usize = 100;
+const HIERARCHY_DEPTH_MAX: usize = 8;
+
+/// May `user` see this room in a hierarchy at all?
+///
+/// The same shape as the directory's rule and for the same reason: a
+/// hierarchy is a list handed to somebody who may be in none of these rooms,
+/// so it must not become a way to enumerate private ones. A room is included
+/// when the user is joined -- they can already see it -- or when it is
+/// world-readable, public or knockable, which are the ways a room says it
+/// expects to be found by strangers.
+///
+/// A room this server holds no log for is *not* an error: over federation the
+/// tree crosses servers, and the honest answer is to leave out what we cannot
+/// speak for rather than to fail the page.
+fn hierarchy_visible(
+    state: &AppState,
+    user: &str,
+    room_id: &str,
+) -> Option<crate::rooms::RoomSummary> {
+    let summary = state.rooms.summary(room_id).ok()?;
+    if state.rooms.is_joined(user, room_id).unwrap_or(false) {
+        return Some(summary);
+    }
+    let open =
+        summary.world_readable || matches!(summary.join_rule.as_deref(), Some("public" | "knock"));
+    open.then_some(summary)
+}
+
+/// The `m.space.child` events of a room, in the spec's order.
+///
+/// Ordered by the child's `order` field then its room ID, because a space
+/// with no explicit order still has to paginate stably -- the same argument
+/// the room directory makes.
+fn space_children(state: &AppState, room_id: &str, suggested_only: bool) -> Vec<Value> {
+    let Ok(events) = state.rooms.state(room_id) else {
+        return Vec::new();
+    };
+    let mut children: Vec<Value> = events
+        .into_iter()
+        .filter(|event| event["type"] == "m.space.child")
+        // A child with no `via` is not a child: the spec says an
+        // `m.space.child` without it is to be ignored, and that is also how a
+        // child is *removed* -- by replacing its content with an empty one.
+        .filter(|event| {
+            event["content"]["via"]
+                .as_array()
+                .is_some_and(|via| !via.is_empty())
+        })
+        .filter(|event| !suggested_only || event["content"]["suggested"].as_bool().unwrap_or(false))
+        .collect();
+    children.sort_by(|left, right| {
+        let key = |event: &Value| {
+            (
+                event["content"]["order"].as_str().unwrap_or("").to_owned(),
+                event["state_key"].as_str().unwrap_or("").to_owned(),
+            )
+        };
+        key(left).cmp(&key(right))
+    });
+    children
+}
+
+/// `GET /_matrix/client/v1/rooms/{room_id}/hierarchy`
+///
+/// A breadth-first walk of `m.space.child`, which is a *graph* and not a tree:
+/// a space may contain itself, directly or through a cycle, and nothing stops
+/// two spaces containing each other. The visited set is therefore not an
+/// optimisation -- without it this endpoint never returns.
+async fn room_hierarchy(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<HierarchyQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    let limit = query
+        .limit
+        .unwrap_or(HIERARCHY_PAGE)
+        .clamp(1, HIERARCHY_PAGE_MAX);
+    let max_depth = query
+        .max_depth
+        .unwrap_or(HIERARCHY_DEPTH_MAX)
+        .min(HIERARCHY_DEPTH_MAX);
+    let offset: usize = match query.from.as_deref() {
+        Some(token) => token.parse().map_err(|_| {
+            MatrixError::bad_json("from is not a hierarchy token this server issued")
+        })?,
+        None => 0,
+    };
+
+    // The root itself has to be visible, and a root nobody may see is a 403
+    // rather than an empty page: an empty page would say "this space is
+    // empty", which is a different and false claim.
+    if hierarchy_visible(&state, &identity.user_id, &room_id).is_none() {
+        return Err(MatrixError::forbidden(
+            "you are not allowed to view this room's hierarchy",
+        ));
+    }
+
+    // Visibility is decided ONCE, as a room enters the walk. Filtering again
+    // at render time would look like belt and braces and is actually a bug:
+    // `ordered` would count rooms the caller cannot see, so `total` -- and
+    // therefore `next_batch` -- would be computed from a number that does not
+    // match what is returned, and `take(limit)` would hand back a SHORT page
+    // whenever an invisible room fell inside it. A client paging by counting
+    // would then mis-page. So nothing invisible is ever put in the list.
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut ordered: Vec<(crate::rooms::RoomSummary, Vec<Value>)> = Vec::new();
+    let mut frontier = vec![(room_id.clone(), 0_usize)];
+    visited.insert(room_id.clone());
+
+    while !frontier.is_empty() {
+        let (current, depth) = frontier.remove(0);
+        // The ONE visibility check, and it is deliberately here rather than at
+        // enqueue time. `continue` skips the child expansion below too, so an
+        // invisible room is neither returned nor descended into -- a second
+        // check on the way in would be pure optimisation, and a second check
+        // at render time is the bug described above. One check, one place.
+        let Some(summary) = hierarchy_visible(&state, &identity.user_id, &current) else {
+            continue;
+        };
+        let children = space_children(&state, &current, query.suggested_only);
+        ordered.push((summary, children.clone()));
+        if depth >= max_depth {
+            continue;
+        }
+        for child in &children {
+            let Some(child_id) = child["state_key"].as_str() else {
+                continue;
+            };
+            if !visited.insert(child_id.to_owned()) {
+                continue;
+            }
+            frontier.push((child_id.to_owned(), depth + 1));
+        }
+    }
+
+    let total = ordered.len();
+    let mut rooms = Vec::new();
+    for (summary, children) in ordered.into_iter().skip(offset).take(limit) {
+        let Value::Object(mut entry) = chunk_of(&summary) else {
+            continue;
+        };
+        entry.insert("children_state".to_owned(), Value::Array(children));
+        rooms.push(Value::Object(entry));
+    }
+
+    let mut body = serde_json::Map::new();
+    body.insert("rooms".to_owned(), Value::Array(rooms));
+    if offset + limit < total {
+        body.insert("next_batch".to_owned(), json!((offset + limit).to_string()));
+    }
+    Ok(Json(Value::Object(body)))
 }
