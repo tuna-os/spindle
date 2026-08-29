@@ -32,9 +32,17 @@ impl Harness {
     }
 
     /// A harness over storage that already exists, as a restart would open it.
-    fn reopen(path: &std::path::Path) -> Self {
-        let store = Arc::new(FjallStore::open(path).unwrap());
-        let app = spindle_server::app(Self::config(), store).expect("a signing key is established");
+    /// A second server over a store that is already open.
+    ///
+    /// Not a second `FjallStore::open` of the same directory: fjall 3 holds
+    /// an exclusive lock on a data directory for as long as any handle to it
+    /// lives, and a running server's delivery loops hold one for the life of
+    /// the process. Two servers over one directory is corruption, so refusing
+    /// it is right -- it just means an in-process "restart" shares the store
+    /// rather than reopening the file.
+    fn reopen(store: &Arc<FjallStore>) -> Self {
+        let app = spindle_server::app(Self::config(), Arc::clone(store))
+            .expect("a signing key is established");
         Self {
             _dir: TempDir::new().unwrap(),
             app,
@@ -402,14 +410,19 @@ async fn login_flows_advertise_only_password() {
 #[tokio::test]
 async fn accounts_survive_a_restart() {
     let dir = TempDir::new().unwrap();
+    let store = Arc::new(FjallStore::open(dir.path()).unwrap());
     let token = {
-        let harness = Harness::reopen(dir.path());
+        let harness = Harness::reopen(&store);
         let registered = harness.register("alice", "hunter2").await;
         registered["access_token"].as_str().unwrap().to_owned()
     };
 
-    // A fresh handle over the same directory, as a restart would open.
-    let harness = Harness::reopen(dir.path());
+    // A second server over the same store, which is as close to a restart as
+    // one process gets -- see `reopen`. What it still proves is that the
+    // account went to storage rather than living in the first server's
+    // memory; `spindle-store`'s `backend_compatibility` suite carries the
+    // on-disk claim, by dropping a store and reopening the directory.
+    let harness = Harness::reopen(&store);
     let (status, who) = harness
         .get_auth("/_matrix/client/v3/account/whoami", &token)
         .await;

@@ -19,7 +19,9 @@ use tower::ServiceExt;
 /// A server that can be stopped and started again over the same directory —
 /// the restart is what the counter-resume test is about.
 struct Harness {
+    #[allow(dead_code, reason = "keeps the data directory alive for the store")]
     dir: TempDir,
+    store: Arc<FjallStore>,
     app: axum::Router,
 }
 
@@ -32,22 +34,29 @@ struct Device {
 impl Harness {
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
-        let app = Self::build(dir.path());
-        Self { dir, app }
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let app = Self::build(&store);
+        Self { dir, store, app }
     }
 
-    fn build(path: &std::path::Path) -> axum::Router {
-        let store = Arc::new(FjallStore::open(path).unwrap());
+    fn build(store: &Arc<FjallStore>) -> axum::Router {
         let config = spindle_server::Config::parse(
             "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n",
         )
         .unwrap();
-        spindle_server::app(config, store).expect("a signing key is established")
+        spindle_server::app(config, Arc::clone(store)).expect("a signing key is established")
     }
 
-    /// Everything in memory goes away; the directory stays.
+    /// Everything the *server* held in memory goes away; the store stays.
+    ///
+    /// The store handle is shared rather than reopened: fjall 3 locks a data
+    /// directory for as long as any handle lives, and a running server's
+    /// delivery loops hold one. The claim is unaffected -- what this test is
+    /// about is a fresh server resuming its counter from stored rows rather
+    /// than from its own memory, and the counters are re-read from the store
+    /// whenever the server is built.
     fn restart(&mut self) {
-        self.app = Self::build(self.dir.path());
+        self.app = Self::build(&self.store);
     }
 
     async fn call(&self, request: Request<Body>) -> (StatusCode, Value) {

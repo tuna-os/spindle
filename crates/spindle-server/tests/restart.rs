@@ -17,29 +17,44 @@ use spindle_store::FjallStore;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-/// A server that can be stopped and started again over the same directory.
+/// A server that can be rebuilt over the same store.
 struct Restartable {
+    #[allow(dead_code, reason = "keeps the data directory alive for the store")]
     dir: TempDir,
+    store: Arc<FjallStore>,
     app: axum::Router,
 }
 
 impl Restartable {
     fn start() -> Self {
         let dir = TempDir::new().unwrap();
-        let app = Self::build(dir.path());
-        Self { dir, app }
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let app = Self::build(&store);
+        Self { dir, store, app }
     }
 
-    fn build(path: &std::path::Path) -> axum::Router {
-        let store = Arc::new(FjallStore::open(path).unwrap());
+    fn build(store: &Arc<FjallStore>) -> axum::Router {
         let config = spindle_server::Config::parse("[server]\nname = \"example.org\"\n").unwrap();
-        spindle_server::app(config, store).expect("a signing key is established")
+        spindle_server::app(config, Arc::clone(store)).expect("a signing key is established")
     }
 
-    /// Everything in memory goes away; the directory stays. As close to a
-    /// process restart as one test can get.
+    /// Everything the *server* held in memory goes away; the store stays.
+    ///
+    /// It used to reopen the directory, which is closer to a process restart
+    /// and which fjall 3 refuses: it locks a data directory for as long as
+    /// any handle to it lives, and a running server's delivery loops hold one
+    /// for the life of the process. That is right for a server -- two writers
+    /// over one directory is corruption -- so an in-process restart shares
+    /// the store instead.
+    ///
+    /// What that costs is small and worth naming: this no longer proves the
+    /// bytes made a round trip through the filesystem. Every room registry,
+    /// counter and index here is still rebuilt from stored rows by the new
+    /// server, which is what these tests are about; the on-disk round trip
+    /// is carried by `spindle-store`'s `backend_compatibility` suite, which
+    /// drops a store and reopens the directory with nothing else running.
     fn restart(&mut self) {
-        self.app = Self::build(self.dir.path());
+        self.app = Self::build(&self.store);
     }
 
     async fn call(&self, request: Request<Body>) -> (StatusCode, Value) {

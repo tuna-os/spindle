@@ -12,8 +12,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 
+// fjall 3 renamed the two levels: what was a `Keyspace` (the whole store) is
+// now a `Database`, and what was a `PartitionHandle` (one namespace inside
+// it) is now a `Keyspace`. The aliases below keep this file's own vocabulary
+// -- `db` for the store, `partition` for the namespace -- so the rename does
+// not read as a change of design.
 use fjall::{
-    Config, Keyspace as FjallKeyspace, PartitionCreateOptions, PartitionHandle, PersistMode,
+    Config, Database as FjallDatabase, Keyspace as FjallPartition,
+    KeyspaceCreateOptions as PartitionCreateOptions, PersistMode, Readable,
 };
 use spindle_core::{
     CONTENT_DIGEST_VERSION, EventId, RestoreError, RestoredEntry, RestoredLog, RoomLog, StateRoot,
@@ -336,8 +342,8 @@ impl Default for GroupState {
 impl GroupCommit {
     /// Return once a sync covering the caller's already-journalled bytes has
     /// completed — leading that sync if nobody else is.
-    fn sync(&self, keyspace: &FjallKeyspace, mode: PersistMode) -> Result<(), StoreError> {
-        self.sync_with(|| keyspace.persist(mode).map_err(StoreError::from))
+    fn sync(&self, db: &FjallDatabase, mode: PersistMode) -> Result<(), StoreError> {
+        self.sync_with(|| db.persist(mode).map_err(StoreError::from))
     }
 
     /// [`Self::sync`] with the fsync itself supplied.
@@ -403,8 +409,8 @@ impl GroupCommit {
 }
 
 pub struct FjallStore {
-    keyspace: FjallKeyspace,
-    partition: PartitionHandle,
+    db: FjallDatabase,
+    partition: FjallPartition,
     /// Point reads and scanned rows served since this store was opened.
     ///
     /// Here so that "how much work does this request do" can be *asserted*
@@ -502,14 +508,53 @@ impl FjallStore {
     ///
     /// Returns [`StoreError`] if the keyspace cannot be opened.
     pub fn open_unchecked(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let keyspace = Config::new(path).open()?;
-        let partition = keyspace.open_partition("spindle", PartitionCreateOptions::default())?;
+        // `Database::open`, not `create_or_recover`: the latter is
+        // `#[doc(hidden)]` and documented as fjall's own no-background-threads
+        // variant for testing. It happens to be what `open` calls today, and
+        // depending on that would make a patch release of the engine a
+        // silent change to how this server runs.
+        let db = FjallDatabase::open(Config::new(path.as_ref())).map_err(|error| {
+            // fjall 3 refuses a store written by fjall 2 outright: the on-disk
+            // format changed and there is no in-process upgrade. Its own error
+            // says `InvalidVersion(Some(V2))`, which tells an operator that
+            // something is wrong and nothing about what to do -- and the thing
+            // to do exists, so it is said here.
+            if matches!(
+                error,
+                fjall::Error::InvalidVersion(Some(fjall::FormatVersion::V2))
+            ) {
+                return StoreError::Backend(format!(
+                    "this data directory was written by Spindle's previous \
+                     storage engine (fjall 2) and cannot be opened by this \
+                     build: the on-disk format changed in fjall 3 and there is \
+                     no automatic upgrade. Migrate it with \
+                     https://github.com/fjall-rs/migrate-v2-v3 first, or point \
+                     [storage] path at an empty directory to start fresh. \
+                     ({error})"
+                ));
+            }
+            // fjall 3 also takes an exclusive lock on the directory, which
+            // fjall 2 did not. `Locked` therefore has a meaning an operator
+            // can act on -- something else already has this store open --
+            // and saying so beats the bare word.
+            if matches!(error, fjall::Error::Locked) {
+                return StoreError::Backend(format!(
+                    "this data directory is already open by another process: \
+                     Spindle's storage engine allows one writer at a time, so \
+                     a command that opens the store directly (backup, restore, \
+                     verify-media) cannot run against a directory a server is \
+                     serving from. Stop the server first. ({error})"
+                ));
+            }
+            StoreError::from(error)
+        })?;
+        let partition = db.keyspace("spindle", PartitionCreateOptions::default)?;
         Ok(Self {
             reads: AtomicU64::new(0),
             scanned: AtomicU64::new(0),
             journalled: AtomicU64::new(0),
             group: GroupCommit::default(),
-            keyspace,
+            db,
             partition,
         })
     }
@@ -645,7 +690,7 @@ impl ReadView for FjallStore {
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<Record>, StoreError> {
         let mut out = Vec::new();
         for pair in self.partition.prefix(prefix) {
-            let (key, value) = pair?;
+            let (key, value) = pair.into_inner()?;
             out.push((key.to_vec(), value.to_vec()));
         }
         self.scanned.fetch_add(out.len() as u64, Ordering::Relaxed);
@@ -655,7 +700,7 @@ impl ReadView for FjallStore {
     fn scan_from(&self, prefix: &[u8], start: &[u8]) -> Result<Vec<Record>, StoreError> {
         let mut out = Vec::new();
         for pair in self.partition.range(start.to_vec()..) {
-            let (key, value) = pair?;
+            let (key, value) = pair.into_inner()?;
             // The range runs to the end of the keyspace, so leaving the
             // prefix is the terminator. Breaking rather than filtering is
             // what makes this cost the tail and not the partition.
@@ -671,21 +716,28 @@ impl ReadView for FjallStore {
 
 /// A Fjall read snapshot: every read sees the partition as of the sequence
 /// number current when it was taken, whatever lands afterwards.
-pub struct FjallCheckpoint(fjall::Snapshot);
+///
+/// It carries the partition as well as the snapshot because in fjall 3 a
+/// snapshot spans the whole database and each read names the namespace it is
+/// reading -- where in fjall 2 the snapshot was taken *from* the partition
+/// and remembered it.
+pub struct FjallCheckpoint(fjall::Snapshot, FjallPartition);
 
 impl ReadView for FjallCheckpoint {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         Ok(self
             .0
-            .get(key)
+            .get(&self.1, key)
             .map_err(|error| StoreError::Backend(error.to_string()))?
             .map(|value| value.to_vec()))
     }
 
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<Record>, StoreError> {
         let mut out = Vec::new();
-        for pair in self.0.prefix(prefix) {
-            let (key, value) = pair.map_err(|error| StoreError::Backend(error.to_string()))?;
+        for pair in self.0.prefix(&self.1, prefix) {
+            let (key, value) = pair
+                .into_inner()
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
             out.push((key.to_vec(), value.to_vec()));
         }
         Ok(out)
@@ -693,8 +745,10 @@ impl ReadView for FjallCheckpoint {
 
     fn scan_from(&self, prefix: &[u8], start: &[u8]) -> Result<Vec<Record>, StoreError> {
         let mut out = Vec::new();
-        for pair in self.0.range(start.to_vec()..) {
-            let (key, value) = pair.map_err(|error| StoreError::Backend(error.to_string()))?;
+        for pair in self.0.range(&self.1, start.to_vec()..) {
+            let (key, value) = pair
+                .into_inner()
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
             if !key.starts_with(prefix) {
                 break;
             }
@@ -732,7 +786,8 @@ impl Store for FjallStore {
         // once every item has landed, so a batch is all-or-nothing to a reader
         // exactly as it is to a crash.
         Some(Box::new(FjallCheckpoint(
-            self.partition.snapshot_at(self.keyspace.instant()),
+            self.db.snapshot(),
+            self.partition.clone(),
         )))
     }
 
@@ -742,7 +797,7 @@ impl Store for FjallStore {
     }
 
     fn commit_deferred(&self, writes: &[Record]) -> Result<(), StoreError> {
-        let mut batch = self.keyspace.batch();
+        let mut batch = self.db.batch();
         for (key, value) in writes {
             batch.insert(&self.partition, key.as_slice(), value.as_slice());
         }
@@ -768,17 +823,17 @@ impl Store for FjallStore {
             // Not coalesced: `strict` exists for deployments that want the
             // barrier they asked for, not the cheapest correct one.
             Durability::Strict => {
-                self.keyspace.persist(mode)?;
+                self.db.persist(mode)?;
                 Ok(())
             }
             // Take the next sync going -- ours to lead if nobody else is
             // already running one.
-            Durability::Group => self.group.sync(&self.keyspace, mode),
+            Durability::Group => self.group.sync(&self.db, mode),
         }
     }
 
     fn flush(&self) -> Result<(), StoreError> {
-        self.keyspace.persist(PersistMode::SyncAll)?;
+        self.db.persist(PersistMode::SyncAll)?;
         Ok(())
     }
 }

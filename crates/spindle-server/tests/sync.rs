@@ -19,25 +19,33 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 struct Harness {
+    #[allow(dead_code, reason = "keeps the data directory alive for the store")]
     dir: TempDir,
+    store: Arc<FjallStore>,
     app: axum::Router,
 }
 
 impl Harness {
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
-        let app = Self::build(dir.path());
-        Self { dir, app }
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let app = Self::build(&store);
+        Self { dir, store, app }
     }
 
-    fn build(path: &std::path::Path) -> axum::Router {
-        let store = Arc::new(FjallStore::open(path).unwrap());
+    fn build(store: &Arc<FjallStore>) -> axum::Router {
         let config = spindle_server::Config::parse("[server]\nname = \"example.org\"\n").unwrap();
-        spindle_server::app(config, store).expect("a signing key is established")
+        spindle_server::app(config, Arc::clone(store)).expect("a signing key is established")
     }
 
+    /// A second server over the same store.
+    ///
+    /// Shares the handle rather than reopening the directory, which fjall 3
+    /// locks while any handle lives. The stream counter this test is about is
+    /// re-read from the stored rows whenever a server is built, so the claim
+    /// survives -- see `restart.rs` for the fuller note.
     fn restart(&mut self) {
-        self.app = Self::build(self.dir.path());
+        self.app = Self::build(&self.store);
     }
 
     async fn call(&self, request: Request<Body>) -> (StatusCode, Value) {
