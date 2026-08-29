@@ -26,7 +26,7 @@
 //!           8        656      200     0       1.00x
 //! ```
 //!
-//! and with it moved out:
+//! with it moved out:
 //!
 //! ```text
 //!           1        635      200     0       1.00x
@@ -35,16 +35,28 @@
 //!           8        861      200     0       1.00x
 //! ```
 //!
-//! Roughly 30% at any concurrency above one -- about what one fsync is worth
-//! against the rest of an append. But **still flat across 2 to 8**, and
-//! `rode` is still zero: commits never overlap, so the group commit beneath
-//! them still coalesces nothing.
+//! and with the registry replaced by a lock per room:
 //!
-//! That is the useful reading. The barrier is no longer the write path's
-//! ceiling; the single `Mutex<HashMap<String, RoomLog>>` that `with_room`
-//! takes is, and it will stay so until appends to different rooms can
-//! proceed at the same time. Absolute figures are a debug build and
-//! in-process; the shape is the result.
+//! ```text
+//!           1        612      200     0       1.00x
+//!           2       1220      200     0       1.00x
+//!           4       1912      194    60       1.31x
+//!           8       1661      115   195       2.70x
+//! ```
+//!
+//! **Read the `rode` column first.** It was zero at every concurrency in
+//! both earlier tables: however many clients were sending, two commits
+//! never once overlapped, so the group commit beneath them had nothing to
+//! coalesce. It is now 195 of 310 commits at eight clients -- 310 sends
+//! costing 115 fsyncs. That is a *direct observation* that two writers are
+//! inside `commit()` at the same time, and unlike the rate column it owes
+//! nothing to how many cores the box has.
+//!
+//! The rate column changed shape too, from flat to scaling, and the
+//! one-client figure did not move -- which is what a contention fix should
+//! look like. Absolute figures are a debug build and in-process, and the
+//! eight-client row still shares four cores with the workers generating the
+//! load; the shape and the `rode` column are the result.
 
 use std::sync::Arc;
 

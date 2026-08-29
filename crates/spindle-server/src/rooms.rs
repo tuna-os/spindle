@@ -148,7 +148,7 @@ type Destinations = ([u8; 32], Arc<Vec<String>>);
 pub struct Rooms {
     store: Arc<FjallStore>,
     server_name: String,
-    open: RwLock<HashMap<String, RoomLog>>,
+    open: RwLock<HashMap<String, Arc<RwLock<RoomLog>>>>,
     /// Lock order: `open` before `unread_index`, always. The fast path takes
     /// only `unread_index`; the build and append paths already hold `open`.
     unread_index: Mutex<HashMap<String, UnreadIndex>>,
@@ -497,7 +497,7 @@ impl Rooms {
         self.open
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(room_id.clone(), log);
+            .insert(room_id.clone(), Arc::new(RwLock::new(log)));
         Ok(room_id)
     }
 
@@ -3681,61 +3681,65 @@ impl Rooms {
     ///
     /// Split out so the read path can check residency under a *read* lock
     /// and only reach for the write lock on the miss.
-    fn ensure_open(&self, room_id: &str) -> Result<(), RoomError> {
+    /// The lock for one room, loading it if this process has not opened it.
+    ///
+    /// **The registry lock is held only long enough to clone an `Arc`.** That
+    /// is the whole change: the map says which rooms exist, and holding it
+    /// across an append made every append in the server queue behind every
+    /// other one, in rooms they had nothing to do with. Now the map is a
+    /// lookup and the *room* is the thing contended.
+    ///
+    /// The miss path takes the registry exclusively and re-checks, because
+    /// two requests for the same cold room would otherwise both load it and
+    /// the second would replace the first -- handing two callers different
+    /// locks for one room, which is the same as no lock at all.
+    fn room(&self, room_id: &str) -> Result<Arc<RwLock<RoomLog>>, RoomError> {
+        {
+            crate::metrics::record_registry_lock(false);
+            let open = self
+                .open
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(room) = open.get(room_id) {
+                return Ok(Arc::clone(room));
+            }
+        }
+        crate::metrics::record_registry_lock(true);
         let mut open = self
             .open
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !open.contains_key(room_id) {
-            let restored = RoomStore::new(self.store.as_ref(), room_id)
-                .load()?
-                .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
-            open.insert(room_id.to_owned(), restored.log);
+        if let Some(room) = open.get(room_id) {
+            return Ok(Arc::clone(room));
         }
-        Ok(())
+        let restored = RoomStore::new(self.store.as_ref(), room_id)
+            .load()?
+            .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
+        let room = Arc::new(RwLock::new(restored.log));
+        open.insert(room_id.to_owned(), Arc::clone(&room));
+        Ok(room)
     }
 
     /// [`Self::with_room`] for work that only *reads* the log.
     ///
-    /// Takes the room registry's read lock, so concurrent readers proceed
-    /// together instead of queueing behind each other. Writers still take it
-    /// exclusively, so **append ordering is untouched** -- this widens the
-    /// read path without going near the property a per-room write path would
-    /// have to re-establish.
+    /// Takes the room's lock shared, so concurrent readers of one room
+    /// proceed together -- and readers of *different* rooms never meet at
+    /// all, because the registry is released before the room is taken.
     ///
     /// Which calls belong here is decided by the compiler, not by judgement:
     /// `work` gets `&RoomLog`, so anything that mutates the log fails to
     /// build and stays on [`Self::with_room`].
-    ///
-    /// The measurement that motivates it: on one sitting `/sync` scaled 1.25x
-    /// from one client to four while `send` scaled 1.9x -- a within-sitting
-    /// comparison, so the rig's core count cancels. Reads were the worse
-    /// half, and `/sync` is the call clients make most.
     fn with_room_read<T>(
         &self,
         room_id: &str,
         work: impl FnOnce(&Self, &RoomLog) -> Result<T, RoomError>,
     ) -> Result<T, RoomError> {
-        {
-            crate::metrics::record_room_lock(false);
-            let open = self
-                .open
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(log) = open.get(room_id) {
-                return work(self, log);
-            }
-        }
-        // Not resident. Load it -- which needs the write lock -- and retry.
-        self.ensure_open(room_id)?;
-        let open = self
-            .open
+        let room = self.room(room_id)?;
+        crate::metrics::record_room_lock(false);
+        let log = room
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let log = open
-            .get(room_id)
-            .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
-        work(self, log)
+        work(self, &log)
     }
 
     fn with_room<T>(
@@ -3744,22 +3748,13 @@ impl Rooms {
         work: impl FnOnce(&Self, &mut RoomLog) -> Result<T, RoomError>,
     ) -> Result<T, RoomError> {
         let before = self.store.journalled();
+        let room = self.room(room_id)?;
         let done = {
             crate::metrics::record_room_lock(true);
-            let mut open = self
-                .open
+            let mut log = room
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !open.contains_key(room_id) {
-                let restored = RoomStore::new(self.store.as_ref(), room_id)
-                    .load()?
-                    .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
-                open.insert(room_id.to_owned(), restored.log);
-            }
-            let log = open
-                .get_mut(room_id)
-                .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
-            work(self, log)
+            work(self, &mut log)
         };
         // The guard is gone by here, so the barrier below is not holding
         // anyone up. Ordered before `?` on `done`: a failed `work` may still
@@ -4339,7 +4334,7 @@ impl Rooms {
             self.index_membership(room_id, Some(&user), &event["content"])?;
         }
 
-        open.insert(room_id.to_owned(), log);
+        open.insert(room_id.to_owned(), Arc::new(RwLock::new(log)));
         Ok(())
     }
 

@@ -718,13 +718,47 @@ About 30% at any concurrency above one, which is roughly what one fsync
 is worth against the rest of an append.
 
 **And still flat from 2 to 8, with `rode` still at zero.** Commits never
-overlap, so group commit still coalesces nothing. That is the useful
-result rather than a disappointing one: it says the barrier was never the
-whole ceiling, and names what is. The single
-`Mutex<HashMap<String, RoomLog>>` is held across all of an append's CPU
-work, which is long enough that two writers still never meet at the
-store. Until appends to different rooms proceed at the same time, this
-table stays flat and the coalescing column stays at 1.00×.
+overlapped, so group commit still coalesced nothing. That was the useful
+result rather than a disappointing one: it said the barrier was never the
+whole ceiling, and named what was — the single
+`Mutex<HashMap<String, RoomLog>>`, held across all of an append's CPU
+work.
+
+### Replacing that registry with a lock per room
+
+The map now holds an `Arc<RwLock<RoomLog>>` per room and the registry
+itself is taken only long enough to clone one. Appends to different rooms
+no longer meet:
+
+| concurrency | sends/sec | fsyncs | rode | coalescing |
+|---|---|---|---|---|
+| 1 | 612 | 200 | 0 | 1.00× |
+| 2 | 1 220 | 200 | 0 | 1.00× |
+| 4 | 1 912 | 194 | 60 | 1.31× |
+| 8 | 1 661 | 115 | **195** | **2.70×** |
+
+**Read the `rode` column first.** It was zero at every concurrency in
+every table above: however many clients were sending, two commits never
+once overlapped. It is now 195 of 310 commits at eight clients — 310
+sends costing 115 fsyncs.
+
+That is a *direct observation* that two writers are inside `commit()` at
+the same time, and it owes nothing to how many cores the box has, which
+is what makes it worth more here than the rate column. It also means the
+group commit added earlier is finally doing something: it was correct and
+idle until there was concurrency for it to coalesce.
+
+The rate column changed shape too — flat before, scaling now — while the
+one-client figure did not move, which is what a contention fix should look
+like. The eight-client row still shares four cores with the workers
+generating the load, so the shape and the `rode` column are the result and
+the magnitude is not.
+
+Three changes were needed for any of it to pay, and each was inert alone:
+group commit, moving the fsync out of the critical section, and the lock
+split. A fourth made it *safe* rather than fast — SPEC §10.2's watermark,
+without which concurrent writers hand clients sync tokens past events that
+have not landed.
 
 This is a methodology defect of the same class as the membership one, and
 it is recorded the same way: as a limit on what every table above
