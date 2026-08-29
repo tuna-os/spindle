@@ -278,11 +278,14 @@ async fn state_reads_and_writes_are_subject_to_the_same_rules_as_everything_else
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 
-    // An unknown room is unknown, not an empty state.
+    // An unknown room is refused, not reported empty and not reported
+    // missing: 404 against 403 would tell any caller which room IDs this
+    // server holds. What this assertion is really guarding is that an
+    // unreadable room never comes back as a *successful* empty state.
     let (status, body) = harness
         .get("/_matrix/client/v3/rooms/!nope:example.org/state", &alice)
         .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
 #[tokio::test]
@@ -323,14 +326,17 @@ async fn a_single_event_can_be_fetched_by_id() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["error"], "no such event");
 
+    // A room the caller is not in is refused rather than reported missing,
+    // so the pair of status codes cannot be used to enumerate room IDs. The
+    // "no such event" answer above is the half that survives, and it is the
+    // half a legitimate caller needs.
     let (status, body) = harness
         .get(
             &format!("/_matrix/client/v3/rooms/!nope:example.org/event/{event_id}"),
             &token,
         )
         .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body["error"], "no such room");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
 #[tokio::test]

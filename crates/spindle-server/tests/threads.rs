@@ -449,15 +449,21 @@ async fn an_unknown_include_is_refused_rather_than_ignored() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
+/// A room the caller cannot read is never a successful empty list.
+///
+/// It is refused rather than reported missing, because 404 against 403 would
+/// let anyone enumerate the server's room IDs. The claim this test is really
+/// making survives either code: an empty `chunk` means "no threads", and
+/// never "no room".
 #[tokio::test]
-async fn an_unknown_room_is_not_an_empty_thread_list() {
+async fn an_unreadable_room_is_not_an_empty_thread_list() {
     let harness = Harness::new();
     let token = harness.register("alice").await;
 
     let (status, body) = harness
         .get("/_matrix/client/v1/rooms/!nope:example.org/threads", &token)
         .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
 fn text(body: &str) -> Value {

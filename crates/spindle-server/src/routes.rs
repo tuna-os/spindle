@@ -6383,16 +6383,24 @@ struct RelationsQuery {
 
 async fn relations_all(
     State(state): State<AppState>,
-    Authenticated(_identity): Authenticated,
+    Authenticated(identity): Authenticated,
     axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
     axum::extract::Query(query): axum::extract::Query<RelationsQuery>,
 ) -> Result<Json<Value>, MatrixError> {
-    relations(&state, &room_id, &event_id, None, None, &query)
+    relations(
+        &state,
+        &identity.user_id,
+        &room_id,
+        &event_id,
+        None,
+        None,
+        &query,
+    )
 }
 
 async fn relations_by_type(
     State(state): State<AppState>,
-    Authenticated(_identity): Authenticated,
+    Authenticated(identity): Authenticated,
     axum::extract::Path((room_id, event_id, rel_type)): axum::extract::Path<(
         String,
         String,
@@ -6400,12 +6408,20 @@ async fn relations_by_type(
     )>,
     axum::extract::Query(query): axum::extract::Query<RelationsQuery>,
 ) -> Result<Json<Value>, MatrixError> {
-    relations(&state, &room_id, &event_id, Some(&rel_type), None, &query)
+    relations(
+        &state,
+        &identity.user_id,
+        &room_id,
+        &event_id,
+        Some(&rel_type),
+        None,
+        &query,
+    )
 }
 
 async fn relations_by_event_type(
     State(state): State<AppState>,
-    Authenticated(_identity): Authenticated,
+    Authenticated(identity): Authenticated,
     axum::extract::Path((room_id, event_id, rel_type, event_type)): axum::extract::Path<(
         String,
         String,
@@ -6416,6 +6432,7 @@ async fn relations_by_event_type(
 ) -> Result<Json<Value>, MatrixError> {
     relations(
         &state,
+        &identity.user_id,
         &room_id,
         &event_id,
         Some(&rel_type),
@@ -6427,12 +6444,17 @@ async fn relations_by_event_type(
 /// `GET /_matrix/client/v1/rooms/{room_id}/relations/{event_id}[/{rel_type}[/{event_type}]]`
 fn relations(
     state: &AppState,
+    user_id: &str,
     room_id: &str,
     event_id: &str,
     rel_type: Option<&str>,
     event_type: Option<&str>,
     query: &RelationsQuery,
 ) -> Result<Json<Value>, MatrixError> {
+    // Every edit, reply, reaction and thread reply hanging off an event --
+    // and an `m.replace` carries the replacement's whole new body, so this
+    // reads as much of a private room as `/messages` does.
+    may_read_room(state, user_id, room_id)?;
     // The same `t`-tagged pagination token `/messages` uses, because it is the
     // same thing: a position in this room's linear index.
     let from = match query.from.as_deref() {
@@ -6486,6 +6508,10 @@ async fn room_threads(
     axum::extract::Path(room_id): axum::extract::Path<String>,
     axum::extract::Query(query): axum::extract::Query<ThreadsQuery>,
 ) -> Result<Json<Value>, MatrixError> {
+    // `threads` already takes the viewer, which is what made this one look
+    // guarded. It is not: the viewer decides the `participated` filter, and
+    // the only access check underneath is that the room exists.
+    may_read_room(&state, &identity.user_id, &room_id)?;
     let participated_only = match query.include.as_deref() {
         None | Some("all") => false,
         Some("participated") => true,
@@ -6532,9 +6558,10 @@ async fn room_threads(
 /// `GET /_matrix/client/v3/rooms/{room_id}/state`
 async fn room_state(
     State(state): State<AppState>,
-    Authenticated(_identity): Authenticated,
+    Authenticated(identity): Authenticated,
     axum::extract::Path(room_id): axum::extract::Path<String>,
 ) -> Result<axum::response::Response, MatrixError> {
+    may_read_room(&state, &identity.user_id, &room_id)?;
     // Pre-serialized: the body comes from the state-render cache, keyed by
     // the state root, so a hot room costs no reads, parses or serializing.
     let body = state.rooms.state_serialized(&room_id).map_err(room_error)?;
@@ -6552,13 +6579,16 @@ async fn room_state(
 /// to the reader.
 async fn room_state_event(
     State(state): State<AppState>,
-    Authenticated(_identity): Authenticated,
+    Authenticated(identity): Authenticated,
     axum::extract::Path((room_id, event_type, state_key)): axum::extract::Path<(
         String,
         String,
         String,
     )>,
 ) -> Result<Json<Value>, MatrixError> {
+    // Also a membership oracle without this: `…/state/m.room.member/@someone`
+    // answers whether a named user is in a named room, to anyone who asks.
+    may_read_room(&state, &identity.user_id, &room_id)?;
     let content = state
         .rooms
         .state_event(&room_id, &event_type, &state_key)
@@ -6657,6 +6687,7 @@ async fn room_event(
     Authenticated(identity): Authenticated,
     axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, MatrixError> {
+    may_read_room(&state, &identity.user_id, &room_id)?;
     let event = state.rooms.event(&room_id, &event_id).map_err(room_error)?;
     Ok(Json(with_bundle(
         &state,
@@ -6681,6 +6712,7 @@ async fn room_context(
     axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
     axum::extract::Query(query): axum::extract::Query<ContextQuery>,
 ) -> Result<Json<Value>, MatrixError> {
+    may_read_room(&state, &identity.user_id, &room_id)?;
     // The spec's limit is the total window, so each side gets half.
     let limit = query.limit.unwrap_or(10).clamp(1, 100);
     let each_side = limit.div_ceil(2);
@@ -6810,6 +6842,7 @@ async fn room_messages(
     axum::extract::Path(room_id): axum::extract::Path<String>,
     axum::extract::Query(query): axum::extract::Query<MessagesQuery>,
 ) -> Result<Json<Value>, MatrixError> {
+    may_read_room(&state, &identity.user_id, &room_id)?;
     let from = match query.from.as_deref() {
         Some(token) => Some(
             token
@@ -7509,6 +7542,56 @@ fn hierarchy_visible(
     let open =
         summary.world_readable || matches!(summary.join_rule.as_deref(), Some("public" | "knock"));
     open.then_some(summary)
+}
+
+/// May `user_id` read `room_id`'s contents at all?
+///
+/// **One rule, one place, for the whole read surface.** Membership was
+/// enforced on `/joined_members` and `/aliases` and nowhere else in the
+/// timeline/state group, so `/state`, `/state/{type}/{key}`, `/messages`,
+/// `/event/{id}`, `/context/{id}`, `/relations/…` and `/threads` each
+/// answered 200 with a private room's full contents to any account that knew
+/// its room ID -- including one registered a moment earlier and joined to
+/// nothing. The underlying `Rooms` methods do not check either: they take a
+/// room id and no user, and `with_room_read` is an existence check.
+///
+/// The federation surface never had this hole -- `federation_room_origin`
+/// refuses a server with no member in the room -- so a remote server was held
+/// to a stricter rule than a local account. That asymmetry is the clearest
+/// statement of what was wrong.
+///
+/// Two ways in, and no third:
+///
+/// - joined, which is a point read and the overwhelmingly common case, so it
+///   is answered first and the rest is never reached;
+/// - `m.room.history_visibility` of `world_readable`, which is the room
+///   saying that anyone may read it. This is about *history*, not about
+///   joining: a `public` room is one anyone may enter, not one anyone may
+///   read without entering, and conflating them would leave the hole open for
+///   every public room on the server.
+///
+/// A room this server does not hold gets the same refusal as a room the
+/// caller may not see. The alternative is a 404-versus-403 oracle that tells
+/// a stranger which room IDs exist, which is the smaller half of the same
+/// question they were asking.
+fn may_read_room(state: &AppState, user_id: &str, room_id: &str) -> Result<(), MatrixError> {
+    if state
+        .rooms
+        .is_joined(user_id, room_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+    {
+        return Ok(());
+    }
+    if state
+        .rooms
+        .summary(room_id)
+        .is_ok_and(|summary| summary.world_readable)
+    {
+        return Ok(());
+    }
+    Err(MatrixError::forbidden(format!(
+        "{user_id} is not in {room_id}"
+    )))
 }
 
 /// The `m.space.child` events of a room, in the spec's order.

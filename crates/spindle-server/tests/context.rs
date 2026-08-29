@@ -332,8 +332,16 @@ async fn state_is_rebuilt_for_an_event_far_outside_the_resident_window() {
     );
 }
 
+/// Inside a room the caller can read, a missing event says so.
+///
+/// This used to assert that a missing *room* said so too, which was a better
+/// error message and a room-ID oracle: 404 for "no such room" against 403 for
+/// "not yours" answers, for anyone who asks, which room IDs this server
+/// holds. The read guard now answers both the same way, which is also what
+/// Synapse does. The distinction is kept where it is free -- a caller who may
+/// read the room is told plainly that the event is not in it.
 #[tokio::test]
-async fn an_unknown_event_and_an_unknown_room_are_told_apart() {
+async fn a_missing_event_says_so_and_a_missing_room_does_not() {
     let harness = Harness::new();
     let token = harness.register("alice").await;
     let room = harness.room(&token).await;
@@ -354,8 +362,12 @@ async fn an_unknown_event_and_an_unknown_room_are_told_apart() {
             &token,
         )
         .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body["error"], "no such room");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a room this caller is not in must not be distinguishable from one \
+         that does not exist: {body}"
+    );
 
     // And unauthenticated is unauthenticated.
     let (status, _) = harness
