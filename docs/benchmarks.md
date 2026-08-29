@@ -730,6 +730,125 @@ This is a methodology defect of the same class as the membership one, and
 it is recorded the same way: as a limit on what every table above
 establishes, not as a footnote to them.
 
+## The first throughput numbers this project has ever had
+
+`--dimension concurrency` measures the axis the other two hold at one. It
+reports **operations per second** rather than a per-sample latency,
+because the two are not interchangeable and a server can win one while
+losing the other: latency is one request's path through the code,
+throughput is what the *contended* parts of it allow. A server that
+serializes every write behind one lock has the latency of one request and
+the throughput of one client, however many cores it has.
+
+Release build, over HTTP, one Spindle, each client writing to its own
+room — sharing a room would measure contention on that room's ordering,
+which every homeserver has by definition. Two rounds, because one round
+cannot separate a difference from this host's variance (#171):
+
+| clients | round 1 | round 2 | mean latency | p95 latency |
+|---|---|---|---|---|
+| 1 | 964/s | 940/s | 1.0 ms | 1.3 ms |
+| 2 | 1 565/s | 1 542/s | 1.3 ms | 2.0 ms |
+| 4 | **1 687/s** | **1 705/s** | 2.0 ms | 4.1 ms |
+| 8 | 1 364/s | 1 542/s | 4.7 ms | 10.1 ms |
+
+Peak write throughput on this host is around **1 700 sends per second**.
+
+**The host has four cores, and the driver runs its clients as threads on
+those same four cores.** So at eight clients the harness is competing
+with the server it is measuring, and the fall from four to eight is *not*
+a clean statement about the server — it is what any server would do when
+the load generator takes half the machine. The rows at 1, 2 and 4 are the
+ones this host can speak to, and even they are measured against a client
+that is not free.
+
+The first version of this section read "scales about 1.8× and then
+stops", which asserted a property of Spindle that this rig cannot
+establish. Recorded here rather than quietly edited, because the
+correction is the same kind of finding as the two above: an axis whose
+confound was not checked before the number was written down.
+
+**What survives the confound**, because it does not depend on the shape
+of the curve:
+
+- The **ratios** against another server measured in the same sitting on
+  the same box. That is this document's stated method — "ratios measured
+  inside a single run are the result" — and it is why the Synapse
+  comparison below stands while the scaling claim did not.
+- `rode = 0`, from `tests/probe.rs`. Group commit never once coalesced
+  two commits across 200 sends with eight workers. That is a *direct
+  observation* that two writers were never inside `commit()` together,
+  not an inference from a throughput curve, and no amount of core
+  starvation produces it.
+
+A clean scaling curve needs the driver off the box, or a box with more
+cores than clients. Neither is available here, so the claim is not made.
+
+### How to read this against the rest of the page
+
+Every other table here is a latency at concurrency 1, and Spindle wins
+almost all of them by large margins. Both things are true at once, and
+neither replaces the other:
+
+- What a **user** waits for one message is excellent.
+- What an **operator** gets for a given box tops out at ~1 700 writes/s.
+
+### Against Synapse, on the same axis
+
+Synapse 1.159.0, same host, same driver, same sitting, single process,
+measured on **both** back ends because for a throughput comparison the
+database is not a detail — SQLite has a single-writer lock, which is
+exactly the property under test:
+
+| clients | Spindle | Synapse (SQLite) | Synapse (Postgres) |
+|---|---|---|---|
+| 1 | 964/s | 39/s | 24/s |
+| 2 | 1 565/s | 43/s | 34/s |
+| 4 | **1 705/s** | 46/s | 33/s |
+| 8 | 1 364/s | 48/s | 33/s |
+
+Latency under that load, mean / p95, at eight clients: Spindle
+4.7 / 10.1 ms, Synapse 164 / 184 ms on SQLite and 238 / 283 ms on
+Postgres.
+
+**Spindle's per-process write throughput is 25–50× Synapse's**, and
+unlike the latency figures elsewhere on this page, this one holds *under
+concurrency* — which is the thing a 20× latency win does not on its own
+imply. No separation arithmetic is offered for it because none is needed:
+the repeatability rule (#171) exists to keep a 1.2× cell honest, and a
+25× gap is not a cell that variance decides.
+
+Synapse is flat too: 39 → 48 and 24 → 34 across an eightfold increase in
+clients. Both were measured under the same four-core constraint as
+Spindle, which is exactly why the comparison survives it — the handicap
+is shared, so the ratio is the result and the curve is not.
+
+**Postgres is slower than SQLite here, and that is not a surprise or a
+misconfiguration.** At one process and this volume, Postgres pays
+per-query and network overhead that a local file does not, and its
+advantages — concurrency, larger working sets, replication — are the ones
+this shape does not exercise. The Postgres instance is stock, and tuning
+it would move the number.
+
+### The caveat this comparison has to carry
+
+Both Synapse configurations run as **one process**. That is the fair
+like-for-like against Spindle today, and it is not the whole production
+story: Synapse's actual answer to throughput is horizontal — worker
+processes splitting the load across cores and hosts — and Spindle has no
+scale-out at all (#24, deferred to M6).
+
+So the honest statement is per-process, and it is still a large one: on
+one process, Spindle does 25–50× the writes. What it does not establish
+is a win against a *sharded* Synapse deployment, and it will not until
+#24 exists.
+
+The ceiling's cause is not a mystery, and it is not the storage engine:
+the single `Mutex<HashMap<String, RoomLog>>` in `Rooms::with_room` is
+held across an append's work, so appends to different rooms cannot
+proceed at the same time. The fsync used to be inside it too, and moving
+it out (see above) bought about 30%; what remains is the lock.
+
 ## Fork window: bounded search vs exhaustive walk
 
 | Room history | Bounded | Exhaustive | Ratio |
