@@ -159,6 +159,26 @@ registrations = []
 # public one. See docs/metrics.md.
 # bind = "127.0.0.1:9090"
 
+[delayed_events]
+# MSC4140 delayed events: an event handed over now and sent later, which
+# Matrix RTC uses as a dead-man's switch so a call membership expires when
+# a participant's client vanishes instead of leaving a ghost behind.
+#
+# Both caps exist because a pending delay is storage this server holds on a
+# client's say-so. Uncapped, a client can schedule delays as fast as it can
+# send requests and never refresh them.
+#
+# The longest delay this server will accept, in milliseconds. The default is
+# a day -- far past any call heartbeat, and still bounded. Must be > 0: a
+# zero would refuse every delayed event rather than mean "unlimited", so the
+# server refuses to start on one instead of silently disabling the feature.
+# max_delay_ms = 86400000
+#
+# The most pending delays one sender may hold in one room. Per sender *and*
+# per room, because that is the unit a client works in -- a legitimate
+# Matrix RTC client sits at one. Must be > 0, for the same reason.
+# max_per_room = 100
+
 [logging]
 # A `tracing-subscriber` filter directive.
 # filter = "spindle=debug,warn"

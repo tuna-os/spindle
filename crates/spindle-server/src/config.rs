@@ -30,7 +30,49 @@ pub struct Config {
     #[serde(default)]
     pub metrics: MetricsConfig,
     #[serde(default)]
+    pub delayed_events: DelayedEventsConfig,
+    #[serde(default)]
     pub turn: TurnConfig,
+}
+
+/// The caps on MSC4140 delayed events (#36).
+///
+/// Both exist because a delayed event is storage this server holds on a
+/// client's say-so, and #36 names the uncapped version as a
+/// memory-amplification vector: a client can schedule delays as fast as it
+/// can send requests and never refresh them. The defaults are generous
+/// against any real client -- Matrix RTC keeps one pending departure per
+/// call -- and finite against one that has gone wrong or is trying to.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct DelayedEventsConfig {
+    /// The longest delay this server will accept, in milliseconds.
+    ///
+    /// A day: far past any call heartbeat, and still bounded.
+    #[serde(default = "default_max_delay_ms")]
+    pub max_delay_ms: u64,
+    /// The most delays one sender may have pending in one room.
+    ///
+    /// Per sender *and* per room, because that is the unit a client works
+    /// in: a legitimate Matrix RTC client sits at one.
+    #[serde(default = "default_max_per_room")]
+    pub max_per_room: usize,
+}
+
+impl Default for DelayedEventsConfig {
+    fn default() -> Self {
+        Self {
+            max_delay_ms: default_max_delay_ms(),
+            max_per_room: default_max_per_room(),
+        }
+    }
+}
+
+const fn default_max_delay_ms() -> u64 {
+    crate::delayed::DEFAULT_MAX_DELAY_MS
+}
+
+const fn default_max_per_room() -> usize {
+    crate::delayed::DEFAULT_MAX_PER_ROOM
 }
 
 /// The operational scrape surface (#166).
@@ -356,6 +398,24 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        // Both caps are the reason #36 asks for them: a zero here does not
+        // mean "unlimited", it means every schedule is refused and the
+        // dead-man's switch silently stops working. An operator who typed
+        // it meant something else, so say so rather than starting.
+        if self.delayed_events.max_delay_ms == 0 {
+            return Err(ConfigError::Invalid {
+                field: "delayed_events.max_delay_ms",
+                message: "must be greater than zero; a zero cap refuses every delayed event"
+                    .to_owned(),
+            });
+        }
+        if self.delayed_events.max_per_room == 0 {
+            return Err(ConfigError::Invalid {
+                field: "delayed_events.max_per_room",
+                message: "must be greater than zero; a zero cap refuses every delayed event"
+                    .to_owned(),
+            });
+        }
         let name = &self.server.name;
         if name.is_empty() {
             return Err(ConfigError::Invalid {
