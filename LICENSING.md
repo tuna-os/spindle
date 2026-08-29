@@ -57,7 +57,56 @@ obligation beyond attribution.
 
 ## The copyright line
 
-`LICENSE-MIT` says **The Spindle Authors** rather than naming an individual or
-`tuna-os`. That is accurate today and stays accurate as contributors arrive; if
-the owner wants their own name or the organisation's, it is a one-line change
-in that file.
+`LICENSE-MIT` says **`Copyright (c) 2026 The Spindle Authors`**. Every part of
+that line is a decision, and this section exists so it stops being re-opened.
+
+### Why not a person's name, or `tuna-os`
+
+Because neither would be true. Spindle has no CLA and no copyright assignment,
+and wants neither — so every contributor keeps the copyright in what they
+wrote. A notice naming one human, or the organisation, would assert that party
+holds copyright in contributions they do not hold. The collective name is the
+only one of the three that is accurate the moment a second person commits.
+
+It is also the ecosystem's convention rather than an invention: Rust ships *The
+Rust Project Developers*, Go ships *The Go Authors*. This document already
+leans on the Rust convention one section up, for the dual license itself; this
+is the same convention, applied consistently.
+
+The practical argument is smaller but points the same way: a collective holder
+never needs editing, and a notice that needs editing is a notice that goes
+stale.
+
+If the project ever does adopt a CLA, that is the moment to revisit this — and
+the CLA, not the notice, would be the thing doing the work.
+
+### Why 2026, and why not a range
+
+2026 is the year of first publication: the first commit is dated 2026-08-26.
+
+Not `2026-2027`, and not a year bumped on each release. Under Berne the
+copyright exists whether or not a notice does, so the year in the notice is
+informational — a maintained range buys nothing, and a stale one costs nothing.
+What a range does reliably produce is a diff every January that no one can
+review on its merits.
+
+### Why `LICENSE-APACHE` still ends in `[yyyy] [name of copyright owner]`
+
+That block is not an unfilled field in our notice. It is the appendix Apache
+addresses to licensees — *"How to apply the Apache License to your work"* —
+and its brackets are instructions to a reader applying the license to something
+else. Filling them in would mean editing the text of a standard license, which
+is the one thing not to do to one: a modified Apache-2.0 is no longer
+Apache-2.0, and tooling that identifies licenses by hashing their text stops
+recognising it.
+
+So `LICENSE-APACHE` keeps the appendix. The file is the copy the Rust project
+ships, which differs from apache.org's only in whitespace — a leading blank
+line and a uniform three-space dedent — and not by one word. (Checked, because
+"it's the standard text" is exactly the kind of claim that is repeated rather
+than verified: `diff -w` against
+`https://www.apache.org/licenses/LICENSE-2.0.txt` reports the blank line and
+nothing else.)
+
+The copyright statement lives in `LICENSE-MIT` and in the per-crate `license`
+field, which is where anything reads it from.
