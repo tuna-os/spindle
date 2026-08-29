@@ -772,10 +772,54 @@ neither replaces the other:
 - What a **user** waits for one message is excellent.
 - What an **operator** gets for a given box tops out at ~1 700 writes/s.
 
-No competitor has been measured on this axis yet. Until they have, the
-honest statement is that Spindle's throughput ceiling is known and its
-*relative* throughput is not — and a 20× latency win does not imply a
-throughput win, because Synapse serves its slower requests concurrently.
+### Against Synapse, on the same axis
+
+Synapse 1.159.0, same host, same driver, same sitting, single process,
+measured on **both** back ends because for a throughput comparison the
+database is not a detail — SQLite has a single-writer lock, which is
+exactly the property under test:
+
+| clients | Spindle | Synapse (SQLite) | Synapse (Postgres) |
+|---|---|---|---|
+| 1 | 964/s | 39/s | 24/s |
+| 2 | 1 565/s | 43/s | 34/s |
+| 4 | **1 705/s** | 46/s | 33/s |
+| 8 | 1 364/s | 48/s | 33/s |
+
+Latency under that load, mean / p95, at eight clients: Spindle
+4.7 / 10.1 ms, Synapse 164 / 184 ms on SQLite and 238 / 283 ms on
+Postgres.
+
+**Spindle's per-process write throughput is 25–50× Synapse's**, and
+unlike the latency figures elsewhere on this page, this one holds *under
+concurrency* — which is the thing a 20× latency win does not on its own
+imply. No separation arithmetic is offered for it because none is needed:
+the repeatability rule (#171) exists to keep a 1.2× cell honest, and a
+25× gap is not a cell that variance decides.
+
+Synapse is also flat: 39 → 48 and 24 → 34 across an eightfold increase in
+clients, with latency growing sixfold. Both servers saturate; they
+saturate two orders of magnitude apart.
+
+**Postgres is slower than SQLite here, and that is not a surprise or a
+misconfiguration.** At one process and this volume, Postgres pays
+per-query and network overhead that a local file does not, and its
+advantages — concurrency, larger working sets, replication — are the ones
+this shape does not exercise. The Postgres instance is stock, and tuning
+it would move the number.
+
+### The caveat this comparison has to carry
+
+Both Synapse configurations run as **one process**. That is the fair
+like-for-like against Spindle today, and it is not the whole production
+story: Synapse's actual answer to throughput is horizontal — worker
+processes splitting the load across cores and hosts — and Spindle has no
+scale-out at all (#24, deferred to M6).
+
+So the honest statement is per-process, and it is still a large one: on
+one process, Spindle does 25–50× the writes. What it does not establish
+is a win against a *sharded* Synapse deployment, and it will not until
+#24 exists.
 
 The ceiling's cause is not a mystery, and it is not the storage engine:
 the single `Mutex<HashMap<String, RoomLog>>` in `Rooms::with_room` is
