@@ -220,14 +220,17 @@ pub struct Rooms {
     /// this is the one counter that exists purely because a per-room order is
     /// not a server order.
     ///
-    /// SPEC §10.2 describes a sharded counter with a watermark over in-flight
-    /// ids, because commits there complete out of order. Here every append
-    /// holds the same lock, so ids are assigned and committed in the same
-    /// order and the watermark *is* the counter. That equivalence is a
-    /// property of the single lock, and stops holding the moment §15's
-    /// per-room executors land -- at which point the interval set the spec
-    /// describes has to come back.
-    stream: Mutex<u64>,
+    /// SPEC §10.2's counter *and* its watermark over in-flight ids.
+    ///
+    /// Today every append holds the same lock, so ids are allocated and
+    /// committed in the same order and the watermark is exactly the counter
+    /// -- see `stream::Stream`'s own tests, one of which pins that
+    /// equivalence. The structure is here ahead of the change that needs it
+    /// because it is the part with the teeth: once appends to different
+    /// rooms proceed at once, a token handed out past an in-flight id skips
+    /// that event for that client forever, silently. Building and proving it
+    /// first makes the lock change mechanical instead of frightening.
+    stream: crate::stream::Stream,
     /// Woken whenever an event lands, so a long-polling `/sync` does not have
     /// to spin. SPEC §10.3 wants per-room subscriber lists; this is the same
     /// shape at server granularity, which is enough while there is one lock.
@@ -349,7 +352,9 @@ impl Rooms {
             // they point at -- the same shape of bug as a room registry that
             // does not survive a restart, and worse, because it corrupts
             // rather than merely forgets.
-            stream: Mutex::new(highest_stream_id(store_for_stream.as_ref())),
+            stream: crate::stream::Stream::resuming_at(highest_stream_id(
+                store_for_stream.as_ref(),
+            )),
             appended: tokio::sync::Notify::new(),
         }
     }
@@ -3024,19 +3029,16 @@ impl Rooms {
     /// scan skips absent ids already, so a gap where a to-device message sat
     /// costs nothing.
     pub fn allocate_stream_id(&self) -> u64 {
-        let mut stream = self
-            .stream
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *stream += 1;
-        *stream
+        // Allocated and committed together: these ids name positions on
+        // side streams (to-device, receipts) that are durable by the time
+        // the caller has one, so there is no window for them to be in.
+        let id = self.stream.allocate();
+        self.stream.commit(id);
+        id
     }
 
     pub fn stream_position(&self) -> u64 {
-        *self
-            .stream
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.stream.position()
     }
 
     /// Wait until an event lands, or the deadline passes.
@@ -4565,11 +4567,7 @@ impl Rooms {
         // in the global order or not stored at all. Assigned under the same
         // lock that serialises appends, which is what makes the watermark the
         // counter -- see the field's own note.
-        let mut stream = self
-            .stream
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let stream_id = stream.saturating_add(1);
+        let stream_id = self.stream.allocate();
         extra.push((
             spindle_core::keys::stream(stream_id),
             StreamRecord {
@@ -4583,10 +4581,17 @@ impl Rooms {
         // the handler would fold request parsing and authorization into
         // a number the target does not describe.
         let started = std::time::Instant::now();
-        room_store.journal_entry_with(entry, log, &extra)?;
+        let landed = room_store.journal_entry_with(entry, log, &extra);
+        // The id is released on *both* outcomes, before the `?`. An
+        // allocated id that is never resolved holds the watermark forever,
+        // which does not lose this event -- it makes every later event
+        // invisible to every client.
+        match &landed {
+            Ok(()) => self.stream.commit(stream_id),
+            Err(_) => self.stream.abandon(stream_id),
+        }
+        landed?;
         crate::metrics::observe_append("group", started.elapsed());
-        *stream = stream_id;
-        drop(stream);
 
         // The index is derived from the event that just landed, and only from
         // an event that landed: writing it before the commit would leave a
