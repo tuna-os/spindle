@@ -58,8 +58,10 @@ pub enum Origin {
 // be a poor trade.
 static FORK_CASES: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static EVENTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-/// `[exclusive, shared]` acquisitions of the room registry.
+/// `[exclusive, shared]` acquisitions of one room's lock.
 static ROOM_LOCKS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// `[exclusive, shared]` acquisitions of the registry that finds rooms.
+static REGISTRY_LOCKS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 impl ForkCase {
     fn index(self) -> usize {
@@ -96,16 +98,25 @@ impl Origin {
     }
 }
 
-/// Record one acquisition of the room registry, and how it was taken.
+/// Record one acquisition of a *room's* lock, and how it was taken.
 ///
-/// The registry is a single lock for the whole server, so an *exclusive*
-/// acquisition is one that makes every other request wait -- including
-/// requests for entirely different rooms. Counting the two separately is
-/// what turns "does this endpoint block the server" into a subtraction
-/// rather than a stopwatch, which matters because the effect is smaller
-/// than the run-to-run spread of any box this is likely to be measured on.
+/// Contention here is confined to that room: two requests for different
+/// rooms do not meet. Exclusive is what an append takes, and what makes
+/// concurrent writers to the same room queue -- which is the ordering the
+/// log rests on, not a defect.
 pub fn record_room_lock(exclusive: bool) {
     ROOM_LOCKS[usize::from(!exclusive)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one acquisition of the registry that maps room ids to their locks.
+///
+/// This one *is* server-wide, so an exclusive acquisition stalls every
+/// request for every room. It should be rare: the registry is taken
+/// exclusively only to admit a room this process has not opened yet, and
+/// shared for every lookup after. A rising exclusive count on a server that
+/// is not opening new rooms means something is taking it that should not.
+pub fn record_registry_lock(exclusive: bool) {
+    REGISTRY_LOCKS[usize::from(!exclusive)].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Record one event reaching the log, and which case carried it.
@@ -209,6 +220,18 @@ fn render_room_locks(out: &mut String) {
         let _ = writeln!(
             out,
             "spindle_room_registry_acquisitions_total{{mode=\"{mode}\"}} {}",
+            REGISTRY_LOCKS[index].load(Ordering::Relaxed)
+        );
+    }
+    out.push_str(
+        "# HELP spindle_room_lock_acquisitions_total One room's lock \
+         acquisitions, by mode.\n\
+         # TYPE spindle_room_lock_acquisitions_total counter\n",
+    );
+    for (index, mode) in ["exclusive", "shared"].into_iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "spindle_room_lock_acquisitions_total{{mode=\"{mode}\"}} {}",
             ROOM_LOCKS[index].load(Ordering::Relaxed)
         );
     }

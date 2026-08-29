@@ -1,10 +1,19 @@
 //! Which requests make the whole server wait?
 //!
-//! `Rooms` keeps one registry of open room logs for the entire process.
-//! Taking it *exclusively* stalls every concurrent request, including ones
-//! for rooms it has nothing to do with; taking it *shared* does not. So
-//! "does this endpoint block the server" is a property worth pinning, and
-//! the exposition already counts both (#166).
+//! Two locks, and the difference between them is the point.
+//!
+//! The **registry** maps room ids to their locks and is one lock for the
+//! entire process, so taking it exclusively stalls every request for every
+//! room. It is taken exclusively only to admit a room this process has not
+//! opened before.
+//!
+//! A **room's** lock is taken shared to read it and exclusively to append
+//! to it. Contention there is confined to that room -- which is the
+//! ordering the log rests on, not a defect -- and two requests for
+//! different rooms do not meet at all.
+//!
+//! The exposition counts both (#166), so "what does this endpoint block"
+//! is a subtraction.
 //!
 //! Counted rather than timed, for the reason `read_budget.rs` gives and
 //! then some: the run-to-run spread on the host this was written on is
@@ -109,24 +118,29 @@ impl Harness {
         assert_eq!(status, StatusCode::OK, "{body}");
     }
 
-    /// `(exclusive, shared)` room-registry acquisitions.
+    /// `(exclusive, shared)` acquisitions of the named counter.
     ///
     /// Read out of `metrics::render()` -- the same function the `/metrics`
     /// listener serves -- rather than a test-only accessor, so the number
     /// the test trusts is the number an operator scrapes.
-    fn room_locks() -> (u64, u64) {
+    fn acquisitions(metric: &str) -> (u64, u64) {
         let text = spindle_server::metrics::render();
         let read = |mode: &str| {
             text.lines()
-                .find(|line| {
-                    line.starts_with("spindle_room_registry_acquisitions_total")
-                        && line.contains(mode)
-                })
+                .find(|line| line.starts_with(metric) && line.contains(mode))
                 .and_then(|line| line.rsplit(' ').next())
                 .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or_else(|| panic!("no {mode} counter in the exposition:\n{text}"))
+                .unwrap_or_else(|| panic!("no {metric} {mode} in the exposition:\n{text}"))
         };
         (read("exclusive"), read("shared"))
+    }
+
+    fn room_locks() -> (u64, u64) {
+        Self::acquisitions("spindle_room_lock_acquisitions_total")
+    }
+
+    fn registry_locks() -> (u64, u64) {
+        Self::acquisitions("spindle_room_registry_acquisitions_total")
     }
 
     async fn sync(&self, token: &str, since: Option<&str>) -> Value {
@@ -148,22 +162,28 @@ impl Harness {
     }
 }
 
-/// Reads take the room registry shared; writes take it exclusively.
+/// Reads take a room shared, writes take it exclusively, and neither
+/// touches the process-wide registry exclusively once the room is open.
 ///
-/// One test rather than two, because the counters are process-global and
-/// two tests would perturb each other's deltas.
+/// One test rather than three, because the counters are process-global and
+/// separate tests would perturb each other's deltas.
 ///
-/// The read half is the one that changed. `with_room_read` hands its
-/// closure `&RoomLog`, so which calls qualify is decided by the compiler
-/// rather than by judgement -- anything that mutates the log fails to build
-/// and stays on the writer.
+/// Which calls count as reads is decided by the compiler rather than by
+/// judgement: `with_room_read` hands its closure `&RoomLog`, so anything
+/// that mutates the log fails to build and stays on the writer.
 ///
 /// The write half is here so the read half cannot be satisfied by making
-/// everything shared: append ordering rests on writers excluding each
-/// other, and a change that quietly relaxed that would pass a test which
-/// only checked reads.
+/// everything shared: append ordering rests on writers to one room
+/// excluding each other, and a change that quietly relaxed that would pass
+/// a test which only checked reads.
+///
+/// The registry half is the one that changed with per-room locks. Before,
+/// an append took the registry exclusively and so stalled every request for
+/// every *other* room; now it takes the registry shared and the room
+/// exclusively, which is what lets appends to different rooms proceed at
+/// once.
 #[tokio::test]
-async fn reads_are_shared_and_writes_are_exclusive() {
+async fn rooms_are_locked_but_the_registry_is_not() {
     let harness = Harness::new();
     let alice = harness.register("alice").await;
     let room = harness.room(&alice).await;
@@ -175,7 +195,7 @@ async fn reads_are_shared_and_writes_are_exclusive() {
 
     // One sync first, to warm what a first sync legitimately builds: the
     // unread index is walked once per room per process, and that build
-    // takes the registry exclusively on purpose so no append slips past it
+    // takes the room exclusively on purpose so no append slips past it
     // unindexed. The claim being pinned is about the *steady state*, which
     // is every sync after that one, for every room, forever.
     harness.sync(&alice, None).await;
@@ -188,26 +208,40 @@ async fn reads_are_shared_and_writes_are_exclusive() {
         ("a warm initial sync", None),
         ("a warm incremental sync", Some(batch.clone())),
     ] {
-        let before = Harness::room_locks();
+        let rooms_before = Harness::room_locks();
+        let registry_before = Harness::registry_locks();
         harness.sync(&alice, since.as_deref()).await;
-        let after = Harness::room_locks();
+        let rooms_after = Harness::room_locks();
+        let registry_after = Harness::registry_locks();
+
         assert_eq!(
-            after.0,
-            before.0,
-            "{what} took the room registry exclusively {} time(s)",
-            after.0 - before.0
+            rooms_after.0,
+            rooms_before.0,
+            "{what} took a room exclusively {} time(s)",
+            rooms_after.0 - rooms_before.0
         );
         assert!(
-            after.1 > before.1,
+            rooms_after.1 > rooms_before.1,
             "{what} read no room at all -- the probe is measuring nothing"
+        );
+        assert_eq!(
+            registry_after.0, registry_before.0,
+            "{what} took the process-wide registry exclusively"
         );
     }
 
-    let before = Harness::room_locks();
+    let rooms_before = Harness::room_locks();
+    let registry_before = Harness::registry_locks();
     harness.send(&room, &alice, "one-more").await;
-    let after = Harness::room_locks();
+    let rooms_after = Harness::room_locks();
+    let registry_after = Harness::registry_locks();
     assert!(
-        after.0 > before.0,
-        "a send took no exclusive lock: appends are no longer serialised"
+        rooms_after.0 > rooms_before.0,
+        "a send took no room exclusively: appends to one room are no longer serialised"
+    );
+    assert_eq!(
+        registry_after.0, registry_before.0,
+        "a send took the process-wide registry exclusively, so it stalled every \
+         request for every other room -- which is the thing per-room locks removed"
     );
 }
