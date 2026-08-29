@@ -302,6 +302,14 @@ pub enum Keyspace {
     /// same batch as the row it points at -- an index surviving its row would
     /// send a caller looking for something that is not there.
     DelayedEventById = 0x2c,
+    /// One delayed event that has been finalised -- sent, or refused when it
+    /// came due -- kept so `/sync` can report the outcome to a client that
+    /// was not watching (MSC4309).
+    ///
+    /// Keyed by the stream position at which it finalised, so an incremental
+    /// sync answers "what finished since my token" as a range read rather
+    /// than a scan, exactly as the timeline does.
+    FinalisedDelay = 0x2d,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -869,4 +877,32 @@ pub fn content_addressed(keyspace: Keyspace, hash: &[u8; 32]) -> Vec<u8> {
     key.push(keyspace as u8);
     key.extend_from_slice(hash);
     key
+}
+
+/// One finalised delayed event, ordered by when it finalised within a user.
+///
+/// The position is big-endian first so `/sync` reads the range after the
+/// client's token and stops; the id follows so two delays finalising at the
+/// same position are still two rows.
+#[must_use]
+pub fn finalised_delay(user_id: &str, position: u64, delay_id: &str) -> Vec<u8> {
+    let mut key = user_prefix(Keyspace::FinalisedDelay, user_id);
+    key.extend_from_slice(&position.to_be_bytes());
+    key.extend_from_slice(delay_id.as_bytes());
+    key
+}
+
+/// Every finalised delay one user has.
+#[must_use]
+pub fn finalised_delay_prefix(user_id: &str) -> Vec<u8> {
+    user_prefix(Keyspace::FinalisedDelay, user_id)
+}
+
+/// The position a [`finalised_delay`] key encodes, given the user it belongs
+/// to -- the prefix length is what says where the position starts.
+#[must_use]
+pub fn finalised_delay_position(user_id: &str, key: &[u8]) -> Option<u64> {
+    let at = user_prefix(Keyspace::FinalisedDelay, user_id).len();
+    let bytes: [u8; 8] = key.get(at..at.checked_add(8)?)?.try_into().ok()?;
+    Some(u64::from_be_bytes(bytes))
 }

@@ -40,6 +40,27 @@ pub struct Filter {
     pub account_data: Option<EventFilter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_fields: Option<Vec<String>>,
+    /// MSC4309: whether `/sync` reports delayed events that have finished.
+    ///
+    /// Under the unstable name until the MSC lands. Absent means yes: a
+    /// client that has not heard of this gets the outcomes anyway, which is
+    /// the safe default for a mechanism whose whole point is telling a
+    /// client something it could not otherwise learn. Only an explicit
+    /// `false` turns it off.
+    #[serde(
+        default,
+        rename = "org.matrix.msc4140.finalised_delayed_events",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub finalised_delayed_events: Option<bool>,
+}
+
+impl Filter {
+    /// Whether this filter wants MSC4309's finalised delayed events.
+    #[must_use]
+    pub fn wants_finalised_delayed_events(&self) -> bool {
+        self.finalised_delayed_events.unwrap_or(true)
+    }
 }
 
 /// The room half, which is where almost every real filter lives.
