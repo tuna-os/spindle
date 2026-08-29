@@ -39,7 +39,7 @@ rand = "0.10"
 # migration tool is not a reason to make every operator install a system
 # library, nor to make the default build pay for one.
 rusqlite = { version = "0.37", features = ["bundled"] }
-im = "15"
+imbl = "6"
 # `state-res` is a runtime dependency, not just an oracle: SPEC 9.3 and
 # docs/divergence.md both require the local send path to use the same auth
 # predicate the siblings use. ADR 0002 permits this above the core.

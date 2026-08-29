@@ -5,7 +5,8 @@ Spindle is dual-licensed under **[MIT](LICENSE-MIT) OR
 under the same terms.
 
 This is the Rust ecosystem's convention rather than a novel choice: 205 of the
-336 crates in Spindle's own dependency graph carry exactly this pair. Apache-2.0
+Almost every crate in Spindle's own dependency graph carries exactly this
+pair; `deny.toml` records the full allowed set and CI enforces it. Apache-2.0
 supplies an explicit patent grant, which matters for an implementation of a
 protocol; MIT is the simplest thing a downstream can comply with; and which to
 take is the licensee's decision, not ours.
@@ -33,12 +34,20 @@ homeserver most wants: being easy to embed, fork, package and borrow from.
 Picking a license for code you did not write all of is a way to be wrong
 quietly, so:
 
-- **No copyleft dependency forces the choice.** Of 336 crates, one
-  (`self_cell`) is `Apache-2.0 OR GPL-2.0-only` — dual, so Apache-2.0 applies.
-  Four (`im`, `bitmaps`, `sized-chunks`, `as_variant`) are MPL-2.0, which is
-  *file-level* copyleft: it obliges sharing modifications to those files, and
-  §3.3 expressly permits distributing the larger work under other terms. We do
-  not modify them.
+- **No copyleft dependency forces the choice.** One (`self_cell`) is
+  `Apache-2.0 OR GPL-2.0-only` — dual, so Apache-2.0 applies. Three
+  (`imbl`, `bitmaps`, `as_variant`) are MPL-2.0, which is *file-level*
+  copyleft: it obliges sharing modifications to those files, and §3.3
+  expressly permits distributing the larger work under other terms. We do
+  not modify them. Two of the three (`imbl`, `bitmaps`) are dev-only, so
+  they are not in a shipped binary at all.
+
+  This list is no longer maintained by hand. `deny.toml` holds the allowed
+  set and `cargo deny check licenses` runs in CI, so a dependency that
+  arrives under a licence nobody has argued for fails the build rather than
+  waiting for somebody to re-read this file. #266 is why: the count below
+  was checked once, by hand, and nothing re-checked it — it read 336 while
+  the graph had moved to 498.
 - **No third-party source is vendored.** No `vendor/`, `third_party/` or
   equivalent tree exists.
 - **No sibling homeserver's code was taken.** `docs/divergence.md` §5 draws

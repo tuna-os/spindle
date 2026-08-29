@@ -57,10 +57,10 @@ fn retained_updates(c: &mut Criterion) {
             });
         });
 
-        group.bench_with_input(BenchmarkId::new("im", size), &entries, |b, entries| {
+        group.bench_with_input(BenchmarkId::new("imbl", size), &entries, |b, entries| {
             b.iter(|| {
                 let mut history = Vec::with_capacity(entries.len());
-                let mut state: im::HashMap<String, String> = im::HashMap::new();
+                let mut state: imbl::HashMap<String, String> = imbl::HashMap::new();
                 for (key, event_id) in entries {
                     state.insert(key.state_key().to_owned(), event_id.clone());
                     history.push(state.clone());

@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Not published: the release is goreleaser binaries, and nothing in CI runs
+# `cargo publish`. Saying so keeps an accidental publish from being one
+# command away, and lets `cargo deny` tell an intra-workspace path
+# dependency apart from an unpinned third-party one.
+publish = false
 
 [dependencies]
 blake3.workspace = true
