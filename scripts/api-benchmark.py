@@ -399,6 +399,14 @@ def measure_concurrency(
     contention on that room's ordering, which every homeserver has by
     definition and which says nothing about whether the rest of the server
     can proceed in parallel.
+
+    **The clients are threads in this process, on the same machine as the
+    server.** Past roughly `nproc / 2` clients the driver is competing with
+    the thing it measures, and the rate falls for a reason that has nothing
+    to do with the server. So a *ratio* between two servers measured in one
+    sitting survives -- the handicap is shared -- and the *shape* of one
+    server's curve does not. Read a decline at high client counts as "this
+    rig ran out of cores" unless the driver is on another box.
     """
     alice = Client(base)
     stamp = int(time.time())

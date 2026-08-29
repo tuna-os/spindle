@@ -752,16 +752,37 @@ cannot separate a difference from this host's variance (#171):
 | 4 | **1 687/s** | **1 705/s** | 2.0 ms | 4.1 ms |
 | 8 | 1 364/s | 1 542/s | 4.7 ms | 10.1 ms |
 
-**Spindle scales about 1.8× from one client to four, and then stops.**
-Eight clients are below four in both rounds, and whether that is a
-plateau or a genuine decline does not separate — the two eight-client
-values (1 364 and 1 542) are too far apart to call it. What does separate
-is that eight is no better than four, in both rounds.
+Peak write throughput on this host is around **1 700 sends per second**.
 
-Peak write throughput is therefore around **1 700 sends per second**, and
-past four concurrent writers the extra load buys nothing while mean
-latency grows from 1.0 ms to 4.7 ms and p95 from 1.3 ms to 10.1 ms. That
-is the shape of a saturated server: a flat rate with a growing tail.
+**The host has four cores, and the driver runs its clients as threads on
+those same four cores.** So at eight clients the harness is competing
+with the server it is measuring, and the fall from four to eight is *not*
+a clean statement about the server — it is what any server would do when
+the load generator takes half the machine. The rows at 1, 2 and 4 are the
+ones this host can speak to, and even they are measured against a client
+that is not free.
+
+The first version of this section read "scales about 1.8× and then
+stops", which asserted a property of Spindle that this rig cannot
+establish. Recorded here rather than quietly edited, because the
+correction is the same kind of finding as the two above: an axis whose
+confound was not checked before the number was written down.
+
+**What survives the confound**, because it does not depend on the shape
+of the curve:
+
+- The **ratios** against another server measured in the same sitting on
+  the same box. That is this document's stated method — "ratios measured
+  inside a single run are the result" — and it is why the Synapse
+  comparison below stands while the scaling claim did not.
+- `rode = 0`, from `tests/probe.rs`. Group commit never once coalesced
+  two commits across 200 sends with eight workers. That is a *direct
+  observation* that two writers were never inside `commit()` together,
+  not an inference from a throughput curve, and no amount of core
+  starvation produces it.
+
+A clean scaling curve needs the driver off the box, or a box with more
+cores than clients. Neither is available here, so the claim is not made.
 
 ### How to read this against the rest of the page
 
@@ -797,9 +818,10 @@ imply. No separation arithmetic is offered for it because none is needed:
 the repeatability rule (#171) exists to keep a 1.2× cell honest, and a
 25× gap is not a cell that variance decides.
 
-Synapse is also flat: 39 → 48 and 24 → 34 across an eightfold increase in
-clients, with latency growing sixfold. Both servers saturate; they
-saturate two orders of magnitude apart.
+Synapse is flat too: 39 → 48 and 24 → 34 across an eightfold increase in
+clients. Both were measured under the same four-core constraint as
+Spindle, which is exactly why the comparison survives it — the handicap
+is shared, so the ratio is the result and the curve is not.
 
 **Postgres is slower than SQLite here, and that is not a surprise or a
 misconfiguration.** At one process and this volume, Postgres pays
