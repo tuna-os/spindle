@@ -3316,11 +3316,14 @@ impl Rooms {
         )?;
         let mut out = Vec::with_capacity(rows.len());
         for (key, raw) in rows {
-            // The scan runs to the end of the room's rows, and an append that
-            // landed after `until` was read is beyond what this sync may
-            // answer with -- handing it over now would put it below a token
-            // the client is about to be given, and it would never be sent
-            // again. This is the read side of the watermark.
+            // The scan runs to the end of the room's rows, so it can see an
+            // append that landed after `until` was read -- or one whose id
+            // is above the watermark because a lower id is still in flight.
+            // Either is outside what this sync may answer with: the token
+            // the client gets back is `until`, so an event past it is
+            // delivered now and delivered again on the next sync. This is
+            // the read side of the watermark, and the reason `until` is a
+            // parameter rather than "everything the room has".
             if spindle_core::keys::room_stream_from_key(&key).is_some_and(|id| id > until) {
                 break;
             }
@@ -5389,22 +5392,69 @@ mod stream_index_tests {
         );
     }
 
-    /// The second open has nothing to do, and must not do it anyway.
+    /// The second open has nothing to write, and does not go looking.
     ///
-    /// Without the check, every restart rewrites the whole index -- one put
-    /// per event the server has ever accepted, before it answers a single
-    /// request. That is invisible in a test store and ruinous in a real one,
-    /// so the count is asserted rather than the contents: rewriting the same
-    /// rows leaves the store looking identical.
+    /// Two separate claims, and the cheap one is not the interesting one:
+    /// the per-row `stream_id <= indexed` skip already keeps a second pass
+    /// from rewriting anything, so a count of zero would hold even with the
+    /// early return deleted. What the early return buys is the *scan* -- the
+    /// forward stream is one row per event the server has ever accepted, and
+    /// walking it on every restart to discover there is nothing to do is a
+    /// cost that grows with the server's whole history. So the rows read are
+    /// asserted too, which is the only counter that tells the two apart.
     #[test]
-    fn a_second_pass_writes_nothing() {
+    fn a_second_pass_writes_nothing_and_reads_only_the_index() {
         let dir = TempDir::new().unwrap();
         let store = FjallStore::open(dir.path()).unwrap();
         unindexed(&store, 1, &["!a:example.org", "!b:example.org"]);
 
         let through = highest_stream_row(&store);
         assert_eq!(backfill_room_stream_index(&store, through), 2);
+
+        let before = store.scanned();
         assert_eq!(backfill_room_stream_index(&store, through), 0);
+        assert_eq!(
+            store.scanned() - before,
+            2,
+            "a complete index should cost one scan of the index itself; \
+             anything more means the forward stream was walked again"
+        );
+    }
+
+    /// A slice stops at the position the sync will hand back.
+    ///
+    /// The index is written by the append; the watermark is what `/sync`
+    /// reports. Those move apart whenever an id is allocated and not yet
+    /// committed, so the room's rows can legitimately run past the position
+    /// this response is allowed to describe. Delivering one of them anyway
+    /// puts an event above the `next_batch` the client is about to be given,
+    /// and the client is sent it a second time on its next request.
+    ///
+    /// Written against the index directly rather than through two racing
+    /// appends: the gap between the two numbers is the *point*, and a test
+    /// that has to provoke a race to open it would be testing the scheduler.
+    #[test]
+    fn a_slice_stops_at_the_position_it_was_given() {
+        let dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(FjallStore::open(dir.path()).unwrap());
+        let room = "!a:example.org";
+        for (stream_id, li) in [(1u64, 10i64), (2, 11), (3, 12)] {
+            store
+                .put(
+                    &spindle_core::keys::room_stream(room, stream_id),
+                    &li.to_be_bytes(),
+                )
+                .unwrap();
+        }
+        let rooms = super::Rooms::new(std::sync::Arc::clone(&store), "example.org");
+
+        assert_eq!(rooms.room_slice(room, 0, 3).unwrap(), vec![10, 11, 12]);
+        assert_eq!(
+            rooms.room_slice(room, 0, 2).unwrap(),
+            vec![10, 11],
+            "the third row is above the position this sync may describe"
+        );
+        assert_eq!(rooms.room_slice(room, 1, 2).unwrap(), vec![11]);
     }
 
     /// A hole above the highest indexed id is filled; the rows below it are
