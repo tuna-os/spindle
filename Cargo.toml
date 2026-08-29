@@ -30,6 +30,11 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 fjall = "2.11.2"
 proptest = "1.7"
 rand = "0.10"
+# The Synapse importer's SQLite reader only, behind the non-default
+# `synapse-import` feature. `bundled` compiles SQLite itself: a one-shot
+# migration tool is not a reason to make every operator install a system
+# library, nor to make the default build pay for one.
+rusqlite = { version = "0.37", features = ["bundled"] }
 im = "15"
 # `state-res` is a runtime dependency, not just an oracle: SPEC 9.3 and
 # docs/divergence.md both require the local send path to use the same auth

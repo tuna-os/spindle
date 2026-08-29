@@ -32,6 +32,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 
+/// Reading a `SourceRoom` out of a Synapse database.
+///
+/// Behind a non-default feature: it pulls in a bundled SQLite, and a one-shot
+/// migration path is not a reason for the server binary or the hot CI gate to
+/// pay a C compile.
+#[cfg(feature = "synapse-import")]
+pub mod synapse;
+
 use spindle_core::{AppendError, EventId, EventInput, RoomLog, StateKey, StateSnapshot};
 
 /// Room state as Synapse holds it: `(type, state_key)` to event ID.
