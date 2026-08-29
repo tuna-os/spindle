@@ -119,9 +119,6 @@ MILESTONES = [
 # fails if one has since been implemented, so this list can only rot loudly.
 PLANNED = {
     "Accounts, devices & auth": [
-        ("POST", "/_matrix/client/v3/account/password", "password change (M1 leftover)"),
-        ("POST", "/_matrix/client/v3/account/deactivate", "deactivation (M1 leftover)"),
-        ("POST", "/_matrix/client/v3/delete_devices", "bulk device logout (M2)"),
     ],
     "Profiles & presence": [
         ("GET", "/_matrix/client/v3/presence/{user_id}/status", "presence (M2/M3)"),

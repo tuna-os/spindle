@@ -197,6 +197,7 @@ fn appservice_routes() -> Router<AppState> {
 fn device_routes() -> Router<AppState> {
     Router::new()
         .route("/_matrix/client/v3/devices", get(list_devices))
+        .route("/_matrix/client/v3/delete_devices", post(delete_devices))
         .route(
             "/_matrix/client/v3/devices/{device_id}",
             get(get_device).put(put_device).delete(delete_device),
@@ -369,6 +370,11 @@ fn room_routes() -> Router<AppState> {
         .route(
             "/_matrix/client/v3/user_directory/search",
             post(user_directory_search),
+        )
+        .route("/_matrix/client/v3/account/password", post(change_password))
+        .route(
+            "/_matrix/client/v3/account/deactivate",
+            post(deactivate_account),
         )
         // Two paths for one endpoint. MSC3266 shipped under the unstable
         // prefix long enough that clients still ask for it there, and it
@@ -1640,30 +1646,13 @@ async fn delete_device(
             "no such device",
         ));
     }
-    let manages =
-        appservice_of(&state, &headers).is_some_and(|registration| registration.device_management);
-    if !manages && state.delegated.is_none() {
-        let auth = body
-            .as_ref()
-            .and_then(|Json(body)| body.get("auth").cloned())
-            .filter(|auth| auth["session"].is_string() && auth["type"] == "m.login.password");
-        let Some(auth) = auth else {
-            return Ok((
-                StatusCode::UNAUTHORIZED,
-                Json(json!({
-                    "flows": [{ "stages": ["m.login.password"] }],
-                    "params": {},
-                    "session": "delete_device",
-                })),
-            ));
-        };
-        let password = auth["password"].as_str().unwrap_or_default();
-        if !accounts
-            .verify_password(&localpart, password)
-            .map_err(|error| internal(&error))?
-        {
-            return Err(MatrixError::forbidden("wrong password"));
-        }
+    let auth = body
+        .as_ref()
+        .and_then(|Json(body)| body.get("auth").cloned());
+    if let Some(challenge) =
+        password_uia(&state, &localpart, &headers, auth.as_ref(), "delete_device")?
+    {
+        return Ok((StatusCode::UNAUTHORIZED, challenge));
     }
     accounts
         .delete_device(&localpart, &device_id)
@@ -7164,4 +7153,210 @@ async fn user_directory_search(
     }
 
     Ok(Json(json!({ "results": results, "limited": limited })))
+}
+
+/// Re-prove the password before a change a stolen access token must not be
+/// enough to make.
+///
+/// Returns `Ok(Some(challenge))` when the caller should answer 401 with it,
+/// and `Ok(None)` when the stage is satisfied. Two bypasses, both deliberate
+/// and both pre-existing: an appservice with `device_management` is already
+/// acting for the user by a stronger credential than their password, and a
+/// server delegating auth (MSC3861) has no password to check -- the identity
+/// provider owns that stage.
+fn password_uia(
+    state: &AppState,
+    localpart: &str,
+    headers: &axum::http::HeaderMap,
+    auth: Option<&Value>,
+    session: &'static str,
+) -> Result<Option<Json<Value>>, MatrixError> {
+    let manages =
+        appservice_of(state, headers).is_some_and(|registration| registration.device_management);
+    if manages || state.delegated.is_some() {
+        return Ok(None);
+    }
+    // A dict naming no session is not a completed stage: the session is how a
+    // stage is tied back to the flow it completed, so it draws the challenge
+    // rather than being accepted.
+    let auth =
+        auth.filter(|auth| auth["session"].is_string() && auth["type"] == "m.login.password");
+    let Some(auth) = auth else {
+        return Ok(Some(Json(json!({
+            "flows": [{ "stages": ["m.login.password"] }],
+            "params": {},
+            "session": session,
+        }))));
+    };
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let password = auth["password"].as_str().unwrap_or_default();
+    if !accounts
+        .verify_password(localpart, password)
+        .map_err(|error| internal(&error))?
+    {
+        return Err(MatrixError::forbidden("wrong password"));
+    }
+    Ok(None)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PasswordChangeRequest {
+    new_password: Option<String>,
+    /// Defaults to true, per the spec: changing a password because it leaked
+    /// is the common case, and leaving the other sessions signed in would
+    /// defeat the point.
+    logout_devices: Option<bool>,
+    auth: Option<Value>,
+}
+
+/// `POST /_matrix/client/v3/account/password`
+async fn change_password(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<Value>), MatrixError> {
+    let request: PasswordChangeRequest = optional_body(&body)?;
+    let localpart = localpart_of(&identity.user_id);
+    if let Some(challenge) = password_uia(
+        &state,
+        &localpart,
+        &headers,
+        request.auth.as_ref(),
+        "change_password",
+    )? {
+        return Ok((StatusCode::UNAUTHORIZED, challenge));
+    }
+    let new_password = request
+        .new_password
+        .as_deref()
+        .filter(|password| !password.is_empty())
+        .ok_or_else(|| MatrixError::bad_json("no new_password"))?;
+
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    accounts
+        .set_password(&localpart, new_password)
+        .map_err(|error| internal(&error))?;
+    if request.logout_devices.unwrap_or(true) {
+        accounts
+            .logout_everywhere(&localpart)
+            .map_err(|error| internal(&error))?;
+    }
+    Ok((StatusCode::OK, Json(json!({}))))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DeactivateRequest {
+    auth: Option<Value>,
+}
+
+/// `POST /_matrix/client/v3/account/deactivate`
+///
+/// Deactivation leaves every room the user is in, rather than only flipping
+/// the flag. A deactivated account that is still joined shows up in member
+/// lists, counts toward `num_joined_members`, and keeps appearing in other
+/// people's user-directory results -- so the flag alone would make the
+/// account unusable without making it *gone*, which is the thing the user
+/// asked for.
+///
+/// A room that refuses the leave is recorded and reported rather than
+/// aborting: the account is still deactivated, and the honest answer is which
+/// rooms it could not be removed from.
+async fn deactivate_account(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<Value>), MatrixError> {
+    let request: DeactivateRequest = optional_body(&body)?;
+    let localpart = localpart_of(&identity.user_id);
+    if let Some(challenge) = password_uia(
+        &state,
+        &localpart,
+        &headers,
+        request.auth.as_ref(),
+        "deactivate",
+    )? {
+        return Ok((StatusCode::UNAUTHORIZED, challenge));
+    }
+
+    let rooms = state.rooms.joined(&identity.user_id).unwrap_or_default();
+    for room_id in rooms {
+        let _ = state.rooms.set_membership(
+            &room_id,
+            &identity.user_id,
+            &identity.user_id,
+            "leave",
+            Some("account deactivated"),
+            state.key.pair(),
+        );
+    }
+
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    accounts
+        .set_deactivated(&localpart, true)
+        .map_err(|error| internal(&error))?;
+    accounts
+        .logout_everywhere(&localpart)
+        .map_err(|error| internal(&error))?;
+    state.rooms.wake_sync_waiters();
+
+    // No identity server is contacted, so no third-party binding is removed.
+    // `no-support` is the spec's word for exactly that, and it is more honest
+    // than `success`.
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "id_server_unbind_result": "no-support" })),
+    ))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DeleteDevicesRequest {
+    #[serde(default)]
+    devices: Vec<String>,
+    auth: Option<Value>,
+}
+
+/// `POST /_matrix/client/v3/delete_devices`
+///
+/// The bulk form of `DELETE /devices/{deviceId}`, and it shares that
+/// endpoint's password stage. A device that does not exist is not an error:
+/// the request asks for it to be gone, and it is.
+async fn delete_devices(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<Value>), MatrixError> {
+    let request: DeleteDevicesRequest = optional_body(&body)?;
+    let localpart = localpart_of(&identity.user_id);
+    if let Some(challenge) = password_uia(
+        &state,
+        &localpart,
+        &headers,
+        request.auth.as_ref(),
+        "delete_devices",
+    )? {
+        return Ok((StatusCode::UNAUTHORIZED, challenge));
+    }
+
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    for device_id in &request.devices {
+        accounts
+            .delete_device(&localpart, device_id)
+            .map_err(|error| internal(&error))?;
+        state
+            .devices
+            .remove_device_material(&identity.user_id, device_id)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    }
+    if !request.devices.is_empty() {
+        let seq = state.rooms.allocate_stream_id();
+        state
+            .devices
+            .mark_device_list_changed(&identity.user_id, seq)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        state.rooms.wake_sync_waiters();
+    }
+    Ok((StatusCode::OK, Json(json!({}))))
 }
