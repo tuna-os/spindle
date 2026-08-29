@@ -5634,14 +5634,24 @@ async fn sliding_sync(
     }
     ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-    // Which rooms may appear at all in an incremental response.
+    // Which rooms may appear at all in an incremental response. Asked only
+    // about rooms this response could mention -- the sorted list, plus any
+    // room the client subscribed to directly, which need not be one it is
+    // joined to. Asking the server's whole stream instead would price a
+    // client's sliding sync at everyone else's traffic.
     let changed: Option<std::collections::HashSet<String>> = match since {
-        Some(since) => Some(
-            state
-                .rooms
-                .changed_rooms(since, position)
-                .map_err(room_error)?,
-        ),
+        Some(since) => {
+            let candidates = ordered
+                .iter()
+                .map(|(room_id, _)| room_id.as_str())
+                .chain(subscriptions.iter().map(|(room_id, _)| room_id.as_str()));
+            Some(
+                state
+                    .rooms
+                    .changed_rooms(candidates, since, position)
+                    .map_err(room_error)?,
+            )
+        }
         None => None,
     };
 

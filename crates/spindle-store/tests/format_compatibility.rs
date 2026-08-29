@@ -182,6 +182,7 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::PurgeWatermark, 0x27),
         (Keyspace::RoomBlock, 0x28),
         (Keyspace::PublishedRoom, 0x29),
+        (Keyspace::RoomStream, 0x2a),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(
