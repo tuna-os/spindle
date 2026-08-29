@@ -700,6 +700,32 @@ The ceiling is arithmetic: one lock held for roughly the CPU of an append
 plus one fsync, so server-wide write throughput is about
 `1 / send_latency` however many cores or rooms there are.
 
+### Moving the barrier out, and what it left behind
+
+The fsync now runs after `with_room` releases the room lock rather than
+inside it. Ordering is unchanged — the bytes still reach the journal in
+lock order — so only the barrier moved. Re-measured, same probe, same
+host:
+
+| concurrency | fsync inside the lock | fsync outside it |
+|---|---|---|
+| 1 | 615 | 635 |
+| 2 | 669 | **898** |
+| 4 | 649 | **801** |
+| 8 | 656 | **861** |
+
+About 30% at any concurrency above one, which is roughly what one fsync
+is worth against the rest of an append.
+
+**And still flat from 2 to 8, with `rode` still at zero.** Commits never
+overlap, so group commit still coalesces nothing. That is the useful
+result rather than a disappointing one: it says the barrier was never the
+whole ceiling, and names what is. The single
+`Mutex<HashMap<String, RoomLog>>` is held across all of an append's CPU
+work, which is long enough that two writers still never meet at the
+store. Until appends to different rooms proceed at the same time, this
+table stays flat and the coalescing column stays at 1.00×.
+
 This is a methodology defect of the same class as the membership one, and
 it is recorded the same way: as a limit on what every table above
 establishes, not as a footnote to them.

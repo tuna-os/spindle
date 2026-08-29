@@ -58,7 +58,12 @@ impl Store for FaultyStore {
     // No `snapshot` override: this double has no snapshot isolation, which is
     // exactly what the default `None` says.
 
-    fn commit(&self, writes: &[Record], _durability: Durability) -> Result<(), StoreError> {
+    fn commit(&self, writes: &[Record], durability: Durability) -> Result<(), StoreError> {
+        self.commit_deferred(writes)?;
+        self.sync(durability)
+    }
+
+    fn commit_deferred(&self, writes: &[Record]) -> Result<(), StoreError> {
         let mut remaining = self.commits_before_failure.borrow_mut();
         if *remaining == 0 {
             // The power went out. Nothing from this batch lands.
@@ -70,6 +75,13 @@ impl Store for FaultyStore {
         for (key, value) in writes {
             data.insert(key.clone(), value.clone());
         }
+        Ok(())
+    }
+
+    // This double keeps everything in memory, so there is no barrier to
+    // raise: the fault is injected at the write, which is where a crash
+    // that loses a suffix actually bites.
+    fn sync(&self, _durability: Durability) -> Result<(), StoreError> {
         Ok(())
     }
 

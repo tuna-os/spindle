@@ -3623,25 +3623,65 @@ impl Rooms {
         Ok(rooms)
     }
 
+    /// Run `work` against a room's log, holding the room lock -- and fsync
+    /// **after** letting it go.
+    ///
+    /// The lock is what orders appends, and ordering is memory work measured
+    /// in microseconds. An fsync is a disk barrier measured in hundreds of
+    /// them, and while it was inside this critical section it was the whole
+    /// server's write ceiling: every append everywhere queued behind the
+    /// slowest thing the machine does. Measured before this change, sends
+    /// per second were flat from one client to eight
+    /// (`tests/probe.rs`) and no two commits ever overlapped, so the group
+    /// commit under them had nothing to coalesce.
+    ///
+    /// **Ordering is unchanged.** The bytes still reach the journal in lock
+    /// order; only the barrier moved out. So the `stream` counter's
+    /// watermark-equals-counter equivalence still holds, which is the
+    /// property a per-room executor would break and this deliberately does
+    /// not.
+    ///
+    /// Whether to sync is decided by the store's journal counter rather than
+    /// by remembering: a missed sync is silent data loss, and a rule of the
+    /// form "call this after the appending paths" is a rule someone will
+    /// eventually not follow. A reading that moved because *another* thread
+    /// wrote costs one extra sync; a reading that moved because this one did
+    /// can never be missed.
+    ///
+    /// The cost is that an event is visible to readers for up to one fsync
+    /// before it is durable. SPEC §8.3 already permits a crash to lose a
+    /// suffix of the log; this widens that window to one sync, and no client
+    /// is told the write happened until the sync below returns.
     fn with_room<T>(
         &self,
         room_id: &str,
         work: impl FnOnce(&Self, &mut RoomLog) -> Result<T, RoomError>,
     ) -> Result<T, RoomError> {
-        let mut open = self
-            .open
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !open.contains_key(room_id) {
-            let restored = RoomStore::new(self.store.as_ref(), room_id)
-                .load()?
+        let before = self.store.journalled();
+        let done = {
+            let mut open = self
+                .open
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !open.contains_key(room_id) {
+                let restored = RoomStore::new(self.store.as_ref(), room_id)
+                    .load()?
+                    .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
+                open.insert(room_id.to_owned(), restored.log);
+            }
+            let log = open
+                .get_mut(room_id)
                 .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
-            open.insert(room_id.to_owned(), restored.log);
+            work(self, log)
+        };
+        // The guard is gone by here, so the barrier below is not holding
+        // anyone up. Ordered before `?` on `done`: a failed `work` may still
+        // have journalled -- a partial append is exactly what must not be
+        // left unsynced and then reported as an error.
+        if self.store.journalled() != before {
+            spindle_store::Store::sync(self.store.as_ref(), Durability::Group)?;
         }
-        let log = open
-            .get_mut(room_id)
-            .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
-        work(self, log)
+        done
     }
 
     /// Build, sign, append and persist one event.
@@ -4171,7 +4211,7 @@ impl Rooms {
                 spindle_core::keys::event_room(id),
                 room_id.as_bytes().to_vec(),
             )];
-            room_store.commit_entry_with(&entry, &log, &extra, Durability::Group)?;
+            room_store.journal_entry_with(&entry, &log, &extra)?;
         }
 
         // The join itself is new activity: it goes through the shared
@@ -4458,7 +4498,7 @@ impl Rooms {
         // the handler would fold request parsing and authorization into
         // a number the target does not describe.
         let started = std::time::Instant::now();
-        room_store.commit_entry_with(entry, log, &extra, Durability::Group)?;
+        room_store.journal_entry_with(entry, log, &extra)?;
         crate::metrics::observe_append("group", started.elapsed());
         *stream = stream_id;
         drop(stream);
