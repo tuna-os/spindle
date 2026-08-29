@@ -16,7 +16,7 @@
 //! takes.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::authorize::StoredEvent;
 use ruma::room_version_rules::RoomVersionRules;
@@ -148,7 +148,7 @@ type Destinations = ([u8; 32], Arc<Vec<String>>);
 pub struct Rooms {
     store: Arc<FjallStore>,
     server_name: String,
-    open: Mutex<HashMap<String, RoomLog>>,
+    open: RwLock<HashMap<String, RoomLog>>,
     /// Lock order: `open` before `unread_index`, always. The fast path takes
     /// only `unread_index`; the build and append paths already hold `open`.
     unread_index: Mutex<HashMap<String, UnreadIndex>>,
@@ -337,7 +337,7 @@ impl Rooms {
         Self {
             store,
             server_name: server_name.into(),
-            open: Mutex::new(HashMap::new()),
+            open: RwLock::new(HashMap::new()),
             unread_index: Mutex::new(HashMap::new()),
             last_activity: Mutex::new(HashMap::new()),
             state_render: Mutex::new(HashMap::new()),
@@ -490,7 +490,7 @@ impl Rooms {
         }
 
         self.open
-            .lock()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(room_id.clone(), log);
         Ok(room_id)
@@ -764,7 +764,7 @@ impl Rooms {
         room_id: &str,
         want: impl Fn(&StateKey) -> bool,
     ) -> Result<Vec<Value>, RoomError> {
-        let ids = self.with_room(room_id, |_, log| Ok(current_state(log)))?;
+        let ids = self.with_room_read(room_id, |_, log| Ok(current_state(log)))?;
         let mut events = Vec::with_capacity(ids.len());
         for (key, event_id) in ids {
             if !want(&key) {
@@ -789,7 +789,7 @@ impl Rooms {
     ///
     /// Returns [`RoomError`] if the room is unknown or a body is missing.
     pub fn state_serialized(&self, room_id: &str) -> Result<Arc<String>, RoomError> {
-        let root = self.with_room(room_id, |_, log| {
+        let root = self.with_room_read(room_id, |_, log| {
             Ok(log
                 .entries()
                 .next_back()
@@ -1147,7 +1147,7 @@ impl Rooms {
         state_key: &str,
     ) -> Result<Value, RoomError> {
         let wanted = StateKey::new(event_type, state_key);
-        let found = self.with_room(room_id, |_, log| Ok(current_state_id(log, &wanted)))?;
+        let found = self.with_room_read(room_id, |_, log| Ok(current_state_id(log, &wanted)))?;
         let event_id = found.ok_or_else(|| {
             RoomError::UnknownState(format!("{event_type} with state key {state_key:?}"))
         })?;
@@ -1174,7 +1174,7 @@ impl Rooms {
         state_key: &str,
     ) -> Result<Value, RoomError> {
         let wanted = StateKey::new(event_type, state_key);
-        let found = self.with_room(room_id, |_, log| Ok(current_state_id(log, &wanted)))?;
+        let found = self.with_room_read(room_id, |_, log| Ok(current_state_id(log, &wanted)))?;
         let event_id = found.ok_or_else(|| {
             RoomError::UnknownState(format!("{event_type} with state key {state_key:?}"))
         })?;
@@ -1214,7 +1214,7 @@ impl Rooms {
     ///
     /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
     pub fn exists(&self, room_id: &str) -> Result<(), RoomError> {
-        self.with_room(room_id, |_, _| Ok(()))
+        self.with_room_read(room_id, |_, _| Ok(()))
     }
 
     /// Who is currently joined, as user IDs, without rendering any of them.
@@ -1229,7 +1229,7 @@ impl Rooms {
     ///
     /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
     pub fn joined_member_ids(&self, room_id: &str) -> Result<Arc<Vec<String>>, RoomError> {
-        let (root, members) = self.with_room(room_id, |_, log| {
+        let (root, members) = self.with_room_read(room_id, |_, log| {
             let root = log
                 .entries()
                 .next_back()
@@ -1310,7 +1310,7 @@ impl Rooms {
         // The room has to exist before its events can be looked up, or an
         // unknown room would answer "no such event" and a client could not
         // tell the two apart.
-        self.with_room(room_id, |_, _| Ok(()))?;
+        self.with_room_read(room_id, |_, _| Ok(()))?;
         let mut event = self.read_event(room_id, &EventId::new(event_id))?;
         if let Some(object) = event.as_object_mut() {
             object.insert("event_id".to_owned(), Value::String(event_id.to_owned()));
@@ -1352,7 +1352,7 @@ impl Rooms {
         // The target has to be an event of this room. Redacting something the
         // room does not have would mint an event that refers to nothing, and
         // federate that nothing to every peer.
-        let known = self.with_room(room_id, |_, log| {
+        let known = self.with_room_read(room_id, |_, log| {
             Ok(log.get(&EventId::new(target)).is_some())
         })?;
         if !known {
@@ -1456,7 +1456,7 @@ impl Rooms {
     ) -> Result<(Vec<Value>, Option<i64>), RoomError> {
         // The room has to exist, or an unknown room answers "no relations"
         // and a client cannot tell that from an event nobody replied to.
-        self.with_room(room_id, |_, _| Ok(()))?;
+        self.with_room_read(room_id, |_, _| Ok(()))?;
 
         let prefix = spindle_core::keys::relation_prefix(room_id, target);
         let rows = spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?;
@@ -1534,7 +1534,7 @@ impl Rooms {
     ) -> Result<(Vec<Value>, Option<i64>), RoomError> {
         // The room has to exist, for the reason `relations` gives: an unknown
         // room must not answer "no threads".
-        self.with_room(room_id, |_, _| Ok(()))?;
+        self.with_room_read(room_id, |_, _| Ok(()))?;
 
         let prefix =
             spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::Relation, room_id);
@@ -1635,7 +1635,7 @@ impl Rooms {
         event_id: &str,
         limit: usize,
     ) -> Result<Context, RoomError> {
-        let found = self.with_room(room_id, |_, log| {
+        let found = self.with_room_read(room_id, |_, log| {
             let Some(entry) = log.get(&EventId::new(event_id)) else {
                 return Ok(None);
             };
@@ -1717,7 +1717,7 @@ impl Rooms {
     ///
     /// Returns [`RoomError`] if the room or its indexes cannot be read.
     pub fn server_in_room(&self, room_id: &str, domain: &str) -> Result<bool, RoomError> {
-        let members = self.with_room(room_id, |_, log| {
+        let members = self.with_room_read(room_id, |_, log| {
             let Some(state) = log
                 .entries()
                 .next_back()
@@ -2149,7 +2149,7 @@ impl Rooms {
         room_id: &str,
         event_id: &str,
     ) -> Result<(Vec<IdentifiedEvent>, Vec<IdentifiedEvent>), RoomError> {
-        let previous_root = self.with_room(room_id, |_, log| {
+        let previous_root = self.with_room_read(room_id, |_, log| {
             let Some(entry) = log.get(&EventId::new(event_id)) else {
                 return Err(RoomError::MissingBody(event_id.to_owned()));
             };
@@ -2295,7 +2295,7 @@ impl Rooms {
     ) -> Result<(i64, String, bool, Vec<Value>), RoomError> {
         let (li, event_id) = self.resolve_anchor(room_id, anchor)?;
 
-        let root_or_resident = self.with_room(room_id, |_, log| {
+        let root_or_resident = self.with_room_read(room_id, |_, log| {
             if let Some(snapshot) = log.state_after(spindle_core::LinearIndex::from_raw(li)) {
                 let mut ids = Vec::with_capacity(snapshot.len());
                 snapshot.for_each(|_, id| ids.push(id.to_owned()));
@@ -2335,7 +2335,7 @@ impl Rooms {
         anchor: &StateAtAnchor,
     ) -> Result<(i64, String), RoomError> {
         let resolve = |li: i64| -> Result<(i64, String), RoomError> {
-            self.with_room(room_id, |_, log| {
+            self.with_room_read(room_id, |_, log| {
                 log.entry_at_or_before(li)
                     .map(|entry| (entry.li.get(), entry.event_id.as_str().to_owned()))
                     .ok_or_else(|| RoomError::UnknownState("entry at or before that point".into()))
@@ -2343,13 +2343,13 @@ impl Rooms {
         };
         match anchor {
             StateAtAnchor::Li(li) => resolve(*li),
-            StateAtAnchor::Event(id) => self.with_room(room_id, |_, log| {
+            StateAtAnchor::Event(id) => self.with_room_read(room_id, |_, log| {
                 log.get(&EventId::new(id.as_str()))
                     .map(|entry| (entry.li.get(), entry.event_id.as_str().to_owned()))
                     .ok_or_else(|| RoomError::UnknownState("such an event in this room".into()))
             }),
             StateAtAnchor::Ts(wanted) => {
-                let (mut low, high) = self.with_room(room_id, |_, log| {
+                let (mut low, high) = self.with_room_read(room_id, |_, log| {
                     let mut entries = log.entries();
                     let first = entries.next().map(|entry| entry.li.get());
                     let last = entries.next_back().map(|entry| entry.li.get());
@@ -2464,7 +2464,7 @@ impl Rooms {
         limit: usize,
         forward: bool,
     ) -> Result<(Vec<AdminTimelineEntry>, Option<i64>), RoomError> {
-        let (wanted, next) = self.with_room(room_id, |_, log| {
+        let (wanted, next) = self.with_room_read(room_id, |_, log| {
             let mut wanted = Vec::new();
             let mut next = None;
             let mut visit = |entry: &LogEntry| {
@@ -2586,7 +2586,7 @@ impl Rooms {
     /// Returns [`RoomError::UnknownRoom`] for a room that does not exist,
     /// or [`RoomError`] if the store cannot be written.
     pub fn purge_history(&self, room_id: &str, before_li: i64) -> Result<u64, RoomError> {
-        let victims = self.with_room(room_id, |_, log| {
+        let victims = self.with_room_read(room_id, |_, log| {
             Ok(log
                 .entries()
                 .take_while(|entry| entry.li.get() < before_li)
@@ -2633,7 +2633,7 @@ impl Rooms {
         // whole implementation" cost `O(room)` per request instead. The API
         // benchmark caught it: `/messages` grew 2.47x between a 10-event room
         // and a 500-event one, and `/sync` 4.79x, while `send` stayed flat.
-        let wanted = self.with_room(room_id, |_, log| {
+        let wanted = self.with_room_read(room_id, |_, log| {
             let mut wanted = Vec::new();
             let mut next = None;
             for entry in log.entries().rev() {
@@ -2702,7 +2702,7 @@ impl Rooms {
     /// Returns [`RoomError::UnknownRoom`] if the room does not exist, or
     /// [`RoomError`] if a member event body cannot be read.
     pub fn joined_members(&self, room_id: &str) -> Result<Map<String, Value>, RoomError> {
-        let members = self.with_room(room_id, |_, log| {
+        let members = self.with_room_read(room_id, |_, log| {
             Ok(current_state(log)
                 .into_iter()
                 .filter(|(key, _)| key.event_type().as_str() == "m.room.member")
@@ -2800,7 +2800,7 @@ impl Rooms {
         // Opening the room is what makes an unknown room a 404 rather than a
         // silent success: without it, forgetting a room that never existed
         // would happily write a marker for it.
-        self.with_room(room_id, |_, _| Ok(()))?;
+        self.with_room_read(room_id, |_, _| Ok(()))?;
         let current = spindle_store::ReadView::get(
             self.store.as_ref(),
             &spindle_core::keys::user_room(
@@ -2938,26 +2938,43 @@ impl Rooms {
         // event body — the count is the operation every sync performs for
         // every room, and it used to read every body after the floor to
         // learn its sender (the M2 close-out benchmark's one loss).
-        let notification_count = self.with_room(room_id, |rooms, log| {
-            let mut cache = rooms
+        // Warm: a lookup, so it takes the registry *shared* and does not
+        // stall any other request. This is the case every sync after the
+        // first one hits, for every room, which is why it is worth
+        // separating from the build below.
+        let warm = self.with_room_read(room_id, |rooms, _| {
+            let cache = rooms
                 .unread_index
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !cache.contains_key(room_id) {
-                // The one remaining full walk: once per room per process,
-                // under the room lock so no append can slip past unindexed.
-                let mut index = UnreadIndex::default();
-                for entry in log.entries() {
-                    if entry.state_key.is_some() {
-                        continue;
-                    }
-                    let event = rooms.read_event(room_id, &entry.event_id)?;
-                    index.push(entry.li.get(), event["sender"].as_str().unwrap_or(""));
-                }
-                cache.insert(room_id.to_owned(), index);
-            }
-            Ok(cache[room_id].count_after(boundary, user_id))
+            Ok(cache
+                .get(room_id)
+                .map(|index| index.count_after(boundary, user_id)))
         })?;
+        let notification_count = match warm {
+            Some(count) => count,
+            // Cold. The one remaining full walk: once per room per process,
+            // and under the *exclusive* lock deliberately, so no append can
+            // slip past unindexed while it runs.
+            None => self.with_room(room_id, |rooms, log| {
+                let mut cache = rooms
+                    .unread_index
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !cache.contains_key(room_id) {
+                    let mut index = UnreadIndex::default();
+                    for entry in log.entries() {
+                        if entry.state_key.is_some() {
+                            continue;
+                        }
+                        let event = rooms.read_event(room_id, &entry.event_id)?;
+                        index.push(entry.li.get(), event["sender"].as_str().unwrap_or(""));
+                    }
+                    cache.insert(room_id.to_owned(), index);
+                }
+                Ok(cache[room_id].count_after(boundary, user_id))
+            })?,
+        };
 
         Ok(Unread {
             notification_count,
@@ -3242,7 +3259,7 @@ impl Rooms {
         // room to find one, then took the room lock a second time to read
         // that entry's position -- on a path `unread` runs for every room
         // on every sync, which made each sync scale with the member list.
-        let found = self.with_room(room_id, |_, log| {
+        let found = self.with_room_read(room_id, |_, log| {
             let Some(event_id) = current_state_id(log, &wanted) else {
                 return Ok(None);
             };
@@ -3352,7 +3369,7 @@ impl Rooms {
             // `entry_at` rather than a scan of `entries()`: the log is a
             // BTreeMap, and searching it linearly here made the read
             // quadratic in the room's length on a path that runs per event.
-            let event_id = self.with_room(room_id, |_, log| {
+            let event_id = self.with_room_read(room_id, |_, log| {
                 Ok(log
                     .entry_at(li)
                     .map(|entry| entry.event_id.as_str().to_owned()))
@@ -3566,7 +3583,7 @@ impl Rooms {
         {
             return Ok(cached);
         }
-        let head = self.with_room(room_id, |_, log| {
+        let head = self.with_room_read(room_id, |_, log| {
             Ok(log
                 .entries()
                 .next_back()
@@ -3658,6 +3675,67 @@ impl Rooms {
     /// before it is durable. SPEC §8.3 already permits a crash to lose a
     /// suffix of the log; this widens that window to one sync, and no client
     /// is told the write happened until the sync below returns.
+    /// Make sure a room's log is resident, loading it if not.
+    ///
+    /// Split out so the read path can check residency under a *read* lock
+    /// and only reach for the write lock on the miss.
+    fn ensure_open(&self, room_id: &str) -> Result<(), RoomError> {
+        let mut open = self
+            .open
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !open.contains_key(room_id) {
+            let restored = RoomStore::new(self.store.as_ref(), room_id)
+                .load()?
+                .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
+            open.insert(room_id.to_owned(), restored.log);
+        }
+        Ok(())
+    }
+
+    /// [`Self::with_room`] for work that only *reads* the log.
+    ///
+    /// Takes the room registry's read lock, so concurrent readers proceed
+    /// together instead of queueing behind each other. Writers still take it
+    /// exclusively, so **append ordering is untouched** -- this widens the
+    /// read path without going near the property a per-room write path would
+    /// have to re-establish.
+    ///
+    /// Which calls belong here is decided by the compiler, not by judgement:
+    /// `work` gets `&RoomLog`, so anything that mutates the log fails to
+    /// build and stays on [`Self::with_room`].
+    ///
+    /// The measurement that motivates it: on one sitting `/sync` scaled 1.25x
+    /// from one client to four while `send` scaled 1.9x -- a within-sitting
+    /// comparison, so the rig's core count cancels. Reads were the worse
+    /// half, and `/sync` is the call clients make most.
+    fn with_room_read<T>(
+        &self,
+        room_id: &str,
+        work: impl FnOnce(&Self, &RoomLog) -> Result<T, RoomError>,
+    ) -> Result<T, RoomError> {
+        {
+            crate::metrics::record_room_lock(false);
+            let open = self
+                .open
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(log) = open.get(room_id) {
+                return work(self, log);
+            }
+        }
+        // Not resident. Load it -- which needs the write lock -- and retry.
+        self.ensure_open(room_id)?;
+        let open = self
+            .open
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let log = open
+            .get(room_id)
+            .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
+        work(self, log)
+    }
+
     fn with_room<T>(
         &self,
         room_id: &str,
@@ -3665,9 +3743,10 @@ impl Rooms {
     ) -> Result<T, RoomError> {
         let before = self.store.journalled();
         let done = {
+            crate::metrics::record_room_lock(true);
             let mut open = self
                 .open
-                .lock()
+                .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !open.contains_key(room_id) {
                 let restored = RoomStore::new(self.store.as_ref(), room_id)
@@ -4027,7 +4106,7 @@ impl Rooms {
             "m.room.topic",
             "m.room.encryption",
         ];
-        let ids = match self.with_room(room_id, |_, log| {
+        let ids = match self.with_room_read(room_id, |_, log| {
             let Some(head) = log.entries().next_back() else {
                 return Ok(Vec::new());
             };
@@ -4107,7 +4186,7 @@ impl Rooms {
     ) -> Result<(), RoomError> {
         let mut open = self
             .open
-            .lock()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let already_held = open.contains_key(room_id)
             || RoomStore::new(self.store.as_ref(), room_id)
