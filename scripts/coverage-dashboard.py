@@ -139,7 +139,6 @@ PLANNED = {
     "Profiles & presence": [
     ],
     "Rooms & membership": [
-        ("POST", "/_matrix/client/v3/rooms/{room_id}/upgrade", "room upgrade (#7)"),
     ],
     "Timeline, messaging & search": [
         ("POST", "/_matrix/client/v3/search", "server-side search (#7)"),
