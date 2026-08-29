@@ -54,6 +54,7 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/v1/rooms/{room_id}/relations/{event_id}/{rel_type}",
     "/_matrix/client/v1/rooms/{room_id}/relations/{event_id}/{rel_type}/{event_type}",
     "/_matrix/client/v1/rooms/{room_id}/threads",
+    "/_matrix/client/v1/rooms/{room_id}/timestamp_to_event",
     "/_matrix/client/v3/rooms/{room_id}/state",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}",
@@ -440,6 +441,10 @@ fn timeline_routes() -> Router<AppState> {
         .route(
             "/_matrix/client/v1/rooms/{room_id}/threads",
             get(room_threads),
+        )
+        .route(
+            "/_matrix/client/v1/rooms/{room_id}/timestamp_to_event",
+            get(room_timestamp_to_event),
         )
         .route("/_matrix/client/v3/rooms/{room_id}/state", get(room_state))
         // Two routes, because the spec has two forms and a router cannot
@@ -6490,6 +6495,54 @@ struct ThreadsQuery {
     from: Option<String>,
     limit: Option<usize>,
     include: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TimestampToEventQuery {
+    ts: Option<u64>,
+    dir: Option<String>,
+}
+
+/// `GET /_matrix/client/v1/rooms/{room_id}/timestamp_to_event`
+///
+/// Jump-to-date: the client has a calendar date and wants somewhere in the
+/// timeline to start paginating from. It asks for the event nearest a
+/// timestamp on one side, then pages from there with `/messages`.
+///
+/// `dir` is required and has no default. `f` and `b` are opposite answers to
+/// the same question, and a client that omitted it by mistake would get a
+/// plausible event from the wrong side of the date and page away from what it
+/// was looking for -- a silently wrong answer, which is worse than a 400.
+///
+/// The room is subject to the same read rule as every other room read.
+async fn room_timestamp_to_event(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<TimestampToEventQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    may_read_room(&state, &identity.user_id, &room_id)?;
+    let ts = query
+        .ts
+        .ok_or_else(|| MatrixError::missing_param("ts is required"))?;
+    let direction = match query.dir.as_deref() {
+        Some("f") => crate::rooms::TimestampDirection::Forward,
+        Some("b") => crate::rooms::TimestampDirection::Backward,
+        Some(other) => {
+            return Err(MatrixError::bad_json(format!(
+                "dir must be 'f' or 'b', not {other:?}"
+            )));
+        }
+        None => return Err(MatrixError::missing_param("dir is required")),
+    };
+    let (event_id, origin_server_ts) = state
+        .rooms
+        .event_at_timestamp(&room_id, ts, direction)
+        .map_err(room_error)?;
+    Ok(Json(json!({
+        "event_id": event_id,
+        "origin_server_ts": origin_server_ts,
+    })))
 }
 
 /// `GET /_matrix/client/v1/rooms/{room_id}/threads`
