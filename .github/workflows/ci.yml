@@ -56,6 +56,14 @@ jobs:
       # merge, and its output is what somebody reads when one does. Both are
       # worth a test: #228 is a case where the gate was right, and #231 one
       # where what it printed was not enough to act on.
+      - name: Audit the dependency graph
+        # Installed rather than run through an action: every action here is
+        # SHA-pinned and Dependabot-tracked (#182), and adding one more
+        # third party that runs before our code does, in a job holding a
+        # token, is a worse trade than a two-minute build the cache covers.
+        run: |
+          cargo install cargo-deny --locked --version 0.20.2
+          cargo deny check
       - name: Check the Complement ratchet
         run: python3 scripts/complement-check-test.py
 

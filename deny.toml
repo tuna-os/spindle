@@ -1,0 +1,71 @@
+# What the dependency graph is allowed to contain, checked on every build.
+#
+# LICENSING.md used to record that 336 crates had been checked *by hand,
+# once*. Nothing re-checked, so a transitive dependency could change licence,
+# get yanked, or acquire an advisory between one `cargo update` and the next
+# and the only thing standing between that and a release was somebody
+# remembering. This file is that memory (#266).
+
+[advisories]
+# Every advisory is an error, including "unmaintained" and "unsound": the
+# point of a gate is that new ones stop the build rather than accumulating.
+# Exceptions are listed below, individually, with a reason.
+yanked = "deny"
+ignore = [
+    # `bitmaps` reaches us only through `imbl`, which is a dev-dependency of
+    # spindle-core used by exactly one line of one benchmark -- the
+    # HAMT-versus-persistent-map comparison that justifies SPEC §6.1's choice
+    # of structure. It is never in a shipped binary.
+    #
+    # The advisory is "unmaintained" (the repository was archived), not a
+    # vulnerability. The only way to drop it is to drop the comparison the
+    # benchmark exists to make, which would remove evidence rather than risk.
+    #
+    # Revisit if this ever becomes a real dependency, or if the advisory is
+    # reclassified as a soundness or security problem.
+    { id = "RUSTSEC-2026-0247", reason = "bitmaps: dev-only, via imbl, one benchmark; unmaintained rather than vulnerable" },
+]
+
+[licenses]
+# The set LICENSING.md argues for, now enforced rather than asserted. A new
+# licence in the graph fails the build and has to be argued for here, which
+# is the same review the prose asked for and did not get.
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    # Boost, via xxhash-rust under fjall. Permissive, and does not even
+    # require attribution in binary form.
+    "BSL-1.0",
+    # Zero-clause BSD, via varint-rs under fjall. Public-domain-equivalent:
+    # it does not even require the copyright notice to be reproduced.
+    "0BSD",
+    # MPL-2.0 is file-level copyleft: §3.3 expressly permits distributing the
+    # larger work under other terms, so it does not reach Spindle's own code.
+    # LICENSING.md makes this argument at length.
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Two versions of the same crate in one binary is how two incompatible
+# `rand`s end up linked together -- a real hazard for a crate that generates
+# event IDs and signing nonces.
+multiple-versions = "warn"
+wildcards = "deny"
+# A path dependency inside this workspace has no version to pin -- these
+# crates are not published, so there is nothing for a wildcard to widen to.
+# The check is about depending on somebody *else's* unpinned crate.
+allow-wildcard-paths = true
+
+[sources]
+# crates.io only. A git dependency is a dependency on somebody's branch
+# state, which is not a thing that can be audited once.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
