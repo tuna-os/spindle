@@ -27,7 +27,7 @@ blake3 = "1.8"
 # and nothing else.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
-fjall = "2.11.2"
+fjall = "3.1.9"
 proptest = "1.7"
 rand = "0.10"
 # The Synapse importer's SQLite reader only, behind the non-default
