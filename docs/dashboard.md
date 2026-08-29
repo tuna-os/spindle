@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**158 routes implemented; 14 known gaps in scope.**
+**161 routes implemented; 11 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -218,9 +218,12 @@ neither implemented nor counted.
 - `GET/PUT /_matrix/client/v3/profile/{user_id}/displayname`
 - ⏳ `GET /_matrix/client/v3/presence/{user_id}/status` — presence (M2/M3)
 
-### Accounts, devices & auth — 8 implemented, 3 planned
+### Accounts, devices & auth — 11 implemented, 0 planned
 
+- `POST /_matrix/client/v3/account/deactivate`
+- `POST /_matrix/client/v3/account/password`
 - `GET /_matrix/client/v3/account/whoami`
+- `POST /_matrix/client/v3/delete_devices`
 - `GET /_matrix/client/v3/devices`
 - `GET/PUT/DELETE /_matrix/client/v3/devices/{device_id}`
 - `GET/POST /_matrix/client/v3/login`
@@ -228,9 +231,6 @@ neither implemented nor counted.
 - `POST /_matrix/client/v3/refresh`
 - `POST /_matrix/client/v3/register`
 - `GET /_matrix/client/v3/register/available`
-- ⏳ `POST /_matrix/client/v3/account/password` — password change (M1 leftover)
-- ⏳ `POST /_matrix/client/v3/account/deactivate` — deactivation (M1 leftover)
-- ⏳ `POST /_matrix/client/v3/delete_devices` — bulk device logout (M2)
 
 ### Server, discovery & operations — 9 implemented, 0 planned
 

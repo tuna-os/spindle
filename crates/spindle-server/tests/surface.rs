@@ -166,10 +166,7 @@ async fn an_unimplemented_endpoint_is_a_404_not_a_stub() {
     // shrink it: `/createRoom` and `/joined_rooms` were here until rooms were
     // built, and `/sync` until sync was, and the test said so on each of the
     // commits that built them.
-    for path in [
-        "/_matrix/client/v3/account/password",
-        "/_matrix/client/v3/profile/@alice:example.org",
-    ] {
+    for path in ["/_matrix/client/v3/profile/@alice:example.org"] {
         assert_eq!(
             get(path).await.0,
             StatusCode::NOT_FOUND,
