@@ -53,6 +53,7 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/v1/rooms/{room_id}/relations/{event_id}",
     "/_matrix/client/v1/rooms/{room_id}/relations/{event_id}/{rel_type}",
     "/_matrix/client/v1/rooms/{room_id}/relations/{event_id}/{rel_type}/{event_type}",
+    "/_matrix/client/v1/rooms/{room_id}/threads",
     "/_matrix/client/v3/rooms/{room_id}/state",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}",
@@ -435,6 +436,10 @@ fn timeline_routes() -> Router<AppState> {
         .route(
             "/_matrix/client/v1/rooms/{room_id}/relations/{event_id}/{rel_type}/{event_type}",
             get(relations_by_event_type),
+        )
+        .route(
+            "/_matrix/client/v1/rooms/{room_id}/threads",
+            get(room_threads),
         )
         .route("/_matrix/client/v3/rooms/{room_id}/state", get(room_state))
         // Two routes, because the spec has two forms and a router cannot
@@ -6425,6 +6430,72 @@ fn relations(
     let mut body = serde_json::Map::new();
     body.insert("chunk".to_owned(), Value::Array(chunk));
     // Absent when there is nothing more, which is how a client stops.
+    if let Some(next) = next {
+        body.insert(
+            "next_batch".to_owned(),
+            json!(crate::tokens::Pagination(next).to_string()),
+        );
+    }
+    Ok(Json(Value::Object(body)))
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadsQuery {
+    from: Option<String>,
+    limit: Option<usize>,
+    include: Option<String>,
+}
+
+/// `GET /_matrix/client/v1/rooms/{room_id}/threads`
+///
+/// The chunk is thread *roots*, each carrying the `m.thread` aggregate in
+/// `unsigned.m.relations` — so a client renders the list, with each thread's
+/// reply count and latest reply, from this one response.
+///
+/// `include` is `all` or `participated`; anything else is a 400 rather than a
+/// silent fallback to `all`, because the two answers differ and a client that
+/// misspells the value would otherwise be shown other people's threads and
+/// never learn why.
+async fn room_threads(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<ThreadsQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    let participated_only = match query.include.as_deref() {
+        None | Some("all") => false,
+        Some("participated") => true,
+        Some(other) => {
+            return Err(MatrixError::bad_json(format!(
+                "include must be 'all' or 'participated', not {other:?}"
+            )));
+        }
+    };
+    // The same `t`-tagged token the rest of the room's pagination uses: this
+    // is a position in the same linear index.
+    let from = match query.from.as_deref() {
+        Some(token) => Some(
+            token
+                .parse::<crate::tokens::Pagination>()
+                .map_err(|error| MatrixError::bad_json(error.to_string()))?
+                .0,
+        ),
+        None => None,
+    };
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
+
+    let (roots, next) = state
+        .rooms
+        .threads(&room_id, &identity.user_id, participated_only, from, limit)
+        .map_err(room_error)?;
+
+    let chunk: Vec<Value> = roots
+        .into_iter()
+        .map(|root| with_bundle(&state, &room_id, &identity.user_id, root))
+        .collect();
+
+    let mut body = serde_json::Map::new();
+    body.insert("chunk".to_owned(), Value::Array(chunk));
     if let Some(next) = next {
         body.insert(
             "next_batch".to_owned(),
