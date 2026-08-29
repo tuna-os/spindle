@@ -5634,24 +5634,29 @@ async fn sliding_sync(
     }
     ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
+    // Every room this request may be answered with. A list window can only
+    // produce rooms out of `ordered`, which came from the caller's own
+    // memberships -- but a *subscription* is an arbitrary room id lifted
+    // straight out of the request body, and nothing downstream of here looks
+    // at who is asking: `sliding_room_entry` takes an identity and never
+    // consults it. Without this set, any account on the server could name any
+    // room and be sent its name, its state and its whole timeline.
+    let visible: std::collections::HashSet<&str> = ordered
+        .iter()
+        .map(|(room_id, _)| room_id.as_str())
+        .collect();
+
     // Which rooms may appear at all in an incremental response. Asked only
-    // about rooms this response could mention -- the sorted list, plus any
-    // room the client subscribed to directly, which need not be one it is
-    // joined to. Asking the server's whole stream instead would price a
-    // client's sliding sync at everyone else's traffic.
+    // about rooms this response could mention, which is exactly `visible`:
+    // asking the server's whole stream instead would price a client's
+    // sliding sync at everyone else's traffic.
     let changed: Option<std::collections::HashSet<String>> = match since {
-        Some(since) => {
-            let candidates = ordered
-                .iter()
-                .map(|(room_id, _)| room_id.as_str())
-                .chain(subscriptions.iter().map(|(room_id, _)| room_id.as_str()));
-            Some(
-                state
-                    .rooms
-                    .changed_rooms(candidates, since, position)
-                    .map_err(room_error)?,
-            )
-        }
+        Some(since) => Some(
+            state
+                .rooms
+                .changed_rooms(visible.iter().copied(), since, position)
+                .map_err(room_error)?,
+        ),
         None => None,
     };
 
@@ -5676,6 +5681,15 @@ async fn sliding_sync(
         lists_out.insert(name.clone(), json!({ "count": ordered.len() }));
     }
     for (room_id, subscription) in &subscriptions {
+        // Silence rather than an error: a client that subscribed to a room it
+        // has since left should get a response about its other rooms, not a
+        // rejected request -- and a client fishing for a room it was never in
+        // learns nothing from the difference between "no such room" and "not
+        // yours", which is the same reason the room directory does not
+        // distinguish them.
+        if !visible.contains(room_id.as_str()) {
+            continue;
+        }
         let entry = wanted
             .entry(room_id.clone())
             .or_insert_with(|| (Vec::new(), 0));

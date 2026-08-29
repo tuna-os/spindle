@@ -410,6 +410,83 @@ async fn a_subscription_reaches_a_room_outside_every_window() {
     );
 }
 
+/// A subscription is a room id from the request body, and nothing else in
+/// the handler checks who is asking.
+///
+/// The list windows can only produce rooms the caller is joined to, so the
+/// membership check lived in the *derivation* of the list rather than in the
+/// endpoint -- and a subscription skips that derivation entirely.
+/// `sliding_room_entry` takes an `identity` and never consults it, so before
+/// this a freshly registered account in no rooms at all could name any room
+/// on the server and be sent its name, its state and its whole timeline,
+/// message bodies included.
+///
+/// The assertion is on the timeline, not just on the room's absence: a fix
+/// that returned the room with an empty timeline would still be handing over
+/// the name and the state.
+#[tokio::test]
+async fn a_stranger_cannot_subscribe_their_way_into_a_room() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let mallory = harness.register("mallory").await;
+    let private = harness.named_room(&alice, "alice's room").await;
+    harness.say(&private, &alice, "secret", "t1").await;
+
+    let mut body = window();
+    body["room_subscriptions"] = json!({
+        &private: { "required_state": [["m.room.name", ""]], "timeline_limit": 10 }
+    });
+    let response = harness.sliding(&mallory, None, &body).await;
+
+    assert!(
+        !response["rooms"]
+            .as_object()
+            .unwrap()
+            .contains_key(&private),
+        "mallory is in no rooms at all and was sent one: {response}"
+    );
+    assert!(
+        !serde_json::to_string(&response).unwrap().contains("secret"),
+        "the room was withheld but its timeline was not: {response}"
+    );
+}
+
+/// Leaving a room ends the subscription too.
+///
+/// The same hole with a plausible client behind it: a client that subscribed
+/// to a room and stayed subscribed after leaving it would keep receiving that
+/// room's timeline for as long as it kept asking.
+#[tokio::test]
+async fn a_subscription_does_not_outlive_membership() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness.named_room(&alice, "shared").await;
+    harness.invite(&room, &alice, "bob").await;
+    harness.join(&room, &bob).await;
+
+    let mut body = window();
+    body["room_subscriptions"] = json!({
+        &room: { "required_state": [["m.room.name", ""]], "timeline_limit": 10 }
+    });
+    let seen = harness.sliding(&bob, None, &body).await;
+    assert!(
+        seen["rooms"].as_object().unwrap().contains_key(&room),
+        "bob is joined and should see it: {seen}"
+    );
+
+    harness.leave(&room, &bob).await;
+    harness.say(&room, &alice, "after bob left", "t2").await;
+
+    let response = harness.sliding(&bob, None, &body).await;
+    assert!(
+        !serde_json::to_string(&response)
+            .unwrap()
+            .contains("after bob left"),
+        "bob left and is still being sent the room's timeline: {response}"
+    );
+}
+
 #[tokio::test]
 async fn ranges_past_the_end_are_clipped_not_refused() {
     let harness = Harness::new();
