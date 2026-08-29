@@ -470,12 +470,16 @@ async fn an_unknown_room_is_not_an_event_with_no_relations() {
         .await;
     assert!(ids(&body).is_empty(), "{body}");
 
-    // A room that does not exist is not an answer.
+    // A room the caller cannot read is not an answer either -- and is
+    // refused rather than reported missing, because 404 against 403 would
+    // tell any caller which room IDs this server holds. The distinction this
+    // test is really about survives: an empty chunk means "no relations",
+    // never "no room".
     let (status, body) = harness
         .get(
             &format!("/_matrix/client/v1/rooms/!nope:example.org/relations/{target}"),
             &token,
         )
         .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
