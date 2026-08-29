@@ -1,13 +1,17 @@
 //! What does one incremental `/sync` actually read?
 //!
-//! Counted, not timed (#177): `store.reads()` is a point-read counter, so
-//! the answer is the same on any machine, and the assertion below is a
-//! real gate rather than a wall clock on a shared runner.
+//! Counted, not timed (#177): `store.reads()` and `store.scanned()` count
+//! point reads and scanned rows, so the answer is the same on any machine
+//! and the assertions below are real gates rather than wall clocks on a
+//! shared runner. Where a test could be satisfied by moving work from a
+//! point read into a scan, it sums the two.
 //!
-//! Two axes, varied independently -- which is the point, because the
-//! benchmark driver varies neither. `sync_delta` uses two rooms and a
-//! token from moments earlier, so it holds both at their minimum and
-//! measured the one case where neither costs anything.
+//! Three axes, varied independently -- which is the point, because the
+//! benchmark driver varies none of them. `sync_delta` uses two rooms and a
+//! token from moments earlier, on an otherwise idle server, so it holds all
+//! three at their minimum and measured the one case where none costs
+//! anything: how many rooms the user is in, how much of the room's own
+//! history precedes the token, and how busy the rest of the server has been.
 
 use std::sync::Arc;
 

@@ -797,6 +797,45 @@ This is a methodology defect of the same class as the membership one, and
 it is recorded the same way: as a limit on what every table above
 establishes, not as a footnote to them.
 
+## The third axis: whose traffic a client pays for
+
+The membership axis was a variable the sweep held constant. This one is a
+variable the sweep **cannot** vary, because it is not a property of the
+request at all: it is how busy the rest of the server is.
+
+An incremental `/sync` asks "what happened since my token". The token is a
+position in the server-wide stream, so the answer was assembled by reading
+every stream row in the range and keeping the ones that belonged to the
+caller's rooms. Counted (`crates/spindle-server/tests/sync_cost.rs`), with
+Alice in one room where nothing had happened and Bob talking in a room she
+is not in:
+
+| events elsewhere | 0 | 50 | 200 | 800 |
+|---|---|---|---|---|
+| point reads, before | 1 | 51 | 201 | 801 |
+| point reads, after | 1 | 1 | 1 | 1 |
+
+Exactly `elsewhere + 1`. Alice's sync got more expensive because strangers
+were talking, and on a server with a thousand users she would have been
+paying for the other nine hundred and ninety-nine on every poll. Every
+benchmark on this page runs one tenant on an idle server, so every one of
+them measured that factor at zero.
+
+The fix is the reverse index — the same rows keyed `(room_id, stream_id)`
+instead of `stream_id` — so the question is a range scan that starts at the
+client's token and covers one room. `ReadView::scan_from` is the primitive
+that makes "start at the token" possible; a filter over a prefix scan would
+have returned the same rows at the cost of the room's whole history, which
+is the same defect at a smaller radius and has its own assertion.
+
+**No wall clock is quoted here, deliberately.** The reads are counted, and
+the count is the result: it is the same on any machine, where a timing on
+this four-core box could not resolve it against a 10–14% run-to-run spread.
+What the count does not tell you is what it is worth on a real deployment,
+and this environment cannot produce that number — it would take a server
+with genuine multi-tenant traffic, which is exactly the condition the
+factor is proportional to. So the claim is the shape, not a speedup.
+
 ## The first throughput numbers this project has ever had
 
 `--dimension concurrency` measures the axis the other two hold at one. It
