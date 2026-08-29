@@ -284,6 +284,24 @@ pub enum Keyspace {
     /// client's token instead of at the room's creation. The value is the
     /// linear index, which is all the caller wanted from the forward row.
     RoomStream = 0x2a,
+    /// `(fire_at_ms, delay_id)` -> a delayed event awaiting its moment
+    /// (MSC4140).
+    ///
+    /// Keyed by *when* rather than by id, because the question asked
+    /// constantly is "is anything due", and the question asked rarely is
+    /// "where is delay X". A scan of everything pending on every tick is the
+    /// shape this ordering exists to avoid: due rows are a prefix of the
+    /// keyspace, so a tick that finds nothing reads one row and stops.
+    DelayedEvent = 0x2b,
+    /// `delay_id` -> the `fire_at_ms` its [`Self::DelayedEvent`] row is filed
+    /// under.
+    ///
+    /// Eight bytes, and the only reason it exists: the primary key is a time
+    /// the caller does not know, so without this, acting on a delay by id
+    /// means scanning every delay on the server. Written and deleted in the
+    /// same batch as the row it points at -- an index surviving its row would
+    /// send a caller looking for something that is not there.
+    DelayedEventById = 0x2c,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -439,6 +457,39 @@ pub fn stream_prefix() -> Vec<u8> {
 pub fn room_stream(room_id: &str, stream_id: u64) -> Vec<u8> {
     let mut key = room_prefix(Keyspace::RoomStream, room_id);
     key.extend_from_slice(&stream_id.to_be_bytes());
+    key
+}
+
+/// One delayed event's row, ordered by when it fires.
+///
+/// The timestamp is big-endian first so a range scan reads them in the order
+/// they come due; the id follows so two delays landing on the same
+/// millisecond are still two rows.
+#[must_use]
+pub fn delayed_event(fire_at_ms: u64, delay_id: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::DelayedEvent as u8];
+    key.extend_from_slice(&fire_at_ms.to_be_bytes());
+    key.extend_from_slice(delay_id.as_bytes());
+    key
+}
+
+/// The prefix every delayed-event row shares.
+#[must_use]
+pub fn delayed_event_prefix() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::DelayedEvent as u8]
+}
+
+/// The `delay_id` a [`delayed_event`] key ends in.
+#[must_use]
+pub fn delayed_event_id_from_key(key: &[u8]) -> Option<String> {
+    String::from_utf8(key.get(10..)?.to_vec()).ok()
+}
+
+/// The by-id index row for one delayed event.
+#[must_use]
+pub fn delayed_event_by_id(delay_id: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::DelayedEventById as u8];
+    key.extend_from_slice(delay_id.as_bytes());
     key
 }
 
