@@ -146,7 +146,6 @@ PLANNED = {
     # stale-entry check from saying so.
     "Federation": [],
     "VoIP & MatrixRTC": [
-        ("GET", "/_matrix/client/v3/voip/turnServer", "TURN discovery (M7)"),
     ],
 }
 

@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**166 routes implemented; 8 known gaps in scope.**
+**167 routes implemented; 7 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -229,7 +229,7 @@ neither implemented nor counted.
 - `POST /_matrix/client/v3/register`
 - `GET /_matrix/client/v3/register/available`
 
-### Server, discovery & operations — 14 implemented, 0 planned
+### Server, discovery & operations — 15 implemented, 0 planned
 
 - `GET /.well-known/matrix/client`
 - `GET /.well-known/matrix/server`
@@ -241,14 +241,14 @@ neither implemented nor counted.
 - `GET /_matrix/client/v3/capabilities`
 - `GET/POST /_matrix/client/v3/publicRooms`
 - `POST /_matrix/client/v3/user_directory/search`
+- `GET /_matrix/client/v3/voip/turnServer`
 - `GET /_matrix/client/versions`
 - `GET /_matrix/key/v2/server`
 - `GET /health`
 - `GET /ready`
 
-### VoIP & MatrixRTC — 0 implemented, 1 planned
+### VoIP & MatrixRTC — 0 implemented, 0 planned
 
-- ⏳ `GET /_matrix/client/v3/voip/turnServer` — TURN discovery (M7)
 
 ## Benchmarks
 
