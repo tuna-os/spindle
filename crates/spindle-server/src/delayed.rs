@@ -149,6 +149,30 @@ pub struct Delayed {
     /// client sits at one and this is only ever reached by something that
     /// has gone wrong or is trying to.
     max_per_room: usize,
+    /// The live deadline of every delay that has been restarted since it
+    /// was last persisted.
+    ///
+    /// `restart` is the hot path, and #36 asks that it not touch storage:
+    /// Matrix RTC refreshes the pending departure of every participant in
+    /// every live call, continuously, so a restart that rewrote two rows
+    /// would make the store's write rate a function of how many people are
+    /// on calls rather than of how much is actually happening. It bumps the
+    /// deadline here instead, and the queue row keeps its old position until
+    /// the fire loop actually reaches it -- at which point the row moves
+    /// once, rather than once per heartbeat.
+    ///
+    /// The persisted deadline is therefore a *lower bound* on the live one,
+    /// never an upper one, because a restart only ever moves a deadline
+    /// later. So a crash loses the bumps and the delay fires early. For a
+    /// dead-man's switch that is the safe direction to fail in: a live
+    /// participant is dropped once and their client rejoins, where the
+    /// opposite error leaves exactly the ghost the mechanism exists to
+    /// remove.
+    ///
+    /// Bounded by [`Self::max_per_room`] per sender per room, the same cap
+    /// that bounds the rows -- an entry exists only for a delay that has a
+    /// row.
+    restarts: std::sync::Mutex<std::collections::HashMap<String, u64>>,
     /// Bumped whenever a row is written, so a caller can tell whether
     /// anything changed without reading the rows.
     generation: std::sync::atomic::AtomicU64,
@@ -171,6 +195,7 @@ impl Delayed {
             store,
             max_delay_ms: DEFAULT_MAX_DELAY_MS,
             max_per_room: DEFAULT_MAX_PER_ROOM,
+            restarts: std::sync::Mutex::new(std::collections::HashMap::new()),
             generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -242,14 +267,82 @@ impl Delayed {
         Ok(())
     }
 
-    /// Remove both rows for one delay.
-    fn erase(&self, delay_id: &str, fire_at_ms: u64) -> Result<(), DelayError> {
-        self.store
-            .delete(&spindle_core::keys::delayed_event(fire_at_ms, delay_id))?;
+    /// Where the queue row for `delay_id` currently sits, or `None` if
+    /// there is no such delay.
+    ///
+    /// The by-id row is the only thing that knows this. The live deadline
+    /// in [`Self::restarts`] deliberately does *not*: it says when the
+    /// delay should fire, not where its row is, and conflating the two is
+    /// how a restarted delay would be deleted by the wrong key.
+    fn queued_at(&self, delay_id: &str) -> Result<Option<u64>, DelayError> {
+        let Some(raw) = self
+            .store
+            .get(&spindle_core::keys::delayed_event_by_id(delay_id))?
+        else {
+            return Ok(None);
+        };
+        Ok(raw
+            .as_slice()
+            .try_into()
+            .ok()
+            .map(|bytes: [u8; 8]| u64::from_be_bytes(bytes)))
+    }
+
+    /// Remove both rows for one delay, and forget any live deadline.
+    ///
+    /// Takes only the id: the row's position is read back from the by-id
+    /// row rather than passed in, because a caller holding a
+    /// [`DelayedEvent`] may be holding its *live* deadline (see
+    /// [`Self::restarts`]), and deleting by that would leave the queue row
+    /// behind to fire a second time.
+    fn erase(&self, delay_id: &str) -> Result<(), DelayError> {
+        if let Some(fire_at_ms) = self.queued_at(delay_id)? {
+            self.store
+                .delete(&spindle_core::keys::delayed_event(fire_at_ms, delay_id))?;
+        }
         self.store
             .delete(&spindle_core::keys::delayed_event_by_id(delay_id))?;
+        if let Ok(mut restarts) = self.restarts.lock() {
+            restarts.remove(delay_id);
+        }
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The live deadline for `delay_id`, if it has been restarted since it
+    /// was last persisted.
+    fn live_deadline(&self, delay_id: &str) -> Option<u64> {
+        self.restarts
+            .lock()
+            .ok()
+            .and_then(|restarts| restarts.get(delay_id).copied())
+    }
+
+    /// Move a delay's queue row to `deadline` and forget the live entry.
+    ///
+    /// The deferred half of [`Action::Restart`]: paid once, when the fire
+    /// loop reaches a row whose deadline has moved on, instead of once per
+    /// heartbeat. Removing the live entry is conditional on it still being
+    /// the value just persisted, so a restart racing this write is kept
+    /// rather than silently dropped back to the row's position.
+    fn requeue(&self, event: &DelayedEvent, deadline: u64) -> Result<(), DelayError> {
+        let moved = DelayedEvent {
+            fire_at_ms: deadline,
+            ..event.clone()
+        };
+        if let Some(queued_at) = self.queued_at(&event.delay_id)? {
+            self.store.delete(&spindle_core::keys::delayed_event(
+                queued_at,
+                &event.delay_id,
+            ))?;
+        }
+        self.write(&moved)?;
+        if let Ok(mut restarts) = self.restarts.lock()
+            && restarts.get(&event.delay_id) == Some(&deadline)
+        {
+            restarts.remove(&event.delay_id);
+        }
         Ok(())
     }
 
@@ -273,10 +366,16 @@ impl Delayed {
             .store
             .get(&spindle_core::keys::delayed_event(fire_at_ms, delay_id))?
             .ok_or(DelayError::NotFound)?;
-        let event: DelayedEvent =
+        let mut event: DelayedEvent =
             serde_json::from_slice(&stored).map_err(|_| DelayError::NotFound)?;
         if event.sender != sender {
             return Err(DelayError::NotFound);
+        }
+        // What the caller asked is "when does this fire", so answer with the
+        // live deadline rather than the row's position, which lags it by
+        // design between restarts.
+        if let Some(deadline) = self.live_deadline(&event.delay_id) {
+            event.fire_at_ms = deadline;
         }
         Ok(event)
     }
@@ -304,9 +403,12 @@ impl Delayed {
             .scan_prefix(&spindle_core::keys::delayed_event_prefix())?;
         let mut out = Vec::new();
         for (_, raw) in rows {
-            if let Ok(event) = serde_json::from_slice::<DelayedEvent>(&raw)
+            if let Ok(mut event) = serde_json::from_slice::<DelayedEvent>(&raw)
                 && event.sender == sender
             {
+                if let Some(deadline) = self.live_deadline(&event.delay_id) {
+                    event.fire_at_ms = deadline;
+                }
                 out.push(event);
             }
         }
@@ -331,11 +433,11 @@ impl Delayed {
         let event = self.get(delay_id, sender)?;
         match action {
             Action::Cancel => {
-                self.erase(&event.delay_id, event.fire_at_ms)?;
+                self.erase(&event.delay_id)?;
                 Ok(None)
             }
             Action::Send => {
-                self.erase(&event.delay_id, event.fire_at_ms)?;
+                self.erase(&event.delay_id)?;
                 Ok(Some(event))
             }
             Action::Restart => {
@@ -343,12 +445,17 @@ impl Delayed {
                 // heartbeat that shortened the window on every beat would
                 // converge on firing while the client was still alive, which
                 // is the opposite of what restarting it means.
-                self.erase(&event.delay_id, event.fire_at_ms)?;
-                let restarted = DelayedEvent {
-                    fire_at_ms: Self::now_ms().saturating_add(event.delay_ms),
-                    ..event
-                };
-                self.write(&restarted)?;
+                let deadline = Self::now_ms().saturating_add(event.delay_ms);
+                // And no write: the hot path (#36) records the new deadline
+                // in memory and leaves the row where it is. The row is a
+                // lower bound, so the only cost of not moving it now is that
+                // the fire loop reaches it early and moves it then -- once
+                // per delay period instead of once per heartbeat.
+                if let Ok(mut restarts) = self.restarts.lock() {
+                    restarts.insert(event.delay_id.clone(), deadline);
+                }
+                self.generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(None)
             }
         }
@@ -378,8 +485,18 @@ impl Delayed {
             if fire_at > now_ms {
                 break;
             }
-            if let Ok(event) = serde_json::from_slice::<DelayedEvent>(&raw) {
-                out.push(event);
+            let Ok(event) = serde_json::from_slice::<DelayedEvent>(&raw) else {
+                continue;
+            };
+            // The row is due, but the delay may not be: a restart since this
+            // row was written moved the deadline without moving the row.
+            // Settle it now -- one write, here, in place of the write every
+            // heartbeat would otherwise have made.
+            match self.live_deadline(&event.delay_id) {
+                Some(deadline) if deadline > now_ms => {
+                    self.requeue(&event, deadline)?;
+                }
+                _ => out.push(event),
             }
         }
         Ok(out)
@@ -391,7 +508,7 @@ impl Delayed {
     ///
     /// Returns a store error if the rows cannot be removed.
     pub fn take(&self, event: &DelayedEvent) -> Result<(), DelayError> {
-        self.erase(&event.delay_id, event.fire_at_ms)
+        self.erase(&event.delay_id)
     }
 
     /// How many times the pending set has changed since startup.
@@ -465,5 +582,199 @@ pub async fn fire_loop(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod restart_hot_path_tests {
+    use super::*;
+
+    /// A `Delayed` over its own store, with the directory kept alive.
+    fn delayed() -> (tempfile::TempDir, Arc<FjallStore>, Delayed) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let delayed = Delayed::new(Arc::clone(&store));
+        (dir, store, delayed)
+    }
+
+    fn schedule(delayed: &Delayed, delay_ms: u64) -> String {
+        delayed
+            .schedule(
+                "!room:example.org",
+                "@alice:example.org",
+                "m.room.message",
+                None,
+                &serde_json::json!({ "body": "hi" }),
+                delay_ms,
+            )
+            .unwrap()
+    }
+
+    /// These tests pass `now` to [`Delayed::due`] rather than sleeping, so
+    /// what they assert is the ordering of deadlines and rows, not the speed
+    /// of the machine running them. The one real-time dependency is that
+    /// some milliseconds pass between scheduling and restarting, which the
+    /// sleep below makes true by a wide margin.
+    fn a_moment() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    /// The claim in one assertion: a restart writes nothing.
+    #[test]
+    fn a_restart_does_not_write() {
+        let (_dir, store, delayed) = delayed();
+        let id = schedule(&delayed, 60_000);
+        let before = store.written();
+        for _ in 0..1_000 {
+            delayed
+                .act(&id, "@alice:example.org", Action::Restart)
+                .unwrap();
+        }
+        assert_eq!(
+            store.written(),
+            before,
+            "a thousand restarts, no rows written"
+        );
+    }
+
+    /// And the deadline really did move, so the previous test is not
+    /// passing by doing nothing at all.
+    #[test]
+    fn a_restart_moves_the_deadline_it_did_not_write() {
+        let (_dir, _store, delayed) = delayed();
+        let id = schedule(&delayed, 60_000);
+        let queued_at = delayed.get(&id, "@alice:example.org").unwrap().fire_at_ms;
+        a_moment();
+        delayed
+            .act(&id, "@alice:example.org", Action::Restart)
+            .unwrap();
+
+        let live = delayed.get(&id, "@alice:example.org").unwrap().fire_at_ms;
+        assert!(
+            live > queued_at,
+            "the reported deadline moved: {queued_at} -> {live}"
+        );
+        assert_eq!(
+            delayed.queued_at(&id).unwrap(),
+            Some(queued_at),
+            "but the row did not: that is the whole saving"
+        );
+    }
+
+    /// The row is due, the delay is not. Reaching it must move the row.
+    #[test]
+    fn a_row_whose_deadline_moved_is_requeued_rather_than_fired() {
+        let (_dir, _store, delayed) = delayed();
+        let id = schedule(&delayed, 60_000);
+        let queued_at = delayed.get(&id, "@alice:example.org").unwrap().fire_at_ms;
+        a_moment();
+        delayed
+            .act(&id, "@alice:example.org", Action::Restart)
+            .unwrap();
+        let live = delayed.get(&id, "@alice:example.org").unwrap().fire_at_ms;
+
+        assert!(
+            delayed.due(queued_at).unwrap().is_empty(),
+            "the row came due, but the delay had been restarted past it"
+        );
+        assert_eq!(
+            delayed.queued_at(&id).unwrap(),
+            Some(live),
+            "so the row was settled at the deadline it actually has"
+        );
+        assert_eq!(
+            delayed.due(live).unwrap().len(),
+            1,
+            "and it fires there"
+        );
+    }
+
+    /// Once, not once per tick: the deferred write is a saving only if
+    /// reaching a moved row does not keep costing.
+    #[test]
+    fn the_row_is_settled_once_however_many_ticks_reach_it() {
+        let (_dir, store, delayed) = delayed();
+        let id = schedule(&delayed, 60_000);
+        let queued_at = delayed.get(&id, "@alice:example.org").unwrap().fire_at_ms;
+        a_moment();
+        delayed
+            .act(&id, "@alice:example.org", Action::Restart)
+            .unwrap();
+
+        let before = store.written();
+        delayed.due(queued_at).unwrap();
+        let after_first = store.written();
+        assert!(
+            after_first > before,
+            "the first tick to reach it pays for the move"
+        );
+        for _ in 0..10 {
+            delayed.due(queued_at).unwrap();
+        }
+        assert_eq!(
+            store.written(),
+            after_first,
+            "later ticks find nothing due and write nothing"
+        );
+    }
+
+    /// The trade-off, stated as a test rather than only as a comment: the
+    /// bumps live in memory, so a process restart loses them and the delay
+    /// fires at its persisted deadline -- early, never late.
+    ///
+    /// Early is the direction a dead-man's switch should fail in. A
+    /// participant is dropped once and their client rejoins; the opposite
+    /// error leaves the ghost the mechanism exists to remove.
+    #[test]
+    fn a_restart_lost_to_a_crash_fires_early_never_late() {
+        let (_dir, store, delayed) = delayed();
+        let id = schedule(&delayed, 60_000);
+        let queued_at = delayed.get(&id, "@alice:example.org").unwrap().fire_at_ms;
+        a_moment();
+        delayed
+            .act(&id, "@alice:example.org", Action::Restart)
+            .unwrap();
+
+        // A second `Delayed` over the same store is what a restart leaves.
+        let reopened = Delayed::new(Arc::clone(&store));
+        assert_eq!(
+            reopened.get(&id, "@alice:example.org").unwrap().fire_at_ms,
+            queued_at,
+            "the surviving deadline is the persisted one"
+        );
+        assert_eq!(
+            reopened.due(queued_at).unwrap().len(),
+            1,
+            "so it fires there, which is earlier than the client asked for"
+        );
+    }
+
+    /// Erasing uses the row's position, not the deadline the caller sees.
+    ///
+    /// A cancel that deleted by the live deadline would delete a key that
+    /// does not exist and leave the row behind, to fire an event the client
+    /// had cancelled.
+    #[test]
+    fn cancelling_a_restarted_delay_removes_its_row() {
+        let (_dir, _store, delayed) = delayed();
+        let id = schedule(&delayed, 60_000);
+        let queued_at = delayed.get(&id, "@alice:example.org").unwrap().fire_at_ms;
+        a_moment();
+        delayed
+            .act(&id, "@alice:example.org", Action::Restart)
+            .unwrap();
+        delayed
+            .act(&id, "@alice:example.org", Action::Cancel)
+            .unwrap();
+
+        assert_eq!(delayed.queued_at(&id).unwrap(), None, "the index is gone");
+        assert!(
+            delayed.due(queued_at.saturating_add(120_000)).unwrap().is_empty(),
+            "and no row survives to fire at any later time"
+        );
+        assert!(
+            delayed.list("@alice:example.org").unwrap().is_empty(),
+            "nothing is listed"
+        );
     }
 }
