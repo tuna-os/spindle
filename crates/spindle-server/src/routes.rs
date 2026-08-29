@@ -5635,7 +5635,7 @@ async fn sliding_sync(
     ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     // Which rooms may appear at all in an incremental response.
-    let changed: Option<Vec<String>> = match since {
+    let changed: Option<std::collections::HashSet<String>> = match since {
         Some(since) => Some(
             state
                 .rooms
