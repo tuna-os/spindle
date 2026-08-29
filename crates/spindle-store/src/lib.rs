@@ -216,6 +216,37 @@ pub trait Store: ReadView {
     /// Returns a backend error if the commit fails.
     fn commit(&self, writes: &[Record], durability: Durability) -> Result<(), StoreError>;
 
+    /// [`Store::commit`]'s first half: journal `writes` atomically, without
+    /// making them durable.
+    ///
+    /// Pairs with [`Store::sync`], and exists so a caller holding a lock can
+    /// keep the *ordering* inside it and leave the *fsync* outside. Writing
+    /// under a lock is microseconds of memory work; syncing under it is a
+    /// disk barrier, and a lock that spans one serializes every writer behind
+    /// the slowest thing a machine does.
+    ///
+    /// A caller that does not pair this with a sync has written to the page
+    /// cache and told nobody, so a crash loses it silently. Every use should
+    /// read as one unit with the sync that follows.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the write fails.
+    fn commit_deferred(&self, writes: &[Record]) -> Result<(), StoreError>;
+
+    /// [`Store::commit`]'s second half: make everything journalled so far
+    /// durable, to the standard `durability` asks for.
+    ///
+    /// Cumulative rather than per-write, which is what makes it safe to call
+    /// after releasing the lock that ordered the writes: a later writer's sync
+    /// also covers an earlier writer's bytes, so durability cannot invert even
+    /// though the syncs race.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the sync fails.
+    fn sync(&self, durability: Durability) -> Result<(), StoreError>;
+
     /// # Errors
     ///
     /// Returns a backend error if the flush fails.
@@ -286,12 +317,8 @@ impl Default for GroupState {
 impl GroupCommit {
     /// Return once a sync covering the caller's already-journalled bytes has
     /// completed — leading that sync if nobody else is.
-    fn sync(&self, keyspace: &FjallKeyspace) -> Result<(), StoreError> {
-        self.sync_with(|| {
-            keyspace
-                .persist(PersistMode::SyncData)
-                .map_err(StoreError::from)
-        })
+    fn sync(&self, keyspace: &FjallKeyspace, mode: PersistMode) -> Result<(), StoreError> {
+        self.sync_with(|| keyspace.persist(mode).map_err(StoreError::from))
     }
 
     /// [`Self::sync`] with the fsync itself supplied.
@@ -374,6 +401,16 @@ pub struct FjallStore {
     /// increment is far cheaper than the read it is counting.
     reads: AtomicU64,
     scanned: AtomicU64,
+    /// Batches journalled but not necessarily synced, ever, since open.
+    ///
+    /// Exists so a caller can ask "did anything get written while I held
+    /// that lock?" by comparing two readings. It is deliberately *global*
+    /// rather than per-caller: a reading that changed because some other
+    /// thread wrote causes one extra sync, and a reading that changed
+    /// because *this* thread wrote can never be missed. The failure mode is
+    /// a wasted fsync, never a lost one, which is the only direction worth
+    /// being wrong in.
+    journalled: AtomicU64,
     /// Shared by every writer, which is what lets their fsyncs become one.
     group: GroupCommit,
 }
@@ -389,6 +426,15 @@ impl FjallStore {
     #[must_use]
     pub fn group_commits(&self) -> (u64, u64) {
         self.group.counters()
+    }
+
+    /// Batches journalled since this store was opened.
+    ///
+    /// Monotonic. Two readings that differ mean a write landed in between,
+    /// which is how an append path knows a sync is owed -- see the field.
+    #[must_use]
+    pub fn journalled(&self) -> u64 {
+        self.journalled.load(Ordering::Relaxed)
     }
 
     /// Point reads served since this store was opened.
@@ -442,6 +488,7 @@ impl FjallStore {
         Ok(Self {
             reads: AtomicU64::new(0),
             scanned: AtomicU64::new(0),
+            journalled: AtomicU64::new(0),
             group: GroupCommit::default(),
             keyspace,
             partition,
@@ -643,25 +690,43 @@ impl Store for FjallStore {
     }
 
     fn commit(&self, writes: &[Record], durability: Durability) -> Result<(), StoreError> {
+        self.commit_deferred(writes)?;
+        self.sync(durability)
+    }
+
+    fn commit_deferred(&self, writes: &[Record]) -> Result<(), StoreError> {
         let mut batch = self.keyspace.batch();
         for (key, value) in writes {
             batch.insert(&self.partition, key.as_slice(), value.as_slice());
         }
+        // Always `Buffer`: the bytes reach the journal and nothing is synced.
+        // Which sync they get -- if any -- is `sync`'s decision.
+        batch.durability(Some(PersistMode::Buffer)).commit()?;
+        // After the write, so an observer that sees the count move knows the
+        // bytes are already journalled and a sync will cover them.
+        self.journalled.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    fn sync(&self, durability: Durability) -> Result<(), StoreError> {
+        // Every arm takes its syscall from `persist_mode`, so that mapping
+        // stays the one place the modes are defined and
+        // `durability_modes_map_to_distinct_syscalls` keeps pinning
+        // something real.
+        let mode = durability.persist_mode();
         match durability {
-            // Both of these mean exactly what they say, so they go straight
-            // through: one is a promise to sync before returning, the other a
-            // promise not to. Neither has anything to gain from waiting.
-            Durability::Strict | Durability::Relaxed => {
-                batch.durability(Some(durability.persist_mode())).commit()?;
+            // `Buffer` is the absence of a barrier, and the bytes are already
+            // in the journal. A promise not to sync now, kept.
+            Durability::Relaxed => Ok(()),
+            // Not coalesced: `strict` exists for deployments that want the
+            // barrier they asked for, not the cheapest correct one.
+            Durability::Strict => {
+                self.keyspace.persist(mode)?;
                 Ok(())
             }
-            // Land the bytes in the journal without syncing, then take the
-            // next sync going -- which is ours to lead if nobody else is
+            // Take the next sync going -- ours to lead if nobody else is
             // already running one.
-            Durability::Group => {
-                batch.durability(Some(PersistMode::Buffer)).commit()?;
-                self.group.sync(&self.keyspace)
-            }
+            Durability::Group => self.group.sync(&self.keyspace, mode),
         }
     }
 
@@ -855,6 +920,27 @@ impl<'a, S: Store> RoomStore<'a, S> {
         self.commit_entry_with(entry, log, &[], durability)
     }
 
+    /// [`Self::commit_entry_with`] without the fsync.
+    ///
+    /// The entry and its records are journalled atomically, exactly as the
+    /// durable form does; only the sync is left to the caller, which must
+    /// follow with [`Store::sync`] before telling anyone the write happened.
+    /// Splitting them lets the append path hold its lock across the ordering
+    /// and release it before the disk barrier -- see [`Store::commit_deferred`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the batch cannot be journalled, or
+    /// [`StoreError::StateNotResident`] if the entry's state has been evicted.
+    pub fn journal_entry_with(
+        &self,
+        entry: &spindle_core::LogEntry,
+        log: &RoomLog,
+        extra: &[Record],
+    ) -> Result<(), StoreError> {
+        self.write_entry(entry, log, extra, None)
+    }
+
     /// As [`Self::commit_entry`], with extra records in the *same* batch.
     ///
     /// The caller's records land if and only if the entry does. That matters
@@ -874,6 +960,18 @@ impl<'a, S: Store> RoomStore<'a, S> {
         log: &RoomLog,
         extra: &[Record],
         durability: Durability,
+    ) -> Result<(), StoreError> {
+        self.write_entry(entry, log, extra, Some(durability))
+    }
+
+    /// The batch both forms build. `durability` of `None` journals without
+    /// syncing.
+    fn write_entry(
+        &self,
+        entry: &spindle_core::LogEntry,
+        log: &RoomLog,
+        extra: &[Record],
+        durability: Option<Durability>,
     ) -> Result<(), StoreError> {
         // Only the nodes this entry actually created. Path copying means an
         // unchanged subtree keeps its content address, so the walk stops as
@@ -906,7 +1004,10 @@ impl<'a, S: Store> RoomStore<'a, S> {
         }
         writes.extend_from_slice(extra);
 
-        self.store.commit(&writes, durability)
+        match durability {
+            Some(durability) => self.store.commit(&writes, durability),
+            None => self.store.commit_deferred(&writes),
+        }
     }
 
     fn meta(log: &RoomLog) -> RoomRecord {
