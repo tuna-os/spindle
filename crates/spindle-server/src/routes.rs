@@ -284,6 +284,64 @@ struct PresenceRequest {
     status_msg: Option<String>,
 }
 
+/// `POST /_matrix/client/v3/rooms/{room_id}/report/{event_id}`
+///
+/// A user tells the server's operators that an event is a problem. The
+/// report goes into the admin audit log, which is the feed an operator
+/// already reads -- a report stored somewhere nobody looks is not a
+/// moderation feature, it is the appearance of one.
+///
+/// **404 covers both "no such event" and "you cannot see it", deliberately
+/// and per the spec.** Distinguishing them would turn this endpoint into an
+/// oracle for whether a given event ID exists in a room the caller is not
+/// in, which is exactly the thing a reporting endpoint must not become.
+async fn report_event(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
+    Json(request): Json<ReportRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    // The spec's range, and it is signed: a "score" here runs from -100
+    // (worst) to 0, so a positive number is a caller who has misread the
+    // API rather than one paying a compliment.
+    if let Some(score) = request.score
+        && !(-100..=0).contains(&score)
+    {
+        return Err(MatrixError::bad_json(format!(
+            "score must be between -100 and 0, not {score}"
+        )));
+    }
+    let not_found = || MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such event");
+    if may_read_room(&state, &identity.user_id, &room_id).is_err() {
+        return Err(not_found());
+    }
+    state
+        .rooms
+        .event(&room_id, &event_id)
+        .map_err(|_| not_found())?;
+
+    crate::admin::audit(
+        &state,
+        &identity.user_id,
+        "report",
+        &event_id,
+        &json!({
+            "room_id": room_id,
+            "reason": request.reason,
+            "score": request.score,
+        }),
+    )?;
+    Ok(Json(json!({})))
+}
+
+#[derive(Debug, Deserialize)]
+struct ReportRequest {
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    score: Option<i64>,
+}
+
 /// The surface only an appservice speaks.
 fn appservice_routes() -> Router<AppState> {
     Router::new().route(
@@ -516,6 +574,10 @@ fn timeline_routes() -> Router<AppState> {
         .route(
             "/_matrix/client/v3/rooms/{room_id}/read_markers",
             post(read_markers),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/report/{event_id}",
+            post(report_event),
         )
         .route(
             "/_matrix/client/v3/rooms/{room_id}/redact/{event_id}/{txn_id}",
