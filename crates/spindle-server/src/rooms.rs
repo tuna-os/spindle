@@ -375,6 +375,7 @@ impl Rooms {
         preset: Option<&str>,
         initial_state: &[(String, String, Value)],
         version: Option<&str>,
+        creation_content: Option<&serde_json::Map<String, Value>>,
     ) -> Result<String, RoomError> {
         // The requested version, or this build's default. Refused rather
         // than substituted: handing back a different version than was asked
@@ -391,11 +392,8 @@ impl Rooms {
             .ok()
             .and_then(|id| id.rules())
             .is_some_and(|rules| rules.authorization.explicitly_privilege_room_creators);
-        let create_content = if privileges_creators {
-            serde_json::json!({ "room_version": version })
-        } else {
-            serde_json::json!({ "room_version": version, "creator": creator })
-        };
+        let create_content =
+            build_create_content(version, creator, privileges_creators, creation_content);
         // MSC4291 inverts the order a room is born in. Before v12 the ID
         // was chosen and the create event then named it; from v12 the ID
         // *is* the create event's hash, so the event must be signed before
@@ -5062,6 +5060,7 @@ mod room_version_tests {
                 None,
                 &[],
                 Some(unsupported),
+                None,
             );
             assert!(
                 matches!(result, Err(RoomError::UnsupportedVersion(ref named)) if named == unsupported),
@@ -5084,6 +5083,7 @@ mod room_version_tests {
                 None,
                 &[],
                 Some("11"),
+                None,
             )
             .expect("v11 is advertised and must be accepted");
         assert_eq!(rooms.room_version(&room_id).unwrap(), RoomVersionId::V11);
@@ -5113,7 +5113,16 @@ mod room_version_tests {
         let (_dir, store, rooms) = rooms();
         let key = key();
         let room_id = rooms
-            .create("@alice:example.org", &key, None, None, None, &[], None)
+            .create(
+                "@alice:example.org",
+                &key,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                None,
+            )
             .unwrap();
 
         let restarted = Rooms::new(store, "example.org");
@@ -5154,6 +5163,7 @@ mod room_version_tests {
                 None,
                 &[],
                 Some("12"),
+                None,
             )
             .expect("v12 is advertised");
 
@@ -5194,6 +5204,7 @@ mod room_version_tests {
                 None,
                 &[],
                 Some("12"),
+                None,
             )
             .unwrap();
         let create = rooms
@@ -5233,6 +5244,7 @@ mod room_version_tests {
                 None,
                 &[],
                 Some("11"),
+                None,
             )
             .unwrap();
         assert!(room_id.ends_with(":example.org"), "{room_id}");
@@ -5264,6 +5276,7 @@ mod room_version_tests {
                 None,
                 &[],
                 Some("12"),
+                None,
             )
             .unwrap();
         let event_id = rooms
@@ -5314,7 +5327,16 @@ mod room_version_tests {
         let (_dir, _store, rooms) = rooms();
         let key = key();
         let room_id = rooms
-            .create("@alice:example.org", &key, None, None, None, &[], None)
+            .create(
+                "@alice:example.org",
+                &key,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                None,
+            )
             .unwrap();
 
         assert_eq!(
@@ -5362,7 +5384,16 @@ mod room_version_tests {
         let (_dir, store, rooms) = rooms();
         let key = key();
         let room_id = rooms
-            .create("@alice:example.org", &key, None, None, None, &[], None)
+            .create(
+                "@alice:example.org",
+                &key,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                None,
+            )
             .unwrap();
 
         // Same store, empty caches -- the state a server comes back up in.
@@ -5377,4 +5408,44 @@ mod room_version_tests {
             )
             .expect("an append with a cold cache must not hang or fail");
     }
+}
+
+/// The `m.room.create` content: what the server decides, plus what the client
+/// asked for, with the server's keys winning.
+///
+/// `creation_content` is how a client says what *kind* of room this is --
+/// `type: "m.space"` above all -- and how it sets `m.federate`.
+///
+/// Two keys are the server's, and are written *after* the client's so a client
+/// cannot claim them:
+///
+/// - **`room_version`**, negotiated and refused-rather-than-substituted by the
+///   caller. A client that could set it here would be describing a room that
+///   is not the one being built.
+/// - **`creator`**, which before v12 is an authorization input. A client that
+///   could set it would be handing itself somebody else's privileges.
+///
+/// Winning silently rather than refusing is deliberate: the spec says the
+/// server should ignore these keys, and a client echoing back the same
+/// `room_version` it already asked for in the outer field is not doing
+/// anything wrong.
+fn build_create_content(
+    version: &str,
+    creator: &str,
+    privileges_creators: bool,
+    supplied: Option<&serde_json::Map<String, Value>>,
+) -> Value {
+    let reserved = if privileges_creators {
+        serde_json::json!({ "room_version": version })
+    } else {
+        serde_json::json!({ "room_version": version, "creator": creator })
+    };
+    let Some(supplied) = supplied else {
+        return reserved;
+    };
+    let mut content = supplied.clone();
+    if let Value::Object(reserved) = reserved {
+        content.extend(reserved);
+    }
+    Value::Object(content)
 }

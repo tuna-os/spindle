@@ -522,7 +522,7 @@ async fn an_invite_or_a_join_clears_the_forget_marker() {
     let alice = "@alice:example.org";
     let bob = "@bob:example.org";
     let room = rooms
-        .create(alice, key.pair(), None, None, None, &[], None)
+        .create(alice, key.pair(), None, None, None, &[], None, None)
         .unwrap();
 
     let member = |room: &str, sender: &str, target: &str, membership: &str| {
@@ -551,7 +551,7 @@ async fn an_invite_or_a_join_clears_the_forget_marker() {
     // deleted it would survive -- which is precisely what happened when this
     // test first tried to make the point with an invite in the way.
     let open = rooms
-        .create(alice, key.pair(), None, None, None, &[], None)
+        .create(alice, key.pair(), None, None, None, &[], None, None)
         .unwrap();
     rooms
         .set_state(
@@ -577,7 +577,7 @@ async fn an_invite_or_a_join_clears_the_forget_marker() {
     // both the user and the room, and a delete that ignored the room would
     // silently unhide every room the user had ever forgotten.
     let other = rooms
-        .create(alice, key.pair(), None, None, None, &[], None)
+        .create(alice, key.pair(), None, None, None, &[], None, None)
         .unwrap();
     member(&other, alice, bob, "invite");
     member(&other, bob, bob, "leave");

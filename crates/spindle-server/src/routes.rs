@@ -2921,6 +2921,11 @@ struct CreateRoomRequest {
     /// safer way round: a client that forgets the field gets an unlisted
     /// room rather than an advertised one.
     visibility: Option<String>,
+    /// Extra `m.room.create` content -- `type: "m.space"`, `m.federate`.
+    ///
+    /// The server keeps `room_version` and `creator` for itself; see
+    /// [`crate::rooms::Rooms::create`].
+    creation_content: Option<serde_json::Map<String, Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2975,6 +2980,7 @@ async fn create_room(
                 .room_version
                 .as_deref()
                 .filter(|version| crate::surface::supports_room_version(version)),
+            request.creation_content.as_ref(),
         )
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
     // Invites after the room stands, refused invites failing the create the
