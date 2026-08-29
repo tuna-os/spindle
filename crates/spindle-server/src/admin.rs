@@ -158,6 +158,29 @@ fn audit(
 }
 
 /// `@name:this.server` → `name`; anything else is not ours.
+/// Whether `user_id` is a live admin account on this server.
+///
+/// The same predicate [`AdminActor`] enforces, exposed for handlers that treat
+/// admin as *one* way to be allowed rather than the only one -- the extractor
+/// rejects a non-admin outright, which is the wrong shape when membership also
+/// grants the right.
+///
+/// # Errors
+///
+/// Returns [`crate::accounts::AccountError`] if the account cannot be read.
+pub fn is_server_admin(
+    state: &AppState,
+    user_id: &str,
+) -> Result<bool, crate::accounts::AccountError> {
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let Some(localpart) = local_localpart(state, user_id) else {
+        return Ok(false);
+    };
+    Ok(accounts
+        .account(&localpart)?
+        .is_some_and(|account| account.admin && !account.deactivated))
+}
+
 fn local_localpart(state: &AppState, user_id: &str) -> Option<String> {
     user_id
         .strip_prefix('@')
