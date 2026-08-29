@@ -2961,11 +2961,26 @@ impl Rooms {
         let invited = self.invited(user_id)?;
         let knocked = self.knocked(user_id)?;
 
+        // One pass for the whole sync, joined and left sections alike --
+        // never one per room. `None` on an initial sync, which reads tails
+        // instead and has no stream range to walk.
+        let slice = match since {
+            Some(since) => Some(self.stream_slice(since, position)?),
+            None => None,
+        };
+
         let mut rooms = Vec::new();
         for room_id in joined {
-            let (events, limited) = match since {
+            let (events, limited) = match &slice {
                 None => self.timeline_tail(&room_id, timeline_limit)?,
-                Some(since) => (self.timeline_since(&room_id, since, position, None)?, false),
+                Some(slice) => (
+                    self.timeline_of(
+                        &room_id,
+                        slice.get(&room_id).map_or(&[][..], Vec::as_slice),
+                        None,
+                    )?,
+                    false,
+                ),
             };
             // An incremental sync says nothing about a room where nothing
             // happened. A client diffing rooms it was sent against rooms it
@@ -2988,7 +3003,7 @@ impl Rooms {
             });
         }
 
-        let left = self.left_rooms(user_id, since, position)?;
+        let left = self.left_rooms(user_id, since, slice.as_ref())?;
 
         // How stale was the freshest thing we just handed over? A client
         // keeping up sees milliseconds; a server falling behind sees this
@@ -3064,7 +3079,7 @@ impl Rooms {
         &self,
         user_id: &str,
         since: Option<u64>,
-        position: u64,
+        slice: Option<&HashMap<String, Vec<i64>>>,
     ) -> Result<Vec<SyncRoom>, RoomError> {
         let mut out = Vec::new();
         for membership in [LEAVE, BAN] {
@@ -3076,11 +3091,13 @@ impl Rooms {
                 else {
                     continue;
                 };
-                let events = match since {
+                let events = match slice {
                     None => vec![departure],
-                    Some(since) => {
-                        self.timeline_since(&room_id, since, position, Some(departed_at))?
-                    }
+                    Some(slice) => self.timeline_of(
+                        &room_id,
+                        slice.get(&room_id).map_or(&[][..], Vec::as_slice),
+                        Some(departed_at),
+                    )?,
                 };
                 // An incremental sync says nothing about a room the user left
                 // long ago, for the same reason it says nothing about a joined
@@ -3152,14 +3169,28 @@ impl Rooms {
     /// and an earlier draft of this filtered on `unsigned.li`, a field that
     /// does not exist. Every comparison silently succeeded and the cap did
     /// nothing at all.
-    fn timeline_since(
+    /// One pass over the stream range, bucketed by room.
+    ///
+    /// **This is read once per sync, not once per room.** The stream is the
+    /// server's order, so "what happened since this token" is one question
+    /// with one answer; asking it per room made a sync cost
+    /// `joined_rooms x events_accepted_server_wide`, which is a product of
+    /// two things a client does not control -- the second being other
+    /// people's traffic in rooms it is not even in. Measured before the
+    /// change at 1,601 point reads for eight rooms over 200 foreign events,
+    /// and exactly `rooms x elsewhere + 1` at every size
+    /// (`tests/sync_cost.rs`).
+    ///
+    /// The remaining cost is linear in the range, which is inherent to
+    /// reading a server-wide order and is not fixed here: that needs a
+    /// reverse `(room, stream_id)` index, which is a stored format and a
+    /// migration.
+    fn stream_slice(
         &self,
-        room_id: &str,
         since: u64,
         position: u64,
-        max_li: Option<i64>,
-    ) -> Result<Vec<Value>, RoomError> {
-        let mut out = Vec::new();
+    ) -> Result<HashMap<String, Vec<i64>>, RoomError> {
+        let mut by_room: HashMap<String, Vec<i64>> = HashMap::new();
         for stream_id in (since + 1)..=position {
             let Some(raw) = spindle_store::ReadView::get(
                 self.store.as_ref(),
@@ -3171,16 +3202,32 @@ impl Rooms {
             let Some(record) = StreamRecord::decode(&raw) else {
                 continue;
             };
-            if record.room_id != room_id {
+            by_room.entry(record.room_id).or_default().push(record.li);
+        }
+        Ok(by_room)
+    }
+
+    /// The events a room contributed to a stream range, as bodies.
+    ///
+    /// Takes the room's own indices rather than finding them, so the caller
+    /// pays for the stream range once -- see [`Self::stream_slice`].
+    fn timeline_of(
+        &self,
+        room_id: &str,
+        indices: &[i64],
+        max_li: Option<i64>,
+    ) -> Result<Vec<Value>, RoomError> {
+        let mut out = Vec::new();
+        for &li in indices {
+            if max_li.is_some_and(|max| li > max) {
                 continue;
             }
-            if max_li.is_some_and(|max| record.li > max) {
-                continue;
-            }
+            // `entry_at` rather than a scan of `entries()`: the log is a
+            // BTreeMap, and searching it linearly here made the read
+            // quadratic in the room's length on a path that runs per event.
             let event_id = self.with_room(room_id, |_, log| {
                 Ok(log
-                    .entries()
-                    .find(|entry| entry.li.get() == record.li)
+                    .entry_at(li)
                     .map(|entry| entry.event_id.as_str().to_owned()))
             })?;
             if let Some(event_id) = event_id {

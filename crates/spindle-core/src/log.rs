@@ -329,6 +329,18 @@ impl RoomLog {
             .and_then(|li| self.entries.get(li))
     }
 
+    /// The entry at exactly `li`, if the log still holds it.
+    ///
+    /// `entries` is a `BTreeMap`, so this is a probe rather than a walk.
+    /// Worth its own method because the alternative reads naturally and is
+    /// not: `entries().find(|e| e.li.get() == li)` is a linear scan of the
+    /// room, and on a path that runs per event it makes the whole read
+    /// quadratic in the room's length.
+    #[must_use]
+    pub fn entry_at(&self, li: i64) -> Option<&LogEntry> {
+        self.entries.get(&li)
+    }
+
     /// The newest entry at or before `li` — the seek behind "what did
     /// this room look like at that point" (SPEC §17.4). One `BTreeMap`
     /// range probe; `None` means the log starts after that point.
