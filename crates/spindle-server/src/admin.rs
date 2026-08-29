@@ -127,7 +127,7 @@ impl FromRequestParts<AppState> for AdminActor {
 /// action succeeded — the record says what happened, not what was
 /// attempted, and a storage failure writing it is a server error the
 /// caller hears about rather than a silent gap in the log.
-fn audit(
+pub(crate) fn audit(
     state: &AppState,
     actor: &str,
     action: &str,
