@@ -106,8 +106,24 @@ MILESTONES = [
      "E2EE key backup and not this. #42's parity gate vs Synapse and "
      "Tuwunel remains part of the definition of done."),
     ("M6", "Optional differentiators", "Not started", "#22 hub mode, #23 MLS."),
-    ("M7", "MatrixRTC", "Not started",
-     "#36–#41 — delayed events (MSC4140) first; no Rust homeserver has them."),
+    ("M7", "MatrixRTC", "In progress",
+     "#36's delayed events (MSC4140) are served, which no other Rust "
+     "homeserver has — Tuwunel's compliance table records the endpoints as "
+     "unimplemented despite having the Ruma types. All four endpoints, "
+     "authorisation at *fire* time rather than schedule time, survival "
+     "across a restart, and both caps configurable with a zero refused at "
+     "startup rather than silently disabling the mechanism. `restart` is "
+     "the hot path and costs no writes: it moves an in-memory deadline and "
+     "lets the fire loop settle the row when it reaches it, so the write "
+     "rate follows how much is happening rather than how many people are "
+     "on calls. The trade-off is recorded rather than implied — a crash "
+     "loses the bumps and a delay fires early, never late, which is the "
+     "direction a dead-man's switch should fail in. MSC4309 reports "
+     "finished delays on `/sync` under the unstable name, capped per user "
+     "and evicted oldest-first. What #36 still owes is its three "
+     "benchmarks: restart throughput at 10/100/1000, firing jitter "
+     "p50/p99, and reload at 10k. #37–#41 are not started; #269 would run "
+     "Element Call's own Playwright suite against this server."),
 ]
 
 # ---------------------------------------------------------------------------
