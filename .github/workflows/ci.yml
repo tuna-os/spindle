@@ -56,6 +56,14 @@ jobs:
       # merge, and its output is what somebody reads when one does. Both are
       # worth a test: #228 is a case where the gate was right, and #231 one
       # where what it printed was not enough to act on.
+      - name: Check every room read asks who is asking
+        # semgrep rather than an action, for the reason the cargo-deny step
+        # gives: one fewer third party running before our code in a job
+        # holding a token. Pinned, because a rule engine that changes how it
+        # parses Rust changes what this gate catches.
+        run: |
+          pip install --quiet semgrep==1.175.0
+          python3 scripts/authorization-rule.py
       - name: Audit the dependency graph
         # Installed rather than run through an action: every action here is
         # SHA-pinned and Dependabot-tracked (#182), and adding one more
