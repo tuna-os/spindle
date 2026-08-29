@@ -167,7 +167,6 @@ async fn an_unimplemented_endpoint_is_a_404_not_a_stub() {
     // built, and `/sync` until sync was, and the test said so on each of the
     // commits that built them.
     for path in [
-        "/_matrix/client/v3/publicRooms",
         "/_matrix/client/v3/account/password",
         "/_matrix/client/v3/profile/@alice:example.org",
     ] {

@@ -261,6 +261,13 @@ pub enum Keyspace {
     /// block is lifted. Its presence is the block; the value records who
     /// and when, for the audit trail's benefit.
     RoomBlock = 0x28,
+    /// `room_id` → the room is published in this server's room directory.
+    ///
+    /// Presence is the publication; the value records who published it and
+    /// when. Visibility is deliberately *not* room state: it is one server's
+    /// decision about its own directory, not a fact about the room, and two
+    /// servers sharing a room are each entitled to a different answer.
+    PublishedRoom = 0x29,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -315,6 +322,30 @@ pub fn purge_watermark(room_id: &str) -> Vec<u8> {
 #[must_use]
 pub fn room_block(room_id: &str) -> Vec<u8> {
     room_prefix(Keyspace::RoomBlock, room_id)
+}
+
+/// A room's entry in this server's published-room directory.
+#[must_use]
+pub fn published_room(room_id: &str) -> Vec<u8> {
+    room_prefix(Keyspace::PublishedRoom, room_id)
+}
+
+/// Every published room, for a directory scan.
+#[must_use]
+pub fn published_rooms_prefix() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::PublishedRoom as u8]
+}
+
+/// Recover the room ID from a key [`room_prefix`] built.
+///
+/// Here rather than at the call site because the layout -- a schema byte, a
+/// keyspace byte, a big-endian length, then the ID -- is this module's to
+/// know. A scan that peeled the header off by hand would be a second copy of
+/// that knowledge, and the copy is what goes stale when the layout moves.
+#[must_use]
+pub fn room_from_prefixed(key: &[u8]) -> Option<&str> {
+    let length = usize::from(u16::from_be_bytes([*key.get(2)?, *key.get(3)?]));
+    std::str::from_utf8(key.get(4..4 + length)?).ok()
 }
 
 /// Map an `i64` onto `u64` so that big-endian byte order matches numeric order.

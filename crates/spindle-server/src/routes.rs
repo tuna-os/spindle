@@ -358,6 +358,14 @@ fn room_routes() -> Router<AppState> {
             "/_matrix/client/v3/rooms/{room_id}/aliases",
             get(room_aliases),
         )
+        .route(
+            "/_matrix/client/v3/directory/list/room/{room_id}",
+            get(get_room_visibility).put(set_room_visibility),
+        )
+        .route(
+            "/_matrix/client/v3/publicRooms",
+            get(public_rooms).post(public_rooms_filtered),
+        )
         // Two paths for one endpoint. MSC3266 shipped under the unstable
         // prefix long enough that clients still ask for it there, and it
         // became `/v1/room_summary` in Matrix 1.15. Serving both costs one
@@ -2914,6 +2922,12 @@ struct CreateRoomRequest {
     initial_state: Vec<InitialStateEvent>,
     room_alias_name: Option<String>,
     room_version: Option<String>,
+    /// `"public"` publishes the new room in this server's directory.
+    ///
+    /// Defaults to private, which is what the spec asks for and also the
+    /// safer way round: a client that forgets the field gets an unlisted
+    /// room rather than an advertised one.
+    visibility: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2974,6 +2988,14 @@ async fn create_room(
     // way the spec asks (the room still exists; the error names why).
     for target in &request.invite {
         invite_user(&state, &identity.user_id, &room_id, target, None).await?;
+    }
+    if request.visibility.as_deref() == Some("public") {
+        // The creator is joined by construction, so `may_publish` would pass;
+        // calling it anyway would be a round-trip to re-learn that.
+        state
+            .directory
+            .publish(&room_id, &identity.user_id)
+            .map_err(|error| directory_error(&error))?;
     }
     if let Some(localpart) = request.room_alias_name.as_deref() {
         let alias = format!("#{localpart}:{}", state.config.server.name);
@@ -6742,4 +6764,275 @@ async fn room_messages(
         );
     }
     Ok(Json(Value::Object(body)))
+}
+
+/// May `user_id` change whether `room_id` appears in this server's directory?
+///
+/// The rule: **a joined member may publish their own room; a server admin may
+/// publish any.** That is deliberately stricter than alias creation, which
+/// lets any authenticated user claim any free alias -- the difference is that
+/// an alias is a name somebody has to already know, while the directory is a
+/// list this server actively hands to strangers. Publishing is therefore spam
+/// surface in a way that claiming `#foo:example.org` is not, and requiring
+/// membership makes the person answerable for the room they are advertising.
+///
+/// The spec explicitly leaves this to the server ("servers may choose to
+/// impose additional restrictions"), so this is a policy choice rather than a
+/// reading of the spec, and it is written here so it can be argued with.
+fn may_publish(state: &AppState, user_id: &str, room_id: &str) -> Result<(), MatrixError> {
+    if state
+        .rooms
+        .is_joined(user_id, room_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+    {
+        return Ok(());
+    }
+    let admin = crate::admin::is_server_admin(state, user_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    if admin {
+        return Ok(());
+    }
+    Err(MatrixError::forbidden(
+        "only a member of the room, or a server admin, may change its directory visibility",
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct VisibilityRequest {
+    visibility: String,
+}
+
+/// `PUT /_matrix/client/v3/directory/list/room/{room_id}`
+async fn set_room_visibility(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    Json(request): Json<VisibilityRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    // A room that does not exist cannot be advertised. Checked before the
+    // permission test so that "no such room" does not come back as a refusal,
+    // which would tell a stranger the room exists and they simply are not in
+    // it.
+    state.rooms.exists(&room_id).map_err(room_error)?;
+    may_publish(&state, &identity.user_id, &room_id)?;
+
+    match request.visibility.as_str() {
+        "public" => state
+            .directory
+            .publish(&room_id, &identity.user_id)
+            .map_err(|error| directory_error(&error))?,
+        "private" => state
+            .directory
+            .unpublish(&room_id)
+            .map_err(|error| directory_error(&error))?,
+        other => {
+            return Err(MatrixError::bad_json(format!(
+                "visibility must be \"public\" or \"private\", not {other:?}"
+            )));
+        }
+    }
+    Ok(Json(json!({})))
+}
+
+/// `GET /_matrix/client/v3/directory/list/room/{room_id}`
+///
+/// Unauthenticated, as the spec has it: the directory is public, so whether a
+/// room is in it is public too.
+async fn get_room_visibility(
+    State(state): State<AppState>,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    let published = state
+        .directory
+        .is_published(&room_id)
+        .map_err(|error| directory_error(&error))?;
+    Ok(Json(json!({
+        "visibility": if published { "public" } else { "private" },
+    })))
+}
+
+/// One page of the room directory.
+#[derive(Debug, Default, Deserialize)]
+struct PublicRoomsQuery {
+    limit: Option<usize>,
+    since: Option<String>,
+    /// Another server's directory. Not served yet -- see the handler.
+    server: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PublicRoomsFilter {
+    generic_search_term: Option<String>,
+    #[serde(default)]
+    room_types: Vec<Option<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PublicRoomsRequest {
+    limit: Option<usize>,
+    since: Option<String>,
+    #[serde(default)]
+    filter: PublicRoomsFilter,
+    server: Option<String>,
+}
+
+/// The directory's default and maximum page size.
+///
+/// A client that asks for everything gets a page, not everything: the
+/// directory is the one endpoint a stranger can call to make this server
+/// render every published room's state at once.
+const DIRECTORY_PAGE: usize = 50;
+const DIRECTORY_PAGE_MAX: usize = 200;
+
+fn chunk_of(summary: &crate::rooms::RoomSummary) -> Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("room_id".to_owned(), json!(summary.room_id));
+    entry.insert(
+        "num_joined_members".to_owned(),
+        json!(summary.num_joined_members),
+    );
+    entry.insert("world_readable".to_owned(), json!(summary.world_readable));
+    entry.insert("guest_can_join".to_owned(), json!(summary.guest_can_join));
+    for (field, value) in [
+        ("name", summary.name.clone()),
+        ("topic", summary.topic.clone()),
+        ("avatar_url", summary.avatar_url.clone()),
+        ("canonical_alias", summary.canonical_alias.clone()),
+        ("join_rule", summary.join_rule.clone()),
+        ("room_type", summary.room_type.clone()),
+    ] {
+        if let Some(value) = value {
+            entry.insert(field.to_owned(), json!(value));
+        }
+    }
+    Value::Object(entry)
+}
+
+fn matches_term(summary: &crate::rooms::RoomSummary, term: &str) -> bool {
+    let needle = term.trim().to_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    [
+        summary.name.as_deref(),
+        summary.topic.as_deref(),
+        summary.canonical_alias.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|field| field.to_lowercase().contains(&needle))
+}
+
+/// Build one page of the directory.
+///
+/// `since` is an offset into the room-ID-ordered list rather than a cursor
+/// into storage. That is honest about what it is: the directory is a
+/// materialised list rebuilt per request, so a token pointing at a room could
+/// name one that has since been unpublished, and an offset degrades more
+/// gracefully -- a page boundary shifts by one instead of the whole listing
+/// failing.
+fn directory_page(
+    state: &AppState,
+    limit: Option<usize>,
+    since: Option<&str>,
+    term: Option<&str>,
+    room_types: &[Option<String>],
+) -> Result<Json<Value>, MatrixError> {
+    let limit = limit.unwrap_or(DIRECTORY_PAGE).clamp(1, DIRECTORY_PAGE_MAX);
+    let offset: usize = match since {
+        Some(token) => token.parse().map_err(|_| {
+            MatrixError::bad_json("since is not a directory token this server issued")
+        })?,
+        None => 0,
+    };
+
+    let published = state
+        .directory
+        .published()
+        .map_err(|error| directory_error(&error))?;
+
+    // A published room whose summary cannot be read is skipped rather than
+    // failing the page. The directory is a list of pointers, and one dangling
+    // pointer -- a room purged while still published -- must not take the
+    // whole listing down with it.
+    let mut visible: Vec<crate::rooms::RoomSummary> = Vec::new();
+    for room_id in &published {
+        let Ok(summary) = state.rooms.summary(room_id) else {
+            continue;
+        };
+        if term.is_some_and(|term| !matches_term(&summary, term)) {
+            continue;
+        }
+        if !room_types.is_empty() && !room_types.contains(&summary.room_type) {
+            continue;
+        }
+        visible.push(summary);
+    }
+
+    let total = visible.len();
+    let page: Vec<Value> = visible
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(chunk_of)
+        .collect();
+
+    let mut body = serde_json::Map::new();
+    body.insert("chunk".to_owned(), Value::Array(page));
+    body.insert("total_room_count_estimate".to_owned(), json!(total));
+    if offset + limit < total {
+        body.insert("next_batch".to_owned(), json!((offset + limit).to_string()));
+    }
+    if offset > 0 {
+        body.insert(
+            "prev_batch".to_owned(),
+            json!(offset.saturating_sub(limit).to_string()),
+        );
+    }
+    Ok(Json(Value::Object(body)))
+}
+
+/// Another server's directory is that server's to serve.
+///
+/// Refused rather than silently answered from our own list, which would show
+/// a client our rooms under someone else's name. The federated read is a
+/// follow-up.
+fn refuse_remote_directory(server: Option<&String>, ours: &str) -> Result<(), MatrixError> {
+    match server {
+        Some(name) if name != ours => Err(MatrixError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "M_UNRECOGNIZED",
+            "this server does not proxy another server's room directory yet",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// `GET /_matrix/client/v3/publicRooms`
+async fn public_rooms(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<PublicRoomsQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    refuse_remote_directory(query.server.as_ref(), &state.config.server.name)?;
+    directory_page(&state, query.limit, query.since.as_deref(), None, &[])
+}
+
+/// `POST /_matrix/client/v3/publicRooms`
+///
+/// Authenticated, unlike the GET form: the spec has it that way, and the
+/// filter is the reason -- a search term is a thing a user types, so it is
+/// attributable.
+async fn public_rooms_filtered(
+    State(state): State<AppState>,
+    Authenticated(_identity): Authenticated,
+    Json(request): Json<PublicRoomsRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    refuse_remote_directory(request.server.as_ref(), &state.config.server.name)?;
+    directory_page(
+        &state,
+        request.limit,
+        request.since.as_deref(),
+        request.filter.generic_search_term.as_deref(),
+        &request.filter.room_types,
+    )
 }

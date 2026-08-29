@@ -198,3 +198,87 @@ impl std::fmt::Display for DirectoryError {
 }
 
 impl std::error::Error for DirectoryError {}
+
+/// Who published a room to this server's directory, and when.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PublishedRecord {
+    pub published_by: String,
+    pub published_at: u64,
+}
+
+impl Directory {
+    /// Publish a room in this server's directory.
+    ///
+    /// Visibility is deliberately **not** room state. A published room is one
+    /// server's decision about its own directory, not a fact about the room:
+    /// two servers sharing a room are each entitled to a different answer, and
+    /// writing it into the room would broadcast one server's editorial choice
+    /// to every other. The spec agrees -- `m.room.join_rules` governs who may
+    /// enter, and the directory is a separate list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DirectoryError`] if the row cannot be written.
+    pub fn publish(&self, room_id: &str, published_by: &str) -> Result<(), DirectoryError> {
+        let record = PublishedRecord {
+            published_by: published_by.to_owned(),
+            published_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or_default(),
+        };
+        Store::put(
+            self.store.as_ref(),
+            &keys::published_room(room_id),
+            &serde_json::to_vec(&record)?,
+        )?;
+        Ok(())
+    }
+
+    /// Remove a room from this server's directory. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DirectoryError`] if the row cannot be removed.
+    pub fn unpublish(&self, room_id: &str) -> Result<(), DirectoryError> {
+        Store::delete(self.store.as_ref(), &keys::published_room(room_id))?;
+        Ok(())
+    }
+
+    /// Whether the room is in this server's directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DirectoryError`] if the row cannot be read.
+    pub fn is_published(&self, room_id: &str) -> Result<bool, DirectoryError> {
+        Ok(ReadView::get(self.store.as_ref(), &keys::published_room(room_id))?.is_some())
+    }
+
+    /// Every published room, in room-ID order.
+    ///
+    /// Paging needs a *stable total order*, and the store's prefix scan
+    /// already supplies one -- so the explicit sort is not what makes paging
+    /// correct today. What it buys is independence from the key layout:
+    /// `room_prefix` puts a big-endian length ahead of the ID, so raw store
+    /// order groups by ID length before content, and any future change to
+    /// that layout would silently re-order the directory under clients
+    /// half-way through walking it. Sorting here means the order is a
+    /// property of this function rather than of how keys happen to be built.
+    ///
+    /// A directory that reordered itself between two pages would show some
+    /// rooms twice and skip others, and the skip is the invisible half.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DirectoryError`] if the scan fails.
+    pub fn published(&self) -> Result<Vec<String>, DirectoryError> {
+        let prefix = keys::published_rooms_prefix();
+        let mut rooms: Vec<String> = ReadView::scan_prefix(self.store.as_ref(), &prefix)?
+            .into_iter()
+            .filter_map(|(key, _)| keys::room_from_prefixed(&key).map(str::to_owned))
+            .collect();
+        rooms.sort();
+        rooms.dedup();
+        Ok(rooms)
+    }
+}
