@@ -92,10 +92,19 @@ MILESTONES = [
      "its own listener with the fork-case counter, append and HTTP "
      "histograms. #21 has its counting performance gate (`read_budget.rs`, "
      "#177), which asserts flat-in-membership rather than timing on CI. "
-     "**#20 has not started** — backup, restore, upgrades and Synapse "
-     "migration; `backups.rs` is M2's E2EE key backup and not this. #42's "
-     "parity gate vs Synapse and Tuwunel remains part of the definition of "
-     "done."),
+     "#20 is three-quarters done and split: `spindle backup`, `restore` and "
+     "`verify-media` are served, and #230 added versioned schema migrations "
+     "whose guarantees — chaining, the no-path refusal, dry runs writing "
+     "nothing, and the marker never landing ahead of the data — are proven "
+     "against synthetic tables; the real migration table is deliberately "
+     "empty because no schema change has yet needed a data rewrite, and "
+     "`docs/lifecycle.md` says so rather than implying otherwise. The "
+     "Synapse importer moved to #240 and is parked behind the API surface "
+     "and MatrixRTC: its fixture (#234, #237), ordering and divergence "
+     "check (#235) and SQLite reader (#239) are on main, and the exit "
+     "criterion has been executed end to end once. `backups.rs` is M2's "
+     "E2EE key backup and not this. #42's parity gate vs Synapse and "
+     "Tuwunel remains part of the definition of done."),
     ("M6", "Optional differentiators", "Not started", "#22 hub mode, #23 MLS."),
     ("M7", "MatrixRTC", "Not started",
      "#36–#41 — delayed events (MSC4140) first; no Rust homeserver has them."),
