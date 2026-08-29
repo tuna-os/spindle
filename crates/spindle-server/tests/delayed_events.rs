@@ -132,6 +132,62 @@ impl Harness {
         body["delay_id"].as_str().unwrap().to_owned()
     }
 
+    async fn invite(&self, room: &str, token: &str, username: &str) {
+        let (status, body) = self
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/_matrix/client/v3/rooms/{room}/invite"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "user_id": format!("@{username}:example.org") }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    async fn join(&self, room: &str, token: &str) {
+        let (status, body) = self
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/_matrix/client/v3/rooms/{room}/join"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    async fn set_state(
+        &self,
+        room: &str,
+        token: &str,
+        event_type: &str,
+        state_key: &str,
+        content: &Value,
+    ) {
+        let (status, body) = self
+            .call(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/_matrix/client/v3/rooms/{room}/state/{event_type}/{state_key}"
+                    ))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(content.to_string()))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
     async fn act(&self, delay_id: &str, token: &str, action: &str) -> (StatusCode, Value) {
         self.call(
             Request::builder()
@@ -432,6 +488,193 @@ async fn an_unbounded_delay_is_refused_with_its_limit() {
         body["error"].as_str().unwrap().contains("86400000"),
         "the limit must be in the message so a client can retry under it: {body}"
     );
+}
+
+/// One sender cannot fill the store with pending delays in one room.
+///
+/// The duration cap does not imply this one: a client can schedule an
+/// unbounded number of *short* delays as fast as it can send requests, and
+/// each is a row this server holds until it fires. #36 names that as the
+/// memory-amplification vector, and a cap on how long a delay lasts does
+/// nothing about how many there are.
+#[tokio::test]
+async fn one_sender_cannot_hold_unbounded_delays_in_one_room() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.create_room(&alice).await;
+
+    for index in 0..100 {
+        harness
+            .delay_message(&room, &alice, 600_000, &format!("d{index}"))
+            .await;
+    }
+
+    let (status, body) = harness
+        .call(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/_matrix/client/v3/rooms/{room}/send/m.room.message/over?{DELAY_PARAM}=600000"
+                ))
+                .header("authorization", format!("Bearer {alice}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "msgtype": "m.text", "body": "no" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_LIMIT_EXCEEDED", "{body}");
+    assert_eq!(harness.pending(&alice).await.len(), 100, "the cap leaked");
+}
+
+/// At the cap, a client can still keep the delays it has alive.
+///
+/// `restart` replaces a row rather than adding one, so it must not be
+/// counted against the cap. If it were, a client that reached the limit
+/// could never heartbeat again and every one of its pending departures would
+/// fire — turning a cap meant to protect the server into a way to eject
+/// every participant of a busy call at once.
+#[tokio::test]
+async fn a_client_at_the_cap_can_still_restart() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.create_room(&alice).await;
+
+    let mut ids = Vec::new();
+    for index in 0..100 {
+        ids.push(
+            harness
+                .delay_message(&room, &alice, 600_000, &format!("d{index}"))
+                .await,
+        );
+    }
+
+    let (status, body) = harness.act(&ids[0], &alice, "restart").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "restart was refused at the cap: {body}"
+    );
+    assert_eq!(harness.pending(&alice).await.len(), 100);
+}
+
+/// The cap is per room, not per server.
+#[tokio::test]
+async fn the_cap_does_not_span_rooms() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let first = harness.create_room(&alice).await;
+    let second = harness.create_room(&alice).await;
+
+    for index in 0..100 {
+        harness
+            .delay_message(&first, &alice, 600_000, &format!("d{index}"))
+            .await;
+    }
+    // The other room starts from zero.
+    harness
+        .delay_message(&second, &alice, 600_000, "elsewhere")
+        .await;
+    assert_eq!(harness.pending(&alice).await.len(), 101);
+}
+
+/// A delay from someone who has since lost permission is not sent.
+///
+/// #36 calls for this specifically: the sender's power level may have
+/// changed, or they may have been kicked, between scheduling and firing. The
+/// authorization that matters is the one at fire time, and it is the ordinary
+/// append path's — this test is what says the delayed path did not find a way
+/// around it.
+///
+/// Bob schedules a departure-shaped state event, then loses the power to send
+/// it. When it comes due the room must be unchanged, and the delay gone: a
+/// refused firing is resolved, not retried forever.
+#[tokio::test]
+async fn a_delay_is_authorised_when_it_fires_not_when_it_is_scheduled() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness.create_room(&alice).await;
+    harness.invite(&room, &alice, "bob").await;
+    harness.join(&room, &bob).await;
+
+    // Bob is given exactly enough to set state, and no more. Not 100: a user
+    // cannot change the power level of someone at their own level, so Alice
+    // could never demote him again and the test would be measuring that rule
+    // instead of this one.
+    harness
+        .set_state(
+            &room,
+            &alice,
+            "m.room.power_levels",
+            "",
+            &json!({
+                "users": { "@alice:example.org": 100, "@bob:example.org": 50 },
+                "events": {},
+                "events_default": 0,
+                "state_default": 50,
+            }),
+        )
+        .await;
+
+    let (status, body) = harness
+        .call(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/_matrix/client/v3/rooms/{room}/state/m.room.topic/?{DELAY_PARAM}=1"
+                ))
+                .header("authorization", format!("Bearer {bob}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "topic": "bob was here" }).to_string()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Demote Bob below what setting state needs.
+    harness
+        .set_state(
+            &room,
+            &alice,
+            "m.room.power_levels",
+            "",
+            &json!({
+                "users": { "@alice:example.org": 100, "@bob:example.org": 0 },
+                "events": {},
+                "events_default": 0,
+                "state_default": 50,
+            }),
+        )
+        .await;
+
+    // Give the loop time to try, then confirm it tried and was refused: the
+    // delay is gone, and the topic never landed.
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if harness.pending(&bob).await.is_empty() {
+            let (_, topic) = harness
+                .call(
+                    Request::builder()
+                        .uri(format!(
+                            "/_matrix/client/v3/rooms/{room}/state/m.room.topic/"
+                        ))
+                        .header("authorization", format!("Bearer {alice}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await;
+            assert_ne!(
+                topic["topic"], "bob was here",
+                "a sender who lost permission after scheduling still got the \
+                 event sent: {topic}"
+            );
+            return;
+        }
+    }
+    panic!("the delay never fired at all, so nothing was authorised either way");
 }
 
 /// An unknown action is refused rather than treated as one of the three.

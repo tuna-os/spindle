@@ -95,6 +95,11 @@ pub enum DelayError {
     TooLong {
         limit_ms: u64,
     },
+    /// This sender already has as many delays pending in this room as the
+    /// server will hold for them.
+    TooMany {
+        limit: usize,
+    },
     Store(StoreError),
 }
 
@@ -105,6 +110,10 @@ impl std::fmt::Display for DelayError {
             Self::TooLong { limit_ms } => {
                 write!(formatter, "the maximum delay is {limit_ms}ms")
             }
+            Self::TooMany { limit } => write!(
+                formatter,
+                "at most {limit} delayed events may be pending in one room"
+            ),
             Self::Store(error) => write!(formatter, "{error}"),
         }
     }
@@ -127,13 +136,33 @@ pub struct Delayed {
     /// client's say-so, and an uncapped one is an unbounded write anybody can
     /// make. A day is far past any call heartbeat and still finite.
     max_delay_ms: u64,
+    /// The most delays one sender may have pending in one room.
+    ///
+    /// The *count* cap, which the duration cap does not imply: a client can
+    /// schedule an unbounded number of short delays as fast as it can send
+    /// requests, and each is a stored row this server holds until it fires.
+    /// Without this, one account is a write amplifier against the store --
+    /// which #36 names as the reason to have it.
+    ///
+    /// Per sender *and* per room, because that is the unit a client works
+    /// in: Matrix RTC keeps one pending departure per call, so a legitimate
+    /// client sits at one and this is only ever reached by something that
+    /// has gone wrong or is trying to.
+    max_per_room: usize,
     /// Bumped whenever a row is written, so a caller can tell whether
     /// anything changed without reading the rows.
     generation: std::sync::atomic::AtomicU64,
 }
 
-/// The default cap: a day.
+/// The default duration cap: a day.
 pub const DEFAULT_MAX_DELAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// The default count cap, per sender per room.
+///
+/// Generous against any real client -- Matrix RTC keeps one pending
+/// departure per call -- and small enough that a misbehaving one is stopped
+/// long before it is a storage problem.
+pub const DEFAULT_MAX_PER_ROOM: usize = 100;
 
 impl Delayed {
     #[must_use]
@@ -141,6 +170,7 @@ impl Delayed {
         Self {
             store,
             max_delay_ms: DEFAULT_MAX_DELAY_MS,
+            max_per_room: DEFAULT_MAX_PER_ROOM,
             generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -170,6 +200,15 @@ impl Delayed {
         if delay_ms > self.max_delay_ms {
             return Err(DelayError::TooLong {
                 limit_ms: self.max_delay_ms,
+            });
+        }
+        // Counted before the write, so the cap is a refusal rather than a
+        // cleanup. `restart` deliberately does not come through here: it
+        // replaces a row rather than adding one, and a client sitting at the
+        // cap must still be able to keep the delays it has alive.
+        if self.pending_in(room_id, sender)? >= self.max_per_room {
+            return Err(DelayError::TooMany {
+                limit: self.max_per_room,
             });
         }
         let delay_id = format!("{:032x}", rand::random::<u128>());
@@ -240,6 +279,18 @@ impl Delayed {
             return Err(DelayError::NotFound);
         }
         Ok(event)
+    }
+
+    /// How many delays `sender` already has pending in `room_id`.
+    fn pending_in(&self, room_id: &str, sender: &str) -> Result<usize, DelayError> {
+        let rows = self
+            .store
+            .scan_prefix(&spindle_core::keys::delayed_event_prefix())?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(_, raw)| serde_json::from_slice::<DelayedEvent>(&raw).ok())
+            .filter(|event| event.sender == sender && event.room_id == room_id)
+            .count())
     }
 
     /// Every delay `sender` is waiting on.

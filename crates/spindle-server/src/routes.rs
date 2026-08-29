@@ -6583,6 +6583,14 @@ fn delay_error(error: crate::delayed::DelayError) -> MatrixError {
             "M_INVALID_PARAM",
             format!("the maximum delay is {limit_ms}ms"),
         ),
+        // `M_LIMIT_EXCEEDED` rather than `M_INVALID_PARAM`: nothing about the
+        // request was wrong, and the same request will work once one of this
+        // caller's pending delays in this room fires or is cancelled.
+        DelayError::TooMany { limit } => MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_LIMIT_EXCEEDED",
+            format!("at most {limit} delayed events may be pending in one room"),
+        ),
         DelayError::Store(inner) => MatrixError::internal(&inner.to_string()),
     }
 }
