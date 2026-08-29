@@ -6040,6 +6040,11 @@ async fn sync(
     body.insert("device_unused_fallback_key_types", raw(&unused_fallback)?);
     body.insert("account_data", raw(&json!({ "events": global }))?);
 
+    let window = (since, result.next_batch);
+    if let Some(done) = finalised_delays(&state, &identity.user_id, filter.as_ref(), window)? {
+        body.insert("org.matrix.msc4140.finalised_delayed_events", raw(&done)?);
+    }
+
     let text =
         serde_json::to_string(&body).map_err(|error| MatrixError::internal(&error.to_string()))?;
     Ok((
@@ -6054,6 +6059,29 @@ async fn sync(
 /// Lifted out of the handler because the handler had four sections to
 /// assemble and the joined one is by far the largest: it is the only one that
 /// carries state, account data, ephemeral events and an unread count at once.
+/// MSC4309's delayed events that finished in this sync's window.
+///
+/// `None` rather than an empty vector when there is nothing to report, so
+/// the caller omits the key entirely as the MSC requires. The distinction
+/// matters at this server's scale rather than in principle: almost nobody
+/// has ever scheduled a delay, so an always-present key would be dead weight
+/// on essentially every sync response this server writes.
+fn finalised_delays(
+    state: &AppState,
+    user_id: &str,
+    filter: Option<&crate::filters::Filter>,
+    (since, next_batch): (Option<u64>, u64),
+) -> Result<Option<Vec<crate::delayed::FinalisedDelay>>, MatrixError> {
+    if !filter.is_none_or(crate::filters::Filter::wants_finalised_delayed_events) {
+        return Ok(None);
+    }
+    let finalised = state
+        .delayed
+        .finalised_between(user_id, since, next_batch)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    Ok((!finalised.is_empty()).then_some(finalised))
+}
+
 /// The account-level account data a sync carries, defaults included.
 ///
 /// Lifted out of the handler because it is the one section with a rule of
@@ -6678,6 +6706,29 @@ async fn delayed_event_action(
                 &event.content,
             ),
         };
+        // MSC4309, for the same reason the fire loop records its outcome:
+        // this device learns the result from the response, but the user's
+        // *other* devices are exactly as uninformed as if the delay had
+        // fired on its own. A failure to record must not fail the send that
+        // already happened, so it is logged rather than returned.
+        let record = crate::delayed::FinalisedDelay {
+            delay_id: event.delay_id.clone(),
+            room_id: event.room_id.clone(),
+            event_type: event.event_type.clone(),
+            state_key: event.state_key.clone(),
+            event_id: sent.as_ref().ok().cloned(),
+            error: sent.as_ref().err().map(ToString::to_string),
+        };
+        if let Err(error) =
+            state
+                .delayed
+                .finalise(&event.sender, state.rooms.stream_position(), &record)
+        {
+            tracing::warn!(
+                delay_id = %event.delay_id,
+                "a delayed event was sent but its outcome was not recorded: {error}"
+            );
+        }
         sent.map_err(room_error)?;
     }
     Ok(Json(json!({})))

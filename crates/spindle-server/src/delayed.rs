@@ -58,6 +58,31 @@ pub struct DelayedEvent {
     pub fire_at_ms: u64,
 }
 
+/// A delayed event that has finished: sent, or refused when it came due.
+///
+/// MSC4309's payload. It exists because the client that scheduled a delay is,
+/// by the nature of a dead-man's switch, often not around when it fires --
+/// and a client that reconnects has no way to learn what happened without
+/// polling. This lets `/sync` tell it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FinalisedDelay {
+    pub delay_id: String,
+    pub room_id: String,
+    pub event_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_key: Option<String>,
+    /// The event this became, when it was sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    /// Why it was not sent, when it was refused.
+    ///
+    /// A delay is authorised when it fires, not when it is scheduled, so
+    /// "refused" is an ordinary outcome: the sender may have left the room
+    /// or lost the power to send by the time their moment came.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// What a caller asked to do with a pending delay.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
@@ -173,6 +198,9 @@ pub struct Delayed {
     /// that bounds the rows -- an entry exists only for a delay that has a
     /// row.
     restarts: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// How many finalised delays are kept per user; see
+    /// [`DEFAULT_MAX_FINALISED_PER_USER`].
+    max_finalised: usize,
     /// Bumped whenever a row is written, so a caller can tell whether
     /// anything changed without reading the rows.
     generation: std::sync::atomic::AtomicU64,
@@ -180,6 +208,16 @@ pub struct Delayed {
 
 /// The default duration cap: a day.
 pub const DEFAULT_MAX_DELAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// How many finalised delays are kept per user.
+///
+/// Finalised rows are written by the server, not the client, so nothing the
+/// client does removes them -- which makes an unbounded set the same
+/// amplification vector [`DEFAULT_MAX_PER_ROOM`] exists to close, one step
+/// removed. MSC4309 permits discarding them once a sync has returned them;
+/// that is not done here, because a user's *other* devices have not synced
+/// yet and would lose the outcome. Keeping a bounded window serves both.
+pub const DEFAULT_MAX_FINALISED_PER_USER: usize = 100;
 
 /// The default count cap, per sender per room.
 ///
@@ -204,6 +242,7 @@ impl Delayed {
             store,
             max_delay_ms,
             max_per_room,
+            max_finalised: DEFAULT_MAX_FINALISED_PER_USER,
             restarts: std::sync::Mutex::new(std::collections::HashMap::new()),
             generation: std::sync::atomic::AtomicU64::new(0),
         }
@@ -520,6 +559,84 @@ impl Delayed {
         self.erase(&event.delay_id)
     }
 
+    /// Record that a delay finished, for MSC4309's `/sync` report.
+    ///
+    /// `position` is the stream position the outcome belongs at, so an
+    /// incremental sync can ask for everything after its token. A send takes
+    /// the position of the event it produced; a refusal takes the current
+    /// head, because nothing was appended and the client should still hear
+    /// about it on its next sync.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if the row cannot be written.
+    pub fn finalise(
+        &self,
+        user_id: &str,
+        position: u64,
+        record: &FinalisedDelay,
+    ) -> Result<(), DelayError> {
+        let encoded = serde_json::to_vec(record).unwrap_or_default();
+        self.store.put(
+            &spindle_core::keys::finalised_delay(user_id, position, &record.delay_id),
+            &encoded,
+        )?;
+        self.prune_finalised(user_id)
+    }
+
+    /// Drop the oldest finalised rows past the cap.
+    ///
+    /// Oldest first is right rather than arbitrary: the rows are ordered by
+    /// position, so the ones dropped are the ones every client is most
+    /// likely to have seen already.
+    fn prune_finalised(&self, user_id: &str) -> Result<(), DelayError> {
+        let rows = self
+            .store
+            .scan_prefix(&spindle_core::keys::finalised_delay_prefix(user_id))?;
+        let Some(excess) = rows.len().checked_sub(self.max_finalised) else {
+            return Ok(());
+        };
+        for (key, _) in rows.into_iter().take(excess) {
+            self.store.delete(&key)?;
+        }
+        Ok(())
+    }
+
+    /// Everything `user_id` finalised after `since`, up to and including
+    /// `until`, oldest first.
+    ///
+    /// The bounds are `/sync`'s own, so a client hears about an outcome
+    /// exactly once: in the sync whose window contains it. A first sync
+    /// passes `None` and gets everything still kept, which is what MSC4309
+    /// asks for.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if the keyspace cannot be scanned.
+    pub fn finalised_between(
+        &self,
+        user_id: &str,
+        since: Option<u64>,
+        until: u64,
+    ) -> Result<Vec<FinalisedDelay>, DelayError> {
+        let rows = self
+            .store
+            .scan_prefix(&spindle_core::keys::finalised_delay_prefix(user_id))?;
+        let mut out = Vec::new();
+        for (key, raw) in rows {
+            let Some(position) = spindle_core::keys::finalised_delay_position(user_id, &key) else {
+                continue;
+            };
+            if position > until || since.is_some_and(|since| position <= since) {
+                continue;
+            }
+            if let Ok(record) = serde_json::from_slice::<FinalisedDelay>(&raw) {
+                out.push(record);
+            }
+        }
+        Ok(out)
+    }
+
     /// How many times the pending set has changed since startup.
     #[must_use]
     pub fn generation(&self) -> u64 {
@@ -579,6 +696,27 @@ pub async fn fire_loop(
                     &event.content,
                 ),
             };
+            // MSC4309: whatever happened, the client that scheduled this is
+            // very likely not here -- that is what a dead-man's switch means
+            // -- so the outcome is recorded for its next sync to carry.
+            let record = FinalisedDelay {
+                delay_id: event.delay_id.clone(),
+                room_id: event.room_id.clone(),
+                event_type: event.event_type.clone(),
+                state_key: event.state_key.clone(),
+                event_id: sent.as_ref().ok().cloned(),
+                error: sent.as_ref().err().map(ToString::to_string),
+            };
+            // A send takes the position of the event it produced; a refusal
+            // takes the head, because nothing was appended and there is no
+            // position of its own to take.
+            let position = rooms.stream_position();
+            if let Err(error) = delayed.finalise(&event.sender, position, &record) {
+                tracing::warn!(
+                    delay_id = %event.delay_id,
+                    "a delayed event finalised but its outcome was not recorded: {error}"
+                );
+            }
             if let Err(error) = sent {
                 // Expected, not exceptional: by the time a departure comes
                 // due the sender may have left the room, or been kicked, and

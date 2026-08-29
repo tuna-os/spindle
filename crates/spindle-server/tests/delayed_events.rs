@@ -932,3 +932,224 @@ async fn the_count_cap_is_the_one_the_operator_set() {
         "and the refusal did not cost the delays already held"
     );
 }
+
+const FINALISED: &str = "org.matrix.msc4140.finalised_delayed_events";
+
+impl Harness {
+    /// A sync, returning the whole body so the MSC4309 key can be inspected
+    /// by its presence as well as its contents.
+    async fn sync(&self, token: &str, since: Option<&str>) -> Value {
+        let uri = match since {
+            Some(since) => format!("/_matrix/client/v3/sync?timeout=0&since={since}"),
+            None => "/_matrix/client/v3/sync?timeout=0".to_owned(),
+        };
+        let (status, body) = self
+            .call(
+                Request::builder()
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+}
+
+/// MSC4309's reason for existing: the client that scheduled a delay is, by
+/// the nature of a dead-man's switch, usually gone when it fires. A client
+/// that comes back learns the outcome from `/sync` rather than by polling.
+#[tokio::test]
+async fn a_delay_that_fires_is_reported_on_sync() {
+    let harness = Harness::new();
+    let token = harness.register("alice").await;
+    let room = harness.create_room(&token).await;
+    let since = harness.sync(&token, None).await["next_batch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let delay_id = harness.delay_message(&room, &token, 40, "fired").await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+
+    let body = harness.sync(&token, Some(&since)).await;
+    let finalised = body[FINALISED]
+        .as_array()
+        .unwrap_or_else(|| panic!("the fired delay is reported: {body}"));
+    assert_eq!(finalised.len(), 1, "{finalised:?}");
+    assert_eq!(finalised[0]["delay_id"].as_str(), Some(delay_id.as_str()));
+    assert_eq!(finalised[0]["room_id"].as_str(), Some(room.as_str()));
+    assert!(
+        finalised[0]["event_id"].is_string(),
+        "a delay that sent carries the event it became: {finalised:?}"
+    );
+    assert!(
+        finalised[0]["error"].is_null(),
+        "and no error: {finalised:?}"
+    );
+}
+
+/// The key is absent, not empty, when there is nothing to report -- which is
+/// every sync for the overwhelming majority of users.
+#[tokio::test]
+async fn sync_omits_the_key_when_nothing_finalised() {
+    let harness = Harness::new();
+    let token = harness.register("alice").await;
+    harness.create_room(&token).await;
+
+    let body = harness.sync(&token, None).await;
+    assert!(
+        body.get(FINALISED).is_none(),
+        "no delays have finished, so the key is not there at all: {body}"
+    );
+}
+
+/// A cancelled delay is not an outcome to report. MSC4140 says a cancelled
+/// delay leaves no trace, and MSC4309 reports what was *sent or failed to
+/// send* -- a client that cancelled its own delay knows, and nobody else
+/// needs telling.
+#[tokio::test]
+async fn a_cancelled_delay_is_not_reported() {
+    let harness = Harness::new();
+    let token = harness.register("alice").await;
+    let room = harness.create_room(&token).await;
+    let since = harness.sync(&token, None).await["next_batch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let delay_id = harness.delay_message(&room, &token, 60_000, "gone").await;
+    let (status, body) = harness.act(&delay_id, &token, "cancel").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let body = harness.sync(&token, Some(&since)).await;
+    assert!(
+        body.get(FINALISED).is_none(),
+        "a cancellation leaves no trace: {body}"
+    );
+}
+
+/// Reported once, in the sync whose window contains it -- not again on the
+/// next one. A client that saw an outcome and synced past it must not see it
+/// a second time and act on it twice.
+#[tokio::test]
+async fn a_finalised_delay_is_reported_once() {
+    let harness = Harness::new();
+    let token = harness.register("alice").await;
+    let room = harness.create_room(&token).await;
+    let since = harness.sync(&token, None).await["next_batch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    harness.delay_message(&room, &token, 40, "once").await;
+    tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+
+    let first = harness.sync(&token, Some(&since)).await;
+    assert_eq!(
+        first[FINALISED].as_array().map(Vec::len),
+        Some(1),
+        "{first}"
+    );
+    let next = first["next_batch"].as_str().unwrap().to_owned();
+
+    let second = harness.sync(&token, Some(&next)).await;
+    assert!(
+        second.get(FINALISED).is_none(),
+        "already reported, and the client has synced past it: {second}"
+    );
+}
+
+/// One user's outcomes are not another's. The rows are per-user because a
+/// delay belongs to whoever scheduled it.
+///
+/// **`carol`, not `bob`, and the length is the point.** The key is a user
+/// prefix followed by a big-endian position, so a read that scanned every
+/// user's rows would decode the position at the *reader's* prefix length. A
+/// shorter or longer foreign id lands that read on the wrong bytes, yields a
+/// nonsense position, and gets discarded by the range check -- so a test
+/// using `bob` against `alice` passes whether or not the isolation is real.
+/// `@carol:example.org` is exactly as long as `@alice:example.org`, so the
+/// position decodes correctly and a leak is a leak.
+#[tokio::test]
+async fn one_users_finalised_delays_are_not_anothers() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let carol = harness.register("carol").await;
+    assert_eq!(
+        "@alice:example.org".len(),
+        "@carol:example.org".len(),
+        "the isolation this test checks is only checked at equal id lengths"
+    );
+    let room = harness.create_room(&alice).await;
+    harness.invite(&room, &alice, "carol").await;
+    harness.join(&room, &carol).await;
+    let carol_since = harness.sync(&carol, None).await["next_batch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    harness.delay_message(&room, &alice, 40, "alices").await;
+    tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+
+    let body = harness.sync(&carol, Some(&carol_since)).await;
+    assert!(
+        body.get(FINALISED).is_none(),
+        "Carol is in the room and sees the event, but the delay was not hers: {body}"
+    );
+}
+
+/// MSC4309 adds a filter key, and `false` must actually turn the report off.
+#[tokio::test]
+async fn a_filter_can_turn_the_report_off() {
+    let harness = Harness::new();
+    let token = harness.register("alice").await;
+    let room = harness.create_room(&token).await;
+    let (status, body) = harness
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/_matrix/client/v3/user/@alice:example.org/filter")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "org.matrix.msc4140.finalised_delayed_events": false }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let filter_id = body["filter_id"].as_str().unwrap().to_owned();
+
+    let since = harness.sync(&token, None).await["next_batch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    harness.delay_message(&room, &token, 40, "quiet").await;
+    tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+
+    // The same window, with and without the filter: the delay did finalise,
+    // so an absent key here is the filter working rather than nothing to say.
+    let unfiltered = harness.sync(&token, Some(&since)).await;
+    assert_eq!(
+        unfiltered[FINALISED].as_array().map(Vec::len),
+        Some(1),
+        "without the filter the outcome is reported: {unfiltered}"
+    );
+
+    let (status, filtered) = harness
+        .call(
+            Request::builder()
+                .uri(format!(
+                    "/_matrix/client/v3/sync?timeout=0&since={since}&filter={filter_id}"
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{filtered}");
+    assert!(
+        filtered.get(FINALISED).is_none(),
+        "the filter said no: {filtered}"
+    );
+}
