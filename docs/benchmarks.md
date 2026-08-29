@@ -730,6 +730,59 @@ This is a methodology defect of the same class as the membership one, and
 it is recorded the same way: as a limit on what every table above
 establishes, not as a footnote to them.
 
+## The first throughput numbers this project has ever had
+
+`--dimension concurrency` measures the axis the other two hold at one. It
+reports **operations per second** rather than a per-sample latency,
+because the two are not interchangeable and a server can win one while
+losing the other: latency is one request's path through the code,
+throughput is what the *contended* parts of it allow. A server that
+serializes every write behind one lock has the latency of one request and
+the throughput of one client, however many cores it has.
+
+Release build, over HTTP, one Spindle, each client writing to its own
+room — sharing a room would measure contention on that room's ordering,
+which every homeserver has by definition. Two rounds, because one round
+cannot separate a difference from this host's variance (#171):
+
+| clients | round 1 | round 2 | mean latency | p95 latency |
+|---|---|---|---|---|
+| 1 | 964/s | 940/s | 1.0 ms | 1.3 ms |
+| 2 | 1 565/s | 1 542/s | 1.3 ms | 2.0 ms |
+| 4 | **1 687/s** | **1 705/s** | 2.0 ms | 4.1 ms |
+| 8 | 1 364/s | 1 542/s | 4.7 ms | 10.1 ms |
+
+**Spindle scales about 1.8× from one client to four, and then stops.**
+Eight clients are below four in both rounds, and whether that is a
+plateau or a genuine decline does not separate — the two eight-client
+values (1 364 and 1 542) are too far apart to call it. What does separate
+is that eight is no better than four, in both rounds.
+
+Peak write throughput is therefore around **1 700 sends per second**, and
+past four concurrent writers the extra load buys nothing while mean
+latency grows from 1.0 ms to 4.7 ms and p95 from 1.3 ms to 10.1 ms. That
+is the shape of a saturated server: a flat rate with a growing tail.
+
+### How to read this against the rest of the page
+
+Every other table here is a latency at concurrency 1, and Spindle wins
+almost all of them by large margins. Both things are true at once, and
+neither replaces the other:
+
+- What a **user** waits for one message is excellent.
+- What an **operator** gets for a given box tops out at ~1 700 writes/s.
+
+No competitor has been measured on this axis yet. Until they have, the
+honest statement is that Spindle's throughput ceiling is known and its
+*relative* throughput is not — and a 20× latency win does not imply a
+throughput win, because Synapse serves its slower requests concurrently.
+
+The ceiling's cause is not a mystery, and it is not the storage engine:
+the single `Mutex<HashMap<String, RoomLog>>` in `Rooms::with_room` is
+held across an append's work, so appends to different rooms cannot
+proceed at the same time. The fsync used to be inside it too, and moving
+it out (see above) bought about 30%; what remains is the lock.
+
 ## Fork window: bounded search vs exhaustive walk
 
 | Room history | Bounded | Exhaustive | Ratio |

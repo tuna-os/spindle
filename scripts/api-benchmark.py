@@ -22,6 +22,7 @@ a benchmark to be wrong in. Any non-2xx response aborts the whole run.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 
 # How `register` satisfies user-interactive auth. Overridden by
 # --registration-token, because the servers this driver must treat equally do
@@ -372,6 +373,93 @@ def measure(base: str, sizes: list[int], samples: int, warmup: int) -> dict:
     return results
 
 
+def measure_concurrency(
+    base: str, sizes: list[int], clients: list[int], samples: int, warmup: int
+) -> dict:
+    """Sends per second with `n` clients writing at once.
+
+    **The axis every other run in this file holds at one.** `measure` and
+    `measure_members` both time `[timed(op) for _ in range(samples)]` -- one
+    request in flight, always -- so they report what a user *waits*, which is
+    real and is not what an operator sizing a server asks for. Nothing here
+    has ever produced a throughput figure.
+
+    The two are not interchangeable and a fast server can lose one while
+    winning the other: latency is one request's path through the code, and
+    throughput is what the contended parts of it allow. A server that
+    serializes every write behind one lock has the latency of one request
+    and the throughput of one client, however many cores it has.
+
+    So this reports **operations per second**, and the shape across `clients`
+    is the result: a server that scales rises with it, and one that does not
+    is flat. The latency spread is reported beside it, because the way a
+    saturated server looks is a flat rate with a growing tail.
+
+    Each client writes to its *own* room. Sharing one would measure
+    contention on that room's ordering, which every homeserver has by
+    definition and which says nothing about whether the rest of the server
+    can proceed in parallel.
+    """
+    alice = Client(base)
+    stamp = int(time.time())
+    alice.register(f"conc{stamp}")
+    results: dict = {}
+
+    for size in sizes:
+        peak = max(clients)
+        rooms = []
+        for index in range(peak):
+            room_id = alice.request("POST", "/_matrix/client/v3/createRoom", {})[
+                "room_id"
+            ]
+            fill_room(alice, room_id, size, 0)
+            rooms.append(room_id)
+
+        for count in clients:
+            # The same total work at every concurrency, so the rate is
+            # comparable across the row rather than measuring a different
+            # amount of work each time.
+            each = max(1, samples // count)
+
+            def burst(worker: int, tag: str, rounds: int) -> list[float]:
+                room = rooms[worker]
+                taken = []
+                for index in range(rounds):
+                    taken.append(
+                        timed(
+                            lambda: alice.request(
+                                "PUT",
+                                f"/_matrix/client/v3/rooms/{room}/send/"
+                                f"m.room.message/{tag}{worker}x{index}",
+                                {"msgtype": "m.text", "body": "x"},
+                            )
+                        )
+                    )
+                return taken
+
+            for worker in range(count):
+                burst(worker, f"warm{size}x{count}x", warmup)
+
+            started = time.perf_counter_ns()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
+                spread = [
+                    sample
+                    for taken in pool.map(
+                        lambda worker: burst(worker, f"run{size}x{count}x", each),
+                        range(count),
+                    )
+                    for sample in taken
+                ]
+            elapsed = float(time.perf_counter_ns() - started)
+
+            summary = summarise(spread)
+            summary["clients"] = count
+            summary["sends_per_second"] = (each * count) / (elapsed / 1e9)
+            results[f"send_throughput/{size}/{count}"] = summary
+
+    return results
+
+
 def measure_members(base: str, sizes: list[int], samples: int, warmup: int) -> dict:
     """Time the room-list reads in rooms of N *joined members*.
 
@@ -479,11 +567,19 @@ def main() -> int:
     )
     parser.add_argument(
         "--dimension",
-        choices=("events", "members"),
+        choices=("events", "members", "concurrency"),
         default="events",
-        help="what --sizes counts: events in the room (default), or joined "
-        "members in it. Two different axes, so two different runs and two "
-        "different output files -- never one chart with both on it.",
+        help="what to vary: events in the room (default), joined members in "
+        "it, or -- with --clients -- the number of clients writing at once. "
+        "Three different axes, so three different runs and three different "
+        "output files -- never one chart with two of them on it.",
+    )
+    parser.add_argument(
+        "--clients",
+        default="1,2,4,8",
+        help="for --dimension concurrency: how many clients write at once, "
+        "comma separated. The shape across this row is the result -- a "
+        "server that scales rises with it, one that serializes is flat.",
     )
     parser.add_argument(
         "--round",
@@ -508,11 +604,20 @@ def main() -> int:
     if not sizes:
         parser.error("--sizes needs at least one room size")
 
-    driver = measure if arguments.dimension == "events" else measure_members
+    clients = [int(count) for count in arguments.clients.split(",") if count]
+    if arguments.dimension == "concurrency" and not clients:
+        parser.error("--dimension concurrency needs at least one --clients count")
+
     try:
-        benchmarks = driver(
-            arguments.base_url, sizes, arguments.samples, arguments.warmup
-        )
+        if arguments.dimension == "concurrency":
+            benchmarks = measure_concurrency(
+                arguments.base_url, sizes, clients, arguments.samples, arguments.warmup
+            )
+        else:
+            driver = measure if arguments.dimension == "events" else measure_members
+            benchmarks = driver(
+                arguments.base_url, sizes, arguments.samples, arguments.warmup
+            )
     except Failed as error:
         # Loudly, and with nothing written. A run that drops failures and
         # reports the rest makes a broken server look like a fast one.
@@ -524,6 +629,7 @@ def main() -> int:
         "server": arguments.server,
         "base_url": arguments.base_url,
         "dimension": arguments.dimension,
+        "clients": clients if arguments.dimension == "concurrency" else None,
         "round": arguments.round,
         "sizes": sizes,
         "samples": arguments.samples,
