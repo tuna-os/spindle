@@ -337,6 +337,15 @@ impl Rooms {
     #[must_use]
     pub fn new(store: Arc<FjallStore>, server_name: impl Into<String>) -> Self {
         let store_for_stream = Arc::clone(&store);
+        // Read once and used twice: the stream's own high-water mark bounds
+        // the index backfill and is one of the four drawers the counter
+        // resumes above.
+        let stream_high = highest_stream_row(store_for_stream.as_ref());
+        // Before anything reads the reverse index, make it complete. A store
+        // written by a binary without it has a forward stream and no index,
+        // and an incremental `/sync` answered from an empty index would
+        // report that nothing had happened -- not slower, wrong.
+        backfill_room_stream_index(store_for_stream.as_ref(), stream_high);
         Self {
             store,
             server_name: server_name.into(),
@@ -354,6 +363,7 @@ impl Rooms {
             // rather than merely forgets.
             stream: crate::stream::Stream::resuming_at(highest_stream_id(
                 store_for_stream.as_ref(),
+                stream_high,
             )),
             appended: tokio::sync::Notify::new(),
         }
@@ -3089,24 +3099,16 @@ impl Rooms {
         let invited = self.invited(user_id)?;
         let knocked = self.knocked(user_id)?;
 
-        // One pass for the whole sync, joined and left sections alike --
-        // never one per room. `None` on an initial sync, which reads tails
-        // instead and has no stream range to walk.
-        let slice = match since {
-            Some(since) => Some(self.stream_slice(since, position)?),
-            None => None,
-        };
+        // The range each room is asked about. `None` on an initial sync,
+        // which reads tails instead and has no range to walk.
+        let range = since.map(|since| (since, position));
 
         let mut rooms = Vec::new();
         for room_id in joined {
-            let (events, limited) = match &slice {
+            let (events, limited) = match range {
                 None => self.timeline_tail(&room_id, timeline_limit)?,
-                Some(slice) => (
-                    self.timeline_of(
-                        &room_id,
-                        slice.get(&room_id).map_or(&[][..], Vec::as_slice),
-                        None,
-                    )?,
+                Some((since, until)) => (
+                    self.timeline_of(&room_id, &self.room_slice(&room_id, since, until)?, None)?,
                     false,
                 ),
             };
@@ -3131,7 +3133,7 @@ impl Rooms {
             });
         }
 
-        let left = self.left_rooms(user_id, since, slice.as_ref())?;
+        let left = self.left_rooms(user_id, since, range)?;
 
         // How stale was the freshest thing we just handed over? A client
         // keeping up sees milliseconds; a server falling behind sees this
@@ -3207,7 +3209,7 @@ impl Rooms {
         &self,
         user_id: &str,
         since: Option<u64>,
-        slice: Option<&HashMap<String, Vec<i64>>>,
+        range: Option<(u64, u64)>,
     ) -> Result<Vec<SyncRoom>, RoomError> {
         let mut out = Vec::new();
         for membership in [LEAVE, BAN] {
@@ -3219,11 +3221,11 @@ impl Rooms {
                 else {
                     continue;
                 };
-                let events = match slice {
+                let events = match range {
                     None => vec![departure],
-                    Some(slice) => self.timeline_of(
+                    Some((since, until)) => self.timeline_of(
                         &room_id,
-                        slice.get(&room_id).map_or(&[][..], Vec::as_slice),
+                        &self.room_slice(&room_id, since, until)?,
                         Some(departed_at),
                     )?,
                 };
@@ -3287,70 +3289,49 @@ impl Rooms {
         Ok((out, more.is_some()))
     }
 
-    /// Events of one room that entered the global stream after `since`.
-    /// `max_li` caps the range at a position in the room's own order, which is
-    /// how the leave section stops at the user's departure. `None` means the
-    /// whole range, which is what a joined room wants.
+    /// Where one room's events sit in its own order, for everything it
+    /// contributed to the stream range `(since, until]`.
     ///
-    /// The cap is tested against the stream record's `li` rather than against
-    /// anything in the event body -- events do not carry their linear index,
-    /// and an earlier draft of this filtered on `unsigned.li`, a field that
-    /// does not exist. Every comparison silently succeeded and the cap did
-    /// nothing at all.
-    /// One pass over the stream range, bucketed by room.
+    /// **The cost is this room's traffic, not the server's.** The stream is a
+    /// server-wide order, so answering from it meant reading every event
+    /// anyone sent anywhere since the token and keeping the few that were
+    /// this room's: a user in one quiet room paid for strangers talking, and
+    /// `tests/sync_cost.rs` measured that as one point read per foreign event
+    /// on every incremental sync. The reverse index
+    /// ([`Keyspace::RoomStream`](spindle_core::keys::Keyspace::RoomStream))
+    /// puts the room first in the key, so the same question is a scan that
+    /// starts at the client's token and ends at the room's newest event.
     ///
-    /// **This is read once per sync, not once per room.** The stream is the
-    /// server's order, so "what happened since this token" is one question
-    /// with one answer; asking it per room made a sync cost
-    /// `joined_rooms x events_accepted_server_wide`, which is a product of
-    /// two things a client does not control -- the second being other
-    /// people's traffic in rooms it is not even in. Measured before the
-    /// change at 1,601 point reads for eight rooms over 200 foreign events,
-    /// and exactly `rooms x elsewhere + 1` at every size
-    /// (`tests/sync_cost.rs`).
-    ///
-    /// The remaining cost is linear in the range, which is inherent to
-    /// reading a server-wide order and is not fixed here: that needs a
-    /// reverse `(room, stream_id)` index, which is a stored format and a
-    /// migration.
-    fn stream_slice(
-        &self,
-        since: u64,
-        position: u64,
-    ) -> Result<HashMap<String, Vec<i64>>, RoomError> {
-        let mut by_room: HashMap<String, Vec<i64>> = HashMap::new();
-        self.scan_stream(since, position, |room_id, li| {
-            by_room.entry(room_id).or_default().push(li);
-        })?;
-        Ok(by_room)
-    }
-
-    /// Walk a stream range once, handing each row to `emit`.
-    ///
-    /// The one place the range is read. Both callers want a different shape
-    /// out of the same walk -- one buckets the indices, the other only wants
-    /// the distinct rooms -- and having two copies of the loop is how they
-    /// drift.
-    fn scan_stream(
-        &self,
-        since: u64,
-        until: u64,
-        mut emit: impl FnMut(String, i64),
-    ) -> Result<(), RoomError> {
-        for stream_id in (since + 1)..=until {
-            let Some(raw) = spindle_store::ReadView::get(
-                self.store.as_ref(),
-                &spindle_core::keys::stream(stream_id),
-            )?
-            else {
-                continue;
-            };
-            let Some(record) = StreamRecord::decode(&raw) else {
-                continue;
-            };
-            emit(record.room_id, record.li);
+    /// An earlier fix made this one pass per *sync* rather than one per room;
+    /// this makes each pass proportional to what the room did. Both were
+    /// needed, and neither subsumes the other.
+    fn room_slice(&self, room_id: &str, since: u64, until: u64) -> Result<Vec<i64>, RoomError> {
+        if until <= since {
+            return Ok(Vec::new());
         }
-        Ok(())
+        let rows = spindle_store::ReadView::scan_from(
+            self.store.as_ref(),
+            &spindle_core::keys::room_stream_prefix(room_id),
+            &spindle_core::keys::room_stream(room_id, since + 1),
+        )?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (key, raw) in rows {
+            // The scan runs to the end of the room's rows, so it can see an
+            // append that landed after `until` was read -- or one whose id
+            // is above the watermark because a lower id is still in flight.
+            // Either is outside what this sync may answer with: the token
+            // the client gets back is `until`, so an event past it is
+            // delivered now and delivered again on the next sync. This is
+            // the read side of the watermark, and the reason `until` is a
+            // parameter rather than "everything the room has".
+            if spindle_core::keys::room_stream_from_key(&key).is_some_and(|id| id > until) {
+                break;
+            }
+            if let Ok(bytes) = <[u8; 8]>::try_from(raw.as_slice()) {
+                out.push(i64::from_be_bytes(bytes));
+            }
+        }
+        Ok(out)
     }
 
     /// The events a room contributed to a stream range, as bodies.
@@ -3603,22 +3584,33 @@ impl Rooms {
         Ok(activity)
     }
 
-    /// Room IDs with at least one event in the stream range `(since, until]`.
+    /// Which of `rooms` had at least one event in the stream range
+    /// `(since, until]`.
     ///
-    /// One forward scan, deduplicated — the set an incremental sliding sync
-    /// answers about. The classic `/sync` asks a different question (which
-    /// *events*), so it walks per room; this asks only *which rooms*, and one
-    /// pass over the shared stream answers it for all of them.
+    /// Asked about a named set rather than answered for the whole server:
+    /// incremental sliding sync wants to stay silent about rooms where
+    /// nothing happened, and it already knows which rooms it might speak
+    /// about -- the windows it is serving and the subscriptions it was
+    /// handed. Scanning the server's whole stream to find out made the
+    /// answer cost other people's traffic, and then threw away every room
+    /// the caller was never going to mention.
     ///
     /// # Errors
     ///
-    /// Returns [`RoomError`] if the stream cannot be read.
-    pub fn changed_rooms(&self, since: u64, until: u64) -> Result<HashSet<String>, RoomError> {
-        let mut rooms = HashSet::new();
-        self.scan_stream(since, until, |room_id, _| {
-            rooms.insert(room_id);
-        })?;
-        Ok(rooms)
+    /// Returns [`RoomError`] if the index cannot be read.
+    pub fn changed_rooms<'a>(
+        &self,
+        rooms: impl IntoIterator<Item = &'a str>,
+        since: u64,
+        until: u64,
+    ) -> Result<HashSet<String>, RoomError> {
+        let mut changed = HashSet::new();
+        for room_id in rooms {
+            if !self.room_slice(room_id, since, until)?.is_empty() {
+                changed.insert(room_id.to_owned());
+            }
+        }
+        Ok(changed)
     }
 
     /// The newest `limit` timeline events of a room, oldest first, stamped.
@@ -4571,6 +4563,16 @@ impl Rooms {
             }
             .encode(),
         ));
+        // The same fact keyed the other way round, in the same batch. Two
+        // rows that must always agree are written by one commit or by
+        // neither: an index row without its forward row would answer a sync
+        // with an event the stream does not have, and a forward row without
+        // its index row would hide the event from every client whose token
+        // predates it.
+        extra.push((
+            spindle_core::keys::room_stream(room_id, stream_id),
+            entry.li.get().to_be_bytes().to_vec(),
+        ));
         // Timed here rather than around the whole handler: this is the
         // commit SPEC §18.3's local-send target is about, and wrapping
         // the handler would fold request parsing and authorization into
@@ -5204,20 +5206,85 @@ impl StreamRecord {
     }
 }
 
-/// The highest stream id already on disk, or 0 for a fresh store.
-fn highest_stream_id(store: &FjallStore) -> u64 {
-    // A prefix scan rather than a stored high-water mark: one number that has
-    // to be kept in step with the rows it describes is one number that can
-    // disagree with them, and the rows are the truth.
-    let from_stream =
+/// The highest id in the forward stream index, or 0 for a fresh store.
+///
+/// A prefix scan rather than a stored high-water mark: one number that has to
+/// be kept in step with the rows it describes is one number that can disagree
+/// with them, and the rows are the truth.
+fn highest_stream_row(store: &FjallStore) -> u64 {
+    spindle_store::ReadView::scan_prefix(store, &spindle_core::keys::stream_prefix())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|(key, _)| spindle_core::keys::stream_from_key(key))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Fill in any reverse-index rows the forward stream has and the index does
+/// not, and report how many were written.
+///
+/// Every append writes both rows in one batch, so in the steady state there
+/// is nothing to do and this costs one scan of a keyspace holding eight bytes
+/// per event. It is not dead code, though: a store written before the reverse
+/// index existed has a forward stream and no index at all, and reading it
+/// with this binary must not silently answer `/sync` from an index that stops
+/// short. That is the whole migration -- no marker, no version gate, no
+/// operator step -- and it is safe to run twice because a row is a pure
+/// function of the forward row it comes from.
+///
+/// The comparison is `max` against `max` rather than a count, because the two
+/// keyspaces are written together: any id the index is missing is above the
+/// highest id it holds.
+fn backfill_room_stream_index(store: &FjallStore, through: u64) -> usize {
+    let indexed = spindle_store::ReadView::scan_prefix(
+        store,
+        &[
+            spindle_core::keys::KEY_SCHEMA_VERSION,
+            spindle_core::keys::Keyspace::RoomStream as u8,
+        ],
+    )
+    .unwrap_or_default()
+    .iter()
+    .filter_map(|(key, _)| spindle_core::keys::room_stream_from_key(key))
+    .max()
+    .unwrap_or(0);
+    if indexed >= through {
+        return 0;
+    }
+    let mut written = 0;
+    for (key, raw) in
         spindle_store::ReadView::scan_prefix(store, &spindle_core::keys::stream_prefix())
             .unwrap_or_default()
-            .iter()
-            .filter_map(|(key, _)| spindle_core::keys::stream_from_key(key))
-            .max()
-            .unwrap_or(0);
+    {
+        let Some(stream_id) = spindle_core::keys::stream_from_key(&key) else {
+            continue;
+        };
+        if stream_id <= indexed {
+            continue;
+        }
+        let Some(record) = StreamRecord::decode(&raw) else {
+            continue;
+        };
+        if spindle_store::Store::put(
+            store,
+            &spindle_core::keys::room_stream(&record.room_id, stream_id),
+            &record.li.to_be_bytes(),
+        )
+        .is_ok()
+        {
+            written += 1;
+        }
+    }
+    written
+}
+
+/// The highest stream id already on disk, or 0 for a fresh store.
+///
+/// `from_stream` is [`highest_stream_row`], passed in because the caller has
+/// already paid for that scan.
+fn highest_stream_id(store: &FjallStore, from_stream: u64) -> u64 {
     // Pending to-device messages drew from this counter without writing a
-    // stream row, so their sequence numbers are invisible to the scan above.
+    // stream row, so their sequence numbers are invisible to `from_stream`.
     // A counter resumed below them would eventually re-allocate a pending
     // message's sequence for the same device and overwrite it — silent loss
     // of session-establishment ciphertext. Their keys end in the big-endian
@@ -5272,6 +5339,147 @@ fn highest_stream_id(store: &FjallStore) -> u64 {
         .max(from_to_device)
         .max(from_device_lists)
         .max(from_outbox)
+}
+
+#[cfg(test)]
+mod stream_index_tests {
+    use spindle_store::{FjallStore, Store};
+    use tempfile::TempDir;
+
+    use super::{StreamRecord, backfill_room_stream_index, highest_stream_row};
+
+    /// Write forward stream rows from `first` and no index rows, which is
+    /// what a store written before the reverse index looks like.
+    fn unindexed(store: &FjallStore, first: u64, rooms: &[&str]) {
+        for (offset, room_id) in rooms.iter().enumerate() {
+            let offset = u64::try_from(offset).unwrap();
+            store
+                .put(
+                    &spindle_core::keys::stream(first + offset),
+                    &StreamRecord {
+                        room_id: (*room_id).to_owned(),
+                        li: i64::try_from(offset).unwrap(),
+                    }
+                    .encode(),
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_store_with_no_index_gets_one_row_per_stream_row() {
+        let dir = TempDir::new().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        unindexed(
+            &store,
+            1,
+            &["!a:example.org", "!b:example.org", "!a:example.org"],
+        );
+
+        assert_eq!(
+            backfill_room_stream_index(&store, highest_stream_row(&store)),
+            3
+        );
+        assert_eq!(
+            spindle_store::ReadView::scan_prefix(
+                &store,
+                &spindle_core::keys::room_stream_prefix("!a:example.org")
+            )
+            .unwrap()
+            .len(),
+            2,
+            "the two rows of one room must land under that room's prefix"
+        );
+    }
+
+    /// The second open has nothing to write, and does not go looking.
+    ///
+    /// Two separate claims, and the cheap one is not the interesting one:
+    /// the per-row `stream_id <= indexed` skip already keeps a second pass
+    /// from rewriting anything, so a count of zero would hold even with the
+    /// early return deleted. What the early return buys is the *scan* -- the
+    /// forward stream is one row per event the server has ever accepted, and
+    /// walking it on every restart to discover there is nothing to do is a
+    /// cost that grows with the server's whole history. So the rows read are
+    /// asserted too, which is the only counter that tells the two apart.
+    #[test]
+    fn a_second_pass_writes_nothing_and_reads_only_the_index() {
+        let dir = TempDir::new().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        unindexed(&store, 1, &["!a:example.org", "!b:example.org"]);
+
+        let through = highest_stream_row(&store);
+        assert_eq!(backfill_room_stream_index(&store, through), 2);
+
+        let before = store.scanned();
+        assert_eq!(backfill_room_stream_index(&store, through), 0);
+        assert_eq!(
+            store.scanned() - before,
+            2,
+            "a complete index should cost one scan of the index itself; \
+             anything more means the forward stream was walked again"
+        );
+    }
+
+    /// A slice stops at the position the sync will hand back.
+    ///
+    /// The index is written by the append; the watermark is what `/sync`
+    /// reports. Those move apart whenever an id is allocated and not yet
+    /// committed, so the room's rows can legitimately run past the position
+    /// this response is allowed to describe. Delivering one of them anyway
+    /// puts an event above the `next_batch` the client is about to be given,
+    /// and the client is sent it a second time on its next request.
+    ///
+    /// Written against the index directly rather than through two racing
+    /// appends: the gap between the two numbers is the *point*, and a test
+    /// that has to provoke a race to open it would be testing the scheduler.
+    #[test]
+    fn a_slice_stops_at_the_position_it_was_given() {
+        let dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(FjallStore::open(dir.path()).unwrap());
+        let room = "!a:example.org";
+        for (stream_id, li) in [(1u64, 10i64), (2, 11), (3, 12)] {
+            store
+                .put(
+                    &spindle_core::keys::room_stream(room, stream_id),
+                    &li.to_be_bytes(),
+                )
+                .unwrap();
+        }
+        let rooms = super::Rooms::new(std::sync::Arc::clone(&store), "example.org");
+
+        assert_eq!(rooms.room_slice(room, 0, 3).unwrap(), vec![10, 11, 12]);
+        assert_eq!(
+            rooms.room_slice(room, 0, 2).unwrap(),
+            vec![10, 11],
+            "the third row is above the position this sync may describe"
+        );
+        assert_eq!(rooms.room_slice(room, 1, 2).unwrap(), vec![11]);
+    }
+
+    /// A hole above the highest indexed id is filled; the rows below it are
+    /// not revisited.
+    ///
+    /// This is the shape a downgrade leaves behind -- an older binary appends
+    /// forward rows and no index rows -- and it is also why the check is
+    /// `max` against `max` rather than "is the index empty".
+    #[test]
+    fn a_gap_left_by_an_older_binary_is_filled() {
+        let dir = TempDir::new().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        unindexed(&store, 1, &["!a:example.org", "!b:example.org"]);
+        assert_eq!(
+            backfill_room_stream_index(&store, highest_stream_row(&store)),
+            2
+        );
+
+        unindexed(&store, 3, &["!c:example.org"]);
+        assert_eq!(
+            backfill_room_stream_index(&store, highest_stream_row(&store)),
+            1,
+            "only the row the older binary missed"
+        );
+    }
 }
 
 #[cfg(test)]

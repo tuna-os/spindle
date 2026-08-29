@@ -1,13 +1,17 @@
 //! What does one incremental `/sync` actually read?
 //!
-//! Counted, not timed (#177): `store.reads()` is a point-read counter, so
-//! the answer is the same on any machine, and the assertion below is a
-//! real gate rather than a wall clock on a shared runner.
+//! Counted, not timed (#177): `store.reads()` and `store.scanned()` count
+//! point reads and scanned rows, so the answer is the same on any machine
+//! and the assertions below are real gates rather than wall clocks on a
+//! shared runner. Where a test could be satisfied by moving work from a
+//! point read into a scan, it sums the two.
 //!
-//! Two axes, varied independently -- which is the point, because the
-//! benchmark driver varies neither. `sync_delta` uses two rooms and a
-//! token from moments earlier, so it holds both at their minimum and
-//! measured the one case where neither costs anything.
+//! Three axes, varied independently -- which is the point, because the
+//! benchmark driver varies none of them. `sync_delta` uses two rooms and a
+//! token from moments earlier, on an otherwise idle server, so it holds all
+//! three at their minimum and measured the one case where none costs
+//! anything: how many rooms the user is in, how much of the room's own
+//! history precedes the token, and how busy the rest of the server has been.
 
 use std::sync::Arc;
 
@@ -176,11 +180,96 @@ async fn reads_do_not_multiply_by_joined_rooms() {
     );
 }
 
-/// The cost that remains: linear in how far behind the client is.
+/// A sync must not get more expensive because *other people* were talking.
 ///
-/// Inherent to reading a server-wide order, and not fixed by the change
-/// above. Removing it needs a reverse `(room, stream_id)` index, which is
-/// a stored format and therefore a migration.
+/// Alice is in one room where nothing has happened since her token. What
+/// varies is how many events Bob sent in a room she is not in. Answering
+/// her from the server-wide stream meant reading every one of them and
+/// throwing them away -- measured at exactly `elsewhere + 1`:
+///
+/// ```text
+/// elsewhere   0    50    200   800
+/// reads       1    51    201   801
+/// ```
+///
+/// and flat at 1 after the reverse `(room, stream_id)` index. This is the
+/// multi-tenant shape of the defect: on a server with a thousand users, a
+/// client in one quiet room paid for the other nine hundred and ninety
+/// nine, and its sync got slower every time the server got busier.
+///
+/// Scanned rows are counted alongside point reads, because the fix moves
+/// the question from a point read per stream id to a range scan -- and a
+/// scan that still walked the whole range would be the same defect wearing
+/// a different counter.
+#[tokio::test]
+async fn a_sync_does_not_pay_for_other_rooms() {
+    let mut measured = Vec::new();
+    for elsewhere in [0usize, 800] {
+        let harness = Harness::new();
+        let alice = harness.register("alice").await;
+        let bob = harness.register("bob").await;
+        let mine = harness.room(&alice).await;
+        let theirs = harness.room(&bob).await;
+
+        harness.send(&mine, &alice, "seed").await;
+        let batch = harness.sync(&alice, None).await["next_batch"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for index in 0..elsewhere {
+            harness.send(&theirs, &bob, &format!("x{index}")).await;
+        }
+
+        let before = harness.store.reads() + harness.store.scanned();
+        harness.sync(&alice, Some(&batch)).await;
+        measured.push(harness.store.reads() + harness.store.scanned() - before);
+    }
+    assert_eq!(
+        measured[0], measured[1],
+        "a quiet sync touched {} rows, and the same sync behind 800 events \
+         in someone else's room touched {} -- the server-wide stream is \
+         being walked again",
+        measured[0], measured[1]
+    );
+}
+
+/// Nor for its own room's history before the token.
+///
+/// The reverse index is keyed `(room_id, stream_id)`, so a scan that
+/// started at the room's first row instead of at the client's token would
+/// pass the test above -- the cost would be the room's own past rather
+/// than the server's present, which is the same defect at a smaller
+/// radius. It is the room a client keeps for years that this protects.
+#[tokio::test]
+async fn a_sync_does_not_pay_for_its_own_history() {
+    let mut measured = Vec::new();
+    for before_token in [0usize, 800] {
+        let harness = Harness::new();
+        let alice = harness.register("alice").await;
+        let mine = harness.room(&alice).await;
+        for index in 0..before_token {
+            harness.send(&mine, &alice, &format!("old{index}")).await;
+        }
+        let batch = harness.sync(&alice, None).await["next_batch"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        harness.send(&mine, &alice, "new").await;
+
+        let before = harness.store.reads() + harness.store.scanned();
+        harness.sync(&alice, Some(&batch)).await;
+        measured.push(harness.store.reads() + harness.store.scanned() - before);
+    }
+    assert_eq!(
+        measured[0], measured[1],
+        "a sync one event behind touched {} rows in a new room and {} in a \
+         room with 800 events already read -- the scan is starting at the \
+         room's first row, not at the token",
+        measured[0], measured[1]
+    );
+}
+
+/// What one incremental sync reads as the client falls further behind.
 #[tokio::test]
 #[ignore = "a measurement, not an assertion"]
 async fn reads_versus_token_age() {

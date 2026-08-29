@@ -268,6 +268,22 @@ pub enum Keyspace {
     /// decision about its own directory, not a fact about the room, and two
     /// servers sharing a room are each entitled to a different answer.
     PublishedRoom = 0x29,
+    /// `(room_id, stream_id)` -> `li`: the [`Self::Stream`] index, read the
+    /// other way round.
+    ///
+    /// [`Self::Stream`] answers "what is the *server's* n-th event", which is
+    /// the question `/sync`'s token is written in. But no client asks that
+    /// question -- each one asks "what happened in *my* rooms since my token",
+    /// and answering it from a server-wide order means reading every event
+    /// anyone sent anywhere in between and discarding the ones that were not
+    /// theirs. A user in one quiet room got slower `/sync`s because strangers
+    /// were talking.
+    ///
+    /// The room comes first in the key so one room's rows are contiguous, and
+    /// the stream id is big-endian after it so a scan can start at the
+    /// client's token instead of at the room's creation. The value is the
+    /// linear index, which is all the caller wanted from the forward row.
+    RoomStream = 0x2a,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -412,6 +428,31 @@ pub fn stream_from_key(key: &[u8]) -> Option<u64> {
 #[must_use]
 pub fn stream_prefix() -> Vec<u8> {
     vec![KEY_SCHEMA_VERSION, Keyspace::Stream as u8]
+}
+
+/// One room's row in the reverse stream index.
+///
+/// See [`Keyspace::RoomStream`] for why this exists. The stream id is
+/// big-endian for the same reason [`stream`] gives: ids start at 1 and only
+/// increase, so the plain encoding already sorts.
+#[must_use]
+pub fn room_stream(room_id: &str, stream_id: u64) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::RoomStream, room_id);
+    key.extend_from_slice(&stream_id.to_be_bytes());
+    key
+}
+
+/// The prefix every reverse-index row for one room shares.
+#[must_use]
+pub fn room_stream_prefix(room_id: &str) -> Vec<u8> {
+    room_prefix(Keyspace::RoomStream, room_id)
+}
+
+/// The `stream_id` a [`room_stream`] key encodes.
+#[must_use]
+pub fn room_stream_from_key(key: &[u8]) -> Option<u64> {
+    let bytes: [u8; 8] = key.get(key.len().checked_sub(8)?..)?.try_into().ok()?;
+    Some(u64::from_be_bytes(bytes))
 }
 
 /// The prefix every relation of one event shares.

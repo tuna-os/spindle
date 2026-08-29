@@ -145,6 +145,25 @@ pub trait ReadView {
     ///
     /// Returns a backend error if the scan fails.
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<Record>, StoreError>;
+
+    /// Entries whose key starts with `prefix` *and* sorts at or after
+    /// `start`, in key order.
+    ///
+    /// [`Self::scan_prefix`] with a filter would read the same rows and throw
+    /// most of them away; this reads only the tail. That is the whole point
+    /// wherever a key ends in a position the caller already holds -- a client
+    /// asking what happened since its sync token wants the rows after the
+    /// token, and the number of rows before it is the size of the history it
+    /// is not asking about.
+    ///
+    /// `start` need not itself be a stored key, and need not share `prefix`:
+    /// a start below the prefix yields the whole prefix, and one above it
+    /// yields nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the scan fails.
+    fn scan_from(&self, prefix: &[u8], start: &[u8]) -> Result<Vec<Record>, StoreError>;
 }
 
 pub trait Store: ReadView {
@@ -632,6 +651,22 @@ impl ReadView for FjallStore {
         self.scanned.fetch_add(out.len() as u64, Ordering::Relaxed);
         Ok(out)
     }
+
+    fn scan_from(&self, prefix: &[u8], start: &[u8]) -> Result<Vec<Record>, StoreError> {
+        let mut out = Vec::new();
+        for pair in self.partition.range(start.to_vec()..) {
+            let (key, value) = pair?;
+            // The range runs to the end of the keyspace, so leaving the
+            // prefix is the terminator. Breaking rather than filtering is
+            // what makes this cost the tail and not the partition.
+            if !key.starts_with(prefix) {
+                break;
+            }
+            out.push((key.to_vec(), value.to_vec()));
+        }
+        self.scanned.fetch_add(out.len() as u64, Ordering::Relaxed);
+        Ok(out)
+    }
 }
 
 /// A Fjall read snapshot: every read sees the partition as of the sequence
@@ -651,6 +686,18 @@ impl ReadView for FjallCheckpoint {
         let mut out = Vec::new();
         for pair in self.0.prefix(prefix) {
             let (key, value) = pair.map_err(|error| StoreError::Backend(error.to_string()))?;
+            out.push((key.to_vec(), value.to_vec()));
+        }
+        Ok(out)
+    }
+
+    fn scan_from(&self, prefix: &[u8], start: &[u8]) -> Result<Vec<Record>, StoreError> {
+        let mut out = Vec::new();
+        for pair in self.0.range(start.to_vec()..) {
+            let (key, value) = pair.map_err(|error| StoreError::Backend(error.to_string()))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
             out.push((key.to_vec(), value.to_vec()));
         }
         Ok(out)
