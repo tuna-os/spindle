@@ -58,6 +58,8 @@ pub enum Origin {
 // be a poor trade.
 static FORK_CASES: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static EVENTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// `[exclusive, shared]` acquisitions of the room registry.
+static ROOM_LOCKS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 impl ForkCase {
     fn index(self) -> usize {
@@ -94,6 +96,18 @@ impl Origin {
     }
 }
 
+/// Record one acquisition of the room registry, and how it was taken.
+///
+/// The registry is a single lock for the whole server, so an *exclusive*
+/// acquisition is one that makes every other request wait -- including
+/// requests for entirely different rooms. Counting the two separately is
+/// what turns "does this endpoint block the server" into a subtraction
+/// rather than a stopwatch, which matters because the effect is smaller
+/// than the run-to-run spread of any box this is likely to be measured on.
+pub fn record_room_lock(exclusive: bool) {
+    ROOM_LOCKS[usize::from(!exclusive)].fetch_add(1, Ordering::Relaxed);
+}
+
 /// Record one event reaching the log, and which case carried it.
 pub fn record_append(origin: Origin, case: ForkCase) {
     EVENTS[origin.index()].fetch_add(1, Ordering::Relaxed);
@@ -117,6 +131,7 @@ pub fn render() -> String {
     let mut out = String::with_capacity(2048);
     render_build_info(&mut out);
     render_appends(&mut out);
+    render_room_locks(&mut out);
     render_http(&mut out);
     render_federation(&mut out);
     render_sync(&mut out);
@@ -181,6 +196,21 @@ fn render_appends(out: &mut String) {
                 &format!("durability=\"{}\"", escape(durability)),
             );
         }
+    }
+}
+
+fn render_room_locks(out: &mut String) {
+    out.push_str(
+        "# HELP spindle_room_registry_acquisitions_total Room registry lock \
+         acquisitions, by mode.\n\
+         # TYPE spindle_room_registry_acquisitions_total counter\n",
+    );
+    for (index, mode) in ["exclusive", "shared"].into_iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "spindle_room_registry_acquisitions_total{{mode=\"{mode}\"}} {}",
+            ROOM_LOCKS[index].load(Ordering::Relaxed)
+        );
     }
 }
 
