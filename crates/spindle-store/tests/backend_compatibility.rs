@@ -14,9 +14,23 @@
 //!
 //! So the directory under `tests/fixtures/fjall2/` was written by `fjall`
 //! 2.11.2 and checked in. **Do not regenerate it.** If a `fjall` upgrade makes
-//! this test fail, that failure is the finding: existing stores need a
+//! these tests fail, that failure is the finding: existing stores need a
 //! migration, or the upgrade needs to be declined. Refreshing the fixture
 //! converts "operators lose their data" into a green tick.
+//!
+//! ## That already happened, and this is what it looks like
+//!
+//! Taking `fjall` 3 (#193) made these fail with `InvalidVersion(Some(V2))`.
+//! `fjall` 3 changed the on-disk format and has no in-process upgrade: it
+//! refuses a v2 directory and points at a separate tool. The fixtures were
+//! **kept and the assertions inverted** — they now prove the refusal is
+//! clean and explains itself, which is the property an operator has left
+//! once the data cannot be read. Regenerating them under `fjall` 3 would
+//! have been the green tick this file exists to refuse.
+//!
+//! The break was accepted deliberately because Spindle has no deployments
+//! and therefore no data to migrate. That is a fact with an expiry date, and
+//! these fixtures are what will notice when it expires.
 //!
 //! ## Two fixtures, because there are two formats
 //!
@@ -46,9 +60,6 @@ const ROWS: &[(&[u8], &[u8])] = &[
     (b"\x01beta", b"two"),
     (b"\x01gamma", b"three"),
 ];
-
-/// How many rows `fixtures/fjall2-segments/` holds.
-const SEGMENT_ROWS: usize = 64;
 
 /// Copy the fixture somewhere writable.
 ///
@@ -85,76 +96,84 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
     }
 }
 
-/// A store written by the pinned `fjall` opens, and still holds its rows.
+/// A store written by fjall 2 is **refused**, and says what to do.
+///
+/// This test used to assert the opposite, and the change is the finding. The
+/// module doc above said: *"If a fjall upgrade makes this test fail, that
+/// failure is the finding: existing stores need a migration, or the upgrade
+/// needs to be declined. Refreshing the fixture converts 'operators lose
+/// their data' into a green tick."*
+///
+/// Taking fjall 3 made it fail, with `InvalidVersion(Some(V2))`. fjall 3
+/// changed the on-disk format and has **no in-process upgrade path** — it
+/// refuses the directory and points at a separate migration tool. So the
+/// fixture was not refreshed: it is kept, and the assertion inverted to the
+/// property that now matters. An operator with a v2 directory must get a
+/// comprehensible refusal rather than corruption or a silently empty store.
+///
+/// Taking the break was a deliberate decision (#193): Spindle has no
+/// deployments, so there is no data to migrate. The day that stops being
+/// true, this fixture is the thing that says so.
 #[test]
-fn a_store_written_by_fjall_2_still_opens_and_reads() {
+fn a_store_written_by_fjall_2_is_refused_with_an_explanation() {
     let dir = fixture();
-    let store = FjallStore::open(dir.path()).expect(
-        "a store written by an earlier fjall must open -- if this fails after a \
-         fjall upgrade, existing deployments cannot be opened either",
-    );
+    let error = FjallStore::open(dir.path())
+        .err()
+        .expect("a fjall 2 store must not open under fjall 3");
+    let message = error.to_string();
 
+    // The three things an operator needs: which engine wrote it, that there
+    // is no automatic upgrade, and where the tool is.
+    assert!(message.contains("fjall 2"), "{message}");
+    assert!(message.contains("no automatic upgrade"), "{message}");
+    assert!(message.contains("migrate-v2-v3"), "{message}");
+}
+
+/// The segment-bearing fixture is refused too, and for the same reason.
+///
+/// Kept separate because the two fixtures fail at different layers — one has
+/// its rows in the journal, the other in a segment — and a version gate that
+/// caught only one of them would leave the other to fail later and worse.
+#[test]
+fn a_segment_written_by_fjall_2_is_refused_too() {
+    let dir = segment_fixture();
+    let error = FjallStore::open(dir.path())
+        .err()
+        .expect("a fjall 2 segment store must not open under fjall 3");
+    assert!(error.to_string().contains("migrate-v2-v3"), "{error}");
+}
+
+/// A store this build wrote reopens, with its rows intact.
+///
+/// The fjall 2 fixtures can no longer carry this claim, and it is the claim
+/// that matters day to day: the two tests above prove the *refusal* is clean,
+/// and this one proves that reading a store back still works — which a
+/// refusal would otherwise mask. Written and reopened in one test rather than
+/// checked in as a fixture, because a checked-in fjall 3 fixture is the next
+/// major version's tripwire and this is about the engine in use now.
+#[test]
+fn a_store_this_build_wrote_reopens_with_its_rows() {
+    let dir = TempDir::new().expect("temp dir");
+    {
+        let store = FjallStore::open(dir.path()).expect("create");
+        for (key, value) in ROWS {
+            spindle_store::Store::put(&store, key, value).expect("write");
+        }
+        // Through a segment as well as the journal, so this covers the same
+        // two layers the fixtures did.
+        spindle_store::Store::flush_to_segments(&store).expect("rotate");
+        spindle_store::Store::sync(&store, spindle_store::Durability::Strict).expect("sync");
+    }
+
+    let store = FjallStore::open(dir.path()).expect("reopen");
     for (key, want) in ROWS {
         let got = store
             .get(key)
             .expect("read")
             .unwrap_or_else(|| panic!("{} is missing", String::from_utf8_lossy(key)));
-        assert_eq!(
-            got.as_slice(),
-            *want,
-            "{} came back changed",
-            String::from_utf8_lossy(key),
-        );
+        assert_eq!(got.as_slice(), *want);
     }
-}
-
-/// The fixture is not empty, and the emptiness would otherwise pass silently.
-///
-/// If a future `fjall` opened the directory, found a format it did not
-/// understand, and started fresh rather than failing, every `get` above would
-/// return `None` — and a test that only checked "no error" would agree that
-/// all was well. This is the assertion that catches a silent reset.
-#[test]
-fn the_fixture_is_not_silently_empty() {
-    let dir = fixture();
-    let store = FjallStore::open(dir.path()).expect("open");
-    let rows = store.scan_prefix(&[1]).expect("scan");
-    assert_eq!(
-        rows.len(),
-        ROWS.len(),
-        "the fixture holds {} rows; finding {} means the store was reset rather \
-         than read",
-        ROWS.len(),
-        rows.len(),
-    );
-}
-
-/// A store whose rows live in a **segment** opens and reads.
-///
-/// This is the half `fixtures/fjall2/` could not reach. Its rows were in the
-/// journal, so a `fjall` upgrade that changed only the segment format would
-/// have passed that test and still failed to open a real deployment — where
-/// most rows are in segments, because that is where an LSM engine puts them.
-#[test]
-fn a_store_whose_rows_are_in_a_segment_still_opens_and_reads() {
-    let dir = segment_fixture();
-    let store = FjallStore::open(dir.path()).expect(
-        "a segment written by an earlier fjall must open -- if this fails after \
-         an upgrade, so does every store that has ever compacted",
-    );
-
-    for n in 0..SEGMENT_ROWS {
-        let key = format!("\x01row-{n:04}");
-        let got = store
-            .get(key.as_bytes())
-            .expect("read")
-            .unwrap_or_else(|| panic!("{key} is missing"));
-        assert_eq!(
-            got.as_slice(),
-            format!("value-{n}").as_bytes(),
-            "{key} came back changed",
-        );
-    }
+    assert_eq!(store.scan_prefix(&[1]).expect("scan").len(), ROWS.len());
 }
 
 /// The segment fixture really does carry a segment.

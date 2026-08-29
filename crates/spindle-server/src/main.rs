@@ -333,15 +333,16 @@ fn backup(config_path: &str, file: &str) -> ExitCode {
 /// empty target and let the operator move the old directory aside
 /// deliberately.
 async fn restore(config_path: &str, file: &str) -> ExitCode {
-    let Some(store) = open_store(config_path) else {
+    let Some((store, config)) = open_store_with_config(config_path) else {
         return ExitCode::FAILURE;
     };
+    let store = std::sync::Arc::new(store);
     // "Empty" means no *data*, not no rows: opening a store stamps the schema
     // marker, so a store that has never held anything already has one row.
     // Counting that as content would refuse every restore, including the only
     // one that is supposed to work.
     let marker = spindle_core::keys::store_marker();
-    match spindle_store::ReadView::scan_prefix(&store, &[]) {
+    match spindle_store::ReadView::scan_prefix(store.as_ref(), &[]) {
         Ok(rows) => {
             let existing = rows.iter().filter(|(key, _)| *key != marker).count();
             if existing > 0 {
@@ -365,7 +366,7 @@ async fn restore(config_path: &str, file: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match spindle_store::backup::read_backup(&mut source, &store) {
+    match spindle_store::backup::read_backup(&mut source, store.as_ref()) {
         Ok(rows) => {
             println!("restored {rows} rows from {file}");
             // A backup carries rows; media bytes live outside it. Saying
@@ -374,7 +375,13 @@ async fn restore(config_path: &str, file: &str) -> ExitCode {
             // the rows still need. It is a report, not a failure: staging a
             // bucket or rsyncing a directory after the rows is a legitimate
             // order to do this in, and the operator is the one who knows.
-            report_media(config_path).await;
+            // The store this restore is holding, not a fresh open of the
+            // same directory: fjall 3 takes an exclusive lock on a data
+            // directory, so reopening it here fails with `Locked` -- and
+            // `report_media` used to swallow that into silence, turning "you
+            // are missing these blobs" into no output at all. The test that
+            // caught it is `a_restore_says_which_media_the_rows_it_wrote_still_need`.
+            report_media_with(&config, std::sync::Arc::clone(&store)).await;
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -403,8 +410,12 @@ async fn verify_media(config_path: &str) -> ExitCode {
 }
 
 /// Print the media audit as part of another command, never failing it.
-async fn report_media(config_path: &str) {
-    match audit_media(config_path).await {
+///
+/// Takes the store rather than a path, because the caller is mid-command and
+/// already holds one -- and fjall 3 will not hand out a second handle to a
+/// directory that is already open.
+async fn report_media_with(config: &Config, store: std::sync::Arc<FjallStore>) {
+    match audit_with(config, store).await {
         Some(audit) if audit.complete() => {
             println!("media: {} blobs, all present", audit.blobs);
         }
@@ -445,9 +456,17 @@ async fn audit_media(config_path: &str) -> Option<spindle_server::media::MediaAu
             return None;
         }
     };
+    audit_with(&config, store).await
+}
+
+/// The audit itself, over a store the caller already has open.
+async fn audit_with(
+    config: &Config,
+    store: std::sync::Arc<FjallStore>,
+) -> Option<spindle_server::media::MediaAudit> {
     let media = spindle_server::media::Media::new(
         store,
-        spindle_server::blobs_for(&config),
+        spindle_server::blobs_for(config),
         config.server.name.clone(),
     );
     match media.audit().await {
@@ -461,6 +480,16 @@ async fn audit_media(config_path: &str) -> Option<spindle_server::media::MediaAu
 
 /// Open the store a config names, reporting why if it cannot be opened.
 fn open_store(config_path: &str) -> Option<FjallStore> {
+    open_store_with_config(config_path).map(|(store, _)| store)
+}
+
+/// The same, keeping the config the caller will need anyway.
+///
+/// A command that opens the store almost always needs the configuration too,
+/// and re-loading it is cheap -- but re-*opening the store* is not merely
+/// wasteful under fjall 3, it fails: the directory is locked by the handle
+/// this function just returned.
+fn open_store_with_config(config_path: &str) -> Option<(FjallStore, Config)> {
     let config = match Config::load(config_path) {
         Ok(config) => config,
         Err(error) => {
@@ -469,7 +498,7 @@ fn open_store(config_path: &str) -> Option<FjallStore> {
         }
     };
     match FjallStore::open(&config.storage.path) {
-        Ok(store) => Some(store),
+        Ok(store) => Some((store, config)),
         Err(error) => {
             eprintln!(
                 "spindle: cannot open storage at {}: {error}",

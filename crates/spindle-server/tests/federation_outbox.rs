@@ -128,29 +128,38 @@ impl Stub {
 }
 
 struct Harness {
+    #[allow(dead_code, reason = "keeps the data directory alive for the store")]
     dir: TempDir,
+    store: Arc<FjallStore>,
     app: axum::Router,
 }
 
 impl Harness {
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
-        let app = Self::build(dir.path());
-        Self { dir, app }
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let app = Self::build(&store);
+        Self { dir, store, app }
     }
 
-    fn build(path: &std::path::Path) -> axum::Router {
-        let store = Arc::new(FjallStore::open(path).unwrap());
+    fn build(store: &Arc<FjallStore>) -> axum::Router {
         let config = spindle_server::Config::parse(
             "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n\
              [federation]\ninsecure_http = true\nretry_base_ms = 50\n",
         )
         .unwrap();
-        spindle_server::app(config, store).expect("the app builds")
+        spindle_server::app(config, Arc::clone(store)).expect("the app builds")
     }
 
+    /// A second server over the same store.
+    ///
+    /// Shares the handle rather than reopening the directory, which fjall 3
+    /// locks for as long as any handle lives -- and a running server's own
+    /// delivery loops hold one. The outbox claim is unchanged: the pending
+    /// rows are read back from the store by the new server's drain loop,
+    /// which is what "survive a rebuild" means here.
     fn restart(&mut self) {
-        self.app = Self::build(self.dir.path());
+        self.app = Self::build(&self.store);
     }
 
     async fn call(&self, request: Request<Body>) -> (StatusCode, Value) {
