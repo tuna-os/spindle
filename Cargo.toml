@@ -59,6 +59,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [workspace.lints.rust]
+# Was `RUSTFLAGS: -Dwarnings` on two workflows, which meant `cargo build`
+# locally applied different rules from CI and a contributor found out at
+# review time. Declared here so there is one place it lives (#266).
+warnings = "deny"
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
