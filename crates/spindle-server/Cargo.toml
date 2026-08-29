@@ -38,6 +38,13 @@ toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+rusqlite = { workspace = true, optional = true }
+
+[features]
+# Off by default: the reader is a one-shot migration path, and neither the
+# server binary nor the hot CI gate should pay a C compile for it.
+synapse-import = ["dep:rusqlite"]
+
 [dev-dependencies]
 # `state-res` so the tests can judge our events with the same implementation a
 # federating peer would (ADR 0002: ruma judges, it never builds our side).

@@ -25,6 +25,14 @@ jobs:
       - name: Run Matrix protocol compliance fixtures
         run: cargo test --test matrix_compliance
 
+      # The Synapse reader is behind a non-default feature, so the workspace
+      # gate never compiles it -- which is exactly how a parked module rots.
+      # This builds and runs it. No Synapse checkout is cloned: the one test
+      # that needs real DDL skips itself, and the rest carry the shapes that
+      # actually bite (a legacy is_state edge, an edge with a NULL room_id).
+      - name: Check the Synapse reader still builds and passes
+        run: cargo test --features synapse-import --test synapse_reader
+
   complement-readiness:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
