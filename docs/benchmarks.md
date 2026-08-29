@@ -648,6 +648,62 @@ None of this changes a published cell. Every sitting on the page predates
 withheld there rather than applied to numbers they do not describe. They
 take effect on the first multi-round sitting the page carries.
 
+## The second axis the sweep never varied: concurrency
+
+The M5 section above records holding room membership at two for every
+sitting since M2, and what that hid. The same question asked of a
+different axis has a sharper answer.
+
+`scripts/api-benchmark.py` measures with `[timed(operation) for _ in
+range(samples)]`. Every sample is sequential. **One request has been in
+flight at a time, in every sitting on this page.**
+
+So every figure published here is a *latency* at concurrency 1. That is a
+real and useful number — it is what a user waits — but it is not the
+number an operator sizing a server asks for, and no throughput figure
+against any competitor exists.
+
+Measured with `crates/spindle-server/tests/probe.rs`, eight tokio workers
+sending to eight independent rooms, debug build, in process:
+
+| concurrency | sends/sec | fsyncs | rode | coalescing |
+|---|---|---|---|---|
+| 1 | 615 | 200 | 0 | 1.00× |
+| 2 | 669 | 200 | 0 | 1.00× |
+| 4 | 649 | 200 | 0 | 1.00× |
+| 8 | 656 | 200 | 0 | 1.00× |
+
+**Flat.** Eight clients writing to eight different rooms get the
+throughput of one. Absolute values are a debug build and would be higher
+in release; the flatness is the result, and a shape does not move with a
+build profile.
+
+### Why, and what it retires
+
+`Rooms::with_room` takes a single process-wide
+`Mutex<HashMap<String, RoomLog>>` and holds it across the closure — which
+contains the commit *and its fsync*. Two writers are therefore never
+inside `commit()` together, which the `rode` column shows directly: with
+group commit present and eight clients pushing, not one commit ever rode
+another's fsync.
+
+That retires a question worth stating plainly, because it is the obvious
+first guess: **a faster WAL, or a different storage engine, cannot help
+here.** Postgres, RocksDB, LMDB — none of them is the constraint, because
+the server never asks the store to do two things at once. The 34×
+strict-vs-relaxed ratio measured below is the cost of `fsync`, and
+nothing makes `fsync` faster; systems make it *rarer*. Group commit does
+exactly that, and will coalesce nothing at all until the fsync moves out
+of that critical section.
+
+The ceiling is arithmetic: one lock held for roughly the CPU of an append
+plus one fsync, so server-wide write throughput is about
+`1 / send_latency` however many cores or rooms there are.
+
+This is a methodology defect of the same class as the membership one, and
+it is recorded the same way: as a limit on what every table above
+establishes, not as a footnote to them.
+
 ## Fork window: bounded search vs exhaustive walk
 
 | Room history | Bounded | Exhaustive | Ratio |
