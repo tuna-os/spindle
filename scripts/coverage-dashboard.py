@@ -137,7 +137,6 @@ PLANNED = {
     "Accounts, devices & auth": [
     ],
     "Profiles & presence": [
-        ("GET", "/_matrix/client/v3/presence/{user_id}/status", "presence (M2/M3)"),
     ],
     "Rooms & membership": [
         ("POST", "/_matrix/client/v3/rooms/{room_id}/upgrade", "room upgrade (#7)"),

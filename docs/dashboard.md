@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**167 routes implemented; 7 known gaps in scope.**
+**168 routes implemented; 6 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -208,12 +208,12 @@ neither implemented nor counted.
 - ⏳ `POST /_matrix/client/v3/rooms/{room_id}/upgrade` — room upgrade (#7)
 - ⏳ `POST /_matrix/client/v3/rooms/{room_id}/report/{event_id}` — reporting (M5)
 
-### Profiles & presence — 3 implemented, 1 planned
+### Profiles & presence — 4 implemented, 0 planned
 
+- `GET/PUT /_matrix/client/v3/presence/{user_id}/status`
 - `GET /_matrix/client/v3/profile/{user_id}`
 - `GET/PUT /_matrix/client/v3/profile/{user_id}/avatar_url`
 - `GET/PUT /_matrix/client/v3/profile/{user_id}/displayname`
-- ⏳ `GET /_matrix/client/v3/presence/{user_id}/status` — presence (M2/M3)
 
 ### Accounts, devices & auth — 11 implemented, 0 planned
 

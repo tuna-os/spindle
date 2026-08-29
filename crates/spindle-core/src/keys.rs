@@ -310,6 +310,10 @@ pub enum Keyspace {
     /// sync answers "what finished since my token" as a range read rather
     /// than a scan, exactly as the timeline does.
     FinalisedDelay = 0x2d,
+    /// One user's presence: whether they are online, and what they said
+    /// about it. Keyed by user because presence is a property of the user
+    /// rather than of any room they are in.
+    Presence = 0x2e,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -905,4 +909,10 @@ pub fn finalised_delay_position(user_id: &str, key: &[u8]) -> Option<u64> {
     let at = user_prefix(Keyspace::FinalisedDelay, user_id).len();
     let bytes: [u8; 8] = key.get(at..at.checked_add(8)?)?.try_into().ok()?;
     Some(u64::from_be_bytes(bytes))
+}
+
+/// One user's presence row.
+#[must_use]
+pub fn presence(user_id: &str) -> Vec<u8> {
+    user_prefix(Keyspace::Presence, user_id)
 }
