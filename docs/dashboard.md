@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**168 routes implemented; 6 known gaps in scope.**
+**169 routes implemented; 5 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
