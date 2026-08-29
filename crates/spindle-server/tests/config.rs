@@ -206,3 +206,39 @@ fn the_shipped_example_parses() {
          copied config cannot accidentally federate as something real"
     );
 }
+
+/// #36 asks for both delayed-event caps to be "rejected loudly". A zero is
+/// the case worth naming: it reads like "no limit" and means the opposite,
+/// so a server that accepted it would start with the dead-man's switch
+/// silently refusing every schedule -- the failure MSC4140 exists to prevent,
+/// arrived at through the config file.
+#[test]
+fn a_zero_delayed_event_cap_is_refused_at_startup() {
+    for (field, line) in [
+        ("delayed_events.max_delay_ms", "max_delay_ms = 0"),
+        ("delayed_events.max_per_room", "max_per_room = 0"),
+    ] {
+        let error = parse(&format!(
+            "[server]\nname = \"example.org\"\n[delayed_events]\n{line}\n"
+        ))
+        .expect_err("a zero cap must not start the server");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(field),
+            "the refusal names the field the operator has to fix: {rendered}"
+        );
+        assert!(
+            rendered.contains("refuses every delayed event"),
+            "and says what the zero would actually do: {rendered}"
+        );
+    }
+}
+
+/// The defaults still apply when the section is absent, so an existing
+/// config keeps working and does not have to learn about this.
+#[test]
+fn the_delayed_event_caps_default_without_the_section() {
+    let config = parse("[server]\nname = \"example.org\"\n").expect("no section is fine");
+    assert_eq!(config.delayed_events.max_delay_ms, 24 * 60 * 60 * 1000);
+    assert_eq!(config.delayed_events.max_per_room, 100);
+}

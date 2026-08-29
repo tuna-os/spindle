@@ -36,7 +36,27 @@ fn config() -> spindle_server::Config {
     .unwrap()
 }
 
+/// The same, with the caps an operator set rather than the defaults.
+fn config_with(extra: &str) -> spindle_server::Config {
+    spindle_server::Config::parse(&format!(
+        "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n{extra}"
+    ))
+    .unwrap()
+}
+
 impl Harness {
+    /// A server built on an operator's caps, not the built-in ones.
+    fn with_config(config: spindle_server::Config) -> Self {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let app = spindle_server::app(config, Arc::clone(&store)).unwrap();
+        Self {
+            _dir: dir,
+            store,
+            app,
+        }
+    }
+
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
@@ -835,5 +855,80 @@ async fn a_restart_is_visible_in_the_reported_deadline() {
     assert!(
         remaining.is_some() || after.len() == 1,
         "the restarted delay is still listed: {after:?}"
+    );
+}
+
+/// #36 asks for both caps to be *configurable*, not merely present. The
+/// tests above prove the defaults hold; these prove an operator's numbers
+/// are the ones actually enforced, which a constant would pass silently.
+#[tokio::test]
+async fn the_duration_cap_is_the_one_the_operator_set() {
+    let harness = Harness::with_config(config_with("[delayed_events]\nmax_delay_ms = 5000\n"));
+    let token = harness.register("alice").await;
+    let room = harness.create_room(&token).await;
+
+    let (status, body) = harness
+        .call(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/_matrix/client/v3/rooms/{room}/send/m.room.message/over?{DELAY_PARAM}=6000"
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "msgtype": "m.text", "body": "over" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "6s is past the 5s cap this server was configured with: {body}"
+    );
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains("5000"),
+        "and the refusal names the operator's limit, not the default: {body}"
+    );
+
+    // Well inside the default day, so a constant would have accepted it.
+    harness.delay_message(&room, &token, 4_000, "under").await;
+}
+
+/// The count cap, likewise.
+#[tokio::test]
+async fn the_count_cap_is_the_one_the_operator_set() {
+    let harness = Harness::with_config(config_with("[delayed_events]\nmax_per_room = 2\n"));
+    let token = harness.register("alice").await;
+    let room = harness.create_room(&token).await;
+
+    harness.delay_message(&room, &token, 60_000, "one").await;
+    harness.delay_message(&room, &token, 60_000, "two").await;
+
+    let (status, body) = harness
+        .call(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/_matrix/client/v3/rooms/{room}/send/m.room.message/three?{DELAY_PARAM}=60000"
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "msgtype": "m.text", "body": "three" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the third is past the operator's cap of 2, far below the default 100: {body}"
+    );
+    assert_eq!(
+        harness.pending(&token).await.len(),
+        2,
+        "and the refusal did not cost the delays already held"
     );
 }

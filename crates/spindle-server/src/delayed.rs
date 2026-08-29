@@ -191,10 +191,19 @@ pub const DEFAULT_MAX_PER_ROOM: usize = 100;
 impl Delayed {
     #[must_use]
     pub fn new(store: Arc<FjallStore>) -> Self {
+        Self::with_limits(store, DEFAULT_MAX_DELAY_MS, DEFAULT_MAX_PER_ROOM)
+    }
+
+    /// The same, with the caps an operator configured.
+    ///
+    /// Separate from [`Self::new`] so the defaults live in one place and
+    /// the tests that do not care about the caps do not have to name them.
+    #[must_use]
+    pub fn with_limits(store: Arc<FjallStore>, max_delay_ms: u64, max_per_room: usize) -> Self {
         Self {
             store,
-            max_delay_ms: DEFAULT_MAX_DELAY_MS,
-            max_per_room: DEFAULT_MAX_PER_ROOM,
+            max_delay_ms,
+            max_per_room,
             restarts: std::sync::Mutex::new(std::collections::HashMap::new()),
             generation: std::sync::atomic::AtomicU64::new(0),
         }

@@ -181,6 +181,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
         .auth
         .builtin_oidc
         .then(|| Arc::new(oidc::BuiltinOidc::new()));
+    let delayed_caps = config.delayed_events.clone();
     let state = AppState {
         config: Arc::new(config),
         store,
@@ -200,7 +201,11 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
         delegated,
         oidc: oidc_provider,
         federation,
-        delayed: Arc::new(delayed::Delayed::new(Arc::clone(&store_for_delayed))),
+        delayed: Arc::new(delayed::Delayed::with_limits(
+            Arc::clone(&store_for_delayed),
+            delayed_caps.max_delay_ms,
+            delayed_caps.max_per_room,
+        )),
     };
     spawn_delivery_loops(&state);
     Ok(routes::router(state))
