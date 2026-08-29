@@ -628,10 +628,15 @@ async fn a_fork_on_the_same_slot_is_counted_as_the_expensive_case() {
     // The append is refused today. When #16 wires bounded resolution into
     // ingest this becomes an OK, and the assertion below is the one that
     // has to change -- deliberately, with the counter still moving.
-    assert_ne!(
+    //
+    // 503, not 500: #225 recorded that a genuinely contested fork answered
+    // with a bare internal error, which tells a client nothing it can act
+    // on. The server is working correctly here; the *room* is in a state it
+    // cannot fold yet, and that is a different thing to say.
+    assert_eq!(
         merged,
-        StatusCode::OK,
-        "the same-slot fork was merged; #16 has landed and this test needs its other half"
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a contested fork must be refused as a service state, not as a crash"
     );
     assert_eq!(
         delta.contested, 1,

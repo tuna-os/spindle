@@ -4001,11 +4001,14 @@ impl Rooms {
                 // this append needs the resolver. Counted where the
                 // decision is made (#166), whether it is then resolved or
                 // — as today — refused.
-                if matches!(
-                    error,
-                    spindle_core::AppendError::NeedsStateResolution { .. }
-                ) {
+                if let spindle_core::AppendError::NeedsStateResolution { key, .. } = &error {
                     crate::metrics::record_contested_state(crate::metrics::Origin::Local);
+                    return RoomError::Contested {
+                        // The `type/state_key` spelling `/state_ids` uses,
+                        // so an operator can match this against what the
+                        // room actually reports holding.
+                        key: format!("{}/{}", key.event_type().as_str(), key.state_key()),
+                    };
                 }
                 RoomError::Append(format!("{error:?}"))
             })?
@@ -4540,11 +4543,14 @@ impl Rooms {
         let entry = log
             .append_remote(input)
             .map_err(|error| {
-                if matches!(
-                    error,
-                    spindle_core::AppendError::NeedsStateResolution { .. }
-                ) {
+                if let spindle_core::AppendError::NeedsStateResolution { key, .. } = &error {
                     crate::metrics::record_contested_state(crate::metrics::Origin::Federated);
+                    return RoomError::Contested {
+                        // The `type/state_key` spelling `/state_ids` uses,
+                        // so an operator can match this against what the
+                        // room actually reports holding.
+                        key: format!("{}/{}", key.event_type().as_str(), key.state_key()),
+                    };
                 }
                 RoomError::Append(format!("{error:?}"))
             })?
@@ -5234,6 +5240,18 @@ pub enum RoomError {
     MissingBody(String),
     Build(String),
     Append(String),
+    /// SPEC §9.2 case 3: two branches of a fork moved the same state key
+    /// away from the value they both inherited, so the merge needs the
+    /// room-version resolver that is not yet wired into ingest (#16).
+    ///
+    /// Distinct from [`RoomError::Append`] because it is the one append
+    /// failure that is neither the caller's fault nor a bug: the room is in
+    /// a state this server cannot currently fold, and #225 recorded that
+    /// answering it with a bare 500 tells a client nothing it can act on
+    /// and an operator nothing they can diagnose.
+    Contested {
+        key: String,
+    },
     StateUnavailable(String),
     UnknownState(String),
     Forbidden(String),
@@ -5262,6 +5280,10 @@ impl std::fmt::Display for RoomError {
                     "this server does not support room version {version}"
                 )
             }
+            Self::Contested { key } => write!(
+                formatter,
+                "the state key {key} is contested between two branches of a                  fork and needs state resolution"
+            ),
             Self::UnknownRoom(id) => write!(formatter, "no such room: {id}"),
             Self::MissingBody(id) => write!(formatter, "the body of {id} is missing"),
             Self::Build(message) => write!(formatter, "cannot build the event: {message}"),

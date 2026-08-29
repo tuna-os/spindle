@@ -7153,7 +7153,24 @@ pub(crate) fn room_error(error: crate::rooms::RoomError) -> MatrixError {
         crate::rooms::RoomError::MissingBody(_) => {
             MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such event")
         }
+        // The message is ruma's own wording for the rule that refused, which
+        // is the same explanation a federating peer would give. A generic
+        // "forbidden" would make a client's bug report useless.
         crate::rooms::RoomError::Forbidden(rule) => MatrixError::forbidden(rule),
+        // #225: this was a 500 with an empty body, which told a client
+        // nothing and an operator nothing. It is not an internal error --
+        // the server is working correctly and the *room* is in a state it
+        // cannot fold until #16 wires the resolver into ingest. 503 says
+        // "this server, this room, not now", which is the true shape of it,
+        // and naming the contested key makes it diagnosable.
+        crate::rooms::RoomError::Contested { key } => MatrixError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "M_UNKNOWN",
+            format!(
+                "this room has a fork contesting {key}, which this server cannot \
+                 resolve yet; sends are refused until it is settled"
+            ),
+        ),
         other => MatrixError::internal(&other.to_string()),
     }
 }
@@ -7244,16 +7261,7 @@ async fn send_event(
                 &event_type,
                 &content,
             )
-            .map_err(|error| match error {
-                crate::rooms::RoomError::UnknownRoom(_) => {
-                    MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such room")
-                }
-                // The message is ruma's own wording for the rule that refused,
-                // which is the same explanation a federating peer would give. A
-                // generic "forbidden" would make a client's bug report useless.
-                crate::rooms::RoomError::Forbidden(rule) => MatrixError::forbidden(rule),
-                other => MatrixError::internal(&other.to_string()),
-            })
+            .map_err(room_error)
     })
 }
 
@@ -7286,16 +7294,10 @@ async fn room_messages(
     };
     let limit = query.limit.unwrap_or(10).clamp(1, 100);
 
-    let (events, next) =
-        state
-            .rooms
-            .messages(&room_id, from, limit)
-            .map_err(|error| match error {
-                crate::rooms::RoomError::UnknownRoom(_) => {
-                    MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such room")
-                }
-                other => MatrixError::internal(&other.to_string()),
-            })?;
+    let (events, next) = state
+        .rooms
+        .messages(&room_id, from, limit)
+        .map_err(room_error)?;
 
     let chunk: Vec<Value> = events
         .iter()
