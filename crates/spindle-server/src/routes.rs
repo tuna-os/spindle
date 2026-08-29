@@ -518,6 +518,10 @@ fn timeline_routes() -> Router<AppState> {
             post(read_markers),
         )
         .route(
+            "/_matrix/client/v3/rooms/{room_id}/upgrade",
+            post(upgrade_room),
+        )
+        .route(
             "/_matrix/client/v3/rooms/{room_id}/redact/{event_id}/{txn_id}",
             axum::routing::put(redact_event),
         )
@@ -8121,6 +8125,156 @@ fn may_read_room(state: &AppState, user_id: &str, room_id: &str) -> Result<(), M
     Err(MatrixError::forbidden(format!(
         "{user_id} is not in {room_id}"
     )))
+}
+
+/// The state a room upgrade carries across.
+///
+/// Everything here is a room-level *setting* rather than a record of who
+/// did what: the new room is the same room continued, so it should look and
+/// behave the same the moment it opens. Deliberately absent:
+///
+/// - `m.room.member` — the whole point of an upgrade is that members rejoin
+///   through the tombstone, which is what re-runs the join rules against
+///   the new version's own rules rather than trusting the old room's.
+/// - `m.room.create` — the new room has its own, carrying `predecessor`.
+/// - `m.room.tombstone` — the old room gets one; a new room born with one
+///   would be dead on arrival.
+/// - Anything not listed: an unknown state event is room content whose
+///   meaning this server does not know, and copying it blind could carry a
+///   stale reference to the old room across.
+const UPGRADE_CARRIES: &[&str] = &[
+    "m.room.name",
+    "m.room.topic",
+    "m.room.avatar",
+    "m.room.join_rules",
+    "m.room.guest_access",
+    "m.room.history_visibility",
+    "m.room.encryption",
+    "m.room.server_acl",
+    "m.space.parent",
+];
+
+#[derive(Debug, Deserialize)]
+struct UpgradeRequest {
+    new_version: String,
+}
+
+/// `POST /_matrix/client/v3/rooms/{room_id}/upgrade`
+///
+/// The room continues at a new version. This is the path that matters for
+/// #178's v12 work: a room created at 11 has no other way to reach 12, and
+/// v12 exists because the old state-resolution behaviour was exploitable.
+///
+/// The order is deliberate and is the part worth getting right. The new
+/// room is built *first*, and the tombstone in the old room is written
+/// last, because the tombstone is what tells clients where to go. A
+/// tombstone written before the replacement exists points at nothing, and
+/// there is no way to withdraw it -- every client in the room would follow
+/// it into a room that is not there.
+async fn upgrade_room(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    Json(request): Json<UpgradeRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    if !crate::surface::supports_room_version(&request.new_version) {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_UNSUPPORTED_ROOM_VERSION",
+            format!(
+                "this server does not support room version {}",
+                request.new_version
+            ),
+        ));
+    }
+    may_read_room(&state, &identity.user_id, &room_id)?;
+    let old_state = state.rooms.state(&room_id).map_err(room_error)?;
+
+    // Whether this user may end the room, asked of the old room before
+    // anything is built. The tombstone is a real state event and faces the
+    // real power-level check when it is sent; asking first means a refusal
+    // does not leave an orphaned replacement room behind.
+    let carried: Vec<(String, String, Value)> = old_state
+        .iter()
+        .filter_map(|event| {
+            let event_type = event["type"].as_str()?;
+            if !UPGRADE_CARRIES.contains(&event_type) {
+                return None;
+            }
+            Some((
+                event_type.to_owned(),
+                event["state_key"].as_str().unwrap_or_default().to_owned(),
+                event["content"].clone(),
+            ))
+        })
+        .collect();
+
+    // The old room's power levels come across too, but only after the
+    // creator has been able to write the rest: a copied ruleset that
+    // already forbids the creator from sending would freeze the new room
+    // half-built. So it is applied as the last state write, not carried in
+    // the initial state.
+    let power_levels = old_state
+        .iter()
+        .find(|event| event["type"] == "m.room.power_levels")
+        .map(|event| event["content"].clone());
+
+    let mut creation_content = serde_json::Map::new();
+    creation_content.insert(
+        "predecessor".to_owned(),
+        json!({ "room_id": room_id.clone() }),
+    );
+    let replacement = state
+        .rooms
+        .create(
+            &identity.user_id,
+            state.key.pair(),
+            None,
+            None,
+            None,
+            &carried,
+            Some(&request.new_version),
+            Some(&creation_content),
+        )
+        .map_err(room_error)?;
+
+    if let Some(levels) = power_levels {
+        // Best effort, and said so: a ruleset the new room refuses is a
+        // ruleset the old room should not have had either, and failing the
+        // whole upgrade over it would strand the user in a room they have
+        // already been told is being replaced.
+        if let Err(error) = state.rooms.set_state(
+            &replacement,
+            &identity.user_id,
+            state.key.pair(),
+            "m.room.power_levels",
+            "",
+            &levels,
+        ) {
+            tracing::warn!(
+                %room_id, %replacement,
+                "the upgraded room kept default power levels: {error}"
+            );
+        }
+    }
+
+    // Last, and the reason for the whole ordering above.
+    state
+        .rooms
+        .set_state(
+            &room_id,
+            &identity.user_id,
+            state.key.pair(),
+            "m.room.tombstone",
+            "",
+            &json!({
+                "body": "this room has been replaced",
+                "replacement_room": replacement.clone(),
+            }),
+        )
+        .map_err(room_error)?;
+
+    Ok(Json(json!({ "replacement_room": replacement })))
 }
 
 /// The `m.space.child` events of a room, in the spec's order.
