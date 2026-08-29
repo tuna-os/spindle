@@ -1,0 +1,69 @@
+# The defect this repository actually keeps making.
+#
+# Five handlers shipped that authenticated the caller and then read a room
+# without asking whether that caller could see it (#258). Every one was
+# found by a human reading the file. Clippy cannot express the rule --
+# it is not a lint about a construct, it is a rule about a *missing* call
+# on a path that already has the caller's identity in hand.
+#
+# Authenticating says who somebody is. It does not say what they may read.
+rules:
+  - id: room-read-without-authorization
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - crates/spindle-server/src/routes.rs
+        - .semgrep/fixtures/*.rs
+    message: >-
+      This handler takes an authenticated caller and a room id, reads that
+      room, and never asks whether the caller may see it. Authenticating a
+      caller says who they are, not what they may read -- which is exactly
+      how five of these shipped (#258). Call
+      `may_read_room(&state, &identity.user_id, &room_id)?;` before touching
+      `state.rooms`, or, if this endpoint is deliberately open, make that a
+      decision somebody can find: gate it on the room's own visibility and
+      say so where the gate would have gone.
+    patterns:
+      # An authenticated handler ...
+      - pattern-inside: |
+          async fn $HANDLER(..., Authenticated($ID): Authenticated, ...) -> $RET {
+            ...
+          }
+      # ... that is handed a room id by the router ...
+      - pattern-inside: |
+          async fn $HANDLER(..., axum::extract::Path($ROOM): axum::extract::Path<String>, ...) -> $RET {
+            ...
+          }
+      # ... and reads that room.
+      - pattern: $STATE.rooms.$METHOD(&$ROOM, ...)
+      # Writes are out of scope: an append is authorised by the room's own
+      # auth rules on the way through `append`, which is a stronger check
+      # than this rule knows how to ask for. Named rather than allow-listing
+      # reads, so a *new* read method is flagged by default -- a security
+      # rule should fail loud on the thing it has not been taught.
+      - metavariable-regex:
+          metavariable: $METHOD
+          regex: ^(?!set_|send|append|create|redact|invite|kick|ban|leave|join|upgrade|purge|delete|forget).*
+      # The gates this codebase actually uses. Semgrep matches Rust
+      # statements structurally rather than textually, so each spelling has
+      # to be named; a new gate shape must be added here, which is the point
+      # at which somebody notices they invented one.
+      - pattern-not-inside: |
+          async fn $HANDLER(...) -> $RET {
+            ...
+            may_read_room(...)?;
+            ...
+          }
+      - pattern-not-inside: |
+          async fn $HANDLER(...) -> $RET {
+            ...
+            if may_read_room(...).is_err() { ... }
+            ...
+          }
+      - pattern-not-inside: |
+          async fn $HANDLER(...) -> $RET {
+            ...
+            may_publish(...)?;
+            ...
+          }
