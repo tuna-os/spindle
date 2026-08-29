@@ -3300,7 +3300,25 @@ impl Rooms {
         position: u64,
     ) -> Result<HashMap<String, Vec<i64>>, RoomError> {
         let mut by_room: HashMap<String, Vec<i64>> = HashMap::new();
-        for stream_id in (since + 1)..=position {
+        self.scan_stream(since, position, |room_id, li| {
+            by_room.entry(room_id).or_default().push(li);
+        })?;
+        Ok(by_room)
+    }
+
+    /// Walk a stream range once, handing each row to `emit`.
+    ///
+    /// The one place the range is read. Both callers want a different shape
+    /// out of the same walk -- one buckets the indices, the other only wants
+    /// the distinct rooms -- and having two copies of the loop is how they
+    /// drift.
+    fn scan_stream(
+        &self,
+        since: u64,
+        until: u64,
+        mut emit: impl FnMut(String, i64),
+    ) -> Result<(), RoomError> {
+        for stream_id in (since + 1)..=until {
             let Some(raw) = spindle_store::ReadView::get(
                 self.store.as_ref(),
                 &spindle_core::keys::stream(stream_id),
@@ -3311,9 +3329,9 @@ impl Rooms {
             let Some(record) = StreamRecord::decode(&raw) else {
                 continue;
             };
-            by_room.entry(record.room_id).or_default().push(record.li);
+            emit(record.room_id, record.li);
         }
-        Ok(by_room)
+        Ok(())
     }
 
     /// The events a room contributed to a stream range, as bodies.
@@ -3576,23 +3594,11 @@ impl Rooms {
     /// # Errors
     ///
     /// Returns [`RoomError`] if the stream cannot be read.
-    pub fn changed_rooms(&self, since: u64, until: u64) -> Result<Vec<String>, RoomError> {
-        let mut rooms = Vec::new();
-        for stream_id in (since + 1)..=until {
-            let Some(raw) = spindle_store::ReadView::get(
-                self.store.as_ref(),
-                &spindle_core::keys::stream(stream_id),
-            )?
-            else {
-                continue;
-            };
-            let Some(record) = StreamRecord::decode(&raw) else {
-                continue;
-            };
-            if !rooms.contains(&record.room_id) {
-                rooms.push(record.room_id);
-            }
-        }
+    pub fn changed_rooms(&self, since: u64, until: u64) -> Result<HashSet<String>, RoomError> {
+        let mut rooms = HashSet::new();
+        self.scan_stream(since, until, |room_id, _| {
+            rooms.insert(room_id);
+        })?;
         Ok(rooms)
     }
 
