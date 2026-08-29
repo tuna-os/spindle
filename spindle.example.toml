@@ -122,6 +122,36 @@ registrations = []
 # surface answers 404 and the provider cannot manage accounts here.
 # homeserver_secret = "..."
 
+[turn]
+# TURN relays, for calls that cannot connect peer-to-peer.
+#
+# Empty is a working configuration: `/voip/turnServer` answers with an empty
+# object, which is what the spec says and what clients expect. Most calls
+# never need a relay — the ones behind symmetric NAT do, and without one they
+# fail silently, which is why this is usually configured after the first
+# complaint rather than before it.
+# uris = [
+#     "turn:turn.example.org:3478?transport=udp",
+#     "turn:turn.example.org:3478?transport=tcp",
+# ]
+#
+# coturn's `static-auth-secret`. Credentials are minted per request as
+# `expiry:@user:example.org` with an HMAC-SHA1 of that under this secret, so
+# they expire on their own and the relay verifies them without an account
+# database and without ever contacting this server. Prefer this.
+# shared_secret = "the same string as coturn's static-auth-secret"
+#
+# The alternative, for a relay that speaks nothing else: one fixed pair
+# handed to every client. It cannot expire and cannot be revoked for one
+# caller. Mutually exclusive with shared_secret, and refused at startup if
+# both are set.
+# username = "spindle"
+# password = "..."
+#
+# How long an issued credential lasts, and the `ttl` reported to clients as
+# their cue to fetch a fresh one. Defaults to a day, which is coturn's own.
+# ttl_seconds = 86400
+
 [metrics]
 # Prometheus scrape surface, off unless this is set. Its own listener, on
 # loopback: the exposition names the peers this server federates with and
