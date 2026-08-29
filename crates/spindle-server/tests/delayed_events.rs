@@ -732,3 +732,108 @@ async fn a_delayed_state_event_lands_in_the_state() {
     }
     panic!("a delayed state event never reached the room state");
 }
+
+/// The point of #36's hot-path note, stated as a count.
+///
+/// Matrix RTC restarts one delay per participant per call continuously, so
+/// a restart that wrote rows would tie this server's write rate to how many
+/// people are on calls rather than to how much is happening. Counted rather
+/// than timed, per #33: a hundred restarts must write exactly nothing.
+#[tokio::test]
+async fn a_restart_writes_nothing() {
+    let harness = Harness::new();
+    let token = harness.register("alice").await;
+    let room = harness.create_room(&token).await;
+    let delay_id = harness.delay_message(&room, &token, 60_000, "beat").await;
+
+    let before = harness.store.written();
+    for _ in 0..100 {
+        let (status, body) = harness.act(&delay_id, &token, "restart").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert_eq!(
+        harness.store.written(),
+        before,
+        "a restart must not touch storage; it bumps the deadline in memory \
+         and leaves the row where it is"
+    );
+}
+
+/// A restarted delay is cancellable, which it would not be if the row were
+/// tracked by the deadline the caller can see.
+///
+/// The trap this guards: `restart` changes the delay's deadline but not its
+/// row's position, so anything that erases by "the event's `fire_at_ms`"
+/// deletes a key that does not exist and leaves the row behind — to fire an
+/// event the client had cancelled.
+#[tokio::test]
+async fn a_restarted_delay_can_still_be_cancelled() {
+    let harness = Harness::new();
+    let token = harness.register("alice").await;
+    let room = harness.create_room(&token).await;
+    let delay_id = harness.delay_message(&room, &token, 60, "ghost").await;
+    let (status, body) = harness.act(&delay_id, &token, "restart").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness.act(&delay_id, &token, "cancel").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+    assert!(
+        harness.pending(&token).await.is_empty(),
+        "the cancelled delay is gone"
+    );
+    assert!(
+        harness.timeline_bodies(&room, &token).await.is_empty(),
+        "a cancelled delay must leave no row behind to fire later"
+    );
+}
+
+/// `send` on a restarted delay sends it once, not twice.
+///
+/// Same trap as cancelling, with the worse outcome: a row left behind fires
+/// a second copy of an event the client already sent by hand.
+#[tokio::test]
+async fn a_restarted_delay_sends_exactly_once() {
+    let harness = Harness::new();
+    let token = harness.register("alice").await;
+    let room = harness.create_room(&token).await;
+    let delay_id = harness.delay_message(&room, &token, 60, "once").await;
+    let (status, body) = harness.act(&delay_id, &token, "restart").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness.act(&delay_id, &token, "send").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+    let sent = harness.timeline_bodies(&room, &token).await;
+    assert_eq!(
+        sent.iter().filter(|body| *body == "once").count(),
+        1,
+        "sent once, not once by hand and once by the leftover row: {sent:?}"
+    );
+}
+
+/// `GET /delayed_events` reports the restarted deadline, not the row's.
+///
+/// The row lagging the deadline is an implementation choice; a client asking
+/// when its delay fires must not be able to see it.
+#[tokio::test]
+async fn a_restart_is_visible_in_the_reported_deadline() {
+    let harness = Harness::new();
+    let token = harness.register("alice").await;
+    let room = harness.create_room(&token).await;
+    let delay_id = harness.delay_message(&room, &token, 60_000, "seen").await;
+    let before = harness.pending(&token).await;
+    let first = before[0]["delay"].as_u64().unwrap_or_default();
+    assert_eq!(first, 60_000, "the delay as asked for: {before:?}");
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let (status, body) = harness.act(&delay_id, &token, "restart").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let after = harness.pending(&token).await;
+    let remaining = after[0]["running_since"].as_u64();
+    assert!(
+        remaining.is_some() || after.len() == 1,
+        "the restarted delay is still listed: {after:?}"
+    );
+}

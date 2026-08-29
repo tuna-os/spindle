@@ -426,6 +426,7 @@ pub struct FjallStore {
     /// increment is far cheaper than the read it is counting.
     reads: AtomicU64,
     scanned: AtomicU64,
+    written: AtomicU64,
     /// Batches journalled but not necessarily synced, ever, since open.
     ///
     /// Exists so a caller can ask "did anything get written while I held
@@ -479,6 +480,18 @@ impl FjallStore {
     #[must_use]
     pub fn scanned(&self) -> u64 {
         self.scanned.load(Ordering::Relaxed)
+    }
+
+    /// Rows written since this store was opened, counting a delete as a
+    /// write because that is what it is on an LSM tree: a tombstone is a
+    /// row, and it is merged and compacted like any other.
+    ///
+    /// The counterpart to [`Self::reads`], and for the same reason -- a
+    /// claim about how much a path writes is testable by subtracting two
+    /// readings, where a claim about how long it takes is not (#33).
+    #[must_use]
+    pub fn written(&self) -> u64 {
+        self.written.load(Ordering::Relaxed)
     }
 
     /// Open or create a store at `path`.
@@ -552,6 +565,7 @@ impl FjallStore {
         Ok(Self {
             reads: AtomicU64::new(0),
             scanned: AtomicU64::new(0),
+            written: AtomicU64::new(0),
             journalled: AtomicU64::new(0),
             group: GroupCommit::default(),
             db,
@@ -761,6 +775,7 @@ impl ReadView for FjallCheckpoint {
 impl Store for FjallStore {
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         self.partition.insert(key, value)?;
+        self.written.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -775,6 +790,7 @@ impl Store for FjallStore {
 
     fn delete(&self, key: &[u8]) -> Result<(), StoreError> {
         self.partition.remove(key)?;
+        self.written.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -804,6 +820,11 @@ impl Store for FjallStore {
         // Always `Buffer`: the bytes reach the journal and nothing is synced.
         // Which sync they get -- if any -- is `sync`'s decision.
         batch.durability(Some(PersistMode::Buffer)).commit()?;
+        // Rows, not batches: a batch of a hundred is a hundred rows to
+        // merge and compact, and counting it as one would let a path claim
+        // it writes less by bundling the same work.
+        self.written
+            .fetch_add(writes.len() as u64, Ordering::Relaxed);
         // After the write, so an observer that sees the count move knows the
         // bytes are already journalled and a sync will cover them.
         self.journalled.fetch_add(1, Ordering::Release);
