@@ -1497,6 +1497,115 @@ impl Rooms {
         Ok((out, next))
     }
 
+    /// A room's thread roots, most recently active first.
+    ///
+    /// The ordering the spec asks for is by *latest activity in the thread*,
+    /// not by when the root was sent, so the sort key is the highest `li`
+    /// among a root's live `m.thread` children. That key is free here: the
+    /// relation index is keyed by room and ends in `li`, so one prefix scan
+    /// over the room hands back every relation already in log order and the
+    /// last row for a target is that thread's latest reply. No `latest_event`
+    /// column has to be maintained, and nothing can drift out of step with
+    /// the events themselves.
+    ///
+    /// **The root comes out of the child's `content`, not out of the key.**
+    /// Both name the same event, but reading it from content makes redaction
+    /// handle itself: redaction strips `m.relates_to`, so a redacted reply
+    /// stops counting toward the thread it was in — the same rule
+    /// [`Rooms::relations`] and [`Rooms::bundle_relations`] apply, and the
+    /// reason all three agree about what a thread contains.
+    ///
+    /// `participated` is the spec's definition and Synapse's: the viewer sent
+    /// a reply in the thread, **or** sent the root itself. Applied here rather
+    /// than by the caller so that the filter and the
+    /// `current_user_participated` flag the bundle carries cannot disagree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room is unknown or the index cannot be
+    /// read.
+    pub fn threads(
+        &self,
+        room_id: &str,
+        viewer: &str,
+        participated_only: bool,
+        from: Option<i64>,
+        limit: usize,
+    ) -> Result<(Vec<Value>, Option<i64>), RoomError> {
+        // The room has to exist, for the reason `relations` gives: an unknown
+        // room must not answer "no threads".
+        self.with_room(room_id, |_, _| Ok(()))?;
+
+        let prefix =
+            spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::Relation, room_id);
+        let rows = spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?;
+
+        // root event id -> (latest reply's li, viewer replied in it)
+        let mut roots: HashMap<String, (i64, bool)> = HashMap::new();
+        for (key, value) in rows {
+            let Some(li) = spindle_core::keys::li_from_key(&key) else {
+                continue;
+            };
+            let Some((rel_type, event_id)) = decode_relation(&value) else {
+                continue;
+            };
+            // Filtered off the index value before the body is read, so a room
+            // full of reactions costs one comparison each rather than a load.
+            if rel_type != "m.thread" {
+                continue;
+            }
+            let reply = match self.event(room_id, &event_id) {
+                Ok(reply) => reply,
+                // A purged reply cannot say what it replied to. Skipped, not
+                // an error -- the thread's other replies still describe it.
+                Err(RoomError::MissingBody(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let Some((_, root)) = relates_to(&reply["content"]) else {
+                continue;
+            };
+            let replied = reply["sender"].as_str() == Some(viewer);
+            let entry = roots.entry(root).or_insert((li, false));
+            entry.0 = entry.0.max(li);
+            entry.1 |= replied;
+        }
+
+        // Descending by latest reply. No tie-break is needed and none would
+        // ever fire: an `li` names one event, so two threads cannot share a
+        // latest reply.
+        let mut ordered: Vec<(i64, String, bool)> = roots
+            .into_iter()
+            .map(|(root, (li, replied))| (li, root, replied))
+            .collect();
+        ordered.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+
+        let mut out = Vec::new();
+        let mut next = None;
+        for (li, root, replied) in ordered {
+            // Mirrors `relations`, reflected: that scan runs forward and
+            // resumes above the token, this one runs backward and resumes
+            // below it.
+            if from.is_some_and(|from| li >= from) {
+                continue;
+            }
+            let event = match self.event(room_id, &root) {
+                Ok(event) => event,
+                // A thread whose root has been purged has nothing to list.
+                Err(RoomError::MissingBody(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            if participated_only && !replied && event["sender"].as_str() != Some(viewer) {
+                continue;
+            }
+            if out.len() == limit {
+                next = Some(li + 1);
+                break;
+            }
+            out.push(event);
+        }
+        Ok((out, next))
+    }
+
     /// The events around one event, and the room's state as it stood there.
     ///
     /// SPEC §10.5 in one line: "`/context` is a symmetric scan around it and
@@ -3257,6 +3366,12 @@ impl Rooms {
     /// - `m.thread`: count and the latest event, whole, plus whether the
     ///   asking user has participated — which is why this takes `viewer`.
     ///
+    /// "Participated" is the spec's definition, which the `/threads`
+    /// endpoint states outright and this aggregate only implies: the viewer
+    /// sent an event in the thread, **or** sent the thread root itself. The
+    /// root's sender costs a read the replies do not, so it is only consulted
+    /// when the replies have not already settled the question.
+    ///
     /// A redacted relation stops relating here for the same reason it does in
     /// `/relations`: `m.relates_to` lives in content and redaction strips it,
     /// so the check is reading the event rather than trusting the index row.
@@ -3341,6 +3456,19 @@ impl Rooms {
             );
         }
         if let Some(latest) = thread_latest {
+            // Starting a thread is participating in it. Checked last and only
+            // when no reply has already answered it, so the common case pays
+            // nothing: a thread the viewer is in is settled by the replies.
+            if !viewer_in_thread {
+                viewer_in_thread = match self.event(room_id, target) {
+                    Ok(root) => root["sender"].as_str() == Some(viewer),
+                    // A root whose body is gone cannot name its sender. Not
+                    // participating is the answer that shows the viewer less,
+                    // which is the right way to be wrong here.
+                    Err(RoomError::MissingBody(_)) => false,
+                    Err(error) => return Err(error),
+                };
+            }
             bundle.insert(
                 "m.thread".to_owned(),
                 serde_json::json!({
