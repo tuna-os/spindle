@@ -419,3 +419,37 @@ async fn an_empty_state_key_may_be_spelled_as_a_trailing_slash() {
         .await;
     assert_eq!(read_back["topic"], "set through the trailing slash");
 }
+
+/// A room read a caller may not make is 403, on every read endpoint.
+///
+/// Both endpoints refuse in `may_read_room` before any room error can be
+/// raised, so this is not guarding a live 500 — it is guarding the
+/// *agreement*. `/state` and `/messages` reached that answer by different
+/// routes, and `/messages` carried its own copy of the room-error match
+/// with no `Forbidden` arm at all. Nothing reached that arm today, which is
+/// exactly why a later change could quietly start relying on it and get the
+/// catch-all instead: a caller unable to tell "you may not read this" from
+/// "this server is broken".
+///
+/// The copy is gone and both share `room_error`. This asserts the property
+/// that made the duplication safe to remove.
+#[tokio::test]
+async fn a_refused_room_read_is_forbidden_on_every_endpoint() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room_id = harness.create_room(&alice).await;
+
+    for path in [
+        format!("/_matrix/client/v3/rooms/{room_id}/state"),
+        format!("/_matrix/client/v3/rooms/{room_id}/messages?dir=b&limit=10"),
+    ] {
+        let (status, body) = harness.get(&path, &bob).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{path} answered {status} to a non-member: {body}"
+        );
+        assert_eq!(body["errcode"], "M_FORBIDDEN", "{path}: {body}");
+    }
+}
