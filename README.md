@@ -114,9 +114,11 @@ impossible and the exception path is dead code.
 | **M6** Differentiators | Not started | Hub mode, MLS |
 | **M7** MatrixRTC | Started | **MSC4140 delayed events** — the dead-man's switch that stops calls accumulating ghost participants. No other Rust homeserver has them |
 
-**166 routes**, a **274-test Complement ratchet** in CI, and **109 test suites**
-in the workspace. The [generated dashboard](docs/dashboard.md) is parsed from
-the router and CI fails on drift, so what it says matches `main`.
+**166 routes** and a **274-test Complement ratchet** in CI, over a workspace of
+100+ test suites. The first two are gated — the [dashboard](docs/dashboard.md)
+is parsed from the router and CI fails on drift, and the ratchet is a file every
+entry of which must pass — so what they say matches `main` rather than matching
+when someone last edited this paragraph.
 
 ### Throughput
 
@@ -201,14 +203,15 @@ The risks that would invalidate the headline claim are enumerated in
 ## Building and contributing
 
 ```bash
-cargo test --workspace              # 109 suites
+cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 scripts/complement.sh               # the interop ratchet (needs Docker)
 ```
 
-Rust **1.90** or newer. Storage is [fjall](https://github.com/fjall-rs/fjall) 3
-— embedded, no database to run.
+`rust-toolchain.toml` pins **1.90.0**, so rustup fetches the right compiler on
+its own. Storage is [fjall](https://github.com/fjall-rs/fjall) 3 — embedded,
+so there is no database to provision.
 
 CI gates on all of the above plus the Complement ratchet, a config-drift check,
 a generated-dashboard drift check, and pinned-action and benchmark-tooling

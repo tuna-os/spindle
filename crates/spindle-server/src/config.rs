@@ -31,6 +31,8 @@ pub struct Config {
     pub metrics: MetricsConfig,
     #[serde(default)]
     pub delayed_events: DelayedEventsConfig,
+    #[serde(default)]
+    pub turn: TurnConfig,
 }
 
 /// The caps on MSC4140 delayed events (#36).
@@ -85,6 +87,54 @@ pub struct MetricsConfig {
     /// `address:port` to serve `/metrics` on. Absent means no listener,
     /// which is the default.
     pub bind: Option<String>,
+}
+
+/// TURN relays for calls that cannot connect peer-to-peer.
+///
+/// Empty by default, and an empty configuration is not a failure: a server
+/// with no relay answers `/voip/turnServer` with an empty object, which is
+/// what the spec says to do and what a client is prepared for. Most calls
+/// never need a relay; the ones behind symmetric NAT do, and they fail
+/// silently without one — so this is the setting an operator finds out
+/// about *after* the complaint, which is why it is written down here.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnConfig {
+    /// The relay URIs handed to clients, e.g.
+    /// `turn:turn.example.org:3478?transport=udp`.
+    ///
+    /// Nothing else here matters if this is empty: credentials for no relay
+    /// are credentials for nothing, so an empty list short-circuits the
+    /// endpoint.
+    #[serde(default)]
+    pub uris: Vec<String>,
+    /// coturn's `static-auth-secret`, for time-limited credentials.
+    ///
+    /// The mechanism is the TURN REST API: the username is an expiry stamp
+    /// and the caller's Matrix ID, and the password is an HMAC of it under
+    /// this secret. The relay recomputes the same HMAC and needs no account
+    /// database and no contact with this server -- which is the whole reason
+    /// the scheme exists, and why it is preferred over
+    /// [`Self::username`]/[`Self::password`].
+    pub shared_secret: Option<String>,
+    /// A fixed username, for a relay that does not do the REST scheme.
+    ///
+    /// Every client is handed the same credential, so it cannot be revoked
+    /// for one caller and it does not expire. Present because some relays
+    /// offer nothing else, not because it is a good idea.
+    pub username: Option<String>,
+    /// The password paired with [`Self::username`].
+    pub password: Option<String>,
+    /// How long an issued credential is valid, in seconds.
+    ///
+    /// Also what the response reports as `ttl`, which is a client's cue to
+    /// come back for a fresh one. A day is coturn's own default.
+    #[serde(default = "default_turn_ttl")]
+    pub ttl_seconds: u64,
+}
+
+fn default_turn_ttl() -> u64 {
+    86_400
 }
 
 /// How callers prove who they are.
@@ -405,6 +455,38 @@ impl Config {
                 field: "auth.builtin_oidc",
                 message: "cannot be combined with auth.delegated — pick one identity authority"
                     .to_owned(),
+            });
+        }
+        // Two credential schemes would mean the server picks one silently,
+        // and an operator who configured both has already told us they are
+        // unsure which their relay speaks. Refusing is the only answer that
+        // does not leave calls failing for a reason nothing reports.
+        if self.turn.shared_secret.is_some() && self.turn.username.is_some() {
+            return Err(ConfigError::Invalid {
+                field: "turn.shared_secret",
+                message: "cannot be combined with turn.username — a relay takes \
+                          time-limited credentials or a static pair, not both"
+                    .to_owned(),
+            });
+        }
+        // Relays configured with no way to authenticate to them would be
+        // handed to clients that then cannot use them, and the call would
+        // fail at connection time with nothing in this server's log.
+        if !self.turn.uris.is_empty()
+            && self.turn.shared_secret.is_none()
+            && self.turn.username.is_none()
+        {
+            return Err(ConfigError::Invalid {
+                field: "turn.uris",
+                message: "relays are configured but no credentials are — set \
+                          turn.shared_secret, or turn.username and turn.password"
+                    .to_owned(),
+            });
+        }
+        if self.turn.username.is_some() != self.turn.password.is_some() {
+            return Err(ConfigError::Invalid {
+                field: "turn.password",
+                message: "turn.username and turn.password go together".to_owned(),
             });
         }
         Ok(())
