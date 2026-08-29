@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "HTTP surface for the Spindle homeserver"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 repository.workspace = true
 
 # The crate is spindle-server because it is the server crate; the executable an

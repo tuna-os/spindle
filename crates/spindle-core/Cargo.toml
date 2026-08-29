@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Core linear-log and persistent-state primitives for Spindle"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [dependencies]
