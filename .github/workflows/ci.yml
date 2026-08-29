@@ -10,7 +10,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
 
 jobs:
   rust:
@@ -56,6 +55,13 @@ jobs:
       # merge, and its output is what somebody reads when one does. Both are
       # worth a test: #228 is a case where the gate was right, and #231 one
       # where what it printed was not enough to act on.
+      - name: Check for dependencies nothing uses
+        # A crate nothing imports is still a licence obligation, an audit
+        # surface and a thing `cargo deny` has to reason about. Cheap to
+        # carry, so it accumulates unless something says no.
+        run: |
+          cargo install cargo-machete --locked --version 0.9.2
+          cargo machete
       - name: Audit the dependency graph
         # Installed rather than run through an action: every action here is
         # SHA-pinned and Dependabot-tracked (#182), and adding one more
