@@ -126,7 +126,6 @@ PLANNED = {
     "Rooms & membership": [
         ("POST", "/_matrix/client/v3/rooms/{room_id}/upgrade", "room upgrade (#7)"),
         ("POST", "/_matrix/client/v3/rooms/{room_id}/report/{event_id}", "reporting (M5)"),
-        ("GET", "/_matrix/client/v1/rooms/{room_id}/timestamp_to_event", "jump-to-date"),
     ],
     "Timeline, messaging & search": [
         ("POST", "/_matrix/client/v3/search", "server-side search (#7)"),

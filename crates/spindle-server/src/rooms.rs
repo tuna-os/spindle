@@ -312,6 +312,15 @@ pub enum StateAtAnchor {
     Event(String),
 }
 
+/// Which side of a timestamp `/timestamp_to_event` should look.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimestampDirection {
+    /// The first event at or after the timestamp (`dir=f`).
+    Forward,
+    /// The last event at or before it (`dir=b`).
+    Backward,
+}
+
 /// One stored event, as a client sees it.
 #[derive(Clone, Debug)]
 pub struct TimelineEvent {
@@ -2419,6 +2428,96 @@ impl Rooms {
                     }
                 }
                 resolve(low_li)
+            }
+        }
+    }
+
+    /// The event closest to `ts`, on the side `direction` names.
+    ///
+    /// `/timestamp_to_event`'s whole job. [`StateAtAnchor::Ts`] already
+    /// answers the backward side -- the last entry at or under a time -- so
+    /// that is what this delegates to; the forward side is the entry after
+    /// it, because the log is ordered and "the first entry at or after `ts`"
+    /// is the successor of "the last entry strictly before `ts`".
+    ///
+    /// The one case that is not a successor is a `ts` at or below the room's
+    /// first event: there is nothing before it to take the successor of, and
+    /// the answer is the first entry itself.
+    ///
+    /// # The assumption, stated rather than buried
+    ///
+    /// A binary search over the linear index assumes `origin_server_ts`
+    /// rises with it. In a room this server sequenced, it does. In a room
+    /// with **backfilled** history it need not: the linear index is arrival
+    /// order, and history fetched from a peer arrives now and is stamped
+    /// then. Against such a room this returns *an* event near the time
+    /// rather than provably the nearest.
+    ///
+    /// That is the same assumption the admin `state_at?ts` anchor makes and
+    /// the same one Synapse makes locally -- Synapse then asks the room's
+    /// other servers, which is federation work this does not do yet. The
+    /// alternative locally is a scan of the whole room per request, which is
+    /// the trade this declines.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] if the room is not held here, and
+    /// [`RoomError::UnknownState`] when the room has no event on that side
+    /// of the timestamp.
+    pub fn event_at_timestamp(
+        &self,
+        room_id: &str,
+        ts: u64,
+        direction: TimestampDirection,
+    ) -> Result<(String, u64), RoomError> {
+        let stamped = |event_id: String| -> Result<(String, u64), RoomError> {
+            let ts = self
+                .event(room_id, &event_id)
+                .map(|event| event["origin_server_ts"].as_u64().unwrap_or(0))
+                // A purged body cannot say when it happened. The entry is
+                // still the right answer -- the caller asked which event,
+                // not what it said -- so the time is reported as 0 rather
+                // than the whole call failing.
+                .unwrap_or(0);
+            Ok((event_id, ts))
+        };
+        match direction {
+            TimestampDirection::Backward => {
+                let (_, event_id) = self.resolve_anchor(room_id, &StateAtAnchor::Ts(ts))?;
+                stamped(event_id)
+            }
+            TimestampDirection::Forward => {
+                // The last entry strictly before `ts`, then the one after
+                // it. `ts - 1` rather than `ts` so an entry stamped exactly
+                // `ts` is not itself the predecessor -- the forward side is
+                // inclusive of an exact match.
+                let before = match ts.checked_sub(1) {
+                    Some(before) => self.resolve_anchor(room_id, &StateAtAnchor::Ts(before)),
+                    None => Err(RoomError::UnknownState(
+                        "entry at or before that time".into(),
+                    )),
+                };
+                let after = match before {
+                    Ok((li, _)) => self.with_room_read(room_id, |_, log| {
+                        Ok(log
+                            .entries()
+                            .find(|entry| entry.li.get() > li)
+                            .map(|entry| entry.event_id.as_str().to_owned()))
+                    })?,
+                    // Nothing before it, so the room's first entry is the
+                    // first at or after -- which is also the `ts = 0` case,
+                    // where there is no `ts - 1` to ask about.
+                    Err(RoomError::UnknownState(_)) => self.with_room_read(room_id, |_, log| {
+                        Ok(log
+                            .entries()
+                            .next()
+                            .map(|entry| entry.event_id.as_str().to_owned()))
+                    })?,
+                    Err(error) => return Err(error),
+                };
+                let event_id = after
+                    .ok_or_else(|| RoomError::UnknownState("entry at or after that time".into()))?;
+                stamped(event_id)
             }
         }
     }

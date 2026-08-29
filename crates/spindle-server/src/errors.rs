@@ -93,6 +93,18 @@ impl MatrixError {
         Self::new(StatusCode::BAD_REQUEST, "M_BAD_JSON", error)
     }
 
+    /// A required parameter was not sent.
+    ///
+    /// `M_MISSING_PARAM` rather than [`Self::bad_json`]: the spec keeps them
+    /// apart because they tell a client different things. `M_BAD_JSON` says
+    /// what was sent is malformed, which sends a developer looking at their
+    /// serializer; this says something was left out, which is the actual
+    /// fault when a query string is short a key.
+    #[must_use]
+    pub fn missing_param(error: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "M_MISSING_PARAM", error)
+    }
+
     /// Something went wrong on our side.
     ///
     /// The message is deliberately generic: an internal error's detail is for
