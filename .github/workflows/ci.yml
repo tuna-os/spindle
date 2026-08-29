@@ -59,6 +59,13 @@ jobs:
       - name: Check the Complement ratchet
         run: python3 scripts/complement-check-test.py
 
+      # The Synapse fixture builder for #20's importer. Its ordering rules
+      # are the part with judgement in them, and they run here against a
+      # synthetic Synapse-shaped tree: the one test needing a real checkout
+      # skips without SYNAPSE_SOURCE and says so.
+      - name: Check the Synapse fixture builder
+        run: python3 scripts/synapse-fixture-test.py
+
       # And the same idea for the example config, which had drifted furthest
       # of anything here: 22 of 37 fields had never appeared in it. A setting
       # an operator cannot discover is a setting that does not exist.
