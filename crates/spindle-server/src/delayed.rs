@@ -682,11 +682,7 @@ mod restart_hot_path_tests {
             Some(live),
             "so the row was settled at the deadline it actually has"
         );
-        assert_eq!(
-            delayed.due(live).unwrap().len(),
-            1,
-            "and it fires there"
-        );
+        assert_eq!(delayed.due(live).unwrap().len(), 1, "and it fires there");
     }
 
     /// Once, not once per tick: the deferred write is a saving only if
@@ -769,7 +765,10 @@ mod restart_hot_path_tests {
 
         assert_eq!(delayed.queued_at(&id).unwrap(), None, "the index is gone");
         assert!(
-            delayed.due(queued_at.saturating_add(120_000)).unwrap().is_empty(),
+            delayed
+                .due(queued_at.saturating_add(120_000))
+                .unwrap()
+                .is_empty(),
             "and no row survives to fire at any later time"
         );
         assert!(
