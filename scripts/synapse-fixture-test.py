@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -182,6 +183,123 @@ def test_a_real_synapse_checkout_provides_every_table(skipped: list[str]):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "tables the importer reads are present" in result.stdout, result.stdout
+
+
+def minimal_room(**broken: bool) -> sqlite3.Connection:
+    """The columns `verify_populated` reads, and nothing else.
+
+    Not Synapse's DDL -- column *names*, which are interface rather than
+    something to copy. That keeps these runnable in CI, where no Synapse
+    checkout exists, while the end-to-end build stays behind SYNAPSE_SOURCE.
+    """
+    module = load_module()
+    database = sqlite3.connect(":memory:")
+    database.executescript(
+        """
+        CREATE TABLE event_edges (event_id TEXT, prev_event_id TEXT, is_state BOOL);
+        CREATE TABLE events (event_id TEXT, outlier BOOL, rejection_reason TEXT);
+        CREATE TABLE current_state_events (event_id TEXT, room_id TEXT, type TEXT, state_key TEXT);
+        """
+    )
+    child, parent = module.LEGACY_STATE_EDGE
+    real_parent = next(
+        event[3][0] for event in module.TIMELINE if event[0] == child
+    )
+    database.execute(
+        "INSERT INTO event_edges VALUES (?, ?, 0)", (child, real_parent)
+    )
+    # The mutation under test: the legacy edge written as a real DAG edge.
+    database.execute(
+        "INSERT INTO event_edges VALUES (?, ?, ?)",
+        (child, parent, 0 if broken.get("legacy_edge") else 1),
+    )
+    database.execute(
+        "INSERT INTO events VALUES (?, ?, NULL)",
+        (module.OUTLIER[0], 0 if broken.get("outlier") else 1),
+    )
+    database.execute(
+        "INSERT INTO events VALUES (?, 0, ?)",
+        (module.REJECTED[0], None if broken.get("rejection") else module.REJECTION_REASON),
+    )
+    for (event_type, state_key), event_id in module.CURRENT_STATE.items():
+        if broken.get("state") and event_type == "m.room.topic":
+            continue
+        database.execute(
+            "INSERT INTO current_state_events VALUES (?, ?, ?, ?)",
+            (event_id, module.ROOM_ID, event_type, state_key),
+        )
+    return database
+
+
+def test_a_correctly_written_room_verifies_clean():
+    module = load_module()
+    problems = module.verify_populated(minimal_room())
+    assert problems == [], problems
+
+
+def test_a_legacy_edge_written_as_a_real_one_is_caught():
+    """The whole reason the edge is in the fixture. Unfiltered, it fabricates
+    a merge that never happened -- and a fabricated merge looks like data, not
+    like an error."""
+    module = load_module()
+    problems = module.verify_populated(minimal_room(legacy_edge=True))
+    assert any("not marked is_state" in problem for problem in problems), problems
+    assert any("exactly one real parent" in problem for problem in problems), problems
+
+
+def test_an_unflagged_outlier_is_caught():
+    module = load_module()
+    problems = module.verify_populated(minimal_room(outlier=True))
+    assert any("outlier" in problem for problem in problems), problems
+
+
+def test_a_rejection_missing_from_events_is_caught():
+    """`events.rejection_reason` is where modern Synapse records a rejection.
+    A fixture carrying it only in the older `rejections` table would let a
+    reader that never looks at the column pass."""
+    module = load_module()
+    problems = module.verify_populated(minimal_room(rejection=True))
+    assert any("rejection_reason" in problem for problem in problems), problems
+
+
+def test_current_state_drift_is_caught():
+    module = load_module()
+    problems = module.verify_populated(minimal_room(state=True))
+    assert any("current_state_events" in problem for problem in problems), problems
+
+
+def test_populate_against_a_real_checkout(skipped: list[str]):
+    """The end-to-end build, where the schema is Synapse's own.
+
+    Skipped where no checkout is available, which is most of CI. Point
+    SYNAPSE_SOURCE at one to run it.
+    """
+    source = os.environ.get("SYNAPSE_SOURCE")
+    if not source or not (Path(source) / "synapse" / "storage" / "schema").is_dir():
+        skipped.append("no Synapse checkout; set SYNAPSE_SOURCE to run this one")
+        return
+
+    with tempfile.TemporaryDirectory() as work:
+        out = Path(work) / "populated.db"
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--synapse", source, "--out", str(out), "--populate"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "legacy is_state edge" in result.stdout, result.stdout
+
+        module = load_module()
+        database = sqlite3.connect(str(out))
+        assert module.verify_populated(database) == []
+        # And the room really is readable the way a reader would read it.
+        rows = database.execute(
+            "SELECT COUNT(*) FROM events WHERE room_id = ? AND NOT outlier "
+            "AND rejection_reason IS NULL",
+            (module.ROOM_ID,),
+        ).fetchone()
+        assert rows[0] == len(module.TIMELINE), rows
 
 
 def main() -> int:
