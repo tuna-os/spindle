@@ -442,18 +442,31 @@ async fn one_rooms_account_data_does_not_appear_under_another() {
     );
 }
 
+/// Account data is stored, not held.
+///
+/// A second server is built over the same store, which is as close to a
+/// restart as one process can get: **fjall 3 holds an exclusive lock on the
+/// data directory** for as long as any handle to it lives, and a server's
+/// delivery loops hold one for the life of the process. That is right for a
+/// server — two writers on one directory is corruption — and it means this
+/// test cannot close the file and reopen it. Under fjall 2 it did, and the
+/// second `open` here failed with `Locked` the moment the engine changed.
+///
+/// So the claim is narrower than it was: this proves the data went to the
+/// store rather than living in the first server's memory, and no longer
+/// proves it survived a trip through the filesystem.
+/// `spindle-store`'s own `backend_compatibility` suite is what carries the
+/// on-disk claim now, by writing a store, dropping it, and reopening.
 #[tokio::test]
 async fn account_data_survives_a_restart() {
-    // It is stored, not held: a client's settings outliving the process is the
-    // only reason to write them down at all.
     let dir = TempDir::new().unwrap();
     let config = || spindle_server::Config::parse("[server]\nname = \"example.org\"\n").unwrap();
+    let store = Arc::new(FjallStore::open(dir.path()).unwrap());
 
     let token = {
-        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
         let harness = Harness {
             _dir: TempDir::new().unwrap(),
-            app: spindle_server::app(config(), store).unwrap(),
+            app: spindle_server::app(config(), Arc::clone(&store)).unwrap(),
         };
         let alice = harness.register("alice").await;
         harness
@@ -466,7 +479,6 @@ async fn account_data_survives_a_restart() {
         alice
     };
 
-    let store = Arc::new(FjallStore::open(dir.path()).unwrap());
     let harness = Harness {
         _dir: TempDir::new().unwrap(),
         app: spindle_server::app(config(), store).unwrap(),

@@ -17,7 +17,9 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 struct Harness {
+    #[allow(dead_code, reason = "keeps the data directory alive for the store")]
     dir: TempDir,
+    store: Arc<FjallStore>,
     app: axum::Router,
 }
 
@@ -29,21 +31,30 @@ struct Device {
 impl Harness {
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
-        let app = Self::build(dir.path());
-        Self { dir, app }
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let app = Self::build(&store);
+        Self { dir, store, app }
     }
 
-    fn build(path: &std::path::Path) -> axum::Router {
-        let store = Arc::new(FjallStore::open(path).unwrap());
+    fn build(store: &Arc<FjallStore>) -> axum::Router {
         let config = spindle_server::Config::parse(
             "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n",
         )
         .unwrap();
-        spindle_server::app(config, store).expect("a signing key is established")
+        spindle_server::app(config, Arc::clone(store)).expect("a signing key is established")
     }
 
+    /// A second server over the same store.
+    ///
+    /// It shares the store handle rather than reopening the directory, which
+    /// fjall 3 would refuse -- it locks a data directory for as long as any
+    /// handle lives, and a running server's delivery loops hold one. The
+    /// claim survives intact: what this test is about is that a *fresh
+    /// server* resumes its counter from the stored rows rather than from
+    /// memory, and every counter is re-read from the store when the server is
+    /// built, whichever handle it is built over.
     fn restart(&mut self) {
-        self.app = Self::build(self.dir.path());
+        self.app = Self::build(&self.store);
     }
 
     async fn call(&self, request: Request<Body>) -> (StatusCode, Value) {

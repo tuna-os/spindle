@@ -39,6 +39,15 @@ use tower::ServiceExt;
 /// One server over a store directory this test controls, so a second one can
 /// later be opened over the restored copy.
 struct Server {
+    /// Kept so a backup can be taken through the same handle.
+    ///
+    /// fjall 3 locks a data directory for as long as any handle to it lives,
+    /// so `FjallStore::open` on a directory a server is serving from now
+    /// fails with `Locked`. That is a real change for operators too --
+    /// `spindle backup` can no longer read a *running* server's directory --
+    /// and it is why this drill takes its snapshot through the server's own
+    /// store rather than opening the path a second time.
+    store: Arc<FjallStore>,
     app: axum::Router,
 }
 
@@ -52,8 +61,24 @@ impl Server {
         ))
         .unwrap();
         Self {
-            app: spindle_server::app(config, store).expect("the app builds"),
+            app: spindle_server::app(config, Arc::clone(&store)).expect("the app builds"),
+            store,
         }
+    }
+
+    /// A backup taken through this server's own store handle.
+    ///
+    /// `spindle backup` opens the directory itself, which fjall 3 refuses
+    /// while a server is serving from it. Taking the snapshot here is what
+    /// the drill can still do; the operator-facing consequence is recorded
+    /// on the `store` field.
+    fn backup(&self) -> (Vec<u8>, u64) {
+        let view = spindle_store::Store::snapshot(self.store.as_ref()).expect("fjall snapshots");
+        let mut archive = Vec::new();
+        let rows = spindle_store::backup::write_backup(view.as_ref(), &mut archive)
+            .expect("the backup is written");
+        assert!(rows > 0, "the backup captured nothing to restore");
+        (archive, rows)
     }
 
     async fn call(&self, request: Request<Body>) -> (StatusCode, Value) {
@@ -328,12 +353,8 @@ async fn a_restored_server_is_the_server_that_was_backed_up() {
             .state_event(&room, &alice_token, "m.room.topic")
             .await;
 
-        // --- the backup, taken as `spindle backup` takes it --------------
-        let store = FjallStore::open(&source_root).unwrap();
-        let view = spindle_store::Store::snapshot(&store).expect("fjall snapshots");
-        let mut archive = Vec::new();
-        let rows = spindle_store::backup::write_backup(view.as_ref(), &mut archive).unwrap();
-        assert!(rows > 0, "the backup captured nothing to restore");
+        // --- the backup, through the running server's store --------------
+        let (archive, rows) = source.backup();
 
         let restored = FjallStore::open(&target_root).unwrap();
         let read = spindle_store::backup::read_backup(&mut archive.as_slice(), &restored).unwrap();
@@ -420,10 +441,7 @@ async fn a_restore_without_the_media_tree_serves_rows_and_not_files() {
         let source = Server::open(&source_root);
         let token = source.register("alice").await;
         let mxc = source.upload(&token, b"bytes that stay behind").await;
-        let store = FjallStore::open(&source_root).unwrap();
-        let view = spindle_store::Store::snapshot(&store).expect("fjall snapshots");
-        let mut archive = Vec::new();
-        spindle_store::backup::write_backup(view.as_ref(), &mut archive).unwrap();
+        let (archive, _) = source.backup();
         (token, mxc, archive)
     };
 
