@@ -36,6 +36,7 @@ pub mod s3;
 pub mod secrets;
 pub mod signing;
 pub mod sliding;
+pub mod stream;
 pub mod surface;
 pub mod tokens;
 pub mod typing;
