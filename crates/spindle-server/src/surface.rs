@@ -147,6 +147,12 @@ pub const UNSTABLE_FEATURES: &[(&str, bool)] = &[
     // name as well as the stable one, and a client that checks here before
     // sending it is doing the right thing.
     ("org.matrix.msc4222.use_state_after", true),
+    // MSC4140's delayed events. This flag is how a Matrix RTC client decides
+    // whether it may rely on the server to remove it from a call it can no
+    // longer say it has left -- and a client that finds the flag absent is
+    // expected to fall back to leaving a stale membership behind. So the
+    // advertisement is not decoration: it changes what clients do.
+    ("org.matrix.msc4140", true),
 ];
 
 #[must_use]

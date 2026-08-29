@@ -55,6 +55,8 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/v1/rooms/{room_id}/relations/{event_id}/{rel_type}/{event_type}",
     "/_matrix/client/v1/rooms/{room_id}/threads",
     "/_matrix/client/v1/rooms/{room_id}/timestamp_to_event",
+    "/_matrix/client/unstable/org.matrix.msc4140/delayed_events",
+    "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}",
     "/_matrix/client/v3/rooms/{room_id}/state",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}",
@@ -445,6 +447,14 @@ fn timeline_routes() -> Router<AppState> {
         .route(
             "/_matrix/client/v1/rooms/{room_id}/timestamp_to_event",
             get(room_timestamp_to_event),
+        )
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc4140/delayed_events",
+            get(delayed_events),
+        )
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}",
+            post(delayed_event_action),
         )
         .route("/_matrix/client/v3/rooms/{room_id}/state", get(room_state))
         // Two routes, because the spec has two forms and a router cannot
@@ -6545,6 +6555,124 @@ async fn room_timestamp_to_event(
     })))
 }
 
+/// MSC4140's delay, spelled as the unstable query parameter.
+///
+/// `serde` renames it rather than the field being called that, because the
+/// wire name is not an identifier and will change when the MSC stabilises --
+/// at which point this is one line, not a search for every use.
+#[derive(Debug, Deserialize)]
+struct DelayQuery {
+    #[serde(rename = "org.matrix.msc4140.delay")]
+    delay: Option<u64>,
+}
+
+/// Turn a delay failure into the response a client can act on.
+fn delay_error(error: crate::delayed::DelayError) -> MatrixError {
+    use crate::delayed::DelayError;
+    match error {
+        DelayError::NotFound => MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "no such delayed event",
+        ),
+        // `M_INVALID_PARAM` with the limit in the message: a client that
+        // asked for too long can retry with less, but only if it is told
+        // what "too long" is.
+        DelayError::TooLong { limit_ms } => MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            format!("the maximum delay is {limit_ms}ms"),
+        ),
+        DelayError::Store(inner) => MatrixError::internal(&inner.to_string()),
+    }
+}
+
+/// `GET /_matrix/client/unstable/org.matrix.msc4140/delayed_events`
+///
+/// What this caller is still waiting on. Scoped to the caller: a delay is a
+/// pending action taken in their name, and whose it is is the only sensible
+/// unit here.
+async fn delayed_events(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+) -> Result<Json<Value>, MatrixError> {
+    let pending = state.delayed.list(&identity.user_id).map_err(delay_error)?;
+    let chunk: Vec<Value> = pending
+        .into_iter()
+        .map(|event| {
+            let mut entry = serde_json::Map::new();
+            entry.insert("delay_id".to_owned(), json!(event.delay_id));
+            entry.insert("room_id".to_owned(), json!(event.room_id));
+            entry.insert("type".to_owned(), json!(event.event_type));
+            if let Some(state_key) = event.state_key {
+                entry.insert("state_key".to_owned(), json!(state_key));
+            }
+            entry.insert("delay".to_owned(), json!(event.delay_ms));
+            // When the current window started, which is the one field a
+            // client could not have computed for itself and the one it needs
+            // in order to decide whether to restart.
+            entry.insert(
+                "running_since".to_owned(),
+                json!(event.fire_at_ms.saturating_sub(event.delay_ms)),
+            );
+            entry.insert("content".to_owned(), event.content);
+            Value::Object(entry)
+        })
+        .collect();
+    Ok(Json(json!({ "delayed_events": chunk })))
+}
+
+#[derive(Debug, Deserialize)]
+struct DelayActionRequest {
+    action: String,
+}
+
+/// `POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}`
+///
+/// `restart` is the one that matters: it is the heartbeat a live client sends
+/// to say "not yet", and it re-applies the *original* delay rather than what
+/// remained. A restart that shortened the window each time would converge on
+/// firing while the client was still there, which is the opposite of what
+/// restarting means.
+async fn delayed_event_action(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(delay_id): axum::extract::Path<String>,
+    Json(request): Json<DelayActionRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    let action = crate::delayed::Action::parse(&request.action).ok_or_else(|| {
+        MatrixError::bad_json(format!(
+            "action must be 'send', 'cancel' or 'restart', not {:?}",
+            request.action
+        ))
+    })?;
+    let to_send = state
+        .delayed
+        .act(&delay_id, &identity.user_id, action)
+        .map_err(delay_error)?;
+    if let Some(event) = to_send {
+        let sent = match &event.state_key {
+            Some(state_key) => state.rooms.set_state(
+                &event.room_id,
+                &event.sender,
+                state.key.pair(),
+                &event.event_type,
+                state_key,
+                &event.content,
+            ),
+            None => state.rooms.send(
+                &event.room_id,
+                &event.sender,
+                state.key.pair(),
+                &event.event_type,
+                &event.content,
+            ),
+        };
+        sent.map_err(room_error)?;
+    }
+    Ok(Json(json!({})))
+}
+
 /// `GET /_matrix/client/v1/rooms/{room_id}/threads`
 ///
 /// The chunk is thread *roots*, each carrying the `m.thread` aggregate in
@@ -6650,6 +6778,11 @@ async fn room_state_event(
 }
 
 /// `PUT /_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}`
+///
+/// Also the MSC4140 entry point that Matrix RTC actually uses: a call
+/// participant's *departure* is a state event, and delaying one is how a
+/// client arranges to be removed from a call it can no longer say it has
+/// left.
 async fn set_room_state(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
@@ -6658,8 +6791,33 @@ async fn set_room_state(
         String,
         String,
     )>,
+    axum::extract::Query(query): axum::extract::Query<DelayQuery>,
     Json(content): Json<Value>,
 ) -> Result<Json<Value>, MatrixError> {
+    if let Some(delay_ms) = query.delay {
+        if !state
+            .rooms
+            .is_joined(&identity.user_id, &room_id)
+            .unwrap_or(false)
+        {
+            return Err(MatrixError::forbidden(format!(
+                "{} is not in {room_id}",
+                identity.user_id
+            )));
+        }
+        let delay_id = state
+            .delayed
+            .schedule(
+                &room_id,
+                &identity.user_id,
+                &event_type,
+                Some(&state_key),
+                &content,
+                delay_ms,
+            )
+            .map_err(delay_error)?;
+        return Ok(Json(json!({ "delay_id": delay_id })));
+    }
     let event_id = state
         .rooms
         .set_state(
@@ -6695,12 +6853,14 @@ async fn set_room_state_default(
     state: State<AppState>,
     identity: Authenticated,
     axum::extract::Path((room_id, event_type)): axum::extract::Path<(String, String)>,
+    query: axum::extract::Query<DelayQuery>,
     content: Json<Value>,
 ) -> Result<Json<Value>, MatrixError> {
     set_room_state(
         state,
         identity,
         axum::extract::Path((room_id, event_type, String::new())),
+        query,
         content,
     )
     .await
@@ -6853,8 +7013,40 @@ async fn send_event(
         String,
         String,
     )>,
+    axum::extract::Query(query): axum::extract::Query<DelayQuery>,
     Json(content): Json<Value>,
 ) -> Result<Json<Value>, MatrixError> {
+    // MSC4140 rides the existing send rather than adding a parallel one: the
+    // event, its authorization and its transaction handling are identical,
+    // and only *when* it is appended changes. A separate endpoint would be a
+    // second copy of all of that, drifting.
+    if let Some(delay_ms) = query.delay {
+        // The room is checked now, not when it fires: a client that cannot
+        // send here should be told so while it is still listening, rather
+        // than have its event silently refused an hour later.
+        if !state
+            .rooms
+            .is_joined(&identity.user_id, &room_id)
+            .unwrap_or(false)
+        {
+            return Err(MatrixError::forbidden(format!(
+                "{} is not in {room_id}",
+                identity.user_id
+            )));
+        }
+        let delay_id = state
+            .delayed
+            .schedule(
+                &room_id,
+                &identity.user_id,
+                &event_type,
+                None,
+                &content,
+                delay_ms,
+            )
+            .map_err(delay_error)?;
+        return Ok(Json(json!({ "delay_id": delay_id })));
+    }
     with_transaction(&state, &identity, &txn_id, || {
         state
             .rooms

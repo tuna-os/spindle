@@ -183,6 +183,8 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::RoomBlock, 0x28),
         (Keyspace::PublishedRoom, 0x29),
         (Keyspace::RoomStream, 0x2a),
+        (Keyspace::DelayedEvent, 0x2b),
+        (Keyspace::DelayedEventById, 0x2c),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(

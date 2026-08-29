@@ -15,6 +15,7 @@ pub mod authorize;
 pub mod backups;
 pub mod blobs;
 pub mod config;
+pub mod delayed;
 pub mod delegated;
 pub mod devices;
 pub mod directory;
@@ -73,6 +74,7 @@ pub struct AppState {
     /// (#159): this server is then its own MSC3861 issuer.
     pub oidc: Option<Arc<oidc::BuiltinOidc>>,
     pub federation: Arc<federation::Federation>,
+    pub delayed: Arc<delayed::Delayed>,
 }
 
 /// Why the application cannot be built. Both are startup-fatal on purpose:
@@ -138,6 +140,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
     ));
     let store_for_filters = Arc::clone(&store);
     let store_for_devices = Arc::clone(&store);
+    let store_for_delayed = Arc::clone(&store);
     let store_for_backups = Arc::clone(&store);
     let account_data = Arc::new(account_data::AccountData::new(Arc::clone(&store)));
     let blobs = blobs_for(&config);
@@ -197,6 +200,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
         delegated,
         oidc: oidc_provider,
         federation,
+        delayed: Arc::new(delayed::Delayed::new(Arc::clone(&store_for_delayed))),
     };
     spawn_delivery_loops(&state);
     Ok(routes::router(state))
@@ -210,6 +214,15 @@ fn spawn_delivery_loops(state: &AppState) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
     }
+    // A second is far below any heartbeat a client would set and far above
+    // the cost of the tick: when nothing is due it reads one row, because
+    // the rows are ordered by when they fire.
+    tokio::spawn(delayed::fire_loop(
+        Arc::clone(&state.delayed),
+        Arc::clone(&state.rooms),
+        Arc::clone(&state.key),
+        std::time::Duration::from_secs(1),
+    ));
     tokio::spawn(federation::drain_outbox(
         Arc::clone(&state.store),
         Arc::clone(&state.federation),

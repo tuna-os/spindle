@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**164 routes implemented; 8 known gaps in scope.**
+**166 routes implemented; 8 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -229,10 +229,12 @@ neither implemented nor counted.
 - `POST /_matrix/client/v3/register`
 - `GET /_matrix/client/v3/register/available`
 
-### Server, discovery & operations — 12 implemented, 0 planned
+### Server, discovery & operations — 14 implemented, 0 planned
 
 - `GET /.well-known/matrix/client`
 - `GET /.well-known/matrix/server`
+- `GET /_matrix/client/unstable/org.matrix.msc4140/delayed_events`
+- `POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}`
 - `GET /_matrix/client/v1/rooms/{room_id}/hierarchy`
 - `GET /_matrix/client/v1/rooms/{room_id}/threads`
 - `GET /_matrix/client/v1/rooms/{room_id}/timestamp_to_event`
