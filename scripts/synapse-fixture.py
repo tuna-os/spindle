@@ -21,8 +21,9 @@ this fixture should say so where its evidence is published, the same way
 
 **Nothing is vendored.** The schema is read from a Synapse checkout the
 caller points at, rather than copied into this repository. That keeps the
-fixture honest about tracking upstream, and it avoids copying AGPL-licensed
-SQL into a repository whose own terms are currently undefined (#233).
+fixture honest about tracking upstream -- a vendored copy silently ages --
+and it keeps AGPL-licensed SQL out of a repository that is MIT OR Apache-2.0
+(see LICENSING.md; the licence question was #233).
 
 Usage:
     scripts/synapse-fixture.py --synapse PATH [--out FILE] [--populate] [--quiet]
@@ -413,7 +414,7 @@ def main() -> int:
     if arguments.synapse is None:
         print(
             "synapse-fixture: pass --synapse PATH or set SYNAPSE_SOURCE; "
-            "Synapse's schema is read from a checkout and never vendored (#233)",
+            "Synapse's schema is read from a checkout and never vendored",
             file=sys.stderr,
         )
         return 2

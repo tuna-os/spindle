@@ -136,3 +136,10 @@ Tuwunel under protocol workload needs a server and starts at M1.
 
 The known risks, including the one that would invalidate the headline claim, are
 enumerated in §21.
+
+## License
+
+Dual-licensed under **[MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE)**, at
+your option; contributions are accepted under the same terms. Dependencies keep
+their own licenses. [`LICENSING.md`](LICENSING.md) records what was checked
+before choosing, and why not AGPL despite Synapse being AGPL.

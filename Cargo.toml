@@ -4,6 +4,10 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
+# Dual, the Rust ecosystem's convention: Apache-2.0 carries an explicit patent
+# grant, MIT is the simplest thing a downstream can comply with, and taking
+# either is the licensee's choice. See LICENSING.md for why not AGPL (#233).
+license = "MIT OR Apache-2.0"
 rust-version = "1.89"
 repository = "https://github.com/tuna-os/spindle"
 
