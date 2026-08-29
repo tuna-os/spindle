@@ -27,6 +27,7 @@ pub mod mas;
 pub mod media;
 pub mod metrics;
 pub mod oidc;
+pub mod presence;
 pub mod previews;
 pub mod profiles;
 pub mod push_rules;
@@ -64,6 +65,7 @@ pub struct AppState {
     pub media: Arc<media::Media>,
     pub devices: Arc<devices::Devices>,
     pub backups: Arc<backups::Backups>,
+    pub presence: Arc<presence::Presence>,
     pub previews: Arc<previews::Previews>,
     pub profiles: Arc<profiles::Profiles>,
     pub appservices: Arc<appservices::Appservices>,
@@ -141,6 +143,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
     let store_for_filters = Arc::clone(&store);
     let store_for_devices = Arc::clone(&store);
     let store_for_delayed = Arc::clone(&store);
+    let store_for_presence = Arc::clone(&store);
     let store_for_backups = Arc::clone(&store);
     let account_data = Arc::new(account_data::AccountData::new(Arc::clone(&store)));
     let blobs = blobs_for(&config);
@@ -195,6 +198,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
         media,
         devices: Arc::new(devices::Devices::new(store_for_devices)),
         backups: Arc::new(backups::Backups::new(store_for_backups)),
+        presence: Arc::new(presence::Presence::new(Arc::clone(&store_for_presence))),
         previews,
         profiles,
         appservices,
