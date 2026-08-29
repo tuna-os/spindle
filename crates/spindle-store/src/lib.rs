@@ -10,6 +10,7 @@ pub mod migrate;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, PoisonError};
 
 use fjall::{
     Config, Keyspace as FjallKeyspace, PartitionCreateOptions, PartitionHandle, PersistMode,
@@ -222,6 +223,139 @@ pub trait Store: ReadView {
 }
 
 /// A Fjall-backed store.
+/// Coalesces [`Durability::Group`]'s fsyncs across concurrent commits.
+///
+/// SPEC §8.3 describes the batch as "flushed on whichever comes first of `N`
+/// pending entries or `T` microseconds". This is the same coalescing with
+/// **neither constant**, and the absence is the design rather than a
+/// simplification of it: a timer buys throughput under load by adding latency
+/// when there is none to trade, so a server that is quiet pays `T` for
+/// nothing. Here the first writer to arrive syncs immediately and everyone
+/// who piles up behind it rides that sync — so the window is exactly as long
+/// as one fsync takes, which is the shortest it could correctly be, and there
+/// is no number to tune per deployment.
+///
+/// The correctness argument is a ticket:
+///
+/// - A writer's bytes reach the journal *before* it asks for a sync, so any
+///   sync that **starts** after that point covers it. `next` names that sync.
+/// - The leader seals the ticket it is about to satisfy and bumps `next`, so
+///   a writer arriving mid-sync claims the *following* one — never the sync
+///   already in flight, which may have started before its bytes landed.
+/// - `done` only moves on success. A failed sync therefore wakes its
+///   followers without satisfying them, and each retries as its own leader:
+///   a broken disk fsyncs per writer and reports the error to every one of
+///   them, rather than one failure being silently ridden as a success.
+#[derive(Debug, Default)]
+struct GroupCommit {
+    state: Mutex<GroupState>,
+    woken: Condvar,
+}
+
+/// `next` starts at 1 and `done` at 0, which is the encoding of "no sync has
+/// happened yet". Starting both at 0 makes the *first* commit after startup
+/// find `done >= ticket` and return durable without ever having fsynced —
+/// the one commit whose loss a reader would have no way to detect, since
+/// there is no later entry to expose the gap.
+#[derive(Debug)]
+struct GroupState {
+    /// The sync that will cover a writer arriving now.
+    next: u64,
+    /// The highest sync that has completed successfully.
+    done: u64,
+    /// Whether a sync is in flight.
+    running: bool,
+    /// Syncs actually performed.
+    led: u64,
+    /// Commits that returned on a sync somebody else performed.
+    joined: u64,
+}
+
+impl Default for GroupState {
+    fn default() -> Self {
+        Self {
+            next: 1,
+            done: 0,
+            running: false,
+            led: 0,
+            joined: 0,
+        }
+    }
+}
+
+impl GroupCommit {
+    /// Return once a sync covering the caller's already-journalled bytes has
+    /// completed — leading that sync if nobody else is.
+    fn sync(&self, keyspace: &FjallKeyspace) -> Result<(), StoreError> {
+        self.sync_with(|| {
+            keyspace
+                .persist(PersistMode::SyncData)
+                .map_err(StoreError::from)
+        })
+    }
+
+    /// [`Self::sync`] with the fsync itself supplied.
+    ///
+    /// Split out so the ticket protocol can be tested against a `persist`
+    /// that blocks on command. The property that matters — a writer arriving
+    /// mid-sync does not ride that sync — is unobservable against a real
+    /// fsync, which is over before a test can arrange to be inside it.
+    fn sync_with(
+        &self,
+        persist: impl FnOnce() -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let ticket = state.next;
+        let mut persist = Some(persist);
+        loop {
+            if state.done >= ticket {
+                return Ok(());
+            }
+            if state.running {
+                // Counted here, under the lock and before parking, so a
+                // reader that observes the count knows the waiter is
+                // committed to waiting rather than about to lead.
+                state.joined += 1;
+                state = self
+                    .woken
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner);
+                continue;
+            }
+            // Nobody is syncing, so lead one. Everything buffered up to this
+            // instant rides along, which is where the coalescing comes from:
+            // the followers do no I/O at all.
+            let sealed = state.next;
+            state.running = true;
+            state.next = sealed + 1;
+            state.led += 1;
+            drop(state);
+
+            let result = persist
+                .take()
+                .expect("the leader runs the persist exactly once")();
+
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.running = false;
+            if result.is_ok() {
+                state.done = state.done.max(sealed);
+            }
+            self.woken.notify_all();
+            return result;
+        }
+    }
+
+    /// `(syncs performed, commits that rode somebody else's)`.
+    ///
+    /// The second over the first is the coalescing factor, and it is the
+    /// number that says whether group commit is doing anything on a given
+    /// workload: it is 0 at concurrency 1, by design and not by failure.
+    fn counters(&self) -> (u64, u64) {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        (state.led, state.joined)
+    }
+}
+
 pub struct FjallStore {
     keyspace: FjallKeyspace,
     partition: PartitionHandle,
@@ -240,9 +374,23 @@ pub struct FjallStore {
     /// increment is far cheaper than the read it is counting.
     reads: AtomicU64,
     scanned: AtomicU64,
+    /// Shared by every writer, which is what lets their fsyncs become one.
+    group: GroupCommit,
 }
 
 impl FjallStore {
+    /// `(fsyncs performed, commits that rode somebody else's fsync)` in
+    /// `Durability::Group`.
+    ///
+    /// The second over the first is the coalescing factor. It is 0 whenever
+    /// commits never overlap — which is a fact about the caller's
+    /// concurrency, not about this store, and the only way to tell a server
+    /// that cannot coalesce from a workload that has nothing to coalesce.
+    #[must_use]
+    pub fn group_commits(&self) -> (u64, u64) {
+        self.group.counters()
+    }
+
     /// Point reads served since this store was opened.
     ///
     /// Monotonic and never reset: a caller measures a span by subtracting
@@ -294,6 +442,7 @@ impl FjallStore {
         Ok(Self {
             reads: AtomicU64::new(0),
             scanned: AtomicU64::new(0),
+            group: GroupCommit::default(),
             keyspace,
             partition,
         })
@@ -498,13 +647,178 @@ impl Store for FjallStore {
         for (key, value) in writes {
             batch.insert(&self.partition, key.as_slice(), value.as_slice());
         }
-        batch.durability(Some(durability.persist_mode())).commit()?;
-        Ok(())
+        match durability {
+            // Both of these mean exactly what they say, so they go straight
+            // through: one is a promise to sync before returning, the other a
+            // promise not to. Neither has anything to gain from waiting.
+            Durability::Strict | Durability::Relaxed => {
+                batch.durability(Some(durability.persist_mode())).commit()?;
+                Ok(())
+            }
+            // Land the bytes in the journal without syncing, then take the
+            // next sync going -- which is ours to lead if nobody else is
+            // already running one.
+            Durability::Group => {
+                batch.durability(Some(PersistMode::Buffer)).commit()?;
+                self.group.sync(&self.keyspace)
+            }
+        }
     }
 
     fn flush(&self) -> Result<(), StoreError> {
         self.keyspace.persist(PersistMode::SyncAll)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod group_commit_tests {
+    use std::sync::Arc;
+    use std::sync::mpsc;
+
+    use super::{GroupCommit, StoreError};
+
+    /// At concurrency 1 there is nothing to coalesce, so the writer syncs on
+    /// arrival. This is the property a timer-based window would destroy: it
+    /// would make a quiet server wait `T` for company that never comes.
+    #[test]
+    fn a_lone_writer_syncs_immediately() {
+        let group = GroupCommit::default();
+        group.sync_with(|| Ok(())).unwrap();
+        assert_eq!(group.counters(), (1, 0), "one sync led, nobody rode it");
+    }
+
+    /// Sequential writers each get their own sync: the second writer's bytes
+    /// reached the journal after the first sync finished, so that sync cannot
+    /// have covered them.
+    #[test]
+    fn sequential_writers_do_not_share_a_sync() {
+        let group = GroupCommit::default();
+        group.sync_with(|| Ok(())).unwrap();
+        group.sync_with(|| Ok(())).unwrap();
+        assert_eq!(group.counters(), (2, 0));
+    }
+
+    /// The win: writers that pile up during one sync are satisfied by a
+    /// single sync between them, not one each.
+    ///
+    /// They cannot ride the sync already running -- it may have started
+    /// before their bytes reached the journal -- so they share the *next*
+    /// ticket, one of them leads it, and the rest return on that. Five
+    /// writers therefore cost one fsync, and the ratio only improves as more
+    /// arrive within a sync's duration. That is the whole mechanism: without
+    /// it these six commits are six fsyncs.
+    #[test]
+    fn writers_piling_up_during_a_sync_share_one() {
+        let group = Arc::new(GroupCommit::default());
+        let (entered, inside) = mpsc::channel();
+        let (release, held) = mpsc::channel::<()>();
+
+        let leader = {
+            let group = Arc::clone(&group);
+            std::thread::spawn(move || {
+                group
+                    .sync_with(|| {
+                        entered.send(()).unwrap();
+                        held.recv().unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+            })
+        };
+        // The leader is now inside the fsync with `running` set.
+        inside.recv().unwrap();
+
+        let waiting: Vec<_> = (0..5)
+            .map(|_| {
+                let group = Arc::clone(&group);
+                std::thread::spawn(move || group.sync_with(|| Ok(())).unwrap())
+            })
+            .collect();
+
+        // `joined` is incremented under the lock immediately before parking,
+        // and the waiter holds the lock until `wait` releases it -- so
+        // observing 5 proves all five are parked rather than about to lead.
+        while group.counters().1 < 5 {
+            std::thread::yield_now();
+        }
+        release.send(()).unwrap();
+
+        leader.join().unwrap();
+        for writer in waiting {
+            writer.join().unwrap();
+        }
+        assert_eq!(
+            group.counters().0,
+            2,
+            "six commits cost two fsyncs: the leader's, and one shared by \
+             the five that arrived while it ran"
+        );
+    }
+
+    /// The safety property, and the reason `next` is bumped when the leader
+    /// seals rather than when it finishes: a writer whose bytes landed
+    /// *during* a sync must not be told that sync made them durable.
+    ///
+    /// Unobservable against a real fsync, which is over before a test can
+    /// arrange to be inside it -- which is why `sync_with` exists.
+    #[test]
+    fn a_writer_arriving_mid_sync_waits_for_the_next_one() {
+        let group = Arc::new(GroupCommit::default());
+        let (entered, inside) = mpsc::channel();
+        let (release, held) = mpsc::channel::<()>();
+
+        let leader = {
+            let group = Arc::clone(&group);
+            std::thread::spawn(move || {
+                group
+                    .sync_with(|| {
+                        entered.send(()).unwrap();
+                        held.recv().unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+            })
+        };
+        inside.recv().unwrap();
+
+        // A writer arriving now claims the *following* sync, so once the
+        // leader's completes it still has to lead one of its own.
+        let latecomer = {
+            let group = Arc::clone(&group);
+            std::thread::spawn(move || group.sync_with(|| Ok(())).unwrap())
+        };
+        while group.counters().1 < 1 {
+            std::thread::yield_now();
+        }
+        release.send(()).unwrap();
+
+        leader.join().unwrap();
+        latecomer.join().unwrap();
+        assert_eq!(
+            group.counters().0,
+            2,
+            "the latecomer led its own sync rather than riding one that \
+             started before its bytes were in the journal"
+        );
+    }
+
+    /// A failed sync satisfies nobody. The next writer performs a real one
+    /// rather than reading a success off the failure.
+    #[test]
+    fn a_failed_sync_does_not_count_as_done() {
+        let group = GroupCommit::default();
+        let failed = group.sync_with(|| Err(StoreError::Backend("disk".to_owned())));
+        assert!(failed.is_err());
+
+        let mut ran = false;
+        group
+            .sync_with(|| {
+                ran = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(ran, "the next writer must fsync rather than inherit an Ok");
     }
 }
 
