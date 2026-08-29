@@ -52,7 +52,7 @@ fn decode_every_way(key: &[u8]) {
 fn real_keys(user: &str, room: &str, text: &str, number: u64) -> Vec<Vec<u8>> {
     vec![
         room_prefix(Keyspace::Log, room),
-        room_li(Keyspace::Log, room, LinearIndex::from_raw(number as i64)),
+        room_li(Keyspace::Log, room, LinearIndex::from_raw(number.cast_signed())),
         room_stream(room, number),
         stream(number),
         delayed_event(number, text),
