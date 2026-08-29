@@ -128,7 +128,6 @@ PLANNED = {
     ],
     "Rooms & membership": [
         ("POST", "/_matrix/client/v3/rooms/{room_id}/upgrade", "room upgrade (#7)"),
-        ("POST", "/_matrix/client/v3/user_directory/search", "user directory"),
         ("GET", "/_matrix/client/v1/rooms/{room_id}/hierarchy", "spaces (#7)"),
         ("GET", "/_matrix/client/v1/rooms/{room_id}/threads", "thread listing"),
         ("POST", "/_matrix/client/v3/rooms/{room_id}/report/{event_id}", "reporting (M5)"),

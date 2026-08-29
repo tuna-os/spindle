@@ -366,6 +366,10 @@ fn room_routes() -> Router<AppState> {
             "/_matrix/client/v3/publicRooms",
             get(public_rooms).post(public_rooms_filtered),
         )
+        .route(
+            "/_matrix/client/v3/user_directory/search",
+            post(user_directory_search),
+        )
         // Two paths for one endpoint. MSC3266 shipped under the unstable
         // prefix long enough that clients still ask for it there, and it
         // became `/v1/room_summary` in Matrix 1.15. Serving both costs one
@@ -7035,4 +7039,129 @@ async fn public_rooms_filtered(
         request.filter.generic_search_term.as_deref(),
         &request.filter.room_types,
     )
+}
+
+#[derive(Debug, Deserialize)]
+struct UserSearchRequest {
+    search_term: String,
+    limit: Option<usize>,
+}
+
+/// The default and maximum number of users one search returns.
+const USER_SEARCH_LIMIT: usize = 10;
+const USER_SEARCH_LIMIT_MAX: usize = 50;
+
+/// Everyone `searcher` is allowed to find.
+///
+/// The spec sets a *floor* rather than a rule -- results "should at least"
+/// cover users you share a room with and users in public rooms -- and
+/// explicitly leaves the rest to the server. Spindle serves exactly that floor
+/// and nothing wider:
+///
+/// - **someone you share a joined room with**, because you can already see
+///   their name and avatar in that room's member list, so the directory
+///   reveals nothing new; and
+/// - **someone joined to a published room**, because they chose to be in a
+///   room this server advertises to strangers.
+///
+/// The rejected alternative is "every account on the server", which several
+/// homeservers offer behind a config flag. It turns the directory into a user
+/// enumeration endpoint: an attacker with one account learns every localpart,
+/// and a user who joined no public rooms never consented to that. Making it
+/// opt-in would push the decision onto operators who mostly will not read it.
+///
+/// The cost is proportional to the searcher's rooms plus the published ones,
+/// not to the number of accounts -- which is the right shape, but it is still
+/// a scan per request, and it is the thing to replace with a maintained index
+/// if the directory ever gets hot.
+fn visible_users(
+    state: &AppState,
+    searcher: &str,
+) -> Result<std::collections::BTreeSet<String>, MatrixError> {
+    let mut visible = std::collections::BTreeSet::new();
+    let mut rooms = state
+        .rooms
+        .joined(searcher)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    rooms.extend(
+        state
+            .directory
+            .published()
+            .map_err(|error| directory_error(&error))?,
+    );
+    rooms.sort();
+    rooms.dedup();
+
+    for room_id in rooms {
+        // A room in the index that cannot be read is skipped, not fatal: one
+        // stale pointer must not make search stop working.
+        let Ok(members) = state.rooms.joined_member_ids(&room_id) else {
+            continue;
+        };
+        visible.extend(members.iter().cloned());
+    }
+    visible.remove(searcher);
+    Ok(visible)
+}
+
+/// Does `term` match this user?
+///
+/// Matched against the localpart and the display name, case-insensitively.
+/// Not against the full user ID, because every local ID ends in the server
+/// name -- searching for it would return the whole directory, which reads as
+/// a bug rather than a feature.
+fn user_matches(term: &str, user_id: &str, displayname: Option<&str>) -> bool {
+    let needle = term.trim().to_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    let localpart = user_id
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(':').map(|(local, _)| local))
+        .unwrap_or(user_id);
+    localpart.to_lowercase().contains(&needle)
+        || displayname.is_some_and(|name| name.to_lowercase().contains(&needle))
+}
+
+/// `POST /_matrix/client/v3/user_directory/search`
+async fn user_directory_search(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    Json(request): Json<UserSearchRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    let limit = request
+        .limit
+        .unwrap_or(USER_SEARCH_LIMIT)
+        .clamp(1, USER_SEARCH_LIMIT_MAX);
+
+    let mut results = Vec::new();
+    let mut limited = false;
+    for user_id in visible_users(&state, &identity.user_id)? {
+        let profile = state.profiles.get(&user_id).unwrap_or_default();
+        if !user_matches(
+            &request.search_term,
+            &user_id,
+            profile.displayname.as_deref(),
+        ) {
+            continue;
+        }
+        // One past the limit is how `limited` is known: the spec asks whether
+        // results were cut, which cannot be answered by stopping exactly at
+        // the limit.
+        if results.len() == limit {
+            limited = true;
+            break;
+        }
+        let mut entry = serde_json::Map::new();
+        entry.insert("user_id".to_owned(), json!(user_id));
+        if let Some(name) = profile.displayname {
+            entry.insert("display_name".to_owned(), json!(name));
+        }
+        if let Some(avatar) = profile.avatar_url {
+            entry.insert("avatar_url".to_owned(), json!(avatar));
+        }
+        results.push(Value::Object(entry));
+    }
+
+    Ok(Json(json!({ "results": results, "limited": limited })))
 }
