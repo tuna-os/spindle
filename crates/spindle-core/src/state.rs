@@ -407,6 +407,21 @@ fn hash_bytes(hasher: &mut blake3::Hasher, value: &[u8]) {
 const TAG_LEAF: u8 = 0;
 const TAG_BRANCH: u8 = 1;
 
+/// The deepest an honest trie goes.
+///
+/// [`digest_slot`] spends five bits of a 256-bit digest per level, so two
+/// different digests must diverge within 52 of them -- the bound its own
+/// `debug_assert` already states. A node deeper than that did not come from
+/// [`encode_node`].
+///
+/// This is not belt-and-braces around the hash check in [`rebuild`]. That
+/// check runs *after* the recursive descent, so on a trie that never bottoms
+/// out it does not run at all: one corrupted child pointer aimed back at an
+/// ancestor recurses until the stack is gone, and a stack overflow is not an
+/// error a caller can catch -- it aborts the process. Refusing at a depth no
+/// real trie reaches is what turns that into a [`RehydrateError::Malformed`].
+const MAX_DEPTH: usize = 52;
+
 /// Why a stored state trie could not be rebuilt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RehydrateError {
@@ -456,7 +471,7 @@ impl StateSnapshot {
         if root == Self::new().root() {
             return Ok(Self::new());
         }
-        let node = rebuild(&root, load)?;
+        let node = rebuild(&root, load, 0)?;
         let len = count_entries(&node);
         Ok(Self {
             root: Some(node),
@@ -560,7 +575,11 @@ fn put_field(out: &mut Vec<u8>, value: &[u8]) {
 fn rebuild(
     address: &StateRoot,
     load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+    depth: usize,
 ) -> Result<Arc<Node>, RehydrateError> {
+    if depth > MAX_DEPTH {
+        return Err(RehydrateError::Malformed);
+    }
     let bytes = load(address).ok_or(RehydrateError::MissingNode)?;
     let mut at = 0_usize;
     let tag = *bytes.first().ok_or(RehydrateError::Malformed)?;
@@ -569,7 +588,9 @@ fn rebuild(
     let node = match tag {
         TAG_LEAF => {
             let digest = take_array::<32>(&bytes, &mut at)?;
-            let count = take_len(&bytes, &mut at)?;
+            // Three length-prefixed fields per entry, so four bytes each at
+            // the very least.
+            let count = take_count(&bytes, &mut at, 3 * 4)?;
             let mut entries = Vec::with_capacity(count);
             for _ in 0..count {
                 let event_type = take_string(&bytes, &mut at)?;
@@ -584,11 +605,11 @@ fn rebuild(
         }
         TAG_BRANCH => {
             let bitmap = u32::from_be_bytes(take_array::<4>(&bytes, &mut at)?);
-            let count = take_len(&bytes, &mut at)?;
+            let count = take_count(&bytes, &mut at, 32)?;
             let mut children = Vec::with_capacity(count);
             for _ in 0..count {
                 let child = StateRoot(take_array::<32>(&bytes, &mut at)?);
-                children.push(rebuild(&child, load)?);
+                children.push(rebuild(&child, load, depth + 1)?);
             }
             Node::branch(bitmap, children)
         }
@@ -611,6 +632,31 @@ fn take_array<const N: usize>(bytes: &[u8], at: &mut usize) -> Result<[u8; N], R
 
 fn take_len(bytes: &[u8], at: &mut usize) -> Result<usize, RehydrateError> {
     Ok(u32::from_be_bytes(take_array::<4>(bytes, at)?) as usize)
+}
+
+/// A count of framed items, refused when too few bytes remain to frame that
+/// many. `each` is the smallest number of bytes one item can occupy.
+///
+/// `Vec::with_capacity` on a length straight off disk is an allocation the
+/// input chooses, and a 37-byte leaf claiming `u32::MAX` entries is a request
+/// for 206 GiB. That does not fail the way the rest of this decoder fails: a
+/// failed allocation aborts the process rather than returning the
+/// [`RehydrateError::Malformed`] this function exists to produce, so one
+/// flipped bit in one node takes the server down instead of costing it that
+/// node.
+///
+/// Refusing rather than clamping to what fits: a node claiming four billion
+/// entries is corrupt whatever else it says, and reading it as one holding
+/// none would hand back a plausible trie built from a broken one. The hash
+/// check would catch that -- but only after the work, and only because it is
+/// there; the decoder should not be relying on it to notice a length it could
+/// see was impossible.
+fn take_count(bytes: &[u8], at: &mut usize, each: usize) -> Result<usize, RehydrateError> {
+    let claimed = take_len(bytes, at)?;
+    if claimed > bytes.len().saturating_sub(*at) / each {
+        return Err(RehydrateError::Malformed);
+    }
+    Ok(claimed)
 }
 
 fn take_string(bytes: &[u8], at: &mut usize) -> Result<String, RehydrateError> {
