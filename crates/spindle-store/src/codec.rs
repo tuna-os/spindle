@@ -122,7 +122,7 @@ impl EntryRecord {
         let depth = u64::from_be_bytes(cursor.array::<8>()?);
         let state_root = cursor.array::<32>()?;
         let event_id = cursor.string()?;
-        let parent_count = cursor.len()?;
+        let parent_count = cursor.count()?;
         let mut prev_events = Vec::with_capacity(parent_count);
         for _ in 0..parent_count {
             prev_events.push(cursor.string()?);
@@ -181,7 +181,7 @@ impl RoomRecord {
         }
         let next_forward = spindle_core::keys::from_order_preserving(cursor.array::<8>()?);
         let next_backward = spindle_core::keys::from_order_preserving(cursor.array::<8>()?);
-        let count = cursor.len()?;
+        let count = cursor.count()?;
         let mut forward_extremities = Vec::with_capacity(count);
         for _ in 0..count {
             forward_extremities.push(cursor.string()?);
@@ -227,6 +227,36 @@ impl Cursor<'_> {
 
     fn len(&mut self) -> Result<usize, CodecError> {
         Ok(u32::from_be_bytes(self.array::<4>()?) as usize)
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.at)
+    }
+
+    /// A count of framed items, bounded by what is left to frame them with.
+    ///
+    /// `Vec::with_capacity` on a length straight off disk is an allocation
+    /// the input chooses, and `u32::MAX` items of `String` is a request for
+    /// 103 GiB. That does not fail the way the rest of this module fails: a
+    /// failed allocation aborts the process rather than returning a
+    /// `CodecError` the caller could refuse, so a single flipped bit in one
+    /// record takes the server down instead of costing it one row.
+    ///
+    /// Every item here costs at least the four bytes of its own length
+    /// prefix, so the bytes remaining are a hard ceiling on how many can
+    /// actually follow, and a record claiming more is truncated no matter
+    /// what the rest of it says. Refusing on the count rather than clamping
+    /// to the ceiling: clamping would read a record claiming four billion
+    /// extremities as one holding none, which is a corrupt record silently
+    /// becoming a plausible one -- the failure this whole module is shaped
+    /// to avoid. An honest record never reaches the ceiling, so it still
+    /// reserves exactly what it needs.
+    fn count(&mut self) -> Result<usize, CodecError> {
+        let claimed = self.len()?;
+        if claimed > self.remaining() / 4 {
+            return Err(CodecError::Truncated);
+        }
+        Ok(claimed)
     }
 
     fn string(&mut self) -> Result<String, CodecError> {

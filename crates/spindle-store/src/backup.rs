@@ -135,11 +135,9 @@ pub fn read_backup(source: &mut dyn Read, store: &dyn Store) -> Result<u64, Back
         if key_len == END_OF_ROWS {
             break;
         }
-        let mut key = vec![0_u8; key_len as usize];
-        src.read_exact(&mut key)?;
+        let key = src.read_framed(key_len as usize)?;
         let value_len = src.read_u32()? as usize;
-        let mut value = vec![0_u8; value_len];
-        src.read_exact(&mut value)?;
+        let value = src.read_framed(value_len)?;
         store.put(&key, &value)?;
         restored += 1;
     }
@@ -211,6 +209,31 @@ impl<'a, R: Read + ?Sized> Digesting<'a, R> {
         let mut bytes = [0_u8; 4];
         self.read_exact(&mut bytes)?;
         Ok(u32::from_be_bytes(bytes))
+    }
+
+    /// Read `len` bytes, growing the buffer as they arrive.
+    ///
+    /// `vec![0; len]` on a length read out of the stream is an allocation
+    /// the file chooses: twenty-six bytes claiming `u32::MAX - 1` reserve
+    /// four gibibytes before one byte behind that claim has been read. It
+    /// survives today only where the kernel overcommits pages nothing goes
+    /// on to touch, which is the kernel's decision rather than this
+    /// format's, and `spindle restore` is a command an operator points at a
+    /// file somebody else wrote.
+    ///
+    /// Growing in bounded steps costs one reallocation per chunk on an
+    /// honest stream, and on a lying one costs a single chunk before
+    /// `read_exact` reaches the end and refuses.
+    fn read_framed(&mut self, len: usize) -> Result<Vec<u8>, BackupError> {
+        const CHUNK: usize = 64 * 1024;
+        let mut out = Vec::with_capacity(len.min(CHUNK));
+        while out.len() < len {
+            let at = out.len();
+            let want = CHUNK.min(len - at);
+            out.resize(at + want, 0);
+            self.read_exact(&mut out[at..])?;
+        }
+        Ok(out)
     }
 }
 
