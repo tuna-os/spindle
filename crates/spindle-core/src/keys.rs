@@ -903,11 +903,18 @@ pub fn finalised_delay_prefix(user_id: &str) -> Vec<u8> {
 }
 
 /// The position a [`finalised_delay`] key encodes, given the user it belongs
-/// to -- the prefix length is what says where the position starts.
+/// to.
+///
+/// `None` unless the key really is that user's, for the reason
+/// [`room_from_user_room`] gives. Slicing at the prefix's *length* would be
+/// enough for keys that came from a scan of this user, and wrong for anything
+/// else: the position would be read out of the middle of another user's key
+/// and returned as a plausible number rather than as nothing.
 #[must_use]
 pub fn finalised_delay_position(user_id: &str, key: &[u8]) -> Option<u64> {
-    let at = user_prefix(Keyspace::FinalisedDelay, user_id).len();
-    let bytes: [u8; 8] = key.get(at..at.checked_add(8)?)?.try_into().ok()?;
+    let prefix = user_prefix(Keyspace::FinalisedDelay, user_id);
+    let rest = key.strip_prefix(prefix.as_slice())?;
+    let bytes: [u8; 8] = rest.get(..8)?.try_into().ok()?;
     Some(u64::from_be_bytes(bytes))
 }
 
