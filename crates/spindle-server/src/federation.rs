@@ -104,11 +104,17 @@ impl Federation {
         // Every name this client connects to resolves through the vetting
         // resolver, so a peer whose name points inward is refused before a
         // socket is opened. Literal IPs never reach DNS; `base_url` vets
-        // those.
+        // the first hop and the redirect policy every hop after it (#312):
+        // a public peer that answers `302 Location: http://169.254.169.254/`
+        // would otherwise be followed straight past the resolver.
         let client = reqwest::Client::builder()
             .dns_resolver(Arc::new(VettingResolver {
                 allowed: allowed.clone(),
             }))
+            .redirect(crate::netguard::redirect_policy(
+                allowed.clone(),
+                "federatable",
+            ))
             .build()
             .map_err(|error| FederationError::Refused(error.to_string()))?;
         Ok(Self {
