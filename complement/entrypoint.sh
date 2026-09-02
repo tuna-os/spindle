@@ -97,6 +97,10 @@ enabled = false
 # Federation over TLS on the port peers actually knock on. The certificate
 # is the one signed by Complement's CA above; peers were told to trust it.
 [federation]
+# Complement's peers live on the Docker network, which is RFC 1918 space
+# the address guard (#288) refuses by default, as it should everywhere
+# but a test rig. Docker's default pools cover all three private ranges.
+allow_internal = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 bind = "0.0.0.0:8448"
 tls_cert = "/certs/${SERVER_NAME}.crt"
 tls_key = "/certs/${SERVER_NAME}.key"
