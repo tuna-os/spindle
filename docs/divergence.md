@@ -155,11 +155,11 @@ order across zero), keyspace-tagged and room-prefixed; a hand-written versioned
 record format over Fjall. Purely internal, versioned from day one so the format
 can move without a flag day.
 
-### 4.6 Read paths as index arithmetic (`server/src/rooms.rs`)
+### 4.6 Read paths as index arithmetic (`server/src/rooms/`)
 
 The M1 endpoints lean on the linear index instead of maintaining derived
-tables. The unread count is `head − max(receipt, own join)` filtered over a
-contiguous range; `/context` is a window either side of one `li` plus the
+tables. The unread count (`rooms/unread.rs`, with the receipts that set its
+floor) is `head − max(receipt, own join)` filtered over a contiguous range; `/context` is a window either side of one `li` plus the
 event's own state snapshot; `/relations` is a prefix scan whose key *ends* in
 `li`, so results arrive in timeline order with nothing sorting them.
 
