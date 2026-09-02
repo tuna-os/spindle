@@ -28,6 +28,7 @@ use crate::inbound::{
     sign_membership_template,
 };
 use crate::ratelimit::{FAILED_LOGIN_PER_ACCOUNT, FAILED_LOGIN_PER_SOURCE, REGISTER_PER_SOURCE};
+use crate::rooms::ReadScope;
 use crate::{AppState, surface};
 
 /// Every path this server answers.
@@ -3351,20 +3352,11 @@ async fn room_members(
     axum::extract::Path(room_id): axum::extract::Path<String>,
     axum::extract::Query(query): axum::extract::Query<MembersQuery>,
 ) -> Result<Json<Value>, MatrixError> {
-    let scope = read_scope(&state, &identity.user_id, &room_id)?;
-    let events = match scope.bound() {
-        None => state
-            .rooms
-            .state_where(&room_id, |key| key.event_type().as_str() == "m.room.member")
-            .map_err(room_error)?,
-        Some(bound) => state
-            .rooms
-            .state_as_of(&room_id, bound)
-            .map_err(room_error)?
-            .into_iter()
-            .filter(|event| event["type"] == "m.room.member")
-            .collect(),
-    };
+    let events = state
+        .rooms
+        .reader(&identity.user_id, &room_id)
+        .and_then(|reader| reader.members())
+        .map_err(room_error)?;
     let chunk: Vec<Value> = events
         .into_iter()
         .filter(|event| {
@@ -5257,7 +5249,7 @@ fn sliding_room_entry(
 ) -> Result<Value, MatrixError> {
     let name = state
         .rooms
-        .state_event(room_id, "m.room.name", "")
+        .state_event_unscoped(room_id, "m.room.name", "")
         .ok()
         .and_then(|content| content["name"].as_str().map(str::to_owned));
     // A wildcard has to be answered by looking at everything; a list of
@@ -5823,7 +5815,7 @@ fn sync_join(
         let state_json = if state_block == crate::rooms::StateBlock::Deferred {
             let rendered = state
                 .rooms
-                .state_serialized(&room.room_id)
+                .state_serialized_unscoped(&room.room_id)
                 .map_err(room_error)?;
             RawValue::from_string(format!(r#"{{"events":{rendered}}}"#))
                 .map_err(|error| MatrixError::internal(&error.to_string()))?
@@ -6463,28 +6455,11 @@ async fn room_state(
     Authenticated(identity): Authenticated,
     axum::extract::Path(room_id): axum::extract::Path<String>,
 ) -> Result<axum::response::Response, MatrixError> {
-    let scope = read_scope(&state, &identity.user_id, &room_id)?;
-    let body = match scope.bound() {
-        // Pre-serialized: the body comes from the state-render cache, keyed
-        // by the state root, so a hot room costs no reads, parses or
-        // serializing.
-        None => state
-            .rooms
-            .state_serialized(&room_id)
-            .map_err(room_error)?
-            .as_str()
-            .to_owned(),
-        // A former member sees the room as it stood when they were
-        // removed: the state at that position, rendered here rather than
-        // from the cache, which only ever holds the present.
-        Some(bound) => Value::Array(
-            state
-                .rooms
-                .state_as_of(&room_id, bound)
-                .map_err(room_error)?,
-        )
-        .to_string(),
-    };
+    let body = state
+        .rooms
+        .reader(&identity.user_id, &room_id)
+        .and_then(|reader| reader.state_serialized())
+        .map_err(room_error)?;
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
@@ -6508,17 +6483,11 @@ async fn room_state_event(
 ) -> Result<Json<Value>, MatrixError> {
     // Also a membership oracle without this: `…/state/m.room.member/@someone`
     // answers whether a named user is in a named room, to anyone who asks.
-    let scope = read_scope(&state, &identity.user_id, &room_id)?;
-    let content = match scope.bound() {
-        None => state
-            .rooms
-            .state_event(&room_id, &event_type, &state_key)
-            .map_err(room_error)?,
-        Some(bound) => state
-            .rooms
-            .state_event_as_of(&room_id, bound, &event_type, &state_key)
-            .map_err(room_error)?,
-    };
+    let content = state
+        .rooms
+        .reader(&identity.user_id, &room_id)
+        .and_then(|reader| reader.state_event(&event_type, &state_key))
+        .map_err(room_error)?;
     Ok(Json(content))
 }
 
@@ -7642,7 +7611,7 @@ impl RoomRuleContext {
                 .len(),
             power_levels: state
                 .rooms
-                .state_event(room_id, "m.room.power_levels", "")
+                .state_event_unscoped(room_id, "m.room.power_levels", "")
                 .unwrap_or_else(|_| json!({})),
         })
     }
@@ -7808,22 +7777,15 @@ fn search_state(
         let Some(scope) = scopes.get(&hit.room_id) else {
             continue;
         };
-        let room_state = match scope.bound() {
-            None => serde_json::from_str::<Value>(
-                state
-                    .rooms
-                    .state_serialized(&hit.room_id)
-                    .map_err(room_error)?
-                    .as_str(),
-            )
-            .map_err(|error| MatrixError::internal(&error.to_string()))?,
-            Some(bound) => Value::Array(
-                state
-                    .rooms
-                    .state_as_of(&hit.room_id, bound)
-                    .map_err(room_error)?,
-            ),
-        };
+        // The gate already ran once per room to build `scopes`; the reader
+        // carries that answer rather than asking again.
+        let rendered = state
+            .rooms
+            .reader_with(&hit.room_id, scope.clone())
+            .state_serialized()
+            .map_err(room_error)?;
+        let room_state = serde_json::from_str::<Value>(&rendered)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
         states.insert(hit.room_id.clone(), room_state);
     }
     Ok(states)
@@ -8212,121 +8174,18 @@ fn hierarchy_visible(
 /// a stranger which room IDs exist, which is the smaller half of the same
 /// question they were asking.
 fn may_read_room(state: &AppState, user_id: &str, room_id: &str) -> Result<(), MatrixError> {
-    if state
-        .rooms
-        .is_joined(user_id, room_id)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?
-    {
-        return Ok(());
-    }
-    if state
-        .rooms
-        .summary(room_id)
-        .is_ok_and(|summary| summary.world_readable)
-    {
-        return Ok(());
-    }
-    Err(MatrixError::forbidden(format!(
-        "{user_id} is not in {room_id}"
-    )))
+    state.rooms.may_read(user_id, room_id).map_err(room_error)
 }
 
-/// How much of a room a caller may read.
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ReadScope {
-    /// All of it: joined, or the room is world-readable.
-    Whole,
-    /// Up to and including this position: a former member of a `shared`
-    /// room, reading what was said while they were there and before.
-    UpTo(i64),
-    /// Only these stretches, `(first, last)` inclusive: a former member of
-    /// a `joined` or `invited` room, reading what was said while they were
-    /// in it, one stint at a time (#268).
-    Within(Vec<(i64, i64)>),
-}
-
-impl ReadScope {
-    /// Whether position `li` is inside what the caller may read.
-    fn admits(&self, li: i64) -> bool {
-        match self {
-            Self::Whole => true,
-            Self::UpTo(bound) => li <= *bound,
-            Self::Within(stints) => stints
-                .iter()
-                .any(|(first, last)| (*first..=*last).contains(&li)),
-        }
-    }
-
-    /// The last position the caller may read, for the reads that answer
-    /// with the room *as it stood* -- state and members -- rather than
-    /// with a stretch of its timeline. `None` means the present.
-    fn bound(&self) -> Option<i64> {
-        match self {
-            Self::Whole => None,
-            Self::UpTo(bound) => Some(*bound),
-            Self::Within(stints) => stints.last().map(|(_, last)| *last),
-        }
-    }
-}
-
-/// What `user_id` may read of `room_id`: everything, a bounded past, or
-/// nothing.
-///
-/// [`may_read_room`]'s two ways in, plus the third the spec has and #258
-/// knowingly left out: **a former member reads up to their departure.**
-/// Under `shared` history visibility -- the default -- someone who left,
-/// was kicked or was banned may still read what was said up to and
-/// including the event that removed them, and nothing after. The
-/// visibility that governs is the one in force *at* their departure, so a
-/// room that later tightened or relaxed it changes nothing for them.
-///
-/// Under `joined` and `invited` the spec makes visibility a per-event
-/// question -- what the caller's membership was as of each event -- so a
-/// former member of such a room reads the stretches during which they
-/// were joined (or, under `invited`, invited or joined), one stint at a
-/// time, and nothing between or after them: [`ReadScope::Within`], from
-/// the membership-history index.
-///
-/// Used by the reads that page a timeline -- `/messages`, `/event`,
-/// `/context` -- and by the two state reads, `/state` and
-/// `/state/{type}/{key}`, which answer with the room as it stood at the
-/// bound. Every other read keeps [`may_read_room`], which never hands a
-/// former member anything, until it too is taught to stop at the bound.
-fn read_scope(state: &AppState, user_id: &str, room_id: &str) -> Result<ReadScope, MatrixError> {
-    if may_read_room(state, user_id, room_id).is_ok() {
-        return Ok(ReadScope::Whole);
-    }
-    let internal = |error: crate::rooms::RoomError| MatrixError::internal(&error.to_string());
-    // `departure` opens the room; a room this server does not hold is the
-    // same refusal as one the caller may not see, for the reason
-    // `may_read_room` gives.
-    let Ok(Some(departure)) = state.rooms.departure(room_id, user_id) else {
-        return Err(MatrixError::forbidden(format!(
-            "{user_id} is not in {room_id}"
-        )));
-    };
-    let visibility = state
-        .rooms
-        .history_visibility_at(room_id, departure)
-        .map_err(internal)?;
-    match visibility.as_str() {
-        "shared" | "world_readable" => Ok(ReadScope::UpTo(departure)),
-        "joined" | "invited" => {
-            let stints = state
-                .rooms
-                .membership_intervals(room_id, user_id, visibility == "invited")
-                .map_err(internal)?;
-            if stints.is_empty() {
-                return Err(MatrixError::forbidden(format!(
-                    "{user_id} is not in {room_id}"
-                )));
-            }
-            Ok(ReadScope::Within(stints))
-        }
-        _ => Err(MatrixError::forbidden(format!(
-            "{user_id} is not in {room_id}"
-        ))),
-    }
+/// The gate, for the handlers that have not yet been moved onto a
+/// [`crate::rooms::RoomReader`]: they still take a scope and choose what to
+/// do with it. Each one that moves deletes a call here.
+fn read_scope(
+    state: &AppState,
+    user_id: &str,
+    room_id: &str,
+) -> Result<crate::rooms::ReadScope, MatrixError> {
+    state.rooms.read_scope(user_id, room_id).map_err(room_error)
 }
 
 /// The state a room upgrade carries across.

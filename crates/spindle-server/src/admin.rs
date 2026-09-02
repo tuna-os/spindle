@@ -1030,6 +1030,7 @@ async fn make_room_admin(
         .map_err(crate::routes::room_error)?;
     let levels = state
         .rooms
+        .admin(&actor)
         .state_event(&room_id, "m.room.power_levels", "")
         .unwrap_or_else(|_| json!({}));
     let users_default = levels["users_default"].as_i64().unwrap_or(0);
