@@ -104,11 +104,20 @@ which is a different claim: clients depend on emergent behavior (sync token
 stability, `prev_batch` semantics, ordering under gappy sync) that a
 conformance test may not pin down.
 
-- **Element Web / Desktop:** add a Spindle plugin under
-  `playwright/plugins/homeserver/` alongside the Synapse and Dendrite ones, then
-  run Element's own suite against us. This is the highest-value client test we
-  can get, because it is maintained by the client's authors and updated as the
-  client changes.
+- **Element Web / Desktop:** `scripts/element-web-e2e/run.sh` serves a
+  pinned Element Web release (tag and digest in the script) against a Spindle
+  on a throwaway store, and drives two browsers through Playwright: register,
+  log in, create a room, invite, accept, a message each way, leave. Every step
+  is named; a failure leaves a screenshot per browser under that name in
+  `tmp/element-web-e2e/`, and the `element-web-e2e` job in `compliance.yml`
+  uploads them. Locally: `npm ci` and `npx playwright install chromium` in
+  `scripts/element-web-e2e/`, then the script. Its first run found something
+  Complement had not: `/sync` never carries a timeline `prev_batch`, so
+  Element cannot paginate backwards and a new joiner sees no history at all
+  (#331). The larger step remains open: a Spindle plugin under Element's own
+  `playwright/plugins/homeserver/`, alongside the Synapse and Dendrite ones,
+  to run the client's whole suite against us, maintained by the client's
+  authors and updated as the client changes.
 - **Element X (iOS/Android):** exercises **Simplified Sliding Sync (MSC4186)** —
   our newest and least-proven surface, and the one most likely to diverge.
   Priority target once M2 lands.
