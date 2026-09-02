@@ -232,3 +232,37 @@ async fn versions_advertises_msc4143() {
         "{body}"
     );
 }
+
+/// Both well-known documents say how long they may be reused (#37).
+///
+/// The design point the transports work left open. Neither document is
+/// authenticated and both are read by things that cache: with no header a
+/// peer follows the server-server spec's 24-hour default and a browser
+/// picks a heuristic, so an operator who changes a setting and restarts
+/// serves the new answer to nobody for up to a day. The header is how the
+/// server chooses that number instead of inheriting it.
+#[tokio::test]
+async fn both_well_known_documents_carry_a_cache_lifetime() {
+    let harness = Harness::with(TWO_FOCI);
+
+    for path in ["/.well-known/matrix/client", "/.well-known/matrix/server"] {
+        let response = harness
+            .app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let cache = response
+            .headers()
+            .get("cache-control")
+            .unwrap_or_else(|| panic!("{path} says nothing about caching"))
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            cache, "public, max-age=3600",
+            "{path} publishes the lifetime this server chose"
+        );
+    }
+}
