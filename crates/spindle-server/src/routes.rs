@@ -80,6 +80,7 @@ pub const MOUNTED: &[&str] = &[
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(account_routes())
+        .merge(push_routes())
         .merge(appservice_routes())
         .merge(device_routes())
         .merge(profile_routes())
@@ -452,6 +453,13 @@ fn account_routes() -> Router<AppState> {
             "/_matrix/client/v3/user/{user_id}/filter/{filter_id}",
             get(get_filter),
         )
+}
+
+/// Push: where a user's devices are told, and by which rules.
+fn push_routes() -> Router<AppState> {
+    Router::new()
+        .route("/_matrix/client/v3/pushers", get(get_pushers))
+        .route("/_matrix/client/v3/pushers/set", post(set_pusher))
         // Four arities of the same path, because the spec has four and each
         // reads or writes a different slice of one ruleset.
         .route("/_matrix/client/v3/pushrules/", get(get_push_rules))
@@ -4621,6 +4629,109 @@ fn limit_exceeded(what: &str, limit: usize) -> MatrixError {
         "M_LIMIT_EXCEEDED",
         format!("at most {limit} {what} may be held for one account"),
     )
+}
+
+/// `GET /_matrix/client/v3/pushers`
+async fn get_pushers(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+) -> Result<Json<Value>, MatrixError> {
+    let pushers = state
+        .pushers
+        .list(&identity.user_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    Ok(Json(json!({ "pushers": pushers })))
+}
+
+#[derive(Debug, Deserialize)]
+struct SetPusherRequest {
+    pushkey: String,
+    /// `http`, `email`, or `null` to remove the pusher.
+    kind: Option<String>,
+    app_id: String,
+    #[serde(default)]
+    app_display_name: String,
+    #[serde(default)]
+    device_display_name: String,
+    #[serde(default)]
+    profile_tag: Option<String>,
+    #[serde(default)]
+    lang: String,
+    #[serde(default)]
+    data: Value,
+    /// The spec's `append` governs pushers of the *same* pushkey held by
+    /// *other* users; this server keys pushers per user, so it has nothing
+    /// to remove either way and the flag is accepted for the wire shape.
+    #[serde(default)]
+    #[allow(dead_code)]
+    append: bool,
+}
+
+/// `POST /_matrix/client/v3/pushers/set`
+///
+/// Register, replace or (with `kind: null`) remove one of the caller's
+/// pushers. Registrations are kept, not yet driven: nothing evaluates a
+/// push rule against an event yet (#7), so nothing is sent to the URL a
+/// client hands over -- which is also why that URL is not fetched, vetted
+/// or otherwise touched here.
+async fn set_pusher(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    Json(request): Json<SetPusherRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    let internal = |error: spindle_store::StoreError| MatrixError::internal(&error.to_string());
+    let Some(kind) = request.kind.as_deref() else {
+        state
+            .pushers
+            .remove(&identity.user_id, &request.app_id, &request.pushkey)
+            .map_err(internal)?;
+        return Ok(Json(json!({})));
+    };
+    match kind {
+        "http" => {
+            if request.data["url"].as_str().is_none() {
+                return Err(MatrixError::missing_param("an http pusher needs data.url"));
+            }
+        }
+        "email" => {}
+        other => {
+            return Err(MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                format!("unknown pusher kind {other:?}; expected http, email or null"),
+            ));
+        }
+    }
+    // Replacing a registration does not count against the cap: a client
+    // that re-registers the same device forever stays where it is.
+    let cap = state.config.limits.pushers_per_user;
+    if !state
+        .pushers
+        .holds(&identity.user_id, &request.app_id, &request.pushkey)
+        .map_err(internal)?
+        && state.pushers.count(&identity.user_id).map_err(internal)? >= cap
+    {
+        return Err(limit_exceeded("pushers", cap));
+    }
+    state
+        .pushers
+        .set(
+            &identity.user_id,
+            &request.app_id,
+            &request.pushkey,
+            &json!({
+                "pushkey": request.pushkey,
+                "kind": kind,
+                "app_id": request.app_id,
+                "app_display_name": request.app_display_name,
+                "device_display_name": request.device_display_name,
+                "profile_tag": request.profile_tag,
+                "lang": request.lang,
+                "data": request.data,
+            }),
+        )
+        .map_err(internal)?;
+    Ok(Json(json!({})))
 }
 
 /// The caller's ruleset, seeded from the defaults if they have never edited it.

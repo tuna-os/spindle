@@ -48,6 +48,7 @@ if abuse ever needs one, and it belongs in `[ratelimit]` beside `enabled`.
 | Filters held per user | 1,000 | `[limits] filters_per_user` | 400 `M_LIMIT_EXCEEDED` |
 | Account-data types per user (global + per-room) | 20,000 | `[limits] account_data_per_user` | 400 `M_LIMIT_EXCEEDED`; rewriting an existing type is free |
 | One-time keys held per device | 1,000 | `[limits] one_time_keys_per_device` | 400 `M_LIMIT_EXCEEDED`; counts held plus the batch offered |
+| Pushers registered per user | 100 | `[limits] pushers_per_user` | 400 `M_LIMIT_EXCEEDED`; replacing a registration is free |
 | Pending delayed events per sender per room | 100 | `[delayed_events] max_per_room` | 400 `M_LIMIT_EXCEEDED` |
 | Longest delay | 24 h | `[delayed_events] max_delay_ms` | 400, naming the limit |
 | PDUs per federation transaction | 50 | fixed (the spec's own number) | 400 `M_BAD_JSON` |

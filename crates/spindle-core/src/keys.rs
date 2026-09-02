@@ -314,6 +314,12 @@ pub enum Keyspace {
     /// about it. Keyed by user because presence is a property of the user
     /// rather than of any room they are in.
     Presence = 0x2e,
+    /// `(user_id, app_id, pushkey)` -> a registered pusher.
+    ///
+    /// The app ID is length-prefixed ahead of the pushkey for the reason
+    /// [`account_data`] gives: without it two different (app, key) pairs
+    /// could spell the same bytes.
+    Pusher = 0x2f,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -864,6 +870,23 @@ pub fn filter(user_id: &str, filter_id: &str) -> Vec<u8> {
     let mut key = filter_prefix(user_id);
     key.extend_from_slice(filter_id.as_bytes());
     key
+}
+
+/// `(user_id, app_id, pushkey)` key for [`Keyspace::Pusher`].
+#[must_use]
+pub fn pusher(user_id: &str, app_id: &str, pushkey: &str) -> Vec<u8> {
+    let (len, app) = framed(app_id.as_bytes());
+    let mut key = pusher_prefix(user_id);
+    key.extend_from_slice(&len.to_be_bytes());
+    key.extend_from_slice(app);
+    key.extend_from_slice(pushkey.as_bytes());
+    key
+}
+
+/// The prefix every pusher key for one user shares.
+#[must_use]
+pub fn pusher_prefix(user_id: &str) -> Vec<u8> {
+    user_prefix(Keyspace::Pusher, user_id)
 }
 
 /// The prefix every filter key for one user shares.

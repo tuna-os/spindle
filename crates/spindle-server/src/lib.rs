@@ -32,6 +32,7 @@ pub mod presence;
 pub mod previews;
 pub mod profiles;
 pub mod push_rules;
+pub mod pushers;
 pub mod ratelimit;
 pub mod rooms;
 pub mod routes;
@@ -63,6 +64,7 @@ pub struct AppState {
     pub account_data: Arc<account_data::AccountData>,
     pub directory: Arc<directory::Directory>,
     pub filters: Arc<filters::Filters>,
+    pub pushers: Arc<pushers::Pushers>,
     pub media: Arc<media::Media>,
     pub devices: Arc<devices::Devices>,
     pub backups: Arc<backups::Backups>,
@@ -202,6 +204,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
         account_data,
         directory,
         filters: Arc::new(filters::Filters::new(Arc::clone(&store_for_filters))),
+        pushers: Arc::new(pushers::Pushers::new(Arc::clone(&store_for_filters))),
         media,
         devices: Arc::new(devices::Devices::new(store_for_devices)),
         backups: Arc::new(backups::Backups::new(store_for_backups)),

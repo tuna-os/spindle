@@ -101,6 +101,8 @@ pub struct LimitsConfig {
     /// One-time keys held for one device.
     #[serde(default = "default_one_time_keys_per_device")]
     pub one_time_keys_per_device: usize,
+    #[serde(default = "default_pushers_per_user")]
+    pub pushers_per_user: usize,
 }
 
 impl Default for LimitsConfig {
@@ -109,6 +111,7 @@ impl Default for LimitsConfig {
             filters_per_user: default_filters_per_user(),
             account_data_per_user: default_account_data_per_user(),
             one_time_keys_per_device: default_one_time_keys_per_device(),
+            pushers_per_user: default_pushers_per_user(),
         }
     }
 }
@@ -130,6 +133,14 @@ const fn default_account_data_per_user() -> usize {
 
 const fn default_one_time_keys_per_device() -> usize {
     DEFAULT_ONE_TIME_KEYS_PER_DEVICE
+}
+
+/// Pushers one account may register. A client registers one per device;
+/// a hundred is a household of devices, not a quota anyone meets.
+pub const DEFAULT_PUSHERS_PER_USER: usize = 100;
+
+const fn default_pushers_per_user() -> usize {
+    DEFAULT_PUSHERS_PER_USER
 }
 
 /// The operational scrape surface (#166).
@@ -492,6 +503,7 @@ impl Config {
                 "limits.account_data_per_user",
                 self.limits.account_data_per_user,
             ),
+            ("limits.pushers_per_user", self.limits.pushers_per_user),
             (
                 "limits.one_time_keys_per_device",
                 self.limits.one_time_keys_per_device,

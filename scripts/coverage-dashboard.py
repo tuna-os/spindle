@@ -146,8 +146,6 @@ PLANNED = {
     ],
     "Sync": [],
     "Account data, filters & push": [
-        ("GET", "/_matrix/client/v3/pushers", "pusher list (#7)"),
-        ("POST", "/_matrix/client/v3/pushers/set", "pusher registration (#7)"),
     ],
     "End-to-end encryption": [],
     "Media": [],
