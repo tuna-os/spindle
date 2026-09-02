@@ -169,3 +169,98 @@ async fn a_bad_allow_list_entry_refuses_to_start() {
     };
     assert!(error.contains("federation config"), "{error}");
 }
+
+/// A loopback listener that answers every request with a redirect to
+/// `location` and counts what it answered.
+struct Redirector {
+    port: u16,
+    answered: Arc<AtomicUsize>,
+}
+
+impl Redirector {
+    async fn listen(location: String) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let answered = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&answered);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut sink = [0_u8; 4096];
+                let _ = socket.read(&mut sink).await;
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        Self { port, answered }
+    }
+}
+
+/// A sentinel on a second loopback address, so an allow-list can admit the
+/// redirecting peer and not the place it redirects to.
+async fn sentinel_on(address: &str) -> Sentinel {
+    let listener = tokio::net::TcpListener::bind((address, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let knocks = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&knocks);
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            drop(socket);
+        }
+    });
+    Sentinel { port, knocks }
+}
+
+#[tokio::test]
+async fn a_redirect_into_an_unlisted_address_is_not_followed() {
+    // The peer is reachable (its exact address is listed); where it
+    // redirects to is loopback too, but outside the list -- the stand-in
+    // for a public peer answering `302 Location: http://169.254.169.254/`,
+    // which no test can bind (#312).
+    let target = sentinel_on("127.0.0.2").await;
+    let peer = Redirector::listen(format!(
+        "http://127.0.0.2:{}/_matrix/key/v2/server",
+        target.port
+    ))
+    .await;
+    let harness =
+        Harness::with_federation("insecure_http = true\nallow_internal = [\"127.0.0.1/32\"]");
+    let (status, _) = harness
+        .knock_from(&format!("127.0.0.1:{}", peer.port))
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        peer.answered.load(Ordering::SeqCst),
+        1,
+        "the peer was fetched"
+    );
+    assert_eq!(
+        target.settled_knocks().await,
+        0,
+        "the redirect was followed into an address the allow-list does not cover"
+    );
+
+    // The same redirect with the target listed is followed: the policy
+    // vets, it does not forbid redirects outright.
+    let target = sentinel_on("127.0.0.2").await;
+    let peer = Redirector::listen(format!(
+        "http://127.0.0.2:{}/_matrix/key/v2/server",
+        target.port
+    ))
+    .await;
+    let harness =
+        Harness::with_federation("insecure_http = true\nallow_internal = [\"127.0.0.0/8\"]");
+    let (status, _) = harness
+        .knock_from(&format!("127.0.0.1:{}", peer.port))
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        target.settled_knocks().await,
+        1,
+        "a listed redirect target is reached"
+    );
+}
