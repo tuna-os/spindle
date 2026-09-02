@@ -2951,9 +2951,10 @@ impl Rooms {
     /// this room's members, so the cost is proportional to the room -- which
     /// is what the caller asked for.
     ///
-    /// `display_name` and `avatar_url` are whatever the member event carries.
-    /// A member who set neither gets JSON nulls, which is what the spec's
-    /// `RoomMember` says and what a client expects to see.
+    /// `display_name` and `avatar_url` are whatever the member event carries,
+    /// and absent when it carries nothing: the spec's `RoomMember` has both
+    /// as optional strings, and a null is neither (the spec-schema check in
+    /// `scripts/openapi-check.py` caught the nulls this used to send).
     ///
     /// # Errors
     ///
@@ -2977,13 +2978,16 @@ impl Rooms {
             if event["content"]["membership"].as_str() != Some(JOIN_STR) {
                 continue;
             }
-            out.insert(
-                user_id,
-                serde_json::json!({
-                    "display_name": event["content"]["displayname"].clone(),
-                    "avatar_url": event["content"]["avatar_url"].clone(),
-                }),
-            );
+            let mut member = Map::new();
+            for (theirs, ours) in [
+                ("displayname", "display_name"),
+                ("avatar_url", "avatar_url"),
+            ] {
+                if let Some(value) = event["content"][theirs].as_str() {
+                    member.insert(ours.to_owned(), Value::String(value.to_owned()));
+                }
+            }
+            out.insert(user_id, Value::Object(member));
         }
         Ok(out)
     }

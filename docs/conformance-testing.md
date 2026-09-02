@@ -135,6 +135,18 @@ catches a whole class of "technically works, subtly wrong" bugs — a missing
 optional field, a stringified integer — that black-box behavioral tests miss
 because clients happen to tolerate them. Cheap to build, and it fails loudly.
 
+**Built, as a CI check rather than a middleware:** `scripts/openapi-check.py`
+starts the built binary on a throwaway store, drives one scripted client
+through the Client-Server API (two users, one room, a message, and every read
+the spec gives a response schema for), and validates each response body
+against the schema for its route and status, read straight from the
+`data/api/client-server/*.yaml` files of a pinned `matrix-spec` revision with
+their `$ref`s resolved. The pin is in the script; bumping it is a deliberate
+commit. Known, explained divergences live in `scripts/openapi-allowlist.txt`
+and are reported without failing the job, so that list is the ratchet. Its
+first run caught two: `/devices` and `/joined_members` sent `null` where the
+spec has an optional string, which every client tolerated and no test noticed.
+
 ---
 
 ## 5. What we have to build ourselves

@@ -1,0 +1,5 @@
+# Routes whose response is known not to match the matrix-spec OpenAPI, one
+# per line as `METHOD /template | why`, read by scripts/openapi-check.py.
+# A failure on a route listed here is reported as known and does not fail
+# the check; every other failure does. The list is a ratchet: an entry is
+# added with the reason the divergence is kept, and removed when it is not.
