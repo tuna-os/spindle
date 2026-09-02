@@ -806,6 +806,11 @@ async fn download_media_named(
     serve_media(&state, &identity, &server_name, &media_id).await
 }
 
+/// The identity is authenticated and then, by ADR 0003, not consulted:
+/// possession of the URI is the capability, as the spec and every reference
+/// server have it. The binding is what makes the route require a token at
+/// all. `docs/architecture-decisions/0003-media-authorization.md` says why,
+/// and what would supersede it.
 async fn serve_media(
     state: &AppState,
     _identity: &crate::accounts::Identity,
@@ -962,6 +967,9 @@ struct ThumbnailQuery {
 }
 
 /// `GET /_matrix/client/v1/media/thumbnail/{server_name}/{media_id}`
+///
+/// Authenticated, and open to any account holding the URI, for the reason
+/// [`serve_media`] gives (ADR 0003).
 async fn thumbnail_media(
     State(state): State<AppState>,
     Authenticated(_identity): Authenticated,
@@ -3189,7 +3197,7 @@ async fn create_room(
         invite_user(&state, &identity.user_id, &room_id, target, None).await?;
     }
     if request.visibility.as_deref() == Some("public") {
-        // The creator is joined by construction, so `may_publish` would pass;
+        // The creator is joined by construction, so `may_advertise` would pass;
         // calling it anyway would be a round-trip to re-learn that.
         state
             .directory
@@ -3832,7 +3840,10 @@ struct CreateAliasRequest {
 ///
 /// The room must exist. Letting an alias point at nothing would put a name in
 /// the directory that resolves to a 404 on join -- a broken link the server
-/// handed out itself.
+/// handed out itself. And the caller must be in it, or a server admin: see
+/// [`may_advertise`]. Existence is checked first, so that "no such room" does
+/// not come back as a refusal, which would tell a stranger the room exists
+/// and they simply are not in it.
 async fn create_alias(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
@@ -3840,6 +3851,12 @@ async fn create_alias(
     Json(request): Json<CreateAliasRequest>,
 ) -> Result<Json<Value>, MatrixError> {
     state.rooms.exists(&request.room_id).map_err(room_error)?;
+    may_advertise(
+        &state,
+        &identity.user_id,
+        &request.room_id,
+        "give it an alias",
+    )?;
     state
         .directory
         .create(&room_alias, &request.room_id, &identity.user_id)
@@ -7528,20 +7545,32 @@ async fn room_messages(
     Ok(Json(Value::Object(body)))
 }
 
-/// May `user_id` change whether `room_id` appears in this server's directory?
+/// May `user_id` attach this server's name to `room_id` -- by listing it in
+/// the directory, or by giving it an alias?
 ///
-/// The rule: **a joined member may publish their own room; a server admin may
-/// publish any.** That is deliberately stricter than alias creation, which
-/// lets any authenticated user claim any free alias -- the difference is that
-/// an alias is a name somebody has to already know, while the directory is a
-/// list this server actively hands to strangers. Publishing is therefore spam
-/// surface in a way that claiming `#foo:example.org` is not, and requiring
-/// membership makes the person answerable for the room they are advertising.
+/// The rule: **a joined member may; a server admin may for any room.** One
+/// rule for both, because both are the same act: a name this server hands to
+/// strangers that resolves to the room. An earlier version of this comment
+/// argued that an alias was different -- "a name somebody has to already
+/// know" -- and let any account claim any free alias for any room. That was
+/// backwards: `/join/#name:server` is precisely how strangers find rooms, so
+/// an alias is the more published of the two, and it let anyone who had
+/// learnt a room ID hang `#official:example.org` on it from outside. #268
+/// named the disagreement; requiring membership for both makes the person
+/// answerable for the room they are naming, and matches what Sytest expects
+/// of a regular user, who joins before claiming.
 ///
 /// The spec explicitly leaves this to the server ("servers may choose to
 /// impose additional restrictions"), so this is a policy choice rather than a
 /// reading of the spec, and it is written here so it can be argued with.
-fn may_publish(state: &AppState, user_id: &str, room_id: &str) -> Result<(), MatrixError> {
+/// `action` names the act in the refusal, so a client learns what was refused
+/// without learning anything about the room.
+fn may_advertise(
+    state: &AppState,
+    user_id: &str,
+    room_id: &str,
+    action: &str,
+) -> Result<(), MatrixError> {
     if state
         .rooms
         .is_joined(user_id, room_id)
@@ -7554,9 +7583,9 @@ fn may_publish(state: &AppState, user_id: &str, room_id: &str) -> Result<(), Mat
     if admin {
         return Ok(());
     }
-    Err(MatrixError::forbidden(
-        "only a member of the room, or a server admin, may change its directory visibility",
-    ))
+    Err(MatrixError::forbidden(format!(
+        "only a member of the room, or a server admin, may {action}"
+    )))
 }
 
 #[derive(Debug, Deserialize)]
@@ -7576,7 +7605,12 @@ async fn set_room_visibility(
     // which would tell a stranger the room exists and they simply are not in
     // it.
     state.rooms.exists(&room_id).map_err(room_error)?;
-    may_publish(&state, &identity.user_id, &room_id)?;
+    may_advertise(
+        &state,
+        &identity.user_id,
+        &room_id,
+        "change its directory visibility",
+    )?;
 
     match request.visibility.as_str() {
         "public" => state

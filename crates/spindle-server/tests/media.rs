@@ -578,3 +578,53 @@ async fn concurrent_uploads_of_identical_bytes_all_land_intact() {
         assert_eq!(bytes, payload, "a racing writer tore the blob");
     }
 }
+
+/// ADR 0003: possession of the URI is the capability.
+///
+/// Bob shares no room with alice and has never been sent this file. He
+/// has the URI, and that is what the spec makes sufficient -- authenticated
+/// media requires a token, not a relationship to the uploader. This is a
+/// decision, not an oversight; the ADR says why, and what would supersede
+/// it. If this test starts failing, either the ADR was revisited or a
+/// media ACL crept in without one.
+#[tokio::test]
+async fn any_account_may_fetch_media_it_holds_the_uri_for() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let (status, body) = harness
+        .upload(&alice, "text/plain", None, b"for whoever holds the link")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mxc = body["content_uri"].as_str().unwrap();
+
+    let (status, _, bytes) = harness.download(&bob, mxc).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, b"for whoever holds the link");
+}
+
+/// The other half of that decision: it is only sound while a URI cannot be
+/// guessed. Sixteen random bytes, hex-encoded, and never the same twice.
+#[tokio::test]
+async fn a_media_id_is_128_random_bits() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let mut ids = std::collections::BTreeSet::new();
+    for _ in 0..8 {
+        let (status, body) = harness
+            .upload(&alice, "text/plain", None, b"the same bytes every time")
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mxc = body["content_uri"].as_str().unwrap();
+        let (_, media_id) = mxc.strip_prefix("mxc://").unwrap().split_once('/').unwrap();
+        assert_eq!(media_id.len(), 32, "{media_id}");
+        assert!(
+            media_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{media_id}"
+        );
+        ids.insert(media_id.to_owned());
+    }
+    // Identical content, eight distinct IDs: the ID is not the hash, and it
+    // is not a counter.
+    assert_eq!(ids.len(), 8);
+}
