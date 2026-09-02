@@ -229,6 +229,15 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
 /// when a runtime is running — which is every real caller; a build
 /// outside one gets a router that serves but never sends, and the
 /// absence of a runtime is that caller's own statement of intent.
+///
+/// Each loop holds what it reads weakly and ends once the router is
+/// gone, so the last reference to the store is never the one a loop
+/// holds. A runtime tears its tasks down as it shuts down, and a task
+/// dropped that way is the wrong place for the store to close: fjall's
+/// close joins its worker threads, and #292 caught it waiting forever
+/// there. With the loops holding only weak references the store closes
+/// where its last owner is dropped -- the router, on the thread that
+/// served it -- and the loops notice on their next pass and return.
 fn spawn_delivery_loops(state: &AppState) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
@@ -237,14 +246,14 @@ fn spawn_delivery_loops(state: &AppState) {
     // the cost of the tick: when nothing is due it reads one row, because
     // the rows are ordered by when they fire.
     tokio::spawn(delayed::fire_loop(
-        Arc::clone(&state.delayed),
-        Arc::clone(&state.rooms),
-        Arc::clone(&state.key),
+        Arc::downgrade(&state.delayed),
+        Arc::downgrade(&state.rooms),
+        Arc::downgrade(&state.key),
         std::time::Duration::from_secs(1),
     ));
     tokio::spawn(federation::drain_outbox(
-        Arc::clone(&state.store),
-        Arc::clone(&state.federation),
+        Arc::downgrade(&state.store),
+        Arc::downgrade(&state.federation),
         std::time::Duration::from_millis(state.config.federation.retry_base_ms),
     ));
     // The appservice push shares the outbox's retry base: both are
@@ -257,11 +266,11 @@ fn spawn_delivery_loops(state: &AppState) {
         .any(|registration| registration.url.is_some())
     {
         tokio::spawn(appservices::push_loop(
-            Arc::clone(&state.store),
-            Arc::clone(&state.appservices),
-            Arc::clone(&state.rooms),
-            Arc::clone(&state.typing),
-            Arc::clone(&state.devices),
+            Arc::downgrade(&state.store),
+            Arc::downgrade(&state.appservices),
+            Arc::downgrade(&state.rooms),
+            Arc::downgrade(&state.typing),
+            Arc::downgrade(&state.devices),
             state.config.server.name.clone(),
             std::time::Duration::from_millis(state.config.federation.retry_base_ms),
         ));

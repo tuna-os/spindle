@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use ruma::{CanonicalJsonObject, CanonicalJsonValue};
@@ -816,9 +816,15 @@ type OutboxRow = (Vec<u8>, Vec<u8>);
 /// acknowledged the transaction carrying them — a crash between send and
 /// delete re-sends, and the transaction ID being derived from the first
 /// row's sequence lets the peer's replay table absorb the duplicate.
+///
+/// Holds the store and the federation weakly and ends when they are gone,
+/// for the reason `spawn_delivery_loops` gives. A pass holds them strongly
+/// only from its upgrade to its end, so a cancellation at the idle sleep --
+/// where a quiet server spends almost all of its time -- finds nothing to
+/// drop.
 pub async fn drain_outbox(
-    store: Arc<FjallStore>,
-    federation: Arc<Federation>,
+    store: Weak<FjallStore>,
+    federation: Weak<Federation>,
     retry_base: Duration,
 ) {
     let mut backoff: std::collections::HashMap<String, (u32, std::time::Instant)> =
@@ -830,6 +836,9 @@ pub async fn drain_outbox(
                 .max(Duration::from_millis(25)),
         )
         .await;
+        let (Some(store), Some(federation)) = (store.upgrade(), federation.upgrade()) else {
+            return;
+        };
         let Ok(rows) = ReadView::scan_prefix(store.as_ref(), &keys::federation_outbox_all()) else {
             continue;
         };

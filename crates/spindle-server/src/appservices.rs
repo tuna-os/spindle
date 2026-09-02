@@ -12,7 +12,7 @@
 //! possible error.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use regex::Regex;
@@ -843,23 +843,20 @@ fn compute_pending(
 /// the service still advances the cursor durably — otherwise a service
 /// whose rooms went quiet would re-scan the same dead range every pass,
 /// forever.
+///
+/// Holds everything it reads weakly and ends when it is gone, for the
+/// reason `spawn_delivery_loops` gives; like the outbox drain, a pass holds
+/// its sources strongly only from its upgrade to its end.
 pub async fn push_loop(
-    store: Arc<FjallStore>,
-    appservices: Arc<Appservices>,
-    rooms: Arc<Rooms>,
-    typing: Arc<crate::typing::Typing>,
-    devices: Arc<crate::devices::Devices>,
+    store: Weak<FjallStore>,
+    appservices: Weak<Appservices>,
+    rooms: Weak<Rooms>,
+    typing: Weak<crate::typing::Typing>,
+    devices: Weak<crate::devices::Devices>,
     server_name: String,
     retry_base: Duration,
 ) {
     let client = reqwest::Client::new();
-    let sources = PushSources {
-        store: &store,
-        devices: &devices,
-        rooms: &rooms,
-        typing: &typing,
-        server_name: &server_name,
-    };
     let mut pending: HashMap<String, PendingPush> = HashMap::new();
     let mut backoff: HashMap<String, (u32, std::time::Instant)> = HashMap::new();
     // What each opted-in service believes about who is typing where.
@@ -874,6 +871,22 @@ pub async fn push_loop(
                 .max(Duration::from_millis(25)),
         )
         .await;
+        let (Some(store), Some(appservices), Some(rooms), Some(typing), Some(devices)) = (
+            store.upgrade(),
+            appservices.upgrade(),
+            rooms.upgrade(),
+            typing.upgrade(),
+            devices.upgrade(),
+        ) else {
+            return;
+        };
+        let sources = PushSources {
+            store: &store,
+            devices: &devices,
+            rooms: &rooms,
+            typing: &typing,
+            server_name: &server_name,
+        };
         for registration in appservices.all() {
             let Some(url) = &registration.url else {
                 continue;
