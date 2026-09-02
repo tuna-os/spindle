@@ -27,6 +27,8 @@ pub mod mas;
 pub mod media;
 pub mod metrics;
 pub mod netguard;
+#[cfg(test)]
+mod netguard_tests;
 pub mod oidc;
 pub mod presence;
 pub mod previews;
