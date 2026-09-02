@@ -52,6 +52,21 @@ impl ReadView for FaultyStore {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect())
     }
+
+    fn scan_until(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<Record>, StoreError> {
+        Ok(self
+            .data
+            .borrow()
+            .range(start.to_vec()..end.to_vec())
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
+    }
 }
 
 impl Store for FaultyStore {
