@@ -49,6 +49,23 @@ impl AccountData {
         Ok(())
     }
 
+    /// How many entries `user_id` has, global and per-room together.
+    ///
+    /// A scan of the user's whole prefix, which is bounded by the cap the
+    /// caller is about to enforce, so the cost is proportional to the limit
+    /// and not to the server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountDataError`] if the scan fails.
+    pub fn count(&self, user_id: &str) -> Result<usize, AccountDataError> {
+        Ok(ReadView::scan_prefix(
+            self.store.as_ref(),
+            &keys::user_prefix(keys::Keyspace::AccountData, user_id),
+        )?
+        .len())
+    }
+
     /// One entry, or `None` if the user has never set it.
     ///
     /// # Errors

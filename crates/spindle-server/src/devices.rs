@@ -97,6 +97,16 @@ impl Devices {
         self.one_time_key_counts(user_id, device_id)
     }
 
+    /// How many one-time keys one device holds, across every algorithm.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the scan fails.
+    pub fn one_time_key_total(&self, user_id: &str, device_id: &str) -> Result<usize, StoreError> {
+        let prefix = keys::device_scoped(Keyspace::OneTimeKeys, user_id, device_id, &[]);
+        Ok(ReadView::scan_prefix(self.store.as_ref(), &prefix)?.len())
+    }
+
     /// How many one-time keys remain, by algorithm.
     ///
     /// # Errors

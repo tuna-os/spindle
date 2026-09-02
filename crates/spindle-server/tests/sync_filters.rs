@@ -24,11 +24,16 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
+        Self::with_config("")
+    }
+
+    /// The default harness plus `extra` TOML, for the tests about caps.
+    fn with_config(extra: &str) -> Self {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
-        let config = spindle_server::Config::parse(
-            "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n",
-        )
+        let config = spindle_server::Config::parse(&format!(
+            "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n{extra}"
+        ))
         .unwrap();
         let app = spindle_server::app(config, store).expect("a signing key is established");
         Self { _dir: dir, app }
@@ -486,4 +491,49 @@ async fn a_filter_limit_outranks_the_query_parameter() {
         2,
         "the filter is the more specific of the two: {body}"
     );
+}
+
+/// Every upload mints a fresh id, so every upload is growth, and nothing
+/// bounded it (#268). The cap is per user: one account at its limit says
+/// nothing about another's.
+#[tokio::test]
+async fn the_filter_store_is_capped_per_user() {
+    let harness = Harness::with_config("[limits]\nfilters_per_user = 3\n");
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let filter = json!({ "room": { "timeline": { "limit": 1 } } });
+
+    for _ in 0..3 {
+        harness
+            .upload_filter("@alice:example.org", &alice, &filter)
+            .await;
+    }
+    let (status, body) = harness
+        .request(
+            "POST",
+            "/_matrix/client/v3/user/@alice:example.org/filter",
+            &alice,
+            &filter,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_LIMIT_EXCEEDED");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains('3')),
+        "the refusal names the limit: {body}"
+    );
+
+    // The ones already stored are untouched, and bob is not at any cap.
+    let (status, _) = harness
+        .get(
+            "/_matrix/client/v3/user/@alice:example.org/filter/0",
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    harness
+        .upload_filter("@bob:example.org", &bob, &filter)
+        .await;
 }

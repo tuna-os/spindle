@@ -212,6 +212,43 @@ fn the_shipped_example_parses() {
 /// so a server that accepted it would start with the dead-man's switch
 /// silently refusing every schedule -- the failure MSC4140 exists to prevent,
 /// arrived at through the config file.
+/// The same rule for the per-account caps (#268): a zero would refuse every
+/// filter upload, every account-data write or every key upload, which is
+/// not a limit but an outage, and it must not start the server.
+#[test]
+fn a_zero_account_cap_is_refused_at_startup() {
+    for (field, line) in [
+        ("limits.filters_per_user", "filters_per_user = 0"),
+        ("limits.account_data_per_user", "account_data_per_user = 0"),
+        (
+            "limits.one_time_keys_per_device",
+            "one_time_keys_per_device = 0",
+        ),
+    ] {
+        let error = parse(&format!(
+            "[server]\nname = \"example.org\"\n[limits]\n{line}\n"
+        ))
+        .expect_err("a zero cap must not start the server");
+        let rendered = error.to_string();
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains("refuses every write"), "{rendered}");
+    }
+    // And the defaults are what the module says they are.
+    let config = parse("[server]\nname = \"example.org\"\n").expect("defaults parse");
+    assert_eq!(
+        config.limits.filters_per_user,
+        spindle_server::config::DEFAULT_FILTERS_PER_USER
+    );
+    assert_eq!(
+        config.limits.account_data_per_user,
+        spindle_server::config::DEFAULT_ACCOUNT_DATA_PER_USER
+    );
+    assert_eq!(
+        config.limits.one_time_keys_per_device,
+        spindle_server::config::DEFAULT_ONE_TIME_KEYS_PER_DEVICE
+    );
+}
+
 #[test]
 fn a_zero_delayed_event_cap_is_refused_at_startup() {
     for (field, line) in [

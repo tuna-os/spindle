@@ -32,6 +32,8 @@ pub struct Config {
     #[serde(default)]
     pub delayed_events: DelayedEventsConfig,
     #[serde(default)]
+    pub limits: LimitsConfig,
+    #[serde(default)]
     pub turn: TurnConfig,
 }
 
@@ -73,6 +75,61 @@ const fn default_max_delay_ms() -> u64 {
 
 const fn default_max_per_room() -> usize {
     crate::delayed::DEFAULT_MAX_PER_ROOM
+}
+
+/// Caps on what one account may make this server keep (#268).
+///
+/// Each of these is a store that grows on a client's say-so and had no
+/// ceiling: filters are minted with a fresh id on every upload, account
+/// data is keyed by a type the client invents, and one-time keys are
+/// whatever a device chooses to upload. None is expensive to hold, and
+/// every one is an unbounded write anybody with an account can make.
+///
+/// The defaults are far above any real client -- Element keeps a handful of
+/// filters, a few dozen account-data entries per room, and tops one-time
+/// keys up to fifty -- and finite against one that has gone wrong or is
+/// trying to. A hit cap answers `M_LIMIT_EXCEEDED`, and a replacement of
+/// something already stored never counts against it.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct LimitsConfig {
+    /// Stored `/sync` filters per user.
+    #[serde(default = "default_filters_per_user")]
+    pub filters_per_user: usize,
+    /// Account-data entries per user, global and per-room together.
+    #[serde(default = "default_account_data_per_user")]
+    pub account_data_per_user: usize,
+    /// One-time keys held for one device.
+    #[serde(default = "default_one_time_keys_per_device")]
+    pub one_time_keys_per_device: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            filters_per_user: default_filters_per_user(),
+            account_data_per_user: default_account_data_per_user(),
+            one_time_keys_per_device: default_one_time_keys_per_device(),
+        }
+    }
+}
+
+/// Element mints one filter per client session and reuses it.
+pub const DEFAULT_FILTERS_PER_USER: usize = 1_000;
+/// Enough for a few dozen entries in each of several hundred rooms.
+pub const DEFAULT_ACCOUNT_DATA_PER_USER: usize = 20_000;
+/// Element tops up to fifty; the spec suggests clients keep "around" that.
+pub const DEFAULT_ONE_TIME_KEYS_PER_DEVICE: usize = 1_000;
+
+const fn default_filters_per_user() -> usize {
+    DEFAULT_FILTERS_PER_USER
+}
+
+const fn default_account_data_per_user() -> usize {
+    DEFAULT_ACCOUNT_DATA_PER_USER
+}
+
+const fn default_one_time_keys_per_device() -> usize {
+    DEFAULT_ONE_TIME_KEYS_PER_DEVICE
 }
 
 /// The operational scrape surface (#166).
@@ -415,6 +472,24 @@ impl Config {
                 message: "must be greater than zero; a zero cap refuses every delayed event"
                     .to_owned(),
             });
+        }
+        for (field, value) in [
+            ("limits.filters_per_user", self.limits.filters_per_user),
+            (
+                "limits.account_data_per_user",
+                self.limits.account_data_per_user,
+            ),
+            (
+                "limits.one_time_keys_per_device",
+                self.limits.one_time_keys_per_device,
+            ),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Invalid {
+                    field,
+                    message: "must be greater than zero; a zero cap refuses every write".to_owned(),
+                });
+            }
         }
         let name = &self.server.name;
         if name.is_empty() {
