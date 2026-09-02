@@ -127,13 +127,21 @@ pub fn indices_in_view(ranges: &[(usize, usize)], len: usize) -> Vec<usize> {
     indices
 }
 
+/// One room's timeline window, as the caller fetched it.
+pub struct Timeline {
+    pub events: Vec<Value>,
+    pub limited: bool,
+    /// Where the window begins, as a `/messages` token (#331); `None` for an
+    /// empty window.
+    pub prev_batch: Option<String>,
+}
+
 /// The `rooms` entry for one room, from the pieces the caller fetched.
 #[must_use]
 pub fn room_entry(
     name: Option<String>,
     required_state: Vec<Value>,
-    timeline: Vec<Value>,
-    limited: bool,
+    timeline: Timeline,
     joined_count: usize,
     notification_count: usize,
     initial: bool,
@@ -143,8 +151,11 @@ pub fn room_entry(
         entry.insert("name".to_owned(), json!(name));
     }
     entry.insert("required_state".to_owned(), Value::Array(required_state));
-    entry.insert("timeline".to_owned(), Value::Array(timeline));
-    entry.insert("limited".to_owned(), json!(limited));
+    entry.insert("timeline".to_owned(), Value::Array(timeline.events));
+    entry.insert("limited".to_owned(), json!(timeline.limited));
+    if let Some(prev_batch) = timeline.prev_batch {
+        entry.insert("prev_batch".to_owned(), json!(prev_batch));
+    }
     entry.insert("joined_count".to_owned(), json!(joined_count));
     entry.insert("notification_count".to_owned(), json!(notification_count));
     // `initial: true` marks a room sent in full, so a client knows to replace

@@ -114,6 +114,11 @@ async function send(page, text) {
     await alice.waitForURL(/#\/room\//, { timeout: SLOW });
     roomUrl = alice.url();
     console.log(`room: ${roomUrl.slice(roomUrl.indexOf('#'))}`);
+    // The room intro, not the "can't see earlier messages" tile: the client
+    // reached the creation event, which needs the sync window to say where
+    // it begins so the client can page back to it (#331).
+    await alice.getByText(/created this room\./).waitFor({ timeout: SLOW });
+    await send(alice, 'before bob');
   });
 
   await step('invite', async () => {
@@ -137,6 +142,10 @@ async function send(page, text) {
     await bob.getByRole('button', { name: /^accept$/i }).click({ timeout: SLOW });
     await composer(bob).waitFor({ timeout: SLOW });
     await alice.getByText(`@bob:${SERVER} joined the room`).waitFor({ timeout: SLOW });
+    // History visibility is `shared`, so what alice said before the invite
+    // is bob's to read once he is in -- if the client can page back to it
+    // (#331).
+    await bob.getByText('before bob').waitFor({ timeout: SLOW });
   });
 
   await step('bob-to-alice', async () => {

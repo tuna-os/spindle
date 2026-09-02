@@ -258,6 +258,30 @@ async fn required_state_is_honoured_and_me_resolves() {
         "timeline_limit honoured: {entry}"
     );
     assert_eq!(entry["initial"], true);
+    // The window says where it begins (#331), and `/messages` pages back from
+    // there to what was left out: everything up to the room's creation, and
+    // not the window's own event again.
+    assert_eq!(entry["limited"], true, "{entry}");
+    let from = entry["prev_batch"]
+        .as_str()
+        .expect("a window says where it begins");
+    let (status, page) = harness
+        .request(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&from={from}&limit=100"),
+            &alice,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let chunk = page["chunk"].as_array().unwrap();
+    assert_eq!(chunk.last().unwrap()["type"], "m.room.create", "{page}");
+    assert!(
+        chunk
+            .iter()
+            .all(|event| event["content"]["body"] != "hello"),
+        "the window's own event came back: {page}"
+    );
 }
 
 #[tokio::test]

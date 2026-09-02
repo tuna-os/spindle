@@ -112,9 +112,10 @@ conformance test may not pin down.
   `tmp/element-web-e2e/`, and the `element-web-e2e` job in `compliance.yml`
   uploads them. Locally: `npm ci` and `npx playwright install chromium` in
   `scripts/element-web-e2e/`, then the script. Its first run found something
-  Complement had not: `/sync` never carries a timeline `prev_batch`, so
-  Element cannot paginate backwards and a new joiner sees no history at all
-  (#331). The larger step remains open: a Spindle plugin under Element's own
+  Complement had not: `/sync` carried no timeline `prev_batch`, so Element
+  could not paginate backwards and a new joiner saw no history at all
+  (#331); the flow now asserts the room intro and a joiner reading what was
+  said before the invite. The larger step remains open: a Spindle plugin under Element's own
   `playwright/plugins/homeserver/`, alongside the Synapse and Dendrite ones,
   to run the client's whole suite against us, maintained by the client's
   authors and updated as the client changes.
