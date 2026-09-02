@@ -522,15 +522,12 @@ async fn a_banned_member_reads_up_to_the_ban() {
     assert!(!seen.contains(&"AFTERTHEBAN".to_owned()), "{body}");
 }
 
-/// The part still narrower than the spec, pinned so it is a decision and
-/// not an accident. Under `joined` visibility the spec makes each event's
-/// visibility depend on whether the reader was a member *when it was sent*
-/// -- membership intervals, not one bound. That is not implemented, and a
-/// former member of such a room is refused outright, which errs on the
-/// side of showing less. When intervals land, this test is the one to turn
-/// around.
+/// Under `joined` history visibility the spec makes visibility a per-event
+/// question: what the caller's membership was as of each event. Someone
+/// who joined, left and joined again reads two stints of the room, and
+/// nothing said before the first, between them, or after the last.
 #[tokio::test]
-async fn a_former_member_of_a_joined_visibility_room_is_still_refused() {
+async fn a_former_member_of_a_joined_visibility_room_reads_each_stint_and_nothing_between() {
     let harness = Harness::new();
     let alice = harness.register("alice").await;
     let bob = harness.register("bob").await;
@@ -547,17 +544,146 @@ async fn a_former_member_of_a_joined_visibility_room_is_still_refused() {
             }),
         )
         .await;
+    let before = harness.say(&room, &alice, "BEFOREBOB").await;
     harness.admit(&room, &alice, &bob, "@bob:example.org").await;
-    harness.say(&room, &alice, "WHILEJOINED").await;
+    let first = harness.say(&room, &alice, "FIRSTSTINT").await;
     harness.leave(&room, &bob).await;
+    let between = harness.say(&room, &alice, "BETWEENSTINTS").await;
+    harness.admit(&room, &alice, &bob, "@bob:example.org").await;
+    harness.say(&room, &alice, "SECONDSTINT").await;
+    harness.leave(&room, &bob).await;
+    harness.say(&room, &alice, "AFTERBOB").await;
 
+    // /messages: both stints, each edge included, nothing else.
     let (status, body) = harness
         .get(
-            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=10"),
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=50"),
             &bob,
         )
         .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let seen = bodies(&body);
+    assert!(seen.contains(&"FIRSTSTINT".to_owned()), "{body}");
+    assert!(seen.contains(&"SECONDSTINT".to_owned()), "{body}");
+    for hidden in ["BEFOREBOB", "BETWEENSTINTS", "AFTERBOB"] {
+        assert!(
+            !seen.contains(&hidden.to_owned()),
+            "{hidden} leaked: {body}"
+        );
+    }
+    let rendered = serde_json::to_string(&body).unwrap();
+    assert_eq!(
+        rendered.matches("\"membership\":\"leave\"").count(),
+        2,
+        "both departures are bob's to see: {body}"
+    );
+
+    // /event: inside a stint, yes; before the first or between them, absent
+    // rather than forbidden.
+    let (status, _) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/event/{first}"),
+            &bob,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    for hidden in [&before, &between] {
+        let (status, body) = harness
+            .get(
+                &format!("/_matrix/client/v3/rooms/{room}/event/{hidden}"),
+                &bob,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    // /context around a stint's message skips what lies outside it on
+    // both sides.
+    let (status, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/context/{first}?limit=20"),
+            &bob,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rendered = serde_json::to_string(&body).unwrap();
+    assert!(rendered.contains("FIRSTSTINT"), "{body}");
+    assert!(
+        !rendered.contains("BEFOREBOB") && !rendered.contains("BETWEENSTINTS"),
+        "{body}"
+    );
+
+    // A stranger is still a stranger.
+    let mallory = harness.register("mallory").await;
+    let (status, _) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=50"),
+            &mallory,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// Under `invited` visibility the stint opens at the invite rather than at
+/// the join: what was said while bob was invited is his, and under
+/// `joined` it is not.
+#[tokio::test]
+async fn invited_visibility_opens_the_stint_at_the_invite_and_joined_does_not() {
+    for (visibility, expected) in [("invited", true), ("joined", false)] {
+        let harness = Harness::new();
+        let alice = harness.register("alice").await;
+        let bob = harness.register("bob").await;
+        let room = harness
+            .create_room(
+                &alice,
+                json!({
+                    "preset": "private_chat",
+                    "initial_state": [{
+                        "type": "m.room.history_visibility",
+                        "state_key": "",
+                        "content": { "history_visibility": visibility },
+                    }],
+                }),
+            )
+            .await;
+        let (status, body) = harness
+            .post(
+                &format!("/_matrix/client/v3/rooms/{room}/invite"),
+                &alice,
+                &json!({ "user_id": "@bob:example.org" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        harness.say(&room, &alice, "WHILEINVITED").await;
+        let (status, body) = harness
+            .post(
+                &format!("/_matrix/client/v3/rooms/{room}/join"),
+                &bob,
+                &json!({}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        harness.say(&room, &alice, "WHILEJOINED").await;
+        harness.leave(&room, &bob).await;
+
+        let (status, body) = harness
+            .get(
+                &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=50"),
+                &bob,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{visibility}: {body}");
+        let seen = bodies(&body);
+        assert!(
+            seen.contains(&"WHILEJOINED".to_owned()),
+            "{visibility}: {body}"
+        );
+        assert_eq!(
+            seen.contains(&"WHILEINVITED".to_owned()),
+            expected,
+            "{visibility}: {body}"
+        );
+    }
 }
 
 /// The state a former member reads is the room as it stood when they were

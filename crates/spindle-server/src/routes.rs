@@ -4303,12 +4303,12 @@ async fn room_members(
     axum::extract::Query(query): axum::extract::Query<MembersQuery>,
 ) -> Result<Json<Value>, MatrixError> {
     let scope = read_scope(&state, &identity.user_id, &room_id)?;
-    let events = match scope {
-        ReadScope::Whole => state
+    let events = match scope.bound() {
+        None => state
             .rooms
             .state_where(&room_id, |key| key.event_type().as_str() == "m.room.member")
             .map_err(room_error)?,
-        ReadScope::UpTo(bound) => state
+        Some(bound) => state
             .rooms
             .state_as_of(&room_id, bound)
             .map_err(room_error)?
@@ -7335,11 +7335,11 @@ async fn room_state(
     axum::extract::Path(room_id): axum::extract::Path<String>,
 ) -> Result<axum::response::Response, MatrixError> {
     let scope = read_scope(&state, &identity.user_id, &room_id)?;
-    let body = match scope {
+    let body = match scope.bound() {
         // Pre-serialized: the body comes from the state-render cache, keyed
         // by the state root, so a hot room costs no reads, parses or
         // serializing.
-        ReadScope::Whole => state
+        None => state
             .rooms
             .state_serialized(&room_id)
             .map_err(room_error)?
@@ -7348,7 +7348,7 @@ async fn room_state(
         // A former member sees the room as it stood when they were
         // removed: the state at that position, rendered here rather than
         // from the cache, which only ever holds the present.
-        ReadScope::UpTo(bound) => Value::Array(
+        Some(bound) => Value::Array(
             state
                 .rooms
                 .state_as_of(&room_id, bound)
@@ -7380,12 +7380,12 @@ async fn room_state_event(
     // Also a membership oracle without this: `…/state/m.room.member/@someone`
     // answers whether a named user is in a named room, to anyone who asks.
     let scope = read_scope(&state, &identity.user_id, &room_id)?;
-    let content = match scope {
-        ReadScope::Whole => state
+    let content = match scope.bound() {
+        None => state
             .rooms
             .state_event(&room_id, &event_type, &state_key)
             .map_err(room_error)?,
-        ReadScope::UpTo(bound) => state
+        Some(bound) => state
             .rooms
             .state_event_as_of(&room_id, bound, &event_type, &state_key)
             .map_err(room_error)?,
@@ -7517,14 +7517,14 @@ async fn room_event(
     axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, MatrixError> {
     let scope = read_scope(&state, &identity.user_id, &room_id)?;
-    if let ReadScope::UpTo(bound) = scope {
-        // Above the bound the event is absent to this caller, not
+    if scope != ReadScope::Whole {
+        // Outside the scope the event is absent to this caller, not
         // forbidden: forbidden would confirm that something is there.
         let position = state
             .rooms
             .event_position(&room_id, &event_id)
             .map_err(room_error)?;
-        if position.is_none_or(|position| position > bound) {
+        if position.is_none_or(|position| !scope.admits(position)) {
             return Err(MatrixError::new(
                 StatusCode::NOT_FOUND,
                 "M_NOT_FOUND",
@@ -7561,13 +7561,9 @@ async fn room_context(
     let limit = query.limit.unwrap_or(10).clamp(1, 100);
     let each_side = limit.div_ceil(2);
 
-    let bound = match scope {
-        ReadScope::Whole => None,
-        ReadScope::UpTo(bound) => Some(bound),
-    };
     let context = state
         .rooms
-        .context_within(&room_id, &event_id, each_side, bound)
+        .context_visible(&room_id, &event_id, each_side, &|li| scope.admits(li))
         .map_err(room_error)?;
 
     Ok(Json(json!({
@@ -7742,13 +7738,9 @@ async fn room_messages(
     };
     let limit = query.limit.unwrap_or(10).clamp(1, 100);
 
-    let bound = match scope {
-        ReadScope::Whole => None,
-        ReadScope::UpTo(bound) => Some(bound),
-    };
     let (events, next) = state
         .rooms
-        .messages_within(&room_id, from, limit, bound)
+        .messages_visible(&room_id, from, limit, &|li| scope.admits(li))
         .map_err(room_error)?;
 
     let chunk: Vec<Value> = events
@@ -8498,13 +8490,41 @@ fn may_read_room(state: &AppState, user_id: &str, room_id: &str) -> Result<(), M
 }
 
 /// How much of a room a caller may read.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ReadScope {
     /// All of it: joined, or the room is world-readable.
     Whole,
-    /// Up to and including this position: a former member, reading what
-    /// was said while they were there.
+    /// Up to and including this position: a former member of a `shared`
+    /// room, reading what was said while they were there and before.
     UpTo(i64),
+    /// Only these stretches, `(first, last)` inclusive: a former member of
+    /// a `joined` or `invited` room, reading what was said while they were
+    /// in it, one stint at a time (#268).
+    Within(Vec<(i64, i64)>),
+}
+
+impl ReadScope {
+    /// Whether position `li` is inside what the caller may read.
+    fn admits(&self, li: i64) -> bool {
+        match self {
+            Self::Whole => true,
+            Self::UpTo(bound) => li <= *bound,
+            Self::Within(stints) => stints
+                .iter()
+                .any(|(first, last)| (*first..=*last).contains(&li)),
+        }
+    }
+
+    /// The last position the caller may read, for the reads that answer
+    /// with the room *as it stood* -- state and members -- rather than
+    /// with a stretch of its timeline. `None` means the present.
+    fn bound(&self) -> Option<i64> {
+        match self {
+            Self::Whole => None,
+            Self::UpTo(bound) => Some(*bound),
+            Self::Within(stints) => stints.last().map(|(_, last)| *last),
+        }
+    }
 }
 
 /// What `user_id` may read of `room_id`: everything, a bounded past, or
@@ -8518,12 +8538,12 @@ enum ReadScope {
 /// visibility that governs is the one in force *at* their departure, so a
 /// room that later tightened or relaxed it changes nothing for them.
 ///
-/// Only `shared` (and `world_readable`, which is already [`ReadScope::Whole`])
-/// is handled here. Under `joined` and `invited` the spec makes visibility
-/// a per-event question -- which events fell inside the caller's membership
-/// intervals -- and a former member is still refused outright, which is
-/// stricter than the spec and recorded as such; see
-/// `a_former_member_of_a_joined_visibility_room_is_still_refused`.
+/// Under `joined` and `invited` the spec makes visibility a per-event
+/// question -- what the caller's membership was as of each event -- so a
+/// former member of such a room reads the stretches during which they
+/// were joined (or, under `invited`, invited or joined), one stint at a
+/// time, and nothing between or after them: [`ReadScope::Within`], from
+/// the membership-history index.
 ///
 /// Used by the reads that page a timeline -- `/messages`, `/event`,
 /// `/context` -- and by the two state reads, `/state` and
@@ -8547,12 +8567,24 @@ fn read_scope(state: &AppState, user_id: &str, room_id: &str) -> Result<ReadScop
         .rooms
         .history_visibility_at(room_id, departure)
         .map_err(internal)?;
-    if visibility == "shared" || visibility == "world_readable" {
-        return Ok(ReadScope::UpTo(departure));
+    match visibility.as_str() {
+        "shared" | "world_readable" => Ok(ReadScope::UpTo(departure)),
+        "joined" | "invited" => {
+            let stints = state
+                .rooms
+                .membership_intervals(room_id, user_id, visibility == "invited")
+                .map_err(internal)?;
+            if stints.is_empty() {
+                return Err(MatrixError::forbidden(format!(
+                    "{user_id} is not in {room_id}"
+                )));
+            }
+            Ok(ReadScope::Within(stints))
+        }
+        _ => Err(MatrixError::forbidden(format!(
+            "{user_id} is not in {room_id}"
+        ))),
     }
-    Err(MatrixError::forbidden(format!(
-        "{user_id} is not in {room_id}"
-    )))
 }
 
 /// The state a room upgrade carries across.

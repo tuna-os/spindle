@@ -188,6 +188,7 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::FinalisedDelay, 0x2d),
         (Keyspace::Presence, 0x2e),
         (Keyspace::Pusher, 0x2f),
+        (Keyspace::MemberHistory, 0x30),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(
