@@ -806,6 +806,11 @@ async fn download_media_named(
     serve_media(&state, &identity, &server_name, &media_id).await
 }
 
+/// The identity is authenticated and then, by ADR 0003, not consulted:
+/// possession of the URI is the capability, as the spec and every reference
+/// server have it. The binding is what makes the route require a token at
+/// all. `docs/architecture-decisions/0003-media-authorization.md` says why,
+/// and what would supersede it.
 async fn serve_media(
     state: &AppState,
     _identity: &crate::accounts::Identity,
@@ -962,6 +967,9 @@ struct ThumbnailQuery {
 }
 
 /// `GET /_matrix/client/v1/media/thumbnail/{server_name}/{media_id}`
+///
+/// Authenticated, and open to any account holding the URI, for the reason
+/// [`serve_media`] gives (ADR 0003).
 async fn thumbnail_media(
     State(state): State<AppState>,
     Authenticated(_identity): Authenticated,
