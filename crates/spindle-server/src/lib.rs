@@ -26,6 +26,7 @@ pub mod import;
 pub mod mas;
 pub mod media;
 pub mod metrics;
+pub mod netguard;
 pub mod oidc;
 pub mod presence;
 pub mod previews;
@@ -86,6 +87,7 @@ pub struct AppState {
 pub enum AppError {
     Signing(signing::SigningError),
     PreviewConfig(String),
+    FederationConfig(String),
     Appservice(String),
 }
 
@@ -94,6 +96,7 @@ impl std::fmt::Display for AppError {
         match self {
             Self::Signing(error) => write!(formatter, "signing key: {error}"),
             Self::PreviewConfig(why) => write!(formatter, "preview config: {why}"),
+            Self::FederationConfig(why) => write!(formatter, "federation config: {why}"),
             Self::Appservice(why) => write!(formatter, "appservice registration: {why}"),
         }
     }
@@ -169,12 +172,16 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
         )
         .map_err(|error| AppError::PreviewConfig(error.to_string()))?,
     );
-    let federation = Arc::new(federation::Federation::new(
-        Arc::clone(&store),
-        config.server.name.clone(),
-        Arc::clone(&key),
-        config.federation.insecure_http,
-    ));
+    let federation = Arc::new(
+        federation::Federation::new(
+            Arc::clone(&store),
+            config.server.name.clone(),
+            Arc::clone(&key),
+            config.federation.insecure_http,
+            &config.federation.allow_internal,
+        )
+        .map_err(|error| AppError::FederationConfig(error.to_string()))?,
+    );
     let delegated = config
         .auth
         .delegated

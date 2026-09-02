@@ -145,7 +145,7 @@ impl Harness {
     fn build(store: &Arc<FjallStore>) -> axum::Router {
         let config = spindle_server::Config::parse(
             "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n\
-             [federation]\ninsecure_http = true\nretry_base_ms = 50\n",
+             [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\nretry_base_ms = 50\n",
         )
         .unwrap();
         spindle_server::app(config, Arc::clone(store)).expect("the app builds")

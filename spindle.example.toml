@@ -70,6 +70,16 @@ allow_private = []
 # the network path can answer the key fetch.
 insecure_http = false
 
+# CIDR ranges a federation fetch may reach although they are not routable.
+# Every key fetch and outbound transaction connects to a host a stranger
+# named -- an X-Matrix origin, a room's membership -- so a server name that
+# resolves inward (loopback, RFC 1918, link-local, the cloud metadata
+# service) is refused by resolved address, always, unless its range is
+# listed here. Same judgement as `[previews] allow_private`. Test rigs whose
+# peers are loopback stubs list "127.0.0.0/8"; a production deployment
+# should not need an entry.
+allow_internal = []
+
 # Base retry delay for outbound delivery, in milliseconds. Doubles per
 # consecutive failure per destination, capped at 64×. Tests shrink it;
 # operators should not need to touch it.

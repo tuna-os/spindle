@@ -148,7 +148,7 @@ impl Harness {
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
         let config = spindle_server::Config::parse(
             "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n\
-             [federation]\ninsecure_http = true\n",
+             [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n",
         )
         .unwrap();
         let app = spindle_server::app(config, store).expect("the app builds");

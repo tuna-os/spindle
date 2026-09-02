@@ -152,7 +152,7 @@ impl Harness {
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
         let config = spindle_server::Config::parse(
             "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n\
-             [federation]\ninsecure_http = true\n",
+             [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n",
         )
         .unwrap();
         let app = spindle_server::app(config, store).expect("the app builds");
@@ -380,8 +380,14 @@ async fn the_signed_object_binds_the_real_method() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(FjallStore::open(dir.path()).unwrap());
     let key = Arc::new(spindle_server::signing::ServerKey::load_or_create(store.as_ref()).unwrap());
-    let federation =
-        spindle_server::federation::Federation::new(Arc::clone(&store), "example.org", key, true);
+    let federation = spindle_server::federation::Federation::new(
+        Arc::clone(&store),
+        "example.org",
+        key,
+        true,
+        &["127.0.0.0/8".to_owned()],
+    )
+    .unwrap();
 
     let header = peer.authorization("PUT", "/_matrix/federation/v1/send/txn1", "example.org");
     federation
