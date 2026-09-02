@@ -502,6 +502,10 @@ fn room_routes() -> Router<AppState> {
             get(room_joined_members),
         )
         .route(
+            "/_matrix/client/v3/rooms/{room_id}/members",
+            get(room_members),
+        )
+        .route(
             "/_matrix/client/v3/join/{room_id_or_alias}",
             post(join_room_by_id_or_alias),
         )
@@ -4262,6 +4266,63 @@ async fn reject_remote_invite(state: &AppState, user_id: &str, room_id: &str) {
         }
     }
     tracing::debug!("no server accepted the rejection of {room_id}; clearing locally");
+}
+
+#[derive(Debug, Deserialize)]
+struct MembersQuery {
+    membership: Option<String>,
+    not_membership: Option<String>,
+    /// A sync token. Accepted and not yet honoured: the roster returned is
+    /// the room's present (or, for a former member, the one at their
+    /// departure), which is what every client that sends `at` sends it
+    /// for -- the token it just synced to, where present and requested
+    /// coincide. Recorded here rather than silently dropped.
+    #[allow(dead_code)]
+    at: Option<String>,
+}
+
+/// `GET /_matrix/client/v3/rooms/{room_id}/members`
+///
+/// The room's member events, whole, optionally filtered by membership.
+/// Read through [`read_scope`]: a member sees the roster as it is, a former
+/// member of a `shared`-visibility room sees it as it stood when they left
+/// (#268), and a stranger sees nothing -- this is the membership oracle
+/// `/joined_members` guards against, one route over.
+async fn room_members(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<MembersQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    let scope = read_scope(&state, &identity.user_id, &room_id)?;
+    let events = match scope {
+        ReadScope::Whole => state
+            .rooms
+            .state_where(&room_id, |key| key.event_type().as_str() == "m.room.member")
+            .map_err(room_error)?,
+        ReadScope::UpTo(bound) => state
+            .rooms
+            .state_as_of(&room_id, bound)
+            .map_err(room_error)?
+            .into_iter()
+            .filter(|event| event["type"] == "m.room.member")
+            .collect(),
+    };
+    let chunk: Vec<Value> = events
+        .into_iter()
+        .filter(|event| {
+            let membership = event["content"]["membership"].as_str().unwrap_or_default();
+            query
+                .membership
+                .as_deref()
+                .is_none_or(|wanted| wanted == membership)
+                && query
+                    .not_membership
+                    .as_deref()
+                    .is_none_or(|unwanted| unwanted != membership)
+        })
+        .collect();
+    Ok(Json(json!({ "chunk": chunk })))
 }
 
 /// `GET /_matrix/client/v3/rooms/{room_id}/joined_members`

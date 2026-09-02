@@ -656,3 +656,102 @@ async fn a_former_member_reads_the_state_as_it_stood_when_they_left() {
         assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
     }
 }
+
+/// `/members` is the roster, whole: a member reads the present, filtered
+/// by membership if they ask; a former member reads the roster as it stood
+/// when they left, departure included and later arrivals absent; a
+/// stranger reads nothing.
+#[tokio::test]
+async fn the_member_list_is_the_roster_a_caller_may_see() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness
+        .create_room(&alice, json!({ "preset": "private_chat" }))
+        .await;
+    harness.admit(&room, &alice, &bob, "@bob:example.org").await;
+    harness.leave(&room, &bob).await;
+    let carol = harness.register("carol").await;
+    harness
+        .admit(&room, &alice, &carol, "@carol:example.org")
+        .await;
+
+    let members = |body: &Value| -> Vec<(String, String)> {
+        body["chunk"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| {
+                (
+                    event["state_key"].as_str().unwrap().to_owned(),
+                    event["content"]["membership"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+
+    // A member: the present, with both filters honoured.
+    let (status, body) = harness
+        .get(&format!("/_matrix/client/v3/rooms/{room}/members"), &alice)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let all = members(&body);
+    assert!(
+        all.contains(&("@alice:example.org".to_owned(), "join".to_owned())),
+        "{body}"
+    );
+    assert!(
+        all.contains(&("@bob:example.org".to_owned(), "leave".to_owned())),
+        "{body}"
+    );
+    assert!(
+        all.contains(&("@carol:example.org".to_owned(), "join".to_owned())),
+        "{body}"
+    );
+    let (_, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/members?membership=join"),
+            &alice,
+        )
+        .await;
+    let joined = members(&body);
+    assert_eq!(joined.len(), 2, "{body}");
+    assert!(joined.iter().all(|(_, m)| m == "join"), "{body}");
+    let (_, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/members?not_membership=join"),
+            &alice,
+        )
+        .await;
+    assert_eq!(
+        members(&body),
+        vec![("@bob:example.org".to_owned(), "leave".to_owned())],
+        "{body}"
+    );
+
+    // A former member: the roster as it stood at the departure.
+    let (status, body) = harness
+        .get(&format!("/_matrix/client/v3/rooms/{room}/members"), &bob)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let then = members(&body);
+    assert!(
+        then.contains(&("@bob:example.org".to_owned(), "leave".to_owned())),
+        "{body}"
+    );
+    assert!(
+        !then.iter().any(|(user, _)| user == "@carol:example.org"),
+        "carol joined after bob left: {body}"
+    );
+
+    // A stranger: nothing, and not a hint of who is inside.
+    let mallory = harness.register("mallory").await;
+    let (status, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/members"),
+            &mallory,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(!serde_json::to_string(&body).unwrap().contains("@alice"));
+}

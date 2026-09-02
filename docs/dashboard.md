@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**170 routes implemented; 4 known gaps in scope.**
+**171 routes implemented; 4 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -182,7 +182,7 @@ neither implemented nor counted.
 - ⏳ `POST /_matrix/client/v3/search` — server-side search (#7)
 - ⏳ `GET /_matrix/client/v3/notifications` — notification list
 
-### Rooms & membership — 23 implemented, 0 planned
+### Rooms & membership — 24 implemented, 0 planned
 
 - `GET /_matrix/client/unstable/im.nheko.summary/rooms/{room_id_or_alias}/summary`
 - `GET /_matrix/client/v1/room_summary/{room_id_or_alias}`
@@ -200,6 +200,7 @@ neither implemented nor counted.
 - `GET /_matrix/client/v3/rooms/{room_id}/joined_members`
 - `POST /_matrix/client/v3/rooms/{room_id}/kick`
 - `POST /_matrix/client/v3/rooms/{room_id}/leave`
+- `GET /_matrix/client/v3/rooms/{room_id}/members`
 - `POST /_matrix/client/v3/rooms/{room_id}/report/{event_id}`
 - `GET /_matrix/client/v3/rooms/{room_id}/state`
 - `GET/PUT /_matrix/client/v3/rooms/{room_id}/state/{event_type}`
