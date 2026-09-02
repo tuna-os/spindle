@@ -34,6 +34,30 @@ the incident it was supposed to explain.
 | `spindle_federation_queue_depth` | gauge | `destination` | Events waiting to go out, per peer. |
 | `spindle_sync_subscribers` | gauge | — | Clients currently blocked in a long-polling `/sync`. |
 | `spindle_sync_lag_seconds` | histogram | — | Age of the newest event a `/sync` delivered. |
+| `spindle_room_registry_acquisitions_total` | counter | `mode` = `exclusive`\|`shared` | Acquisitions of the registry that hands rooms out. |
+| `spindle_room_lock_acquisitions_total` | counter | `mode` = `exclusive`\|`shared` | Acquisitions of a room's own lock: `exclusive` is the write path. |
+
+## Alert rules, a scrape target and a dashboard
+
+`deploy/` carries the pieces an operator would otherwise write from this
+page (#325):
+
+- `deploy/prometheus/spindle-alerts.yaml`: the case-3 alert above, the
+  SPEC §18.3 latency targets as p50 and p99 alerts against `group`
+  durability, a federation backlog that is not draining, sync lag, server
+  errors, and the listener going away. Thresholds from the SPEC where it
+  states one; the rest are starting points.
+- `deploy/kubernetes/servicemonitor.yaml`: a headless Service naming the
+  `metrics` port, and a `ServiceMonitor` and a `PodMonitor` for the
+  Prometheus Operator, either of which sets the `job="spindle"` label the
+  rules select on.
+- `deploy/grafana/spindle.json`: one dashboard, the targets first: append
+  p50/p99 by durability, the case-3 ratio, HTTP rate and latency by route,
+  the deepest federation destinations, sync subscribers and lag.
+
+`scripts/check-observability-pack.py` runs in CI and refuses a rule or a
+panel that names a metric this file or `metrics.rs` does not have, so a
+renamed metric cannot leave a rule that never fires.
 
 ## The one that matters
 

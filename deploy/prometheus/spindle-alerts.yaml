@@ -1,0 +1,126 @@
+# Prometheus alert rules for a Spindle homeserver (#325).
+#
+# Every rule below names a metric `docs/metrics.md` documents and
+# `scripts/check-observability-pack.py` checks exists in
+# `crates/spindle-server/src/metrics.rs`, so a renamed metric fails CI
+# rather than silently emptying a rule. Thresholds come from SPEC §18.3
+# where it states one; the rest are starting points an operator tunes.
+#
+# Load with:
+#   rule_files:
+#     - spindle-alerts.yaml
+groups:
+  - name: spindle.design
+    rules:
+      # The instrument the architecture is falsified by (docs/metrics.md,
+      # "The one that matters"): case-3 fork resolutions as a fraction of
+      # federated events must stay under 0.1%. Six hours because this is a
+      # design-health signal, not a pager; a spike during a federation
+      # catch-up is expected.
+      - alert: SpindleForkCase3Elevated
+        expr: >
+          rate(spindle_fork_resolutions_total{case="3"}[1h])
+            / ignoring(case) rate(spindle_events_appended_total{origin="federated"}[1h])
+            > 0.001
+        for: 6h
+        labels:
+          severity: info
+        annotations:
+          summary: Case-3 state resolutions above the SPEC §18.3 target
+          description: >
+            {{ $value | humanizePercentage }} of federated events needed the
+            resolver over the last hour; the target is under 0.1%. The design
+            claim "no state resolution on the hot path" is not holding for
+            this deployment's traffic, which is worth reporting upstream.
+
+  - name: spindle.latency
+    rules:
+      # SPEC §18.3: local send at p50 < 2 ms and p99 < 10 ms against
+      # `group` durability. The histogram's buckets straddle exactly these
+      # numbers, so the quantile estimate is honest at the boundary.
+      - alert: SpindleAppendP99AboveTarget
+        expr: >
+          histogram_quantile(0.99,
+            sum by (le) (rate(spindle_append_duration_seconds_bucket{durability="group"}[5m])))
+            > 0.010
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Append p99 above the 10 ms target
+          description: >
+            p99 commit time under group durability is {{ $value | humanizeDuration }}.
+            Look at the store's disk before the code: this is the fsync path.
+      - alert: SpindleAppendP50AboveTarget
+        expr: >
+          histogram_quantile(0.50,
+            sum by (le) (rate(spindle_append_duration_seconds_bucket{durability="group"}[5m])))
+            > 0.002
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Append p50 above the 2 ms target
+          description: Median commit time under group durability is {{ $value | humanizeDuration }}.
+
+  - name: spindle.delivery
+    rules:
+      # The delivery loop sets this from its own view of the outbox, so a
+      # depth that only grows is a peer this server cannot reach, or one
+      # that refuses what it sends. The top twenty destinations get a
+      # series each; the rest are summed into `other`.
+      - alert: SpindleFederationBacklog
+        expr: spindle_federation_queue_depth{destination!="other"} > 500
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: Federation outbox to {{ $labels.destination }} is not draining
+          description: >
+            {{ $value }} events have been waiting for {{ $labels.destination }}
+            for half an hour. Check whether the peer is up, and whether it
+            answers this server's transactions with an error.
+      # The age of the newest event a /sync delivered, measured at delivery.
+      # A client keeping up sees milliseconds.
+      - alert: SpindleSyncLagHigh
+        expr: >
+          histogram_quantile(0.99, sum by (le) (rate(spindle_sync_lag_seconds_bucket[5m])))
+            > 30
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Clients are seeing events late
+          description: >
+            p99 age of a delivered event is {{ $value | humanizeDuration }};
+            the server is falling behind its own timeline.
+
+  - name: spindle.serving
+    rules:
+      - alert: SpindleDown
+        expr: up{job="spindle"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: The metrics listener has stopped answering
+          description: >
+            No scrape has succeeded for five minutes. The client and
+            federation listeners are separate from this one, so check them
+            before assuming the server is down.
+      # Server-side failures as a fraction of everything served. Client
+      # errors (4xx) are the callers' and are not counted.
+      - alert: SpindleServerErrors
+        expr: >
+          sum(rate(spindle_http_requests_total{status=~"5.."}[5m]))
+            / sum(rate(spindle_http_requests_total[5m]))
+            > 0.01
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: More than 1% of requests are failing server-side
+          description: >
+            {{ $value | humanizePercentage }} of requests answered 5xx over
+            the last five minutes. The `route` label on the same metric says
+            which endpoints.

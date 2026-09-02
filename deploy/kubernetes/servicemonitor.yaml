@@ -1,0 +1,73 @@
+# Prometheus Operator resources for scraping a Spindle homeserver (#325).
+#
+# Spindle serves metrics on a separate, opt-in listener (`[metrics] bind`
+# in spindle.toml; see docs/metrics.md). In a pod, bind it to the pod's
+# own address on a named port, and keep that port off any Service the
+# clients reach: the exposition names the peers this server talks to and
+# the volume it carries, and it is an operator's surface, not a public one.
+#
+#   [metrics]
+#   bind = "0.0.0.0:9090"
+#
+# Both resources below assume the pod carries `app.kubernetes.io/name:
+# spindle` and a container port named `metrics`. Apply whichever matches
+# how the deployment is exposed: the ServiceMonitor needs a Service that
+# lists the metrics port; the PodMonitor scrapes the pods directly and
+# needs no Service at all.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spindle-metrics
+  labels:
+    app.kubernetes.io/name: spindle
+    app.kubernetes.io/component: metrics
+spec:
+  # Headless: this Service exists to name the port for the ServiceMonitor,
+  # not to load-balance an operator's scrape across replicas.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: spindle
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: spindle
+  labels:
+    app.kubernetes.io/name: spindle
+spec:
+  jobLabel: app.kubernetes.io/name
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spindle
+      app.kubernetes.io/component: metrics
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      # The alert rules select on `job="spindle"`.
+      relabelings:
+        - targetLabel: job
+          replacement: spindle
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: spindle
+  labels:
+    app.kubernetes.io/name: spindle
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spindle
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      relabelings:
+        - targetLabel: job
+          replacement: spindle
