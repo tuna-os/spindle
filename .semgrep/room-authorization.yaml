@@ -67,3 +67,12 @@ rules:
             may_advertise(...)?;
             ...
           }
+      # A read bounded at the caller's departure (#268): `read_scope` refuses
+      # a stranger outright and hands back how far a former member may
+      # look, so the read that follows is authorised by construction.
+      - pattern-not-inside: |
+          async fn $HANDLER(...) -> $RET {
+            ...
+            let $SCOPE = read_scope(...)?;
+            ...
+          }

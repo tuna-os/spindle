@@ -27,3 +27,25 @@ async fn room_messages(
         .map_err(room_error)?;
     Ok(Json(json!({ "chunk": events, "end": next })))
 }
+
+/// The same handler once a former member may read up to their departure
+/// (#268): the gate is `read_scope`, which refuses strangers and bounds
+/// everyone else, and the rule must know that shape too.
+async fn room_messages_bounded(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<MessagesQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    let scope = read_scope(&state, &identity.user_id, &room_id)?;
+    let bound = match scope {
+        ReadScope::Whole => None,
+        ReadScope::UpTo(bound) => Some(bound),
+    };
+    let limit = query.limit.unwrap_or(10).clamp(1, 100);
+    let (events, next) = state
+        .rooms
+        .messages_within(&room_id, None, limit, bound)
+        .map_err(room_error)?;
+    Ok(Json(json!({ "chunk": events, "end": next })))
+}

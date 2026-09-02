@@ -116,6 +116,50 @@ impl Harness {
         body["event_id"].as_str().unwrap().to_owned()
     }
 
+    async fn post(&self, uri: &str, token: &str, body: &Value) -> (StatusCode, Value) {
+        self.call(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+    }
+
+    /// Invite and join, so `user` is a member of `room`.
+    async fn admit(&self, room: &str, inviter: &str, user: &str, user_id: &str) {
+        let (status, body) = self
+            .post(
+                &format!("/_matrix/client/v3/rooms/{room}/invite"),
+                inviter,
+                &json!({ "user_id": user_id }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = self
+            .post(
+                &format!("/_matrix/client/v3/rooms/{room}/join"),
+                user,
+                &json!({}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    async fn leave(&self, room: &str, token: &str) {
+        let (status, body) = self
+            .post(
+                &format!("/_matrix/client/v3/rooms/{room}/leave"),
+                token,
+                &json!({}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
     async fn get(&self, uri: &str, token: &str) -> (StatusCode, Value) {
         self.call(
             Request::builder()
@@ -317,4 +361,188 @@ async fn a_room_that_does_not_exist_is_refused_like_one_that_does() {
         )
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// The bodies in a `/messages` chunk, so a test can say what was and was not
+/// handed over without caring about order or shape.
+fn bodies(chunk: &Value) -> Vec<String> {
+    chunk["chunk"]
+        .as_array()
+        .map(|events| {
+            events
+                .iter()
+                .filter_map(|event| event["content"]["body"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The third way in, which #258 knowingly left out: **a former member reads
+/// up to their departure and no further.** Under `shared` history
+/// visibility -- the default -- what was said while bob was there is his to
+/// read after he leaves, and what was said after is not. The departure event
+/// itself is the last thing he sees.
+#[tokio::test]
+async fn a_former_member_reads_up_to_their_departure_and_no_further() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness
+        .create_room(&alice, json!({ "preset": "private_chat" }))
+        .await;
+    harness.admit(&room, &alice, &bob, "@bob:example.org").await;
+
+    let before = harness.say(&room, &alice, "WHILEBOBWASHERE").await;
+    harness.leave(&room, &bob).await;
+    let after = harness.say(&room, &alice, "AFTERBOBLEFT").await;
+    harness.say(&room, &alice, "ANDAGAIN").await;
+
+    // /messages: the page stops at the departure.
+    let (status, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=10"),
+            &bob,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let seen = bodies(&body);
+    assert!(seen.contains(&"WHILEBOBWASHERE".to_owned()), "{body}");
+    assert!(
+        !seen.contains(&"AFTERBOBLEFT".to_owned()) && !seen.contains(&"ANDAGAIN".to_owned()),
+        "what was said after bob left is not his to read: {body}"
+    );
+    // ... and includes the leave itself, which is the bound.
+    assert!(
+        serde_json::to_string(&body)
+            .unwrap()
+            .contains("\"membership\":\"leave\""),
+        "the departure is the last thing a former member sees: {body}"
+    );
+
+    // /event: before the departure, yes; after it, absent rather than
+    // forbidden, so the refusal does not confirm the event exists.
+    let (status, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/event/{before}"),
+            &bob,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/event/{after}"),
+            &bob,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        !serde_json::to_string(&body)
+            .unwrap()
+            .contains("AFTERBOBLEFT")
+    );
+
+    // /context: the window's later half stops at the departure.
+    let (status, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/context/{before}?limit=10"),
+            &bob,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rendered = serde_json::to_string(&body).unwrap();
+    assert!(rendered.contains("WHILEBOBWASHERE"), "{body}");
+    assert!(
+        !rendered.contains("AFTERBOBLEFT") && !rendered.contains("ANDAGAIN"),
+        "{body}"
+    );
+    let (status, _) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/context/{after}?limit=10"),
+            &bob,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A stranger is still a stranger on every one of them.
+    let mallory = harness.register("mallory").await;
+    for uri in [
+        format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=10"),
+        format!("/_matrix/client/v3/rooms/{room}/event/{before}"),
+        format!("/_matrix/client/v3/rooms/{room}/context/{before}?limit=10"),
+    ] {
+        let (status, body) = harness.get(&uri, &mallory).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+    }
+}
+
+/// A kick and a ban are departures too: what was said up to the event that
+/// removed the user is theirs, and what came after is not.
+#[tokio::test]
+async fn a_banned_member_reads_up_to_the_ban() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness
+        .create_room(&alice, json!({ "preset": "private_chat" }))
+        .await;
+    harness.admit(&room, &alice, &bob, "@bob:example.org").await;
+    harness.say(&room, &alice, "BEFORETHEBAN").await;
+    let (status, body) = harness
+        .post(
+            &format!("/_matrix/client/v3/rooms/{room}/ban"),
+            &alice,
+            &json!({ "user_id": "@bob:example.org" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    harness.say(&room, &alice, "AFTERTHEBAN").await;
+
+    let (status, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=10"),
+            &bob,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let seen = bodies(&body);
+    assert!(seen.contains(&"BEFORETHEBAN".to_owned()), "{body}");
+    assert!(!seen.contains(&"AFTERTHEBAN".to_owned()), "{body}");
+}
+
+/// The part still narrower than the spec, pinned so it is a decision and
+/// not an accident. Under `joined` visibility the spec makes each event's
+/// visibility depend on whether the reader was a member *when it was sent*
+/// -- membership intervals, not one bound. That is not implemented, and a
+/// former member of such a room is refused outright, which errs on the
+/// side of showing less. When intervals land, this test is the one to turn
+/// around.
+#[tokio::test]
+async fn a_former_member_of_a_joined_visibility_room_is_still_refused() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness
+        .create_room(
+            &alice,
+            json!({
+                "preset": "private_chat",
+                "initial_state": [{
+                    "type": "m.room.history_visibility",
+                    "state_key": "",
+                    "content": { "history_visibility": "joined" },
+                }],
+            }),
+        )
+        .await;
+    harness.admit(&room, &alice, &bob, "@bob:example.org").await;
+    harness.say(&room, &alice, "WHILEJOINED").await;
+    harness.leave(&room, &bob).await;
+
+    let (status, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=10"),
+            &bob,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }

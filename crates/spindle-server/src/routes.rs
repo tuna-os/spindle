@@ -7278,7 +7278,22 @@ async fn room_event(
     Authenticated(identity): Authenticated,
     axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, MatrixError> {
-    may_read_room(&state, &identity.user_id, &room_id)?;
+    let scope = read_scope(&state, &identity.user_id, &room_id)?;
+    if let ReadScope::UpTo(bound) = scope {
+        // Above the bound the event is absent to this caller, not
+        // forbidden: forbidden would confirm that something is there.
+        let position = state
+            .rooms
+            .event_position(&room_id, &event_id)
+            .map_err(room_error)?;
+        if position.is_none_or(|position| position > bound) {
+            return Err(MatrixError::new(
+                StatusCode::NOT_FOUND,
+                "M_NOT_FOUND",
+                "no such event",
+            ));
+        }
+    }
     let event = state.rooms.event(&room_id, &event_id).map_err(room_error)?;
     Ok(Json(with_bundle(
         &state,
@@ -7303,14 +7318,18 @@ async fn room_context(
     axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
     axum::extract::Query(query): axum::extract::Query<ContextQuery>,
 ) -> Result<Json<Value>, MatrixError> {
-    may_read_room(&state, &identity.user_id, &room_id)?;
+    let scope = read_scope(&state, &identity.user_id, &room_id)?;
     // The spec's limit is the total window, so each side gets half.
     let limit = query.limit.unwrap_or(10).clamp(1, 100);
     let each_side = limit.div_ceil(2);
 
+    let bound = match scope {
+        ReadScope::Whole => None,
+        ReadScope::UpTo(bound) => Some(bound),
+    };
     let context = state
         .rooms
-        .context(&room_id, &event_id, each_side)
+        .context_within(&room_id, &event_id, each_side, bound)
         .map_err(room_error)?;
 
     Ok(Json(json!({
@@ -7473,7 +7492,7 @@ async fn room_messages(
     axum::extract::Path(room_id): axum::extract::Path<String>,
     axum::extract::Query(query): axum::extract::Query<MessagesQuery>,
 ) -> Result<Json<Value>, MatrixError> {
-    may_read_room(&state, &identity.user_id, &room_id)?;
+    let scope = read_scope(&state, &identity.user_id, &room_id)?;
     let from = match query.from.as_deref() {
         Some(token) => Some(
             token
@@ -7485,9 +7504,13 @@ async fn room_messages(
     };
     let limit = query.limit.unwrap_or(10).clamp(1, 100);
 
+    let bound = match scope {
+        ReadScope::Whole => None,
+        ReadScope::UpTo(bound) => Some(bound),
+    };
     let (events, next) = state
         .rooms
-        .messages(&room_id, from, limit)
+        .messages_within(&room_id, from, limit, bound)
         .map_err(room_error)?;
 
     let chunk: Vec<Value> = events
@@ -8230,6 +8253,63 @@ fn may_read_room(state: &AppState, user_id: &str, room_id: &str) -> Result<(), M
         .is_ok_and(|summary| summary.world_readable)
     {
         return Ok(());
+    }
+    Err(MatrixError::forbidden(format!(
+        "{user_id} is not in {room_id}"
+    )))
+}
+
+/// How much of a room a caller may read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadScope {
+    /// All of it: joined, or the room is world-readable.
+    Whole,
+    /// Up to and including this position: a former member, reading what
+    /// was said while they were there.
+    UpTo(i64),
+}
+
+/// What `user_id` may read of `room_id`: everything, a bounded past, or
+/// nothing.
+///
+/// [`may_read_room`]'s two ways in, plus the third the spec has and #258
+/// knowingly left out: **a former member reads up to their departure.**
+/// Under `shared` history visibility -- the default -- someone who left,
+/// was kicked or was banned may still read what was said up to and
+/// including the event that removed them, and nothing after. The
+/// visibility that governs is the one in force *at* their departure, so a
+/// room that later tightened or relaxed it changes nothing for them.
+///
+/// Only `shared` (and `world_readable`, which is already [`ReadScope::Whole`])
+/// is handled here. Under `joined` and `invited` the spec makes visibility
+/// a per-event question -- which events fell inside the caller's membership
+/// intervals -- and a former member is still refused outright, which is
+/// stricter than the spec and recorded as such; see
+/// `a_former_member_of_a_joined_visibility_room_is_still_refused`.
+///
+/// Used by the reads that page a timeline -- `/messages`, `/event`,
+/// `/context` -- and only those: every other read keeps [`may_read_room`],
+/// which never hands a former member anything, until it too is taught to
+/// stop at the bound.
+fn read_scope(state: &AppState, user_id: &str, room_id: &str) -> Result<ReadScope, MatrixError> {
+    if may_read_room(state, user_id, room_id).is_ok() {
+        return Ok(ReadScope::Whole);
+    }
+    let internal = |error: crate::rooms::RoomError| MatrixError::internal(&error.to_string());
+    // `departure` opens the room; a room this server does not hold is the
+    // same refusal as one the caller may not see, for the reason
+    // `may_read_room` gives.
+    let Ok(Some(departure)) = state.rooms.departure(room_id, user_id) else {
+        return Err(MatrixError::forbidden(format!(
+            "{user_id} is not in {room_id}"
+        )));
+    };
+    let visibility = state
+        .rooms
+        .history_visibility_at(room_id, departure)
+        .map_err(internal)?;
+    if visibility == "shared" || visibility == "world_readable" {
+        return Ok(ReadScope::UpTo(departure));
     }
     Err(MatrixError::forbidden(format!(
         "{user_id} is not in {room_id}"
