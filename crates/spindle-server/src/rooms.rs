@@ -3489,6 +3489,57 @@ impl Rooms {
         Ok(visibility.unwrap_or_else(|| "shared".to_owned()))
     }
 
+    /// The room's full state as it stood at position `li`: every state
+    /// event in force after the entry at or before `li` was applied, whole,
+    /// with its `event_id`.
+    ///
+    /// What a former member sees on `/state`: the room as it was when the
+    /// event that removed them landed, not the room as it is now (#268).
+    /// A position before the room's first entry is an empty room.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] if the room does not exist, or
+    /// [`RoomError::Build`] if the snapshot cannot be rebuilt.
+    pub fn state_as_of(&self, room_id: &str, li: i64) -> Result<Vec<Value>, RoomError> {
+        let root = self.with_room_read(room_id, |_, log| {
+            Ok(log.entry_at_or_before(li).map(|entry| entry.state_root))
+        })?;
+        let Some(root) = root else {
+            return Ok(Vec::new());
+        };
+        self.state_at(room_id, root)
+    }
+
+    /// One state event's content as it stood at position `li`, the
+    /// as-of sibling of [`Self::state_event`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownState`] when the room had no such state
+    /// at that position -- the same answer [`Self::state_event`] gives for
+    /// the present, for the same reason.
+    pub fn state_event_as_of(
+        &self,
+        room_id: &str,
+        li: i64,
+        event_type: &str,
+        state_key: &str,
+    ) -> Result<Value, RoomError> {
+        self.state_as_of(room_id, li)?
+            .into_iter()
+            .find(|event| event["type"] == event_type && event["state_key"] == state_key)
+            .map(|event| {
+                event
+                    .get("content")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
+            })
+            .ok_or_else(|| {
+                RoomError::UnknownState(format!("{event_type} with state key {state_key:?}"))
+            })
+    }
+
     /// The linear position of an event in a room, if the room holds it.
     ///
     /// # Errors

@@ -160,6 +160,19 @@ impl Harness {
         assert_eq!(status, StatusCode::OK, "{body}");
     }
 
+    async fn put(&self, uri: &str, token: &str, body: &Value) -> (StatusCode, Value) {
+        self.call(
+            Request::builder()
+                .method("PUT")
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+    }
+
     async fn get(&self, uri: &str, token: &str) -> (StatusCode, Value) {
         self.call(
             Request::builder()
@@ -545,4 +558,101 @@ async fn a_former_member_of_a_joined_visibility_room_is_still_refused() {
         )
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// The state a former member reads is the room as it stood when they were
+/// removed, not the room as it is now: a topic set after they left, and a
+/// member who joined after they left, are not theirs to see.
+#[tokio::test]
+async fn a_former_member_reads_the_state_as_it_stood_when_they_left() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness
+        .create_room(&alice, json!({ "preset": "private_chat" }))
+        .await;
+    harness.admit(&room, &alice, &bob, "@bob:example.org").await;
+    let (status, body) = harness
+        .put(
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.topic"),
+            &alice,
+            &json!({ "topic": "OLDTOPIC" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    harness.leave(&room, &bob).await;
+
+    let (status, body) = harness
+        .put(
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.topic"),
+            &alice,
+            &json!({ "topic": "NEWTOPIC" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let carol = harness.register("carol").await;
+    harness
+        .admit(&room, &alice, &carol, "@carol:example.org")
+        .await;
+
+    // /state: the whole state, as of the departure.
+    let (status, body) = harness
+        .get(&format!("/_matrix/client/v3/rooms/{room}/state"), &bob)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rendered = serde_json::to_string(&body).unwrap();
+    assert!(rendered.contains("OLDTOPIC"), "{body}");
+    assert!(
+        !rendered.contains("NEWTOPIC"),
+        "a topic set after bob left: {body}"
+    );
+    assert!(
+        !rendered.contains("@carol:example.org"),
+        "a member who joined after bob left: {body}"
+    );
+    assert!(
+        body.as_array().unwrap().iter().any(|event| {
+            event["type"] == "m.room.member"
+                && event["state_key"] == "@bob:example.org"
+                && event["content"]["membership"] == "leave"
+        }),
+        "the departure itself is part of the state bob sees: {body}"
+    );
+
+    // /state/{type}/{key}: the same bound, one key at a time.
+    let (status, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.topic"),
+            &bob,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["topic"], "OLDTOPIC", "{body}");
+    let (status, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.member/@carol:example.org"),
+            &bob,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // Alice, still in the room, reads the present.
+    let (_, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.topic"),
+            &alice,
+        )
+        .await;
+    assert_eq!(body["topic"], "NEWTOPIC", "{body}");
+
+    // A stranger is still a stranger on both.
+    let mallory = harness.register("mallory").await;
+    for uri in [
+        format!("/_matrix/client/v3/rooms/{room}/state"),
+        format!("/_matrix/client/v3/rooms/{room}/state/m.room.topic"),
+    ] {
+        let (status, body) = harness.get(&uri, &mallory).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+    }
 }
