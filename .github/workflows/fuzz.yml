@@ -1,0 +1,74 @@
+name: Fuzz
+
+# The robustness suites run on every PR with proptest's default budget of
+# 256 cases each, which is enough to catch the obvious. This is the long
+# run #267 asks for: the same suites, eighty times the budget, on a
+# schedule -- because a fuzzer's value is in the cases it has not tried
+# yet, and a weekly hour buys more of those than any PR can afford.
+#
+# A failure here is a found input. proptest writes the shrunk case to the
+# suite's `.proptest-regressions` file beside the test; the job uploads
+# those so the case can be committed as a permanent seed, which is what
+# turns a crash found once into a crash that cannot come back.
+
+on:
+  schedule:
+    # Sunday, 03:17 UTC. Off the hour so it does not queue behind every
+    # other project's on-the-hour job.
+    - cron: "17 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      cases:
+        description: "proptest cases per property"
+        required: false
+        default: "20000"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  PROPTEST_CASES: ${{ inputs.cases || '20000' }}
+  # A found case is worth reporting more than it is worth shrinking to
+  # perfection. A minute of shrinking, then the job moves on.
+  PROPTEST_MAX_SHRINK_TIME: "60000"
+
+jobs:
+  robustness:
+    name: Robustness suites at length
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      # Release mode: at 2,000 cases the debug build spends most of a
+      # hundred seconds on the trie suite alone, and the point of the run
+      # is cases, not instructions.
+      - name: Key decoders, state trie nodes, PDU parsing
+        run: >-
+          cargo test --release -p spindle-core
+          --test key_decoding_robustness
+          --test state_trie_robustness
+          --test pdu_robustness
+
+      - name: Record codecs and the backup reader
+        run: cargo test --release -p spindle-store --test hostile_input
+
+      - name: The federation front door
+        run: cargo test --release -p spindle-server --test federation_hostile_input
+
+      - name: Keep any found cases
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: proptest-regressions
+          path: crates/**/tests/*.proptest-regressions
+          if-no-files-found: ignore
