@@ -278,6 +278,14 @@ pub struct SyncRoom {
     /// Whether older events were left out, so a client knows to back-paginate
     /// rather than assume it has the room's whole history.
     pub limited: bool,
+    /// Where the window begins: the position of its first event, which is
+    /// what `/messages?dir=b` pages back from as `prev_batch` (#331). `None`
+    /// only when the window is empty. Sent whether or not the window is
+    /// `limited`: matrix-js-sdk keeps it as the live timeline's backwards
+    /// token, and without one a client cannot ask for anything before the
+    /// window at all -- a joiner's window starts at their join, so they saw
+    /// no history.
+    pub prev_batch: Option<i64>,
 }
 
 /// A room as MSC3266 describes it to someone who may not be in it.
@@ -3396,12 +3404,44 @@ impl Rooms {
 
         let mut rooms = Vec::new();
         for room_id in joined {
-            let (events, limited) = match range {
-                None => self.timeline_tail(&room_id, timeline_limit)?,
-                Some((since, until)) => (
-                    self.timeline_of(&room_id, &self.room_slice(&room_id, since, until)?, None)?,
-                    false,
-                ),
+            // A room joined inside the window is one the client knows only
+            // from its invite, if at all, so it is told the room the way an
+            // initial sync would: the tail of the timeline rather than the
+            // join alone, and the state before it (#331). matrix-js-sdk
+            // takes a `prev_batch` for a room it already knew only when the
+            // window is `limited`, so a join sent as a one-event slice left
+            // Element unable to page back to anything said before it.
+            let (events, limited, prev_batch, fresh) = match range {
+                None => {
+                    let (events, limited, prev_batch) =
+                        self.timeline_tail(&room_id, timeline_limit)?;
+                    (events, limited, prev_batch, true)
+                }
+                Some((since, until)) => {
+                    let slice = self.room_slice(&room_id, since, until)?;
+                    // A join lands in the window, so a quiet room needs no
+                    // lookup: `sync_cost.rs` counts reads per joined room,
+                    // and this must stay flat across rooms where nothing
+                    // happened.
+                    let joined_at = if slice.is_empty() {
+                        None
+                    } else {
+                        self.membership_event(&room_id, user_id)?.map(|(_, li)| li)
+                    };
+                    if joined_at.is_some_and(|li| slice.contains(&li)) {
+                        let (events, limited, prev_batch) =
+                            self.timeline_tail(&room_id, timeline_limit)?;
+                        (events, limited, prev_batch, true)
+                    } else {
+                        let first = slice.iter().copied().min();
+                        (
+                            self.timeline_of(&room_id, &slice, None)?,
+                            false,
+                            first,
+                            false,
+                        )
+                    }
+                }
             };
             // An incremental sync says nothing about a room where nothing
             // happened. A client diffing rooms it was sent against rooms it
@@ -3411,16 +3451,18 @@ impl Rooms {
             }
             rooms.push(SyncRoom {
                 room_id: room_id.clone(),
-                // State only on an initial sync. Incrementally, the state
-                // events are in the timeline already, and sending them twice
-                // would make a client apply each one twice.
-                state: if since.is_none() {
+                // State only when the client is meeting the room: on an
+                // initial sync, or on the sync that joins it. Otherwise the
+                // state events are in the timeline already, and sending them
+                // twice would make a client apply each one twice.
+                state: if fresh {
                     self.initial_state(&room_id, user_id, state_block, &events)?
                 } else {
                     Vec::new()
                 },
                 events,
                 limited,
+                prev_batch,
             });
         }
 
@@ -3512,13 +3554,16 @@ impl Rooms {
                 else {
                     continue;
                 };
-                let events = match range {
-                    None => vec![departure],
-                    Some((since, until)) => self.timeline_of(
-                        &room_id,
-                        &self.room_slice(&room_id, since, until)?,
-                        Some(departed_at),
-                    )?,
+                let (events, prev_batch) = match range {
+                    None => (vec![departure], Some(departed_at)),
+                    Some((since, until)) => {
+                        let slice = self.room_slice(&room_id, since, until)?;
+                        let first = slice.iter().copied().min();
+                        (
+                            self.timeline_of(&room_id, &slice, Some(departed_at))?,
+                            first,
+                        )
+                    }
                 };
                 // An incremental sync says nothing about a room the user left
                 // long ago, for the same reason it says nothing about a joined
@@ -3531,6 +3576,7 @@ impl Rooms {
                     state: Vec::new(),
                     events,
                     limited: false,
+                    prev_batch,
                 });
             }
         }
@@ -3777,14 +3823,23 @@ impl Rooms {
     }
 
     /// The newest `limit` events of a room, oldest first.
-    fn timeline_tail(&self, room_id: &str, limit: usize) -> Result<(Vec<Value>, bool), RoomError> {
+    /// The newest `limit` events of `room_id` in order, whether older ones
+    /// were left out, and the position of the oldest one sent (the window's
+    /// `prev_batch`; `None` for an empty room).
+    fn timeline_tail(
+        &self,
+        room_id: &str,
+        limit: usize,
+    ) -> Result<(Vec<Value>, bool, Option<i64>), RoomError> {
         let (events, more) = self.messages(room_id, None, limit)?;
+        // Newest first, so the last one is where the window begins.
+        let first = events.last().map(|event| event.li);
         let mut out: Vec<Value> = events
             .into_iter()
             .map(|event| stamp(event.json, &event.event_id))
             .collect();
         out.reverse();
-        Ok((out, more.is_some()))
+        Ok((out, more.is_some(), first))
     }
 
     /// Where one room's events sit in its own order, for everything it
@@ -4120,7 +4175,7 @@ impl Rooms {
         &self,
         room_id: &str,
         limit: usize,
-    ) -> Result<(Vec<Value>, bool), RoomError> {
+    ) -> Result<(Vec<Value>, bool, Option<i64>), RoomError> {
         self.timeline_tail(room_id, limit)
     }
 

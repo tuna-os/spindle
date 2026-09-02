@@ -138,6 +138,18 @@ impl Harness {
         assert_eq!(status, StatusCode::OK, "{body}");
     }
 
+    /// The `/messages` page before `from`, oldest last, up to a hundred.
+    async fn messages_before(&self, room_id: &str, token: &str, from: &str) -> Value {
+        let (status, page) = self
+            .get(
+                &format!("/_matrix/client/v3/rooms/{room_id}/messages?dir=b&from={from}&limit=100"),
+                token,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        page
+    }
+
     async fn sync(&self, token: &str, since: Option<&str>) -> Value {
         let path = match since {
             Some(since) => format!("/_matrix/client/v3/sync?since={since}"),
@@ -147,6 +159,147 @@ impl Harness {
         assert_eq!(status, StatusCode::OK, "{body}");
         body
     }
+}
+
+/// The `m.room.message` bodies of a `/messages` page, in page order.
+fn page_bodies(page: &Value) -> Vec<String> {
+    page["chunk"]
+        .as_array()
+        .expect("a chunk")
+        .iter()
+        .filter_map(|event| event["content"]["body"].as_str())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// `/sync` said the window begins here (#331): what `/messages?dir=b`
+/// gives from that token is what came before the window.
+#[tokio::test]
+async fn a_timeline_carries_the_token_that_pages_back_to_what_came_before_it() {
+    let harness = Harness::new();
+    let token = harness.register("alice").await;
+    let room_id = harness.create_room(&token).await;
+    harness.say(&room_id, &token, "before", "t0").await;
+    // The initial window reaches back to the room's creation, so there is
+    // nothing before it -- and a client that asks is told so, rather than
+    // being unable to ask.
+    let initial = harness.sync(&token, None).await;
+    let room = &initial["rooms"]["join"][&room_id];
+    assert_eq!(room["timeline"]["limited"], false, "{room}");
+    let from = room["timeline"]["prev_batch"]
+        .as_str()
+        .expect("the initial window says where it begins")
+        .to_owned();
+    let page = harness.messages_before(&room_id, &token, &from).await;
+    assert_eq!(page["chunk"].as_array().unwrap().len(), 0, "{page}");
+
+    // An incremental window begins where the client's token left off, and
+    // paging back from it reaches the earlier message without repeating
+    // the window's own.
+    let since = initial["next_batch"].as_str().unwrap().to_owned();
+    harness.say(&room_id, &token, "after one", "t1").await;
+    harness.say(&room_id, &token, "after two", "t2").await;
+    let incremental = harness.sync(&token, Some(&since)).await;
+    let room = &incremental["rooms"]["join"][&room_id];
+    assert_eq!(bodies(room), vec!["after one", "after two"], "{room}");
+    let from = room["timeline"]["prev_batch"]
+        .as_str()
+        .expect("an incremental window says where it begins")
+        .to_owned();
+    let page = harness.messages_before(&room_id, &token, &from).await;
+    assert_eq!(page_bodies(&page), vec!["before"], "{page}");
+
+    // A room left carries its departure as the window, and paging back from
+    // there reaches what was said while the member was in it.
+    let (status, body) = harness
+        .post(
+            &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+            &token,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let after_leaving = harness.sync(&token, None).await;
+    let room = &after_leaving["rooms"]["leave"][&room_id];
+    let from = room["timeline"]["prev_batch"]
+        .as_str()
+        .expect("a left room's window says where it begins")
+        .to_owned();
+    let page = harness.messages_before(&room_id, &token, &from).await;
+    assert_eq!(
+        page_bodies(&page),
+        vec!["after two", "after one", "before"],
+        "{page}"
+    );
+}
+
+/// A room joined inside the window is one the client knows only from its
+/// invite, so it is told the room the way an initial sync would (#331): the
+/// tail of the timeline rather than the join alone, the state before it, and
+/// where the window begins. A room joined before the window still gets only
+/// the difference.
+#[tokio::test]
+async fn a_room_joined_since_the_token_arrives_as_an_initial_sync_would_send_it() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room_id = harness.create_room(&alice).await;
+    harness.say(&room_id, &alice, "before bob", "t0").await;
+
+    let since = harness.sync(&bob, None).await["next_batch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    harness
+        .post(
+            &format!("/_matrix/client/v3/rooms/{room_id}/invite"),
+            &alice,
+            &json!({ "user_id": "@bob:example.org" }),
+        )
+        .await;
+    let invited = harness.sync(&bob, Some(&since)).await;
+    assert!(
+        invited["rooms"]["invite"][&room_id].is_object(),
+        "{invited}"
+    );
+    let since = invited["next_batch"].as_str().unwrap().to_owned();
+    harness
+        .post(
+            &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+            &bob,
+            &json!({}),
+        )
+        .await;
+
+    let joined = harness.sync(&bob, Some(&since)).await;
+    let room = &joined["rooms"]["join"][&room_id];
+    assert_eq!(bodies(room), vec!["before bob"], "{room}");
+    let kinds: Vec<&str> = room["state"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["type"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"m.room.create"), "{room}");
+    let from = room["timeline"]["prev_batch"]
+        .as_str()
+        .expect("the window says where it begins")
+        .to_owned();
+    // The whole room fit, so the window begins at its creation.
+    let page = harness.messages_before(&room_id, &bob, &from).await;
+    assert_eq!(page["chunk"].as_array().unwrap().len(), 0, "{page}");
+
+    // Once in, bob is told only what happened since, like anyone else.
+    let since = joined["next_batch"].as_str().unwrap().to_owned();
+    harness.say(&room_id, &alice, "after bob", "t1").await;
+    let later = harness.sync(&bob, Some(&since)).await;
+    let room = &later["rooms"]["join"][&room_id];
+    assert_eq!(bodies(room), vec!["after bob"], "{room}");
+    assert_eq!(
+        room["state"]["events"].as_array().unwrap().len(),
+        0,
+        "{room}"
+    );
 }
 
 fn bodies(room: &Value) -> Vec<String> {

@@ -6229,13 +6229,18 @@ fn sliding_room_entry(
             })
             .collect()
     };
-    let (timeline, limited) = if timeline_limit == 0 {
-        (Vec::new(), false)
+    let (events, limited, prev_batch) = if timeline_limit == 0 {
+        (Vec::new(), false, None)
     } else {
         state
             .rooms
             .timeline_tail_public(room_id, timeline_limit.min(50))
             .map_err(room_error)?
+    };
+    let timeline = crate::sliding::Timeline {
+        events,
+        limited,
+        prev_batch: prev_batch.map(|li| crate::tokens::Pagination(li).to_string()),
     };
     let joined_count = state
         .rooms
@@ -6249,7 +6254,6 @@ fn sliding_room_entry(
         name,
         state_events,
         timeline,
-        limited,
         joined_count,
         unread.notification_count,
         initial,
@@ -6622,11 +6626,27 @@ fn sync_leave(
         leave.insert(
             room.room_id,
             json!({
-                "timeline": { "events": room.events, "limited": room.limited },
+                "timeline": timeline_block(room.events, room.limited, room.prev_batch),
             }),
         );
     }
     leave
+}
+
+/// A sync `timeline` block. `prev_batch` is where the window begins, as
+/// the token `/messages?dir=b` pages back from (#331); absent only for an
+/// empty window, since a client with no token cannot page back at all.
+fn timeline_block(events: Vec<Value>, limited: bool, prev_batch: Option<i64>) -> Value {
+    let mut block = serde_json::Map::new();
+    block.insert("events".to_owned(), Value::Array(events));
+    block.insert("limited".to_owned(), json!(limited));
+    if let Some(li) = prev_batch {
+        block.insert(
+            "prev_batch".to_owned(),
+            json!(crate::tokens::Pagination(li).to_string()),
+        );
+    }
+    Value::Object(block)
 }
 
 fn sync_join(
@@ -6698,7 +6718,7 @@ fn sync_join(
         let mut entry: BTreeMap<&str, Box<RawValue>> = BTreeMap::new();
         entry.insert(
             "timeline",
-            raw(&json!({ "events": events, "limited": room.limited }))?,
+            raw(&timeline_block(events, room.limited, room.prev_batch))?,
         );
         // MSC4222 renames the block rather than changing what is in it, *for
         // this server*. What we send is already the state at the end of the
