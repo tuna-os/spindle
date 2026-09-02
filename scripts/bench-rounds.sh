@@ -76,6 +76,9 @@ token_for() {
   for entry in ${TOKENS[@]+"${TOKENS[@]}"}; do
     [ "${entry%%=*}" = "$name" ] && { printf '%s' "${entry#*=}"; return; }
   done
+  # A server without a token is the common case, and under `set -e` the
+  # loop's final failed test would otherwise end the whole sitting here.
+  return 0
 }
 
 load_now() { cut -d' ' -f1 /proc/loadavg; }

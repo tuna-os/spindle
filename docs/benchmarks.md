@@ -38,7 +38,8 @@ stale on a runner change. Wall times do.
 | Our fast path vs `ruma-state-res`, performance | Done, below — and the result is narrower than the spec implies |
 | `/messages`, `/sync`, join latency vs **Synapse** | Done at M1, below (#42) |
 | The same vs **Continuwuity** (conduwuit lineage) | Done, below (#42) |
-| The same vs **Tuwunel** | Blocked: GitHub release downloads 403 through the sandbox proxy, and a source build compiles RocksDB against the disk allowance. Continuwuity stands in as the same-lineage bar. |
+| The same vs **Tuwunel** | Done from M2 close-out on, below |
+| All four at three rounds a side, under the separation rule (#171) | Done, below — the first sitting the page judges by its own repeatability |
 
 Everything here is **algorithmic**, measured inside the library. None of it is a
 server throughput figure and none of it should be quoted as one. Server-to-
@@ -954,6 +955,89 @@ the single `Mutex<HashMap<String, RoomLog>>` in `Rooms::with_room` is
 held across an append's work, so appends to different rooms cannot
 proceed at the same time. The fsync used to be inside it too, and moving
 it out (see above) bought about 30%; what remains is the lock.
+
+## M7 progress: the first sitting collected the way #171 said a sitting must be
+
+Every four-way table above is one round. #171 measured what one round is
+worth — six rounds of an *identical* binary moved the median cell by
+1.38× — and the apparatus to do better (`bench-rounds.sh`, the separation
+rule, the chance-call count, the isolated-call marker) landed across
+#176, #183 and #184. Then it sat unused, because a four-way at three
+rounds is an hour of a verified-idle machine. This is that hour.
+
+**The ritual, as run.** Main as of #295 (`816568c`, the tree that became
+`f705718`) in release mode, against Synapse 1.159.0, Continuwuity 26.8.1
+(the `conduwuit-linux-amd64` release binary, `ab3c05d`) and Tuwunel 1.9.0.
+One host — four cores, 15 GiB — all four servers up at once on loopback,
+cold databases, every rate limit the competitors expose lifted. Three
+rounds, order reversed on the even round, load 0.37 at the first leg and
+0.45 after the last. Sizes 200/800/3,200, means over 25 samples per cell
+per round, twelve raw files committed as `m7-progress.<server>.r<N>.json`.
+`scripts/bench-four-way.sh` is the launch recipe, committed this time so
+the next sitting starts from it rather than from memory.
+
+**The scoreboard: 81 comparable cells, 75 separated in Spindle's favour,
+none against, six overlapping.** A cell is *separated* when one server's
+slowest round beat the other's fastest — the #176 rule, with no band and
+no threshold. The ratio quoted is median-over-rounds against
+median-over-rounds.
+
+- **vs Synapse: 27 of 27.** Joins 36–40×, sends 22–24×, sliding window
+  12–15×, incremental sync 10–11×, pagination 8–9×, deep context 5–6×,
+  `/state` 4.3–5.0×, the no-op sync poll 3.7–4.6×, initial sync 2.2–2.6×.
+- **vs Continuwuity: 24 of 27, three overlap.** Deep context 4.3–8.9×,
+  pagination 4.5–6.3×, joins 4.6–5.7×, sends 1.25–3.6× (growing with room
+  size), the sync poll 2.7–3.0×, initial sync 1.5–1.7×, `/state` 1.3–2.2×,
+  sliding window 1.2–1.5×. The three cells that do not separate are
+  incremental sync at all three sizes: medians of 1.05×, 1.10× and 1.12×,
+  each inside both servers' own round-to-round spread.
+- **vs Tuwunel: 24 of 27, three overlap.** Joins 4.2–4.7×, pagination
+  2.0–2.8×, sends 1.3–2.5×, deep context 2.0–2.4×, sliding window
+  1.85–2.1×, initial sync 1.4–1.5×, `/state` 1.4–1.7×, incremental sync
+  1.1–1.3×. The overlaps are `state/200` (1.39×), `sync_poll/200` (1.20×)
+  and `sync_poll/3200` (1.11×).
+
+**What the rule adds that the old band could not.** All six unresolved
+cells have medians between 1.05× and 1.39× — precisely the region #171
+said was never evidence, and every one of them would have printed green
+under the retired ±10% band. One of the six is `state/200` against
+Tuwunel, the cell earlier sittings called each way (0.85×, 0.93×, then
+1.09× after the render cache); at three rounds the page says what those
+sittings could not, which is that the two servers are within this host's
+variance there. The other cell that used to flip, `sync_initial/200`
+against Tuwunel (0.89× and 1.21× on the same day at M3), now separates
+cleanly at 1.39×. The isolated-call marker fires
+once: `sync_poll/800` vs Tuwunel separates at 1.27× while 200 and 3,200
+overlap, so it carries the † and should be read as unconfirmed.
+
+**The arithmetic the page now prints.** At three rounds two identical
+servers separate by luck one time in ten, so of 81 cells about 8 should
+be called by chance alone — against 75 actually called. That count is
+what makes 75 mean something; a table calling 8 of 81 would have said
+nothing.
+
+**The instrument, measured again.** Spindle's own max/min across the
+three rounds has a median of 1.14× and a worst of 1.49× (`state/200`);
+Synapse's worst is 1.49×, Tuwunel's 1.47×, and Continuwuity's `context_deep`
+column moved 3.13× and 2.49× between rounds at 3,200 and 800 events. That
+last figure is the case #171 was filed for: a single-round sitting that
+caught Continuwuity's fast round there would have printed a 4.3× that
+another round puts at 9×. Three rounds do not make that spread go away —
+they make it visible, which is the whole point.
+
+**What went wrong on the way, so the next person does not repeat it.**
+`bench-rounds.sh` exited before its first leg whenever a sitting mixed
+token-gated servers with open ones — a `set -e` interaction in
+`token_for` that no two-way sitting had exercised — and is fixed here.
+Everything else was launch recipe, now in `bench-four-way.sh`: Synapse's
+generated config ends without a newline, so an appended override was
+glued onto its last comment and registration stayed off; its
+`rc_joins_per_room` and `rc_invites` limits are separate from `rc_joins`
+and fire on the driver's setup phase; and the Continuwuity release build
+refuses its configured registration token until a first account has been
+created with the one-time token it prints at startup. None of that is a
+finding about any server's performance. All of it is the kind of thing
+that decides whether a sitting happens at all.
 
 ## Fork window: bounded search vs exhaustive walk
 
