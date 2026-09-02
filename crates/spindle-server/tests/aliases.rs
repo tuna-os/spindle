@@ -278,9 +278,82 @@ async fn only_the_creator_may_remove_an_alias() {
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    // And the name is free again, which is the point of removing it.
-    let (status, body) = harness.claim("#lobby:example.org", &room, &bob).await;
+    // And the name is free again, which is the point of removing it. Bob
+    // claims it for a room he is in: claiming needs membership, and this
+    // assertion is about the name being free, not about who may take it.
+    let bobs_room = harness.create_room(&bob).await;
+    let (status, body) = harness.claim("#lobby:example.org", &bobs_room, &bob).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn an_alias_needs_a_member_to_claim_it() {
+    // `/join/#name:server` is how strangers find rooms, so an alias is a
+    // published name, and the one publishing it should be answerable for the
+    // room: a member, or a server admin. Before this, any account that had
+    // learnt a room ID could hang `#official:example.org` on it from outside
+    // (#268). The refusal is a 403 that names the act and nothing about the
+    // room; a room that does not exist is still a 404, checked first, so a
+    // refusal never confirms a room the caller cannot see.
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness.create_room(&alice).await;
+
+    let (status, body) = harness.claim("#official:example.org", &room, &bob).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["errcode"], "M_FORBIDDEN");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("give it an alias")),
+        "{body}"
+    );
+
+    // A refused claim leaves the name free.
+    let (status, _) = harness
+        .get(
+            &format!(
+                "/_matrix/client/v3/directory/room/{}",
+                encoded("#official:example.org")
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Once bob is in the room, the same claim is his to make.
+    let (status, body) = harness
+        .request(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room}/invite"),
+            Some(&alice),
+            &json!({ "user_id": "@bob:example.org" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness
+        .request(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room}/join"),
+            Some(&bob),
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = harness.claim("#official:example.org", &room, &bob).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = harness
+        .get(
+            &format!(
+                "/_matrix/client/v3/directory/room/{}",
+                encoded("#official:example.org")
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(body["room_id"], room);
 }
 
 #[tokio::test]

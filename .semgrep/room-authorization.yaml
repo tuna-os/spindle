@@ -64,6 +64,6 @@ rules:
       - pattern-not-inside: |
           async fn $HANDLER(...) -> $RET {
             ...
-            may_publish(...)?;
+            may_advertise(...)?;
             ...
           }
