@@ -1,0 +1,14 @@
+# Routes whose response is known not to match the matrix-spec OpenAPI, one
+# per line as `METHOD /template | why`, read by scripts/openapi-check.py.
+# A failure on a route listed here is reported as known and does not fail
+# the check; every other failure does. The list is a ratchet: an entry is
+# added with the reason the divergence is kept, and removed when it is not.
+
+# The spec's RoomMember has display_name and avatar_url as optional
+# strings, but Complement's TestRoomState "joined_members fetches my
+# membership" requires the display_name key to be present for a member
+# who never set one, which is what Synapse sends (as null). Complement is
+# this repository's conformance gate, so the keys are sent as null and
+# the schema check records the divergence here rather than the roster
+# breaking the ratchet.
+GET /_matrix/client/v3/rooms/{roomId}/joined_members | Complement requires the keys present; Synapse sends null; the spec has optional strings

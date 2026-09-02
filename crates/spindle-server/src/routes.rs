@@ -1730,12 +1730,15 @@ fn appservice_of<'a>(
 
 /// A device as the spec's `Device` object. Spindle does not track
 /// last-seen data, and the spec has those fields optional, so they are
-/// absent rather than present-and-wrong.
+/// absent rather than present-and-wrong; a device never named has no
+/// `display_name` for the same reason, since the spec's field is a string
+/// and a null is neither absent nor one.
 fn device_body(device: &crate::accounts::Device) -> Value {
-    json!({
-        "device_id": device.device_id,
-        "display_name": device.display_name,
-    })
+    let mut body = json!({ "device_id": device.device_id });
+    if let Some(name) = &device.display_name {
+        body["display_name"] = json!(name);
+    }
+    body
 }
 
 /// `GET /_matrix/client/v3/devices`
