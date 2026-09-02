@@ -138,6 +138,43 @@ def test_an_empty_ledger_is_refused():
     assert "no results at all" in result.stderr, result.stderr
 
 
+def test_interop_categorizes_shared_passes_gaps_and_regressions():
+    interop_script = HERE / "complement-interop.py"
+    with tempfile.TemporaryDirectory() as work:
+        base_path = Path(work) / "base.jsonl"
+        interop_path = Path(work) / "interop.jsonl"
+        base_records = [
+            {"Action": "pass", "Test": "TestSharedPass"},
+            {"Action": "pass", "Test": "TestInteropRegression"},
+            {"Action": "pass", "Test": "TestMediaAdminMSC3916"},
+            {"Action": "fail", "Test": "TestSharedGap"},
+        ]
+        interop_records = [
+            {"Action": "pass", "Test": "TestSharedPass"},
+            {"Action": "fail", "Test": "TestInteropRegression"},
+            {"Action": "fail", "Test": "TestMediaAdminMSC3916"},
+            {"Action": "fail", "Test": "TestSharedGap"},
+            {"Action": "pass", "Test": "TestInteropOnly"},
+        ]
+        base_path.write_text(ledger(base_records), encoding="utf-8")
+        interop_path.write_text(ledger(interop_records), encoding="utf-8")
+
+        result = subprocess.run(
+            [sys.executable, str(interop_script), "--baseline", str(base_path), "--interop", str(interop_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "| **Shared Passing** | 1 |" in result.stdout
+        assert "| **Shared Gaps** | 1 |" in result.stdout
+        assert "| **Peer Divergences** | 1 |" in result.stdout
+        assert "| **Interop Regressions** | 1 |" in result.stdout
+        assert "| **Interop Improvements** | 1 |" in result.stdout
+        assert "TestMediaAdminMSC3916" in result.stdout
+        assert "TestInteropRegression" in result.stdout
+
+
 def main() -> int:
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     failures = 0
@@ -158,3 +195,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

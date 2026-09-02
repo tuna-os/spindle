@@ -79,10 +79,23 @@ COMPLEMENT_BASE_IMAGE_hs2=ghcr.io/element-hq/synapse/complement-synapse:latest \
 ```
 
 `scripts/complement.sh` is the wrapper CI runs: it builds the image, clones
-the pinned suite, and writes the ledger. The same stream passes through
-`scripts/complement-progress.py`, so a run prints one line per test as it
-lands and the log of a full suite reads as progress rather than ten minutes
-of silence:
+the pinned suite, and writes the ledger. It supports both homogeneous runs
+and heterogeneous interop runs via `COMPLEMENT_INTEROP_IMAGE`:
+
+```bash
+# Standard interop: hs1=Spindle, hs2=Synapse
+COMPLEMENT_INTEROP_IMAGE=ghcr.io/element-hq/synapse/complement-synapse:latest \
+  scripts/complement.sh tmp/complement-interop.jsonl
+
+# Summarize interop results against baseline
+python3 scripts/complement-interop.py \
+  --baseline tmp/complement-results.jsonl \
+  --interop tmp/complement-interop.jsonl
+```
+
+The same stream passes through `scripts/complement-progress.py`, so a run prints
+one line per test as it lands and the log of a full suite reads as progress rather
+than ten minutes of silence:
 
 ```
 [   16.8s] PASS TestFetchEvent (15.8s)

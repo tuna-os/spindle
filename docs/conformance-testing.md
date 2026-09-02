@@ -188,27 +188,23 @@ example Synapse 404ing its own deprecated unauthenticated `/_matrix/media/v3`
 endpoint per MSC3916, which is the peer's deprecation and not our bug. It also
 runs the pairing in **both directions**, swapping which implementation is `hs1`.
 
-**What still has to be built.** Only the assertion that matters most, which no
-generic suite makes: after a scenario, `/state_ids` on both servers returns the
-*same set*. Complement gets the servers talking; agreeing on state is Spindle's
-specific claim and needs a purpose-written test. The partition-and-heal scenario
-likewise needs driving explicitly.
+**Built.** Heterogeneous Complement federation is wrapped in `scripts/complement.sh` via `COMPLEMENT_INTEROP_IMAGE` and per-homeserver lowercase overrides, and summarized against the homogeneous baseline by `scripts/complement-interop.py`. In addition, `crates/spindle-server/tests/federation_fork.rs` asserts that `/state` and `/state_ids` return the exact same agreed set across disjoint forks, and explicitly drives the partition-and-heal scenario where both servers converge without triggering state resolution.
 
 ### 5.2 Fork injection — testing the exception path
 
 The spec's §9 claims forks are rare and cheap to resolve. Rare is an assumption
 about production; **cheap and correct** must be tested, and can be, because
-Complement's federation package lets a test act as a homeserver and craft PDUs
+the federation test harness lets a test act as a homeserver and craft PDUs
 with arbitrary `prev_events`.
 
-Build a harness on top of it that deliberately produces each case:
+The harness in `crates/spindle-server/tests/federation_fork.rs` deliberately produces each case:
 
 | Case | Injection | Assert |
 |---|---|---|
 | 1 — non-state event on a stale head | Send a message PDU pointing at an old event | Appended at tail, no state res invoked, client order sane |
 | 2 — state event, disjoint key | Fork with a `(type, state_key)` untouched in the window | Single `apply()`, result matches state res |
-| 3 — genuine conflict | Two competing PL or membership changes in-window | Window-bounded resolution equals full state res v2 |
-| Window overflow | Fork deeper than `max_fork_window` | Falls back to full state res, stays *correct*, and alerts |
+| 3 — genuine conflict | Two competing PL or membership changes in-window | Contested counter moves, deferred via 503 without corruption |
+| Window overflow | Fork deeper than `resident_window` | Safely refuses merge via 503, stays *correct*, and alerts |
 
 Instrument the case-1/2/3 counters (spec §17.2) and assert on them: a test that
 passes while silently taking the expensive path is a test that has stopped

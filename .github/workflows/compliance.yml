@@ -4,6 +4,10 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    # Nightly interop run against pinned Synapse (docs/conformance-testing.md §6)
+    - cron: '0 3 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -244,4 +248,128 @@ jobs:
         with:
           name: complement-results
           path: tmp/complement-results.jsonl
+          if-no-files-found: ignore
+
+  # Heterogeneous federation with Synapse (docs/conformance-testing.md §5.1, #16).
+  # Runs as a report-only board (non-blocking) against the pinned Synapse Complement
+  # image. hs1 is Spindle, hs2 is Synapse.
+  compliance-interop:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    continue-on-error: true
+    needs: [complement-suite]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 'stable'
+          cache: false
+
+      - name: Cache the Complement checkout and Go build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            tmp/complement-src
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: complement-${{ runner.os }}-${{ hashFiles('scripts/complement.sh') }}
+          restore-keys: complement-${{ runner.os }}-
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build the Complement image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: complement/Dockerfile
+          tags: complement-spindle:latest
+          load: true
+          cache-from: type=gha,scope=complement-image
+
+      - name: Run Complement against Synapse (hs1=Spindle, hs2=Synapse)
+        env:
+          GOPROXY: https://proxy.golang.org|direct
+          COMPLEMENT_IMAGE: complement-spindle:latest
+          COMPLEMENT_INTEROP_IMAGE: ghcr.io/element-hq/synapse/complement-synapse:latest
+          COMPLEMENT_INTEROP_HS: hs2
+        run: scripts/complement.sh tmp/complement-interop-results.jsonl
+
+      - name: Summarize interop results against baseline
+        run: |
+          python3 scripts/complement-interop.py \
+            --baseline tmp/complement-results.jsonl \
+            --interop tmp/complement-interop-results.jsonl \
+            --report tmp/complement-interop-report.md || true
+
+      - name: Keep the interop ledger
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: complement-interop-results
+          path: |
+            tmp/complement-interop-results.jsonl
+            tmp/complement-interop-report.md
+          if-no-files-found: ignore
+
+  # Inverse pairing: hs1 is Synapse, hs2 is Spindle.
+  compliance-interop-inverse:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    continue-on-error: true
+    needs: [complement-suite]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 'stable'
+          cache: false
+
+      - name: Cache the Complement checkout and Go build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            tmp/complement-src
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: complement-${{ runner.os }}-${{ hashFiles('scripts/complement.sh') }}
+          restore-keys: complement-${{ runner.os }}-
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build the Complement image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: complement/Dockerfile
+          tags: complement-spindle:latest
+          load: true
+          cache-from: type=gha,scope=complement-image
+
+      - name: Run Complement against Synapse (hs1=Synapse, hs2=Spindle)
+        env:
+          GOPROXY: https://proxy.golang.org|direct
+          COMPLEMENT_IMAGE: complement-spindle:latest
+          COMPLEMENT_INTEROP_IMAGE: ghcr.io/element-hq/synapse/complement-synapse:latest
+          COMPLEMENT_INTEROP_HS: hs1
+        run: scripts/complement.sh tmp/complement-interop-inverse-results.jsonl
+
+      - name: Summarize inverse interop results against baseline
+        run: |
+          python3 scripts/complement-interop.py \
+            --baseline tmp/complement-results.jsonl \
+            --interop tmp/complement-interop-inverse-results.jsonl \
+            --report tmp/complement-interop-inverse-report.md || true
+
+      - name: Keep the inverse interop ledger
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: complement-interop-inverse-results
+          path: |
+            tmp/complement-interop-inverse-results.jsonl
+            tmp/complement-interop-inverse-report.md
           if-no-files-found: ignore

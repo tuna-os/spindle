@@ -757,3 +757,368 @@ async fn a_disjoint_fork_on_preexisting_slots_merges_and_leaves_the_room_writabl
         "a state write after the merge was refused"
     );
 }
+
+/// Both branches concurrently update power levels: SPEC §9.2 case 3.
+///
+/// Power levels are critical state. When two servers modify power levels from
+/// the same fork point with different content, this is a genuine same-slot
+/// conflict (`m.room.power_levels`). It must take the case-3 resolution path,
+/// moving `delta.contested`, and refuse via 503 until resolved without
+/// corrupting existing power levels or room state.
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn a_fork_on_conflicting_power_levels_is_counted_as_the_expensive_case() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, fork_point) = harness.shared_room(&peer).await;
+
+    // Our branch modifies power levels.
+    assert_eq!(
+        harness
+            .send(
+                "PUT",
+                &format!("/_matrix/client/v3/rooms/{room}/state/m.room.power_levels"),
+                &alice,
+                &json!({
+                    "users": { format!("@alice:example.org"): 100, peer.user(): 100, "@charlie:example.org": 50 },
+                    "users_default": 0,
+                    "state_default": 50,
+                    "events_default": 0,
+                }),
+            )
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    // Peer branch modifies power levels from the fork point with different settings.
+    let pdu = Harness::stale_state(
+        &peer,
+        &room,
+        &fork_point,
+        "m.room.power_levels",
+        "",
+        &json!({
+            "users": { format!("@alice:example.org"): 100, peer.user(): 100, "@charlie:example.org": 0 },
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+        }),
+    );
+    harness.inject(&peer, "fork_pl", pdu).await;
+
+    let before = Cases::read();
+    let merged = harness.say(&room, &alice, "after").await;
+    let delta = Cases::read().since(before);
+
+    assert_eq!(
+        merged,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a conflicting power levels fork must be refused as a service state"
+    );
+    assert_eq!(
+        delta.contested, 1,
+        "conflicting power levels must be counted as case 3: {delta:?}"
+    );
+
+    // Power levels state slot remains present and readable.
+    let state = harness.state_ids(&room, &alice).await;
+    assert!(
+        state.contains_key("m.room.power_levels/"),
+        "power levels were lost: {state:?}"
+    );
+}
+
+/// Both branches concurrently update membership for the same user: SPEC §9.2 case 3.
+///
+/// Concurrent membership changes to the same target (`m.room.member/<user>`)
+/// represent a same-slot conflict. Must move the case-3 counter and answer
+/// 503 rather than crashing or arbitrarily picking one without state res.
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn a_fork_on_conflicting_membership_is_counted_as_the_expensive_case() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, fork_point) = harness.shared_room(&peer).await;
+
+    let target_user = "@charlie:example.org";
+
+    // Our branch sets membership (e.g. invite).
+    assert_eq!(
+        harness
+            .send(
+                "PUT",
+                &format!(
+                    "/_matrix/client/v3/rooms/{room}/state/m.room.member/%40charlie%3Aexample.org"
+                ),
+                &alice,
+                &json!({ "membership": "invite" }),
+            )
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    // Peer branch sets conflicting membership from fork point (e.g. ban).
+    let pdu = Harness::stale_state(
+        &peer,
+        &room,
+        &fork_point,
+        "m.room.member",
+        target_user,
+        &json!({ "membership": "ban" }),
+    );
+    harness.inject(&peer, "fork_member", pdu).await;
+
+    let before = Cases::read();
+    let merged = harness.say(&room, &alice, "after").await;
+    let delta = Cases::read().since(before);
+
+    assert_eq!(
+        merged,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "conflicting membership must be refused as a service state"
+    );
+    assert_eq!(
+        delta.contested, 1,
+        "conflicting membership must be counted as case 3: {delta:?}"
+    );
+
+    let state = harness.state_ids(&room, &alice).await;
+    assert!(
+        state.contains_key(&format!("m.room.member/{target_user}")),
+        "target membership was lost: {state:?}"
+    );
+}
+
+/// Multiple disjoint state updates across both branches: SPEC §9.2 case 2.
+///
+/// Proves that multiple disjoint state changes (topic, history_visibility on our
+/// side; name, join_rules on peer side) merge completely in one local append
+/// with zero resolution cost (`delta.contested == 0`), and that the resulting
+/// state reported by `/state` and `/state_ids` agrees across all keys.
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn a_fork_with_multiple_disjoint_state_updates_merges_all_and_preserves_state_ids() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, fork_point) = harness.shared_room(&peer).await;
+
+    // Our branch updates two distinct state slots.
+    assert_eq!(
+        harness
+            .set_state(&room, &alice, "m.room.topic", &json!({ "topic": "disjoint topic" }))
+            .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        harness
+            .set_state(
+                &room,
+                &alice,
+                "m.room.history_visibility",
+                &json!({ "history_visibility": "shared" }),
+            )
+            .await,
+        StatusCode::OK
+    );
+
+    // Peer branch updates two different state slots from the fork point.
+    let pdu_name = Harness::stale_state(
+        &peer,
+        &room,
+        &fork_point,
+        "m.room.name",
+        "",
+        &json!({ "name": "disjoint name" }),
+    );
+    let name_id = harness.inject(&peer, "multi_name", pdu_name).await["pdus"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+
+    let pdu_rules = Harness::stale_state(
+        &peer,
+        &room,
+        &fork_point,
+        "m.room.join_rules",
+        "",
+        &json!({ "join_rule": "public" }),
+    );
+    let rules_id = harness.inject(&peer, "multi_rules", pdu_rules).await["pdus"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+
+    let before = Cases::read();
+    let merged = harness.say(&room, &alice, "merge_point").await;
+    let delta = Cases::read().since(before);
+
+    assert_eq!(merged, StatusCode::OK, "disjoint multi-slot fork failed to merge");
+    assert_eq!(
+        delta.contested, 0,
+        "disjoint multi-slot fork took expensive state resolution: {delta:?}"
+    );
+
+    // Verify state agreement between /state and /state_ids.
+    let state_map = harness.state_ids(&room, &alice).await;
+    assert!(state_map.contains_key("m.room.topic/"), "topic missing from state");
+    assert!(
+        state_map.contains_key("m.room.history_visibility/"),
+        "history_visibility missing from state"
+    );
+    assert_eq!(
+        state_map.get("m.room.name/"),
+        Some(&name_id),
+        "name event ID mismatch"
+    );
+    assert_eq!(
+        state_map.get("m.room.join_rules/"),
+        Some(&rules_id),
+        "join_rules event ID mismatch"
+    );
+
+    // Confirm that GET /state returns the same event IDs.
+    let (_, state_array) = harness
+        .get(&format!("/_matrix/client/v3/rooms/{room}/state"), &alice)
+        .await;
+    for event in state_array.as_array().unwrap() {
+        let key = format!(
+            "{}/{}",
+            event["type"].as_str().unwrap_or_default(),
+            event["state_key"].as_str().unwrap_or_default()
+        );
+        let id = event["event_id"].as_str().unwrap_or_default();
+        assert_eq!(
+            state_map.get(&key),
+            Some(&id.to_owned()),
+            "state endpoint disagreed with state_ids for {key}"
+        );
+    }
+}
+
+/// Partition and heal scenario: prove convergence and state agreement across servers.
+///
+/// Emulates a network partition where both Spindle (local) and Peer advance
+/// their timelines with non-conflicting state and messages. Once the partition
+/// heals, transactions are delivered, local append merges the two heads, and
+/// the final room state across /state and /state_ids converges completely
+/// without taking the case-3 resolution path.
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn federation_partition_and_heal_reconciles_state_ids_identically() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, partition_point) = harness.shared_room(&peer).await;
+
+    // --- During Partition ---
+    // 1. Spindle advances locally: set topic and send a message.
+    assert_eq!(
+        harness
+            .set_state(&room, &alice, "m.room.topic", &json!({ "topic": "partition topic" }))
+            .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        harness.say(&room, &alice, "spindle partition msg").await,
+        StatusCode::OK
+    );
+
+    // 2. Peer advances independently from the partition point: set name and send message.
+    let peer_pdu1 = Harness::stale_state(
+        &peer,
+        &room,
+        &partition_point,
+        "m.room.name",
+        "",
+        &json!({ "name": "peer partition name" }),
+    );
+    let peer_name_event_id = harness.inject(&peer, "part_state", peer_pdu1).await["pdus"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+
+    let peer_pdu2 = Harness::stale_message(&peer, &room, &peer_name_event_id, "peer partition msg");
+    harness.inject(&peer, "part_msg", peer_pdu2).await;
+
+    // --- Partition Heals ---
+    // A subsequent append on Spindle names all extremities and merges the healed partition.
+    let before = Cases::read();
+    let merged = harness.say(&room, &alice, "post-heal message").await;
+    let delta = Cases::read().since(before);
+
+    assert_eq!(merged, StatusCode::OK, "failed to merge healed partition");
+    assert_eq!(
+        delta.contested, 0,
+        "partition-and-heal took expensive state resolution: {delta:?}"
+    );
+
+    // Final state agreement check.
+    let final_state = harness.state_ids(&room, &alice).await;
+    assert_eq!(
+        final_state.get("m.room.name/"),
+        Some(&peer_name_event_id),
+        "peer's name write survived partition heal"
+    );
+    assert!(
+        final_state.contains_key("m.room.topic/"),
+        "spindle's topic write survived partition heal"
+    );
+
+    // All messages from both sides of the partition and the post-heal message exist.
+    let (_, messages) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=50"),
+            &alice,
+        )
+        .await;
+    let bodies: Vec<&str> = messages["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["content"]["body"].as_str())
+        .collect();
+    for expected in [
+        "spindle partition msg",
+        "peer partition msg",
+        "post-heal message",
+    ] {
+        assert!(
+            bodies.contains(&expected),
+            "timeline missing '{expected}': {bodies:?}"
+        );
+    }
+}
