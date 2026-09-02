@@ -7162,13 +7162,31 @@ async fn room_state(
     Authenticated(identity): Authenticated,
     axum::extract::Path(room_id): axum::extract::Path<String>,
 ) -> Result<axum::response::Response, MatrixError> {
-    may_read_room(&state, &identity.user_id, &room_id)?;
-    // Pre-serialized: the body comes from the state-render cache, keyed by
-    // the state root, so a hot room costs no reads, parses or serializing.
-    let body = state.rooms.state_serialized(&room_id).map_err(room_error)?;
+    let scope = read_scope(&state, &identity.user_id, &room_id)?;
+    let body = match scope {
+        // Pre-serialized: the body comes from the state-render cache, keyed
+        // by the state root, so a hot room costs no reads, parses or
+        // serializing.
+        ReadScope::Whole => state
+            .rooms
+            .state_serialized(&room_id)
+            .map_err(room_error)?
+            .as_str()
+            .to_owned(),
+        // A former member sees the room as it stood when they were
+        // removed: the state at that position, rendered here rather than
+        // from the cache, which only ever holds the present.
+        ReadScope::UpTo(bound) => Value::Array(
+            state
+                .rooms
+                .state_as_of(&room_id, bound)
+                .map_err(room_error)?,
+        )
+        .to_string(),
+    };
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/json")],
-        body.as_str().to_owned(),
+        body,
     )
         .into_response())
 }
@@ -7189,11 +7207,17 @@ async fn room_state_event(
 ) -> Result<Json<Value>, MatrixError> {
     // Also a membership oracle without this: `…/state/m.room.member/@someone`
     // answers whether a named user is in a named room, to anyone who asks.
-    may_read_room(&state, &identity.user_id, &room_id)?;
-    let content = state
-        .rooms
-        .state_event(&room_id, &event_type, &state_key)
-        .map_err(room_error)?;
+    let scope = read_scope(&state, &identity.user_id, &room_id)?;
+    let content = match scope {
+        ReadScope::Whole => state
+            .rooms
+            .state_event(&room_id, &event_type, &state_key)
+            .map_err(room_error)?,
+        ReadScope::UpTo(bound) => state
+            .rooms
+            .state_event_as_of(&room_id, bound, &event_type, &state_key)
+            .map_err(room_error)?,
+    };
     Ok(Json(content))
 }
 
@@ -8330,9 +8354,10 @@ enum ReadScope {
 /// `a_former_member_of_a_joined_visibility_room_is_still_refused`.
 ///
 /// Used by the reads that page a timeline -- `/messages`, `/event`,
-/// `/context` -- and only those: every other read keeps [`may_read_room`],
-/// which never hands a former member anything, until it too is taught to
-/// stop at the bound.
+/// `/context` -- and by the two state reads, `/state` and
+/// `/state/{type}/{key}`, which answer with the room as it stood at the
+/// bound. Every other read keeps [`may_read_room`], which never hands a
+/// former member anything, until it too is taught to stop at the bound.
 fn read_scope(state: &AppState, user_id: &str, room_id: &str) -> Result<ReadScope, MatrixError> {
     if may_read_room(state, user_id, room_id).is_ok() {
         return Ok(ReadScope::Whole);
