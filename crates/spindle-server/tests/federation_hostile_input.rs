@@ -497,7 +497,15 @@ async fn arbitrary_pdus_in_signed_transactions_are_answered_not_fatal() {
         1 => any_json(),
     ];
 
-    for batch in 0..8 {
+    // Eight transactions of fifty on an ordinary run; the scheduled long
+    // run raises `PROPTEST_CASES` and this suite follows it, one PDU per
+    // case, so the budget means the same thing here as in the `proptest!`
+    // arms.
+    let batches = std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|cases| cases.parse::<usize>().ok())
+        .map_or(8, |cases| cases.div_ceil(50).clamp(8, 400));
+    for batch in 0..batches {
         let pdus: Vec<Value> = (0..50)
             .map(|_| strategy.new_tree(&mut runner).unwrap().current())
             .collect();
@@ -515,7 +523,7 @@ async fn arbitrary_pdus_in_signed_transactions_are_answered_not_fatal() {
     }
 
     // Still standing, and still a server: the honest peer's next message
-    // lands after four hundred hostile ones.
+    // lands after every hostile one.
     let message = peer.event(json!({
         "type": "m.room.message",
         "sender": peer.user(),
