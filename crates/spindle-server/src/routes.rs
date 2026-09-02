@@ -3342,7 +3342,7 @@ struct MembersQuery {
 /// `GET /_matrix/client/v3/rooms/{room_id}/members`
 ///
 /// The room's member events, whole, optionally filtered by membership.
-/// Read through [`read_scope`]: a member sees the roster as it is, a former
+/// Read through [`crate::rooms::Rooms::read_scope`]: a member sees the roster as it is, a former
 /// member of a `shared`-visibility room sees it as it stood when they left
 /// (#268), and a stranger sees nothing -- this is the membership oracle
 /// `/joined_members` guards against, one route over.
@@ -6614,23 +6614,12 @@ async fn room_event(
     Authenticated(identity): Authenticated,
     axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, MatrixError> {
-    let scope = read_scope(&state, &identity.user_id, &room_id)?;
-    if scope != ReadScope::Whole {
-        // Outside the scope the event is absent to this caller, not
-        // forbidden: forbidden would confirm that something is there.
-        let position = state
-            .rooms
-            .event_position(&room_id, &event_id)
-            .map_err(room_error)?;
-        if position.is_none_or(|position| !scope.admits(position)) {
-            return Err(MatrixError::new(
-                StatusCode::NOT_FOUND,
-                "M_NOT_FOUND",
-                "no such event",
-            ));
-        }
-    }
-    let event = state.rooms.event(&room_id, &event_id).map_err(room_error)?;
+    let event = state
+        .rooms
+        .reader(&identity.user_id, &room_id)
+        .and_then(|reader| reader.event(&event_id))
+        .map_err(room_error)?
+        .ok_or_else(|| MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such event"))?;
     Ok(Json(with_bundle(
         &state,
         &room_id,
@@ -6654,14 +6643,14 @@ async fn room_context(
     axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
     axum::extract::Query(query): axum::extract::Query<ContextQuery>,
 ) -> Result<Json<Value>, MatrixError> {
-    let scope = read_scope(&state, &identity.user_id, &room_id)?;
     // The spec's limit is the total window, so each side gets half.
     let limit = query.limit.unwrap_or(10).clamp(1, 100);
     let each_side = limit.div_ceil(2);
 
     let context = state
         .rooms
-        .context_visible(&room_id, &event_id, each_side, &|li| scope.admits(li))
+        .reader(&identity.user_id, &room_id)
+        .and_then(|reader| reader.context(&event_id, each_side))
         .map_err(room_error)?;
 
     Ok(Json(json!({
@@ -6824,7 +6813,10 @@ async fn room_messages(
     axum::extract::Path(room_id): axum::extract::Path<String>,
     axum::extract::Query(query): axum::extract::Query<MessagesQuery>,
 ) -> Result<Json<Value>, MatrixError> {
-    let scope = read_scope(&state, &identity.user_id, &room_id)?;
+    let reader = state
+        .rooms
+        .reader(&identity.user_id, &room_id)
+        .map_err(room_error)?;
     let from = match query.from.as_deref() {
         Some(token) => Some(
             token
@@ -6836,10 +6828,7 @@ async fn room_messages(
     };
     let limit = query.limit.unwrap_or(10).clamp(1, 100);
 
-    let (events, next) = state
-        .rooms
-        .messages_visible(&room_id, from, limit, &|li| scope.admits(li))
-        .map_err(room_error)?;
+    let (events, next) = reader.messages(from, limit).map_err(room_error)?;
 
     let chunk: Vec<Value> = events
         .iter()
@@ -7403,7 +7392,7 @@ fn origin_server_ts(hit: &SearchHit) -> i64 {
 ///
 /// Room-event search over the rooms the caller may read: by default the
 /// rooms they are joined to, or the `filter.rooms` they name, each under
-/// its own [`read_scope`] so a former member searches only the stretch
+/// its own [`crate::rooms::Rooms::read_scope`] so a former member searches only the stretch
 /// they may read and a room the caller may not see contributes nothing
 /// rather than refusing the whole search. Newest first, by
 /// `origin_server_ts` across rooms and by position within one; `rank` is
@@ -7501,7 +7490,7 @@ async fn search(
 
 /// Walk every room the search covers and gather its hits: the caller's
 /// joined rooms, or the `filter.rooms` named, each under its own
-/// [`read_scope`], and each resumed from `cursor`. Returns the hits
+/// [`crate::rooms::Rooms::read_scope`], and each resumed from `cursor`. Returns the hits
 /// newest first and cut to `limit`, the scope of each room that was
 /// searched (the context needs it again), and whether a further page
 /// exists; `cursor` is advanced to where that page starts.
@@ -7527,19 +7516,14 @@ fn search_rooms(
         }
         // A room the caller may not read contributes nothing, rather than
         // refusing the search: naming it must not tell them it exists.
-        let Ok(scope) = read_scope(state, user_id, &room_id) else {
+        let Ok(scope) = state.rooms.read_scope(user_id, &room_id) else {
             continue;
         };
         let matches = |event: &Value| search_matches(event, needle, keys, &criteria.filter);
         let (found, next) = state
             .rooms
-            .search(
-                &room_id,
-                cursor.get(&room_id).copied(),
-                limit,
-                &|li| scope.admits(li),
-                &matches,
-            )
+            .reader_with(&room_id, scope.clone())
+            .search(cursor.get(&room_id).copied(), limit, &matches)
             .map_err(room_error)?;
         more |= next.is_some();
         hits.extend(found.into_iter().map(|event| SearchHit {
@@ -7675,7 +7659,7 @@ async fn notifications(
     let mut hits: Vec<SearchHit> = Vec::new();
     let mut more = false;
     for room_id in state.rooms.joined(&identity.user_id).map_err(room_error)? {
-        let Ok(scope) = read_scope(&state, &identity.user_id, &room_id) else {
+        let Ok(scope) = state.rooms.read_scope(&identity.user_id, &room_id) else {
             continue;
         };
         let room = RoomRuleContext::of(&state, &room_id)?;
@@ -7688,13 +7672,8 @@ async fn notifications(
         };
         let (found, next) = state
             .rooms
-            .search(
-                &room_id,
-                cursor.get(&room_id).copied(),
-                limit,
-                &|li| scope.admits(li),
-                &notifies,
-            )
+            .reader_with(&room_id, scope.clone())
+            .search(cursor.get(&room_id).copied(), limit, &notifies)
             .map_err(room_error)?;
         more |= next.is_some();
         hits.extend(found.into_iter().map(|event| SearchHit {
@@ -7802,12 +7781,11 @@ fn search_context(
 ) -> Value {
     let before_limit = wanted.before_limit.unwrap_or(SEARCH_CONTEXT_EACH_SIDE);
     let after_limit = wanted.after_limit.unwrap_or(SEARCH_CONTEXT_EACH_SIDE);
-    let Ok(context) = state.rooms.context_visible(
-        &hit.room_id,
-        &hit.event.event_id,
-        before_limit.max(after_limit),
-        &|li| scope.admits(li),
-    ) else {
+    let Ok(context) = state
+        .rooms
+        .reader_with(&hit.room_id, scope.clone())
+        .context(&hit.event.event_id, before_limit.max(after_limit))
+    else {
         return Value::Null;
     };
     let events_before: Vec<Value> = context
@@ -8175,17 +8153,6 @@ fn hierarchy_visible(
 /// question they were asking.
 fn may_read_room(state: &AppState, user_id: &str, room_id: &str) -> Result<(), MatrixError> {
     state.rooms.may_read(user_id, room_id).map_err(room_error)
-}
-
-/// The gate, for the handlers that have not yet been moved onto a
-/// [`crate::rooms::RoomReader`]: they still take a scope and choose what to
-/// do with it. Each one that moves deletes a call here.
-fn read_scope(
-    state: &AppState,
-    user_id: &str,
-    room_id: &str,
-) -> Result<crate::rooms::ReadScope, MatrixError> {
-    state.rooms.read_scope(user_id, room_id).map_err(room_error)
 }
 
 /// The state a room upgrade carries across.

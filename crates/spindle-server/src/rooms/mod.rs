@@ -1682,7 +1682,7 @@ impl Rooms {
     ///
     /// Returns [`RoomError::MissingBody`] if the event is absent from the
     /// room or outside what the caller may see.
-    pub fn context_visible(
+    fn context_visible(
         &self,
         room_id: &str,
         event_id: &str,
@@ -2104,7 +2104,7 @@ impl Rooms {
     /// # Errors
     ///
     /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
-    pub fn messages_visible(
+    fn messages_visible(
         &self,
         room_id: &str,
         from: Option<i64>,
@@ -2172,7 +2172,7 @@ impl Rooms {
     /// # Errors
     ///
     /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
-    pub fn search(
+    fn search(
         &self,
         room_id: &str,
         from: Option<i64>,
@@ -2879,7 +2879,7 @@ impl Rooms {
     /// # Errors
     ///
     /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
-    pub fn event_position(&self, room_id: &str, event_id: &str) -> Result<Option<i64>, RoomError> {
+    fn event_position(&self, room_id: &str, event_id: &str) -> Result<Option<i64>, RoomError> {
         self.with_room_read(room_id, |_, log| {
             Ok(log.get(&EventId::new(event_id)).map(|entry| entry.li.get()))
         })
