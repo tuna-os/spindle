@@ -542,6 +542,7 @@ fn room_routes() -> Router<AppState> {
             post(user_directory_search),
         )
         .route("/_matrix/client/v3/search", post(search))
+        .route("/_matrix/client/v3/notifications", get(notifications))
         .route(
             "/_matrix/client/v1/rooms/{room_id}/hierarchy",
             get(room_hierarchy),
@@ -8433,28 +8434,211 @@ fn search_rooms(
         }));
         scopes.insert(room_id, scope);
     }
-    // Newest first across rooms; ties by room and then position, so a page
-    // boundary falls in the same place however the rooms were walked.
+    more |= page_newest_first(&mut hits, limit, cursor);
+    Ok(SearchPage { hits, scopes, more })
+}
+
+/// Cut a walk's hits to one page, newest first across rooms, and advance
+/// the per-room cursor to where the next page starts. Returns whether the
+/// cut left anything behind.
+///
+/// Ties by room and then position, so a page boundary falls in the same
+/// place however the rooms were walked. Each room resumes below the oldest
+/// position taken from it; a room nothing was taken from resumes where it
+/// was, and finds the same hits again -- which is what makes the pages
+/// neither skip nor repeat.
+fn page_newest_first(
+    hits: &mut Vec<SearchHit>,
+    limit: usize,
+    cursor: &mut BTreeMap<String, i64>,
+) -> bool {
     hits.sort_by(|a, b| {
         origin_server_ts(b)
             .cmp(&origin_server_ts(a))
             .then_with(|| a.room_id.cmp(&b.room_id))
             .then_with(|| b.event.li.cmp(&a.event.li))
     });
-    if hits.len() > limit {
-        more = true;
-        hits.truncate(limit);
-    }
-    // Each room resumes below the oldest position taken from it; a room
-    // nothing was taken from resumes where it was, and finds the same hits
-    // again -- which is what makes the pages neither skip nor repeat.
-    for hit in &hits {
+    let more = hits.len() > limit;
+    hits.truncate(limit);
+    for hit in hits.iter() {
         cursor
             .entry(hit.room_id.clone())
             .and_modify(|from| *from = (*from).min(hit.event.li))
             .or_insert(hit.event.li);
     }
-    Ok(SearchPage { hits, scopes, more })
+    more
+}
+
+#[derive(Deserialize)]
+struct NotificationsQuery {
+    from: Option<String>,
+    limit: Option<usize>,
+    only: Option<String>,
+}
+
+/// The default number of notifications one page returns.
+const NOTIFICATIONS_LIMIT: usize = 50;
+
+/// What the evaluator needs of a room, gathered once per room per page.
+struct RoomRuleContext {
+    member_count: usize,
+    power_levels: Value,
+}
+
+impl RoomRuleContext {
+    fn for_reader<'a>(
+        &'a self,
+        user_id: &'a str,
+        display_name: Option<&'a str>,
+        room_id: &'a str,
+    ) -> crate::push_rules::Context<'a> {
+        crate::push_rules::Context {
+            user_id,
+            display_name,
+            room_id,
+            member_count: self.member_count,
+            power_levels: &self.power_levels,
+        }
+    }
+}
+
+/// `GET /_matrix/client/v3/notifications`
+///
+/// The events in the caller's joined rooms that their push rules say to
+/// notify about, newest first, with whether each is read. The same walk
+/// as `/search` -- there is no notification table; the rules are put to
+/// every event the walk passes, which is what the rules are for -- and the
+/// same per-room `next_token`. A reader's own events never notify,
+/// whatever the rules say: the spec's one rule the ruleset does not
+/// spell out. `only=highlight` keeps the hits whose actions carry the
+/// highlight tweak.
+async fn notifications(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Query(query): axum::extract::Query<NotificationsQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    let limit = query
+        .limit
+        .unwrap_or(NOTIFICATIONS_LIMIT)
+        .clamp(1, SEARCH_LIMIT_MAX);
+    let highlights_only = match query.only.as_deref() {
+        None => false,
+        Some("highlight") => true,
+        Some(other) => {
+            return Err(MatrixError::bad_json(format!(
+                "only must be highlight, not {other}"
+            )));
+        }
+    };
+    let mut cursor = match query.from.as_deref() {
+        Some(token) => parse_search_cursor(token)?,
+        None => BTreeMap::new(),
+    };
+    let ruleset = ruleset_of(&state, &identity.user_id)?;
+    let profile = state
+        .profiles
+        .get(&identity.user_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    let display_name = profile.displayname.as_deref();
+
+    let mut rooms: BTreeMap<String, RoomRuleContext> = BTreeMap::new();
+    let mut hits: Vec<SearchHit> = Vec::new();
+    let mut more = false;
+    for room_id in state.rooms.joined(&identity.user_id).map_err(room_error)? {
+        let Ok(scope) = read_scope(&state, &identity.user_id, &room_id) else {
+            continue;
+        };
+        let room = RoomRuleContext {
+            member_count: state
+                .rooms
+                .joined_members(&room_id)
+                .map_err(room_error)?
+                .len(),
+            power_levels: state
+                .rooms
+                .state_event(&room_id, "m.room.power_levels", "")
+                .unwrap_or_else(|_| json!({})),
+        };
+        let context = room.for_reader(&identity.user_id, display_name, &room_id);
+        let notifies = |event: &Value| {
+            event["sender"] != identity.user_id.as_str()
+                && crate::push_rules::evaluate(&ruleset, event, &context).is_some_and(|actions| {
+                    !highlights_only || crate::push_rules::is_highlight(&actions)
+                })
+        };
+        let (found, next) = state
+            .rooms
+            .search(
+                &room_id,
+                cursor.get(&room_id).copied(),
+                limit,
+                &|li| scope.admits(li),
+                &notifies,
+            )
+            .map_err(room_error)?;
+        more |= next.is_some();
+        hits.extend(found.into_iter().map(|event| SearchHit {
+            room_id: room_id.clone(),
+            event,
+        }));
+        rooms.insert(room_id, room);
+    }
+    more |= page_newest_first(&mut hits, limit, &mut cursor);
+
+    let notifications = render_notifications(
+        &state,
+        &identity.user_id,
+        display_name,
+        &ruleset,
+        &rooms,
+        &hits,
+    )?;
+    let mut body = serde_json::Map::new();
+    body.insert("notifications".to_owned(), Value::Array(notifications));
+    if more {
+        body.insert("next_token".to_owned(), json!(search_cursor(&cursor)));
+    }
+    Ok(Json(Value::Object(body)))
+}
+
+/// One `/notifications` entry per hit: the rule's actions, the event with
+/// its IDs, and whether the caller's `m.read` receipt is at or past it.
+fn render_notifications(
+    state: &AppState,
+    user_id: &str,
+    display_name: Option<&str>,
+    ruleset: &Value,
+    rooms: &BTreeMap<String, RoomRuleContext>,
+    hits: &[SearchHit],
+) -> Result<Vec<Value>, MatrixError> {
+    let mut notifications = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let room = &rooms[&hit.room_id];
+        let actions = crate::push_rules::evaluate(
+            ruleset,
+            &hit.event.json,
+            &room.for_reader(user_id, display_name, &hit.room_id),
+        )
+        .unwrap_or_default();
+        let read = state
+            .rooms
+            .receipt(&hit.room_id, user_id, "m.read")
+            .map_err(room_error)?
+            .is_some_and(|receipt| hit.event.li <= receipt.li);
+        let mut event = hit.event.json.clone();
+        if let Some(object) = event.as_object_mut() {
+            object.insert("event_id".to_owned(), json!(hit.event.event_id));
+            object.insert("room_id".to_owned(), json!(hit.room_id));
+        }
+        notifications.push(json!({
+            "actions": actions,
+            "event": event,
+            "read": read,
+            "room_id": hit.room_id,
+            "ts": origin_server_ts(hit),
+        }));
+    }
+    Ok(notifications)
 }
 
 /// The current state of each room with a hit, for `include_state`: the
