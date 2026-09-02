@@ -4,6 +4,14 @@ on:
   pull_request:
   push:
     branches: [main]
+  # The whole suite, once a night, whether or not main moved (#25 asks for
+  # a nightly full run with retained logs; the push run above only covers
+  # days something merged). Off the hour so it does not queue behind every
+  # other project's on-the-hour job. The protected-subset filter below is
+  # keyed on the pull_request event, so a scheduled run is a full one.
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
