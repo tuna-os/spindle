@@ -2873,6 +2873,60 @@ impl Rooms {
         Ok((out, next))
     }
 
+    /// Events in `room_id` that `matches` accepts, newest first, starting
+    /// below `from`, of the positions `visible` admits: at most `limit` of
+    /// them, and the position a following page starts below.
+    ///
+    /// This is `/search` (#7's "search basics"), and it is a walk, not an
+    /// index: every body the walk passes is read and put to `matches`, so a
+    /// search costs the room it searches, back to the oldest position the
+    /// caller may see or until `limit` hits are in hand. The candidates are
+    /// taken from the spine under the room's read lock and the bodies read
+    /// outside it, as `messages_visible` does. A purged body below the
+    /// watermark is not a hit (there is nothing to match), where every
+    /// other missing body is the error it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
+    pub fn search(
+        &self,
+        room_id: &str,
+        from: Option<i64>,
+        limit: usize,
+        visible: &(dyn Fn(i64) -> bool + Sync),
+        matches: &(dyn Fn(&Value) -> bool + Sync),
+    ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
+        let candidates: Vec<(i64, String)> = self.with_room_read(room_id, |_, log| {
+            Ok(log
+                .entries()
+                .rev()
+                .map(|entry| (entry.li.get(), entry.event_id.as_str().to_owned()))
+                .filter(|(li, _)| from.is_none_or(|from| *li < from) && visible(*li))
+                .collect())
+        })?;
+        let watermark = self.purge_watermark(room_id)?;
+        let mut hits = Vec::new();
+        for (li, event_id) in candidates {
+            if hits.len() == limit {
+                // This candidate is where the next page begins: `from` is
+                // exclusive, so one above it.
+                return Ok((hits, Some(li + 1)));
+            }
+            let json = match self.read_event(room_id, &EventId::new(event_id.as_str())) {
+                Ok(json) => json,
+                Err(RoomError::MissingBody(_)) if watermark.is_some_and(|mark| li < mark) => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if matches(&json) {
+                hits.push(TimelineEvent { event_id, li, json });
+            }
+        }
+        Ok((hits, None))
+    }
+
     /// Room IDs a user is joined to.
     ///
     /// A prefix scan of that user's membership rows, so the cost is
