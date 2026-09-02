@@ -32,6 +32,40 @@ jobs:
       - name: Check the Synapse reader still builds and passes
         run: cargo test --features synapse-import --test synapse_reader
 
+  # Two people meet in a room through Element Web, on a Spindle that was
+  # empty a moment ago (docs/conformance-testing.md, section 4.1). Complement
+  # proves the API; this proves the client the API is for: register, log
+  # in, create a room, invite, accept, a message each way, leave, driven
+  # through a pinned Element Web release in a real browser. The flow takes
+  # seconds; the job's cost is the server build and one browser download.
+  element-web-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Build the server
+        run: cargo build -p spindle-server --bin spindle
+      - name: Install the pinned Playwright and its Chromium
+        working-directory: scripts/element-web-e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Meet in a room through Element Web
+        env:
+          SPINDLE_BIN: target/debug/spindle
+        run: scripts/element-web-e2e/run.sh
+      - name: Keep the screenshots and logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: element-web-e2e
+          path: tmp/element-web-e2e/
+          if-no-files-found: ignore
+
   complement-readiness:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
