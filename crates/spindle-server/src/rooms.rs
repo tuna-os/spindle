@@ -400,6 +400,7 @@ impl Rooms {
         initial_state: &[(String, String, Value)],
         version: Option<&str>,
         creation_content: Option<&serde_json::Map<String, Value>>,
+        creator_profile: &serde_json::Map<String, Value>,
     ) -> Result<String, RoomError> {
         // The requested version, or this build's default. Refused rather
         // than substituted: handing back a different version than was asked
@@ -439,12 +440,10 @@ impl Rooms {
             &create_json,
         )?;
 
+        let mut creator_join = Value::Object(creator_profile.clone());
+        creator_join["membership"] = Value::String("join".to_owned());
         let mut events: Vec<(&str, String, Value)> = vec![
-            (
-                "m.room.member",
-                creator.to_owned(),
-                serde_json::json!({ "membership": "join" }),
-            ),
+            ("m.room.member", creator.to_owned(), creator_join),
             (
                 "m.room.power_levels",
                 String::new(),
@@ -571,6 +570,41 @@ impl Rooms {
         reason: Option<&str>,
         key: &Ed25519KeyPair,
     ) -> Result<String, RoomError> {
+        self.set_membership_with(
+            room_id,
+            sender,
+            target,
+            membership,
+            reason,
+            &serde_json::Map::new(),
+            key,
+        )
+    }
+
+    /// [`Self::set_membership`], with `extra` fields in the content: the
+    /// target's `displayname` and `avatar_url`, which the spec has a join
+    /// and an invite carry so a client can show who joined or was invited
+    /// without a profile lookup (#317). The caller supplies them because
+    /// profiles live above this layer; `membership` and `reason` are set
+    /// here and win over anything in `extra`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_membership`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one membership event, in one place"
+    )]
+    pub fn set_membership_with(
+        &self,
+        room_id: &str,
+        sender: &str,
+        target: &str,
+        membership: &str,
+        reason: Option<&str>,
+        extra: &serde_json::Map<String, Value>,
+        key: &Ed25519KeyPair,
+    ) -> Result<String, RoomError> {
         // An administratively blocked room refuses every join. The check
         // sits here rather than in a route so that every local join path
         // — direct, via alias, accepting an invite — hits it.
@@ -579,7 +613,8 @@ impl Rooms {
                 "this room is blocked by a server administrator".to_owned(),
             ));
         }
-        let mut content = serde_json::json!({ "membership": membership });
+        let mut content = Value::Object(extra.clone());
+        content["membership"] = Value::String(membership.to_owned());
         // Absent rather than null when there is no reason: `reason` is part of
         // the event content, so it is covered by the signature and by the
         // event ID, and a null would make the same kick hash differently from
@@ -6066,6 +6101,7 @@ mod room_version_tests {
                 &[],
                 Some(unsupported),
                 None,
+                &serde_json::Map::new(),
             );
             assert!(
                 matches!(result, Err(RoomError::UnsupportedVersion(ref named)) if named == unsupported),
@@ -6089,6 +6125,7 @@ mod room_version_tests {
                 &[],
                 Some("11"),
                 None,
+                &serde_json::Map::new(),
             )
             .expect("v11 is advertised and must be accepted");
         assert_eq!(rooms.room_version(&room_id).unwrap(), RoomVersionId::V11);
@@ -6127,6 +6164,7 @@ mod room_version_tests {
                 &[],
                 None,
                 None,
+                &serde_json::Map::new(),
             )
             .unwrap();
 
@@ -6169,6 +6207,7 @@ mod room_version_tests {
                 &[],
                 Some("12"),
                 None,
+                &serde_json::Map::new(),
             )
             .expect("v12 is advertised");
 
@@ -6210,6 +6249,7 @@ mod room_version_tests {
                 &[],
                 Some("12"),
                 None,
+                &serde_json::Map::new(),
             )
             .unwrap();
         let create = rooms
@@ -6250,6 +6290,7 @@ mod room_version_tests {
                 &[],
                 Some("11"),
                 None,
+                &serde_json::Map::new(),
             )
             .unwrap();
         assert!(room_id.ends_with(":example.org"), "{room_id}");
@@ -6282,6 +6323,7 @@ mod room_version_tests {
                 &[],
                 Some("12"),
                 None,
+                &serde_json::Map::new(),
             )
             .unwrap();
         let event_id = rooms
@@ -6341,6 +6383,7 @@ mod room_version_tests {
                 &[],
                 None,
                 None,
+                &serde_json::Map::new(),
             )
             .unwrap();
 
@@ -6398,6 +6441,7 @@ mod room_version_tests {
                 &[],
                 None,
                 None,
+                &serde_json::Map::new(),
             )
             .unwrap();
 
