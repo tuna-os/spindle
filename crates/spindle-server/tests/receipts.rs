@@ -294,6 +294,61 @@ async fn a_receipt_for_an_event_this_room_does_not_have_is_refused() {
 }
 
 #[tokio::test]
+async fn a_stranger_cannot_leave_a_receipt() {
+    // A receipt is not private bookkeeping: `m.read` is fanned out to
+    // everyone in the room. Accepting one from outside let any account put
+    // its name into a private room's receipt stream against any event ID it
+    // had learnt (#268). Both spellings go through the same door, so both
+    // are refused, and the refusal is the same whether the room exists.
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let mallory = harness.register("mallory").await;
+    let room = harness.shared_room(&alice, &bob).await;
+    let event = harness.say(&room, &alice, "between friends", "e1").await;
+
+    let (status, body) = harness
+        .post(
+            &format!("/_matrix/client/v3/rooms/{room}/receipt/m.read/{event}"),
+            &mallory,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = harness
+        .post(
+            &format!("/_matrix/client/v3/rooms/{room}/read_markers"),
+            &mallory,
+            &json!({ "m.read": event, "m.fully_read": event }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, _) = harness
+        .post(
+            "/_matrix/client/v3/rooms/!nosuchroom:example.org/receipt/m.read/$nothing",
+            &mallory,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a room that does not exist is refused like one that does"
+    );
+
+    // And bob, who is in the room, still can.
+    let (status, body) = harness
+        .post(
+            &format!("/_matrix/client/v3/rooms/{room}/receipt/m.read/{event}"),
+            &bob,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(harness.unread(&bob, &room).await, 0);
+}
+
+#[tokio::test]
 async fn receipts_are_per_user_and_per_room() {
     let harness = Harness::new();
     let alice = harness.register("alice").await;
