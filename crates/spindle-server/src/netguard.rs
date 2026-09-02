@@ -52,19 +52,29 @@ fn canonical(address: IpAddr) -> IpAddr {
     if let Some(mapped) = v6.to_ipv4_mapped() {
         return IpAddr::V4(mapped);
     }
-    match v6.segments() {
-        // 64:ff9b::/96, NAT64's well-known prefix (RFC 6052 §2.1). The
-        // longer 64:ff9b:1::/48 form carries the address at a
-        // prefix-dependent offset and is not decoded here.
-        [0x0064, 0xff9b, 0, 0, 0, 0, high, low] => embedded_v4(high, low),
-        // 2002::/16, 6to4 (RFC 3056): the embedded address is the relay's.
-        [0x2002, high, low, ..] => embedded_v4(high, low),
-        // ::a.b.c.d, IPv4-compatible (RFC 4291 §2.5.5.1, deprecated).
-        // `::` and `::1` are IPv6 addresses in their own right, judged as
-        // such below — not as 0.0.0.0 and 0.0.0.1.
-        [0, 0, 0, 0, 0, 0, high, low] if high != 0 || low > 1 => embedded_v4(high, low),
-        _ => address,
+    // A `match` would fold these together -- the arms return the same
+    // thing -- and folding them would take the comments with it. Each
+    // line below is a different transition mechanism with a different
+    // reason for being here, so they stay separate.
+    let [first, second, third, fourth, fifth, sixth, high, low] = v6.segments();
+    let leading = [first, second, third, fourth, fifth, sixth];
+    // 64:ff9b::/96, NAT64's well-known prefix (RFC 6052 §2.1). The longer
+    // 64:ff9b:1::/48 form carries the address at a prefix-dependent
+    // offset and is not decoded here.
+    if leading == [0x0064, 0xff9b, 0, 0, 0, 0] {
+        return embedded_v4(high, low);
     }
+    // 2002::/16, 6to4 (RFC 3056): the embedded address is the relay's.
+    if first == 0x2002 {
+        return embedded_v4(second, third);
+    }
+    // ::a.b.c.d, IPv4-compatible (RFC 4291 §2.5.5.1, deprecated). `::`
+    // and `::1` are IPv6 addresses in their own right, judged as such
+    // below — not as 0.0.0.0 and 0.0.0.1.
+    if leading == [0, 0, 0, 0, 0, 0] && (high != 0 || low > 1) {
+        return embedded_v4(high, low);
+    }
+    address
 }
 
 /// The IPv4 address two IPv6 segments spell.
