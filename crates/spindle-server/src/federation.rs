@@ -8,6 +8,7 @@
 //! header, an unfetchable key, a stale key, a destination that is not us,
 //! all refuse rather than degrade.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -222,17 +223,15 @@ impl Federation {
         Ok(parsed.origin)
     }
 
-    /// Every verify key the origin currently publishes, as ruma's map —
-    /// for verifying whole events, which may carry any of its keys.
+    /// Every key the origin publishes, current and retired, for verifying
+    /// whole events -- which may carry any key the origin held when it
+    /// signed them. See [`PeerKeys`] for which key answers for which event.
     ///
     /// # Errors
     ///
     /// Returns [`FederationError`] if the document cannot be fetched or is
     /// not credible.
-    pub async fn public_key_map(
-        &self,
-        origin: &str,
-    ) -> Result<ruma::signatures::PublicKeyMap, FederationError> {
+    pub async fn peer_keys(&self, origin: &str) -> Result<PeerKeys, FederationError> {
         // A fetch-if-stale pass first: `server_key` refreshes the cache as
         // a side effect, and the throwaway id keeps "stale" and "missing"
         // from conflating.
@@ -243,20 +242,7 @@ impl Federation {
             .ok_or_else(|| FederationError::Refused(format!("no keys for {origin}")))?;
         let cached: Value = serde_json::from_slice(&bytes)
             .map_err(|error| FederationError::Storage(error.to_string()))?;
-        let mut key_map = ruma::signatures::PublicKeyMap::new();
-        let entry = key_map.entry(origin.to_owned()).or_default();
-        if let Some(keys) = cached["document"]["verify_keys"].as_object() {
-            for (key_id, key) in keys {
-                if let Some(key) = key["key"].as_str() {
-                    entry.insert(
-                        key_id.clone(),
-                        ruma::serde::Base64::parse(key)
-                            .map_err(|error| FederationError::Refused(error.to_string()))?,
-                    );
-                }
-            }
-        }
-        Ok(key_map)
+        PeerKeys::from_document(origin, &cached["document"])
     }
 
     /// The origin's public key (unpadded base64), from cache or fetched.
@@ -915,6 +901,84 @@ fn request_object(
 
 /// Check a `/key/v2/server` document's self-signature, using the key the
 /// document itself carries.
+/// A peer's published signing keys, split the way the spec splits them.
+///
+/// `verify_keys` are what the peer signs with now. `old_verify_keys` are
+/// keys it has retired, each with the `expired_ts` at which it stopped: an
+/// event the peer signed before that moment still verifies with the retired
+/// key, and one it claims to have signed after it does not -- otherwise a
+/// rotation would change nothing (#296). A retired key published without an
+/// `expired_ts` is not used at all: a key that keeps working forever is a
+/// rotation that did not happen, and refusing is the safe reading of a
+/// malformed entry.
+///
+/// Request signatures (`X-Matrix`) are checked against current keys only,
+/// in [`Federation::server_key`]: a request is made now, and a key the peer
+/// has retired has no business signing one.
+#[derive(Clone, Debug, Default)]
+pub struct PeerKeys {
+    origin: String,
+    current: BTreeMap<String, ruma::serde::Base64>,
+    retired: BTreeMap<String, (ruma::serde::Base64, u64)>,
+    /// Keys of *other* servers that must also verify the event -- the
+    /// countersignature on a restricted join is ours, not the peer's.
+    vouched: ruma::signatures::PublicKeyMap,
+}
+
+impl PeerKeys {
+    fn from_document(origin: &str, document: &Value) -> Result<Self, FederationError> {
+        let mut keys = Self {
+            origin: origin.to_owned(),
+            ..Self::default()
+        };
+        if let Some(entries) = document["verify_keys"].as_object() {
+            for (key_id, entry) in entries {
+                if let Some(key) = entry["key"].as_str() {
+                    keys.current.insert(key_id.clone(), parse_key(key)?);
+                }
+            }
+        }
+        if let Some(entries) = document["old_verify_keys"].as_object() {
+            for (key_id, entry) in entries {
+                if let (Some(key), Some(expired_ts)) =
+                    (entry["key"].as_str(), entry["expired_ts"].as_u64())
+                {
+                    keys.retired
+                        .insert(key_id.clone(), (parse_key(key)?, expired_ts));
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    /// The map ruma verifies against, for an event that says it was signed
+    /// at `origin_server_ts`: every current key, plus each retired key whose
+    /// expiry is after that moment. An event with no timestamp gets current
+    /// keys only.
+    #[must_use]
+    pub fn map_for(&self, origin_server_ts: Option<u64>) -> ruma::signatures::PublicKeyMap {
+        let at = origin_server_ts.unwrap_or(u64::MAX);
+        let mut set: ruma::signatures::PublicKeySet = self.current.clone();
+        for (key_id, (key, expired_ts)) in &self.retired {
+            if at < *expired_ts {
+                set.entry(key_id.clone()).or_insert_with(|| key.clone());
+            }
+        }
+        let mut map = self.vouched.clone();
+        map.insert(self.origin.clone(), set);
+        map
+    }
+
+    /// Add a key of another server, for an event that server also signed.
+    pub fn vouch(&mut self, server: String, key_id: String, key: ruma::serde::Base64) {
+        self.vouched.entry(server).or_default().insert(key_id, key);
+    }
+}
+
+fn parse_key(key: &str) -> Result<ruma::serde::Base64, FederationError> {
+    ruma::serde::Base64::parse(key).map_err(|error| FederationError::Refused(error.to_string()))
+}
+
 fn verify_self_signed(origin: &str, document: &Value) -> Result<(), FederationError> {
     let Some(verify_keys) = document["verify_keys"].as_object() else {
         return Err(FederationError::Refused("no verify_keys".to_owned()));
