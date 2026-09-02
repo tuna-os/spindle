@@ -280,7 +280,7 @@ impl Federation {
         // federation test rig satisfies and docs/dashboard record as a gap.
         let url = format!(
             "{}/_matrix/key/v2/server",
-            base_url(origin, self.insecure_http)
+            base_url(origin, self.insecure_http)?
         );
         let document: Value = self
             .client
@@ -356,7 +356,7 @@ impl Federation {
             .client
             .get(format!(
                 "{}{uri}",
-                base_url(destination, self.insecure_http)
+                base_url(destination, self.insecure_http)?
             ))
             .header("authorization", authorization)
             .timeout(Duration::from_secs(30))
@@ -399,7 +399,7 @@ impl Federation {
             .client
             .get(format!(
                 "{}{uri}",
-                base_url(destination, self.insecure_http)
+                base_url(destination, self.insecure_http)?
             ))
             .header("authorization", authorization)
             .timeout(Duration::from_secs(10))
@@ -442,7 +442,7 @@ impl Federation {
             .client
             .get(format!(
                 "{}{uri}",
-                base_url(destination, self.insecure_http)
+                base_url(destination, self.insecure_http)?
             ))
             .header("authorization", authorization)
             .timeout(Duration::from_secs(10))
@@ -485,7 +485,7 @@ impl Federation {
             .client
             .put(format!(
                 "{}{uri}",
-                base_url(destination, self.insecure_http)
+                base_url(destination, self.insecure_http)?
             ))
             .header("authorization", authorization)
             .header("content-type", "application/json")
@@ -539,7 +539,7 @@ impl Federation {
             .client
             .put(format!(
                 "{}{uri}",
-                base_url(destination, self.insecure_http)
+                base_url(destination, self.insecure_http)?
             ))
             .header("authorization", authorization)
             .header("content-type", "application/json")
@@ -584,7 +584,7 @@ impl Federation {
             .client
             .get(format!(
                 "{}{uri}",
-                base_url(destination, self.insecure_http)
+                base_url(destination, self.insecure_http)?
             ))
             .header("authorization", authorization)
             .timeout(Duration::from_secs(30))
@@ -627,7 +627,7 @@ impl Federation {
             .client
             .put(format!(
                 "{}{uri}",
-                base_url(destination, self.insecure_http)
+                base_url(destination, self.insecure_http)?
             ))
             .header("authorization", authorization)
             .header("content-type", "application/json")
@@ -669,7 +669,7 @@ impl Federation {
             .client
             .get(format!(
                 "{}{uri}",
-                base_url(destination, self.insecure_http)
+                base_url(destination, self.insecure_http)?
             ))
             .header("authorization", authorization)
             .timeout(Duration::from_secs(60))
@@ -695,7 +695,7 @@ impl Federation {
         // peers predating authenticated media; a 404 there is final.
         let legacy = format!(
             "{}/_matrix/media/v3/download/{destination}/{media_id}?allow_redirect=false",
-            base_url(destination, self.insecure_http)
+            base_url(destination, self.insecure_http)?
         );
         let response = self
             .client
@@ -746,7 +746,7 @@ impl Federation {
             .client
             .put(format!(
                 "{}{uri}",
-                base_url(destination, self.insecure_http)
+                base_url(destination, self.insecure_http)?
             ))
             .header("authorization", authorization)
             .header("content-type", "application/json")
@@ -946,13 +946,31 @@ fn verify_self_signed(origin: &str, document: &Value) -> Result<(), FederationEr
 /// discovery's final fallback), not 443 — `https://hs1/` would knock on a
 /// door nothing is behind. Delegation (.well-known, SRV) is still not
 /// resolved; the name is the host, which docs/dashboard records as a gap.
-fn base_url(name: &str, insecure_http: bool) -> String {
+/// Where requests to `name` go, refusing anything that is not a server name.
+///
+/// The name is never this server's own. It comes from a peer's X-Matrix
+/// header, from a room's member list, or from a client's `server_name`
+/// path segment, and it is pasted into a URL. Without this gate a header
+/// reading `origin="127.0.0.1:6379/x?"` is a request this server makes on
+/// a stranger's behalf, to a host, port and path of their choosing, from
+/// inside whatever network it sits in, before a single signature has been
+/// checked -- because checking the signature is what the fetch is for.
+///
+/// A Matrix server name is a hostname or IP literal and an optional port,
+/// nothing else. ruma's validator is the spec's grammar, so this is not a
+/// second opinion on what a server name is; it is the first time one is
+/// asked for here.
+fn base_url(name: &str, insecure_http: bool) -> Result<String, FederationError> {
+    let server = ruma::OwnedServerName::try_from(name).map_err(|error| {
+        FederationError::Refused(format!("not a server name {name:?}: {error}"))
+    })?;
     let scheme = if insecure_http { "http" } else { "https" };
-    if name.contains(':') {
-        format!("{scheme}://{name}")
-    } else {
-        format!("{scheme}://{name}:8448")
-    }
+    // The port question is asked of the parsed name, not of the string: a
+    // bare IPv6 literal contains colons and still has no port.
+    Ok(match server.port() {
+        Some(_) => format!("{scheme}://{name}"),
+        None => format!("{scheme}://{name}:8448"),
+    })
 }
 
 /// Pull `filename="..."` (or bare filename=) out of a Content-Disposition.
@@ -1096,17 +1114,42 @@ mod url_tests {
 
     #[test]
     fn a_portless_name_gets_the_federation_port_not_443() {
-        assert_eq!(base_url("hs1", false), "https://hs1:8448");
+        assert_eq!(base_url("hs1", false).unwrap(), "https://hs1:8448");
         assert_eq!(
-            base_url("matrix.example.org", false),
+            base_url("matrix.example.org", false).unwrap(),
             "https://matrix.example.org:8448"
         );
+        // Colons inside an IPv6 literal are not a port.
+        assert_eq!(base_url("[::1]", false).unwrap(), "https://[::1]:8448");
     }
 
     #[test]
     fn an_explicit_port_is_the_peer_telling_us_where_to_knock() {
-        assert_eq!(base_url("hs1:443", false), "https://hs1:443");
-        assert_eq!(base_url("127.0.0.1:8099", true), "http://127.0.0.1:8099");
+        assert_eq!(base_url("hs1:443", false).unwrap(), "https://hs1:443");
+        assert_eq!(
+            base_url("127.0.0.1:8099", true).unwrap(),
+            "http://127.0.0.1:8099"
+        );
+        assert_eq!(base_url("[::1]:8448", false).unwrap(), "https://[::1]:8448");
+    }
+
+    /// Every one of these parses as an X-Matrix `origin` and would have
+    /// become a URL this server fetched from. None is a server name.
+    #[test]
+    fn a_name_that_is_not_a_server_name_becomes_no_url_at_all() {
+        for hostile in [
+            "127.0.0.1:6379/x?y=",
+            "internal:8448/../admin",
+            "attacker@internal:8448",
+            "internal:8448#",
+            "internal:8448?",
+            "a b",
+            ":8448",
+            "",
+            "internal:notaport",
+        ] {
+            assert!(base_url(hostile, true).is_err(), "{hostile:?} became a URL");
+        }
     }
 }
 

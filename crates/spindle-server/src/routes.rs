@@ -2010,6 +2010,9 @@ async fn federation_query_profile(
     profile_of(&state, &query.user_id).await.map(Json)
 }
 
+/// The longest transaction id `federation_send` accepts.
+const MAX_TXN_ID_LEN: usize = 255;
+
 /// `PUT /_matrix/federation/v1/send/{txnId}`
 ///
 /// One transaction from one peer: up to fifty PDUs and some EDUs. Each PDU
@@ -2030,6 +2033,16 @@ async fn federation_send(
         .uri()
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    // The replay row is keyed by `(origin, txn_id)` behind a two-byte
+    // length, so a peer choosing anything longer than the key can hold
+    // would see its own transactions answer for one another. No real
+    // implementation sends more than a few dozen bytes; the bound sits
+    // far above that and far below the key's.
+    if txn_id.len() > MAX_TXN_ID_LEN {
+        return Err(MatrixError::bad_json(format!(
+            "a transaction id is at most {MAX_TXN_ID_LEN} bytes"
+        )));
+    }
     let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
         .await
         .map_err(|error| MatrixError::bad_json(error.to_string()))?;
