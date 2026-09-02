@@ -378,6 +378,23 @@ impl RoomLog {
         self.head_chain
     }
 
+    /// The entry at a position this log issued.
+    ///
+    /// Every `li` that reaches this came from this log: read out of
+    /// `positions`, or inserted a few lines above the call. The lookup
+    /// cannot miss, and an index says so more plainly than an error nobody
+    /// could give a reason for. `expect` rather than `allow`, so this stops
+    /// compiling the day the lookup can be written without indexing instead
+    /// of quietly outliving its reason. No parsed byte reaches this; it is
+    /// the one indexed lookup the crate keeps, kept in one place.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`li` was issued by this log; see the doc comment"
+    )]
+    fn issued_entry(&self, li: i64) -> &LogEntry {
+        &self.entries[&li]
+    }
+
     /// Find the bounded divergent ancestry behind a set of event tips.
     ///
     /// This walks signed `prev_events`; linear-index proximity is never used to
@@ -449,7 +466,13 @@ impl RoomLog {
             // remaining history is common ancestry and cannot affect the
             // answer. This is what keeps an ordinary tip fork from walking the
             // room: it fires one pop after the fork closes.
-            if frontier.iter().all(|entry| reached[entry] == full) {
+            // A miss cannot happen -- every entry joins `frontier` and
+            // `reached` in the same statement -- and reading one as "not yet
+            // fully reached" keeps walking, which is the safe direction.
+            if frontier
+                .iter()
+                .all(|entry| reached.get(entry).is_some_and(|mask| *mask == full))
+            {
                 nearest = nearest.or(Some(li));
                 break;
             }
@@ -457,7 +480,7 @@ impl RoomLog {
             frontier.remove(&li);
             visited += 1;
 
-            let mask = reached[&li];
+            let mask = reached.get(&li).copied().unwrap_or(0);
             if mask == full {
                 nearest = nearest.or(Some(li));
             } else {
@@ -472,7 +495,7 @@ impl RoomLog {
 
             // A backfill frontier names parents older than anything we hold.
             // Those are outside our history, not a corrupt index.
-            for parent in &self.entries[&li].prev_events {
+            for parent in &self.issued_entry(li).prev_events {
                 if let Some(parent_li) = self.positions.get(parent).copied() {
                     *reached.entry(parent_li).or_default() |= mask;
                     frontier.insert(parent_li);
@@ -485,10 +508,10 @@ impl RoomLog {
         };
 
         Ok(ForkWindow {
-            nearest_common_ancestor: self.entries[&nearest].event_id.clone(),
+            nearest_common_ancestor: self.issued_entry(nearest).event_id.clone(),
             events: divergent
                 .into_iter()
-                .map(|li| self.entries[&li].event_id.clone())
+                .map(|li| self.issued_entry(li).event_id.clone())
                 .collect(),
             visited,
         })
@@ -536,10 +559,10 @@ impl RoomLog {
         if input.prev_events.len() > MAX_PREV_EVENTS {
             return Err(AppendError::TooManyPredecessors(input.prev_events.len()));
         }
-        if self.entries.is_empty() && !input.prev_events.is_empty() {
-            return Err(AppendError::UnknownPredecessor(
-                input.prev_events[0].clone(),
-            ));
+        if let Some(first) = input.prev_events.first()
+            && self.entries.is_empty()
+        {
+            return Err(AppendError::UnknownPredecessor(first.clone()));
         }
         if !self.entries.is_empty() && input.prev_events.is_empty() {
             return Err(AppendError::MissingPredecessor);
@@ -620,7 +643,7 @@ impl RoomLog {
         // After the extremity set is updated, so a parent that just stopped
         // being an extremity stops being pinned by it.
         self.make_resident(li, state_after);
-        Ok(&self.entries[&li])
+        Ok(self.issued_entry(li))
     }
 
     /// Append an event whose state is supplied rather than derived — the
@@ -676,7 +699,7 @@ impl RoomLog {
         self.positions.insert(entry.event_id.clone(), li);
         self.entries.insert(li, entry);
         self.make_resident(li, state_after);
-        Ok(&self.entries[&li])
+        Ok(self.issued_entry(li))
     }
 
     /// Place one backfilled event before everything currently held.
@@ -739,7 +762,7 @@ impl RoomLog {
         // and deliberate: backfilled state came from `/state_ids`, is persisted
         // by the commit, and is rehydrated rather than refolded on reopen.
         self.make_resident(li, state_after);
-        Ok(&self.entries[&li])
+        Ok(self.issued_entry(li))
     }
 }
 
@@ -1035,10 +1058,13 @@ fn merge_states(
                 }
             }
         } else {
-            candidates
-                .into_iter()
-                .next()
-                .expect("a collected state key has a value")
+            // A key reached this map by having a value inserted under it, so
+            // an empty set does not happen; if it somehow did, a key with no
+            // candidate has nothing to apply, which is what skipping it says.
+            let Some(only) = candidates.into_iter().next() else {
+                continue;
+            };
+            only
         };
         merged = merged.apply(key, event_id);
     }

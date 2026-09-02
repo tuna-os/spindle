@@ -4,6 +4,24 @@
 //! per ADR 0002: the linear log and the state trie are the parts that are
 //! actually ours, and they remain independently testable and benchmarkable.
 
+// The parse-path lints #266 asks for on "the storage and event-parsing
+// crates specifically". A homeserver that panics on a malformed PDU or a
+// corrupt row is a remote denial of service, and the parse path is exactly
+// where an index is tempting. `not(test)` because a Cargo `[lints]` table
+// applies per crate rather than per target, and a unit test that cannot
+// `unwrap` is a test nobody writes; integration tests are their own crates
+// and never inherit this. Declared here rather than in `[lints]` for the
+// same reason -- a lint table cannot say "except in tests".
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )
+)]
+
 pub mod backup;
 pub mod codec;
 pub mod migrate;
@@ -383,9 +401,16 @@ impl GroupCommit {
             state.led += 1;
             drop(state);
 
-            let result = persist
-                .take()
-                .expect("the leader runs the persist exactly once")();
+            // The leader runs the persist exactly once: a failed persist
+            // returns below rather than looping, so a second lead cannot
+            // happen. Said as an error rather than assumed, because the
+            // alternative is a panic under the commit lock.
+            let Some(persist) = persist.take() else {
+                return Err(StoreError::Backend(
+                    "group commit tried to lead twice".to_owned(),
+                ));
+            };
+            let result = persist();
 
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             state.running = false;

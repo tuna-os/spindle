@@ -231,7 +231,9 @@ impl<'a, R: Read + ?Sized> Digesting<'a, R> {
             let at = out.len();
             let want = CHUNK.min(len - at);
             out.resize(at + want, 0);
-            self.read_exact(&mut out[at..])?;
+            if let Some(tail) = out.get_mut(at..) {
+                self.read_exact(tail)?;
+            }
         }
         Ok(out)
     }
