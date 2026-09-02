@@ -97,16 +97,23 @@ fn restart_throughput(criterion: &mut Criterion) {
 /// rebuild -- the queue is an ordered keyspace -- so the question becomes
 /// what an idle tick costs with that much pending behind it.
 ///
-/// **This one does not come out flat, and that is the finding.** `due`
-/// breaks out of its loop at the first row that is not due yet, but the
-/// scan underneath it (`ReadView::scan_from`) returns a `Vec`, so every
-/// pending row is read and collected before the first deadline is looked
-/// at. The break saves the JSON parse, not the read. Measured on one
-/// machine: 23 us at 100 pending, 284 us at 1,000, 3.1 ms at 10,000 --
-/// linear in what is *pending*, on a tick that runs every 100 ms whether
-/// or not anything is due. Recorded as #348; the fix is an upper-bounded
-/// range scan, since the deadline is the leading part of the key and
-/// "everything due" is exactly a range ending at now.
+/// **This is the one that came out wrong, and finding it is what the
+/// benchmark was for.** `due` breaks out of its loop at the first row
+/// that is not due yet, but the scan underneath it (`ReadView::scan_from`)
+/// returned a `Vec`, so every pending row was read and collected before
+/// the first deadline was looked at: the break saved the JSON parse, not
+/// the read. Measured on one machine: 23 us at 100 pending, 284 us at
+/// 1,000, 3.1 ms at 10,000 -- linear in what is *pending*, on a tick that
+/// runs every 100 ms whether or not anything is due. Filed as #348.
+///
+/// Fixed in #350: the deadline is the leading part of the key, so
+/// "everything due" is exactly a range ending at now, and `due` asks for
+/// that range through `ReadView::scan_until` instead of for the whole
+/// prefix. It is flat across these sizes now -- the numbers are in
+/// `docs/benchmarks.md` -- so what this benchmark measures today is that
+/// it stays that way. The cheap guard is the row count rather than the
+/// clock: `delayed::restart_hot_path_tests` fails on the regression in
+/// CI, and this reports what it costs.
 fn idle_tick(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("delayed/idle_tick");
     for pending in [100_usize, 1_000, 10_000] {

@@ -1266,9 +1266,9 @@ apart — the tick — so every one of them fell at the same phase and the row
 reported 8 ms where the truth was 98. Deadlines now carry a sub-tick
 offset so every size samples tick phase evenly.
 
-### The idle tick does not hold, and that is the finding
+### The idle tick did not hold, and that is the finding
 
-What the fire loop pays on a tick when *nothing* is due:
+What the fire loop paid on a tick when *nothing* was due, before the fix:
 
 | pending delays | one idle tick |
 |---|---|
@@ -1278,18 +1278,44 @@ What the fire loop pays on a tick when *nothing* is due:
 
 Linear in what is pending. `Delayed::due` walks the queue in deadline order
 and breaks at the first row that is not due, but the scan underneath it
-returns a `Vec`, so every pending row is read and collected before the
-first deadline is examined. The break saves the JSON parse, not the read.
-A server holding 10,000 pending delays therefore spends about 3% of a core
-discovering it has nothing to do, every 100 ms, for as long as the calls
-last.
+returned a `Vec`, so every pending row was read and collected before the
+first deadline was examined. The break saves the JSON parse, not the read.
+A server holding 10,000 pending delays therefore spent about 3% of a core
+discovering it had nothing to do, every 100 ms, for as long as the calls
+lasted.
 
-Filed as #348 with the fix: the deadline is the leading part of the key, so
-"everything due" is a bounded key range and the read can be made
-proportional to what fires rather than to what is pending. The benchmark
-stays as the before-and-after evidence.
+Filed as #348, fixed in #350: the deadline is the leading part of the key,
+so "everything due" is exactly a key range ending at now. `ReadView` grew
+an upper-bounded `scan_until`, and `due` asks for that range instead of for
+the whole prefix.
+
+### And with the bound, flat
+
+Re-measured on the same machine, in a later sitting — so read the shape
+across the column rather than comparing the absolute figures against the
+tables above, which were collected in the first sitting:
+
+| pending delays | before | after |
+|---|---|---|
+| 100 | 23.4 µs | 759 ns |
+| 1,000 | 284 µs | 796 ns |
+| 10,000 | 3.12 ms | 854 ns |
+
+Flat where it was linear: the tick now costs what it costs to look at the
+first key, not what it costs to read everything behind it. The `firing_tick`
+row is unchanged, as intended — work proportional to what fires is the cost
+the design accepts, and the fix was never about that.
+
+What guards it is a row count rather than a clock, following the
+`read_budget.rs` convention: `an_idle_tick_does_not_read_the_pending_queue`
+schedules 200 delays, none due for an hour, ticks once, and fails if the
+store's scanned-row counter moved by 200 or more — which is the count the
+unbounded scan produced. A timing assertion would measure the runner's mood
+and would not say what went wrong; the count says exactly which property
+broke. `a_due_tick_still_sees_everything_at_or_before_it` sits beside it so
+the first test cannot be satisfied by a `due` that reads nothing at all.
 
 This is the case for attaching benchmarks to performance claims rather
 than asserting them. Two of the three came out as designed; the third had
 been wrong since it was written, in a loop that runs forever, and no test
-would have noticed because nothing about it is incorrect — only slow.
+would have noticed because nothing about it was incorrect — only slow.

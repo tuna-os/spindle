@@ -120,9 +120,15 @@ MILESTONES = [
      "loses the bumps and a delay fires early, never late, which is the "
      "direction a dead-man's switch should fail in. MSC4309 reports "
      "finished delays on `/sync` under the unstable name, capped per user "
-     "and evicted oldest-first. What #36 still owes is its three "
-     "benchmarks: restart throughput at 10/100/1000, firing jitter "
-     "p50/p99, and reload at 10k. #37–#41 are not started; #269 would run "
+     "and evicted oldest-first. #36's three benchmarks are collected and "
+     "published (docs/benchmarks.md): `restart` is flat from 10 to 1,000 "
+     "live delays and writes nothing, firing jitter is set by the tick "
+     "rather than by the size, and the third — the reload at 10k — found "
+     "the fire loop reading every pending row on every idle tick (#348, "
+     "fixed in #350: 3.12 ms to 854 ns at ten thousand pending, flat "
+     "where it was linear). What #36 still owes is the comparison against "
+     "a Synapse deployment with MSC4140 enabled, which waits on #42's "
+     "rig. #37–#41 are not started; #269 would run "
      "Element Call's own Playwright suite against this server."),
 ]
 
