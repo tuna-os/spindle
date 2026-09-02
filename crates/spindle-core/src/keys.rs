@@ -382,6 +382,21 @@ pub fn published_rooms_prefix() -> Vec<u8> {
     vec![KEY_SCHEMA_VERSION, Keyspace::PublishedRoom as u8]
 }
 
+/// The first `u16::MAX` bytes of `value`, and how many that is.
+///
+/// Every variable-length component here sits behind a two-byte length, so
+/// this is the most of a value a key can carry, and a longer one is cut
+/// here rather than overflowing the prefix. Nothing on the wire gets close:
+/// Matrix caps user IDs at 255 bytes and room IDs are not much longer. The
+/// cut is what makes the encoding total, so it is written once and named,
+/// and the one thing it costs -- two values that agree on their first
+/// 65,535 bytes share a key -- is stated here rather than implied at ten
+/// call sites.
+fn framed(value: &[u8]) -> (u16, &[u8]) {
+    let kept = value.get(..usize::from(u16::MAX)).unwrap_or(value);
+    (u16::try_from(kept.len()).unwrap_or(u16::MAX), kept)
+}
+
 /// Recover the room ID from a key [`room_prefix`] built.
 ///
 /// Here rather than at the call site because the layout -- a schema byte, a
@@ -424,12 +439,12 @@ pub fn from_order_preserving(bytes: [u8; 8]) -> i64 {
 #[must_use]
 pub fn room_prefix(keyspace: Keyspace, room_id: &str) -> Vec<u8> {
     let room = room_id.as_bytes();
-    let len = u16::try_from(room.len()).unwrap_or(u16::MAX);
+    let (len, room) = framed(room);
     let mut key = Vec::with_capacity(4 + room.len());
     key.push(KEY_SCHEMA_VERSION);
     key.push(keyspace as u8);
     key.extend_from_slice(&len.to_be_bytes());
-    key.extend_from_slice(&room[..len as usize]);
+    key.extend_from_slice(room);
     key
 }
 
@@ -566,12 +581,12 @@ pub fn relation(room_id: &str, target: &str, li: LinearIndex) -> Vec<u8> {
 #[must_use]
 pub fn user_prefix(keyspace: Keyspace, user_id: &str) -> Vec<u8> {
     let user = user_id.as_bytes();
-    let len = u16::try_from(user.len()).unwrap_or(u16::MAX);
+    let (len, user) = framed(user);
     let mut key = Vec::with_capacity(4 + user.len());
     key.push(KEY_SCHEMA_VERSION);
     key.push(keyspace as u8);
     key.extend_from_slice(&len.to_be_bytes());
-    key.extend_from_slice(&user[..len as usize]);
+    key.extend_from_slice(user);
     key
 }
 
@@ -621,10 +636,10 @@ pub fn account_data(user_id: &str, room_id: &str, event_type: &str) -> Vec<u8> {
 #[must_use]
 pub fn account_data_prefix(user_id: &str, room_id: &str) -> Vec<u8> {
     let room = room_id.as_bytes();
-    let len = u16::try_from(room.len()).unwrap_or(u16::MAX);
+    let (len, room) = framed(room);
     let mut key = user_prefix(Keyspace::AccountData, user_id);
     key.extend_from_slice(&len.to_be_bytes());
-    key.extend_from_slice(&room[..len as usize]);
+    key.extend_from_slice(room);
     key
 }
 
@@ -650,12 +665,12 @@ pub fn account_data_type(user_id: &str, room_id: &str, key: &[u8]) -> Option<Str
 #[must_use]
 pub fn alias(room_alias: &str) -> Vec<u8> {
     let alias = room_alias.as_bytes();
-    let len = u16::try_from(alias.len()).unwrap_or(u16::MAX);
+    let (len, alias) = framed(alias);
     let mut key = Vec::with_capacity(4 + alias.len());
     key.push(KEY_SCHEMA_VERSION);
     key.push(Keyspace::Alias as u8);
     key.extend_from_slice(&len.to_be_bytes());
-    key.extend_from_slice(&alias[..len as usize]);
+    key.extend_from_slice(alias);
     key
 }
 
@@ -679,12 +694,12 @@ pub fn alias_from_key(key: &[u8]) -> Option<String> {
 #[must_use]
 pub fn media(media_id: &str) -> Vec<u8> {
     let id = media_id.as_bytes();
-    let len = u16::try_from(id.len()).unwrap_or(u16::MAX);
+    let (len, id) = framed(id);
     let mut key = Vec::with_capacity(4 + id.len());
     key.push(KEY_SCHEMA_VERSION);
     key.push(Keyspace::Media as u8);
     key.extend_from_slice(&len.to_be_bytes());
-    key.extend_from_slice(&id[..len as usize]);
+    key.extend_from_slice(id);
     key
 }
 
@@ -712,9 +727,9 @@ pub fn transaction(user_id: &str, device_id: &str, txn_id: &str) -> Vec<u8> {
     let mut key = user_prefix(Keyspace::Transaction, user_id);
     for part in [device_id, txn_id] {
         let bytes = part.as_bytes();
-        let len = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
+        let (len, bytes) = framed(bytes);
         key.extend_from_slice(&len.to_be_bytes());
-        key.extend_from_slice(&bytes[..len as usize]);
+        key.extend_from_slice(bytes);
     }
     key
 }
@@ -729,9 +744,9 @@ pub fn transaction(user_id: &str, device_id: &str, txn_id: &str) -> Vec<u8> {
 pub fn device_scoped(keyspace: Keyspace, user_id: &str, device_id: &str, suffix: &[u8]) -> Vec<u8> {
     let mut key = user_prefix(keyspace, user_id);
     let device = device_id.as_bytes();
-    let len = u16::try_from(device.len()).unwrap_or(u16::MAX);
+    let (len, device) = framed(device);
     key.extend_from_slice(&len.to_be_bytes());
-    key.extend_from_slice(&device[..len as usize]);
+    key.extend_from_slice(device);
     key.extend_from_slice(suffix);
     key
 }
@@ -754,9 +769,9 @@ pub fn key_backup_data(user_id: &str, version: u64, room_id: &str, session_id: &
     key.extend_from_slice(&version.to_be_bytes());
     for part in [room_id, session_id] {
         let bytes = part.as_bytes();
-        let len = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
+        let (len, bytes) = framed(bytes);
         key.extend_from_slice(&len.to_be_bytes());
-        key.extend_from_slice(&bytes[..len as usize]);
+        key.extend_from_slice(bytes);
     }
     key
 }
@@ -790,9 +805,9 @@ pub fn federation_outbox(destination: &str, seq: u64) -> Vec<u8> {
 pub fn federation_outbox_prefix(destination: &str) -> Vec<u8> {
     let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::FederationOutbox as u8];
     let bytes = destination.as_bytes();
-    let len = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
+    let (len, bytes) = framed(bytes);
     key.extend_from_slice(&len.to_be_bytes());
-    key.extend_from_slice(&bytes[..len as usize]);
+    key.extend_from_slice(bytes);
     key
 }
 
@@ -816,9 +831,9 @@ pub fn federation_txn(origin: &str, txn_id: &str) -> Vec<u8> {
     let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::FederationTxn as u8];
     for part in [origin, txn_id] {
         let bytes = part.as_bytes();
-        let len = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
+        let (len, bytes) = framed(bytes);
         key.extend_from_slice(&len.to_be_bytes());
-        key.extend_from_slice(&bytes[..len as usize]);
+        key.extend_from_slice(bytes);
     }
     key
 }

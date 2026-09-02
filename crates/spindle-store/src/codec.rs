@@ -218,7 +218,7 @@ impl Cursor<'_> {
     }
 
     fn byte(&mut self) -> Result<u8, CodecError> {
-        Ok(self.take(1)?[0])
+        self.take(1)?.first().copied().ok_or(CodecError::Truncated)
     }
 
     fn array<const N: usize>(&mut self) -> Result<[u8; N], CodecError> {

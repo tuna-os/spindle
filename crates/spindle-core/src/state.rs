@@ -243,7 +243,8 @@ impl Node {
             } if leaf_digest == digest => entries
                 .binary_search_by(|(candidate, _)| candidate.cmp(key))
                 .ok()
-                .map(|index| entries[index].1.as_ref()),
+                .and_then(|index| entries.get(index))
+                .map(|(_, value)| value.as_ref()),
             Self::Leaf { .. } => None,
             Self::Branch {
                 bitmap, children, ..
@@ -254,7 +255,7 @@ impl Node {
                     return None;
                 }
                 let index = (bitmap & (bit - 1)).count_ones() as usize;
-                children[index].get(key, digest, depth + 1)
+                children.get(index)?.get(key, digest, depth + 1)
             }
         }
     }
@@ -276,7 +277,11 @@ impl Node {
                 let mut merged = entries.to_vec();
                 for (key, value) in incoming_entries.iter() {
                     match merged.binary_search_by(|(candidate, _)| candidate.cmp(key)) {
-                        Ok(index) => merged[index].1.clone_from(value),
+                        Ok(index) => {
+                            if let Some(slot) = merged.get_mut(index) {
+                                slot.1.clone_from(value);
+                            }
+                        }
                         Err(index) => merged.insert(index, (key.clone(), value.clone())),
                     }
                 }
@@ -299,7 +304,9 @@ impl Node {
                     next.insert(index, incoming);
                     Arc::new(Self::branch(bitmap | bit, next))
                 } else {
-                    next[index] = next[index].insert(incoming, depth + 1);
+                    if let Some(slot) = next.get_mut(index) {
+                        *slot = slot.insert(incoming, depth + 1);
+                    }
                     Arc::new(Self::branch(*bitmap, next))
                 }
             }
@@ -363,9 +370,13 @@ fn digest_slot(digest: &[u8; 32], depth: usize) -> u32 {
     let bit_offset = depth * 5;
     let byte = bit_offset / 8;
     let shift = bit_offset % 8;
-    let mut window = u16::from(digest[byte]) >> shift;
+    // `get` rather than an index: `byte` is below 32 for every depth the
+    // assertion above admits, and this is a hash-walk, not a place to bet
+    // the process on an assertion that only fires in debug builds.
+    let at = |index: usize| u16::from(digest.get(index).copied().unwrap_or(0));
+    let mut window = at(byte) >> shift;
     if shift > 3 && byte + 1 < digest.len() {
-        window |= u16::from(digest[byte + 1]) << (8 - shift);
+        window |= at(byte + 1) << (8 - shift);
     }
     u32::from(window & 0x1f)
 }
