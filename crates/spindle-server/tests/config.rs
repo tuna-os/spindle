@@ -279,3 +279,47 @@ fn the_delayed_event_caps_default_without_the_section() {
     assert_eq!(config.delayed_events.max_delay_ms, 24 * 60 * 60 * 1000);
     assert_eq!(config.delayed_events.max_per_room, 100);
 }
+
+/// A transport this server cannot render is refused at startup (#37).
+///
+/// The reason is the missing feedback path: a focus is advertised to
+/// clients and never used here, so a wrong entry fails in somebody's
+/// browser, mid-call, as "no transport", with nothing in this server's log
+/// to connect it to the config file. Everything checkable is therefore
+/// checked at load, where the operator is still watching.
+#[test]
+fn an_unusable_rtc_transport_is_refused_at_startup() {
+    for (foci, expected) in [
+        (
+            r#"{ type = "janus", livekit_service_url = "https://livekit.example.org/jwt" }"#,
+            "only \"livekit\"",
+        ),
+        (r#"{ type = "livekit" }"#, "needs livekit_service_url"),
+        (
+            r#"{ type = "livekit", livekit_service_url = "livekit.example.org" }"#,
+            "is not an http(s) URL",
+        ),
+    ] {
+        let error = parse(&format!(
+            "[server]\nname = \"example.org\"\n[rtc]\nfoci = [{foci}]\n"
+        ))
+        .expect_err("an unusable transport must not start the server");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("rtc.foci"),
+            "the refusal names the field to fix: {rendered}"
+        );
+        assert!(
+            rendered.contains(expected),
+            "and says what is wrong with it: {rendered}"
+        );
+    }
+}
+
+/// The section is optional and its absence is a working configuration: no
+/// backend is what most deployments have, and it must not be a parse error.
+#[test]
+fn no_rtc_section_means_no_transports() {
+    let config = parse("[server]\nname = \"example.org\"\n").expect("no section is fine");
+    assert!(config.rtc.foci.is_empty());
+}

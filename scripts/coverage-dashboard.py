@@ -128,8 +128,18 @@ MILESTONES = [
      "fixed in #350: 3.12 ms to 854 ns at ten thousand pending, flat "
      "where it was linear). What #36 still owes is the comparison against "
      "a Synapse deployment with MSC4140 enabled, which waits on #42's "
-     "rig. #37–#41 are not started; #269 would run "
-     "Element Call's own Playwright suite against this server."),
+     "rig. #37 is served too: MatrixRTC transport discovery (MSC4143) on "
+     "both the stable and the unstable path, and the same backends named "
+     "unauthenticated in `.well-known` — one renderer behind both, because "
+     "a client reads well-known before it has a token and the endpoint "
+     "after it, and a deployment whose two answers disagree is one where a "
+     "call works or does not depending on which the client believed. A "
+     "server with no backend answers an empty list rather than a 404: the "
+     "endpoint's presence is the claim to implement the MSC, and the list "
+     "is what it currently has. MSC4158 needed nothing separate — it was "
+     "folded into MSC4143 and closed, so the well-known key is "
+     "`org.matrix.msc4143.rtc_foci`. #38–#41 are not started; #269 would "
+     "run Element Call's own Playwright suite against this server."),
 ]
 
 # ---------------------------------------------------------------------------

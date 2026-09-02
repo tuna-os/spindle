@@ -153,6 +153,14 @@ pub const UNSTABLE_FEATURES: &[(&str, bool)] = &[
     // expected to fall back to leaving a stale membership behind. So the
     // advertisement is not decoration: it changes what clients do.
     ("org.matrix.msc4140", true),
+    // MSC4143's MatrixRTC discovery. Advertised unconditionally, because
+    // the flag answers "does this server serve /rtc/transports", not "does
+    // it have a backend to name": the endpoint is served either way and
+    // answers an empty list when nothing is configured. Reporting `false`
+    // for an unconfigured deployment would tell a client the server has not
+    // implemented the MSC, which is a different and untrue thing -- and
+    // would leave the client with no way to distinguish the two.
+    ("org.matrix.msc4143", true),
 ];
 
 #[must_use]
