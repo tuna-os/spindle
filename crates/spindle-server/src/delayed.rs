@@ -32,7 +32,7 @@
 //!
 //! [`Keyspace::DelayedEventById`]: spindle_core::keys::Keyspace::DelayedEventById
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -658,14 +658,25 @@ impl Delayed {
 /// down when that time passed finds it due the moment it reads the keyspace,
 /// and sends it then. That is the restart case working, not a special case
 /// for it.
+///
+/// Holds its collaborators weakly and ends when they are gone, for the reason
+/// `spawn_delivery_loops` gives: the store must never be dropped for the last
+/// time inside a cancelled task.
 pub async fn fire_loop(
-    delayed: Arc<Delayed>,
-    rooms: Arc<Rooms>,
-    key: Arc<crate::signing::ServerKey>,
+    delayed: Weak<Delayed>,
+    rooms: Weak<Rooms>,
+    key: Weak<crate::signing::ServerKey>,
     tick: Duration,
 ) {
     loop {
         tokio::time::sleep(tick).await;
+        // Upgraded for one tick and released before the next sleep, which is
+        // the only point this task can be cancelled at: nothing here awaits.
+        let (Some(delayed), Some(rooms), Some(key)) =
+            (delayed.upgrade(), rooms.upgrade(), key.upgrade())
+        else {
+            return;
+        };
         let now = Delayed::now_ms();
         let Ok(due) = delayed.due(now) else {
             continue;
