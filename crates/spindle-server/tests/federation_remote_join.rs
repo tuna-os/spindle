@@ -608,10 +608,52 @@ async fn the_whole_restricted_room_sequence_holds_across_two_servers() {
             Some(&json!({ "user_id": bob_id })),
         )
         .await;
-    assert_eq!(status, 200, "PROBE invite: {body}");
+    assert_eq!(status, 200, "the invite is accepted: {body}");
     // Complement joins immediately after inviting, with no wait.
     let (status, body) = local.join_via(&room, &bob, &remote.name).await;
-    assert_eq!(status, 200, "PROBE join right after the invite: {body}");
+    assert_eq!(status, 200, "the join right after the invite: {body}");
+
+    // 5. fail with mangled join rules -- and be judged against rules that
+    // are current somewhere. Complement waits for nothing here beyond
+    // alice seeing her own event, so neither does this: the leave, the
+    // rejoin of the allowed room and the rule change are all in flight
+    // against each other, which is the window #342 lives in.
+    let (status, body) = local
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/rooms/{room}/leave"),
+            Some(&bob),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "leaving the room again: {body}");
+    assert_eq!(local.join_via(&space, &bob, &remote.name).await.0, 200);
+    let (status, body) = remote
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.join_rules/"),
+            Some(&alice),
+            Some(&json!({ "join_rule": "restricted", "allow": ["invalid"] })),
+        )
+        .await;
+    assert_eq!(status, 200, "mangling the join rules: {body}");
+    let (status, body) = local.join_via(&room, &bob, &remote.name).await;
+    if status == 200 {
+        // What the joining server believed at the moment it said yes: the
+        // two facts that decide the restricted rule.
+        let (_, rules) = local
+            .request(
+                reqwest::Method::GET,
+                &format!("/_matrix/client/v3/rooms/{room}/state/m.room.join_rules/"),
+                Some(&bob),
+                None,
+            )
+            .await;
+        let member = local.member_event(&room, &bob, &bob_id).await;
+        panic!(
+            "a join the resident would refuse was answered locally: {body}\nrules: {rules}\nmember: {member}"
+        );
+    }
 }
 
 #[tokio::test]
