@@ -2432,6 +2432,7 @@ dependencies = [
  "axum",
  "axum-server",
  "blake3",
+ "criterion",
  "form_urlencoded",
  "hmac",
  "image",

@@ -25,16 +25,23 @@ COPY crates/spindle-core/Cargo.toml crates/spindle-core/
 COPY crates/spindle-store/Cargo.toml crates/spindle-store/
 COPY crates/spindle-server/Cargo.toml crates/spindle-server/
 RUN mkdir -p crates/spindle-core/src crates/spindle-store/src \
-             crates/spindle-server/src crates/spindle-core/benches \
+             crates/spindle-server/src \
     && touch crates/spindle-core/src/lib.rs \
              crates/spindle-store/src/lib.rs \
              crates/spindle-server/src/lib.rs \
     && echo 'fn main() {}' > crates/spindle-server/src/main.rs \
-    # spindle-core declares its benches explicitly, and cargo refuses to
-    # parse a manifest whose named target has no file — even for a build
-    # that would never compile them.
-    && for bench in fork_window state_snapshot state_res_comparison; do \
-         echo 'fn main() {}' > "crates/spindle-core/benches/$bench.rs"; \
+    # Benches are declared explicitly in these manifests, and cargo refuses
+    # to parse one whose named target has no file — even for a build that
+    # would never compile them. Read the names out of the manifest rather
+    # than listing them here: a hardcoded list makes adding a bench break
+    # this build, which is exactly what it did (#349), and contradicts what
+    # the note above promises about the cost of forgetting to update it.
+    && for crate in spindle-core spindle-server; do \
+         mkdir -p "crates/$crate/benches"; \
+         awk '/^\[\[bench\]\]/{want=1;next} want&&/^name/{sub(/^name[ ]*=[ ]*"/,"");sub(/".*/,"");print;want=0}' "crates/$crate/Cargo.toml" \
+           | while read -r bench; do \
+               echo 'fn main() {}' > "crates/$crate/benches/$bench.rs"; \
+             done; \
        done \
     && cargo build --release --locked --bin spindle
 
