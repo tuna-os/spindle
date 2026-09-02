@@ -320,6 +320,15 @@ pub enum Keyspace {
     /// [`account_data`] gives: without it two different (app, key) pairs
     /// could spell the same bytes.
     Pusher = 0x2f,
+    /// `(user_id, room_id, li)` -> the membership `user_id` took at `li`.
+    ///
+    /// A user's membership *history* in a room, one row per member event,
+    /// ordered by position. `joined` and `invited` history visibility ask
+    /// what the caller's membership was as of each event, which the
+    /// current membership cannot answer for anyone who joined, left and
+    /// joined again -- and a scan of the room to reconstruct it is exactly
+    /// the whole-room read every hot path here avoids.
+    MemberHistory = 0x30,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -887,6 +896,40 @@ pub fn pusher(user_id: &str, app_id: &str, pushkey: &str) -> Vec<u8> {
 #[must_use]
 pub fn pusher_prefix(user_id: &str) -> Vec<u8> {
     user_prefix(Keyspace::Pusher, user_id)
+}
+
+/// `(user_id, room_id, li)` key for [`Keyspace::MemberHistory`].
+#[must_use]
+pub fn member_history(user_id: &str, room_id: &str, li: i64) -> Vec<u8> {
+    let mut key = member_history_prefix(user_id, room_id);
+    key.extend_from_slice(&order_preserving(li));
+    key
+}
+
+/// The prefix every membership-history row for one user in one room shares.
+///
+/// The room ID is length-prefixed for the reason [`account_data_prefix`]
+/// gives: a position follows it, and two rooms must not be able to spell
+/// one key between them.
+#[must_use]
+pub fn member_history_prefix(user_id: &str, room_id: &str) -> Vec<u8> {
+    let (len, room) = framed(room_id.as_bytes());
+    let mut key = user_prefix(Keyspace::MemberHistory, user_id);
+    key.extend_from_slice(&len.to_be_bytes());
+    key.extend_from_slice(room);
+    key
+}
+
+/// The position a [`member_history`] key ends with, for that user and room.
+///
+/// `None` unless the key really is theirs, for the reason
+/// [`room_from_user_room`] gives.
+#[must_use]
+pub fn member_history_li(user_id: &str, room_id: &str, key: &[u8]) -> Option<i64> {
+    let prefix = member_history_prefix(user_id, room_id);
+    let rest = key.strip_prefix(prefix.as_slice())?;
+    let bytes: [u8; 8] = rest.get(..8)?.try_into().ok()?;
+    Some(from_order_preserving(bytes))
 }
 
 /// The prefix every filter key for one user shares.

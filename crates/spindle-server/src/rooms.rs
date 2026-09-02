@@ -1678,12 +1678,32 @@ impl Rooms {
         limit: usize,
         bound: Option<i64>,
     ) -> Result<Context, RoomError> {
+        self.context_visible(room_id, event_id, limit, &|li| {
+            bound.is_none_or(|bound| li <= bound)
+        })
+    }
+
+    /// As [`Self::context_within`], with the positions `visible` admits: a
+    /// target the caller may not see is absent, and both halves of the
+    /// window skip what they may not see (#268).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::MissingBody`] if the event is absent from the
+    /// room or outside what the caller may see.
+    pub fn context_visible(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        limit: usize,
+        visible: &(dyn Fn(i64) -> bool + Sync),
+    ) -> Result<Context, RoomError> {
         let found = self.with_room_read(room_id, |_, log| {
             let Some(entry) = log.get(&EventId::new(event_id)) else {
                 return Ok(None);
             };
             let target = entry.li.get();
-            if bound.is_some_and(|bound| target > bound) {
+            if !visible(target) {
                 return Ok(None);
             }
             let state_root = entry.state_root;
@@ -1693,14 +1713,13 @@ impl Rooms {
             let before: Vec<String> = log
                 .entries()
                 .rev()
-                .filter(|entry| entry.li.get() < target)
+                .filter(|entry| entry.li.get() < target && visible(entry.li.get()))
                 .take(limit)
                 .map(|entry| entry.event_id.as_str().to_owned())
                 .collect();
             let after: Vec<String> = log
                 .entries()
-                .filter(|entry| entry.li.get() > target)
-                .filter(|entry| bound.is_none_or(|bound| entry.li.get() <= bound))
+                .filter(|entry| entry.li.get() > target && visible(entry.li.get()))
                 .take(limit)
                 .map(|entry| entry.event_id.as_str().to_owned())
                 .collect();
@@ -2785,6 +2804,30 @@ impl Rooms {
         limit: usize,
         bound: Option<i64>,
     ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
+        self.messages_visible(room_id, from, limit, &|li| {
+            bound.is_none_or(|bound| li <= bound)
+        })
+    }
+
+    /// As [`Self::messages`], showing only the positions `visible` admits.
+    ///
+    /// The general form of the bound above: `joined` and `invited` history
+    /// visibility admit a former member to several stretches of the room
+    /// rather than one prefix of it (#268), and the predicate is what those
+    /// stretches compile to. Positions refused are skipped, not stopped
+    /// at, so a page walks on past a gap to the next stretch the caller
+    /// may see; the `next` token is the position after the last one taken.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
+    pub fn messages_visible(
+        &self,
+        room_id: &str,
+        from: Option<i64>,
+        limit: usize,
+        visible: &(dyn Fn(i64) -> bool + Sync),
+    ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
         // Against the open log, not a fresh `load()`. Reloading rebuilt the
         // whole `RoomLog` from storage on every page, which made the one
         // endpoint SPEC §10.4 calls "a reverse range scan ... that is the
@@ -2799,7 +2842,7 @@ impl Rooms {
                 if from.is_some_and(|from| li >= from) {
                     continue;
                 }
-                if bound.is_some_and(|bound| li > bound) {
+                if !visible(li) {
                     continue;
                 }
                 if wanted.len() == limit {
@@ -3435,6 +3478,99 @@ impl Rooms {
             return Ok(None);
         };
         Ok(Some((self.event(room_id, &event_id)?, li)))
+    }
+
+    /// The stretches of `room_id` during which `user_id` could see it:
+    /// `(first, last)` positions, inclusive, one per stint. A stint opens at
+    /// the join (or, with `from_invite`, the invite) and closes at the
+    /// event that ended it, which the member themselves may still see; a
+    /// stint still open closes at `i64::MAX`.
+    ///
+    /// This is what `joined` and `invited` history visibility mean: the
+    /// caller's membership *as of each event*, which for someone who
+    /// joined, left and joined again is several intervals, not one bound.
+    ///
+    /// Read from the membership-history index. A room that predates the
+    /// index has no rows for its earlier members, so a user with a member
+    /// event and no history is backfilled once, by the whole-room walk the
+    /// index exists to avoid, and never again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the index or the room cannot be read.
+    pub fn membership_intervals(
+        &self,
+        room_id: &str,
+        user_id: &str,
+        from_invite: bool,
+    ) -> Result<Vec<(i64, i64)>, RoomError> {
+        let mut rows = self.member_history(room_id, user_id)?;
+        if rows.is_empty() && self.membership_event(room_id, user_id)?.is_some() {
+            self.backfill_member_history(room_id, user_id)?;
+            rows = self.member_history(room_id, user_id)?;
+        }
+        let mut intervals = Vec::new();
+        let mut open: Option<i64> = None;
+        for (li, membership) in rows {
+            let inside = membership == JOIN_STR || (from_invite && membership == INVITE_STR);
+            match (inside, open) {
+                (true, None) => open = Some(li),
+                (false, Some(start)) => {
+                    intervals.push((start, li));
+                    open = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(start) = open {
+            intervals.push((start, i64::MAX));
+        }
+        Ok(intervals)
+    }
+
+    /// `(li, membership)` for every member event of `user_id` in `room_id`
+    /// the index holds, oldest first.
+    fn member_history(
+        &self,
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<Vec<(i64, String)>, RoomError> {
+        let prefix = spindle_core::keys::member_history_prefix(user_id, room_id);
+        let rows = spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let li = spindle_core::keys::member_history_li(user_id, room_id, &key)?;
+                Some((li, String::from_utf8_lossy(&value).into_owned()))
+            })
+            .collect())
+    }
+
+    /// Fill the membership-history index for one user in one room from the
+    /// log itself. One whole-room walk, for a room older than the index.
+    fn backfill_member_history(&self, room_id: &str, user_id: &str) -> Result<(), RoomError> {
+        let ids: Vec<(i64, String)> = self.with_room_read(room_id, |_, log| {
+            Ok(log
+                .entries()
+                .map(|entry| (entry.li.get(), entry.event_id.as_str().to_owned()))
+                .collect())
+        })?;
+        for (li, event_id) in ids {
+            let Ok(event) = self.read_event(room_id, &EventId::new(event_id.as_str())) else {
+                continue; // purged: its membership, if any, is beyond recovering
+            };
+            if event["type"] != "m.room.member" || event["state_key"] != user_id {
+                continue;
+            }
+            if let Some(membership) = event["content"]["membership"].as_str() {
+                spindle_store::Store::put(
+                    self.store.as_ref(),
+                    &spindle_core::keys::member_history(user_id, room_id, li),
+                    membership.as_bytes(),
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Where `user_id` left `room_id`, if they are a former member.
@@ -4599,7 +4735,10 @@ impl Rooms {
                 continue; // persist_entry indexed the join itself
             }
             let event = self.read_event(room_id, &EventId::new(id.as_str()))?;
-            self.index_membership(room_id, Some(&user), &event["content"])?;
+            let li = log
+                .get(&EventId::new(id.as_str()))
+                .map_or(0, |entry| entry.li.get());
+            self.index_membership(room_id, Some(&user), &event["content"], li)?;
         }
 
         open.insert(room_id.to_owned(), Arc::new(RwLock::new(log)));
@@ -4873,7 +5012,7 @@ impl Rooms {
         // an event that landed: writing it before the commit would leave a
         // user joined to a room whose membership event was never stored.
         if input.event_type == "m.room.member" {
-            self.index_membership(room_id, input.state_key, input.content)?;
+            self.index_membership(room_id, input.state_key, input.content, entry.li.get())?;
         }
         self.appended.notify_waiters();
         Ok(())
@@ -4890,6 +5029,7 @@ impl Rooms {
         room_id: &str,
         state_key: Option<&str>,
         content: &Value,
+        li: i64,
     ) -> Result<(), RoomError> {
         let (Some(user_id), Some(membership)) = (state_key, content["membership"].as_str()) else {
             return Ok(());
@@ -4901,6 +5041,14 @@ impl Rooms {
                 user_id,
                 room_id,
             ),
+            membership.as_bytes(),
+        )?;
+        // And the same fact filed by position, so that "what was this
+        // user's membership as of that event" is a prefix scan rather than
+        // a walk of the room (#268).
+        spindle_store::Store::put(
+            self.store.as_ref(),
+            &spindle_core::keys::member_history(user_id, room_id, li),
             membership.as_bytes(),
         )?;
         // Being brought back into a room undoes forgetting it, and this is the
