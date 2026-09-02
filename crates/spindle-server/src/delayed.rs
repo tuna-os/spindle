@@ -520,7 +520,14 @@ impl Delayed {
     /// Returns a store error if the keyspace cannot be read.
     pub fn due(&self, now_ms: u64) -> Result<Vec<DelayedEvent>, DelayError> {
         let prefix = spindle_core::keys::delayed_event_prefix();
-        let rows = self.store.scan_from(&prefix, &prefix)?;
+        // Bounded at `now`, not run to the end of the queue: the deadline
+        // leads the key, so everything due is a range, and scanning past
+        // it read every pending delay on a tick with nothing to do (#348).
+        let rows = self.store.scan_until(
+            &prefix,
+            &prefix,
+            &spindle_core::keys::delayed_event_due_end(now_ms),
+        )?;
         let mut out = Vec::new();
         for (key, raw) in rows {
             let Some(fire_at) = key
@@ -932,6 +939,60 @@ mod restart_hot_path_tests {
         assert!(
             delayed.list("@alice:example.org").unwrap().is_empty(),
             "nothing is listed"
+        );
+    }
+
+    /// An idle tick reads what is due, not what is pending (#348).
+    ///
+    /// Counted rather than timed, for the reason `read_budget.rs` gives:
+    /// a timing assertion on CI measures the runner's mood, where a row
+    /// count measures the thing the fix is about. The queue is keyed by
+    /// deadline, so a tick with nothing due should touch no rows at all
+    /// however many delays are waiting behind the bound -- before the
+    /// bounded scan this read every one of them.
+    #[test]
+    fn an_idle_tick_does_not_read_the_pending_queue() {
+        let (_dir, store, delayed) = delayed();
+        for number in 0..200 {
+            delayed
+                .schedule(
+                    "!room:example.org",
+                    &format!("@user{number}:example.org"),
+                    "m.room.message",
+                    None,
+                    &serde_json::json!({ "body": "hi" }),
+                    60 * 60 * 1000,
+                )
+                .unwrap();
+        }
+        let before = store.scanned();
+        let due = delayed.due(Delayed::now_ms()).unwrap();
+        let read = store.scanned() - before;
+
+        assert!(due.is_empty(), "none of them is due for an hour");
+        assert!(
+            read < 200,
+            "an idle tick read {read} rows with 200 pending: the scan is \
+             not bounded at the deadline"
+        );
+    }
+
+    /// And the bound admits what it should: a tick that *is* due still
+    /// sees every row at or before it, so the test above cannot pass by
+    /// reading nothing ever.
+    #[test]
+    fn a_due_tick_still_sees_everything_at_or_before_it() {
+        let (_dir, _store, delayed) = delayed();
+        let soon = schedule(&delayed, 1);
+        let later = schedule(&delayed, 60 * 60 * 1000);
+        let at = delayed.get(&soon, "@alice:example.org").unwrap().fire_at_ms;
+
+        let due = delayed.due(at).unwrap();
+        let ids: Vec<&str> = due.iter().map(|event| event.delay_id.as_str()).collect();
+        assert!(ids.contains(&soon.as_str()), "the row at the bound is due");
+        assert!(
+            !ids.contains(&later.as_str()),
+            "the row past the bound is not"
         );
     }
 }

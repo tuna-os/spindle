@@ -188,6 +188,30 @@ pub trait ReadView {
     ///
     /// Returns a backend error if the scan fails.
     fn scan_from(&self, prefix: &[u8], start: &[u8]) -> Result<Vec<Record>, StoreError>;
+
+    /// Entries whose key starts with `prefix`, sorts at or after `start`,
+    /// and sorts *before* `end`.
+    ///
+    /// [`Self::scan_from`]'s bounded sibling, for the case where the
+    /// boundary the caller cares about lies *inside* the prefix rather
+    /// than at its end. Running to the end of the prefix and stopping at
+    /// the first row past the boundary reads every later row first, which
+    /// is only free when there are none: the delayed-event queue is keyed
+    /// by deadline, so "everything due now" is a range whose end is a
+    /// deadline, and scanning to the end of the prefix meant reading every
+    /// *pending* delay on a tick that had nothing to do (#348).
+    ///
+    /// `end` is exclusive, and neither bound need be a stored key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the scan fails.
+    fn scan_until(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<Record>, StoreError>;
 }
 
 pub trait Store: ReadView {
@@ -770,6 +794,27 @@ impl ReadView for FjallStore {
         self.scanned.fetch_add(out.len() as u64, Ordering::Relaxed);
         Ok(out)
     }
+
+    fn scan_until(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<Record>, StoreError> {
+        let mut out = Vec::new();
+        for pair in self.partition.range(start.to_vec()..end.to_vec()) {
+            let (key, value) = pair.into_inner()?;
+            // The range already stops at `end`; the prefix check is what
+            // keeps an `end` above the prefix from walking into the next
+            // keyspace.
+            if !key.starts_with(prefix) {
+                break;
+            }
+            out.push((key.to_vec(), value.to_vec()));
+        }
+        self.scanned.fetch_add(out.len() as u64, Ordering::Relaxed);
+        Ok(out)
+    }
 }
 
 /// A Fjall read snapshot: every read sees the partition as of the sequence
@@ -804,6 +849,25 @@ impl ReadView for FjallCheckpoint {
     fn scan_from(&self, prefix: &[u8], start: &[u8]) -> Result<Vec<Record>, StoreError> {
         let mut out = Vec::new();
         for pair in self.0.range(&self.1, start.to_vec()..) {
+            let (key, value) = pair
+                .into_inner()
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            out.push((key.to_vec(), value.to_vec()));
+        }
+        Ok(out)
+    }
+
+    fn scan_until(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<Record>, StoreError> {
+        let mut out = Vec::new();
+        for pair in self.0.range(&self.1, start.to_vec()..end.to_vec()) {
             let (key, value) = pair
                 .into_inner()
                 .map_err(|error| StoreError::Backend(error.to_string()))?;

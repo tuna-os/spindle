@@ -521,6 +521,23 @@ pub fn delayed_event_prefix() -> Vec<u8> {
     vec![KEY_SCHEMA_VERSION, Keyspace::DelayedEvent as u8]
 }
 
+/// The exclusive upper bound of "every delayed event due at `now_ms`".
+///
+/// The deadline is the leading part of a [`delayed_event`] key, so every
+/// row due at or before `now_ms` sorts below the key a delay one
+/// millisecond later would take. That makes "what is due" a bounded range
+/// rather than a scan of the whole queue, which is what #348 was: a tick
+/// with nothing to do still read every pending row.
+///
+/// Saturating, so the far end of time asks for everything rather than
+/// wrapping to nothing.
+#[must_use]
+pub fn delayed_event_due_end(now_ms: u64) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::DelayedEvent as u8];
+    key.extend_from_slice(&now_ms.saturating_add(1).to_be_bytes());
+    key
+}
+
 /// The `delay_id` a [`delayed_event`] key ends in.
 #[must_use]
 pub fn delayed_event_id_from_key(key: &[u8]) -> Option<String> {
