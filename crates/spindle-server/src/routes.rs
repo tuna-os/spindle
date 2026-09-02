@@ -2079,20 +2079,14 @@ async fn federation_send(
     let key_map = if pdus.is_empty() {
         None
     } else {
-        Some(
-            state
-                .federation
-                .public_key_map(&origin)
-                .await
-                .map_err(|error| {
-                    tracing::debug!("cannot fetch {origin} keys: {error}");
-                    MatrixError::new(
-                        StatusCode::UNAUTHORIZED,
-                        "M_UNAUTHORIZED",
-                        "the origin's keys cannot be verified".to_owned(),
-                    )
-                })?,
-        )
+        Some(state.federation.peer_keys(&origin).await.map_err(|error| {
+            tracing::debug!("cannot fetch {origin} keys: {error}");
+            MatrixError::new(
+                StatusCode::UNAUTHORIZED,
+                "M_UNAUTHORIZED",
+                "the origin's keys cannot be verified".to_owned(),
+            )
+        })?)
     };
 
     let mut results = serde_json::Map::new();
@@ -2187,7 +2181,7 @@ fn report_refused_pdu(origin: &str, event_id: &str, pdu: &Value, reason: &str) {
 fn receive_one_pdu(
     state: &AppState,
     origin: &str,
-    key_map: Option<&ruma::signatures::PublicKeyMap>,
+    keys: Option<&crate::federation::PeerKeys>,
     pdu: &Value,
 ) -> (String, Result<(), String>) {
     use ruma::CanonicalJsonValue;
@@ -2224,12 +2218,16 @@ fn receive_one_pdu(
     };
     let event_id = pdu_parsed.event_id().as_str().to_owned();
 
-    if let Some(key_map) = key_map {
+    if let Some(keys) = keys {
         let rules = ruma::RoomVersionId::try_from(crate::rooms::ROOM_VERSION)
             .expect("the supported room version parses")
             .rules()
             .expect("the supported room version has rules");
-        match ruma::signatures::verify_event(key_map, &canonical, &rules) {
+        // Which of the peer's keys may answer for this event depends on
+        // when the peer says it signed it: a key retired at `expired_ts`
+        // verifies nothing claimed after that moment (#296).
+        let key_map = keys.map_for(pdu["origin_server_ts"].as_u64());
+        match ruma::signatures::verify_event(&key_map, &canonical, &rules) {
             Ok(ruma::signatures::Verified::All) => {}
             // The signature holds but the content hash does not: someone
             // altered the body after signing. The spec's answer is redact,
@@ -2632,18 +2630,14 @@ async fn federation_send_knock(
         return Err(MatrixError::bad_json("the knock has no sender".to_owned()));
     };
 
-    let key_map = state
-        .federation
-        .public_key_map(&origin)
-        .await
-        .map_err(|error| {
-            tracing::debug!("cannot fetch {origin} keys: {error}");
-            MatrixError::new(
-                StatusCode::UNAUTHORIZED,
-                "M_UNAUTHORIZED",
-                "the origin's keys cannot be verified".to_owned(),
-            )
-        })?;
+    let key_map = state.federation.peer_keys(&origin).await.map_err(|error| {
+        tracing::debug!("cannot fetch {origin} keys: {error}");
+        MatrixError::new(
+            StatusCode::UNAUTHORIZED,
+            "M_UNAUTHORIZED",
+            "the origin's keys cannot be verified".to_owned(),
+        )
+    })?;
     let (computed_id, outcome) = receive_one_pdu(&state, &origin, Some(&key_map), &knock);
     if computed_id != event_id {
         return Err(MatrixError::bad_json(format!(
@@ -2719,18 +2713,14 @@ async fn send_leave_common(
         ));
     }
 
-    let key_map = state
-        .federation
-        .public_key_map(&origin)
-        .await
-        .map_err(|error| {
-            tracing::debug!("cannot fetch {origin} keys: {error}");
-            MatrixError::new(
-                StatusCode::UNAUTHORIZED,
-                "M_UNAUTHORIZED",
-                "the origin's keys cannot be verified".to_owned(),
-            )
-        })?;
+    let key_map = state.federation.peer_keys(&origin).await.map_err(|error| {
+        tracing::debug!("cannot fetch {origin} keys: {error}");
+        MatrixError::new(
+            StatusCode::UNAUTHORIZED,
+            "M_UNAUTHORIZED",
+            "the origin's keys cannot be verified".to_owned(),
+        )
+    })?;
     let (computed_id, outcome) = receive_one_pdu(&state, &origin, Some(&key_map), &leave);
     if computed_id != event_id {
         return Err(MatrixError::bad_json(format!(
@@ -2803,18 +2793,14 @@ async fn send_join_common(
         ));
     }
 
-    let mut key_map = state
-        .federation
-        .public_key_map(&origin)
-        .await
-        .map_err(|error| {
-            tracing::debug!("cannot fetch {origin} keys: {error}");
-            MatrixError::new(
-                StatusCode::UNAUTHORIZED,
-                "M_UNAUTHORIZED",
-                "the origin's keys cannot be verified".to_owned(),
-            )
-        })?;
+    let mut key_map = state.federation.peer_keys(&origin).await.map_err(|error| {
+        tracing::debug!("cannot fetch {origin} keys: {error}");
+        MatrixError::new(
+            StatusCode::UNAUTHORIZED,
+            "M_UNAUTHORIZED",
+            "the origin's keys cannot be verified".to_owned(),
+        )
+    })?;
 
     // A restricted join is signed by two servers, and this is the second.
     // The joiner's server signs the event as its sender; the *authorising*
@@ -2829,14 +2815,12 @@ async fn send_join_common(
             if nominee.split_once(':').map(|(_, domain)| domain)
                 == Some(state.config.server.name.as_str()) =>
         {
-            key_map
-                .entry(state.config.server.name.clone())
-                .or_default()
-                .insert(
-                    state.key.key_id(),
-                    ruma::serde::Base64::parse(state.key.public_key_base64())
-                        .map_err(|error| MatrixError::internal(&error.to_string()))?,
-                );
+            key_map.vouch(
+                state.config.server.name.clone(),
+                state.key.key_id(),
+                ruma::serde::Base64::parse(state.key.public_key_base64())
+                    .map_err(|error| MatrixError::internal(&error.to_string()))?,
+            );
             let version = state.rooms.room_version(&room_id).map_err(room_error)?;
             countersign(&state, &join, &version)?
         }
