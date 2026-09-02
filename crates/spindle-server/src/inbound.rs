@@ -4,16 +4,24 @@
 //! `make_leave` template is finished and signed, how a resident's
 //! signatures are taken on, and which servers are asked to broker a join.
 //!
-//! None of this takes an HTTP type. It sat in the route table (#309), so
-//! every claim about it was proven through a socket -- a real peer, a key
-//! pair, a served key document -- to assert things one function call deep.
-//! The outbound client (`federation.rs`) is the other half of the same
-//! protocol; this is the policy the handlers in `routes.rs` apply.
+//! It sat in the route table (#309), so every claim about it was proven
+//! through a socket -- a real peer, a key pair, a served key document -- to
+//! assert things one function call deep. The policy functions at the top
+//! take no HTTP type; the handlers below them take the unwrapped request
+//! (state, headers, path parts, the raw body) and `routes.rs` keeps only the
+//! axum extractor shells, so the route table stays the one list the
+//! dashboard and `surface.rs` check against. The outbound client
+//! (`federation.rs`) is the other half of the same protocol.
 
+use axum::Json;
+use axum::http::StatusCode;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::AppState;
+use crate::accounts::Accounts;
 use crate::errors::MatrixError;
+use crate::routes::{MAX_TXN_ID_LEN, record_invite, room_error};
 
 /// Say that a peer's event was refused, and name what it was refused over.
 ///
@@ -278,6 +286,913 @@ pub(crate) fn join_candidates(
         push(origin, &mut candidates);
     }
     candidates
+}
+
+/// `PUT /_matrix/federation/v1/send/{txnId}`
+///
+/// One transaction from one peer: up to fifty PDUs and some EDUs. Each PDU
+/// is judged alone — hash and signature against the origin's published
+/// keys, then the same authorization predicate local events pass — and a
+/// refusal soft-fails into the per-PDU results without poisoning the
+/// batch. Of the EDUs, `m.typing` is applied — for the origin's own
+/// joined users only, so no server can put words in another's hands —
+/// and the rest are still accepted and dropped (receipts, presence and
+/// device lists arrive with later slices).
+pub(crate) async fn send_transaction(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    txn_id: String,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    // The replay row is keyed by `(origin, txn_id)` behind a two-byte
+    // length, so a peer choosing anything longer than the key can hold
+    // would see its own transactions answer for one another. No real
+    // implementation sends more than a few dozen bytes; the bound sits
+    // far above that and far below the key's.
+    if txn_id.len() > MAX_TXN_ID_LEN {
+        return Err(MatrixError::bad_json(format!(
+            "a transaction id is at most {MAX_TXN_ID_LEN} bytes"
+        )));
+    }
+    let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let body: Value =
+        serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
+
+    let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&body)).await?;
+
+    // The replay table answers a retried transaction with its first answer:
+    // the peer's retry loop is at-least-once, and this row is what makes
+    // redelivery idempotent on our side.
+    let txn_key = spindle_core::keys::federation_txn(&origin, &txn_id);
+    if let Ok(Some(stored)) = spindle_store::ReadView::get(state.store.as_ref(), &txn_key)
+        && let Ok(response) = serde_json::from_slice::<Value>(&stored)
+    {
+        return Ok(Json(response));
+    }
+
+    let pdus = body["pdus"].as_array().cloned().unwrap_or_default();
+    if pdus.len() > 50 {
+        return Err(MatrixError::bad_json(
+            "a transaction carries at most 50 PDUs".to_owned(),
+        ));
+    }
+
+    let key_map = if pdus.is_empty() {
+        None
+    } else {
+        Some(state.federation.peer_keys(&origin).await.map_err(|error| {
+            tracing::debug!("cannot fetch {origin} keys: {error}");
+            MatrixError::new(
+                StatusCode::UNAUTHORIZED,
+                "M_UNAUTHORIZED",
+                "the origin's keys cannot be verified".to_owned(),
+            )
+        })?)
+    };
+
+    let mut results = serde_json::Map::new();
+    for pdu in &pdus {
+        let (event_id, outcome) = receive_one_pdu(&state, &origin, key_map.as_ref(), pdu);
+        let result = match outcome {
+            Ok(()) => json!({}),
+            Err(reason) => {
+                report_refused_pdu(&origin, &event_id, pdu, &reason);
+                json!({ "error": reason })
+            }
+        };
+        results.insert(event_id, result);
+    }
+
+    // EDUs after PDUs, so a join and the typing that follows it land in
+    // order within one transaction. `m.typing` only, and only about the
+    // origin's own joined users: an EDU is unsigned content inside a
+    // signed envelope, so the envelope's origin is the whole authority.
+    for edu in body["edus"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .take(100)
+    {
+        if edu["edu_type"].as_str() != Some("m.typing") {
+            continue;
+        }
+        let content = &edu["content"];
+        let (Some(room_id), Some(user_id), Some(typing)) = (
+            content["room_id"].as_str(),
+            content["user_id"].as_str(),
+            content["typing"].as_bool(),
+        ) else {
+            continue;
+        };
+        if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin.as_str()) {
+            continue;
+        }
+        if !state.rooms.is_joined(user_id, room_id).unwrap_or(false) {
+            continue;
+        }
+        state
+            .typing
+            .set(room_id, user_id, typing, crate::typing::DEFAULT_TIMEOUT);
+    }
+
+    let response = json!({ "pdus": results });
+    spindle_store::Store::put(
+        state.store.as_ref(),
+        &txn_key,
+        response.to_string().as_bytes(),
+    )
+    .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    state.rooms.wake_sync_waiters();
+    Ok(Json(response))
+}
+
+/// `GET /_matrix/federation/v1/state/{roomId}?event_id=`
+pub(crate) async fn room_state(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    room_id: String,
+    query: FederationStateQuery,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
+    let (pdus, auth_chain) = state
+        .rooms
+        .federation_state(&room_id, &query.event_id)
+        .map_err(room_error)?;
+    let bodies = |events: Vec<crate::rooms::IdentifiedEvent>| -> Vec<Value> {
+        events.into_iter().map(|(_, event)| event).collect()
+    };
+    Ok(Json(json!({
+        "pdus": bodies(pdus),
+        "auth_chain": bodies(auth_chain),
+    })))
+}
+
+/// `GET /_matrix/federation/v1/state_ids/{roomId}?event_id=`
+///
+/// The IDs-only form: same computation, smaller wire — a peer that
+/// already holds most events asks for this one.
+pub(crate) async fn room_state_ids(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    room_id: String,
+    query: FederationStateQuery,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
+    let (pdus, auth_chain) = state
+        .rooms
+        .federation_state(&room_id, &query.event_id)
+        .map_err(room_error)?;
+    let ids = |events: Vec<crate::rooms::IdentifiedEvent>| -> Vec<String> {
+        events.into_iter().map(|(id, _)| id).collect()
+    };
+    Ok(Json(json!({
+        "pdu_ids": ids(pdus),
+        "auth_chain_ids": ids(auth_chain),
+    })))
+}
+
+/// `GET /_matrix/federation/v1/event/{eventId}`
+pub(crate) async fn event(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    event_id: String,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    // Resolve the room first: the in-room check needs it, and an event we
+    // do not hold gets the same 404 whether or not the asker could have
+    // seen it — nothing leaks through the error shape.
+    let Some(room_id) = state.rooms.room_of_event(&event_id).map_err(room_error)? else {
+        federation_origin(&state, &headers, "GET", &uri, None).await?;
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "no such event".to_owned(),
+        ));
+    };
+    federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
+    let event = state.rooms.event(&room_id, &event_id).map_err(room_error)?;
+    Ok(Json(json!({
+        "origin": state.config.server.name,
+        "origin_server_ts": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0),
+        "pdus": [event],
+    })))
+}
+
+/// `GET /_matrix/federation/v1/backfill/{roomId}?v=&limit=`
+///
+/// History walking backwards from the named events. On a DAG server this
+/// is a traversal; on the linear log it is a bounded range read, newest
+/// first, starting events included.
+pub(crate) async fn backfill(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    room_id: String,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
+    // `v` repeats; serde's map-shaped Query cannot carry that, so the pairs
+    // are read directly.
+    let mut from = Vec::new();
+    let mut limit = 100_usize;
+    for (key, value) in form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
+    {
+        match key.as_ref() {
+            "v" => from.push(value.into_owned()),
+            "limit" => limit = value.parse().unwrap_or(limit),
+            _ => {}
+        }
+    }
+    // The cap is ours: a peer that asks for the whole room gets a page.
+    let limit = limit.clamp(1, 100);
+    let pdus = state
+        .rooms
+        .backfill(&room_id, &from, limit)
+        .map_err(room_error)?;
+    Ok(Json(json!({
+        "origin": state.config.server.name,
+        "origin_server_ts": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0),
+        "pdus": pdus,
+    })))
+}
+
+/// `POST /_matrix/federation/v1/get_missing_events/{roomId}`
+///
+/// The catch-up call a server makes when a received event cites parents it
+/// does not hold: fill the gap between what they have and what they got.
+pub(crate) async fn missing_events(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    room_id: String,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let body: Value =
+        serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    federation_room_origin(&state, &headers, "POST", &uri, Some(&body), &room_id).await?;
+    let ids = |key: &str| -> Vec<String> {
+        body[key]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let limit = usize::try_from(body["limit"].as_u64().unwrap_or(10))
+        .unwrap_or(10)
+        .clamp(1, 100);
+    let min_depth = body["min_depth"].as_u64().unwrap_or(0);
+    let events = state
+        .rooms
+        .missing_events(
+            &room_id,
+            &ids("earliest_events"),
+            &ids("latest_events"),
+            limit,
+            min_depth,
+        )
+        .map_err(room_error)?;
+    Ok(Json(json!({ "events": events })))
+}
+
+/// `GET /_matrix/federation/v1/make_join/{roomId}/{userId}`
+pub(crate) async fn make_join(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    room_id: String,
+    user_id: String,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let origin = federation_origin(&state, &headers, "GET", &uri, None).await?;
+    // A server makes joins for its own users only: a template for someone
+    // else's user would be a forgery kit.
+    if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin.as_str()) {
+        return Err(MatrixError::forbidden(
+            "the user does not live on the requesting server",
+        ));
+    }
+    // What version this room actually is, rather than what this build's
+    // default happens to be. The old check compared the peer's list against
+    // a literal `ver=11` and, on a mismatch, told them "this room is version
+    // 11" — a sentence it had no basis for, since it had never looked at the
+    // room. For a room of any other version that answer is simply false.
+    let version = state.rooms.room_version(&room_id).map_err(room_error)?;
+    let version = version.as_str();
+
+    // The `ver` list is the peer telling us what *they* can speak. If this
+    // room's version is not in it, no template we produce will parse on
+    // their side, so the refusal is correct — but it has to name the version
+    // they would have needed.
+    let offered = request.uri().query().is_some_and(|query| {
+        query
+            .split('&')
+            .filter_map(|pair| pair.strip_prefix("ver="))
+            .any(|ver| ver == version)
+    });
+    if !offered {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_INCOMPATIBLE_ROOM_VERSION",
+            format!("this room is version {version}"),
+        ));
+    }
+    let event = state
+        .rooms
+        .make_join_template(&room_id, &user_id)
+        .map_err(room_error)?;
+    Ok(Json(json!({
+        "room_version": version,
+        "event": event,
+    })))
+}
+
+/// `GET /_matrix/federation/v1/make_leave/{roomId}/{userId}`
+///
+/// The mirror of `make_join`, and how an invited user's server rejects an
+/// invite to a room it holds no log for: it fetches this template, signs
+/// it, and brings it back through `send_leave`.
+pub(crate) async fn make_leave(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    room_id: String,
+    user_id: String,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let origin = federation_origin(&state, &headers, "GET", &uri, None).await?;
+    // A server makes leaves for its own users only, same as joins: a
+    // template for someone else's user would be a forgery kit.
+    if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin.as_str()) {
+        return Err(MatrixError::forbidden(
+            "the user does not live on the requesting server",
+        ));
+    }
+    let version = state.rooms.room_version(&room_id).map_err(room_error)?;
+    let event = state
+        .rooms
+        .make_leave_template(&room_id, &user_id)
+        .map_err(room_error)?;
+    Ok(Json(json!({
+        "room_version": version.as_str(),
+        "event": event,
+    })))
+}
+
+/// `GET /_matrix/federation/v1/make_knock/{roomId}/{userId}`
+///
+/// A knock template, for a room whose join rule invites them: the same
+/// preview-then-verify shape as `make_join`, and the same auth rules judge
+/// the signed event on the way back through `send_knock`.
+pub(crate) async fn make_knock(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    room_id: String,
+    user_id: String,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let origin = federation_origin(&state, &headers, "GET", &uri, None).await?;
+    if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin.as_str()) {
+        return Err(MatrixError::forbidden(
+            "the user does not live on the requesting server",
+        ));
+    }
+    let version = state.rooms.room_version(&room_id).map_err(room_error)?;
+    let event = state
+        .rooms
+        .make_knock_template(&room_id, &user_id)
+        .map_err(room_error)?;
+    Ok(Json(json!({
+        "room_version": version.as_str(),
+        "event": event,
+    })))
+}
+
+/// `PUT /_matrix/federation/v1/send_knock/{roomId}/{eventId}`
+pub(crate) async fn send_knock(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    room_id: String,
+    event_id: String,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let knock: Value =
+        serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&knock)).await?;
+
+    // Same smuggling rule as send_join and send_leave: this door admits
+    // exactly one kind of event.
+    let is_knock = knock["type"] == json!("m.room.member")
+        && knock["content"]["membership"] == json!("knock")
+        && knock["state_key"] == knock["sender"]
+        && knock["room_id"].as_str() == Some(room_id.as_str());
+    if !is_knock {
+        return Err(MatrixError::bad_json(
+            "send_knock carries exactly a knock event for this room".to_owned(),
+        ));
+    }
+    let Some(knocker) = knock["sender"].as_str().map(str::to_owned) else {
+        return Err(MatrixError::bad_json("the knock has no sender".to_owned()));
+    };
+
+    let key_map = state.federation.peer_keys(&origin).await.map_err(|error| {
+        tracing::debug!("cannot fetch {origin} keys: {error}");
+        MatrixError::new(
+            StatusCode::UNAUTHORIZED,
+            "M_UNAUTHORIZED",
+            "the origin's keys cannot be verified".to_owned(),
+        )
+    })?;
+    let (computed_id, outcome) = receive_one_pdu(&state, &origin, Some(&key_map), &knock);
+    if computed_id != event_id {
+        return Err(MatrixError::bad_json(format!(
+            "the event hashes to {computed_id}, not {event_id}"
+        )));
+    }
+    if let Err(reason) = outcome {
+        return Err(MatrixError::forbidden(&reason));
+    }
+    state.rooms.wake_sync_waiters();
+    // The stripped state a knocker may see: what room they knocked on and
+    // how it admits — the same subset an invitee gets.
+    let events = state
+        .rooms
+        .stripped_state(&room_id, &knocker)
+        .unwrap_or_default();
+    Ok(Json(json!({ "knock_room_state": events })))
+}
+
+/// `PUT /_matrix/federation/v2/send_leave/{roomId}/{eventId}`
+pub(crate) async fn send_leave(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    room_id: String,
+    event_id: String,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    send_leave_common(state, headers, room_id, event_id, request)
+        .await
+        .map(Json)
+}
+
+/// `PUT /_matrix/federation/v1/send_leave/{roomId}/{eventId}`
+///
+/// The v1 `[200, {}]` envelope, same fossil rule as `send_join` v1.
+pub(crate) async fn send_leave_v1(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    room_id: String,
+    event_id: String,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    send_leave_common(state, headers, room_id, event_id, request)
+        .await
+        .map(|answer| Json(json!([200, answer])))
+}
+
+/// `PUT /_matrix/federation/v2/send_join/{roomId}/{eventId}`
+pub(crate) async fn send_join(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    room_id: String,
+    event_id: String,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    send_join_common(state, headers, room_id, event_id, request)
+        .await
+        .map(Json)
+}
+
+/// `PUT /_matrix/federation/v1/send_join/{roomId}/{eventId}`
+///
+/// The v1 shape: the same answer inside a `[200, {...}]` envelope — a
+/// fossil the spec keeps for servers that predate v2, and cheap to serve
+/// since the body is the v2 body.
+pub(crate) async fn send_join_v1(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    room_id: String,
+    event_id: String,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    send_join_common(state, headers, room_id, event_id, request)
+        .await
+        .map(|answer| Json(json!([200, answer])))
+}
+
+/// `PUT /_matrix/federation/v2/invite/{roomId}/{eventId}`
+///
+/// A remote server invites one of this server's users. The event arrives
+/// signed by the inviter; this server checks it names a local user, adds its
+/// own signature — the co-signature is what the rest of the room will accept
+/// as proof the invitee's server was told — and records the invite so the
+/// user's next `/sync` shows it, room history or not.
+pub(crate) async fn invite(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    room_id: String,
+    event_id: String,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let body: Value =
+        serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&body)).await?;
+
+    // The version check comes first: an event from a room version this
+    // server does not speak cannot be reasoned about, let alone signed.
+    //
+    // The question here is *can we speak this*, not *is this our default*,
+    // and the difference is not pedantry. An invite is for a remote room
+    // this server has no state for, so there is nothing to look the version
+    // up from -- the body's `room_version` is the only statement of it, and
+    // the spec puts it there for exactly that reason. Comparing it against
+    // one hardcoded version happened to behave identically only because the
+    // supported list has one entry, and would start silently refusing
+    // invites the moment it had two.
+    let offered = body["room_version"].as_str().unwrap_or_default();
+    if !crate::surface::supports_room_version(offered) {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_INCOMPATIBLE_ROOM_VERSION",
+            format!(
+                "this server speaks room versions {}",
+                crate::surface::ROOM_VERSIONS.join(", ")
+            ),
+        ));
+    }
+    let event = body["event"].clone();
+    let is_invite = event["type"] == json!("m.room.member")
+        && event["content"]["membership"] == json!("invite")
+        && event["room_id"].as_str() == Some(room_id.as_str());
+    if !is_invite {
+        return Err(MatrixError::bad_json(
+            "invite carries exactly an invite event for this room".to_owned(),
+        ));
+    }
+    // The signature this endpoint adds vouches for the *invitee*: their
+    // server was told. It vouches for nothing about the sender — but the
+    // sender must at least belong to the server that signed the request,
+    // or any server could originate invites in another's name.
+    let sender_domain = event["sender"].as_str().and_then(|u| u.split_once(':'));
+    if sender_domain.map(|(_, domain)| domain) != Some(origin.as_str()) {
+        return Err(MatrixError::forbidden(
+            "the invite's sender does not belong to the requesting server",
+        ));
+    }
+    let Some(target) = event["state_key"].as_str() else {
+        return Err(MatrixError::bad_json("the invite names no one".to_owned()));
+    };
+    let target_domain = target.split_once(':').map(|(_, domain)| domain);
+    if target_domain != Some(state.config.server.name.as_str()) {
+        return Err(MatrixError::forbidden(
+            "the invited user is not on this server",
+        ));
+    }
+    // Right domain, no such account: co-signing would vouch that a user
+    // was told about an invite when there is no user to tell.
+    let localpart = target.strip_prefix('@').map_or(target, |rest| {
+        rest.split_once(':')
+            .map_or(rest, |(localpart, _)| localpart)
+    });
+    let known = Accounts::new(state.store.as_ref(), &state.config.server.name)
+        .account(localpart)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+        .is_some();
+    if !known {
+        return Err(MatrixError::forbidden("no such user on this server"));
+    }
+    let target = target.to_owned();
+
+    let Ok(ruma::CanonicalJsonValue::Object(mut canonical)) =
+        ruma::CanonicalJsonValue::try_from(event)
+    else {
+        return Err(MatrixError::bad_json(
+            "the invite event does not canonicalize".to_owned(),
+        ));
+    };
+    let rules = ruma::RoomVersionId::try_from(crate::rooms::ROOM_VERSION)
+        .ok()
+        .and_then(|version| version.rules())
+        .ok_or_else(|| MatrixError::internal("the room version rules are unavailable"))?;
+    // The path names the event the inviter computed; disagreement means the
+    // two servers are not looking at the same event.
+    let hash = ruma::signatures::reference_hash(&canonical, &rules)
+        .map_err(|error| MatrixError::bad_json(format!("the invite cannot be hashed: {error}")))?;
+    if format!("${hash}") != event_id {
+        return Err(MatrixError::bad_json(format!(
+            "the event hashes to ${hash}, not {event_id}"
+        )));
+    }
+    if ruma::signatures::hash_and_sign_event(
+        &state.config.server.name,
+        state.key.pair(),
+        &mut canonical,
+        &rules.redaction,
+    )
+    .is_err()
+    {
+        return Err(MatrixError::internal("the invite cannot be co-signed"));
+    }
+    let signed = serde_json::to_value(&canonical)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+
+    // An invite for a room this server already holds is not a notification
+    // about somewhere else -- it is an event in a log we have, and it has to
+    // go in. It arrives out of band precisely because the invitee's server
+    // is usually *not* in the room, so the inviter cannot reach it through
+    // an ordinary transaction; when we are in the room, that reasoning does
+    // not apply and skipping the append leaves our copy saying the user is
+    // still gone. Their own join is then refused by the rules reading our
+    // state, while the inviting server believes it told us. Synapse and
+    // Continuwuity both add the invite to a room they hold, for this reason.
+    //
+    // Idempotent against the copy that may also arrive in a transaction:
+    // `ingest` returns early for an event already in the log.
+    record_invite(
+        &state, &origin, &room_id, &event_id, &target, &body, &signed,
+    )?;
+
+    Ok(Json(json!({ "event": signed })))
+}
+
+/// Authenticate a federation request, or answer 401 with no gradient.
+///
+/// Every X-Matrix failure — missing header, bad signature, unfetchable
+/// keys, wrong destination — collapses to the same `M_UNAUTHORIZED`, so a
+/// probing peer learns nothing about which check refused it. The detail
+/// lives in our logs, not in their response.
+pub(crate) async fn federation_origin(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    method: &str,
+    uri: &str,
+    content: Option<&Value>,
+) -> Result<String, MatrixError> {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok());
+    state
+        .federation
+        .verify_request(authorization, method, uri, content)
+        .await
+        .map_err(|error| {
+            tracing::debug!("federation auth refused: {error}");
+            MatrixError::new(
+                StatusCode::UNAUTHORIZED,
+                "M_UNAUTHORIZED",
+                "the request signature is not valid".to_owned(),
+            )
+        })
+}
+
+/// Authenticate a federation request AND require the origin in the room.
+///
+/// The two checks always travel together on room-data reads: an
+/// authenticated stranger is still a stranger, and room state belongs to
+/// the servers in the room.
+pub(crate) async fn federation_room_origin(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    method: &str,
+    uri: &str,
+    content: Option<&Value>,
+    room_id: &str,
+) -> Result<String, MatrixError> {
+    let origin = federation_origin(state, headers, method, uri, content).await?;
+    let joined = state
+        .rooms
+        .server_in_room(room_id, &origin)
+        .unwrap_or(false);
+    if !joined {
+        return Err(MatrixError::forbidden(
+            "your server has no joined member in that room",
+        ));
+    }
+    Ok(origin)
+}
+
+pub(crate) async fn send_leave_common(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    room_id: String,
+    event_id: String,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Value, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let leave: Value =
+        serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&leave)).await?;
+
+    // Shape first, same reasoning as send_join: this door admits exactly
+    // one kind of event, and anything else through it is smuggling.
+    let is_leave = leave["type"] == json!("m.room.member")
+        && leave["content"]["membership"] == json!("leave")
+        && leave["state_key"] == leave["sender"]
+        && leave["room_id"].as_str() == Some(room_id.as_str());
+    if !is_leave {
+        return Err(MatrixError::bad_json(
+            "send_leave carries exactly a leave event for this room".to_owned(),
+        ));
+    }
+
+    let key_map = state.federation.peer_keys(&origin).await.map_err(|error| {
+        tracing::debug!("cannot fetch {origin} keys: {error}");
+        MatrixError::new(
+            StatusCode::UNAUTHORIZED,
+            "M_UNAUTHORIZED",
+            "the origin's keys cannot be verified".to_owned(),
+        )
+    })?;
+    let (computed_id, outcome) = receive_one_pdu(&state, &origin, Some(&key_map), &leave);
+    if computed_id != event_id {
+        return Err(MatrixError::bad_json(format!(
+            "the event hashes to {computed_id}, not {event_id}"
+        )));
+    }
+    if let Err(reason) = outcome {
+        return Err(MatrixError::forbidden(&reason));
+    }
+    state.rooms.wake_sync_waiters();
+    Ok(json!({}))
+}
+
+pub(crate) async fn send_join_common(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    room_id: String,
+    event_id: String,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Value, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let join: Value =
+        serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&join)).await?;
+
+    // The shape is checked before the machinery runs: send_join admits one
+    // kind of event, and anything else through this door — however well
+    // signed — is a peer using the join handshake to smuggle.
+    let is_join = join["type"] == json!("m.room.member")
+        && join["content"]["membership"] == json!("join")
+        && join["state_key"] == join["sender"]
+        && join["room_id"].as_str() == Some(room_id.as_str());
+    if !is_join {
+        return Err(MatrixError::bad_json(
+            "send_join carries exactly a join event for this room".to_owned(),
+        ));
+    }
+
+    let mut key_map = state.federation.peer_keys(&origin).await.map_err(|error| {
+        tracing::debug!("cannot fetch {origin} keys: {error}");
+        MatrixError::new(
+            StatusCode::UNAUTHORIZED,
+            "M_UNAUTHORIZED",
+            "the origin's keys cannot be verified".to_owned(),
+        )
+    })?;
+
+    // A restricted join is signed by two servers, and this is the second.
+    // The joiner's server signs the event as its sender; the *authorising*
+    // user's server signs it as the one making the claim, because the
+    // nomination is a statement about a room only that server can see into
+    // (MSC3083, and `required_server_signatures_to_verify_event` enforces
+    // it from v8). We put the nomination in the template, so the signature
+    // it needs is ours -- and without it the event we handed out fails
+    // verification here, on our own doorstep, before any peer sees it.
+    let join = match join["content"]["join_authorised_via_users_server"].as_str() {
+        Some(nominee)
+            if nominee.split_once(':').map(|(_, domain)| domain)
+                == Some(state.config.server.name.as_str()) =>
+        {
+            key_map.vouch(
+                state.config.server.name.clone(),
+                state.key.key_id(),
+                ruma::serde::Base64::parse(state.key.public_key_base64())
+                    .map_err(|error| MatrixError::internal(&error.to_string()))?,
+            );
+            let version = state.rooms.room_version(&room_id).map_err(room_error)?;
+            countersign(&state, &join, &version)?
+        }
+        // Someone else's user, or nobody's: not ours to vouch for. The
+        // signature check below will ask for that server's key and fail if
+        // the joining server did not collect it, which is the right answer
+        // -- a nomination this server did not make is not one it endorses.
+        _ => join,
+    };
+    let (computed_id, outcome) = receive_one_pdu(&state, &origin, Some(&key_map), &join);
+    // The path names the event the peer computed; disagreement means one
+    // side hashed a different event than the other signed.
+    if computed_id != event_id {
+        return Err(MatrixError::bad_json(format!(
+            "the event hashes to {computed_id}, not {event_id}"
+        )));
+    }
+    if let Err(reason) = outcome {
+        return Err(MatrixError::forbidden(&reason));
+    }
+
+    // The state *before* the join, with its auth chain: everything the new
+    // server needs to participate from this event onward.
+    let (state_pairs, auth_pairs) = state
+        .rooms
+        .federation_state(&room_id, &event_id)
+        .map_err(room_error)?;
+    let bodies = |events: Vec<crate::rooms::IdentifiedEvent>| -> Vec<Value> {
+        events.into_iter().map(|(_, event)| event).collect()
+    };
+    state.rooms.wake_sync_waiters();
+    Ok(json!({
+        "origin": state.config.server.name,
+        "event": join,
+        "state": bodies(state_pairs),
+        "auth_chain": bodies(auth_pairs),
+    }))
+}
+
+/// Judge and, if it holds up, apply one received PDU.
+///
+/// Returns the event ID this server *computed* (never one the peer
+/// claimed) with the outcome. A PDU too malformed to even hash is keyed by
+/// a placeholder, because the response shape needs a key and inventing a
+/// plausible-looking ID for garbage would be worse.
+#[derive(Debug, Deserialize)]
+pub(crate) struct FederationStateQuery {
+    pub(crate) event_id: String,
 }
 
 #[cfg(test)]
