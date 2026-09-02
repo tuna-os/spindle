@@ -19,17 +19,32 @@ use std::{cmp::Ordering, sync::Arc};
 /// rather than misread. `the_domain_tags_carry_the_current_digest_version`
 /// holds the two together — the tags all end in `-v{VERSION}`, and that is
 /// asserted rather than trusted.
-pub const CONTENT_DIGEST_VERSION: u8 = 1;
+pub const CONTENT_DIGEST_VERSION: u8 = 2;
 
 /// The domain tag separating each digest below from the others.
 ///
 /// Named rather than written inline at the hasher, so each tag has exactly one
 /// definition: the digest uses it and [`DOMAIN_TAGS`] lists it, instead of a
 /// list that mirrors the literals and can drift from them.
-const STATE_KEY_TAG: &[u8] = b"spindle-state-key-v1\0";
-const EMPTY_STATE_TAG: &[u8] = b"spindle-empty-state-v1";
-const HAMT_LEAF_TAG: &[u8] = b"spindle-hamt-leaf-v1\0";
-const HAMT_BRANCH_TAG: &[u8] = b"spindle-hamt-branch-v1\0";
+///
+/// The state-key tag is eight bytes, not a sentence, and the lengths that
+/// follow it are `u32`, not `u64` (#77): BLAKE3 compresses in 64-byte
+/// blocks, and the version-1 stream for an ordinary member key ran to 69
+/// bytes -- a second block for five bytes of payload, at roughly twice the
+/// cost of one. At eight plus four plus four bytes of framing, a key with
+/// up to 48 bytes of type and state key fits in one block, which covers
+/// `m.room.member` for any user ID up to 35 bytes. The other three tags
+/// are hashed with 32-byte digests and are never near one block anyway;
+/// they moved to `-v2` with the version rather than for a saving.
+const STATE_KEY_TAG: &[u8] = b"spsk-v2\0";
+const EMPTY_STATE_TAG: &[u8] = b"spindle-empty-state-v2";
+const HAMT_LEAF_TAG: &[u8] = b"spindle-hamt-leaf-v2\0";
+const HAMT_BRANCH_TAG: &[u8] = b"spindle-hamt-branch-v2\0";
+
+/// The most bytes of event type plus state key that still digest in one
+/// BLAKE3 block under [`STATE_KEY_TAG`] and two `u32` lengths.
+#[cfg(test)]
+const ONE_BLOCK_KEY_BYTES: usize = 64 - STATE_KEY_TAG.len() - 2 * 4;
 
 /// Every domain tag, for the test that binds them to
 /// [`CONTENT_DIGEST_VERSION`]. A new digest belongs here, or it is not covered.
@@ -404,8 +419,15 @@ fn hash_branch(bitmap: u32, children: &[Arc<Node>]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+/// Length-framed bytes: the frame is what keeps `("ab", "c")` and
+/// `("a", "bc")` apart. `u32` rather than `u64` (#77): four bytes saved
+/// twice is what brings an ordinary state key inside one BLAKE3 block, and
+/// nothing hashed here can approach 4 GiB -- an event is capped at 64 KiB
+/// by the protocol -- so the saturation below is unreachable, and named
+/// only so the cast is not a silent truncation.
 fn hash_bytes(hasher: &mut blake3::Hasher, value: &[u8]) {
-    hasher.update(&(value.len() as u64).to_be_bytes());
+    let length = u32::try_from(value.len()).unwrap_or(u32::MAX);
+    hasher.update(&length.to_be_bytes());
     hasher.update(value);
 }
 
@@ -718,6 +740,22 @@ mod digest_version_tests {
                  CONTENT_DIGEST_VERSION have drifted apart",
             );
         }
+    }
+
+    /// An ordinary state key digests in one BLAKE3 block (#77). The bound
+    /// is arithmetic on the tag and the two length frames, checked here so
+    /// a longer tag or wider length cannot creep back in unnoticed; the
+    /// member key below is the shape the issue measured.
+    #[test]
+    fn an_ordinary_state_key_digests_in_one_block() {
+        let key = super::StateKey::new("m.room.member", "@u25000:example.org");
+        let stream = super::STATE_KEY_TAG.len()
+            + 4
+            + key.event_type().as_str().len()
+            + 4
+            + key.state_key().len();
+        assert!(stream <= 64, "{stream} bytes is more than one block");
+        assert_eq!(super::ONE_BLOCK_KEY_BYTES, 48);
     }
 
     /// The tags are distinct, so one digest cannot be mistaken for another.

@@ -64,12 +64,12 @@ static CHAIN: &[Migration] = &[
         from: SchemaMarker {
             key_schema: 1,
             record: 8,
-            content_digest: 1,
+            content_digest: spindle_core::CONTENT_DIGEST_VERSION,
         },
         to: SchemaMarker {
             key_schema: 1,
             record: 9,
-            content_digest: 1,
+            content_digest: spindle_core::CONTENT_DIGEST_VERSION,
         },
         summary: "first synthetic step",
         reversible: Reversible::Yes,
@@ -79,12 +79,12 @@ static CHAIN: &[Migration] = &[
         from: SchemaMarker {
             key_schema: 1,
             record: 9,
-            content_digest: 1,
+            content_digest: spindle_core::CONTENT_DIGEST_VERSION,
         },
         to: SchemaMarker {
             key_schema: 1,
             record: 1,
-            content_digest: 1,
+            content_digest: spindle_core::CONTENT_DIGEST_VERSION,
         },
         summary: "second synthetic step",
         reversible: Reversible::No,
@@ -97,12 +97,12 @@ static FAILING: &[Migration] = &[Migration {
     from: SchemaMarker {
         key_schema: 1,
         record: 8,
-        content_digest: 1,
+        content_digest: spindle_core::CONTENT_DIGEST_VERSION,
     },
     to: SchemaMarker {
         key_schema: 1,
         record: 1,
-        content_digest: 1,
+        content_digest: spindle_core::CONTENT_DIGEST_VERSION,
     },
     summary: "a step that does not survive contact with the store",
     reversible: Reversible::No,
@@ -296,12 +296,12 @@ fn a_table_that_loops_is_refused_rather_than_walked_forever() {
             from: SchemaMarker {
                 key_schema: 1,
                 record: 8,
-                content_digest: 1,
+                content_digest: spindle_core::CONTENT_DIGEST_VERSION,
             },
             to: SchemaMarker {
                 key_schema: 1,
                 record: 9,
-                content_digest: 1,
+                content_digest: spindle_core::CONTENT_DIGEST_VERSION,
             },
             summary: "there",
             reversible: Reversible::Yes,
@@ -311,12 +311,12 @@ fn a_table_that_loops_is_refused_rather_than_walked_forever() {
             from: SchemaMarker {
                 key_schema: 1,
                 record: 9,
-                content_digest: 1,
+                content_digest: spindle_core::CONTENT_DIGEST_VERSION,
             },
             to: SchemaMarker {
                 key_schema: 1,
                 record: 8,
-                content_digest: 1,
+                content_digest: spindle_core::CONTENT_DIGEST_VERSION,
             },
             summary: "and back again",
             reversible: Reversible::Yes,
