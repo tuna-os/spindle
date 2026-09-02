@@ -845,6 +845,27 @@ struct DeleteRoom {
     message: Option<String>,
 }
 
+/// A fresh room owned by `creator` with nothing in it yet: no name, no
+/// topic, no preset, and no profile on the creator's join, since an
+/// administrator creating a room on a user's behalf is not that user
+/// joining it.
+fn bare_room(state: &AppState, creator: &str) -> Result<String, MatrixError> {
+    state
+        .rooms
+        .create(
+            creator,
+            state.key.pair(),
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            &serde_json::Map::new(),
+        )
+        .map_err(crate::routes::room_error)
+}
+
 /// `DELETE /rooms/{roomId}` — `{block, purge, new_room_user_id, message}`.
 ///
 /// Every departure is a real leave event through the ordinary append
@@ -889,10 +910,7 @@ async fn delete_room(
                     "new_room_user_id must be a user of this server",
                 )
             })?;
-            let new_room = state
-                .rooms
-                .create(creator, state.key.pair(), None, None, None, &[], None, None)
-                .map_err(crate::routes::room_error)?;
+            let new_room = bare_room(&state, creator)?;
             if let Some(message) = &request.message {
                 state
                     .rooms

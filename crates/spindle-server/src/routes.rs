@@ -3186,6 +3186,7 @@ async fn create_room(
                 .as_deref()
                 .filter(|version| crate::surface::supports_room_version(version)),
             request.creation_content.as_ref(),
+            &member_profile(&state, &identity.user_id),
         )
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
     // Invites after the room stands, refused invites failing the create the
@@ -3466,7 +3467,15 @@ async fn invite_user(
             .await;
         state
             .rooms
-            .set_membership(room_id, sender, target, "invite", reason, state.key.pair())
+            .set_membership_with(
+                room_id,
+                sender,
+                target,
+                "invite",
+                reason,
+                &member_profile(state, target),
+                state.key.pair(),
+            )
             .map_err(room_error)?;
         return Ok(());
     }
@@ -3652,12 +3661,13 @@ async fn knock_room(
 ) -> Result<Json<Value>, MatrixError> {
     let request: SelfMembershipRequest = optional_body(&body)?;
     let room_id = resolve_room_target(&state, &room_id_or_alias)?;
-    match state.rooms.set_membership(
+    match state.rooms.set_membership_with(
         &room_id,
         &identity.user_id,
         &identity.user_id,
         "knock",
         request.reason.as_deref(),
+        &member_profile(&state, &identity.user_id),
         state.key.pair(),
     ) {
         Ok(_) => {
@@ -3927,10 +3937,15 @@ async fn join(
     room_id: &str,
     servers: &[String],
 ) -> Result<Json<Value>, MatrixError> {
-    match state
-        .rooms
-        .set_membership(room_id, user_id, user_id, "join", None, state.key.pair())
-    {
+    match state.rooms.set_membership_with(
+        room_id,
+        user_id,
+        user_id,
+        "join",
+        None,
+        &member_profile(state, user_id),
+        state.key.pair(),
+    ) {
         Ok(_) => Ok(Json(json!({ "room_id": room_id }))),
         // A room this server has never held may still be joinable: through
         // the servers the client named, or the one in the room ID itself.
@@ -7776,6 +7791,24 @@ async fn room_messages(
     Ok(Json(Value::Object(body)))
 }
 
+/// The fields of `user_id`'s profile that a join or an invite carries in
+/// its member event: `displayname` and `avatar_url`, each only if set
+/// (#317). A client shows the roster from member events, so a joiner
+/// without them is shown by ID until they next change their profile.
+fn member_profile(state: &AppState, user_id: &str) -> serde_json::Map<String, Value> {
+    let mut fields = serde_json::Map::new();
+    let Ok(profile) = state.profiles.get(user_id) else {
+        return fields;
+    };
+    if let Some(name) = profile.displayname {
+        fields.insert("displayname".to_owned(), Value::String(name));
+    }
+    if let Some(url) = profile.avatar_url {
+        fields.insert("avatar_url".to_owned(), Value::String(url));
+    }
+    fields
+}
+
 /// May `user_id` attach this server's name to `room_id` -- by listing it in
 /// the directory, or by giving it an alias?
 ///
@@ -9102,6 +9135,7 @@ async fn upgrade_room(
             &carried,
             Some(&request.new_version),
             Some(&creation_content),
+            &member_profile(&state, &identity.user_id),
         )
         .map_err(room_error)?;
 
