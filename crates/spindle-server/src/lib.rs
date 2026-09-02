@@ -23,6 +23,7 @@ pub mod errors;
 pub mod federation;
 pub mod filters;
 pub mod import;
+pub mod inbound;
 pub mod mas;
 pub mod media;
 pub mod metrics;
