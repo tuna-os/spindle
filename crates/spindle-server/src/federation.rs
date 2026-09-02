@@ -8,15 +8,17 @@
 //! header, an unfetchable key, a stale key, a destination that is not us,
 //! all refuse rather than degrade.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ruma::{CanonicalJsonObject, CanonicalJsonValue};
 use serde_json::{Value, json};
 use spindle_core::keys::{self};
 use spindle_store::{FjallStore, ReadView, Store};
 
+use crate::netguard::{Cidr, VettingResolver, permits};
 use crate::signing::ServerKey;
 
 /// How long a fetched key document serves at most, whatever its own
@@ -24,6 +26,13 @@ use crate::signing::ServerKey;
 /// for years and have caches honour it — seven days is the ceiling, so a
 /// compromised key ages out even if its owner claimed otherwise.
 const MAX_KEY_VALIDITY: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// How long a failed key fetch is remembered before the origin is tried
+/// again. Without it every miss refetched, so a stranger could make this
+/// server connect to the same unreachable name as often as they could
+/// send a header (#288). A minute bounds that at one connection per name
+/// per minute, and a peer that was genuinely down retries within it.
+const NEGATIVE_CACHE: Duration = Duration::from_secs(60);
 
 pub struct Federation {
     store: Arc<FjallStore>,
@@ -35,6 +44,12 @@ pub struct Federation {
     /// federation authentication in all but name, and the config comment
     /// says so.
     insecure_http: bool,
+    /// Ranges a fetch may reach although they are not routable; every
+    /// other non-global address is refused, by the resolver for names and
+    /// by [`Federation::base_url`] for literals.
+    allowed: Vec<Cidr>,
+    /// Origins whose key fetch failed, and until when not to try again.
+    negative: std::sync::Mutex<HashMap<String, Instant>>,
     /// EDUs waiting for the next transaction to each destination.
     ///
     /// In memory and nowhere else, deliberately: an EDU is ephemeral by
@@ -73,21 +88,57 @@ pub struct XMatrix {
 }
 
 impl Federation {
-    #[must_use]
+    /// # Errors
+    ///
+    /// Returns [`FederationError::Refused`] if an `allow_internal` entry
+    /// does not parse: a config error, surfaced at startup.
     pub fn new(
         store: Arc<FjallStore>,
         server_name: impl Into<String>,
         key: Arc<ServerKey>,
         insecure_http: bool,
-    ) -> Self {
-        Self {
+        allow_internal: &[String],
+    ) -> Result<Self, FederationError> {
+        let allowed =
+            crate::netguard::parse_allow_list(allow_internal).map_err(FederationError::Refused)?;
+        // Every name this client connects to resolves through the vetting
+        // resolver, so a peer whose name points inward is refused before a
+        // socket is opened. Literal IPs never reach DNS; `base_url` vets
+        // those.
+        let client = reqwest::Client::builder()
+            .dns_resolver(Arc::new(VettingResolver {
+                allowed: allowed.clone(),
+            }))
+            .build()
+            .map_err(|error| FederationError::Refused(error.to_string()))?;
+        Ok(Self {
             store,
             server_name: server_name.into(),
             key,
-            client: reqwest::Client::new(),
+            client,
             insecure_http,
+            allowed,
+            negative: std::sync::Mutex::new(HashMap::new()),
             edu_queue: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    /// The URL a request to `name` goes to, or a refusal.
+    ///
+    /// Grammar first (#286), then, for a name that is a literal address,
+    /// the same judgement the resolver applies to a hostname: a literal
+    /// never touches DNS, so this is the only place it can be vetted.
+    fn base_url(&self, name: &str) -> Result<String, FederationError> {
+        let url = base_url(name, self.insecure_http)?;
+        if let Ok(server) = ruma::OwnedServerName::try_from(name)
+            && let Ok(literal) = server.host().trim_matches(['[', ']']).parse::<IpAddr>()
+            && !permits(&self.allowed, literal)
+        {
+            return Err(FederationError::Refused(format!(
+                "{name} is not an address this server reaches"
+            )));
         }
+        Ok(url)
     }
 
     /// Queue one EDU for `destination`'s next transaction.
@@ -261,13 +312,58 @@ impl Federation {
         }
 
         // Cache miss, expiry, or an unknown key id (a peer that rotated):
-        // all three refetch. Delegation (.well-known, SRV) is not resolved
-        // yet — the server name is used as the host directly, which the
-        // federation test rig satisfies and docs/dashboard record as a gap.
-        let url = format!(
-            "{}/_matrix/key/v2/server",
-            base_url(origin, self.insecure_http)?
-        );
+        // all three refetch -- unless the last fetch failed a moment ago,
+        // in which case the answer is still no and costs no connection.
+        {
+            let mut negative = self
+                .negative
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let instant = Instant::now();
+            negative.retain(|_, until| *until > instant);
+            if negative.contains_key(origin) {
+                return Err(FederationError::Refused(format!(
+                    "{origin} could not be fetched from recently"
+                )));
+            }
+        }
+        let document = match self.fetch_key_document(origin).await {
+            Ok(document) => document,
+            Err(error) => {
+                self.negative
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(origin.to_owned(), Instant::now() + NEGATIVE_CACHE);
+                return Err(error);
+            }
+        };
+
+        let claimed_until = document["valid_until_ts"].as_u64().unwrap_or(0);
+        let ceiling = now + u64::try_from(MAX_KEY_VALIDITY.as_millis()).unwrap_or(u64::MAX);
+        let capped = claimed_until.min(ceiling);
+        let record = json!({ "document": document, "fetched_valid_until": capped });
+        Store::put(
+            self.store.as_ref(),
+            &cache_key,
+            record.to_string().as_bytes(),
+        )
+        .map_err(|error| FederationError::Storage(error.to_string()))?;
+
+        record["document"]["verify_keys"][key_id]["key"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| FederationError::Unauthorized(format!("{origin} has no key {key_id}")))
+    }
+}
+
+impl Federation {
+    /// GET a peer's key document and check it vouches for itself.
+    ///
+    /// Delegation (.well-known, SRV) is not resolved yet — the server name
+    /// is used as the host directly, which the federation test rig
+    /// satisfies and docs/dashboard record as a gap.
+    async fn fetch_key_document(&self, origin: &str) -> Result<Value, FederationError> {
+        let url = format!("{}/_matrix/key/v2/server", self.base_url(origin)?);
         let document: Value = self
             .client
             .get(&url)
@@ -292,22 +388,7 @@ impl Federation {
                 "key document names a different server".to_owned(),
             ));
         }
-
-        let claimed_until = document["valid_until_ts"].as_u64().unwrap_or(0);
-        let ceiling = now + u64::try_from(MAX_KEY_VALIDITY.as_millis()).unwrap_or(u64::MAX);
-        let capped = claimed_until.min(ceiling);
-        let record = json!({ "document": document, "fetched_valid_until": capped });
-        Store::put(
-            self.store.as_ref(),
-            &cache_key,
-            record.to_string().as_bytes(),
-        )
-        .map_err(|error| FederationError::Storage(error.to_string()))?;
-
-        record["document"]["verify_keys"][key_id]["key"]
-            .as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| FederationError::Unauthorized(format!("{origin} has no key {key_id}")))
+        Ok(document)
     }
 }
 
@@ -340,10 +421,7 @@ impl Federation {
         let authorization = self.sign_request("GET", &uri, destination, None)?;
         let response = self
             .client
-            .get(format!(
-                "{}{uri}",
-                base_url(destination, self.insecure_http)?
-            ))
+            .get(format!("{}{uri}", self.base_url(destination)?))
             .header("authorization", authorization)
             .timeout(Duration::from_secs(30))
             .send()
@@ -383,10 +461,7 @@ impl Federation {
         let authorization = self.sign_request("GET", &uri, destination, None)?;
         let response = self
             .client
-            .get(format!(
-                "{}{uri}",
-                base_url(destination, self.insecure_http)?
-            ))
+            .get(format!("{}{uri}", self.base_url(destination)?))
             .header("authorization", authorization)
             .timeout(Duration::from_secs(10))
             .send()
@@ -426,10 +501,7 @@ impl Federation {
         let authorization = self.sign_request("GET", &uri, destination, None)?;
         let response = self
             .client
-            .get(format!(
-                "{}{uri}",
-                base_url(destination, self.insecure_http)?
-            ))
+            .get(format!("{}{uri}", self.base_url(destination)?))
             .header("authorization", authorization)
             .timeout(Duration::from_secs(10))
             .send()
@@ -469,10 +541,7 @@ impl Federation {
         let authorization = self.sign_request("PUT", &uri, destination, Some(join))?;
         let response = self
             .client
-            .put(format!(
-                "{}{uri}",
-                base_url(destination, self.insecure_http)?
-            ))
+            .put(format!("{}{uri}", self.base_url(destination)?))
             .header("authorization", authorization)
             .header("content-type", "application/json")
             .timeout(Duration::from_secs(60))
@@ -523,10 +592,7 @@ impl Federation {
         let authorization = self.sign_request("PUT", &uri, destination, Some(body))?;
         let response = self
             .client
-            .put(format!(
-                "{}{uri}",
-                base_url(destination, self.insecure_http)?
-            ))
+            .put(format!("{}{uri}", self.base_url(destination)?))
             .header("authorization", authorization)
             .header("content-type", "application/json")
             .timeout(Duration::from_secs(30))
@@ -568,10 +634,7 @@ impl Federation {
         let authorization = self.sign_request("GET", &uri, destination, None)?;
         let response = self
             .client
-            .get(format!(
-                "{}{uri}",
-                base_url(destination, self.insecure_http)?
-            ))
+            .get(format!("{}{uri}", self.base_url(destination)?))
             .header("authorization", authorization)
             .timeout(Duration::from_secs(30))
             .send()
@@ -611,10 +674,7 @@ impl Federation {
         let authorization = self.sign_request("PUT", &uri, destination, Some(leave))?;
         let response = self
             .client
-            .put(format!(
-                "{}{uri}",
-                base_url(destination, self.insecure_http)?
-            ))
+            .put(format!("{}{uri}", self.base_url(destination)?))
             .header("authorization", authorization)
             .header("content-type", "application/json")
             .timeout(Duration::from_secs(30))
@@ -653,10 +713,7 @@ impl Federation {
         let authorization = self.sign_request("GET", &uri, destination, None)?;
         let response = self
             .client
-            .get(format!(
-                "{}{uri}",
-                base_url(destination, self.insecure_http)?
-            ))
+            .get(format!("{}{uri}", self.base_url(destination)?))
             .header("authorization", authorization)
             .timeout(Duration::from_secs(60))
             .send()
@@ -681,7 +738,7 @@ impl Federation {
         // peers predating authenticated media; a 404 there is final.
         let legacy = format!(
             "{}/_matrix/media/v3/download/{destination}/{media_id}?allow_redirect=false",
-            base_url(destination, self.insecure_http)?
+            self.base_url(destination)?
         );
         let response = self
             .client
@@ -730,10 +787,7 @@ impl Federation {
         let authorization = self.sign_request("PUT", &uri, destination, Some(body))?;
         let response = self
             .client
-            .put(format!(
-                "{}{uri}",
-                base_url(destination, self.insecure_http)?
-            ))
+            .put(format!("{}{uri}", self.base_url(destination)?))
             .header("authorization", authorization)
             .header("content-type", "application/json")
             .timeout(Duration::from_secs(30))

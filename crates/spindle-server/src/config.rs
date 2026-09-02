@@ -299,6 +299,18 @@ pub struct FederationConfig {
     /// all but name: anyone on the network path can answer the key fetch.
     #[serde(default)]
     pub insecure_http: bool,
+    /// CIDR ranges a federation fetch may reach even though they are not
+    /// routable, e.g. `["127.0.0.0/8"]` for a test rig whose peers are
+    /// loopback stubs.
+    ///
+    /// Every key fetch and every outbound transaction connects to a host a
+    /// stranger named -- an `X-Matrix` origin, a room's membership -- so a
+    /// server name that resolves inward (loopback, RFC 1918, link-local,
+    /// the metadata service) is refused by resolved address, always, unless
+    /// its range is listed here (#288). Same judgement, same shape as
+    /// `[previews] allow_private`.
+    #[serde(default)]
+    pub allow_internal: Vec<String>,
     /// Base retry delay for outbound delivery, milliseconds. Doubles per
     /// consecutive failure per destination, capped at 64×. Tests shrink it;
     /// operators should not need to touch it.
@@ -327,6 +339,7 @@ impl Default for FederationConfig {
     fn default() -> Self {
         Self {
             insecure_http: false,
+            allow_internal: Vec::new(),
             retry_base_ms: default_retry_base_ms(),
             bind: None,
             tls_cert: None,

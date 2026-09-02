@@ -36,7 +36,7 @@ impl Instance {
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
         let config = spindle_server::Config::parse(&format!(
             "[server]\nname = \"{name}\"\n[ratelimit]\nenabled = false\n\
-             [federation]\ninsecure_http = true\nretry_base_ms = 50\n",
+             [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\nretry_base_ms = 50\n",
         ))
         .unwrap();
         let app = spindle_server::app(config, store).expect("the app builds");
