@@ -35,6 +35,8 @@ pub struct Config {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub turn: TurnConfig,
+    #[serde(default)]
+    pub rtc: RtcConfig,
 }
 
 /// The caps on MSC4140 delayed events (#36).
@@ -203,6 +205,54 @@ pub struct TurnConfig {
 
 fn default_turn_ttl() -> u64 {
     86_400
+}
+
+/// The `MatrixRTC` transports this deployment offers (#37, MSC4143).
+///
+/// A "focus" is the media backend a call runs through -- today always a
+/// `LiveKit` SFU, reached via the JWT service that mints its tokens. The
+/// server does not talk to it and does not carry media: it only tells
+/// clients where it is, on two surfaces, because a client needs the answer
+/// both before and after it authenticates.
+///
+/// Empty is a working configuration and answers an empty list rather than a
+/// 404: a server that offers no transport is a server clients can still ask,
+/// and the honest answer is "none", not "no such endpoint". A client that
+/// gets the empty list falls back to peer-to-peer or reports that the
+/// deployment has no call backend, which is what has actually happened.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RtcConfig {
+    /// The transports handed to clients, **in the operator's order**.
+    ///
+    /// MSC4143 has clients read this list as a priority ordering, so it is
+    /// carried through exactly as written and never re-sorted: the operator
+    /// knows which of their backends is nearest or cheapest and this server
+    /// does not.
+    #[serde(default)]
+    pub foci: Vec<RtcFocus>,
+}
+
+/// One transport description, as MSC4143 renders it to clients.
+///
+/// `type` is the discriminator and the rest of the object is that type's
+/// own. Only `livekit` (MSC4195) exists today, so it is the only shape
+/// modelled; an unrecognised type is refused at startup rather than passed
+/// through, because a transport this server cannot render correctly is one
+/// clients would read as malformed with nothing here to say why.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RtcFocus {
+    /// The transport type. `livekit` is the only one implemented.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// The `LiveKit` JWT service, e.g. `https://livekit.example.org/jwt`.
+    ///
+    /// Not the SFU's own address: clients ask this service for a token and
+    /// it tells them where the SFU is. Pointing this at the SFU is the
+    /// configuration mistake worth naming, because both are URLs and only
+    /// one works.
+    pub livekit_service_url: Option<String>,
 }
 
 /// How callers prove who they are.
@@ -588,6 +638,49 @@ impl Config {
                 field: "turn.password",
                 message: "turn.username and turn.password go together".to_owned(),
             });
+        }
+        self.validate_rtc()?;
+        Ok(())
+    }
+
+    /// The `MatrixRTC` transports, checked before the server takes traffic
+    /// on them (#37).
+    ///
+    /// Its own function because `validate` is long enough already, and
+    /// because this is the one group of settings with no feedback path of
+    /// its own: see the comment inside.
+    fn validate_rtc(&self) -> Result<(), ConfigError> {
+        // A focus is advertised to clients and never used by this server, so
+        // nothing here fails on our side: a wrong entry fails in a client,
+        // during a call, as "no transport" with nothing in this server's log
+        // to connect it to a typo in the config. That is the same absent
+        // feedback path the TURN credential has, and the same reason to
+        // check what can be checked at startup.
+        for focus in &self.rtc.foci {
+            if focus.kind != "livekit" {
+                return Err(ConfigError::Invalid {
+                    field: "rtc.foci",
+                    message: format!(
+                        "{:?} is not a transport type this server can render; \
+                         only \"livekit\" (MSC4195) is implemented",
+                        focus.kind
+                    ),
+                });
+            }
+            let Some(url) = focus.livekit_service_url.as_deref() else {
+                return Err(ConfigError::Invalid {
+                    field: "rtc.foci",
+                    message: "a livekit transport needs livekit_service_url — \
+                              the JWT service that mints its tokens"
+                        .to_owned(),
+                });
+            };
+            if !url.starts_with("https://") && !url.starts_with("http://") {
+                return Err(ConfigError::Invalid {
+                    field: "rtc.foci",
+                    message: format!("{url:?} is not an http(s) URL"),
+                });
+            }
         }
         Ok(())
     }

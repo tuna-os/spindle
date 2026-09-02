@@ -162,6 +162,31 @@ registrations = []
 # their cue to fetch a fresh one. Defaults to a day, which is coturn's own.
 # ttl_seconds = 86400
 
+[rtc]
+# MatrixRTC transports (MSC4143) — where a call's media is carried.
+#
+# This server never touches the media and never speaks to the backend. Its
+# whole part in a call is telling clients where the backend is, on two
+# surfaces: here, authenticated, at /_matrix/client/v1/rtc/transports (and
+# the org.matrix.msc4143 unstable path shipping clients actually ask for),
+# and unauthenticated in /.well-known/matrix/client, which is how a client
+# finds a backend before it has a token.
+#
+# Empty is a working configuration: the endpoint answers an empty list, and
+# well-known omits the key. Clients read that as "this deployment has no
+# call backend", which is true, rather than as a broken server.
+#
+# The order is yours and is passed through untouched — clients read the list
+# as a priority ordering, and this server does not know which of your
+# backends is nearest.
+#
+# The URL is the LiveKit *JWT service* (element-hq/lk-jwt-service), not the
+# SFU itself: clients ask it for a token and it tells them where the SFU is.
+# Both are URLs and only one works, which is the mistake worth naming.
+# foci = [
+#     { type = "livekit", livekit_service_url = "https://livekit.example.org/jwt" },
+# ]
+
 [metrics]
 # Prometheus scrape surface, off unless this is set. Its own listener, on
 # loopback: the exposition names the peers this server federates with and

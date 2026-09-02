@@ -36,9 +36,16 @@ OMITTED: dict[str, str] = {}
 
 
 def fields_in(source: str) -> dict[str, list[str]]:
-    """struct name -> its `pub` field names, in declaration order."""
+    """struct name -> its field names *as an operator writes them*.
+
+    A `#[serde(rename = "...")]` field is looked for under the renamed
+    spelling, because that is the one that goes in the TOML: `RtcFocus.kind`
+    is written `type`, and searching the example for "kind" would report a
+    documented field as missing.
+    """
     found: dict[str, list[str]] = {}
     current: str | None = None
+    renamed: str | None = None
     for line in source.splitlines():
         opened = re.match(r"\s*pub struct (\w+)", line)
         if opened:
@@ -50,9 +57,14 @@ def fields_in(source: str) -> dict[str, list[str]]:
         if line.strip() == "}":
             current = None
             continue
+        rename = re.search(r'#\[serde\(rename = "([^"]+)"', line)
+        if rename:
+            renamed = rename.group(1)
+            continue
         field = re.match(r"\s*pub (\w+):", line)
         if field:
-            found[current].append(field.group(1))
+            found[current].append(renamed or field.group(1))
+            renamed = None
     return found
 
 
@@ -67,16 +79,25 @@ def main() -> int:
     structs = fields_in(arguments.config.read_text(encoding="utf-8"))
     example = arguments.example.read_text(encoding="utf-8")
 
-    # A field counts as documented if its name appears at all — commented out
-    # is fine, and is the right shape for a setting with no default. This is a
-    # deliberately loose test: it catches "nobody wrote this down", which is
-    # the failure that actually happened, without pretending to verify prose.
+    # A field counts as documented if the example *assigns* it -- commented
+    # out is fine, and is the right shape for a setting with no default. It
+    # is the assignment that is looked for rather than the bare word, so that
+    # prose mentioning a field does not stand in for showing it. That
+    # distinction is not pedantry: `type` (RtcFocus, written `type = ` inside
+    # an inline table) occurs in ordinary sentences all over this file, so a
+    # bare-word search could never fail for it and the check would silently
+    # stop covering the field.
     missing: list[tuple[str, str]] = []
     for struct, fields in sorted(structs.items()):
         for field in fields:
             if field in OMITTED:
                 continue
-            if not re.search(rf"\b{re.escape(field)}\b", example):
+            # Either spelling counts, because both are how TOML names a
+            # setting: `field = ...` for a value, `[section.field]` for a
+            # nested table (`[auth.delegated]`, `[storage.s3]`).
+            assigned = re.search(rf"\b{re.escape(field)}\s*=", example)
+            sectioned = re.search(rf"^\s*#?\s*\[[\w.]*\b{re.escape(field)}\]", example, re.M)
+            if not assigned and not sectioned:
                 missing.append((struct, field))
 
     total = sum(len(fields) for fields in structs.values())

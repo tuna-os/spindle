@@ -631,6 +631,18 @@ fn timeline_routes() -> Router<AppState> {
         )
         .route("/_matrix/client/v3/voip/turnServer", get(voip_turn_server))
         .route(
+            "/_matrix/client/v1/rtc/transports",
+            get(rtc_transports_endpoint),
+        )
+        // The unstable path is the one shipping clients actually request:
+        // MSC4143 is unmerged, so Element Call and Element X ask here and
+        // nowhere else. The stable path above is served alongside it for
+        // the day the MSC lands, not instead of it.
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc4143/rtc/transports",
+            get(rtc_transports_endpoint),
+        )
+        .route(
             "/_matrix/client/unstable/org.matrix.msc4140/delayed_events",
             get(delayed_events),
         )
@@ -1188,6 +1200,15 @@ async fn well_known_client(State(state): State<AppState>) -> Json<Value> {
         body["org.matrix.msc2965.authentication"] = json!({
             "issuer": format!("{}/", crate::oidc::issuer(&state)),
         });
+    }
+    // MSC4143 (which absorbed MSC4158): the MatrixRTC backend, named here
+    // as well as on `/rtc/transports` because a client discovers calls
+    // before it has a token to ask with. Omitted entirely when nothing is
+    // configured -- an empty array here would be a positive claim to have
+    // no backend, where absence is "this server does not answer that".
+    let foci = rtc_transports(&state.config);
+    if !foci.is_empty() {
+        body["org.matrix.msc4143.rtc_foci"] = Value::Array(foci);
     }
     Json(body)
 }
@@ -6316,6 +6337,55 @@ async fn voip_turn_server(
         "uris": turn.uris,
         "ttl": ttl,
     })))
+}
+
+/// The transports this deployment offers, rendered as MSC4143 sends them.
+///
+/// One renderer for both surfaces on purpose. The same list is served
+/// authenticated at `/rtc/transports` and unauthenticated in
+/// `.well-known/matrix/client`, and a client that reads one and then the
+/// other has to find them consistent -- Element Call reads well-known
+/// before login and the endpoint after it, so a deployment whose two
+/// answers disagree is one where a call works or does not depending on
+/// which surface the client happened to believe.
+///
+/// The order is the operator's, carried through untouched: MSC4143 has
+/// clients read the list as a priority ordering.
+fn rtc_transports(config: &crate::Config) -> Vec<Value> {
+    config
+        .rtc
+        .foci
+        .iter()
+        .map(|focus| {
+            json!({
+                "type": focus.kind,
+                "livekit_service_url": focus.livekit_service_url,
+            })
+        })
+        .collect()
+}
+
+/// `GET /_matrix/client/v1/rtc/transports` (MSC4143)
+///
+/// Where a `MatrixRTC` call is carried. This server never touches the media
+/// and never speaks to the backend -- the whole of its part in `MatrixRTC` is
+/// this answer plus the events it already relays, which is why the MSC
+/// calls discovery "the only HS-side requirement".
+///
+/// Authenticated, as the MSC has it: the unauthenticated half of discovery
+/// is `.well-known`, which exists precisely so a client can find a backend
+/// before it has a token. Serving this one openly would make the
+/// distinction meaningless.
+///
+/// A deployment with no transport configured answers `{"rtc_transports": []}`
+/// rather than 404: the endpoint's presence is the server's claim to
+/// implement MSC4143, and the list is what it currently has. A 404 would
+/// tell a client to stop asking.
+async fn rtc_transports_endpoint(
+    State(state): State<AppState>,
+    Authenticated(_identity): Authenticated,
+) -> Json<Value> {
+    Json(json!({ "rtc_transports": rtc_transports(&state.config) }))
 }
 
 /// The TURN REST password: base64 of HMAC-SHA1 over the username.
