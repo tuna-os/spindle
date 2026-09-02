@@ -18,7 +18,7 @@ use spindle_core::keys::{self, Keyspace};
 use spindle_store::{FjallStore, ReadView, Store};
 
 use crate::media::Media;
-use crate::netguard::{Cidr, VettingResolver, is_global};
+use crate::netguard::{Cidr, VettingResolver, permits};
 
 /// How much of a page is read looking for its metadata. Everything a
 /// preview wants lives in `<head>`; a bound this size is about refusing to
@@ -90,10 +90,7 @@ impl Previews {
             }
             if let Some(host) = attempt.url().host_str()
                 && let Ok(literal) = host.trim_matches(['[', ']']).parse::<IpAddr>()
-                && !(is_global(literal)
-                    || allowed_for_redirects
-                        .iter()
-                        .any(|cidr| cidr.contains(literal)))
+                && !permits(&allowed_for_redirects, literal)
             {
                 return attempt.error("redirect into a non-previewable address");
             }
@@ -168,7 +165,7 @@ impl Previews {
     }
 
     fn client_allows(&self, address: IpAddr) -> bool {
-        is_global(address) || self.allowed.iter().any(|cidr| cidr.contains(address))
+        permits(&self.allowed, address)
     }
 
     async fn fetch_preview(&self, url: &reqwest::Url) -> Result<Value, PreviewError> {
@@ -332,7 +329,8 @@ fn decode_entities(text: &str) -> String {
 mod guard_tests {
     use std::net::IpAddr;
 
-    use super::{Cidr, extract_open_graph, is_global};
+    use super::extract_open_graph;
+    use crate::netguard::{Cidr, is_global};
 
     fn ip(text: &str) -> IpAddr {
         text.parse().unwrap()
@@ -356,8 +354,33 @@ mod guard_tests {
             "fd00::1",          // ULA
             "::ffff:127.0.0.1", // v4-mapped smuggling
             "::ffff:169.254.169.254",
+            // The other ways IPv6 spells an IPv4 address. Each is the same
+            // host as a line above, written differently -- which is the
+            // whole of the bypass: a filter that judges the spelling has
+            // one hole per spelling.
+            "64:ff9b::a9fe:a9fe", // NAT64 well-known prefix, metadata again
+            "64:ff9b::7f00:1",    // NAT64, loopback
+            "::7f00:1",           // v4-compatible, loopback
+            "::a9fe:a9fe",        // v4-compatible, metadata
+            "2002:a9fe:a9fe::",   // 6to4, metadata
+            "2002:7f00:1::",      // 6to4, loopback
+            "192.88.99.1",        // the 6to4 relay itself
+            "198.18.0.1",         // benchmarking, RFC 2544
+            "0.1.2.3",            // 0.0.0.0/8 -- not just the bare 0.0.0.0
+            "fec0::1",            // deprecated site-local
         ] {
             assert!(!is_global(ip(address)), "{address} must be refused");
+        }
+    }
+
+    #[test]
+    fn a_public_address_survives_being_written_in_ipv6() {
+        // The other direction, and the reason this is a normalisation
+        // rather than a blanket refusal of the transition prefixes: a
+        // NAT64 network is how an IPv6-only host reaches the v4 internet,
+        // so refusing 64:ff9b::/96 outright would refuse the internet.
+        for address in ["64:ff9b::1.1.1.1", "::5db8:d822", "2002:5db8:d822::"] {
+            assert!(is_global(ip(address)), "{address} must pass");
         }
     }
 

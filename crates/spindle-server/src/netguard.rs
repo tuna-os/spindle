@@ -9,7 +9,7 @@
 //! A literal IP never touches DNS, so callers vet those themselves with
 //! [`permits`] before connecting.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 /// Parse an allow-list, refusing the whole list on the first bad entry.
 ///
@@ -22,8 +22,54 @@ pub(crate) fn parse_allow_list(entries: &[String]) -> Result<Vec<Cidr>, String> 
 }
 
 /// Is `address` reachable under this allow-list: routable, or opened up.
+///
+/// The single entry point. Every caller goes through here rather than
+/// pairing [`is_global`] with its own allow-list scan, so that an address
+/// is canonicalised once and the operator's ranges are matched against the
+/// same thing the routability judgement saw.
 pub(crate) fn permits(allowed: &[Cidr], address: IpAddr) -> bool {
+    let address = canonical(address);
     is_global(address) || allowed.iter().any(|cidr| cidr.contains(address))
+}
+
+/// The address a packet to `address` actually reaches.
+///
+/// IPv6 has several ways to carry an IPv4 address, and on a network that
+/// translates them the destination is that IPv4 address rather than the
+/// IPv6 spelling of it. A filter that judges the spelling therefore has
+/// one bypass per spelling: `::ffff:169.254.169.254` was already handled,
+/// but `64:ff9b::169.254.169.254` — the same host, on any NAT64 network,
+/// which is the ordinary shape of an IPv6-only cloud subnet — was not.
+///
+/// Normalising here rather than adding refusal lines means the operator's
+/// `allow_internal` keeps meaning what it says: a range they opened stays
+/// open however an address in it is written, and everything else stays
+/// shut the same way.
+fn canonical(address: IpAddr) -> IpAddr {
+    let IpAddr::V6(v6) = address else {
+        return address;
+    };
+    if let Some(mapped) = v6.to_ipv4_mapped() {
+        return IpAddr::V4(mapped);
+    }
+    match v6.segments() {
+        // 64:ff9b::/96, NAT64's well-known prefix (RFC 6052 §2.1). The
+        // longer 64:ff9b:1::/48 form carries the address at a
+        // prefix-dependent offset and is not decoded here.
+        [0x0064, 0xff9b, 0, 0, 0, 0, high, low] => embedded_v4(high, low),
+        // 2002::/16, 6to4 (RFC 3056): the embedded address is the relay's.
+        [0x2002, high, low, ..] => embedded_v4(high, low),
+        // ::a.b.c.d, IPv4-compatible (RFC 4291 §2.5.5.1, deprecated).
+        // `::` and `::1` are IPv6 addresses in their own right, judged as
+        // such below — not as 0.0.0.0 and 0.0.0.1.
+        [0, 0, 0, 0, 0, 0, high, low] if high != 0 || low > 1 => embedded_v4(high, low),
+        _ => address,
+    }
+}
+
+/// The IPv4 address two IPv6 segments spell.
+fn embedded_v4(high: u16, low: u16) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::from((u32::from(high) << 16) | u32::from(low)))
 }
 
 /// The vetting DNS resolver: resolve, then judge every address.
@@ -45,10 +91,7 @@ impl reqwest::dns::Resolve for VettingResolver {
                 .await
                 .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
             let vetted: Vec<SocketAddr> = addresses
-                .filter(|address| {
-                    is_global(address.ip())
-                        || allowed.iter().any(|cidr| cidr.contains(address.ip()))
-                })
+                .filter(|address| permits(&allowed, address.ip()))
                 .collect();
             if vetted.is_empty() {
                 return Err(format!(
@@ -68,29 +111,33 @@ impl reqwest::dns::Resolve for VettingResolver {
 /// attack surface (loopback: local admin ports; private + ULA: the LAN;
 /// link-local v4 169.254/16 *and* v6 `fe80::/10`: cloud metadata services;
 /// et cetera).
+///
+/// [`canonical`] runs first, so the v6 arm only ever judges addresses that
+/// are genuinely v6 destinations: every form that carries an IPv4 address
+/// has already become one, and is refused or allowed as that address.
 pub(crate) fn is_global(address: IpAddr) -> bool {
-    match address {
+    match canonical(address) {
         IpAddr::V4(v4) => {
             !(v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_broadcast()
                 || v4.is_documentation()
-                || v4.is_unspecified()
+                || v4.octets()[0] == 0 // 0.0.0.0/8: `is_unspecified` is only 0.0.0.0
                 || v4.octets()[0] >= 224 // multicast + reserved
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64) // CGNAT 100.64/10
-                || (v4.octets()[0] == 192 && v4.octets()[1] == 0 && v4.octets()[2] == 0))
-            // 192.0.0.0/24: IETF protocol assignments
+                || (v4.octets()[0] == 192 && v4.octets()[1] == 0 && v4.octets()[2] == 0) // 192.0.0.0/24: IETF protocol assignments
+                || (v4.octets()[0] == 198 && (v4.octets()[1] & 0xfe) == 18) // benchmarking 198.18.0.0/15
+                || (v4.octets()[0] == 192 && v4.octets()[1] == 88 && v4.octets()[2] == 99))
+            // 192.88.99.0/24: the 6to4 relay anycast address
         }
         IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return is_global(IpAddr::V4(mapped));
-            }
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || (v6.segments()[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
                 || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || (v6.segments()[0] & 0xffc0) == 0xfec0 // site-local fec0::/10, deprecated but routed
                 || (v6.segments()[0] == 0x2001 && v6.segments()[1] == 0xdb8))
             // documentation 2001:db8::/32
         }
