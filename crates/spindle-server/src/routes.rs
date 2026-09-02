@@ -4772,7 +4772,59 @@ fn save_ruleset(state: &AppState, user_id: &str, ruleset: &Value) -> Result<(), 
     state
         .account_data
         .put(user_id, "", crate::push_rules::TYPE, ruleset)
-        .map_err(|error| account_data_error(&error))
+        .map_err(|error| account_data_error(&error))?;
+    // What was scored under the old rules says nothing under the new.
+    state.rooms.forget_highlights(user_id);
+    Ok(())
+}
+
+/// `unread_notifications.highlight_count`: the reader's unread events in
+/// `room_id` that their push rules highlight.
+///
+/// Scored through the reader's tally ([`crate::rooms::Rooms::unscored_highlights`]):
+/// only the bodies after the position last scored are put to the rules, and
+/// the ruleset, profile and room context are read only when there is
+/// something to score. Nothing unread means nothing highlighted, before any
+/// of that.
+fn highlight_count(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    room_id: &str,
+    unread: &crate::rooms::Unread,
+) -> Result<usize, MatrixError> {
+    let Some(boundary) = unread.boundary else {
+        return Ok(0);
+    };
+    if unread.notification_count == 0 {
+        return Ok(0);
+    }
+    let pending = state
+        .rooms
+        .unscored_highlights(room_id, &identity.user_id, boundary)
+        .map_err(room_error)?;
+    if pending.events.is_empty() {
+        return Ok(pending.count);
+    }
+    let ruleset = ruleset_of(state, &identity.user_id)?;
+    let profile = state
+        .profiles
+        .get(&identity.user_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    let room = RoomRuleContext::of(state, room_id)?;
+    let context = room.for_reader(&identity.user_id, profile.displayname.as_deref(), room_id);
+    let count = pending.count
+        + pending
+            .events
+            .iter()
+            .filter(|event| {
+                crate::push_rules::evaluate(&ruleset, event, &context)
+                    .is_some_and(|actions| crate::push_rules::is_highlight(&actions))
+            })
+            .count();
+    state
+        .rooms
+        .record_highlights(room_id, &identity.user_id, boundary, pending.upto, count);
+    Ok(count)
 }
 
 /// Reject a scope the spec does not define.
@@ -6250,12 +6302,16 @@ fn sliding_room_entry(
         .rooms
         .unread(room_id, &identity.user_id)
         .map_err(room_error)?;
+    let highlight_count = highlight_count(state, identity, room_id, &unread)?;
     Ok(crate::sliding::room_entry(
         name,
         state_events,
         timeline,
         joined_count,
-        unread.notification_count,
+        crate::sliding::Counts {
+            notification_count: unread.notification_count,
+            highlight_count,
+        },
         initial,
     ))
 }
@@ -6666,6 +6722,7 @@ fn sync_join(
             .rooms
             .unread(&room.room_id, &identity.user_id)
             .map_err(room_error)?;
+        let highlight_count = highlight_count(state, identity, &room.room_id, &unread)?;
         // Sent in full on every sync, incremental ones included, rather than
         // only when it changed. Account data has no stream position of its
         // own -- the sync token counts room events, and a `PUT` to
@@ -6760,7 +6817,10 @@ fn sync_join(
         );
         entry.insert(
             "unread_notifications",
-            raw(&json!({ "notification_count": unread.notification_count }))?,
+            raw(&json!({
+                "notification_count": unread.notification_count,
+                "highlight_count": highlight_count,
+            }))?,
         );
         join.insert(room.room_id, raw(&entry)?);
     }
@@ -8542,6 +8602,22 @@ struct RoomRuleContext {
 }
 
 impl RoomRuleContext {
+    /// The room-kind facts the rules ask about: the joined count and the
+    /// power levels.
+    fn of(state: &AppState, room_id: &str) -> Result<Self, MatrixError> {
+        Ok(Self {
+            member_count: state
+                .rooms
+                .joined_members(room_id)
+                .map_err(room_error)?
+                .len(),
+            power_levels: state
+                .rooms
+                .state_event(room_id, "m.room.power_levels", "")
+                .unwrap_or_else(|_| json!({})),
+        })
+    }
+
     fn for_reader<'a>(
         &'a self,
         user_id: &'a str,
@@ -8604,17 +8680,7 @@ async fn notifications(
         let Ok(scope) = read_scope(&state, &identity.user_id, &room_id) else {
             continue;
         };
-        let room = RoomRuleContext {
-            member_count: state
-                .rooms
-                .joined_members(&room_id)
-                .map_err(room_error)?
-                .len(),
-            power_levels: state
-                .rooms
-                .state_event(&room_id, "m.room.power_levels", "")
-                .unwrap_or_else(|_| json!({})),
-        };
+        let room = RoomRuleContext::of(&state, &room_id)?;
         let context = room.for_reader(&identity.user_id, display_name, &room_id);
         let notifies = |event: &Value| {
             event["sender"] != identity.user_id.as_str()

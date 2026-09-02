@@ -127,6 +127,14 @@ pub fn indices_in_view(ranges: &[(usize, usize)], len: usize) -> Vec<usize> {
     indices
 }
 
+/// A room's badge for the reader: unread events that notify, and the
+/// highlights among them.
+#[derive(Clone, Copy)]
+pub struct Counts {
+    pub notification_count: usize,
+    pub highlight_count: usize,
+}
+
 /// One room's timeline window, as the caller fetched it.
 pub struct Timeline {
     pub events: Vec<Value>,
@@ -143,7 +151,7 @@ pub fn room_entry(
     required_state: Vec<Value>,
     timeline: Timeline,
     joined_count: usize,
-    notification_count: usize,
+    unread: Counts,
     initial: bool,
 ) -> Value {
     let mut entry = Map::new();
@@ -157,7 +165,11 @@ pub fn room_entry(
         entry.insert("prev_batch".to_owned(), json!(prev_batch));
     }
     entry.insert("joined_count".to_owned(), json!(joined_count));
-    entry.insert("notification_count".to_owned(), json!(notification_count));
+    entry.insert(
+        "notification_count".to_owned(),
+        json!(unread.notification_count),
+    );
+    entry.insert("highlight_count".to_owned(), json!(unread.highlight_count));
     // `initial: true` marks a room sent in full, so a client knows to replace
     // its copy rather than append. Stateless as we are, that is every room in
     // an initial response and every *newly windowed* room later — the caller

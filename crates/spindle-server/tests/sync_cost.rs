@@ -111,6 +111,56 @@ impl Harness {
         assert_eq!(status, StatusCode::OK, "{body}");
     }
 
+    async fn post(&self, path: &str, token: &str, payload: &Value) {
+        let (status, body) = self
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// `bob` joins `room` on `alice`'s invite.
+    async fn invite_and_join(&self, room: &str, alice: &str, bob: &str) {
+        self.post(
+            &format!("/_matrix/client/v3/rooms/{room}/invite"),
+            alice,
+            &json!({ "user_id": "@bob:example.org" }),
+        )
+        .await;
+        self.post(
+            &format!("/_matrix/client/v3/rooms/{room}/join"),
+            bob,
+            &json!({}),
+        )
+        .await;
+    }
+
+    async fn say(&self, room: &str, token: &str, text: &str, txn: &str) {
+        let (status, body) = self
+            .call(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/_matrix/client/v3/rooms/{room}/send/m.room.message/{txn}"
+                    ))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "msgtype": "m.text", "body": text }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
     async fn sync(&self, token: &str, since: Option<&str>) -> Value {
         let uri = match since {
             Some(since) => format!("/_matrix/client/v3/sync?timeout=0&since={since}"),
@@ -265,6 +315,53 @@ async fn a_sync_does_not_pay_for_its_own_history() {
         "a sync one event behind touched {} rows in a new room and {} in a \
          room with 800 events already read -- the scan is starting at the \
          room's first row, not at the token",
+        measured[0], measured[1]
+    );
+}
+
+/// A highlight is a push-rule question answered against the body, so an
+/// unread mention has to be read once. Once: the tally remembers how far it
+/// scored, and a sync that finds nothing new after that position reads no
+/// body it has already scored, however many unread mentions are waiting.
+/// Measured as the reads of a sync that brings one new message on top of a
+/// backlog of one unread mention against a backlog of eight.
+#[tokio::test]
+async fn unread_highlights_are_scored_once_and_not_on_every_sync() {
+    let mut measured = Vec::new();
+    for mentions in [1usize, 8] {
+        let harness = Harness::new();
+        let alice = harness.register("alice").await;
+        let bob = harness.register("bob").await;
+        let mine = harness.room(&alice).await;
+        harness.invite_and_join(&mine, &alice, &bob).await;
+        for index in 0..mentions {
+            harness
+                .say(
+                    &mine,
+                    &bob,
+                    &format!("alice, {index}"),
+                    &format!("m{index}"),
+                )
+                .await;
+        }
+        let first = harness.sync(&alice, None).await;
+        let counts = &first["rooms"]["join"][&mine]["unread_notifications"];
+        assert_eq!(counts["highlight_count"], mentions, "{counts}");
+        let batch = first["next_batch"].as_str().unwrap().to_owned();
+
+        // One more message, so the room is in the next window and its badge
+        // is served again: the new body is scored, the backlog is not.
+        harness.say(&mine, &bob, "and one more", "extra").await;
+        let before = harness.store.reads();
+        let next = harness.sync(&alice, Some(&batch)).await;
+        measured.push(harness.store.reads() - before);
+        let counts = &next["rooms"]["join"][&mine]["unread_notifications"];
+        assert_eq!(counts["highlight_count"], mentions, "{counts}");
+    }
+    assert_eq!(
+        measured[0], measured[1],
+        "a sync behind one unread mention read {} and behind eight read {} \
+         -- the unread backlog is being scored again",
         measured[0], measured[1]
     );
 }

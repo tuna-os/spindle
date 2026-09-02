@@ -258,6 +258,8 @@ async fn required_state_is_honoured_and_me_resolves() {
         "timeline_limit honoured: {entry}"
     );
     assert_eq!(entry["initial"], true);
+    assert_eq!(entry["notification_count"], 0, "{entry}");
+    assert_eq!(entry["highlight_count"], 0, "{entry}");
     // The window says where it begins (#331), and `/messages` pages back from
     // there to what was left out: everything up to the room's creation, and
     // not the window's own event again.

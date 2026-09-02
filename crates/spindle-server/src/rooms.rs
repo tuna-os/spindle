@@ -145,6 +145,33 @@ type MemberIds = ([u8; 32], Arc<Vec<String>>);
 /// Remote domains to fan out to, and the state root they were read from.
 type Destinations = ([u8; 32], Arc<Vec<String>>);
 
+/// How far one reader's unread highlights in one room have been scored.
+///
+/// The count is arithmetic for notifications ([`UnreadIndex`]) and cannot
+/// be for highlights: whether an event highlights is a push-rule question
+/// answered against its body. Scoring every unread body on every sync would
+/// bring back the walk #81 removed, so the tally remembers the position it
+/// was scored to and only what came after it is read again. It is keyed on
+/// the boundary it counted from: a receipt that moves, or a rejoin, starts
+/// a fresh count over the new unread range.
+#[derive(Clone, Copy)]
+struct HighlightTally {
+    boundary: i64,
+    upto: i64,
+    count: usize,
+}
+
+/// The unread events one reader's highlight tally has not scored yet.
+pub struct Unscored {
+    /// Highlights already counted after the boundary.
+    pub count: usize,
+    /// Bodies after the scored position, oldest first, none the reader's
+    /// own; the caller puts these to the reader's rules.
+    pub events: Vec<Value>,
+    /// The position the tally covers once `events` are scored.
+    pub upto: i64,
+}
+
 pub struct Rooms {
     store: Arc<FjallStore>,
     server_name: String,
@@ -152,6 +179,8 @@ pub struct Rooms {
     /// Lock order: `open` before `unread_index`, always. The fast path takes
     /// only `unread_index`; the build and append paths already hold `open`.
     unread_index: Mutex<HashMap<String, UnreadIndex>>,
+    /// Per `(room, reader)`; taken on its own, never under `open`.
+    highlights: Mutex<HashMap<(String, String), HighlightTally>>,
     /// Head-event timestamp per room, kept warm on append.
     ///
     /// The sliding-sync room list sorts by recency, so every request reads
@@ -248,6 +277,9 @@ pub struct Receipt {
 pub struct Unread {
     pub notification_count: usize,
     pub read_up_to: Option<String>,
+    /// The position the count starts after: the reader's receipt or their
+    /// join, whichever is later. `None` for someone who is not a member.
+    pub boundary: Option<i64>,
 }
 
 /// The events around one event, and the state there.
@@ -368,6 +400,7 @@ impl Rooms {
             server_name: server_name.into(),
             open: RwLock::new(HashMap::new()),
             unread_index: Mutex::new(HashMap::new()),
+            highlights: Mutex::new(HashMap::new()),
             last_activity: Mutex::new(HashMap::new()),
             state_render: Mutex::new(HashMap::new()),
             member_ids: Mutex::new(HashMap::new()),
@@ -3242,6 +3275,7 @@ impl Rooms {
                 return Ok(Unread {
                     notification_count: 0,
                     read_up_to: None,
+                    boundary: None,
                 });
             }
         };
@@ -3293,7 +3327,99 @@ impl Rooms {
         Ok(Unread {
             notification_count,
             read_up_to: read_up_to.map(|receipt| receipt.event_id),
+            boundary: Some(boundary),
         })
+    }
+
+    /// What `user_id`'s highlight tally in `room_id` has not scored yet:
+    /// the count so far after `boundary`, and the bodies after the scored
+    /// position that are not the reader's own. A tally counted from another
+    /// boundary is stale, and the range starts over at `boundary`.
+    ///
+    /// Timeline entries only, as the notification count is; a purged body
+    /// is nothing to score. The spine is read under the room's read lock and
+    /// the bodies outside it, as `messages_visible` does. A room with
+    /// nothing after the scored position reads no body at all, which is
+    /// what keeps a sync flat across quiet rooms (`sync_cost.rs`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
+    pub fn unscored_highlights(
+        &self,
+        room_id: &str,
+        user_id: &str,
+        boundary: i64,
+    ) -> Result<Unscored, RoomError> {
+        let key = (room_id.to_owned(), user_id.to_owned());
+        let tally = self
+            .highlights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .copied()
+            .filter(|tally| tally.boundary == boundary);
+        let (count, from) = tally.map_or((0, boundary), |tally| (tally.count, tally.upto));
+        let pending: Vec<(i64, String)> = self.with_room_read(room_id, |_, log| {
+            Ok(log
+                .entries()
+                .rev()
+                .take_while(|entry| entry.li.get() > from)
+                .filter(|entry| entry.state_key.is_none())
+                .map(|entry| (entry.li.get(), entry.event_id.as_str().to_owned()))
+                .collect())
+        })?;
+        let upto = pending.first().map_or(from, |(li, _)| *li);
+        let watermark = self.purge_watermark(room_id)?;
+        let mut events = Vec::with_capacity(pending.len());
+        for (li, event_id) in pending.iter().rev() {
+            match self.read_event(room_id, &EventId::new(event_id.as_str())) {
+                Ok(json) => {
+                    if json["sender"] != user_id {
+                        events.push(json);
+                    }
+                }
+                Err(RoomError::MissingBody(_)) if watermark.is_some_and(|mark| *li < mark) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(Unscored {
+            count,
+            events,
+            upto,
+        })
+    }
+
+    /// Remember that `user_id`'s highlights in `room_id` after `boundary`
+    /// number `count`, scored up to `upto`.
+    pub fn record_highlights(
+        &self,
+        room_id: &str,
+        user_id: &str,
+        boundary: i64,
+        upto: i64,
+        count: usize,
+    ) {
+        self.highlights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                (room_id.to_owned(), user_id.to_owned()),
+                HighlightTally {
+                    boundary,
+                    upto,
+                    count,
+                },
+            );
+    }
+
+    /// Drop every highlight tally of `user_id`: their rules changed, so
+    /// what was scored under the old ones no longer says anything.
+    pub fn forget_highlights(&self, user_id: &str) {
+        self.highlights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(_, reader), _| reader != user_id);
     }
 
     /// One user's receipt of one type, if they have set it.
