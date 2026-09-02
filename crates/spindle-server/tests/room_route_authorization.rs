@@ -110,6 +110,11 @@ const TABLE: &[Route] = &[
     },
     Route {
         method: "GET",
+        path: "/_matrix/client/v3/rooms/{room_id}/members",
+        reach: Reach::Refused,
+    },
+    Route {
+        method: "GET",
         path: "/_matrix/client/v3/rooms/{room_id}/aliases",
         reach: Reach::Refused,
     },
