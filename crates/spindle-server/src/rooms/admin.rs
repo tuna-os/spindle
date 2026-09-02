@@ -324,4 +324,24 @@ impl RoomAdmin<'_> {
         }
         Ok(purged)
     }
+
+    /// One state event's content, read as an operator.
+    ///
+    /// The client-facing spelling of this is on
+    /// [`RoomReader`](super::RoomReader), which answers for what its
+    /// caller may see; an operator's read is not scoped that way, so it
+    /// has its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room is unknown or the event is not in
+    /// its state.
+    pub fn state_event(
+        &self,
+        room_id: &str,
+        event_type: &str,
+        state_key: &str,
+    ) -> Result<Value, RoomError> {
+        self.rooms.state_event(room_id, event_type, state_key)
+    }
 }

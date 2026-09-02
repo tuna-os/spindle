@@ -107,9 +107,11 @@ type Destinations = ([u8; 32], Arc<Vec<String>>);
 
 mod admin;
 mod federation;
+mod read;
 mod unread;
 
 pub use admin::AdminTimelineEntry;
+pub use read::{ReadScope, RoomReader};
 
 use unread::{HighlightTally, UnreadIndex};
 pub use unread::{Receipt, Unread, Unscored};
@@ -801,7 +803,7 @@ impl Rooms {
     /// # Errors
     ///
     /// Returns [`RoomError`] if the room is unknown or a body is missing.
-    pub fn state_serialized(&self, room_id: &str) -> Result<Arc<String>, RoomError> {
+    fn state_serialized(&self, room_id: &str) -> Result<Arc<String>, RoomError> {
         let root = self.with_room_read(room_id, |_, log| {
             Ok(log
                 .entries()
@@ -1153,7 +1155,7 @@ impl Rooms {
     /// which is a different answer from an empty content and must stay that
     /// way: a client reading `m.room.topic` needs to tell "no topic" from "a
     /// topic that is the empty string".
-    pub fn state_event(
+    fn state_event(
         &self,
         room_id: &str,
         event_type: &str,
@@ -2833,7 +2835,7 @@ impl Rooms {
     ///
     /// Returns [`RoomError::UnknownRoom`] if the room does not exist, or
     /// [`RoomError::Build`] if the snapshot cannot be rebuilt.
-    pub fn state_as_of(&self, room_id: &str, li: i64) -> Result<Vec<Value>, RoomError> {
+    fn state_as_of(&self, room_id: &str, li: i64) -> Result<Vec<Value>, RoomError> {
         let root = self.with_room_read(room_id, |_, log| {
             Ok(log.entry_at_or_before(li).map(|entry| entry.state_root))
         })?;
@@ -2851,7 +2853,7 @@ impl Rooms {
     /// Returns [`RoomError::UnknownState`] when the room had no such state
     /// at that position -- the same answer [`Self::state_event`] gives for
     /// the present, for the same reason.
-    pub fn state_event_as_of(
+    fn state_event_as_of(
         &self,
         room_id: &str,
         li: i64,
