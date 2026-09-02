@@ -14,7 +14,7 @@
 
 use serde_json::Value;
 
-use super::{RoomError, Rooms};
+use super::{Context, RoomError, Rooms, TimelineEvent};
 
 /// How much of a room a caller may read.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -285,5 +285,77 @@ impl RoomReader<'_> {
                 .filter(|event| event["type"] == "m.room.member")
                 .collect()),
         }
+    }
+
+    /// A page of the room's timeline, oldest position first, carrying only
+    /// what this caller may see.
+    ///
+    /// The visibility predicate is the reader's own scope. That is the
+    /// point of the type: a caller cannot be paged a window computed
+    /// against somebody else's scope, or against none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room is unknown or its log cannot be
+    /// read.
+    pub fn messages(
+        &self,
+        from: Option<i64>,
+        limit: usize,
+    ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
+        self.rooms
+            .messages_visible(&self.room_id, from, limit, &|li| self.scope.admits(li))
+    }
+
+    /// The window around one event, as this caller may see it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room or the event is unknown.
+    pub fn context(&self, event_id: &str, limit: usize) -> Result<Context, RoomError> {
+        self.rooms
+            .context_visible(&self.room_id, event_id, limit, &|li| self.scope.admits(li))
+    }
+
+    /// The events in this room matching `matches`, as this caller may see
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room is unknown or its log cannot be
+    /// read.
+    pub fn search(
+        &self,
+        from: Option<i64>,
+        limit: usize,
+        matches: &(dyn Fn(&Value) -> bool + Sync),
+    ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
+        self.rooms.search(
+            &self.room_id,
+            from,
+            limit,
+            &|li| self.scope.admits(li),
+            matches,
+        )
+    }
+
+    /// One event, or `None` when it is outside what this caller may see.
+    ///
+    /// Absent rather than forbidden on purpose: refusing would confirm
+    /// that something is there, which is the disclosure the scope exists
+    /// to prevent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room is unknown or the log cannot be
+    /// read.
+    pub fn event(&self, event_id: &str) -> Result<Option<Value>, RoomError> {
+        if self.scope != ReadScope::Whole {
+            let position = self.rooms.event_position(&self.room_id, event_id)?;
+            if position.is_none_or(|position| !self.scope.admits(position)) {
+                return Ok(None);
+            }
+        }
+        self.rooms.event(&self.room_id, event_id).map(Some)
     }
 }

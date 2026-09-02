@@ -103,7 +103,7 @@ pub struct AdminActor(crate::accounts::Identity);
 
 impl AdminActor {
     /// Who the admin is. The field itself stays private: the type is a
-    /// capability -- [`Rooms::admin`] asks for one as proof -- and a
+    /// capability -- [`crate::rooms::Rooms::admin`] asks for one as proof -- and a
     /// public field would let any handler in the crate mint that proof
     /// out of an ordinary identity (#311).
     #[must_use]
