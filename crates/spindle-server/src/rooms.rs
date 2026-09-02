@@ -2959,9 +2959,17 @@ impl Rooms {
 
     /// Record that `user_id` has read up to `event_id`.
     ///
+    /// Members only. A receipt is not private bookkeeping the way a forget
+    /// is: `m.read` is fanned out to everyone in the room, so accepting one
+    /// from outside let any account put its name into a private room's
+    /// receipt stream against any event ID it had learnt. Checked before the
+    /// room is opened, so a stranger gets the same refusal whether or not
+    /// the room exists (#268).
+    ///
     /// # Errors
     ///
-    /// Returns [`RoomError::UnknownRoom`] if the room does not exist, or
+    /// Returns [`RoomError::Forbidden`] if the user is not joined,
+    /// [`RoomError::UnknownRoom`] if the room does not exist, or
     /// [`RoomError::MissingBody`] if the event is not one of its events — a
     /// receipt for an event the room does not have would set an unread
     /// boundary at a position that means nothing.
@@ -2972,6 +2980,11 @@ impl Rooms {
         receipt_type: &str,
         event_id: &str,
     ) -> Result<(), RoomError> {
+        if !self.is_joined(user_id, room_id)? {
+            return Err(RoomError::Forbidden(format!(
+                "{user_id} is not in {room_id}"
+            )));
+        }
         let li = self
             .with_room(room_id, |_, log| {
                 Ok(log.get(&EventId::new(event_id)).map(|entry| entry.li.get()))
