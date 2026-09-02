@@ -88,6 +88,15 @@ jobs:
       - name: Check the Synapse fixture builder
         run: python3 scripts/synapse-fixture-test.py
 
+      # The alert rules and the dashboard under deploy/ rot silently: a
+      # renamed metric leaves a rule that never fires and a panel that
+      # draws nothing. This holds every metric they name to metrics.rs and
+      # the table in docs/metrics.md (#325).
+      - name: Check the observability pack names real metrics
+        run: |
+          pip install --quiet pyyaml==6.0.3
+          python3 scripts/check-observability-pack.py
+
       # And the same idea for the example config, which had drifted furthest
       # of anything here: 22 of 37 fields had never appeared in it. A setting
       # an operator cannot discover is a setting that does not exist.
