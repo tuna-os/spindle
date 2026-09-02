@@ -1659,11 +1659,33 @@ impl Rooms {
         event_id: &str,
         limit: usize,
     ) -> Result<Context, RoomError> {
+        self.context_within(room_id, event_id, limit, None)
+    }
+
+    /// [`Self::context`], seeing nothing above `bound`.
+    ///
+    /// A target above the bound is refused as absent rather than as
+    /// forbidden: the caller may not learn that an event exists there. The
+    /// window's later half stops at the bound, and `end` with it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::context`].
+    pub fn context_within(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        limit: usize,
+        bound: Option<i64>,
+    ) -> Result<Context, RoomError> {
         let found = self.with_room_read(room_id, |_, log| {
             let Some(entry) = log.get(&EventId::new(event_id)) else {
                 return Ok(None);
             };
             let target = entry.li.get();
+            if bound.is_some_and(|bound| target > bound) {
+                return Ok(None);
+            }
             let state_root = entry.state_root;
 
             // Symmetric, and each side stops at the end of the log rather than
@@ -1678,6 +1700,7 @@ impl Rooms {
             let after: Vec<String> = log
                 .entries()
                 .filter(|entry| entry.li.get() > target)
+                .filter(|entry| bound.is_none_or(|bound| entry.li.get() <= bound))
                 .take(limit)
                 .map(|entry| entry.event_id.as_str().to_owned())
                 .collect();
@@ -2741,6 +2764,27 @@ impl Rooms {
         from: Option<i64>,
         limit: usize,
     ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
+        self.messages_within(room_id, from, limit, None)
+    }
+
+    /// [`Self::messages`], seeing nothing above `bound`.
+    ///
+    /// The bound is a former member's departure: what was said while they
+    /// were there is theirs to read, and what was said after is not. `None`
+    /// is the whole room. Applied inside the scan rather than by trimming
+    /// the page afterwards, so a page never comes back short because its
+    /// newer half was cut off -- the client would read that as the end.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::messages`].
+    pub fn messages_within(
+        &self,
+        room_id: &str,
+        from: Option<i64>,
+        limit: usize,
+        bound: Option<i64>,
+    ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
         // Against the open log, not a fresh `load()`. Reloading rebuilt the
         // whole `RoomLog` from storage on every page, which made the one
         // endpoint SPEC §10.4 calls "a reverse range scan ... that is the
@@ -2753,6 +2797,9 @@ impl Rooms {
             for entry in log.entries().rev() {
                 let li = entry.li.get();
                 if from.is_some_and(|from| li >= from) {
+                    continue;
+                }
+                if bound.is_some_and(|bound| li > bound) {
                     continue;
                 }
                 if wanted.len() == limit {
@@ -3375,6 +3422,69 @@ impl Rooms {
             return Ok(None);
         };
         Ok(Some((self.event(room_id, &event_id)?, li)))
+    }
+
+    /// Where `user_id` left `room_id`, if they are a former member.
+    ///
+    /// `Some(li)` is the position of the event that removed them -- their
+    /// own leave, a kick, or a ban -- and is the upper bound on what they
+    /// may still read. `None` for anyone else: a current member reads the
+    /// whole room by another rule, and someone who was never in it reads
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room or its state cannot be read.
+    pub fn departure(&self, room_id: &str, user_id: &str) -> Result<Option<i64>, RoomError> {
+        let Some((event, li)) = self.membership_event(room_id, user_id)? else {
+            return Ok(None);
+        };
+        let departed = matches!(
+            event["content"]["membership"].as_str(),
+            Some("leave" | "ban")
+        );
+        Ok(departed.then_some(li))
+    }
+
+    /// The room's `history_visibility` as it stood at position `li`.
+    ///
+    /// Read from the state at that point rather than from the current
+    /// state, because that is what governs what a former member may see:
+    /// a room that tightened its visibility after they left does not take
+    /// back what they were entitled to, and one that relaxed it does not
+    /// hand them what they were not. Absent means `shared`, per the spec.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room or the state at `li` cannot be read.
+    pub fn history_visibility_at(&self, room_id: &str, li: i64) -> Result<String, RoomError> {
+        let root = self.with_room_read(room_id, |_, log| {
+            Ok(log.entry_at_or_before(li).map(|entry| entry.state_root))
+        })?;
+        let Some(root) = root else {
+            return Ok("shared".to_owned());
+        };
+        let visibility = self
+            .state_at(room_id, root)?
+            .into_iter()
+            .find(|event| event["type"] == "m.room.history_visibility" && event["state_key"] == "")
+            .and_then(|event| {
+                event["content"]["history_visibility"]
+                    .as_str()
+                    .map(str::to_owned)
+            });
+        Ok(visibility.unwrap_or_else(|| "shared".to_owned()))
+    }
+
+    /// The linear position of an event in a room, if the room holds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
+    pub fn event_position(&self, room_id: &str, event_id: &str) -> Result<Option<i64>, RoomError> {
+        self.with_room_read(room_id, |_, log| {
+            Ok(log.get(&EventId::new(event_id)).map(|entry| entry.li.get()))
+        })
     }
 
     /// The newest `limit` events of a room, oldest first.
