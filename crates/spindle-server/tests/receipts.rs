@@ -138,6 +138,21 @@ impl Harness {
         body["event_id"].as_str().unwrap().to_owned()
     }
 
+    /// `(notification_count, highlight_count)` for one room, from `/sync`.
+    async fn badge(&self, token: &str, room_id: &str) -> (u64, u64) {
+        let (status, body) = self.get("/_matrix/client/v3/sync", token).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let counts = &body["rooms"]["join"][room_id]["unread_notifications"];
+        (
+            counts["notification_count"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("no unread count for {room_id}: {body}")),
+            counts["highlight_count"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("no highlight count for {room_id}: {body}")),
+        )
+    }
+
     async fn unread(&self, token: &str, room_id: &str) -> u64 {
         let (status, body) = self.get("/_matrix/client/v3/sync", token).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -395,4 +410,62 @@ async fn receipts_are_per_user_and_per_room() {
         2,
         "one user's receipt cleared another user's unread count"
     );
+}
+
+/// The highlights among the unread: the reader's push rules put to each
+/// unread event, so a message that names them is a highlight and one that
+/// does not is not. Counted incrementally (a tally per room and reader,
+/// scored to a position), so the checks below deliberately interleave new
+/// messages, receipts and a rule change, each of which the tally has to
+/// get right in its own way.
+#[tokio::test]
+async fn a_message_that_names_you_is_a_highlight_until_you_read_it() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room_id = harness.shared_room(&alice, &bob).await;
+
+    harness.say(&room_id, &alice, "hello", "a1").await;
+    assert_eq!(harness.badge(&bob, &room_id).await, (1, 0));
+    // `.m.rule.contains_user_name`: the localpart, as a word.
+    let mention = harness
+        .say(&room_id, &alice, "bob, look at this", "a2")
+        .await;
+    assert_eq!(harness.badge(&bob, &room_id).await, (2, 1));
+    // Scored on top of the tally, not counted again from the start.
+    harness.say(&room_id, &alice, "and this", "a3").await;
+    assert_eq!(harness.badge(&bob, &room_id).await, (3, 1));
+
+    // Bob's own message, naming himself, is not a highlight for him.
+    harness.say(&room_id, &bob, "bob here", "b1").await;
+    assert_eq!(harness.badge(&bob, &room_id).await, (3, 1));
+
+    // Reading past the mention clears it; the later message stays unread.
+    let (status, body) = harness
+        .post(
+            &format!("/_matrix/client/v3/rooms/{room_id}/receipt/m.read/{mention}"),
+            &bob,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(harness.badge(&bob, &room_id).await, (1, 0));
+
+    // A fresh mention after the receipt counts from the new boundary.
+    harness.say(&room_id, &alice, "bob?", "a4").await;
+    assert_eq!(harness.badge(&bob, &room_id).await, (2, 1));
+
+    // Turning the rule off rescores what is unread under the new rules.
+    let (status, body) = harness
+        .put(
+            "/_matrix/client/v3/pushrules/global/content/.m.rule.contains_user_name/enabled",
+            &bob,
+            &json!({ "enabled": false }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(harness.badge(&bob, &room_id).await, (2, 0));
+
+    // Alice is behind on bob's one message, which does not name her.
+    assert_eq!(harness.badge(&alice, &room_id).await, (1, 0));
 }
