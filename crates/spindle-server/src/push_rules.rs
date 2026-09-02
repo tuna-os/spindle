@@ -7,10 +7,10 @@
 //! stored value, so a client that reads `/sync` and a client that reads
 //! `/pushrules/` can never disagree.
 //!
-//! Nothing here evaluates a rule against an event yet — that belongs with the
-//! notification count (#81), which is where the answer would be used. What
-//! this module owns is the ruleset's *shape*: the defaults every user starts
-//! with, the five kinds and their order, and the edits a client may make.
+//! This module owns the ruleset's *shape* -- the defaults every user starts
+//! with, the five kinds and their order, and the edits a client may make --
+//! and, in [`evaluate`], what the rules say about one event: the question
+//! `/notifications` asks of every event it walks past.
 
 use serde_json::{Value, json};
 
@@ -262,4 +262,473 @@ pub fn remove(ruleset: &mut Value, kind: &str, rule_id: &str) -> bool {
     };
     rules.remove(index);
     true
+}
+
+/// What the evaluator knows beyond the event and the ruleset: who is asking,
+/// and the room as it stands.
+pub struct Context<'a> {
+    /// The reader, whose ruleset this is.
+    pub user_id: &'a str,
+    /// Their display name, for `contains_display_name`; `None` matches nothing.
+    pub display_name: Option<&'a str>,
+    /// The room, for the room-kind rules.
+    pub room_id: &'a str,
+    /// Joined members, for `room_member_count`.
+    pub member_count: usize,
+    /// The room's `m.room.power_levels` content, for
+    /// `sender_notification_permission`; an empty object is the defaults.
+    pub power_levels: &'a Value,
+}
+
+/// The actions of the first enabled rule that matches `event`, if they say
+/// to notify.
+///
+/// Kinds in [`KINDS`] order and rules in their stored order, first match
+/// wins, exactly as the spec has it; a rule of a kind that carries no
+/// conditions (`room`, `sender`) matches on its ID, and a `content` rule on
+/// its pattern against the body. A condition of a kind this server does
+/// not know matches nothing, which the spec also asks for: an unknown
+/// condition must not be a rule that fires for everything.
+///
+/// `None` is "do not notify" -- no rule matched, or the one that did says
+/// `dont_notify`, `coalesce`, or nothing at all (the master rule and the
+/// suppressions are empty action lists). A reader's own events are their
+/// caller's business: this asks the rules and nothing else.
+#[must_use]
+pub fn evaluate(ruleset: &Value, event: &Value, context: &Context<'_>) -> Option<Vec<Value>> {
+    for kind in KINDS {
+        let Some(rules) = ruleset.get(kind).and_then(Value::as_array) else {
+            continue;
+        };
+        for rule in rules {
+            if rule["enabled"] != true {
+                continue;
+            }
+            let matched = match kind {
+                "content" => rule["pattern"]
+                    .as_str()
+                    .is_some_and(|pattern| body_contains(event, pattern)),
+                "room" => rule["rule_id"] == context.room_id,
+                "sender" => rule["rule_id"] == event["sender"],
+                _ => rule["conditions"].as_array().is_some_and(|conditions| {
+                    conditions
+                        .iter()
+                        .all(|condition| condition_holds(condition, event, context))
+                }),
+            };
+            if !matched {
+                continue;
+            }
+            let actions = rule["actions"].as_array().cloned().unwrap_or_default();
+            return actions
+                .iter()
+                .any(|action| action == "notify")
+                .then_some(actions);
+        }
+    }
+    None
+}
+
+/// Whether `actions` ask for a highlight: the `set_tweak: highlight` tweak,
+/// present without a value (which means `true`) or with `true`.
+#[must_use]
+pub fn is_highlight(actions: &[Value]) -> bool {
+    actions.iter().any(|action| {
+        action["set_tweak"] == "highlight" && action.get("value").is_none_or(|value| value == true)
+    })
+}
+
+fn condition_holds(condition: &Value, event: &Value, context: &Context<'_>) -> bool {
+    match condition["kind"].as_str() {
+        Some("event_match") => {
+            let (Some(key), Some(pattern)) =
+                (condition["key"].as_str(), condition["pattern"].as_str())
+            else {
+                return false;
+            };
+            let Some(text) = property(event, key).and_then(Value::as_str) else {
+                return false;
+            };
+            // The body is prose, so the pattern may sit anywhere in it on
+            // word boundaries; every other key is matched whole.
+            if key == "content.body" {
+                glob(pattern, true).is_some_and(|glob| glob.is_match(text))
+            } else {
+                glob(pattern, false).is_some_and(|glob| glob.is_match(text))
+            }
+        }
+        Some("event_property_is") => property(event, condition["key"].as_str().unwrap_or_default())
+            .is_some_and(|value| *value == condition["value"]),
+        Some("event_property_contains") => {
+            property(event, condition["key"].as_str().unwrap_or_default())
+                .and_then(Value::as_array)
+                .is_some_and(|values| values.contains(&condition["value"]))
+        }
+        Some("contains_display_name") => context.display_name.is_some_and(|name| {
+            !name.is_empty() && body_contains(event, &name.replace(['*', '?'], ""))
+        }),
+        Some("room_member_count") => condition["is"]
+            .as_str()
+            .is_some_and(|is| member_count_is(is, context.member_count)),
+        Some("sender_notification_permission") => {
+            let key = condition["key"].as_str().unwrap_or_default();
+            let required = context.power_levels["notifications"][key]
+                .as_i64()
+                .unwrap_or(50);
+            let sender = event["sender"].as_str().unwrap_or_default();
+            let level = context.power_levels["users"][sender]
+                .as_i64()
+                .or_else(|| context.power_levels["users_default"].as_i64())
+                .unwrap_or(0);
+            level >= required
+        }
+        _ => false,
+    }
+}
+
+/// Does the message body contain `pattern`, as a word-bounded,
+/// case-insensitive glob?
+fn body_contains(event: &Value, pattern: &str) -> bool {
+    event["content"]["body"]
+        .as_str()
+        .is_some_and(|body| glob(pattern, true).is_some_and(|glob| glob.is_match(body)))
+}
+
+/// The spec's `is` for `room_member_count`: a number with an optional
+/// comparison in front, `==` when there is none.
+fn member_count_is(is: &str, count: usize) -> bool {
+    let (operator, number) = ["==", "<=", ">=", "<", ">"]
+        .into_iter()
+        .find_map(|operator| is.strip_prefix(operator).map(|rest| (operator, rest)))
+        .unwrap_or(("==", is));
+    let Ok(wanted) = number.trim().parse::<usize>() else {
+        return false;
+    };
+    match operator {
+        "<" => count < wanted,
+        ">" => count > wanted,
+        "<=" => count <= wanted,
+        ">=" => count >= wanted,
+        _ => count == wanted,
+    }
+}
+
+/// The value at a dotted path into an event, where `\.` is a literal dot
+/// (the spec's spelling for keys like `content.m\.mentions.user_ids`).
+fn property<'a>(event: &'a Value, key: &str) -> Option<&'a Value> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut chars = key.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&'.') => {
+                current.push('.');
+                chars.next();
+            }
+            '.' => parts.push(std::mem::take(&mut current)),
+            other => current.push(other),
+        }
+    }
+    parts.push(current);
+    parts.iter().try_fold(event, |node, part| node.get(part))
+}
+
+/// A push-rule glob as a regex: `*` is anything, `?` is one character,
+/// everything else is literal, and the match is case-insensitive. `bounded`
+/// is the body form, which may sit anywhere in the text on word boundaries;
+/// unbounded must cover the whole value. `None` only if the regex engine
+/// refuses what was built, which nothing here should be able to make it
+/// do; a rule that cannot be compiled matches nothing.
+fn glob(pattern: &str, bounded: bool) -> Option<regex::Regex> {
+    let mut source = String::from("(?i)");
+    let first_is_word = pattern
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+    let last_is_word = pattern
+        .chars()
+        .last()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+    if bounded {
+        if first_is_word {
+            source.push_str("\\b");
+        }
+    } else {
+        source.push('^');
+    }
+    for c in pattern.chars() {
+        match c {
+            '*' => source.push_str(".*"),
+            '?' => source.push('.'),
+            other => source.push_str(&regex::escape(&other.to_string())),
+        }
+    }
+    if bounded {
+        if last_is_word {
+            source.push_str("\\b");
+        }
+    } else {
+        source.push('$');
+    }
+    regex::Regex::new(&source).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(sender: &str, body: &str) -> Value {
+        json!({
+            "type": "m.room.message",
+            "sender": sender,
+            "content": { "msgtype": "m.text", "body": body },
+        })
+    }
+
+    fn context(power_levels: &Value, member_count: usize) -> Context<'_> {
+        Context {
+            user_id: "@alice:example.org",
+            display_name: Some("Alice Liddell"),
+            room_id: "!room:example.org",
+            member_count,
+            power_levels,
+        }
+    }
+
+    #[test]
+    fn a_plain_message_notifies_under_the_catch_all_and_a_notice_does_not() {
+        let ruleset = defaults("@alice:example.org");
+        let levels = json!({});
+        let actions = evaluate(
+            &ruleset,
+            &message("@bob:example.org", "hello"),
+            &context(&levels, 3),
+        );
+        assert_eq!(actions, Some(vec![json!("notify")]));
+        let mut notice = message("@bob:example.org", "hello");
+        notice["content"]["msgtype"] = json!("m.notice");
+        assert_eq!(evaluate(&ruleset, &notice, &context(&levels, 3)), None);
+    }
+
+    #[test]
+    fn the_name_and_a_mention_highlight_and_a_substring_of_the_name_does_not() {
+        let ruleset = defaults("@alice:example.org");
+        let levels = json!({});
+        let by_name = evaluate(
+            &ruleset,
+            &message("@bob:example.org", "ALICE, look"),
+            &context(&levels, 3),
+        );
+        assert!(by_name.as_deref().is_some_and(is_highlight), "{by_name:?}");
+        let substring = evaluate(
+            &ruleset,
+            &message("@bob:example.org", "malice"),
+            &context(&levels, 3),
+        );
+        assert!(
+            substring
+                .as_deref()
+                .is_some_and(|actions| !is_highlight(actions)),
+            "{substring:?}"
+        );
+        let mut mention = message("@bob:example.org", "hey");
+        mention["content"]["m.mentions"] = json!({ "user_ids": ["@alice:example.org"] });
+        let mentioned = evaluate(&ruleset, &mention, &context(&levels, 3));
+        assert!(
+            mentioned.as_deref().is_some_and(is_highlight),
+            "{mentioned:?}"
+        );
+    }
+
+    #[test]
+    fn a_room_mention_needs_the_power_and_a_one_to_one_room_rings() {
+        let ruleset = defaults("@alice:example.org");
+        let mut at_room = message("@bob:example.org", "everyone");
+        at_room["content"]["m.mentions"] = json!({ "room": true });
+        let levels =
+            json!({ "users": { "@bob:example.org": 50 }, "notifications": { "room": 50 } });
+        assert!(
+            evaluate(&ruleset, &at_room, &context(&levels, 3))
+                .as_deref()
+                .is_some_and(is_highlight)
+        );
+        let too_low = json!({ "users": { "@bob:example.org": 10 } });
+        let actions = evaluate(&ruleset, &at_room, &context(&too_low, 3));
+        assert!(
+            actions
+                .as_deref()
+                .is_some_and(|actions| !is_highlight(actions)),
+            "{actions:?}"
+        );
+        let rings = evaluate(
+            &ruleset,
+            &message("@bob:example.org", "hi"),
+            &context(&levels, 2),
+        );
+        assert!(
+            rings
+                .as_deref()
+                .is_some_and(|actions| actions.iter().any(|a| a["set_tweak"] == "sound")),
+            "{rings:?}"
+        );
+    }
+
+    #[test]
+    fn the_master_switch_and_a_disabled_catch_all_silence_a_message() {
+        let mut ruleset = defaults("@alice:example.org");
+        let levels = json!({});
+        let index = position(&ruleset, "underride", ".m.rule.message").unwrap();
+        ruleset["underride"][index]["enabled"] = json!(false);
+        assert_eq!(
+            evaluate(
+                &ruleset,
+                &message("@bob:example.org", "hi"),
+                &context(&levels, 3)
+            ),
+            None
+        );
+        let mut ruleset = defaults("@alice:example.org");
+        ruleset["override"][0]["enabled"] = json!(true);
+        assert_eq!(
+            evaluate(
+                &ruleset,
+                &message("@bob:example.org", "alice"),
+                &context(&levels, 3)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn room_and_sender_rules_match_on_their_ids_and_an_unknown_condition_never_does() {
+        let mut ruleset = defaults("@alice:example.org");
+        let levels = json!({});
+        upsert(
+            &mut ruleset,
+            "room",
+            "!room:example.org",
+            json!({ "enabled": true, "actions": ["dont_notify"] }),
+        );
+        assert_eq!(
+            evaluate(
+                &ruleset,
+                &message("@bob:example.org", "hi"),
+                &context(&levels, 3)
+            ),
+            None
+        );
+        let mut ruleset = defaults("@alice:example.org");
+        upsert(
+            &mut ruleset,
+            "sender",
+            "@bob:example.org",
+            json!({ "enabled": true, "actions": ["notify", { "set_tweak": "highlight" }] }),
+        );
+        assert!(
+            evaluate(
+                &ruleset,
+                &message("@bob:example.org", "hi"),
+                &context(&levels, 3)
+            )
+            .as_deref()
+            .is_some_and(is_highlight)
+        );
+        let mut ruleset = defaults("@alice:example.org");
+        upsert(
+            &mut ruleset,
+            "override",
+            "mystery",
+            json!({ "enabled": true, "conditions": [{ "kind": "from_the_future" }], "actions": [] }),
+        );
+        assert_eq!(
+            evaluate(
+                &ruleset,
+                &message("@bob:example.org", "hi"),
+                &context(&levels, 3)
+            ),
+            Some(vec![json!("notify")])
+        );
+    }
+
+    #[test]
+    fn an_event_match_on_the_body_sits_on_word_boundaries_and_elsewhere_covers_the_value() {
+        let mut ruleset = defaults("@alice:example.org");
+        let levels = json!({});
+        upsert(
+            &mut ruleset,
+            "override",
+            "cake",
+            json!({
+                "enabled": true,
+                "conditions": [{ "kind": "event_match", "key": "content.body", "pattern": "cake" }],
+                "actions": ["notify", { "set_tweak": "highlight" }],
+            }),
+        );
+        let in_prose = evaluate(
+            &ruleset,
+            &message("@bob:example.org", "I like cake"),
+            &context(&levels, 3),
+        );
+        assert!(
+            in_prose.as_deref().is_some_and(is_highlight),
+            "{in_prose:?}"
+        );
+        let inside_a_word = evaluate(
+            &ruleset,
+            &message("@bob:example.org", "pancakes"),
+            &context(&levels, 3),
+        );
+        assert!(
+            inside_a_word.as_deref().is_some_and(|a| !is_highlight(a)),
+            "{inside_a_word:?}"
+        );
+        upsert(
+            &mut ruleset,
+            "override",
+            "text",
+            json!({
+                "enabled": true,
+                "conditions": [{ "kind": "event_match", "key": "content.msgtype", "pattern": "m.te*" }],
+                "actions": ["notify", { "set_tweak": "sound", "value": "ping" }],
+            }),
+        );
+        let whole = evaluate(
+            &ruleset,
+            &message("@bob:example.org", "hello"),
+            &context(&levels, 3),
+        );
+        assert!(
+            whole
+                .as_deref()
+                .is_some_and(|a| a.iter().any(|t| t["value"] == "ping")),
+            "{whole:?}"
+        );
+        let mut emote = message("@bob:example.org", "hello");
+        emote["content"]["msgtype"] = json!("x.m.text");
+        let partial = evaluate(&ruleset, &emote, &context(&levels, 3));
+        assert!(
+            partial
+                .as_deref()
+                .is_some_and(|a| !a.iter().any(|t| t["value"] == "ping")),
+            "{partial:?}"
+        );
+    }
+
+    #[test]
+    fn member_count_comparisons_and_globs() {
+        assert!(member_count_is("2", 2));
+        assert!(member_count_is("<3", 2));
+        assert!(member_count_is(">=2", 2));
+        assert!(!member_count_is(">2", 2));
+        assert!(!member_count_is("many", 2));
+        assert!(glob("cake*", true).unwrap().is_match("I like cakes"));
+        assert!(!glob("cake", true).unwrap().is_match("pancakes"));
+        assert!(glob("m.notice", false).unwrap().is_match("M.NOTICE"));
+        assert!(!glob("m.notice", false).unwrap().is_match("m.notice.extra"));
+        assert!(
+            glob("@*:example.org", false)
+                .unwrap()
+                .is_match("@bob:example.org")
+        );
+    }
 }
