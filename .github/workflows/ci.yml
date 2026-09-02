@@ -65,6 +65,12 @@ jobs:
       # merge, and its output is what somebody reads when one does. Both are
       # worth a test: #228 is a case where the gate was right, and #231 one
       # where what it printed was not enough to act on.
+      # The README leads with the route count and the ratchet size and says
+      # both are gated. The dashboard and the allowlist are; the README's
+      # copies were typed, and drifted (#310). Read from the gated artifacts.
+      - name: Check the README's headline numbers are the gated ones
+        run: python3 scripts/readme-numbers.py --check
+
       - name: Check for dependencies nothing uses
         # A crate nothing imports is still a licence obligation, an audit
         # surface and a thing `cargo deny` has to reason about. Cheap to
