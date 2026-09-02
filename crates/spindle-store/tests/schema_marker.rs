@@ -71,7 +71,7 @@ fn without_the_marker_a_newer_store_is_indistinguishable_from_an_empty_one() {
     let future = SchemaMarker {
         key_schema: 2,
         record: 1,
-        content_digest: 1,
+        content_digest: spindle_core::CONTENT_DIGEST_VERSION,
     };
     future_store
         .put(&keys::store_marker(), &future.encode())
@@ -117,7 +117,7 @@ fn a_store_from_a_newer_schema_is_refused_with_both_versions_named() {
         let future = SchemaMarker {
             key_schema: keys::KEY_SCHEMA_VERSION + 1,
             record: 7,
-            content_digest: 1,
+            content_digest: spindle_core::CONTENT_DIGEST_VERSION,
         };
         store.put(&keys::store_marker(), &future.encode()).unwrap();
         store.flush().unwrap();
@@ -212,20 +212,19 @@ fn a_store_from_a_different_content_digest_is_refused() {
     );
 }
 
-/// A marker written before `content_digest` existed still opens.
+/// A marker written before `content_digest` existed is refused, now that
+/// a second derivation exists.
 ///
-/// The fix for #78 must not itself become #78: refusing every store already
-/// on disk, because its marker is three bytes rather than four, would be the
-/// exact failure the marker exists to prevent, delivered by the change that
-/// was meant to prevent it.
-///
-/// Reading it as digest version 1 is sound for the same reason the unmarked
-/// arm stamps rather than guesses — there has only ever been one derivation.
-/// And the protection still arrives without rewriting the marker: once a
-/// second derivation exists, `current()` names it, this decodes to 1, and the
-/// comparison refuses.
+/// When the field was added (#78) a three-byte marker still opened, read as
+/// digest version 1, because there had only ever been one derivation and
+/// refusing every store on disk would have been the failure the marker
+/// exists to prevent. That test also said what would happen next: once
+/// `current()` named a second derivation, the three-byte marker would
+/// decode to 1 and the comparison would refuse. The digest moved with
+/// #77; this is that refusal, and it must name the digest and say there
+/// is no migration for it.
 #[test]
-fn a_marker_written_before_the_digest_field_still_opens() {
+fn a_marker_written_before_the_digest_field_is_refused_now_that_the_digest_moved() {
     let dir = TempDir::new().unwrap();
     {
         let store = FjallStore::open(dir.path()).unwrap();
@@ -233,18 +232,50 @@ fn a_marker_written_before_the_digest_field_still_opens() {
         // The three-byte marker exactly as an older binary wrote it.
         let legacy = vec![1_u8, keys::KEY_SCHEMA_VERSION, 1];
         store.put(&keys::store_marker(), &legacy).unwrap();
+        store.flush().unwrap();
     }
 
-    let store =
-        FjallStore::open(dir.path()).expect("a store from before the digest field must still open");
-    let rows = store.scan_prefix(&[keys::KEY_SCHEMA_VERSION]).unwrap();
-    assert!(!rows.is_empty(), "and its history is still there");
+    let Err(error) = FjallStore::open(dir.path()) else {
+        panic!("a store whose node addresses were derived the old way must not open");
+    };
+    let StoreError::UnsupportedSchema { found, supported } = &error else {
+        panic!("expected UnsupportedSchema, got {error:?}");
+    };
+    assert_eq!(found.content_digest, 1);
+    assert_eq!(*supported, SchemaMarker::current());
+    let rendered = error_text(&error);
+    assert!(
+        rendered.contains("no in-place migration"),
+        "a digest refusal must not send the operator to `spindle migrate`: {rendered}"
+    );
+}
 
-    // Read back as digest version 1, and left as it was found: opening with a
-    // newer binary should not rewrite a marker an older one can still read.
+/// A store with rows and no marker at all is the same case: it predates the
+/// marker, so its addresses are version-1 ones, and stamping it current
+/// would be the silent misread #78 exists to prevent. A fresh store, with
+/// nothing in it, is stamped as before.
+#[test]
+fn an_unmarked_store_with_rows_is_refused_and_an_empty_one_is_stamped() {
+    let dir = TempDir::new().unwrap();
+    {
+        let store = FjallStore::open(dir.path()).unwrap();
+        seed(&store);
+        // Take the marker away, as a store from before it would lack one.
+        store.delete(&keys::store_marker()).unwrap();
+        store.flush().unwrap();
+    }
+    assert!(
+        matches!(
+            FjallStore::open(dir.path()),
+            Err(StoreError::UnsupportedSchema { found, .. }) if found.content_digest == 1
+        ),
+        "an unmarked store with history must be refused as digest version 1"
+    );
+
+    let fresh = TempDir::new().unwrap();
+    let store = FjallStore::open(fresh.path()).expect("an empty store is stamped, not refused");
     let raw = store.get(&keys::store_marker()).unwrap().unwrap();
-    assert_eq!(raw.len(), 3, "the marker was not restamped: {raw:?}");
-    assert_eq!(SchemaMarker::decode(&raw).unwrap().content_digest, 1);
+    assert_eq!(SchemaMarker::decode(&raw).unwrap(), SchemaMarker::current());
 }
 
 fn error_text(error: &StoreError) -> String {

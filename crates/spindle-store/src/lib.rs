@@ -609,22 +609,41 @@ impl FjallStore {
     /// marker turns that silence into a refusal.
     fn check_schema(&self) -> Result<(), StoreError> {
         let key = store_marker();
-        match self.get(&key)? {
-            Some(raw) => {
-                let found = SchemaMarker::decode(&raw)?;
-                let supported = SchemaMarker::current();
-                if found != supported {
-                    return Err(StoreError::UnsupportedSchema { found, supported });
-                }
-                Ok(())
+        if let Some(raw) = self.get(&key)? {
+            let found = SchemaMarker::decode(&raw)?;
+            let supported = SchemaMarker::current();
+            if found != supported {
+                return Err(StoreError::UnsupportedSchema { found, supported });
             }
-            // No mark: either a fresh store, or one written before the marker
-            // existed. Both are version 1 by construction -- there has never
-            // been another -- so stamping is correct rather than a guess. Once
-            // a second version exists this arm needs to distinguish them, and
-            // an unmarked non-empty store becomes a migration, not a stamp.
-            None => self.put(&key, &SchemaMarker::current().encode()),
+            return Ok(());
         }
+        // No mark: a fresh store, or one written before the marker existed.
+        // While there was one derivation, stamping either was correct; since
+        // the digest moved to version 2 (#77) the two must be told apart,
+        // because a pre-marker store holds node addresses derived the old
+        // way and would be misread, not refused, by the check above. A
+        // store with any row at all is the old kind, and is refused as the
+        // version it can only be.
+        if self.holds_anything()? {
+            return Err(StoreError::UnsupportedSchema {
+                found: SchemaMarker {
+                    key_schema: KEY_SCHEMA_VERSION,
+                    record: SchemaMarker::current().record,
+                    content_digest: 1,
+                },
+                supported: SchemaMarker::current(),
+            });
+        }
+        self.put(&key, &SchemaMarker::current().encode())
+    }
+
+    /// Whether any row at all is stored under the current key schema.
+    fn holds_anything(&self) -> Result<bool, StoreError> {
+        if let Some(pair) = self.partition.prefix([KEY_SCHEMA_VERSION]).next() {
+            let _ = pair.into_inner()?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 
@@ -1364,18 +1383,39 @@ impl std::fmt::Display for StoreError {
             // The remedy is named here rather than left to the reader: this
             // string is the entire interface between a store that will not
             // open and the person who has to decide what to do about it.
-            Self::UnsupportedSchema { found, supported } => write!(
-                formatter,
-                "store was written at key schema {}/record {}/digest {}, \
-                 this binary speaks {}/{}/{}; run `spindle migrate <config>` \
-                 to move the store forward, after taking a backup",
-                found.key_schema,
-                found.record,
-                found.content_digest,
-                supported.key_schema,
-                supported.record,
-                supported.content_digest,
-            ),
+            Self::UnsupportedSchema { found, supported } => {
+                write!(
+                    formatter,
+                    "store was written at key schema {}/record {}/digest {}, \
+                     this binary speaks {}/{}/{}",
+                    found.key_schema,
+                    found.record,
+                    found.content_digest,
+                    supported.key_schema,
+                    supported.record,
+                    supported.content_digest,
+                )?;
+                // A digest change moves every content address, and nothing
+                // rewrites those in place: the remedy is a different one and
+                // saying `spindle migrate` would send the operator somewhere
+                // that cannot help.
+                if found.content_digest == supported.content_digest {
+                    write!(
+                        formatter,
+                        "; run `spindle migrate <config>` to move the store \
+                         forward, after taking a backup"
+                    )
+                } else {
+                    write!(
+                        formatter,
+                        "; content addresses are derived differently under \
+                         digest {}, and there is no in-place migration for \
+                         that: keep this store for a binary of its own \
+                         version, and start a new one",
+                        supported.content_digest
+                    )
+                }
+            }
             Self::StateNotResident { li } => write!(
                 formatter,
                 "state for li {li} has been evicted; use commit_entry per append"

@@ -112,6 +112,13 @@ fn for_each_visits_in_key_order_however_the_trie_arranged_them() {
 /// answers — "did this change what we write to disk?" — is one every future
 /// attempt at the same optimisation has to answer, and answering it by
 /// inspection is how a format break ships unnoticed.
+///
+/// **These values moved once, deliberately, with #77.** The state-key digest
+/// went from a 21-byte tag with `u64` length frames to an 8-byte tag with
+/// `u32` frames so an ordinary key hashes in one BLAKE3 block, and every
+/// tag moved to `-v2` with `CONTENT_DIGEST_VERSION`; every root below is
+/// the version-2 value, and a store written under version 1 is refused by
+/// its marker rather than read against these.
 #[test]
 fn state_roots_are_the_bytes_they_have_always_been() {
     let hex = |bytes: &[u8; 32]| -> String {
@@ -128,19 +135,19 @@ fn state_roots_are_the_bytes_they_have_always_been() {
             "m.room.create",
             "",
             "$create",
-            "8bf5ea045e582975ee64c1dce97c448c3bdb5c0085eb9f631fa7f0b826fb51bc",
+            "890ce2d330f26e2d5355e92eefbdbf53c590223491f215cd9ef67123d6406614",
         ),
         (
             "m.room.member",
             "@alice:example.org",
             "$alice",
-            "3097222177726e1a763c7efdd60a1b3d1610c87f77826b2571f6f9c5cde8e7bb",
+            "3933ce89ec2e725217bc8053d0030afc146da7119e5cfe4653eb6bce23a921c3",
         ),
         (
             "m.room.power_levels",
             "",
             "$power",
-            "f3f1ae40f6229e21044c0c6d39bacd960939dd03f2b960823902a6310355d397",
+            "fc96425d980d56028c5c91685f264dee6dd5ce98b525d4b1d281c8c8ba345c54",
         ),
     ] {
         state = state.apply(StateKey::new(kind, key), event_id);
@@ -155,7 +162,7 @@ fn state_roots_are_the_bytes_they_have_always_been() {
     let spilled = StateSnapshot::new().apply(StateKey::new("m.room.member", long), "$long");
     assert_eq!(
         hex(spilled.root().as_bytes()),
-        "0504f8fc05f0d0a7ef74d2d29bb14d23e47c4882dce9c44b97dca457ac2ae24e",
+        "9e8431f2c89141429bdb3a3118a8f36279fa266b6f9a8d03cdb7a00b95a4d1a8",
         "a state key that overflows the hashing buffer changed its digest"
     );
 }
