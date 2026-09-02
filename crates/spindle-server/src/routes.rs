@@ -1182,8 +1182,41 @@ async fn capabilities() -> Json<Value> {
     Json(json!({ "capabilities": Value::Object(capabilities) }))
 }
 
+/// How long a well-known document may be reused, in seconds.
+///
+/// Both documents are configuration this server publishes about itself,
+/// and both are read by things that cache. Without a header the caching
+/// is somebody else's default, and the defaults are long: the
+/// server-server spec tells a peer with no header to assume **24 hours**
+/// (capping at 48), and a browser is free to pick a heuristic of its own
+/// for the client document. That is the shape of the problem #37 names --
+/// an operator changes a setting, restarts, and the change is not visible
+/// for a day, from a server that is already serving the new answer.
+///
+/// An hour is a deliberate trade rather than a spec value, because the
+/// spec gives none for the client document and only a default for the
+/// other. It bounds propagation to something an operator can wait out
+/// while a fetch per peer per hour is nothing next to the traffic a peer
+/// already sends. The spec explicitly says a peer should respect the
+/// header when it is present, so this shortens the 24-hour default rather
+/// than fighting it.
+const WELL_KNOWN_MAX_AGE_SECONDS: u32 = 3600;
+
+/// A well-known document, with the caching this server chose.
+fn well_known(body: Value) -> ([(axum::http::HeaderName, String); 1], Json<Value>) {
+    (
+        [(
+            axum::http::header::CACHE_CONTROL,
+            format!("public, max-age={WELL_KNOWN_MAX_AGE_SECONDS}"),
+        )],
+        Json(body),
+    )
+}
+
 /// `GET /.well-known/matrix/client`
-async fn well_known_client(State(state): State<AppState>) -> Json<Value> {
+async fn well_known_client(
+    State(state): State<AppState>,
+) -> ([(axum::http::HeaderName, String); 1], Json<Value>) {
     let mut body = json!({
         "m.homeserver": { "base_url": state.config.client_base_url() },
     });
@@ -1210,7 +1243,7 @@ async fn well_known_client(State(state): State<AppState>) -> Json<Value> {
     if !foci.is_empty() {
         body["org.matrix.msc4143.rtc_foci"] = Value::Array(foci);
     }
-    Json(body)
+    well_known(body)
 }
 
 /// `GET /_matrix/client/v1/auth_metadata`
@@ -1248,8 +1281,10 @@ fn delegated_refusal() -> MatrixError {
 ///
 /// Served so a peer resolving this server name finds the port it actually
 /// listens on rather than assuming 8448.
-async fn well_known_server(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({ "m.server": state.config.server.name }))
+async fn well_known_server(
+    State(state): State<AppState>,
+) -> ([(axum::http::HeaderName, String); 1], Json<Value>) {
+    well_known(json!({ "m.server": state.config.server.name }))
 }
 
 /// Liveness: the process is up.
