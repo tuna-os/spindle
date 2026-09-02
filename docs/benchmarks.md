@@ -1213,3 +1213,83 @@ Three things this does not show, each of which matters more than the ratio:
 Still true, and worth keeping stated plainly: **no measurement in this document
 is a server-to-server comparison.** Everything is algorithmic, measured inside
 the library. Synapse and Tuwunel under protocol workload is #42, at M1–M3.
+
+## M7: what a delayed event costs, and the tick that was reading everything
+
+#36 attaches a benchmark to delayed events because their design makes a
+performance claim: `restart` is the hot path — MatrixRTC refreshes the
+pending departure of every participant in every live call, continuously —
+and it was built to bump an in-memory deadline rather than rewrite a row.
+Three measurements, run on one machine in one sitting, comparable only
+against each other.
+
+`cargo bench -p spindle-server --bench delayed_events` and
+`--bench delayed_firing`.
+
+### The hot path holds
+
+One participant's heartbeat, with N of them live in the room:
+
+| live delays | one `restart` |
+|---|---|
+| 10 | 1.17 µs |
+| 100 | 1.24 µs |
+| 1,000 | 1.49 µs |
+
+A hundredfold more participants for 1.3× the cost, and no rows written —
+the claim the in-memory deadline exists to make. What little climb there
+is comes from the map it lives in, not from touching the other
+participants.
+
+### Firing jitter is set by the tick, not by the size
+
+How late a delay is against the deadline it was given, at a 100 ms tick:
+
+| live delays | p50 late | p99 late | max late |
+|---|---|---|---|
+| 10 | 50 ms | 97 ms | 97 ms |
+| 100 | 49 ms | 98 ms | 99 ms |
+| 1,000 | 51 ms | 100 ms | 102 ms |
+
+p50 at half a tick and p99 at one tick is exactly the shape a polling loop
+should produce, and it is flat from ten participants to a thousand: a
+larger call does not make anybody's departure land later.
+
+Two methodology corrections were needed before these numbers meant
+anything, and both were found by disbelieving the first run. Deadlines are
+fixed when a delay is scheduled, so writing a thousand rows left the early
+ones overdue before the loop even started, and the first run reported that
+setup as jitter (p99 413 ms at 1,000). The harness now asserts that every
+deadline is still ahead of it before it starts timing. Then, with the
+overrun gone, ten deadlines spread across a second landed exactly 100 ms
+apart — the tick — so every one of them fell at the same phase and the row
+reported 8 ms where the truth was 98. Deadlines now carry a sub-tick
+offset so every size samples tick phase evenly.
+
+### The idle tick does not hold, and that is the finding
+
+What the fire loop pays on a tick when *nothing* is due:
+
+| pending delays | one idle tick |
+|---|---|
+| 100 | 23.4 µs |
+| 1,000 | 284 µs |
+| 10,000 | 3.12 ms |
+
+Linear in what is pending. `Delayed::due` walks the queue in deadline order
+and breaks at the first row that is not due, but the scan underneath it
+returns a `Vec`, so every pending row is read and collected before the
+first deadline is examined. The break saves the JSON parse, not the read.
+A server holding 10,000 pending delays therefore spends about 3% of a core
+discovering it has nothing to do, every 100 ms, for as long as the calls
+last.
+
+Filed as #348 with the fix: the deadline is the leading part of the key, so
+"everything due" is a bounded key range and the read can be made
+proportional to what fires rather than to what is pending. The benchmark
+stays as the before-and-after evidence.
+
+This is the case for attaching benchmarks to performance claims rather
+than asserting them. Two of the three came out as designed; the third had
+been wrong since it was written, in a loop that runs forever, and no test
+would have noticed because nothing about it is incorrect — only slow.
