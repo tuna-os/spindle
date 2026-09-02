@@ -99,7 +99,18 @@ pub fn routes() -> Router<AppState> {
 /// in this module either takes this and is authorized, or cannot see
 /// the request at all. The acceptance test iterates every route with a
 /// non-admin token; this type is why that test cannot find a gap.
-pub struct AdminActor(pub crate::accounts::Identity);
+pub struct AdminActor(crate::accounts::Identity);
+
+impl AdminActor {
+    /// Who the admin is. The field itself stays private: the type is a
+    /// capability -- [`Rooms::admin`] asks for one as proof -- and a
+    /// public field would let any handler in the crate mint that proof
+    /// out of an ordinary identity (#311).
+    #[must_use]
+    pub fn identity(&self) -> &crate::accounts::Identity {
+        &self.0
+    }
+}
 
 impl FromRequestParts<AppState> for AdminActor {
     type Rejection = MatrixError;
@@ -299,7 +310,7 @@ struct PutUser {
 /// `PUT /users/{userId}` — create or modify.
 async fn put_user(
     State(state): State<AppState>,
-    AdminActor(actor): AdminActor,
+    actor: AdminActor,
     Path(user_id): Path<String>,
     Json(request): Json<PutUser>,
 ) -> Result<(StatusCode, Json<Value>), MatrixError> {
@@ -353,7 +364,7 @@ async fn put_user(
     // The password never enters the audit record; that it changed does.
     audit(
         &state,
-        &actor.user_id,
+        &actor.identity().user_id,
         "put_user",
         &user_id,
         &json!({
@@ -382,7 +393,7 @@ struct Deactivate {
 /// `POST /users/{userId}/deactivate`
 async fn deactivate(
     State(state): State<AppState>,
-    AdminActor(actor): AdminActor,
+    actor: AdminActor,
     Path(user_id): Path<String>,
     body: Option<Json<Deactivate>>,
 ) -> Result<Json<Value>, MatrixError> {
@@ -391,7 +402,7 @@ async fn deactivate(
     crate::mas::deactivate_user(&state, &localpart, erase)?;
     audit(
         &state,
-        &actor.user_id,
+        &actor.identity().user_id,
         "deactivate",
         &user_id,
         &json!({ "erase": erase }),
@@ -408,7 +419,7 @@ struct ResetPassword {
 /// `POST /users/{userId}/reset_password`
 async fn reset_password(
     State(state): State<AppState>,
-    AdminActor(actor): AdminActor,
+    actor: AdminActor,
     Path(user_id): Path<String>,
     Json(request): Json<ResetPassword>,
 ) -> Result<Json<Value>, MatrixError> {
@@ -425,7 +436,7 @@ async fn reset_password(
     }
     audit(
         &state,
-        &actor.user_id,
+        &actor.identity().user_id,
         "reset_password",
         &user_id,
         &json!({ "logout_devices": logout }),
@@ -458,7 +469,7 @@ async fn devices(
 /// `DELETE /users/{userId}/devices/{deviceId}`
 async fn delete_device(
     State(state): State<AppState>,
-    AdminActor(actor): AdminActor,
+    actor: AdminActor,
     Path((user_id, device_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, MatrixError> {
     let (localpart, _) = target_account(&state, &user_id)?;
@@ -467,7 +478,7 @@ async fn delete_device(
     crate::mas::device_list_changed(&state, &accounts.user_id(&localpart));
     audit(
         &state,
-        &actor.user_id,
+        &actor.identity().user_id,
         "delete_device",
         &user_id,
         &json!({ "device_id": device_id }),
@@ -571,12 +582,13 @@ struct RoomsQuery {
 /// `GET /rooms?from&limit&order_by&search_term`
 async fn list_rooms(
     State(state): State<AppState>,
-    _actor: AdminActor,
+    actor: AdminActor,
     Query(query): Query<RoomsQuery>,
 ) -> Result<Json<Value>, MatrixError> {
     let mut rooms = Vec::new();
     for room_id in state
         .rooms
+        .admin(&actor)
         .all_room_ids()
         .map_err(|error| MatrixError::internal(&error.to_string()))?
     {
@@ -679,7 +691,7 @@ struct StateAtQuery {
 /// whether the answer came from the resident window or was rehydrated.
 async fn room_state_at(
     State(state): State<AppState>,
-    _actor: AdminActor,
+    actor: AdminActor,
     Path(room_id): Path<String>,
     Query(query): Query<StateAtQuery>,
 ) -> Result<Json<Value>, MatrixError> {
@@ -698,6 +710,7 @@ async fn room_state_at(
     };
     let (li, event_id, resident, events) = state
         .rooms
+        .admin(&actor)
         .admin_state_at(&room_id, &anchor)
         .map_err(crate::routes::room_error)?;
     let ts = state
@@ -730,7 +743,7 @@ struct TimelineQuery {
 /// the log say", read the way the log is written.
 async fn room_timeline(
     State(state): State<AppState>,
-    _actor: AdminActor,
+    actor: AdminActor,
     Path(room_id): Path<String>,
     Query(query): Query<TimelineQuery>,
 ) -> Result<Json<Value>, MatrixError> {
@@ -747,6 +760,7 @@ async fn room_timeline(
     };
     let (events, next) = state
         .rooms
+        .admin(&actor)
         .admin_timeline(&room_id, query.from, query.limit.unwrap_or(100), forward)
         .map_err(crate::routes::room_error)?;
     let chunk: Vec<Value> = events
@@ -795,7 +809,7 @@ struct PurgeRequest {
 /// far and how many.
 async fn purge_history(
     State(state): State<AppState>,
-    AdminActor(actor): AdminActor,
+    actor: AdminActor,
     Path(room_id): Path<String>,
     Json(request): Json<PurgeRequest>,
 ) -> Result<Json<Value>, MatrixError> {
@@ -821,11 +835,12 @@ async fn purge_history(
     };
     let purged = state
         .rooms
+        .admin(&actor)
         .purge_history(&room_id, before_li)
         .map_err(crate::routes::room_error)?;
     audit(
         &state,
-        &actor.user_id,
+        &actor.identity().user_id,
         "purge_history",
         &room_id,
         &json!({ "before_li": before_li, "events_purged": purged }),
@@ -876,7 +891,7 @@ fn bare_room(state: &AppState, creator: &str) -> Result<String, MatrixError> {
 /// whole log, so the spine and the chain survive even total deletion.
 async fn delete_room(
     State(state): State<AppState>,
-    AdminActor(actor): AdminActor,
+    actor: AdminActor,
     Path(room_id): Path<String>,
     Json(request): Json<DeleteRoom>,
 ) -> Result<Json<Value>, MatrixError> {
@@ -894,7 +909,8 @@ async fn delete_room(
     if request.block {
         state
             .rooms
-            .set_room_block(&room_id, &json!({ "actor": actor.user_id }))
+            .admin(&actor)
+            .set_room_block(&room_id, &json!({ "actor": actor.identity().user_id }))
             .map_err(crate::routes::room_error)?;
     }
 
@@ -961,13 +977,14 @@ async fn delete_room(
     if request.purge {
         state
             .rooms
+            .admin(&actor)
             .purge_history(&room_id, i64::MAX)
             .map_err(crate::routes::room_error)?;
     }
 
     audit(
         &state,
-        &actor.user_id,
+        &actor.identity().user_id,
         "delete_room",
         &room_id,
         &json!({
@@ -1000,11 +1017,13 @@ struct MakeRoomAdmin {
 /// can author the event, it says so.
 async fn make_room_admin(
     State(state): State<AppState>,
-    AdminActor(actor): AdminActor,
+    actor: AdminActor,
     Path(room_id): Path<String>,
     Json(request): Json<MakeRoomAdmin>,
 ) -> Result<Json<Value>, MatrixError> {
-    let target = request.user_id.unwrap_or_else(|| actor.user_id.clone());
+    let target = request
+        .user_id
+        .unwrap_or_else(|| actor.identity().user_id.clone());
     let members = state
         .rooms
         .joined_members(&room_id)
@@ -1059,7 +1078,7 @@ async fn make_room_admin(
 
     audit(
         &state,
-        &actor.user_id,
+        &actor.identity().user_id,
         "make_room_admin",
         &room_id,
         &json!({ "user_id": target, "granted": granted, "authored_by": author }),

@@ -13,6 +13,7 @@ use serde_json::Value;
 use spindle_core::{EventId, LogEntry};
 
 use super::{RoomError, Rooms, StateAtAnchor, event_body_key};
+use crate::admin::AdminActor;
 
 /// One log entry as the admin timeline shows it: the spine always, the
 /// body only while it exists. `json: None` with the entry present is the
@@ -28,6 +29,65 @@ pub struct AdminTimelineEntry {
 }
 
 impl Rooms {
+    /// Why an administrator blocked this room, if one did.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the row cannot be read.
+    pub fn room_block(&self, room_id: &str) -> Result<Option<Value>, RoomError> {
+        Ok(spindle_store::ReadView::get(
+            self.store.as_ref(),
+            &spindle_core::keys::room_block(room_id),
+        )?
+        .and_then(|raw| serde_json::from_slice(&raw).ok()))
+    }
+
+    /// The first `li` NOT covered by a history purge, if one ever ran.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the row cannot be read.
+    pub fn purge_watermark(&self, room_id: &str) -> Result<Option<i64>, RoomError> {
+        Ok(spindle_store::ReadView::get(
+            self.store.as_ref(),
+            &spindle_core::keys::purge_watermark(room_id),
+        )?
+        .and_then(|raw| raw.get(..8).map(|bytes| bytes.try_into().unwrap_or([0; 8])))
+        .map(i64::from_be_bytes))
+    }
+}
+
+/// A handle on the operations an operator may perform on a room.
+///
+/// The five methods here are the destructive and server-wide ones, and
+/// they sit on this type rather than on [`Rooms`] so that reaching them
+/// is a property of what a handler was given. [`Rooms::admin`] is the
+/// only way to build one and it asks for an [`AdminActor`] — the token
+/// the admin routes' extractor mints and nothing else can, since #311
+/// asked for a compile-time fact in place of a review convention. A
+/// client handler holds the same `Arc<Rooms>` as before and now cannot
+/// name `purge_history` at all.
+///
+/// Borrowed rather than owned: the handle is made per request, at the
+/// call, and outlives nothing.
+pub struct RoomAdmin<'a> {
+    rooms: &'a Rooms,
+}
+
+impl Rooms {
+    /// The administrative view of these rooms, for a caller who has
+    /// proven they are a server admin.
+    ///
+    /// The proof is taken by reference and never read: what matters is
+    /// that the caller *had* one to give, which only an admin-gated
+    /// handler does.
+    #[must_use]
+    pub fn admin(&self, _proof: &AdminActor) -> RoomAdmin<'_> {
+        RoomAdmin { rooms: self }
+    }
+}
+
+impl RoomAdmin<'_> {
     /// The room's state at a past point (#83 §4): the query the linear
     /// index turns from a forensic exercise into one seek.
     ///
@@ -54,9 +114,9 @@ impl Rooms {
         room_id: &str,
         anchor: &StateAtAnchor,
     ) -> Result<(i64, String, bool, Vec<Value>), RoomError> {
-        let (li, event_id) = self.resolve_anchor(room_id, anchor)?;
+        let (li, event_id) = self.rooms.resolve_anchor(room_id, anchor)?;
 
-        let root_or_resident = self.with_room_read(room_id, |_, log| {
+        let root_or_resident = self.rooms.with_room_read(room_id, |_, log| {
             if let Some(snapshot) = log.state_after(spindle_core::LinearIndex::from_raw(li)) {
                 let mut ids = Vec::with_capacity(snapshot.len());
                 snapshot.for_each(|_, id| ids.push(id.to_owned()));
@@ -72,11 +132,11 @@ impl Rooms {
             Ok(ids) => {
                 let mut out = Vec::with_capacity(ids.len());
                 for id in ids {
-                    out.push(self.event(room_id, &id)?);
+                    out.push(self.rooms.event(room_id, &id)?);
                 }
                 (true, out)
             }
-            Err(root) => (false, self.state_at(room_id, root)?),
+            Err(root) => (false, self.rooms.state_at(room_id, root)?),
         };
         Ok((li, event_id, resident, state))
     }
@@ -96,7 +156,7 @@ impl Rooms {
             spindle_core::keys::KEY_SCHEMA_VERSION,
             spindle_core::keys::Keyspace::RoomMeta as u8,
         ];
-        let records = spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?;
+        let records = spindle_store::ReadView::scan_prefix(self.rooms.store.as_ref(), &prefix)?;
         let mut out = Vec::with_capacity(records.len());
         for (key, _) in records {
             // Key layout per `keys::room_prefix`: version, keyspace,
@@ -137,7 +197,7 @@ impl Rooms {
         limit: usize,
         forward: bool,
     ) -> Result<(Vec<AdminTimelineEntry>, Option<i64>), RoomError> {
-        let (wanted, next) = self.with_room_read(room_id, |_, log| {
+        let (wanted, next) = self.rooms.with_room_read(room_id, |_, log| {
             let mut wanted = Vec::new();
             let mut next = None;
             let mut visit = |entry: &LogEntry| {
@@ -178,10 +238,13 @@ impl Rooms {
             Ok((wanted, next))
         })?;
 
-        let watermark = self.purge_watermark(room_id)?;
+        let watermark = self.rooms.purge_watermark(room_id)?;
         let mut out = Vec::with_capacity(wanted.len());
         for (li, event_id, chain) in wanted {
-            let json = match self.read_event(room_id, &EventId::new(event_id.as_str())) {
+            let json = match self
+                .rooms
+                .read_event(room_id, &EventId::new(event_id.as_str()))
+            {
                 Ok(json) => Some(json),
                 Err(RoomError::MissingBody(_)) if watermark.is_some_and(|mark| li < mark) => None,
                 Err(error) => return Err(error),
@@ -196,19 +259,6 @@ impl Rooms {
         Ok((out, next))
     }
 
-    /// Why an administrator blocked this room, if one did.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RoomError`] if the row cannot be read.
-    pub fn room_block(&self, room_id: &str) -> Result<Option<Value>, RoomError> {
-        Ok(spindle_store::ReadView::get(
-            self.store.as_ref(),
-            &spindle_core::keys::room_block(room_id),
-        )?
-        .and_then(|raw| serde_json::from_slice(&raw).ok()))
-    }
-
     /// Record an administrative block. The row's presence is the block;
     /// the record says who and when for the audit trail.
     ///
@@ -217,27 +267,13 @@ impl Rooms {
     /// Returns [`RoomError`] if the store cannot be written.
     pub fn set_room_block(&self, room_id: &str, record: &Value) -> Result<(), RoomError> {
         spindle_store::Store::put(
-            self.store.as_ref(),
+            self.rooms.store.as_ref(),
             &spindle_core::keys::room_block(room_id),
             serde_json::to_vec(record)
                 .map_err(|error| RoomError::Codec(error.to_string()))?
                 .as_slice(),
         )?;
         Ok(())
-    }
-
-    /// The first `li` NOT covered by a history purge, if one ever ran.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RoomError`] if the row cannot be read.
-    pub fn purge_watermark(&self, room_id: &str) -> Result<Option<i64>, RoomError> {
-        Ok(spindle_store::ReadView::get(
-            self.store.as_ref(),
-            &spindle_core::keys::purge_watermark(room_id),
-        )?
-        .and_then(|raw| raw.get(..8).map(|bytes| bytes.try_into().unwrap_or([0; 8])))
-        .map(i64::from_be_bytes))
     }
 
     /// Purge history before `before_li`: delete the bodies, keep the spine.
@@ -259,7 +295,7 @@ impl Rooms {
     /// Returns [`RoomError::UnknownRoom`] for a room that does not exist,
     /// or [`RoomError`] if the store cannot be written.
     pub fn purge_history(&self, room_id: &str, before_li: i64) -> Result<u64, RoomError> {
-        let victims = self.with_room_read(room_id, |_, log| {
+        let victims = self.rooms.with_room_read(room_id, |_, log| {
             Ok(log
                 .entries()
                 .take_while(|entry| entry.li.get() < before_li)
@@ -270,18 +306,19 @@ impl Rooms {
         // The watermark only moves forward: a second, shallower purge must
         // not un-mark entries the first one already deleted.
         let mark = self
+            .rooms
             .purge_watermark(room_id)?
             .map_or(before_li, |existing| existing.max(before_li));
         spindle_store::Store::put(
-            self.store.as_ref(),
+            self.rooms.store.as_ref(),
             &spindle_core::keys::purge_watermark(room_id),
             &mark.to_be_bytes(),
         )?;
         let mut purged = 0;
         for event_id in &victims {
             let key = event_body_key(room_id, event_id);
-            if spindle_store::ReadView::get(self.store.as_ref(), &key)?.is_some() {
-                spindle_store::Store::delete(self.store.as_ref(), &key)?;
+            if spindle_store::ReadView::get(self.rooms.store.as_ref(), &key)?.is_some() {
+                spindle_store::Store::delete(self.rooms.store.as_ref(), &key)?;
                 purged += 1;
             }
         }
