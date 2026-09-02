@@ -541,6 +541,7 @@ fn room_routes() -> Router<AppState> {
             "/_matrix/client/v3/user_directory/search",
             post(user_directory_search),
         )
+        .route("/_matrix/client/v3/search", post(search))
         .route(
             "/_matrix/client/v1/rooms/{room_id}/hierarchy",
             get(room_hierarchy),
@@ -8143,6 +8144,412 @@ fn user_matches(term: &str, user_id: &str, displayname: Option<&str>) -> bool {
         .unwrap_or(user_id);
     localpart.to_lowercase().contains(&needle)
         || displayname.is_some_and(|name| name.to_lowercase().contains(&needle))
+}
+
+/// `POST /_matrix/client/v3/search`, the body.
+#[derive(Deserialize)]
+struct SearchRequest {
+    search_categories: SearchCategories,
+}
+
+#[derive(Deserialize)]
+struct SearchCategories {
+    room_events: Option<RoomEventsCriteria>,
+}
+
+#[derive(Deserialize)]
+struct RoomEventsCriteria {
+    search_term: String,
+    #[serde(default)]
+    keys: Vec<String>,
+    #[serde(default)]
+    filter: SearchFilter,
+    order_by: Option<String>,
+    event_context: Option<SearchContext>,
+    #[serde(default)]
+    include_state: bool,
+}
+
+/// The spec's `RoomEventFilter`, the parts a search can honour.
+#[derive(Default, Deserialize)]
+struct SearchFilter {
+    limit: Option<usize>,
+    rooms: Option<Vec<String>>,
+    #[serde(default)]
+    not_rooms: Vec<String>,
+    senders: Option<Vec<String>>,
+    #[serde(default)]
+    not_senders: Vec<String>,
+    types: Option<Vec<String>>,
+    #[serde(default)]
+    not_types: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct SearchContext {
+    before_limit: Option<usize>,
+    after_limit: Option<usize>,
+    #[serde(default)]
+    include_profile: bool,
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    next_batch: Option<String>,
+}
+
+/// The default and maximum number of results one search page returns.
+const SEARCH_LIMIT: usize = 10;
+const SEARCH_LIMIT_MAX: usize = 100;
+
+/// The spec's default for each side of a result's context.
+const SEARCH_CONTEXT_EACH_SIDE: usize = 5;
+
+/// Where each room's next page starts, as the opaque `next_batch` a client
+/// hands back: `li:room_id` pairs joined by `;`, the position first because
+/// a room ID has colons of its own. Per room rather than one global
+/// position because positions are per room, and a page that stops in the
+/// middle of one room's hits must resume exactly there while the other
+/// rooms resume where they were.
+fn parse_search_cursor(token: &str) -> Result<BTreeMap<String, i64>, MatrixError> {
+    let mut cursor = BTreeMap::new();
+    for pair in token.split(';').filter(|pair| !pair.is_empty()) {
+        let (li, room_id) = pair
+            .split_once(':')
+            .ok_or_else(|| MatrixError::bad_json("next_batch is not a search token"))?;
+        let li = li
+            .parse::<i64>()
+            .map_err(|_| MatrixError::bad_json("next_batch is not a search token"))?;
+        cursor.insert(room_id.to_owned(), li);
+    }
+    Ok(cursor)
+}
+
+fn search_cursor(cursor: &BTreeMap<String, i64>) -> String {
+    cursor
+        .iter()
+        .map(|(room_id, li)| format!("{li}:{room_id}"))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// The value at a dotted path into an event (`content.body`), if it is text.
+fn text_at<'a>(event: &'a Value, path: &str) -> Option<&'a str> {
+    path.split('.')
+        .try_fold(event, |node, part| node.get(part))
+        .and_then(Value::as_str)
+}
+
+/// Does `event` pass the search's filter and carry the term under one of
+/// its keys? Case-insensitive containment, which is what "search basics"
+/// means here: no stemming, no ranking, no index.
+fn search_matches(event: &Value, needle: &str, keys: &[String], filter: &SearchFilter) -> bool {
+    let sender = event["sender"].as_str().unwrap_or_default();
+    let event_type = event["type"].as_str().unwrap_or_default();
+    if filter
+        .senders
+        .as_ref()
+        .is_some_and(|senders| !senders.iter().any(|wanted| wanted == sender))
+        || filter.not_senders.iter().any(|unwanted| unwanted == sender)
+        || filter
+            .types
+            .as_ref()
+            .is_some_and(|types| !types.iter().any(|wanted| wanted == event_type))
+        || filter
+            .not_types
+            .iter()
+            .any(|unwanted| unwanted == event_type)
+    {
+        return false;
+    }
+    keys.iter()
+        .any(|key| text_at(event, key).is_some_and(|text| text.to_lowercase().contains(needle)))
+}
+
+/// One search hit, with where it came from.
+struct SearchHit {
+    room_id: String,
+    event: crate::rooms::TimelineEvent,
+}
+
+/// What one walk of the rooms produced: the page's hits, the scope each
+/// searched room was read under, and whether there is a page after this.
+struct SearchPage {
+    hits: Vec<SearchHit>,
+    scopes: BTreeMap<String, ReadScope>,
+    more: bool,
+}
+
+fn origin_server_ts(hit: &SearchHit) -> i64 {
+    hit.event.json["origin_server_ts"].as_i64().unwrap_or(0)
+}
+
+/// `POST /_matrix/client/v3/search`
+///
+/// Room-event search over the rooms the caller may read: by default the
+/// rooms they are joined to, or the `filter.rooms` they name, each under
+/// its own [`read_scope`] so a former member searches only the stretch
+/// they may read and a room the caller may not see contributes nothing
+/// rather than refusing the whole search. Newest first, by
+/// `origin_server_ts` across rooms and by position within one; `rank` is
+/// the same order, since nothing here scores.
+///
+/// `count` is the number on this page. The spec calls the field an
+/// approximation of the total, and a true total would mean walking every
+/// room to its end on every search, which is the one cost this endpoint
+/// declines: a page costs the rooms it walks to fill itself, and no more.
+async fn search(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Query(query): axum::extract::Query<SearchQuery>,
+    Json(request): Json<SearchRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    let Some(criteria) = request.search_categories.room_events else {
+        return Ok(Json(json!({ "search_categories": {} })));
+    };
+    let needle = criteria.search_term.trim().to_lowercase();
+    if needle.is_empty() {
+        return Err(MatrixError::bad_json("search_term is empty"));
+    }
+    if let Some(order) = criteria.order_by.as_deref()
+        && order != "recent"
+        && order != "rank"
+    {
+        return Err(MatrixError::bad_json(format!(
+            "order_by must be recent or rank, not {order}"
+        )));
+    }
+    let keys = if criteria.keys.is_empty() {
+        vec!["content.body".to_owned()]
+    } else {
+        criteria.keys.clone()
+    };
+    let limit = criteria
+        .filter
+        .limit
+        .unwrap_or(SEARCH_LIMIT)
+        .clamp(1, SEARCH_LIMIT_MAX);
+    let mut cursor = match query.next_batch.as_deref() {
+        Some(token) => parse_search_cursor(token)?,
+        None => BTreeMap::new(),
+    };
+
+    let SearchPage { hits, scopes, more } = search_rooms(
+        &state,
+        &identity.user_id,
+        &criteria,
+        &needle,
+        &keys,
+        limit,
+        &mut cursor,
+    )?;
+
+    let results: Vec<Value> = hits
+        .iter()
+        .map(|hit| {
+            let mut event = hit.event.json.clone();
+            if let Some(object) = event.as_object_mut() {
+                object.insert("event_id".to_owned(), json!(hit.event.event_id));
+                object.insert("room_id".to_owned(), json!(hit.room_id));
+            }
+            let event = with_bundle(&state, &hit.room_id, &identity.user_id, event);
+            let mut result = json!({ "rank": 1.0, "result": event });
+            if let Some(wanted) = &criteria.event_context
+                && let Some(scope) = scopes.get(&hit.room_id)
+            {
+                result["context"] = search_context(&state, hit, wanted, scope);
+            }
+            result
+        })
+        .collect();
+
+    let mut room_events = serde_json::Map::new();
+    room_events.insert("count".to_owned(), json!(results.len()));
+    room_events.insert(
+        "highlights".to_owned(),
+        json!(needle.split_whitespace().collect::<Vec<_>>()),
+    );
+    room_events.insert("results".to_owned(), Value::Array(results));
+    if more {
+        room_events.insert("next_batch".to_owned(), json!(search_cursor(&cursor)));
+    }
+    if criteria.include_state {
+        room_events.insert(
+            "state".to_owned(),
+            Value::Object(search_state(&state, &hits, &scopes)?),
+        );
+    }
+    Ok(Json(json!({
+        "search_categories": { "room_events": Value::Object(room_events) }
+    })))
+}
+
+/// Walk every room the search covers and gather its hits: the caller's
+/// joined rooms, or the `filter.rooms` named, each under its own
+/// [`read_scope`], and each resumed from `cursor`. Returns the hits
+/// newest first and cut to `limit`, the scope of each room that was
+/// searched (the context needs it again), and whether a further page
+/// exists; `cursor` is advanced to where that page starts.
+fn search_rooms(
+    state: &AppState,
+    user_id: &str,
+    criteria: &RoomEventsCriteria,
+    needle: &str,
+    keys: &[String],
+    limit: usize,
+    cursor: &mut BTreeMap<String, i64>,
+) -> Result<SearchPage, MatrixError> {
+    let rooms = match &criteria.filter.rooms {
+        Some(rooms) => rooms.clone(),
+        None => state.rooms.joined(user_id).map_err(room_error)?,
+    };
+    let mut scopes: BTreeMap<String, ReadScope> = BTreeMap::new();
+    let mut hits: Vec<SearchHit> = Vec::new();
+    let mut more = false;
+    for room_id in rooms {
+        if criteria.filter.not_rooms.contains(&room_id) {
+            continue;
+        }
+        // A room the caller may not read contributes nothing, rather than
+        // refusing the search: naming it must not tell them it exists.
+        let Ok(scope) = read_scope(state, user_id, &room_id) else {
+            continue;
+        };
+        let matches = |event: &Value| search_matches(event, needle, keys, &criteria.filter);
+        let (found, next) = state
+            .rooms
+            .search(
+                &room_id,
+                cursor.get(&room_id).copied(),
+                limit,
+                &|li| scope.admits(li),
+                &matches,
+            )
+            .map_err(room_error)?;
+        more |= next.is_some();
+        hits.extend(found.into_iter().map(|event| SearchHit {
+            room_id: room_id.clone(),
+            event,
+        }));
+        scopes.insert(room_id, scope);
+    }
+    // Newest first across rooms; ties by room and then position, so a page
+    // boundary falls in the same place however the rooms were walked.
+    hits.sort_by(|a, b| {
+        origin_server_ts(b)
+            .cmp(&origin_server_ts(a))
+            .then_with(|| a.room_id.cmp(&b.room_id))
+            .then_with(|| b.event.li.cmp(&a.event.li))
+    });
+    if hits.len() > limit {
+        more = true;
+        hits.truncate(limit);
+    }
+    // Each room resumes below the oldest position taken from it; a room
+    // nothing was taken from resumes where it was, and finds the same hits
+    // again -- which is what makes the pages neither skip nor repeat.
+    for hit in &hits {
+        cursor
+            .entry(hit.room_id.clone())
+            .and_modify(|from| *from = (*from).min(hit.event.li))
+            .or_insert(hit.event.li);
+    }
+    Ok(SearchPage { hits, scopes, more })
+}
+
+/// The current state of each room with a hit, for `include_state`: the
+/// present for a member, the room as it stood at the bound for a former
+/// one, exactly as `/state` answers.
+fn search_state(
+    state: &AppState,
+    hits: &[SearchHit],
+    scopes: &BTreeMap<String, ReadScope>,
+) -> Result<serde_json::Map<String, Value>, MatrixError> {
+    let mut states = serde_json::Map::new();
+    for hit in hits {
+        if states.contains_key(&hit.room_id) {
+            continue;
+        }
+        let Some(scope) = scopes.get(&hit.room_id) else {
+            continue;
+        };
+        let room_state = match scope.bound() {
+            None => serde_json::from_str::<Value>(
+                state
+                    .rooms
+                    .state_serialized(&hit.room_id)
+                    .map_err(room_error)?
+                    .as_str(),
+            )
+            .map_err(|error| MatrixError::internal(&error.to_string()))?,
+            Some(bound) => Value::Array(
+                state
+                    .rooms
+                    .state_as_of(&hit.room_id, bound)
+                    .map_err(room_error)?,
+            ),
+        };
+        states.insert(hit.room_id.clone(), room_state);
+    }
+    Ok(states)
+}
+
+/// The events around one hit, as `/context` would show them, trimmed to
+/// what the search asked for on each side. A hit whose context cannot be
+/// read is a hit without context rather than a failed search.
+fn search_context(
+    state: &AppState,
+    hit: &SearchHit,
+    wanted: &SearchContext,
+    scope: &ReadScope,
+) -> Value {
+    let before_limit = wanted.before_limit.unwrap_or(SEARCH_CONTEXT_EACH_SIDE);
+    let after_limit = wanted.after_limit.unwrap_or(SEARCH_CONTEXT_EACH_SIDE);
+    let Ok(context) = state.rooms.context_visible(
+        &hit.room_id,
+        &hit.event.event_id,
+        before_limit.max(after_limit),
+        &|li| scope.admits(li),
+    ) else {
+        return Value::Null;
+    };
+    let events_before: Vec<Value> = context
+        .events_before
+        .into_iter()
+        .take(before_limit)
+        .collect();
+    let events_after: Vec<Value> = context.events_after.into_iter().take(after_limit).collect();
+    let mut out = json!({
+        "events_before": events_before,
+        "events_after": events_after,
+        "start": crate::tokens::Pagination(context.start).to_string(),
+        "end": crate::tokens::Pagination(context.end).to_string(),
+    });
+    if wanted.include_profile {
+        // The profile each sender had at the hit, from the state the
+        // context already carries.
+        let mut profiles = serde_json::Map::new();
+        let senders = std::iter::once(&hit.event.json)
+            .chain(out["events_before"].as_array().into_iter().flatten())
+            .chain(out["events_after"].as_array().into_iter().flatten())
+            .filter_map(|event| event["sender"].as_str().map(str::to_owned))
+            .collect::<std::collections::BTreeSet<_>>();
+        for sender in senders {
+            let member = context.state.iter().find(|event| {
+                event["type"] == "m.room.member" && event["state_key"] == sender.as_str()
+            });
+            let mut profile = serde_json::Map::new();
+            if let Some(name) = member.and_then(|event| event["content"]["displayname"].as_str()) {
+                profile.insert("displayname".to_owned(), json!(name));
+            }
+            if let Some(url) = member.and_then(|event| event["content"]["avatar_url"].as_str()) {
+                profile.insert("avatar_url".to_owned(), json!(url));
+            }
+            profiles.insert(sender, Value::Object(profile));
+        }
+        out["profile_info"] = Value::Object(profiles);
+    }
+    out
 }
 
 /// `POST /_matrix/client/v3/user_directory/search`

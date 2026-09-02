@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**173 routes implemented; 2 known gaps in scope.**
+**174 routes implemented; 1 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -164,7 +164,7 @@ neither implemented nor counted.
 - `GET /_matrix/media/v3/config`
 - `POST /_matrix/media/v3/upload`
 
-### Timeline, messaging & search — 11 implemented, 2 planned
+### Timeline, messaging & search — 12 implemented, 1 planned
 
 - `GET /_matrix/client/v1/rooms/{room_id}/relations/{event_id}`
 - `GET /_matrix/client/v1/rooms/{room_id}/relations/{event_id}/{rel_type}`
@@ -177,7 +177,7 @@ neither implemented nor counted.
 - `PUT /_matrix/client/v3/rooms/{room_id}/redact/{event_id}/{txn_id}`
 - `PUT /_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}`
 - `PUT /_matrix/client/v3/rooms/{room_id}/typing/{user_id}`
-- ⏳ `POST /_matrix/client/v3/search` — server-side search (#7)
+- `POST /_matrix/client/v3/search`
 - ⏳ `GET /_matrix/client/v3/notifications` — notification list
 
 ### Rooms & membership — 24 implemented, 0 planned

@@ -141,7 +141,6 @@ PLANNED = {
     "Rooms & membership": [
     ],
     "Timeline, messaging & search": [
-        ("POST", "/_matrix/client/v3/search", "server-side search (#7)"),
         ("GET", "/_matrix/client/v3/notifications", "notification list"),
     ],
     "Sync": [],
@@ -186,6 +185,7 @@ AREA_RULES = [
     ("Account data, filters & push", ("/_matrix/client/v3/user/", "/_matrix/client/v3/pushrules/")),
     ("Media", ("/_matrix/client/v1/media/", "/_matrix/media/v3/", "/_matrix/client/v1/media/config")),
     ("Timeline, messaging & search", (
+        "/_matrix/client/v3/search",
         "/_matrix/client/v3/rooms/{room_id}/messages",
         "/_matrix/client/v3/rooms/{room_id}/context/",
         "/_matrix/client/v3/rooms/{room_id}/event/",
