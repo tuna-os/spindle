@@ -4535,6 +4535,24 @@ fn write_account_data(
     // validation of `content` beyond it being JSON -- which the extractor has
     // already established. A client inventing a new `event_type` has to work
     // on a server that has never heard of it.
+    //
+    // What it may not do is invent them without end. A replacement never
+    // counts: the cap is on how much is held, not on how often it changes.
+    let cap = state.config.limits.account_data_per_user;
+    let is_new = state
+        .account_data
+        .get(user_id, room_id, event_type)
+        .map_err(|error| account_data_error(&error))?
+        .is_none();
+    if is_new
+        && state
+            .account_data
+            .count(user_id)
+            .map_err(|error| account_data_error(&error))?
+            >= cap
+    {
+        return Err(limit_exceeded("account data entries", cap));
+    }
     state
         .account_data
         .put(user_id, room_id, event_type, content)
@@ -4544,6 +4562,20 @@ fn write_account_data(
 
 fn account_data_error(error: &crate::account_data::AccountDataError) -> MatrixError {
     MatrixError::internal(&error.to_string())
+}
+
+/// A per-account cap from `[limits]` has been reached (#268).
+///
+/// The same code and shape the delayed-events cap answers with, so a
+/// client meets one refusal for "you are holding too much here" wherever
+/// it meets it. The limit is named because the operator set it, and the
+/// client can only act on a number it can see.
+fn limit_exceeded(what: &str, limit: usize) -> MatrixError {
+    MatrixError::new(
+        StatusCode::BAD_REQUEST,
+        "M_LIMIT_EXCEEDED",
+        format!("at most {limit} {what} may be held for one account"),
+    )
 }
 
 /// The caller's ruleset, seeded from the defaults if they have never edited it.
@@ -4876,6 +4908,17 @@ async fn create_filter(
     Json(filter): Json<crate::filters::Filter>,
 ) -> Result<Json<Value>, MatrixError> {
     own_account(&identity, &user_id)?;
+    // Every upload mints a new id, so every upload is growth; a client that
+    // wants the same filter back is expected to keep the id it was given.
+    let cap = state.config.limits.filters_per_user;
+    if state
+        .filters
+        .count(&user_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+        >= cap
+    {
+        return Err(limit_exceeded("filters", cap));
+    }
     let filter_id = state
         .filters
         .put(&user_id, &filter)
@@ -5073,10 +5116,25 @@ async fn upload_keys(
             .map_err(|error| MatrixError::internal(&error.to_string()))?;
     }
     let counts = match &request.one_time_keys {
-        Some(one_time_keys) => state
-            .devices
-            .upload_one_time_keys(&identity.user_id, &identity.device_id, one_time_keys)
-            .map_err(|error| MatrixError::internal(&error.to_string()))?,
+        Some(one_time_keys) => {
+            // Counted before the write, against what the device already
+            // holds plus what it is sending. A key that re-uses an id it
+            // already uploaded is counted twice here; that errs toward
+            // refusing at the cap, and a client at the cap has no business
+            // uploading more.
+            let cap = state.config.limits.one_time_keys_per_device;
+            let held = state
+                .devices
+                .one_time_key_total(&identity.user_id, &identity.device_id)
+                .map_err(|error| MatrixError::internal(&error.to_string()))?;
+            if held.saturating_add(one_time_keys.len()) > cap {
+                return Err(limit_exceeded("one-time keys per device", cap));
+            }
+            state
+                .devices
+                .upload_one_time_keys(&identity.user_id, &identity.device_id, one_time_keys)
+                .map_err(|error| MatrixError::internal(&error.to_string()))?
+        }
         None => state
             .devices
             .one_time_key_counts(&identity.user_id, &identity.device_id)

@@ -245,6 +245,15 @@ impl Filters {
         Ok(id)
     }
 
+    /// How many filters `user_id` has stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the scan fails.
+    pub fn count(&self, user_id: &str) -> Result<usize, StoreError> {
+        Ok(ReadView::scan_prefix(self.store.as_ref(), &keys::filter_prefix(user_id))?.len())
+    }
+
     /// One stored filter, or `None` if the user never uploaded it.
     ///
     /// # Errors

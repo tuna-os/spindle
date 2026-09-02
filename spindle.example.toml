@@ -179,6 +179,27 @@ registrations = []
 # Matrix RTC client sits at one. Must be > 0, for the same reason.
 # max_per_room = 100
 
+[limits]
+# Ceilings on what one account may make this server hold. Each of these
+# stores grew without bound under an ordinary registered account before the
+# caps existed: nothing ever deleted a filter, every new account-data type
+# added a row, and one-time keys were accepted for as long as a client kept
+# sending them. A write past a cap is refused with 400 `M_LIMIT_EXCEEDED`,
+# the same answer the delayed-events caps give. Every cap must be > 0: a
+# zero would refuse every write, and a config that quietly disables a
+# feature is worse than one that will not load.
+#
+# Filters a user may hold. `POST /filter` appends; nothing deletes.
+# filters_per_user = 1000
+#
+# Account-data types one user may hold, global and per-room together.
+# Rewriting a type that already exists does not count against this.
+# account_data_per_user = 20000
+#
+# One-time keys one device may hold unclaimed. A client past the cap has
+# stopped claiming, not run short.
+# one_time_keys_per_device = 1000
+
 [logging]
 # A `tracing-subscriber` filter directive.
 # filter = "spindle=debug,warn"

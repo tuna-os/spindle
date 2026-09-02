@@ -33,16 +33,25 @@ struct Device {
 
 impl Harness {
     fn new() -> Self {
+        Self::with_config("")
+    }
+
+    /// The default harness plus `extra` TOML, for the tests about caps.
+    fn with_config(extra: &str) -> Self {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
-        let app = Self::build(&store);
+        let app = Self::build_with(&store, extra);
         Self { dir, store, app }
     }
 
     fn build(store: &Arc<FjallStore>) -> axum::Router {
-        let config = spindle_server::Config::parse(
-            "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n",
-        )
+        Self::build_with(store, "")
+    }
+
+    fn build_with(store: &Arc<FjallStore>, extra: &str) -> axum::Router {
+        let config = spindle_server::Config::parse(&format!(
+            "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n{extra}"
+        ))
         .unwrap();
         spindle_server::app(config, Arc::clone(store)).expect("a signing key is established")
     }
@@ -533,4 +542,68 @@ async fn restart_resumes_the_counter_past_pending_to_device_messages() {
         2,
         "both messages survive the restart: {events:?}"
     );
+}
+
+/// One-time keys are whatever a device chooses to upload, and nothing
+/// bounded it (#268). The cap is per device and counts what is held plus
+/// what is arriving, so a batch that would cross it is refused whole and
+/// what was held is untouched.
+#[tokio::test]
+async fn one_time_keys_are_capped_per_device() {
+    let harness = Harness::with_config("[limits]\none_time_keys_per_device = 4\n");
+    let alice = harness.register("alice").await;
+    harness.upload_identity("@alice:example.org", &alice).await;
+    let keys = |ids: &[&str]| -> Value {
+        json!({
+            "one_time_keys": ids
+                .iter()
+                .map(|id| (format!("signed_curve25519:{id}"), json!({ "key": id })))
+                .collect::<serde_json::Map<String, Value>>()
+        })
+    };
+
+    let (status, body) = harness
+        .send(
+            "POST",
+            "/_matrix/client/v3/keys/upload",
+            &alice.token,
+            &keys(&["a", "b", "c"]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["one_time_key_counts"]["signed_curve25519"], 3);
+
+    // Two more would make five: refused whole.
+    let (status, body) = harness
+        .send(
+            "POST",
+            "/_matrix/client/v3/keys/upload",
+            &alice.token,
+            &keys(&["d", "e"]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_LIMIT_EXCEEDED", "{body}");
+
+    // Still three, and one more fits exactly.
+    let (status, body) = harness
+        .send(
+            "POST",
+            "/_matrix/client/v3/keys/upload",
+            &alice.token,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["one_time_key_counts"]["signed_curve25519"], 3);
+    let (status, body) = harness
+        .send(
+            "POST",
+            "/_matrix/client/v3/keys/upload",
+            &alice.token,
+            &keys(&["d"]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["one_time_key_counts"]["signed_curve25519"], 4);
 }

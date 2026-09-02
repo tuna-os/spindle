@@ -23,9 +23,16 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
+        Self::with_config("")
+    }
+
+    /// The default harness plus `extra` TOML, for the tests about caps.
+    fn with_config(extra: &str) -> Self {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
-        let config = spindle_server::Config::parse("[server]\nname = \"example.org\"\n").unwrap();
+        let config =
+            spindle_server::Config::parse(&format!("[server]\nname = \"example.org\"\n{extra}"))
+                .unwrap();
         let app = spindle_server::app(config, store).expect("a signing key is established");
         Self { _dir: dir, app }
     }
@@ -491,4 +498,60 @@ async fn account_data_survives_a_restart() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body, json!({ "kept": true }));
+}
+
+/// Account data is keyed by a type the client invents, so a client could
+/// invent them without end (#268). The cap counts what is held -- global and
+/// per-room together -- and a replacement of something already stored never
+/// counts against it, because the cap is on how much, not how often.
+#[tokio::test]
+async fn account_data_is_capped_per_user_and_replacements_do_not_count() {
+    let harness = Harness::with_config("[limits]\naccount_data_per_user = 3\n");
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness.create_room(&alice).await;
+    let mine = "/_matrix/client/v3/user/@alice:example.org";
+
+    for path in [
+        format!("{mine}/account_data/org.example.one"),
+        format!("{mine}/account_data/org.example.two"),
+        format!("{mine}/rooms/{room}/account_data/org.example.three"),
+    ] {
+        let (status, body) = harness.put(&path, &alice, &json!({ "n": 1 })).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    }
+
+    // At the cap, a replacement is fine ...
+    let (status, body) = harness
+        .put(
+            &format!("{mine}/account_data/org.example.one"),
+            &alice,
+            &json!({ "n": 2 }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // ... and a fourth entry is not, whichever kind it is.
+    for path in [
+        format!("{mine}/account_data/org.example.four"),
+        format!("{mine}/rooms/{room}/account_data/org.example.four"),
+    ] {
+        let (status, body) = harness.put(&path, &alice, &json!({ "n": 1 })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert_eq!(body["errcode"], "M_LIMIT_EXCEEDED", "{body}");
+    }
+    // The replacement landed and nothing already stored was lost.
+    let (_, body) = harness
+        .get(&format!("{mine}/account_data/org.example.one"), &alice)
+        .await;
+    assert_eq!(body["n"], 2);
+
+    // Bob's count is his own.
+    let (status, body) = harness
+        .put(
+            "/_matrix/client/v3/user/@bob:example.org/account_data/org.example.one",
+            &bob,
+            &json!({ "n": 1 }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
