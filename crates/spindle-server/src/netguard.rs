@@ -7,7 +7,8 @@
 //! from here: every resolved address is vetted, non-global ranges are
 //! refused, and an operator opens named CIDR ranges back up explicitly.
 //! A literal IP never touches DNS, so callers vet those themselves with
-//! [`permits`] before connecting.
+//! [`permits`] before connecting, and hand [`redirect_policy`] to the
+//! client so a *hop* to one is vetted too.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -24,6 +25,43 @@ pub(crate) fn parse_allow_list(entries: &[String]) -> Result<Vec<Cidr>, String> 
 /// Is `address` reachable under this allow-list: routable, or opened up.
 pub(crate) fn permits(allowed: &[Cidr], address: IpAddr) -> bool {
     is_global(address) || allowed.iter().any(|cidr| cidr.contains(address))
+}
+
+/// How many hops an outbound fetch may follow before it is a loop.
+const MAX_REDIRECTS: usize = 5;
+
+/// The redirect policy that belongs beside every [`VettingResolver`].
+///
+/// The resolver is a *DNS* hook, so it only ever sees hostnames. A hop
+/// whose `Location` carries a literal IP never reaches DNS, and reqwest's
+/// default policy follows it: without this, any host the vet approved
+/// could answer `302 Location: http://169.254.169.254/` and walk straight
+/// past the resolver into whatever network this server sits in.
+///
+/// This lived in `previews.rs`, which meant federation — the other feature
+/// that connects to a host somebody else chose, and the one reachable by
+/// anyone who can send an `X-Matrix` header — had a resolver and no policy
+/// for its whole history. One judgement in two places is how that happens,
+/// so there is one, here, beside the judgement it applies.
+///
+/// `refusal` names the feature in the error a hop is refused with, because
+/// "refused" with no subject is the log line nobody can act on.
+pub(crate) fn redirect_policy(
+    allowed: Vec<Cidr>,
+    refusal: &'static str,
+) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() > MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        if let Some(host) = attempt.url().host_str()
+            && let Ok(literal) = host.trim_matches(['[', ']']).parse::<IpAddr>()
+            && !permits(&allowed, literal)
+        {
+            return attempt.error(refusal);
+        }
+        attempt.follow()
+    })
 }
 
 /// The vetting DNS resolver: resolve, then judge every address.

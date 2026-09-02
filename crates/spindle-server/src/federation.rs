@@ -104,11 +104,24 @@ impl Federation {
         // Every name this client connects to resolves through the vetting
         // resolver, so a peer whose name points inward is refused before a
         // socket is opened. Literal IPs never reach DNS; `base_url` vets
-        // those.
+        // the destination and the redirect policy vets every hop after it.
+        //
+        // The policy is not optional decoration. The resolver is a DNS
+        // hook, so it never sees a `Location:` carrying a literal IP, and
+        // reqwest's default is to follow ten of them. `fetch_key_document`
+        // is driven by the `origin` of an inbound `X-Matrix` header — so
+        // without this, anyone who can send that header could point it at
+        // a host they control, have it answer `302 Location:
+        // http://169.254.169.254/`, and reach the metadata service from
+        // inside this server's network.
         let client = reqwest::Client::builder()
             .dns_resolver(Arc::new(VettingResolver {
                 allowed: allowed.clone(),
             }))
+            .redirect(crate::netguard::redirect_policy(
+                allowed.clone(),
+                "redirect into an address this server does not reach",
+            ))
             .build()
             .map_err(|error| FederationError::Refused(error.to_string()))?;
         Ok(Self {

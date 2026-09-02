@@ -18,7 +18,7 @@ use spindle_core::keys::{self, Keyspace};
 use spindle_store::{FjallStore, ReadView, Store};
 
 use crate::media::Media;
-use crate::netguard::{Cidr, VettingResolver, is_global};
+use crate::netguard::{Cidr, VettingResolver, is_global, redirect_policy};
 
 /// How much of a page is read looking for its metadata. Everything a
 /// preview wants lives in `<head>`; a bound this size is about refusing to
@@ -83,25 +83,15 @@ impl Previews {
         // through the resolver above, but a hop to a *literal IP* never
         // touches DNS — without this policy, any public page could 302 to
         // http://169.254.169.254/ and walk straight past the resolver.
-        let allowed_for_redirects = allowed.clone();
-        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() > 5 {
-                return attempt.error("too many redirects");
-            }
-            if let Some(host) = attempt.url().host_str()
-                && let Ok(literal) = host.trim_matches(['[', ']']).parse::<IpAddr>()
-                && !(is_global(literal)
-                    || allowed_for_redirects
-                        .iter()
-                        .any(|cidr| cidr.contains(literal)))
-            {
-                return attempt.error("redirect into a non-previewable address");
-            }
-            attempt.follow()
-        });
+        // The policy itself is in `netguard`, beside the judgement it
+        // applies, because federation needs the same one and having a
+        // copy here is how it went without.
         let client = reqwest::Client::builder()
             .dns_resolver(resolver)
-            .redirect(redirect_policy)
+            .redirect(redirect_policy(
+                allowed.clone(),
+                "redirect into a non-previewable address",
+            ))
             .timeout(Duration::from_secs(20))
             .user_agent("spindle-url-preview")
             .build()
