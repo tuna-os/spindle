@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**171 routes implemented; 4 known gaps in scope.**
+**173 routes implemented; 2 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -141,7 +141,7 @@ neither implemented nor counted.
 - `POST /_matrix/client/unstable/org.matrix.simplified_msc3575/sync`
 - `GET /_matrix/client/v3/sync`
 
-### Account data, filters & push — 10 implemented, 2 planned
+### Account data, filters & push — 10 implemented, 0 planned
 
 - `GET /_matrix/client/v3/pushrules/`
 - `GET/PUT/DELETE /_matrix/client/v3/pushrules/{scope}/{kind}/{rule_id}`
@@ -153,8 +153,6 @@ neither implemented nor counted.
 - `GET/PUT /_matrix/client/v3/user/{user_id}/rooms/{room_id}/account_data/{event_type}`
 - `GET /_matrix/client/v3/user/{user_id}/rooms/{room_id}/tags`
 - `PUT/DELETE /_matrix/client/v3/user/{user_id}/rooms/{room_id}/tags/{tag}`
-- ⏳ `GET /_matrix/client/v3/pushers` — pusher list (#7)
-- ⏳ `POST /_matrix/client/v3/pushers/set` — pusher registration (#7)
 
 ### Media — 7 implemented, 0 planned
 
@@ -230,7 +228,7 @@ neither implemented nor counted.
 - `POST /_matrix/client/v3/register`
 - `GET /_matrix/client/v3/register/available`
 
-### Server, discovery & operations — 15 implemented, 0 planned
+### Server, discovery & operations — 17 implemented, 0 planned
 
 - `GET /.well-known/matrix/client`
 - `GET /.well-known/matrix/server`
@@ -241,6 +239,8 @@ neither implemented nor counted.
 - `GET /_matrix/client/v1/rooms/{room_id}/timestamp_to_event`
 - `GET /_matrix/client/v3/capabilities`
 - `GET/POST /_matrix/client/v3/publicRooms`
+- `GET /_matrix/client/v3/pushers`
+- `POST /_matrix/client/v3/pushers/set`
 - `POST /_matrix/client/v3/user_directory/search`
 - `GET /_matrix/client/v3/voip/turnServer`
 - `GET /_matrix/client/versions`

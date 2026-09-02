@@ -209,6 +209,9 @@ registrations = []
 # One-time keys one device may hold unclaimed. A client past the cap has
 # stopped claiming, not run short.
 # one_time_keys_per_device = 1000
+#
+# Pushers one account may register. A client registers one per device.
+# pushers_per_user = 100
 
 [logging]
 # A `tracing-subscriber` filter directive.
