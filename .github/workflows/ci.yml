@@ -38,6 +38,16 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-features
 
+      # Every response the scripted client gets back from a live server,
+      # validated against the matrix-spec OpenAPI at a pinned revision (#25).
+      # The test step above has already built the binary it runs. The spec
+      # is a shallow fetch of one commit, so it costs seconds, and pinning it
+      # means a spec change cannot fail this job on its own.
+      - name: Check responses against the matrix-spec OpenAPI
+        run: |
+          pip install --quiet jsonschema==4.26.0 pyyaml==6.0.3
+          python3 scripts/openapi-check.py --binary target/debug/spindle --spec tmp/matrix-spec
+
       # The benchmark publishing scripts run on push to main, which is the
       # worst place to find out they are broken: the failure lands after the
       # change is in, and the site keeps serving whatever it served last.
