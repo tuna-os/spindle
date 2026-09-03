@@ -52,6 +52,9 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 regex = "1"
 tempfile = "3"
+# Tests only: the certificate a test server needs to bring up its TLS
+# federation listener, made on the spot rather than checked in as a key.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
 toml = "0.8"
 tower = "0.5"
