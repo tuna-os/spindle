@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use spindle_core::{
-    AppendError, EventId, EventInput, ForkWindowError, RoomLog, StateKey, StateSnapshot,
+    AppendError, EventId, EventInput, ForkWindowError, RoomLog, SetAside, StateKey, StateSnapshot,
 };
 
 #[test]
@@ -123,6 +123,134 @@ fn a_same_slot_fork_still_needs_the_resolver_when_the_slot_was_already_set() {
         room.append_local("$merge", None),
         Err(AppendError::NeedsStateResolution { .. })
     ));
+}
+
+/// A contested fork is stepped around, not tripped over: the room keeps
+/// taking local appends on its linear head (#225).
+///
+/// What is set aside is the tip that claims the contested key other than
+/// the head, the head being the entry the linear order puts last, whichever
+/// branch it belongs to. The tip set aside stays a forward extremity -- the
+/// resolver will want it -- but no local append names it, and a second call
+/// finds nothing left to set aside, which is what keeps one open fork from
+/// being counted on every send.
+#[test]
+fn a_contested_fork_is_set_aside_and_local_appends_continue_on_the_head() {
+    let topic = StateKey::new("m.room.topic", "");
+    let mut room = RoomLog::new();
+    room.append_local("$create", Some(StateKey::new("m.room.create", "")))
+        .unwrap();
+    room.append_local("$topic0", Some(topic.clone())).unwrap();
+    let base = room.forward_extremities().iter().next().unwrap().clone();
+
+    room.append_local("$topic-ours", Some(topic.clone()))
+        .unwrap();
+    // Theirs lands last, so it is the linear head.
+    room.append_remote(EventInput::new("$topic-theirs", vec![base]).with_state_key(topic.clone()))
+        .unwrap();
+    assert!(matches!(
+        room.append_local("$merge", None),
+        Err(AppendError::NeedsStateResolution { .. })
+    ));
+
+    let set_aside = room.set_aside_contested().unwrap();
+    assert_eq!(
+        set_aside,
+        vec![SetAside {
+            extremity: EventId::new("$topic-ours"),
+            key: topic.clone(),
+        }]
+    );
+    assert!(
+        room.set_aside_contested().unwrap().is_empty(),
+        "one fork is set aside once"
+    );
+
+    let merge = room.append_local("$merge", None).unwrap();
+    assert_eq!(merge.prev_events, vec![EventId::new("$topic-theirs")]);
+    let state = room.state_after_event(&EventId::new("$merge")).unwrap();
+    assert_eq!(state.get(&topic), Some("$topic-theirs"));
+
+    // Still a tip of the DAG, still resident, just not authored on.
+    let ours = EventId::new("$topic-ours");
+    assert!(room.forward_extremities().contains(&ours));
+    assert!(room.set_aside_extremities().contains(&ours));
+    assert!(room.state_after_event(&ours).is_some());
+    assert_eq!(room.authoring_extremities().count(), 1);
+}
+
+/// A three-way fork loses only the branch that disagrees.
+///
+/// A tip that merely inherited the contested key made no claim on it, and
+/// setting it aside would drop a branch that would have merged for free.
+#[test]
+fn set_aside_keeps_a_tip_that_only_inherited_the_contested_key() {
+    let topic = StateKey::new("m.room.topic", "");
+    let mut room = RoomLog::new();
+    room.append_local("$create", Some(StateKey::new("m.room.create", "")))
+        .unwrap();
+    room.append_local("$topic0", Some(topic.clone())).unwrap();
+    let base = room.forward_extremities().iter().next().unwrap().clone();
+
+    room.append_remote(EventInput::new("$message", vec![base.clone()]))
+        .unwrap();
+    room.append_remote(
+        EventInput::new("$topic-a", vec![base.clone()]).with_state_key(topic.clone()),
+    )
+    .unwrap();
+    room.append_remote(EventInput::new("$topic-b", vec![base]).with_state_key(topic.clone()))
+        .unwrap();
+    assert_eq!(room.forward_extremities().len(), 3);
+
+    let set_aside = room.set_aside_contested().unwrap();
+    assert_eq!(set_aside.len(), 1, "{set_aside:?}");
+    assert_eq!(set_aside[0].extremity, EventId::new("$topic-a"));
+
+    let merge = room.append_local("$merge", None).unwrap();
+    assert_eq!(merge.prev_events.len(), 2, "{:?}", merge.prev_events);
+    assert!(merge.prev_events.contains(&EventId::new("$message")));
+    assert!(merge.prev_events.contains(&EventId::new("$topic-b")));
+    let state = room.state_after_event(&EventId::new("$merge")).unwrap();
+    assert_eq!(state.get(&topic), Some("$topic-b"));
+}
+
+/// Whatever builds on a set-aside tip is a fresh tip, judged afresh.
+///
+/// The set-aside mark is about a tip, not a branch. A peer that extends the
+/// branch this server stepped around produces a new extremity, which the
+/// next local append considers on its own merits -- and, since it still
+/// contests the key, sets aside in turn. That second decision is a second
+/// fork for the counter, which is right: the peer produced a second tip
+/// this server cannot fold.
+#[test]
+fn a_tip_built_on_a_set_aside_tip_is_judged_afresh() {
+    let topic = StateKey::new("m.room.topic", "");
+    let mut room = RoomLog::new();
+    room.append_local("$create", Some(StateKey::new("m.room.create", "")))
+        .unwrap();
+    room.append_local("$topic0", Some(topic.clone())).unwrap();
+    let base = room.forward_extremities().iter().next().unwrap().clone();
+    room.append_local("$topic-ours", Some(topic.clone()))
+        .unwrap();
+    room.append_remote(EventInput::new("$topic-theirs", vec![base]).with_state_key(topic.clone()))
+        .unwrap();
+    assert_eq!(room.set_aside_contested().unwrap().len(), 1);
+    room.append_local("$merge", None).unwrap();
+
+    room.append_remote(EventInput::new("$more", vec![EventId::new("$topic-ours")]))
+        .unwrap();
+    assert!(
+        room.set_aside_extremities().is_empty(),
+        "the tip built on is no tip, and no longer set aside"
+    );
+    assert_eq!(room.authoring_extremities().count(), 2);
+
+    let set_aside = room.set_aside_contested().unwrap();
+    assert_eq!(set_aside.len(), 1, "{set_aside:?}");
+    // `$more` is the linear head now, so it is `$merge` that steps aside.
+    assert_eq!(set_aside[0].extremity, EventId::new("$merge"));
+    let next = room.append_local("$next", None).unwrap();
+    assert_eq!(next.prev_events, vec![EventId::new("$more")]);
 }
 
 #[test]

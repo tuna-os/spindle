@@ -580,24 +580,29 @@ async fn a_fork_on_slots_neither_branch_held_merges_without_resolution() {
 
 /// Both branches write the *same* slot: SPEC §9.2 case 3.
 ///
-/// This is the expensive case, and today it is not resolved but refused —
-/// `metrics.rs` says so in as many words: *bounded resolution exists in
-/// `spindle-core` but is not yet wired into ingest (#16)*. The test pins the
-/// refusal rather than the aspiration, because a test asserting the intended
-/// behaviour would fail today and a test asserting nothing would let the
-/// refusal turn into silent data loss unnoticed.
+/// This is the expensive case, and today it is not resolved: bounded
+/// resolution exists in `spindle-core` but is not yet wired into ingest
+/// (#16). What the server does instead is the subject of this test.
 ///
-/// What must hold either way: the room is not corrupted. Whichever way the
-/// merge goes, both servers must still be able to read a consistent state,
-/// and the case-3 counter must have moved — the design's falsifiable target
-/// (§18.3, case 3 under 0.1% of federated events) is meaningless if the
-/// expensive path can be taken without being counted.
+/// Before #225 the merge was refused, and because every later local append
+/// named the same two extremities, refused *permanently*: one concurrent
+/// edit from a peer made the room unwritable for every local user, with no
+/// path out. The server must not wedge on a fork it cannot fold. It keeps
+/// authoring on its linear head, sets the contested branch aside for the
+/// resolver, and says so: the case-3 counter moves exactly once for the
+/// fork -- not once per send while it stays open -- because §18.3's target
+/// is meaningless if the expensive path can be taken without being counted,
+/// and equally meaningless if one fork is counted as many.
+///
+/// What must hold either way: the room is not corrupted. Whichever branch
+/// survives, the room still reads a consistent state and still holds one of
+/// the two topics rather than neither.
 #[tokio::test]
 #[allow(
     clippy::await_holding_lock,
     reason = "serializing the tests is the job"
 )]
-async fn a_fork_on_the_same_slot_is_counted_as_the_expensive_case() {
+async fn a_fork_on_the_same_slot_is_counted_once_and_leaves_the_room_writable() {
     let _guard = COUNTERS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -625,31 +630,51 @@ async fn a_fork_on_the_same_slot_is_counted_as_the_expensive_case() {
     let merged = harness.say(&room, &alice, "after").await;
     let delta = Cases::read().since(before);
 
-    // The append is refused today. When #16 wires bounded resolution into
-    // ingest this becomes an OK, and the assertion below is the one that
-    // has to change -- deliberately, with the counter still moving.
-    //
-    // 503, not 500: #225 recorded that a genuinely contested fork answered
-    // with a bare internal error, which tells a client nothing it can act
-    // on. The server is working correctly here; the *room* is in a state it
-    // cannot fold yet, and that is a different thing to say.
+    // The severe half of #225: the send after a contested fork answered 500
+    // (503 once the error was mapped), and so did every send after it.
     assert_eq!(
         merged,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "a contested fork must be refused as a service state, not as a crash"
+        StatusCode::OK,
+        "a contested fork wedged the room on the first send"
     );
     assert_eq!(
         delta.contested, 1,
         "the expensive path was taken without being counted: {delta:?}"
     );
 
-    // Refused is not corrupted: the room still reads, and still holds one of
-    // the two topics rather than neither.
-    let state = harness.state_ids(&room, &alice).await;
-    assert!(
-        state.contains_key("m.room.topic/"),
-        "the refused merge lost the topic entirely: {state:?}"
+    // The room stays writable, and the fork that is still open is not
+    // counted again on every send that steps around it.
+    let before = Cases::read();
+    for attempt in 0..3 {
+        assert_eq!(
+            harness.say(&room, &alice, &format!("retry{attempt}")).await,
+            StatusCode::OK,
+            "the room wedged on retry {attempt}"
+        );
+    }
+    assert_eq!(
+        harness
+            .set_state(&room, &alice, "m.room.topic", &json!({ "topic": "later" }))
+            .await,
+        StatusCode::OK,
+        "a state write after the fork was refused"
     );
+    let delta = Cases::read().since(before);
+    assert_eq!(
+        delta.contested, 0,
+        "one open fork was counted again on later sends: {delta:?}"
+    );
+
+    // Set aside is not corrupted: the room still reads, and the last local
+    // write is what it now holds.
+    let (status, topic) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.topic"),
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{topic}");
+    assert_eq!(topic["topic"], json!("later"), "the topic after the fork");
 }
 
 /// Disjoint slots that both already held a value: the case #225 got wrong.
