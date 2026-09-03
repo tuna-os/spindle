@@ -2040,24 +2040,11 @@ impl Rooms {
     /// Like [`Self::state_at`], but keeping each event's ID beside it —
     /// federation answers want both, and the ID is known before the body
     /// is read.
-    fn state_pairs_at(
+    fn state_pairs_of(
         &self,
         room_id: &str,
-        root: spindle_core::StateRoot,
+        snapshot: &spindle_core::StateSnapshot,
     ) -> Result<Vec<IdentifiedEvent>, RoomError> {
-        let mut load = |address: &spindle_core::StateRoot| {
-            spindle_store::ReadView::get(
-                self.store.as_ref(),
-                &spindle_core::keys::content_addressed(
-                    spindle_core::keys::Keyspace::StateNode,
-                    address.as_bytes(),
-                ),
-            )
-            .ok()
-            .flatten()
-        };
-        let snapshot = spindle_core::StateSnapshot::rehydrate(root, &mut load)
-            .map_err(|error| RoomError::Build(format!("cannot rebuild state: {error:?}")))?;
         let mut ids = Vec::with_capacity(snapshot.len());
         snapshot.for_each(|_, event_id| ids.push(event_id.to_owned()));
         let mut out = Vec::with_capacity(ids.len());

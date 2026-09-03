@@ -17,7 +17,7 @@ use std::sync::{Arc, RwLock};
 
 use ruma::RoomVersionId;
 use serde_json::Value;
-use spindle_core::{EventId, EventInput, LogEntry, Pdu, RoomLog, StateKey};
+use spindle_core::{AppendError, EventId, EventInput, LogEntry, Pdu, RoomLog, StateKey};
 use spindle_store::RoomStore;
 
 use super::{
@@ -420,37 +420,49 @@ impl Rooms {
     /// federation's `/state` and `/state_ids`.
     ///
     /// Before rather than after, matching what a joining or backfilling
-    /// server needs: the state its new event was authorized against. This
-    /// is the read SPEC §18.1 is about — the state at an arbitrary
-    /// historical point is one content-addressed rehydration, not a
-    /// resolution: the entry already carries the root.
+    /// server needs: the state its new event was authorized against. That
+    /// is the fold of the event's parents (`RoomLog::state_before`), which
+    /// in a linear room is one content-addressed rehydration of the entry
+    /// before it -- the read SPEC §18.1 is about. It used to be *only*
+    /// that, the linear predecessor's root whatever the event's parents,
+    /// which after a fork is one branch's state: a peer asking at the
+    /// event that merged two branches was told a state missing the other
+    /// branch's writes, while a client of this server saw both. The
+    /// federation fork tests compare the two reads, and that is what they
+    /// found (#16).
     ///
     /// # Errors
     ///
     /// Returns [`RoomError::MissingBody`] for an event the room does not
-    /// hold, or [`RoomError`] if bodies cannot be read.
+    /// hold, or [`RoomError`] if the state or bodies cannot be read.
     pub fn federation_state(
         &self,
         room_id: &str,
         event_id: &str,
     ) -> Result<(Vec<IdentifiedEvent>, Vec<IdentifiedEvent>), RoomError> {
-        let previous_root = self.with_room_read(room_id, |_, log| {
-            let Some(entry) = log.get(&EventId::new(event_id)) else {
-                return Err(RoomError::MissingBody(event_id.to_owned()));
+        let before = self.with_room_read(room_id, |rooms, log| {
+            let mut load = |address: &spindle_core::StateRoot| {
+                spindle_store::ReadView::get(
+                    rooms.store.as_ref(),
+                    &spindle_core::keys::content_addressed(
+                        spindle_core::keys::Keyspace::StateNode,
+                        address.as_bytes(),
+                    ),
+                )
+                .ok()
+                .flatten()
             };
-            let target = entry.li;
-            Ok(log
-                .entries()
-                .rev()
-                .find(|entry| entry.li < target)
-                .map(|entry| entry.state_root))
+            log.state_before(&EventId::new(event_id), &mut load)
+                .map_err(|error| match error {
+                    AppendError::UnknownPredecessor(_) => {
+                        RoomError::MissingBody(event_id.to_owned())
+                    }
+                    other => RoomError::Build(format!(
+                        "cannot rebuild the state before {event_id}: {other:?}"
+                    )),
+                })
         })?;
-
-        let pdus = match previous_root {
-            Some(root) => self.state_pairs_at(room_id, root)?,
-            // The first event: the state before it is no state at all.
-            None => Vec::new(),
-        };
+        let pdus = self.state_pairs_of(room_id, &before)?;
 
         // The auth chain is every event the state transitively cites: a
         // walk over stored bodies, deduplicated, no network.

@@ -273,6 +273,99 @@ impl RoomLog {
             .and_then(|li| self.resident.get(li))
     }
 
+    /// The state before `event_id`: its parents folded, which is what the
+    /// event was authorized against and what federation's `/state` and
+    /// `/state_ids` answer for it.
+    ///
+    /// Not the state after the entry before it in this server's order. The
+    /// two agree in a linear room and part after a fork: the entry before
+    /// the event that merges two branches belongs to one of them, and its
+    /// state lacks the other's writes, while the merge event was authorized
+    /// against the fold of both. Reading the linear predecessor told a peer
+    /// a state this server never held at that event; the federation fork
+    /// tests caught it by comparing that read with the client's (#16).
+    ///
+    /// Resident snapshots serve where the window still holds them; older
+    /// ones are rehydrated through `load`, the store's content-addressed
+    /// read, because a peer may ask about an event older than the window.
+    /// The fold is the append path's own: a fork whose base the window
+    /// cannot reach takes the same conservative rule, refused rather than
+    /// guessed, and a fold that fails names a log no append produced.
+    ///
+    /// Parents this server does not hold are outside its history, not a
+    /// corrupt index -- the frontier of a backfill names them -- and are
+    /// left out of the fold. An event none of whose parents is held has no
+    /// fold to compute, and answers the state after the entry before it in
+    /// linear order, which for backfilled history is the older event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppendError::UnknownPredecessor`] for an event the log does
+    /// not hold, [`AppendError::StateNotResident`] for a parent whose state
+    /// is neither resident nor rehydratable, and
+    /// [`AppendError::NeedsStateResolution`] for parents that do not fold.
+    pub fn state_before(
+        &self,
+        event_id: &EventId,
+        load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+    ) -> Result<StateSnapshot, AppendError> {
+        let Some(entry) = self.get(event_id) else {
+            return Err(AppendError::UnknownPredecessor(event_id.clone()));
+        };
+        let held: Vec<EventId> = entry
+            .prev_events
+            .iter()
+            .filter(|parent| self.positions.contains_key(*parent))
+            .cloned()
+            .collect();
+        if held.is_empty() {
+            return match self
+                .entry_at_or_before(entry.li.get().saturating_sub(1))
+                .filter(|previous| previous.li < entry.li)
+            {
+                Some(previous) => self.state_after_or_rehydrated(&previous.event_id, load),
+                None => Ok(StateSnapshot::new()),
+            };
+        }
+        let mut parents = Vec::with_capacity(held.len());
+        for parent in &held {
+            parents.push(self.state_after_or_rehydrated(parent, load)?);
+        }
+        let base = if held.len() > 1 {
+            match self.fork_window(&held, self.resident_window) {
+                Ok(window) => {
+                    Some(self.state_after_or_rehydrated(&window.nearest_common_ancestor, load)?)
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let parents: Vec<&StateSnapshot> = parents.iter().collect();
+        merge_states(&parents, base.as_ref())
+    }
+
+    /// The state after `event_id`, from the window if it is still there and
+    /// from the store through `load` if not.
+    fn state_after_or_rehydrated(
+        &self,
+        event_id: &EventId,
+        load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+    ) -> Result<StateSnapshot, AppendError> {
+        let Some(entry) = self.get(event_id) else {
+            return Err(AppendError::UnknownPredecessor(event_id.clone()));
+        };
+        if let Some(state) = self.resident.get(&entry.li.get()) {
+            return Ok(state.clone());
+        }
+        StateSnapshot::rehydrate(entry.state_root, load).map_err(|_| {
+            AppendError::StateNotResident {
+                li: entry.li,
+                event_id: event_id.clone(),
+            }
+        })
+    }
+
     /// How many snapshots are currently held in memory.
     ///
     /// Exposed so a test can assert the bound holds rather than assume it. A

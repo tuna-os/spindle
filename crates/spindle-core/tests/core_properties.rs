@@ -98,6 +98,77 @@ fn a_disjoint_fork_merges_whether_or_not_the_slots_were_already_set() {
     }
 }
 
+/// The state before an event is the fold of its parents, not the state
+/// after whichever entry happens to precede it in linear order.
+///
+/// The two are the same thing in a linear room, which is how the
+/// federation `/state_ids` read got away with the second for as long as it
+/// did. After a fork they part: the entry before the merge event belongs
+/// to one branch, and its state has that branch's write and not the
+/// other's, while the merge event was authorized against both. Asked at
+/// the merge event, a peer was told a state this server never held there.
+#[test]
+fn the_state_before_a_merge_event_is_the_fold_of_both_branches() {
+    let mut room = RoomLog::new();
+    room.append_local("$create", Some(StateKey::new("m.room.create", "")))
+        .unwrap();
+    let base = room.forward_extremities().iter().next().unwrap().clone();
+    room.append_local("$topic-ours", Some(StateKey::new("m.room.topic", "")))
+        .unwrap();
+    room.append_remote(
+        EventInput::new("$name-theirs", vec![base.clone()])
+            .with_state_key(StateKey::new("m.room.name", "")),
+    )
+    .unwrap();
+    room.append_local("$merge", None).unwrap();
+
+    // Nothing is evicted in a room this small, so the loader must never be
+    // asked; a snapshot rehydrated here would be one the window still held.
+    let mut load = |_: &spindle_core::StateRoot| -> Option<Vec<u8>> {
+        panic!("the state before a recent event is resident")
+    };
+    let before = room
+        .state_before(&EventId::new("$merge"), &mut load)
+        .unwrap();
+    assert_eq!(
+        before.get(&StateKey::new("m.room.topic", "")),
+        Some("$topic-ours"),
+        "our branch's write is missing from the state before the merge"
+    );
+    assert_eq!(
+        before.get(&StateKey::new("m.room.name", "")),
+        Some("$name-theirs"),
+        "their branch's write is missing from the state before the merge"
+    );
+    assert_eq!(
+        before.root(),
+        room.state_after_event(&EventId::new("$merge"))
+            .unwrap()
+            .root(),
+        "a message changes nothing, so before and after it agree"
+    );
+
+    // In the linear stretch the fold is the one parent: the state before
+    // the topic write is the base, without the topic.
+    let before = room
+        .state_before(&EventId::new("$topic-ours"), &mut load)
+        .unwrap();
+    assert_eq!(before.get(&StateKey::new("m.room.topic", "")), None);
+    assert_eq!(before.root(), room.state_after_event(&base).unwrap().root());
+
+    // And before the create event there is no state at all.
+    let before = room
+        .state_before(&EventId::new("$create"), &mut load)
+        .unwrap();
+    assert!(before.is_empty());
+
+    assert_eq!(
+        room.state_before(&EventId::new("$nowhere"), &mut load)
+            .unwrap_err(),
+        AppendError::UnknownPredecessor(EventId::new("$nowhere"))
+    );
+}
+
 /// The same slot on both branches stays case 3, preset or not.
 ///
 /// The counterpart to the test above, and the reason the fix is a rule about

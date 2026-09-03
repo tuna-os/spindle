@@ -79,7 +79,34 @@ COMPLEMENT_BASE_IMAGE_hs2=ghcr.io/element-hq/synapse/complement-synapse:latest \
 ```
 
 `scripts/complement.sh` is the wrapper CI runs: it builds the image, clones
-the pinned suite, and writes the ledger. The same stream passes through
+the pinned suite, and writes the ledger. It runs the heterogeneous pairing
+too, lowercasing the suffix itself, and the nightly `compliance-interop`
+jobs are exactly this:
+
+```bash
+# Spindle drives, Synapse answers federation as hs2.
+COMPLEMENT_INTEROP_IMAGE=ghcr.io/element-hq/synapse/complement-synapse:latest \
+  scripts/complement.sh tmp/compliance-interop.jsonl
+
+# The inverse: Synapse is hs1, Spindle is hs2.
+COMPLEMENT_INTEROP_HS=hs1 \
+COMPLEMENT_INTEROP_IMAGE=ghcr.io/element-hq/synapse/complement-synapse:latest \
+  scripts/complement.sh tmp/compliance-interop-inverse.jsonl
+
+# Read either against the homogeneous run from the same commit.
+python3 scripts/complement-interop.py \
+  --baseline tmp/complement-results.jsonl \
+  --interop tmp/compliance-interop.jsonl
+```
+
+The ratchet does not apply to an interop ledger. The summariser sorts it
+against the baseline instead — shared passes, baseline gaps, peer-side
+false positives named with a reason in `interop-known.txt`, and the
+regressions that are actually news — because a heterogeneous result set
+legitimately differs from the homogeneous one (docs/conformance-testing.md
+§5.1).
+
+The same stream passes through
 `scripts/complement-progress.py`, so a run prints one line per test as it
 lands and the log of a full suite reads as progress rather than ten minutes
 of silence:

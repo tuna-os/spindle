@@ -212,27 +212,53 @@ example Synapse 404ing its own deprecated unauthenticated `/_matrix/media/v3`
 endpoint per MSC3916, which is the peer's deprecation and not our bug. It also
 runs the pairing in **both directions**, swapping which implementation is `hs1`.
 
-**What still has to be built.** Only the assertion that matters most, which no
-generic suite makes: after a scenario, `/state_ids` on both servers returns the
-*same set*. Complement gets the servers talking; agreeing on state is Spindle's
-specific claim and needs a purpose-written test. The partition-and-heal scenario
-likewise needs driving explicitly.
+**Built (#16).** `scripts/complement.sh` takes `COMPLEMENT_INTEROP_IMAGE` and
+`COMPLEMENT_INTEROP_HS` and lowercases the suffix itself, so the gotcha above
+cannot recur through it; `scripts/complement-interop.py` diffs the run against
+the homogeneous baseline from the same commit into shared passes, baseline
+gaps, peer-side false positives (named with a reason in
+`complement/interop-known.txt`) and genuine regressions; and
+`.github/workflows/compliance.yml` runs it nightly and on demand as
+`compliance-interop` and `compliance-interop-inverse`, report-only, against
+`ghcr.io/element-hq/synapse/complement-synapse:latest` with the digest in the
+log. In the inverse direction Synapse is `hs1`, so single-server tests
+exercise Synapse alone and only the federation tests say anything about us;
+the report header names the direction.
+
+The assertion that matters most, which no generic suite makes, is that after a
+scenario `/state_ids` returns the *same set* everywhere. Complement gets the
+servers talking; agreeing on state is Spindle's specific claim, and
+`crates/spindle-server/tests/federation_fork.rs` makes it directly: after each
+fork, the client's `/state`, federation's `/state` and federation's `/state_ids`
+at the merge event must name one set of events. The first time that
+comparison ran it failed — `/state_ids` answered with the linearly previous
+entry's state, one branch of the fork, and `RoomLog::state_before` now folds
+the event's parents instead. The partition-and-heal scenario is driven
+explicitly in the same file, down to the heal event's signed `prev_events`.
 
 ### 5.2 Fork injection — testing the exception path
 
 The spec's §9 claims forks are rare and cheap to resolve. Rare is an assumption
-about production; **cheap and correct** must be tested, and can be, because
-Complement's federation package lets a test act as a homeserver and craft PDUs
-with arbitrary `prev_events`.
+about production; **cheap and correct** must be tested, and can be, because a
+test can act as a homeserver and craft PDUs with arbitrary `prev_events`.
 
-Build a harness on top of it that deliberately produces each case:
+`crates/spindle-server/tests/federation_fork.rs` is that harness: an in-process
+peer with its own signing key delivers PDUs over the real `/send` path, each
+naming a deliberately *stale* parent, so every fork is reproducible rather than
+a delivery race. It produces each case and asserts on the counters:
 
 | Case | Injection | Assert |
 |---|---|---|
 | 1 — non-state event on a stale head | Send a message PDU pointing at an old event | Appended at tail, no state res invoked, client order sane |
-| 2 — state event, disjoint key | Fork with a `(type, state_key)` untouched in the window | Single `apply()`, result matches state res |
-| 3 — genuine conflict | Two competing PL or membership changes in-window | Window-bounded resolution equals full state res v2 |
-| Window overflow | Fork deeper than `max_fork_window` | Falls back to full state res, stays *correct*, and alerts |
+| 2 — state event, disjoint key | Fork with a `(type, state_key)` untouched in the window, one slot or several, preset or not | Single `apply()`, both branches' writes survive, every state read agrees |
+| 3 — genuine conflict | Two competing power-level or membership changes in-window | Counted once per tip; the room stays writable on its linear head (#359); the head's branch is what the client reads, what `/state_ids` reports and what the room enforces |
+| Partition and heal | Each side sets state and sends on its own branch, then the peer's branch lands at once | The heal event names both tips, no state res invoked, one state and one timeline |
+| Window overflow | Fork deeper than `max_fork_window` | Falls back to full state res, stays *correct*, and alerts — not yet driven |
+
+Case 3 is *deferred*, not resolved: the resolver is not wired into ingest yet,
+and the row says what the executable behaviour is today rather than what the
+design targets. When the resolver lands, the same test must move from
+"the head's branch" to "what full state res v2 would choose".
 
 Instrument the case-1/2/3 counters (spec §17.2) and assert on them: a test that
 passes while silently taking the expensive path is a test that has stopped
@@ -273,7 +299,7 @@ so it runs on every commit, and a counterexample is a release blocker.
 | Per commit | Unit tests, §5.3 property tests, schema validation (§4.3), fuzz corpus | Blocking |
 | Per PR | Complement with `spindle_blacklist`, blacklist-size ratchet | Blocking |
 | Per PR | §5.2 fork injection | Blocking |
-| Nightly | sytest, full fuzzing, §5.1 interop run against pinned Synapse (report-only board, both directions) | Non-blocking, tracked |
+| Nightly | sytest, full fuzzing, §5.1 interop run against Synapse's Complement image (`compliance-interop`, report-only, both directions) | Non-blocking, tracked |
 | Nightly | complement-crypto | Blocking from M2 |
 | Weekly | Interop rig against Synapse `develop`; Element Web Playwright suite | Non-blocking, alerts |
 | Release | Full matrix + manual client pass + federation tester against a live deploy | Blocking |
