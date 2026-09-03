@@ -24,6 +24,13 @@
 //! a hand-built log. This is the first place a fork reaches it through the
 //! federation surface, with real signatures, real authorization and the real
 //! ingest path in between.
+//!
+//! The later tests also read the result back the way a peer would: the
+//! same peer signs `GET`s for federation's `/state`, `/state_ids` and
+//! `/event`, and what those say must match what a client of this server
+//! sees. That is the `/state_ids` agreement #16 asks for, and the first
+//! time it was checked it failed -- the read answered with the linearly
+//! previous entry's state, which after a fork is one branch's.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -156,6 +163,28 @@ impl Peer {
             self.name
         )
     }
+
+    /// Sign a GET the way `transaction_header` signs a PUT.
+    ///
+    /// A peer reading this server's federation state is authenticated too,
+    /// and the reads below are the point of the interop tests: what a real
+    /// Synapse would be told after a fork, not what a local client sees.
+    fn get_header(&self, uri: &str) -> String {
+        let mut object = json!({
+            "method": "GET",
+            "uri": uri,
+            "origin": self.name,
+            "destination": "example.org",
+        });
+        sign_value(&self.name, &self.pair, &mut object);
+        let signature = object["signatures"][&self.name]["ed25519:0"]
+            .as_str()
+            .unwrap();
+        format!(
+            "X-Matrix origin=\"{}\",destination=\"example.org\",key=\"ed25519:0\",sig=\"{signature}\"",
+            self.name
+        )
+    }
 }
 
 fn sign_value(entity: &str, pair: &Ed25519KeyPair, value: &mut Value) {
@@ -186,6 +215,19 @@ fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
         .unwrap()
+}
+
+/// The `event_id` a client-API send answered with.
+fn event_id_in(body: &Value) -> String {
+    body["event_id"].as_str().unwrap_or_default().to_owned()
+}
+
+/// The ID of the one PDU a `/send` transaction carried.
+fn injected_id(body: &Value) -> String {
+    body["pdus"]
+        .as_object()
+        .and_then(|map| map.keys().next().cloned())
+        .expect("the transaction response names the PDU")
 }
 
 struct Harness {
@@ -277,6 +319,29 @@ impl Harness {
         body["access_token"].as_str().unwrap().to_owned()
     }
 
+    /// Register a local user, invite them, and have them join.
+    async fn admit(&self, room: &str, inviter: &str, username: &str) {
+        let token = self.register(username).await;
+        let (status, body) = self
+            .send(
+                "POST",
+                &format!("/_matrix/client/v3/rooms/{room}/invite"),
+                inviter,
+                &json!({ "user_id": format!("@{username}:example.org") }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = self
+            .send(
+                "POST",
+                &format!("/_matrix/client/v3/rooms/{room}/join"),
+                &token,
+                &json!({}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
     async fn head_event(&self, room: &str, token: &str) -> String {
         let (_, body) = self
             .get(
@@ -295,25 +360,113 @@ impl Harness {
         event_type: &str,
         content: &Value,
     ) -> StatusCode {
-        self.send(
-            "PUT",
-            &format!("/_matrix/client/v3/rooms/{room}/state/{event_type}"),
-            token,
-            content,
-        )
-        .await
-        .0
+        self.put_state(room, token, event_type, content).await.0
+    }
+
+    /// Set one state event locally, and return its event ID with the status.
+    async fn put_state(
+        &self,
+        room: &str,
+        token: &str,
+        event_type: &str,
+        content: &Value,
+    ) -> (StatusCode, String) {
+        let (status, body) = self
+            .send(
+                "PUT",
+                &format!("/_matrix/client/v3/rooms/{room}/state/{event_type}"),
+                token,
+                content,
+            )
+            .await;
+        (status, event_id_in(&body))
     }
 
     async fn say(&self, room: &str, token: &str, text: &str) -> StatusCode {
-        self.send(
-            "PUT",
-            &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/{text}"),
-            token,
-            &json!({ "msgtype": "m.text", "body": text }),
-        )
-        .await
-        .0
+        self.send_message(room, token, text).await.0
+    }
+
+    /// Send a message locally, and return its event ID with the status.
+    async fn send_message(&self, room: &str, token: &str, text: &str) -> (StatusCode, String) {
+        let (status, body) = self
+            .send(
+                "PUT",
+                &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/{text}"),
+                token,
+                &json!({ "msgtype": "m.text", "body": text }),
+            )
+            .await;
+        (status, event_id_in(&body))
+    }
+
+    /// A signed federation read by the peer, which must succeed.
+    async fn peer_get(&self, peer: &Peer, uri: &str) -> Value {
+        let (status, body) = self
+            .call(
+                Request::builder()
+                    .uri(uri)
+                    .header("authorization", peer.get_header(uri))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        body
+    }
+
+    /// The state federation's `/state_ids` reports before `event_id`, as
+    /// the peer would be told it.
+    ///
+    /// This is the assertion #16 asks for and no generic suite makes: after
+    /// a scenario, `/state_ids` and the client's view of the room name the
+    /// same set of events. For a message the state before it is the state
+    /// after it, so asking at the merge event reads the merged state.
+    async fn federation_state_ids(
+        &self,
+        peer: &Peer,
+        room: &str,
+        event_id: &str,
+    ) -> std::collections::BTreeSet<String> {
+        let uri = format!("/_matrix/federation/v1/state_ids/{room}?event_id={event_id}");
+        let body = self.peer_get(peer, &uri).await;
+        body["pdu_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// The slots federation's `/state` reports before `event_id`, keyed the
+    /// way `state_ids` keys the client's view.
+    async fn federation_state_keys(
+        &self,
+        peer: &Peer,
+        room: &str,
+        event_id: &str,
+    ) -> std::collections::BTreeSet<String> {
+        let uri = format!("/_matrix/federation/v1/state/{room}?event_id={event_id}");
+        let body = self.peer_get(peer, &uri).await;
+        body["pdus"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| {
+                format!(
+                    "{}/{}",
+                    event["type"].as_str().unwrap_or_default(),
+                    event["state_key"].as_str().unwrap_or_default()
+                )
+            })
+            .collect()
+    }
+
+    /// One event as federation serves it, with its signed `prev_events`.
+    async fn federation_event(&self, peer: &Peer, event_id: &str) -> Value {
+        let body = self
+            .peer_get(peer, &format!("/_matrix/federation/v1/event/{event_id}"))
+            .await;
+        body["pdus"][0].clone()
     }
 
     /// The room's current state as `(type, state_key) -> event_id`.
@@ -788,4 +941,435 @@ async fn a_disjoint_fork_on_preexisting_slots_merges_and_leaves_the_room_writabl
         StatusCode::OK,
         "a state write after the merge was refused"
     );
+}
+
+/// Both branches move the power levels: SPEC §9.2 case 3 on the slot whose
+/// loss is worst.
+///
+/// The topic test above proves the same-slot fork is counted once and does
+/// not wedge the room. Power levels are the slot every later authorization
+/// reads, so this is the fork where "set aside" has to mean something more
+/// precise than "still writable": which branch the room holds afterwards
+/// decides who may write to it at all. #359's rule is that the linear head
+/// stays -- the entry this server's order puts last, whose state
+/// authorization already reads -- and the tip that contests it is set
+/// aside. The peer's PDU is appended after our write, so the peer's power
+/// levels are what the room now enforces, and both the client's view and
+/// federation's must say so, or the two servers' disagreement (#16) would
+/// be joined by a disagreement inside this one.
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn a_fork_on_the_power_levels_is_set_aside_and_the_head_decides_who_may_write() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, fork_point) = harness.shared_room(&peer).await;
+
+    let levels = |charlie: u64| {
+        json!({
+            "users": {
+                "@alice:example.org": 100,
+                peer.user(): 100,
+                "@charlie:example.org": charlie,
+            },
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+        })
+    };
+    // Our branch promotes charlie.
+    let (status, ours) = harness
+        .put_state(&room, &alice, "m.room.power_levels", &levels(50))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    // Theirs, from the same fork point, leaves charlie at zero.
+    let pdu = Harness::stale_state(
+        &peer,
+        &room,
+        &fork_point,
+        "m.room.power_levels",
+        "",
+        &levels(0),
+    );
+    let theirs = injected_id(&harness.inject(&peer, "fork_pl", pdu).await);
+
+    let before = Cases::read(&harness.metrics);
+    let (merged, merge) = harness.send_message(&room, &alice, "after").await;
+    let delta = Cases::read(&harness.metrics).since(before);
+
+    assert_eq!(
+        merged,
+        StatusCode::OK,
+        "a contested power-levels fork wedged the room"
+    );
+    assert_eq!(
+        delta.contested, 1,
+        "the expensive path was taken without being counted: {delta:?}"
+    );
+
+    // The head's branch is the one the room holds: theirs, because it was
+    // appended last. Ours is set aside, not lost -- it stays a forward
+    // extremity for the resolver -- but it is not what the room reads.
+    let state = harness.state_ids(&room, &alice).await;
+    assert_eq!(
+        state.get("m.room.power_levels/"),
+        Some(&theirs),
+        "the room does not hold the linear head's power levels (ours: {ours})"
+    );
+    let (_, held) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.power_levels"),
+            &alice,
+        )
+        .await;
+    assert_eq!(held["users"]["@charlie:example.org"], json!(0), "{held}");
+
+    // Federation tells the peer the same thing the client is told.
+    let federation = harness.federation_state_ids(&peer, &room, &merge).await;
+    assert_eq!(
+        federation,
+        state.values().cloned().collect(),
+        "/state_ids disagrees with the client's view of the room"
+    );
+
+    // The room stays writable under the levels it holds, and the fork that
+    // is still open is not counted again.
+    let before = Cases::read(&harness.metrics);
+    for attempt in 0..3 {
+        assert_eq!(
+            harness.say(&room, &alice, &format!("retry{attempt}")).await,
+            StatusCode::OK,
+            "the room wedged on retry {attempt}"
+        );
+    }
+    assert_eq!(
+        harness
+            .set_state(&room, &alice, "m.room.power_levels", &levels(25))
+            .await,
+        StatusCode::OK,
+        "a power-levels write after the fork was refused"
+    );
+    let delta = Cases::read(&harness.metrics).since(before);
+    assert_eq!(
+        delta.contested, 0,
+        "one open fork was counted again on later sends: {delta:?}"
+    );
+}
+
+/// Both branches move one user's membership: SPEC §9.2 case 3 on the slot
+/// #16's scope names alongside power levels.
+///
+/// We kick charlie; the peer, from the same fork point, bans them. The
+/// same rule as the power-levels test decides the outcome -- the peer's
+/// ban is the linear head -- and the assertion that matters is that the
+/// room *enforces* the membership it holds: a banned user cannot be
+/// re-invited, so the invite that a kick would have allowed is refused.
+/// A room that read one membership and enforced another would be the
+/// inconsistency the set-aside rule exists to avoid.
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn a_fork_on_one_membership_is_set_aside_and_the_head_is_what_is_enforced() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, _) = harness.shared_room(&peer).await;
+
+    // Charlie is a member before the branches diverge, so both a kick and
+    // a ban move the slot away from the value both branches inherited.
+    harness.admit(&room, &alice, "charlie").await;
+    let fork_point = harness.head_event(&room, &alice).await;
+
+    // Ours: a kick.
+    let (status, body) = harness
+        .send(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room}/kick"),
+            &alice,
+            &json!({ "user_id": "@charlie:example.org" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Theirs, from the fork point: a ban.
+    let pdu = Harness::stale_state(
+        &peer,
+        &room,
+        &fork_point,
+        "m.room.member",
+        "@charlie:example.org",
+        &json!({ "membership": "ban" }),
+    );
+    let theirs = injected_id(&harness.inject(&peer, "fork_member", pdu).await);
+
+    let before = Cases::read(&harness.metrics);
+    let (merged, merge) = harness.send_message(&room, &alice, "after").await;
+    let delta = Cases::read(&harness.metrics).since(before);
+
+    assert_eq!(
+        merged,
+        StatusCode::OK,
+        "a contested membership fork wedged the room"
+    );
+    assert_eq!(
+        delta.contested, 1,
+        "the expensive path was taken without being counted: {delta:?}"
+    );
+
+    let state = harness.state_ids(&room, &alice).await;
+    assert_eq!(
+        state.get("m.room.member/@charlie:example.org"),
+        Some(&theirs),
+        "the room does not hold the linear head's membership"
+    );
+    let (_, held) = harness
+        .get(
+            &format!(
+                "/_matrix/client/v3/rooms/{room}/state/m.room.member/%40charlie%3Aexample.org"
+            ),
+            &alice,
+        )
+        .await;
+    assert_eq!(held["membership"], json!("ban"), "{held}");
+
+    // Enforced, not merely read: the invite a kick would permit is refused
+    // under the ban the room now holds.
+    let (status, body) = harness
+        .send(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room}/invite"),
+            &alice,
+            &json!({ "user_id": "@charlie:example.org" }),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the room reads a ban but does not enforce it: {body}"
+    );
+
+    let federation = harness.federation_state_ids(&peer, &room, &merge).await;
+    assert_eq!(
+        federation,
+        state.values().cloned().collect(),
+        "/state_ids disagrees with the client's view of the room"
+    );
+
+    let before = Cases::read(&harness.metrics);
+    for attempt in 0..3 {
+        assert_eq!(
+            harness.say(&room, &alice, &format!("retry{attempt}")).await,
+            StatusCode::OK,
+            "the room wedged on retry {attempt}"
+        );
+    }
+    let delta = Cases::read(&harness.metrics).since(before);
+    assert_eq!(
+        delta.contested, 0,
+        "one open fork was counted again on later sends: {delta:?}"
+    );
+}
+
+/// Each branch moves two slots the other left alone: SPEC §9.2 case 2,
+/// wider than one write, and read back through every surface.
+///
+/// The single-slot disjoint tests above prove the merge is free. This one
+/// is about agreement: after the merge, the client's `/state`, federation's
+/// `/state` and federation's `/state_ids` must describe the same set of
+/// events. `/state_ids` is the read #16 names -- it is what a peer compares
+/// against its own view -- and the three are separate code paths, so a
+/// merge that materialized one thing and served another would pass every
+/// counter assertion in this file and still be wrong on the wire.
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn a_disjoint_fork_over_several_slots_merges_and_every_state_read_agrees() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, fork_point) = harness.shared_room(&peer).await;
+
+    // Ours: two slots, one after the other.
+    let (status, our_topic) = harness
+        .put_state(&room, &alice, "m.room.topic", &json!({ "topic": "ours" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, our_visibility) = harness
+        .put_state(
+            &room,
+            &alice,
+            "m.room.history_visibility",
+            &json!({ "history_visibility": "joined" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Theirs: two other slots, the second building on the first, so the
+    // peer's branch is two events deep like ours.
+    let pdu = Harness::stale_state(
+        &peer,
+        &room,
+        &fork_point,
+        "m.room.name",
+        "",
+        &json!({ "name": "theirs" }),
+    );
+    let their_name = injected_id(&harness.inject(&peer, "multi_name", pdu).await);
+    let pdu = Harness::stale_state(
+        &peer,
+        &room,
+        &their_name,
+        "m.room.join_rules",
+        "",
+        &json!({ "join_rule": "public" }),
+    );
+    let their_rules = injected_id(&harness.inject(&peer, "multi_rules", pdu).await);
+
+    let before = Cases::read(&harness.metrics);
+    let (merged, merge) = harness.send_message(&room, &alice, "after").await;
+    let delta = Cases::read(&harness.metrics).since(before);
+
+    assert_eq!(merged, StatusCode::OK, "the disjoint fork was refused");
+    assert_eq!(
+        delta.contested, 0,
+        "a disjoint fork took the state-resolution path: {delta:?}"
+    );
+
+    // All four writes survived, each as the event that made it.
+    let state = harness.state_ids(&room, &alice).await;
+    for (slot, expected) in [
+        ("m.room.topic/", &our_topic),
+        ("m.room.history_visibility/", &our_visibility),
+        ("m.room.name/", &their_name),
+        ("m.room.join_rules/", &their_rules),
+    ] {
+        assert_eq!(state.get(slot), Some(expected), "{slot} after the merge");
+    }
+
+    // The three state reads agree.
+    let ids = harness.federation_state_ids(&peer, &room, &merge).await;
+    assert_eq!(
+        ids,
+        state.values().cloned().collect(),
+        "/state_ids disagrees with the client's view of the room"
+    );
+    let keys = harness.federation_state_keys(&peer, &room, &merge).await;
+    assert_eq!(
+        keys,
+        state.keys().cloned().collect(),
+        "federation's /state disagrees with the client's view of the room"
+    );
+}
+
+/// A partition that heals: both servers keep going, then meet again.
+///
+/// The scenario #16 names by name. During the partition each side sets
+/// state and sends a message on its own branch; the peer's branch arrives
+/// in one go when the partition heals, and the next local send is the
+/// event that names both branches. What is asserted is that it really
+/// does -- its signed `prev_events` are the two branches' tips, read back
+/// through federation rather than inferred from a counter -- and that the
+/// state it leaves is one both the client and the peer's `/state_ids` read
+/// identically, with nothing from either side of the partition lost.
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn a_partition_heals_into_one_state_the_client_and_the_peer_read_alike() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, partition_point) = harness.shared_room(&peer).await;
+
+    // Our side of the partition: a state change and a message.
+    let (status, our_topic) = harness
+        .put_state(&room, &alice, "m.room.topic", &json!({ "topic": "ours" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, our_message) = harness.send_message(&room, &alice, "ours").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Theirs, delivered when the partition heals: a state change and a
+    // message on top of it, both unaware of ours.
+    let pdu = Harness::stale_state(
+        &peer,
+        &room,
+        &partition_point,
+        "m.room.name",
+        "",
+        &json!({ "name": "theirs" }),
+    );
+    let their_name = injected_id(&harness.inject(&peer, "heal_name", pdu).await);
+    let pdu = Harness::stale_message(&peer, &room, &their_name, "theirs");
+    let their_message = injected_id(&harness.inject(&peer, "heal_message", pdu).await);
+
+    // The heal: the next local event names both branches.
+    let before = Cases::read(&harness.metrics);
+    let (merged, heal) = harness.send_message(&room, &alice, "after").await;
+    let delta = Cases::read(&harness.metrics).since(before);
+
+    assert_eq!(merged, StatusCode::OK, "the healed partition was refused");
+    assert_eq!(
+        delta.contested, 0,
+        "healing a disjoint partition took the state-resolution path: {delta:?}"
+    );
+    let signed = harness.federation_event(&peer, &heal).await;
+    let parents: std::collections::BTreeSet<String> = signed["prev_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        parents,
+        [our_message.clone(), their_message.clone()].into(),
+        "the heal event does not name both branches"
+    );
+
+    // One state, with both sides' writes, read alike by the client and by
+    // the peer.
+    let state = harness.state_ids(&room, &alice).await;
+    assert_eq!(state.get("m.room.topic/"), Some(&our_topic), "our topic");
+    assert_eq!(state.get("m.room.name/"), Some(&their_name), "their name");
+    let federation = harness.federation_state_ids(&peer, &room, &heal).await;
+    assert_eq!(
+        federation,
+        state.values().cloned().collect(),
+        "/state_ids disagrees with the client's view of the room"
+    );
+
+    // And one timeline, with both sides' messages.
+    let (_, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=50"),
+            &alice,
+        )
+        .await;
+    let bodies: Vec<&str> = body["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["content"]["body"].as_str())
+        .collect();
+    for expected in ["ours", "theirs", "after"] {
+        assert!(
+            bodies.contains(&expected),
+            "{expected} is missing: {bodies:?}"
+        );
+    }
 }

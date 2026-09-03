@@ -287,3 +287,99 @@ jobs:
           name: complement-results
           path: tmp/complement-results.jsonl
           if-no-files-found: ignore
+
+  # Heterogeneous federation against a real Synapse (docs/conformance-testing.md
+  # §5.1, #16): the suite above, unchanged, with Element's Complement image
+  # of Synapse on the other end of the wire. Report-only, as tuwunel runs
+  # it, because a heterogeneous result set legitimately differs from the
+  # homogeneous one: rather than a gate, the job diffs its ledger against
+  # the baseline complement-suite just produced from the same commit and
+  # sorts what differs into shared gaps, peer-side false positives and
+  # genuine interop regressions (scripts/complement-interop.py), with the
+  # report on the run's summary page. Both directions run, since which side
+  # drives a federation test changes what it exercises -- and in the
+  # inverse, single-server tests exercise Synapse alone, which the report
+  # header says. Nightly and on demand only: an hour of Docker against a
+  # moving image is not a per-PR cost, and `latest` is deliberate -- the
+  # digest the run federated with is in its log, and a Synapse change that
+  # breaks interop should show up here first, not in someone's deployment.
+  compliance-interop:
+    name: ${{ matrix.name }}
+    # Not `needs` alone: the suite job fails on a ratchet regression, and
+    # its ledger is uploaded either way, so a red baseline is still a
+    # baseline. Only a cancelled run has nothing to compare against.
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+    needs: complement-suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: compliance-interop
+            peer: hs2
+          - name: compliance-interop-inverse
+            peer: hs1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 'stable'
+          cache: false
+
+      - name: Cache the Complement checkout and Go build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            tmp/complement-src
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: complement-${{ runner.os }}-${{ hashFiles('scripts/complement.sh') }}
+          restore-keys: complement-${{ runner.os }}-
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # Import only, from the layer cache the suite job exported.
+      - name: Build the Complement image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: complement/Dockerfile
+          tags: complement-spindle:latest
+          load: true
+          cache-from: type=gha,scope=complement-image
+
+      - name: Fetch the homogeneous baseline
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: complement-results
+          path: tmp/baseline
+
+      - name: Run Complement with Synapse as ${{ matrix.peer }}
+        env:
+          GOPROXY: https://proxy.golang.org|direct
+          COMPLEMENT_IMAGE: complement-spindle:latest
+          COMPLEMENT_INTEROP_IMAGE: ghcr.io/element-hq/synapse/complement-synapse:latest
+          COMPLEMENT_INTEROP_HS: ${{ matrix.peer }}
+        run: scripts/complement.sh tmp/${{ matrix.name }}.jsonl
+
+      - name: Read the run against the baseline
+        run: |
+          python3 scripts/complement-interop.py \
+            --baseline tmp/baseline/complement-results.jsonl \
+            --interop tmp/${{ matrix.name }}.jsonl \
+            --peer "synapse as ${{ matrix.peer }}" \
+            --report tmp/${{ matrix.name }}.md
+          cat tmp/${{ matrix.name }}.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the ledger and the report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            tmp/${{ matrix.name }}.jsonl
+            tmp/${{ matrix.name }}.md
+          if-no-files-found: ignore

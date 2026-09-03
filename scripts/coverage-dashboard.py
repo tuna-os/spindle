@@ -71,8 +71,15 @@ MILESTONES = [
      "Remote joins work in both roles: the server walks "
      "make_join/send_join as the joining side and seeds the room from the "
      "response — proven by a two-instance Spindle-to-Spindle test with "
-     "messages flowing both ways. Next: #16's fork-proof rig — where the no-state-resolution claim meets "
-     "adversarial evidence."),
+     "messages flowing both ways. #16's fork rig exists: "
+     "`federation_fork.rs` injects stale, disjoint, contested (power levels, "
+     "membership) and partition-and-heal forks over real federation and "
+     "asserts the case counters and that the client's `/state`, federation's "
+     "`/state` and `/state_ids` agree — which caught `/state_ids` answering "
+     "with one branch's state after a merge. Complement runs "
+     "heterogeneously against Synapse nightly, in both directions, as the "
+     "report-only `compliance-interop` board. Still open on #16: the "
+     "resolver for case 3, and fork metrics from a real deployment."),
     ("M4", "Ecosystem integration", "In progress",
      "Both halves are built and under test, which is why this no longer reads "
      "*not started*. #18: appservice registration, authentication and "
@@ -591,8 +598,9 @@ def build_markdown() -> str:
         "  comparison covers all three siblings — Tuwunel builds from source",
         "  in the bench environment (the recipe is in docs/benchmarks.md).",
         "- What the CS-API numbers do **not** establish — the fork/state-",
-        "  resolution claim — is documented in docs/benchmarks.md; it needs",
-        "  #16's federated rig.",
+        "  resolution claim — is documented in docs/benchmarks.md; it is",
+        "  what #16's federated rig (`federation_fork.rs`, and the nightly",
+        "  Synapse interop board) exercises.",
         "",
     ]
     return "\n".join(lines)

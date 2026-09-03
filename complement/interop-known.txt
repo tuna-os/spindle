@@ -1,0 +1,15 @@
+# Complement tests that fail with a real Synapse on the other end of the
+# wire for a reason that is the peer's and not ours.
+#
+# scripts/complement-interop.py sorts a heterogeneous run against the
+# homogeneous baseline. A test that passes between two Spindles and fails
+# with the peer is a regression *unless it is named here*, with the reason
+# -- the kind of thing docs/conformance-testing.md §5.1 describes: Synapse
+# 404ing an endpoint it deprecated under MSC3916 is Synapse's deprecation,
+# not a Spindle bug, and a run that keeps reporting it teaches everyone to
+# stop reading the report.
+#
+# One test per line: the name, whitespace, the reason. A name covers every
+# subtest under it. Add a line only after reading the failure in the nightly
+# report and finding the cause on the peer's side; an entry is a claim that
+# nobody needs to look at that test again, and it has to be true.
