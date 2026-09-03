@@ -318,7 +318,7 @@ async fn a_message_reaches_the_other_members_gateway_as_the_specs_body() {
         .await;
     assert_eq!(status, 200, "{body}");
 
-    let event_id = hs.say(&alice, &room, "hello bob").await;
+    let event_id = hs.say(&alice, &room, "hello there").await;
     let deliveries = gateway.wait_for(2).await;
     let notification = &deliveries[1]["notification"];
     assert_eq!(notification["event_id"], event_id);
@@ -330,7 +330,7 @@ async fn a_message_reaches_the_other_members_gateway_as_the_specs_body() {
             .unwrap()
             .starts_with("@alice:")
     );
-    assert_eq!(notification["content"]["body"], "hello bob");
+    assert_eq!(notification["content"]["body"], "hello there");
     assert_eq!(notification["room_name"], "The room");
     // Two members: `.m.rule.room_one_to_one` claims it, with a sound, and
     // a sound is what makes a notification worth waking the device for.
@@ -346,7 +346,7 @@ async fn a_message_reaches_the_other_members_gateway_as_the_specs_body() {
     assert_eq!(devices[0]["tweaks"], json!({ "sound": "default" }));
 
     // Bob's own message goes to alice's device and never to bob's.
-    hs.say(&bob, &room, "hello alice").await;
+    hs.say(&bob, &room, "hi again").await;
     let deliveries = gateway.wait_for(3).await;
     let devices = deliveries[2]["notification"]["devices"].as_array().unwrap();
     assert_eq!(devices.len(), 1);
