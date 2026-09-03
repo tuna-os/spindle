@@ -19,8 +19,10 @@ Two different things are bounded here, and they fail differently:
 
 ## Rates
 
-There are four. Three sit on the unauthenticated edge; the fourth is the
-one thing an account can do that makes every phone in a room sound.
+There are six. Three sit on the unauthenticated edge. The other three are
+MatrixRTC's, and they are the only authenticated rates this server
+enforces: the one thing an account can do that makes every phone in a
+room sound (#39), and the two credential mints a call needs (#38).
 
 | Endpoint | Key | Limit | Counted when |
 |---|---|---|---|
@@ -28,6 +30,15 @@ one thing an account can do that makes every phone in a room sound.
 | `POST /login` (password) | source address | 30 per 60 s | a failed attempt |
 | `POST /register` | source address | 5 per 300 s | a request that carries `auth`, i.e. after the mandatory first 401 |
 | `PUT /send/m.rtc.notification` (and the MSC4075 unstable name) | account | `[ratelimit] rings_per_minute`, 10 | every attempt, delayed or not, whether or not the room then refuses it |
+| `POST /user/{userId}/openid/request_token` | user | 20 per 60 s | every request, before the token is minted |
+| `POST /_spindle/rtc/livekit/sfu/get` (built-in LiveKit service) | user | 20 per 60 s | every request that carried a live OpenID token, before the membership check |
+
+The two mints are limited because they are not reads: an OpenID token is a
+durable row written on the caller's say-so, and both tokens exist to make
+a third party — a JWT service, an SFU — do work. Minting is an HMAC here
+and a room on the SFU there, which is the asymmetry #38 names. A client
+mints one of each per call it joins, so twenty a minute is a busy user
+several times over and a loop within seconds.
 
 Both login keys are checked before the password is, so a caller over the
 limit does not get an Argon2 verification out of each attempt. Both are

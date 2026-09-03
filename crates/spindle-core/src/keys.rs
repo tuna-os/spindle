@@ -349,6 +349,17 @@ pub enum Keyspace {
     /// it may enter when nobody has said it may — so the two never share a
     /// key, and `stripped_state` reads whichever one stands.
     PendingKnock = 0x32,
+    /// `(expires_at_ms, token_hash)` -> the user an `OpenID` token vouches for.
+    ///
+    /// An `OpenID` token (`/openid/request_token`) is a short-lived bearer
+    /// credential a client hands to a third party -- a `LiveKit` JWT
+    /// service, an integration manager -- which redeems it against this
+    /// server's `/openid/userinfo` to learn who the client is. Keyed by
+    /// expiry first, as [`Self::DelayedEvent`] is by deadline, so that
+    /// "everything expired" is a bounded range read from the front rather
+    /// than a scan of every token ever minted; the token carries its own
+    /// expiry so a lookup can still address one row directly.
+    OpenIdToken = 0x33,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -372,6 +383,40 @@ pub fn profile(user_id: &str) -> Vec<u8> {
 #[must_use]
 pub fn push_cursor() -> Vec<u8> {
     vec![KEY_SCHEMA_VERSION, Keyspace::PushCursor as u8]
+}
+
+/// One `OpenID` token's row: its expiry, then the digest of the token.
+///
+/// The expiry leads for the same reason a delayed event's deadline does:
+/// the question asked on every mint is "which tokens have expired", and
+/// with the deadline in front that is a range read from the start of the
+/// keyspace to now, stopping at the first live row. The digest rather than
+/// the token, so a copy of the store is not a copy of every live
+/// credential.
+#[must_use]
+pub fn openid_token(expires_at_ms: u64, digest: &[u8; 32]) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::OpenIdToken as u8];
+    key.extend_from_slice(&expires_at_ms.to_be_bytes());
+    key.extend_from_slice(digest);
+    key
+}
+
+/// The prefix every `OpenID`-token row shares.
+#[must_use]
+pub fn openid_token_prefix() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::OpenIdToken as u8]
+}
+
+/// The exclusive upper bound of "every `OpenID` token expired at `now_ms`".
+///
+/// A row expiring exactly at `now_ms` is expired -- a token is live
+/// strictly before its expiry -- so the bound is one millisecond past it,
+/// saturating as [`delayed_event_due_end`] does.
+#[must_use]
+pub fn openid_token_expired_end(now_ms: u64) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::OpenIdToken as u8];
+    key.extend_from_slice(&now_ms.saturating_add(1).to_be_bytes());
+    key
 }
 
 /// The transaction-push cursor for one appservice.

@@ -200,3 +200,20 @@ pub const FAILED_LOGIN_PER_SOURCE: Limit = Limit::new(30, Duration::from_secs(60
 /// durable write, and a bulk-registration flood is both a spam problem and a
 /// cheap way to make the server do work.
 pub const REGISTER_PER_SOURCE: Limit = Limit::new(5, Duration::from_secs(300));
+
+/// `OpenID` token mints, per user.
+///
+/// The first authenticated rate, and it is here because a mint is not a
+/// read: each is a durable row on the caller's say-so, and each exists to
+/// make a third party -- a JWT service, an SFU -- do work. A client mints
+/// one per call it joins, so twenty a minute is a busy user several times
+/// over and a loop within a few seconds.
+pub const OPENID_TOKEN_PER_USER: Limit = Limit::new(20, Duration::from_secs(60));
+
+/// `LiveKit` token mints, per user, on the built-in JWT service.
+///
+/// Minting is an HMAC here and a room on the SFU there, which is the
+/// asymmetry #38 names: cheap for this server, not for the one the token
+/// is for. One token joins one call; a client needs a fresh one only when
+/// it rejoins or its token's window closes.
+pub const LIVEKIT_TOKEN_PER_USER: Limit = Limit::new(20, Duration::from_secs(60));

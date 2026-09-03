@@ -683,8 +683,9 @@ fn random_hex(bytes: usize) -> String {
     })
 }
 
-/// RFC 7636's base64url without padding, for PKCE challenges.
-fn base64url_unpadded(bytes: &[u8]) -> String {
+/// RFC 7636's base64url without padding, for PKCE challenges -- and RFC
+/// 7515's, which is the same alphabet, for the JWTs `livekit` mints.
+pub(crate) fn base64url_unpadded(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {

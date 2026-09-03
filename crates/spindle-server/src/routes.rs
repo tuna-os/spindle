@@ -61,6 +61,9 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/v1/rooms/{room_id}/threads",
     "/_matrix/client/v1/rooms/{room_id}/timestamp_to_event",
     "/_matrix/client/v3/voip/turnServer",
+    "/_matrix/client/v3/user/{user_id}/openid/request_token",
+    "/_matrix/federation/v1/openid/userinfo",
+    "/_spindle/rtc/livekit/sfu/get",
     "/_matrix/client/unstable/org.matrix.msc4140/delayed_events",
     "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}",
     "/_matrix/client/v3/rooms/{room_id}/state",
@@ -96,6 +99,8 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::mas::routes())
         .merge(crate::admin::routes())
         .merge(crate::oidc::routes())
+        .merge(crate::openid::routes())
+        .merge(crate::livekit::routes())
         // SPEC: an endpoint the server does not recognize answers 404
         // M_UNRECOGNIZED — a JSON verdict, not a bare status. Clients (and
         // Complement's TestUnknownEndpoints) read the errcode to tell "this
@@ -6638,18 +6643,20 @@ async fn voip_turn_server(
 /// which surface the client happened to believe.
 ///
 /// The order is the operator's, carried through untouched: MSC4143 has
-/// clients read the list as a priority ordering.
+/// clients read the list as a priority ordering. The one addition is the
+/// built-in `LiveKit` service (#38), listed first when `[rtc.livekit]` is
+/// set: it is this server's own, and a deployment that configured it did
+/// so to use it.
 fn rtc_transports(config: &crate::Config) -> Vec<Value> {
-    config
-        .rtc
-        .foci
-        .iter()
-        .map(|focus| {
+    crate::livekit::service_url(config)
+        .map(|url| json!({ "type": "livekit", "livekit_service_url": url }))
+        .into_iter()
+        .chain(config.rtc.foci.iter().map(|focus| {
             json!({
                 "type": focus.kind,
                 "livekit_service_url": focus.livekit_service_url,
             })
-        })
+        }))
         .collect()
 }
 

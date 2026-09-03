@@ -267,6 +267,50 @@ pub struct RtcConfig {
     /// does not.
     #[serde(default)]
     pub foci: Vec<RtcFocus>,
+    /// The built-in `LiveKit` JWT service (#38). Off unless set.
+    ///
+    /// When set, this server mints `LiveKit` access tokens for its own users
+    /// itself, and advertises itself as a `livekit` transport ahead of
+    /// [`Self::foci`] -- ahead because a deployment that configured its
+    /// own minter did so to use it, and the operator's list stays the
+    /// operator's order after it.
+    pub livekit: Option<LivekitConfig>,
+}
+
+/// The built-in `LiveKit` JWT service: what it needs to mint a token the
+/// SFU will honour.
+///
+/// The same three values `lk-jwt-service` takes as `LIVEKIT_URL`,
+/// `LIVEKIT_KEY` and `LIVEKIT_SECRET`, because it is the same job. The
+/// secret is `LiveKit`'s, shared with the SFU and with nothing else here:
+/// it is deliberately not derived from the server's signing key, so the two
+/// can rotate apart and a leak of one is not a leak of the other.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LivekitConfig {
+    /// The SFU's own address, `wss://livekit.example.org`, as handed to
+    /// clients in the token response. The one place the SFU's URL goes:
+    /// `livekit_service_url` in the transport list is *this server*.
+    pub url: String,
+    /// `LiveKit`'s API key, the `iss` of every token minted.
+    pub key: String,
+    /// `LiveKit`'s API secret, the HMAC key every token is signed with.
+    pub secret: String,
+    /// How long a minted token admits its holder, in seconds.
+    ///
+    /// A token cannot be revoked once minted -- it is stateless, and the
+    /// SFU never asks this server again -- so this window is the whole of
+    /// what bounds a user who leaves the room after minting one. Fifteen
+    /// minutes by default: long enough to join and to ride out a reconnect,
+    /// short enough that a leaked or outlived token is not an afternoon's
+    /// access. `lk-jwt-service` issues an hour; set that here if a client
+    /// needs it, knowing what the hour buys.
+    #[serde(default = "default_livekit_ttl")]
+    pub token_ttl_seconds: u64,
+}
+
+fn default_livekit_ttl() -> u64 {
+    900
 }
 
 /// One transport description, as MSC4143 renders it to clients.
@@ -742,6 +786,37 @@ impl Config {
                 return Err(ConfigError::Invalid {
                     field: "rtc.foci",
                     message: format!("{url:?} is not an http(s) URL"),
+                });
+            }
+        }
+        if let Some(livekit) = &self.rtc.livekit {
+            // The SFU is reached over a websocket, and a client handed an
+            // https URL here would try to open one against it and fail
+            // during a call, on its own machine -- the same silent failure
+            // path a wrong focus has.
+            if !livekit.url.starts_with("wss://") && !livekit.url.starts_with("ws://") {
+                return Err(ConfigError::Invalid {
+                    field: "rtc.livekit.url",
+                    message: format!(
+                        "{:?} is not a ws(s) URL — this is the SFU's own address",
+                        livekit.url
+                    ),
+                });
+            }
+            if livekit.key.is_empty() || livekit.secret.is_empty() {
+                return Err(ConfigError::Invalid {
+                    field: "rtc.livekit",
+                    message: "key and secret are LiveKit's API key and secret, and \
+                              a token signed with an empty one admits nobody"
+                        .to_owned(),
+                });
+            }
+            if livekit.token_ttl_seconds == 0 {
+                return Err(ConfigError::Invalid {
+                    field: "rtc.livekit.token_ttl_seconds",
+                    message: "must be > 0: a zero would mint tokens already expired \
+                              rather than mean \"unlimited\""
+                        .to_owned(),
                 });
             }
         }

@@ -114,7 +114,7 @@ impossible and the exception path is dead code.
 | **M6** Differentiators | Not started | Hub mode, MLS |
 | **M7** MatrixRTC | Started | **MSC4140 delayed events** — the dead-man's switch that stops calls accumulating ghost participants. No other Rust homeserver has them |
 
-**177 routes** and a **311-test Complement ratchet** in CI, over a workspace of
+**180 routes** and a **311-test Complement ratchet** in CI, over a workspace of
 100+ test suites. The first two are gated — the [dashboard](docs/dashboard.md)
 is parsed from the router and CI fails on drift, and the ratchet is a file every
 entry of which must pass — so what they say matches `main` rather than matching
@@ -197,6 +197,7 @@ The risks that would invalidate the headline claim are enumerated in
 | [docs/metrics.md](docs/metrics.md) | What is exported, including the number the architecture is falsified by |
 | [docs/lifecycle.md](docs/lifecycle.md) | Backup, restore, migrations |
 | [docs/rate-limits.md](docs/rate-limits.md) | Every rate and cap, and the growth nothing bounds yet |
+| [docs/matrix-rtc.md](docs/matrix-rtc.md) | Calls end to end: the SFU, the JWT service built in or beside, and what a token cannot promise |
 | [docs/dashboard.md](docs/dashboard.md) | Generated endpoint and milestone coverage |
 
 ---
