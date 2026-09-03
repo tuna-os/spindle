@@ -41,6 +41,9 @@ pub struct Federation {
     client: reqwest::Client,
     /// Where the outbox depth gauge is set; the server's one registry.
     metrics: Arc<crate::metrics::Metrics>,
+    /// Peers reached by configuration rather than by name
+    /// (`[federation] peers`), keyed by server name.
+    peers: HashMap<String, Peer>,
     /// Fetch peer keys over plain http. For test rigs whose "servers" are
     /// loopback stubs; a production config leaving this on has disabled
     /// federation authentication in all but name, and the config comment
@@ -84,6 +87,13 @@ pub enum FederationError {
         body: Value,
     },
     Storage(String),
+}
+
+/// A peer reached by configuration: see [`Federation::with_peers`].
+#[derive(Clone, Debug)]
+struct Peer {
+    url: String,
+    max_backoff: Option<Duration>,
 }
 
 impl std::fmt::Display for FederationError {
@@ -161,6 +171,7 @@ impl Federation {
             key,
             client,
             metrics: Arc::default(),
+            peers: HashMap::new(),
             insecure_http,
             allowed,
             negative: std::sync::Mutex::new(HashMap::new()),
@@ -181,12 +192,56 @@ impl Federation {
         &self.metrics
     }
 
+    /// Reach the named peers at their configured URLs rather than by
+    /// resolving their names (`[federation] peers`).
+    #[must_use]
+    pub fn with_peers(mut self, peers: &BTreeMap<String, crate::config::PeerConfig>) -> Self {
+        self.peers = peers
+            .iter()
+            .map(|(name, peer)| {
+                (
+                    name.clone(),
+                    Peer {
+                        url: peer.url.trim_end_matches('/').to_owned(),
+                        max_backoff: peer.max_backoff_ms.map(Duration::from_millis),
+                    },
+                )
+            })
+            .collect();
+        self
+    }
+
+    /// The longest the outbox waits between attempts at `destination`,
+    /// when the operator has said how patient to be with it.
+    #[must_use]
+    pub fn peer_max_backoff(&self, destination: &str) -> Option<Duration> {
+        self.peers
+            .get(destination)
+            .and_then(|peer| peer.max_backoff)
+    }
+
     /// The URL a request to `name` goes to, or a refusal.
     ///
     /// Grammar first (#286), then, for a name that is a literal address,
     /// the same judgement the resolver applies to a hostname: a literal
     /// never touches DNS, so this is the only place it can be vetted.
     fn base_url(&self, name: &str) -> Result<String, FederationError> {
+        // A configured peer goes where the operator said, and its host is
+        // judged the same way a name's would be: a literal here, a hostname
+        // by the resolver when the connection is made.
+        if let Some(peer) = self.peers.get(name) {
+            if let Some(host) = reqwest::Url::parse(&peer.url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                && let Ok(literal) = host.trim_matches(['[', ']']).parse::<IpAddr>()
+                && !permits(&self.allowed, literal)
+            {
+                return Err(FederationError::Refused(format!(
+                    "{name} is configured at an address this server does not reach"
+                )));
+            }
+            return Ok(peer.url.clone());
+        }
         let url = base_url(name, self.insecure_http)?;
         if let Ok(server) = ruma::OwnedServerName::try_from(name)
             && let Ok(literal) = server.host().trim_matches(['[', ']']).parse::<IpAddr>()
@@ -884,6 +939,21 @@ impl Federation {
             return parse_multipart_media(&content_type, &body);
         }
         let status = response.status();
+        // `M_TOO_LARGE` is the peer's answer, not its failure to answer: a
+        // peer that caps what it serves (a mesh homeserver at 256 KiB, say)
+        // has said so, and the legacy endpoint would only say it again.
+        let body: Value = response
+            .bytes()
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or(Value::Null);
+        if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE || body["errcode"] == "M_TOO_LARGE" {
+            return Err(FederationError::Answered {
+                status: status.as_u16(),
+                body,
+            });
+        }
 
         // Legacy fallback: the public v3 endpoint, no signature. Kept for
         // peers predating authenticated media; a 404 there is final.
@@ -1063,11 +1133,38 @@ pub async fn drain_outbox(
                 Err(error) => {
                     tracing::debug!("outbox to {destination}: {error}");
                     let failures = backoff.get(&destination).map_or(0, |(count, _)| *count) + 1;
-                    let delay = retry_base * 2_u32.saturating_pow(failures.min(6));
+                    let Some(federation) = federation.upgrade() else {
+                        return;
+                    };
+                    let delay = backoff_delay(
+                        retry_base,
+                        failures,
+                        federation.peer_max_backoff(&destination),
+                    );
                     backoff.insert(destination, (failures, Instant::now() + delay));
                 }
             }
         }
+    }
+}
+
+/// How long to wait before the next attempt at a destination that has
+/// failed `failures` times in a row.
+///
+/// Doubling from the base, capped at 64× -- about a minute at the default
+/// base -- so an unreachable peer is retried often enough that its return
+/// is noticed within a minute. A peer the operator has marked patient
+/// (`[federation] peers` with `max_backoff_ms`) keeps doubling up to its
+/// own cap instead: a homeserver on a phone, or a gateway on a venue
+/// uplink, is expected to be dark for hours, and one connection attempt an
+/// hour is the whole cost of waiting for it. Nothing is dropped in either
+/// case; the rows wait in the outbox until the peer acknowledges them.
+fn backoff_delay(retry_base: Duration, failures: u32, patient: Option<Duration>) -> Duration {
+    match patient {
+        Some(cap) => retry_base
+            .saturating_mul(2_u32.saturating_pow(failures.min(30)))
+            .min(cap),
+        None => retry_base * 2_u32.saturating_pow(failures.min(6)),
     }
 }
 
@@ -1540,5 +1637,28 @@ mod header_tests {
         ] {
             assert!(parse_x_matrix(broken).is_err(), "{broken}");
         }
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+
+    #[test]
+    fn an_ordinary_peer_is_retried_within_a_minute_and_a_patient_one_within_its_cap() {
+        let base = Duration::from_secs(1);
+        assert_eq!(backoff_delay(base, 1, None), Duration::from_secs(2));
+        assert_eq!(backoff_delay(base, 6, None), Duration::from_secs(64));
+        // The ordinary cap holds however long the peer stays dark.
+        assert_eq!(backoff_delay(base, 40, None), Duration::from_secs(64));
+        let hour = Duration::from_secs(3600);
+        assert_eq!(backoff_delay(base, 6, Some(hour)), Duration::from_secs(64));
+        assert_eq!(
+            backoff_delay(base, 11, Some(hour)),
+            Duration::from_secs(2048)
+        );
+        assert_eq!(backoff_delay(base, 12, Some(hour)), hour);
+        // Past the cap, the cap; and a huge failure count cannot overflow.
+        assert_eq!(backoff_delay(base, u32::MAX, Some(hour)), hour);
     }
 }

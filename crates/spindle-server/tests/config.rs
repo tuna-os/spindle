@@ -289,6 +289,51 @@ fn a_zero_ring_budget_is_refused_and_the_default_is_ten() {
     assert_eq!(config.ratelimit.rings_per_minute, 10);
 }
 
+/// `[federation] peers` names a peer's URL and, optionally, how patient
+/// to be with it; a URL that is not one, or a cap shorter than the base
+/// it caps, is refused at startup.
+#[test]
+fn a_configured_peer_parses_and_a_bad_one_is_refused_at_startup() {
+    let config = parse(
+        "[server]\nname = \"example.org\"\n[federation]\nretry_base_ms = 500\n\
+         peers = { \"node\" = { url = \"http://10.20.0.5:8008/\", max_backoff_ms = 3600000 }, \
+         \"gateway.venue\" = { url = \"https://gateway.venue:8448\" } }\n",
+    )
+    .expect("two peers");
+    assert_eq!(
+        config.federation.peers["node"].max_backoff_ms,
+        Some(3_600_000)
+    );
+    assert_eq!(
+        config.federation.peers["gateway.venue"].max_backoff_ms,
+        None
+    );
+    for (line, field) in [
+        (
+            "peers = { \"node\" = { url = \"not a url\" } }",
+            "federation.peers.url",
+        ),
+        (
+            "peers = { \"node\" = { url = \"ftp://10.20.0.5\" } }",
+            "federation.peers.url",
+        ),
+        (
+            "peers = { \"node\" = { url = \"http://10.20.0.5:8008/_matrix\" } }",
+            "federation.peers.url",
+        ),
+        (
+            "retry_base_ms = 1000\npeers = { \"node\" = { url = \"http://10.20.0.5\", max_backoff_ms = 10 } }",
+            "federation.peers.max_backoff_ms",
+        ),
+    ] {
+        let error = parse(&format!(
+            "[server]\nname = \"example.org\"\n[federation]\n{line}\n"
+        ))
+        .expect_err("refused at startup");
+        assert!(error.to_string().contains(field), "{line}: {error}");
+    }
+}
+
 #[test]
 fn the_delayed_event_caps_default_without_the_section() {
     let config = parse("[server]\nname = \"example.org\"\n").expect("no section is fine");
