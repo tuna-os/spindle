@@ -202,6 +202,39 @@ registrations = []
 #     { type = "livekit", livekit_service_url = "https://livekit.example.org/jwt" },
 # ]
 
+[rtc.livekit]
+# The built-in LiveKit JWT service (#38, MSC4195) — off unless this section
+# is set. See docs/matrix-rtc.md for the deployment end to end.
+#
+# With it set, this server mints the tokens clients present to the SFU
+# itself, and a deployment needs no lk-jwt-service. It advertises itself
+# as a `livekit` transport ahead of `foci` above, at
+# <public_base_url>/_spindle/rtc/livekit, which is what a client posts to.
+#
+# What it does that the external service cannot: a token is minted only
+# for a room the user is joined to *at that moment*, checked against this
+# server's own membership index. What it cannot do: revoke. A minted token
+# is stateless and the SFU never asks again, so a user who leaves the room
+# holds their token until it expires — which is why the window below is
+# short, and why it is the whole of the guarantee.
+#
+# The SFU's own websocket address, as handed to clients with their token.
+# url = "wss://livekit.example.org"
+#
+# LiveKit's API key and secret — the same pair the SFU was started with
+# (`--keys`, or `keys:` in its config). The secret signs every token and is
+# shared with the SFU and nothing else: it is not this server's signing
+# key, and it is never logged.
+# key = "APIxxxxxxxx"
+# secret = "..."
+#
+# How long a minted token admits its holder, in seconds. Fifteen minutes by
+# default: enough to join and ride out a reconnect, short enough that a
+# token outliving its membership is not an afternoon's access. Must be > 0.
+# lk-jwt-service issues an hour; set 3600 here to match it if a client
+# needs that, knowing what it buys.
+# token_ttl_seconds = 900
+
 [metrics]
 # Prometheus scrape surface, off unless this is set. Its own listener, on
 # loopback: the exposition names the peers this server federates with and

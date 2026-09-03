@@ -19,22 +19,33 @@ Two different things are bounded here, and they fail differently:
 
 ## Rates
 
-There are three, and they all sit on the unauthenticated edge.
+There are five. Three sit on the unauthenticated edge; the two that do not
+are the credential mints MatrixRTC introduced (#38), which are the first
+authenticated rates this server enforces.
 
 | Endpoint | Key | Limit | Counted when |
 |---|---|---|---|
 | `POST /login` (password) | account | 5 per 60 s | a failed attempt; a success forgets both keys' history |
 | `POST /login` (password) | source address | 30 per 60 s | a failed attempt |
 | `POST /register` | source address | 5 per 300 s | a request that carries `auth`, i.e. after the mandatory first 401 |
+| `POST /user/{userId}/openid/request_token` | user | 20 per 60 s | every request, before the token is minted |
+| `POST /_spindle/rtc/livekit/sfu/get` (built-in LiveKit service) | user | 20 per 60 s | every request that carried a live OpenID token, before the membership check |
+
+The two mints are limited because they are not reads: an OpenID token is a
+durable row written on the caller's say-so, and both tokens exist to make
+a third party — a JWT service, an SFU — do work. Minting is an HMAC here
+and a room on the SFU there, which is the asymmetry #38 names. A client
+mints one of each per call it joins, so twenty a minute is a busy user
+several times over and a loop within seconds.
 
 Both login keys are checked before the password is, so a caller over the
 limit does not get an Argon2 verification out of each attempt. Both are
 needed: per-account alone misses credential stuffing, per-source alone
 locks out everyone behind one NAT. The reasoning is in the module header.
 
-**Nothing an authenticated account does is rate limited.** Event sends,
-room creation, invites, joins, media uploads, device registration, sync —
-none of it. That is a choice this document records rather than defends:
+**Nothing else an authenticated account does is rate limited.** Event
+sends, room creation, invites, joins, media uploads, device registration,
+sync — none of it. That is a choice this document records rather than defends:
 the caps below bound what a single account can make the server *hold*,
 and the benchmark rig depends on being able to issue requests as fast as
 the server takes them. A per-account send rate is the obvious next limit

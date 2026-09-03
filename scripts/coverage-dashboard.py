@@ -175,7 +175,34 @@ MILESTONES = [
      "(a `sticky` key on the PDU, its own `/sync` section, eager "
      "federation push) that no shipped client requires yet and is its "
      "own piece of work -- and the 5/20/100-participant churn benchmarks. "
-     "#38 and #41 are not started; #269 would run Element Call's own "
+     "#38 is served on both of its halves, and ADR 0004 records the "
+     "decision between them. The homeserver's half of LiveKit "
+     "authorisation is the OpenID round trip: `/openid/request_token` "
+     "mints a short-lived credential that opens nothing on this server, "
+     "and the federation `/openid/userinfo` redeems it -- with the user's "
+     "ID while it lives, with `M_UNKNOWN_TOKEN` once it has expired, and "
+     "the two refusals indistinguishable from a forged one. Tokens are "
+     "keyed by expiry, the way delayed events are keyed by deadline, so "
+     "every mint sweeps what has expired in a bounded read and the "
+     "keyspace never needs a loop of its own. That is everything "
+     "`lk-jwt-service` needs, and the external path is what `[rtc] foci` "
+     "advertises. The other half is the built-in JWT service behind "
+     "`[rtc.livekit]`, off by default: it serves `lk-jwt-service`'s own "
+     "`/sfu/get` contract at `/_spindle/rtc/livekit`, so Element Call "
+     "cannot tell which minter it reached, and mints only for a room the "
+     "user is joined to *at that moment* -- the one check the external "
+     "service has no state to make, and a single membership-index read "
+     "here. A user who has left is refused; an invited one is refused; a "
+     "room that does not exist is refused identically. The window is "
+     "fifteen minutes by default and exactly `token_ttl_seconds` wide, "
+     "the secret is LiveKit's and not the signing key, minting is rate "
+     "limited per user (the first authenticated rates this server "
+     "enforces, docs/rate-limits.md), and `roomCreate` is withheld "
+     "because in LiveKit it is also `roomDelete`. What a stateless token "
+     "cannot do is be revoked when its holder leaves, and docs/matrix-rtc.md "
+     "says so in those words rather than implying a guarantee the "
+     "mechanism cannot make; it also lays out both deployments end to "
+     "end. #41 is not started; #269 would run Element Call's own "
      "Playwright suite against this server."),
 ]
 
@@ -229,6 +256,21 @@ AREA_RULES = [
         "/_spindle/oidc/",
     )),
     ("Appservices", ("/_matrix/app/", "/_matrix/client/v1/appservice/")),
+    # M7's own surface. These fell into the catch-all (the `/voip/` and
+    # `/rtc/` routes) or into "Account data" by the `/user/` prefix (the
+    # OpenID mint), so the milestone's area read "0 implemented" while its
+    # endpoints were served under other headings. The OpenID pair is here
+    # rather than under auth because a call is what a client mints one for:
+    # it is the credential the LiveKit JWT service redeems.
+    ("VoIP & MatrixRTC", (
+        "/_matrix/client/v3/voip/",
+        "/_matrix/client/v1/rtc/",
+        "/_matrix/client/unstable/org.matrix.msc4143/",
+        "/_matrix/client/unstable/org.matrix.msc4140/",
+        "/_matrix/client/v3/user/{user_id}/openid/",
+        "/_matrix/federation/v1/openid/",
+        "/_spindle/rtc/",
+    )),
     ("Key backup", ("/_matrix/client/v3/room_keys/",)),
     ("Federation", ("/_matrix/federation/",)),
     ("End-to-end encryption", ("/_matrix/client/v3/keys/", "/_matrix/client/v3/sendToDevice/")),
