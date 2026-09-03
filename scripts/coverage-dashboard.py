@@ -40,7 +40,7 @@ MILESTONES = [
      "covered by restart and torn-write tests."),
     ("M1", "Usable local homeserver", "**Done**",
      "Full local CS-API surface with classic `/sync`; leftovers tracked on #7 "
-     "(room upgrade, spaces, search, pushers, OpenAPI validation, Element Web rig). "
+     "(room upgrade, spaces, search, OpenAPI validation, Element Web rig). "
      "Benchmarked vs Synapse and Continuwuity — see docs/benchmarks.md."),
     ("M2", "Modern encrypted clients", "**Done**",
      "Media + thumbnails (#99, #104), Simplified Sliding Sync (#105), E2EE "
@@ -138,8 +138,18 @@ MILESTONES = [
      "endpoint's presence is the claim to implement the MSC, and the list "
      "is what it currently has. MSC4158 needed nothing separate — it was "
      "folded into MSC4143 and closed, so the well-known key is "
-     "`org.matrix.msc4143.rtc_foci`. #38–#41 are not started; #269 would "
-     "run Element Call's own Playwright suite against this server."),
+     "`org.matrix.msc4143.rtc_foci`. #39's server half is served: pushers "
+     "are driven — a delivery loop walks the stream, asks every reader's "
+     "rules, and posts the spec's notification body to the gateway each "
+     "device registered, with the gateway address vetted like a preview's "
+     "and a `rejected` pushkey forgotten. MSC4075 in its current form "
+     "defines no push rule of its own: a ring is routed by `m.mentions`, "
+     "so the default mention rules are what make a fresh account's phone "
+     "ring, at high priority, and an MSC4310 decline carries no mention "
+     "and pushes nobody. What #39 still owes: the ring dispatch latency "
+     "benchmark and a ring budget separate from ordinary push. #38, #40 "
+     "and #41 are not started; #269 would run Element Call's own "
+     "Playwright suite against this server."),
 ]
 
 # ---------------------------------------------------------------------------

@@ -63,6 +63,21 @@ enabled = true
 # genuinely wants previews of an internal wiki and says so range by range.
 allow_private = []
 
+[push]
+# Deliver notifications to the push gateways clients register (`POST
+# /pushers/set`). Off keeps the registrations and sends nothing.
+enabled = true
+
+# A pusher is a URL a client handed this server, fetched every time one of
+# that client's rooms has something to say -- the same request-forgery
+# vector as a URL preview, held open for as long as the registration
+# stands. A gateway that resolves inward (loopback, RFC 1918, link-local,
+# the cloud metadata service) is refused by resolved address unless its
+# range is listed here, and a literal address that would be refused is
+# refused at registration. Same judgement as `[previews] allow_private`.
+# Test rigs whose gateway is a loopback stub list "127.0.0.0/8".
+allow_internal = []
+
 [federation]
 # Fetch peer keys and send requests over plain http instead of https. For
 # test rigs whose "servers" are loopback stubs. A production deployment with

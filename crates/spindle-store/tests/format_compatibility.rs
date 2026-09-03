@@ -189,6 +189,7 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::Presence, 0x2e),
         (Keyspace::Pusher, 0x2f),
         (Keyspace::MemberHistory, 0x30),
+        (Keyspace::PushCursor, 0x31),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(

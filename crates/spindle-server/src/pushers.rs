@@ -1,9 +1,10 @@
 //! Pushers: where a user's devices asked to be told about events.
 //!
-//! Stored and served, not yet driven: nothing here sends a push, because
-//! nothing yet evaluates a push rule against an event (#7). What a client
-//! registers is kept faithfully, per user and per `(app_id, pushkey)`, so
-//! the day the evaluator lands the registrations are already there.
+//! Stored and served here; driven by `push::deliver_loop`, which reads the
+//! registrations back for every event a user's rules say to notify about.
+//! What a client registers is kept faithfully, per user and per
+//! `(app_id, pushkey)`; the one thing that removes a registration behind
+//! the client's back is its gateway reporting the pushkey `rejected`.
 
 use std::sync::Arc;
 
