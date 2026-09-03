@@ -30,7 +30,7 @@ blake3 = "1.8"
 # fed with attacker-controlled bytes, so the list is the formats we thumbnail
 # and nothing else.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 fjall = "3.1.9"
 proptest = "1.7"
 rand = "0.10"
