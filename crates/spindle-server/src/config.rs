@@ -471,10 +471,23 @@ pub struct FederationConfig {
     #[serde(default)]
     pub allow_internal: Vec<String>,
     /// Base retry delay for outbound delivery, milliseconds. Doubles per
-    /// consecutive failure per destination, capped at 64×. Tests shrink it;
-    /// operators should not need to touch it.
+    /// consecutive failure per destination, capped at 64× unless the peer
+    /// has a `max_backoff_ms` of its own below. Tests shrink it; operators
+    /// should not need to touch it.
     #[serde(default = "default_retry_base_ms")]
     pub retry_base_ms: u64,
+    /// Peers reached by configuration rather than by resolving their name,
+    /// keyed by server name.
+    ///
+    /// A federation peer is normally found by its name: the name is the
+    /// host, and delegation is not resolved. A peer whose name is not a
+    /// hostname at all -- a mesh homeserver named by its node key, a
+    /// venue gateway on a LAN with no DNS -- is listed here with the URL
+    /// its requests go to (docs/mesh-federation.md). The URL's host is
+    /// vetted like any other: a literal inside address needs
+    /// `allow_internal`.
+    #[serde(default)]
+    pub peers: std::collections::BTreeMap<String, PeerConfig>,
     /// Where the federation TLS listener binds, e.g. `0.0.0.0:8448`. Unset
     /// means no federation listener: a deployment behind a reverse proxy
     /// terminates TLS there and serves federation on the main bind.
@@ -500,11 +513,33 @@ impl Default for FederationConfig {
             insecure_http: false,
             allow_internal: Vec::new(),
             retry_base_ms: default_retry_base_ms(),
+            peers: std::collections::BTreeMap::new(),
             bind: None,
             tls_cert: None,
             tls_key: None,
         }
     }
+}
+
+/// One entry of `[federation] peers`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerConfig {
+    /// Where requests to this peer go: scheme, host and port, no path,
+    /// e.g. `http://10.20.0.5:8008`. `http` is allowed here without
+    /// `insecure_http`, since the operator is naming one host they run
+    /// rather than turning authentication off for every peer.
+    pub url: String,
+    /// The longest this server waits between delivery attempts while the
+    /// peer is unreachable, milliseconds. Unset means the ordinary cap of
+    /// 64× `retry_base_ms`, about a minute. A peer that is expected to be
+    /// dark for hours -- a phone, a gateway on a venue uplink -- is given
+    /// hours here, so that its queue waits at the cost of one connection
+    /// attempt per period rather than one a minute. Nothing queued is
+    /// dropped either way; rows leave the outbox only when the peer
+    /// acknowledges them.
+    #[serde(default)]
+    pub max_backoff_ms: Option<u64>,
 }
 
 /// URL preview fetching.
@@ -626,6 +661,42 @@ impl Config {
         Self::parse(&text)
     }
 
+    /// `[federation] peers`: each URL is a scheme, host and port, and a
+    /// patience cap is never shorter than the base it caps.
+    fn validate_peers(&self) -> Result<(), ConfigError> {
+        for (name, peer) in &self.federation.peers {
+            let url = reqwest::Url::parse(&peer.url).map_err(|error| ConfigError::Invalid {
+                field: "federation.peers.url",
+                message: format!("peer {name}: {error}"),
+            })?;
+            if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                return Err(ConfigError::Invalid {
+                    field: "federation.peers.url",
+                    message: format!("peer {name}: must be an http or https URL with a host"),
+                });
+            }
+            if url.path() != "/" || url.query().is_some() {
+                return Err(ConfigError::Invalid {
+                    field: "federation.peers.url",
+                    message: format!("peer {name}: scheme, host and port only, no path"),
+                });
+            }
+            if let Some(cap) = peer.max_backoff_ms
+                && cap < self.federation.retry_base_ms
+            {
+                return Err(ConfigError::Invalid {
+                    field: "federation.peers.max_backoff_ms",
+                    message: format!(
+                        "peer {name}: must be at least retry_base_ms ({}); a shorter cap \
+                         retries faster than the base",
+                        self.federation.retry_base_ms
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         // Both caps are the reason #36 asks for them: a zero here does not
         // mean "unlimited", it means every schedule is refused and the
@@ -645,6 +716,7 @@ impl Config {
                     .to_owned(),
             });
         }
+        self.validate_peers()?;
         // A ring budget of zero is not "unlimited" either: it refuses every
         // ring, and a call nobody can be summoned to is a feature silently
         // off.

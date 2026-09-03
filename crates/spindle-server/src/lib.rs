@@ -210,6 +210,7 @@ pub fn app_with_metrics(
             &config.federation.allow_internal,
         )
         .map_err(|error| AppError::FederationConfig(error.to_string()))?
+        .with_peers(&config.federation.peers)
         .with_metrics(Arc::clone(&metrics)),
     );
     let delegated = config
