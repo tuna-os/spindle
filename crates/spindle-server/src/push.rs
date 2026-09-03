@@ -49,15 +49,49 @@ pub const NOTIFY_PATH: &str = "/_matrix/push/v1/notify";
 const BATCH_LIMIT: usize = 256;
 
 /// Notifications one gateway may have waiting. Past this the oldest is
-/// dropped: a gateway that has been unreachable for a thousand
-/// notifications is not going to want the first of them.
-const QUEUE_CAP: usize = 1_000;
+/// dropped: a gateway that has been unreachable for this long is not
+/// going to want the first of them.
+///
+/// Sized for a room, not a device: one gateway URL serves every device
+/// of every user on it, so a single ring in a thousand-member room is a
+/// thousand notifications queued for one URL at once, and a cap of a
+/// thousand -- the first figure here -- dropped the first phone of
+/// exactly that ring in the latency benchmark. A pending notification is
+/// a few kilobytes, so ten thousand is tens of megabytes per gateway at
+/// the very worst, and only while it is down.
+const QUEUE_CAP: usize = 10_000;
 
 /// Attempts at one notification before it is dropped. With the retry
 /// base doubling to 64× that is the better part of two minutes at the
 /// default base, which is longer than any ring and long enough for a
 /// gateway to come back from a restart.
 const MAX_ATTEMPTS: u32 = 8;
+
+/// How often the loop looks for new events and due gateways.
+///
+/// The tick is the floor on dispatch latency: a ring appended just after
+/// one waits nearly a whole tick before anything is sent. 100 ms is the
+/// fire loop's tick too, so the two halves of a call's push -- the ring
+/// and the departure -- land with the same delay. Retry backoff is a
+/// separate knob (`[federation] retry_base_ms`) and not tied to it.
+const TICK: Duration = Duration::from_millis(100);
+
+/// How many notifications one gateway is sent per pass.
+///
+/// A gateway serves every device of every user on it, so a ring in a
+/// hundred-member room is a hundred notifications to one URL. One per
+/// tick would make the last phone ring ten seconds after the first; a
+/// batch keeps that to the time the gateway takes to answer, bounded so a
+/// slow gateway cannot hold the pass -- and every other gateway's turn --
+/// for long.
+const SEND_BATCH: usize = 64;
+
+/// Whether `event_type` is a `MatrixRTC` ring (MSC4075), under the stable
+/// or the unstable name.
+#[must_use]
+pub fn is_ring(event_type: &str) -> bool {
+    event_type == "m.rtc.notification" || event_type == "org.matrix.msc4075.rtc.notification"
+}
 
 /// The client every push goes through, and the judgement on where it may
 /// go.
@@ -206,12 +240,7 @@ pub async fn deliver_loop(sources: Sources, retry_base: Duration) {
     let mut queues: HashMap<String, VecDeque<Pending>> = HashMap::new();
     let mut backoff: HashMap<String, (u32, Instant)> = HashMap::new();
     loop {
-        tokio::time::sleep(
-            retry_base
-                .min(Duration::from_millis(500))
-                .max(Duration::from_millis(25)),
-        )
-        .await;
+        tokio::time::sleep(TICK).await;
         // Plan under the strong references, send under none: a request in
         // flight to a gateway that never answers must not be what keeps
         // the store open while the runtime shuts down (#292).
@@ -258,18 +287,48 @@ pub async fn deliver_loop(sources: Sources, retry_base: Duration) {
         }
         drop((store, rooms, pushers, account_data, profiles));
 
-        // One notification per gateway per pass, taken from the queues
-        // that are not backing off. The gateway client owns no store.
+        // A batch per gateway per pass, taken from the queues that are not
+        // backing off. The gateway client owns no store.
         let now = Instant::now();
-        let due: Vec<(String, Pending)> = queues
+        let due: Vec<(String, VecDeque<Pending>)> = queues
             .iter_mut()
             .filter(|(url, _)| backoff.get(*url).is_none_or(|(_, until)| *until <= now))
-            .filter_map(|(url, queue)| queue.pop_front().map(|pending| (url.clone(), pending)))
+            .map(|(url, queue)| {
+                let take = queue.len().min(SEND_BATCH);
+                (url.clone(), queue.drain(..take).collect())
+            })
             .collect();
         queues.retain(|_, queue| !queue.is_empty());
 
-        let mut removals: Vec<(String, String, String)> = Vec::new();
-        for (url, mut pending) in due {
+        let removals = send_batches(&gateway, due, &mut queues, &mut backoff, retry_base).await;
+        if !removals.is_empty() {
+            // The registrations outlive a shutdown either way: a rejected
+            // pushkey the loop could not forget is forgotten on the next
+            // answer from that gateway.
+            let Some(pushers) = sources.pushers.upgrade() else {
+                return;
+            };
+            for (user_id, app_id, pushkey) in removals {
+                let _ = pushers.remove(&user_id, &app_id, &pushkey);
+            }
+        }
+    }
+}
+
+/// Send each gateway its batch, in order, stopping a gateway at its first
+/// transient failure: what was not sent goes back to the front of its
+/// queue and the gateway backs off. Returns the `(user_id, app_id,
+/// pushkey)` of every device a gateway reported `rejected`.
+async fn send_batches(
+    gateway: &Gateway,
+    due: Vec<(String, VecDeque<Pending>)>,
+    queues: &mut HashMap<String, VecDeque<Pending>>,
+    backoff: &mut HashMap<String, (u32, Instant)>,
+    retry_base: Duration,
+) -> Vec<(String, String, String)> {
+    let mut removals: Vec<(String, String, String)> = Vec::new();
+    for (url, mut batch) in due {
+        while let Some(mut pending) = batch.pop_front() {
             match gateway.notify(&url, &pending.body).await {
                 Ok(rejected) => {
                     backoff.remove(&url);
@@ -292,28 +351,25 @@ pub async fn deliver_loop(sources: Sources, retry_base: Duration) {
                 }
                 Err(Failure::Transient(why)) => {
                     tracing::debug!("push to {url}: {why}");
+                    // The one that failed goes back first, then what
+                    // was behind it, in order, and the gateway waits.
                     pending.attempts += 1;
                     if pending.attempts < MAX_ATTEMPTS {
-                        queues.entry(url.clone()).or_default().push_front(pending);
+                        batch.push_front(pending);
+                    }
+                    let queue = queues.entry(url.clone()).or_default();
+                    for unsent in batch.into_iter().rev() {
+                        queue.push_front(unsent);
                     }
                     let failures = backoff.get(&url).map_or(0, |(count, _)| *count) + 1;
                     let delay = retry_base * 2_u32.saturating_pow(failures.min(6));
                     backoff.insert(url, (failures, Instant::now() + delay));
+                    break;
                 }
             }
         }
-        if !removals.is_empty() {
-            // The registrations outlive a shutdown either way: a rejected
-            // pushkey the loop could not forget is forgotten on the next
-            // answer from that gateway.
-            let Some(pushers) = sources.pushers.upgrade() else {
-                return;
-            };
-            for (user_id, app_id, pushkey) in removals {
-                let _ = pushers.remove(&user_id, &app_id, &pushkey);
-            }
-        }
     }
+    removals
 }
 
 /// The room facts the rules ask about, gathered once per room per pass.

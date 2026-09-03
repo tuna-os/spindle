@@ -1367,3 +1367,74 @@ This is the case for attaching benchmarks to performance claims rather
 than asserting them. Two of the three came out as designed; the third had
 been wrong since it was written, in a loop that runs forever, and no test
 would have noticed because nothing about it was incorrect — only slow.
+
+## M7: how long after a ring each phone is told
+
+#39 attaches a benchmark to push delivery for the same reason #36 did:
+the design makes a claim — a `MatrixRTC` ring (MSC4075) is an ordinary
+event on the way in and, on the way out, one notification per mentioned
+member through the gateway each of their devices registered — and a
+call cares about the gap between the two. Two figures per room size, each
+a distribution over twenty rings, measured from the sender's `PUT`
+returning to the gateway receiving the notification: **first**, the
+earliest phone, and **last**, the latest. One gateway URL serves every
+device, which is how a real deployment looks (one Sygnal, many phones),
+and it answers in microseconds, so the *last* column is the server's cost
+alone; a real gateway's round-trip adds to it per member.
+
+`cargo bench -p spindle-server --bench ring_latency`. Wall-clock, not
+criterion, not a CI gate; the shape across sizes is the result.
+
+| pushered members | first p50 | first p99 | last p50 | last p99 |
+|---|---|---|---|---|
+| 10 | 97 ms | 101 ms | 99 ms | 102 ms |
+| 100 | 108 ms | 111 ms | 222 ms | 225 ms |
+| 1,000 | 248 ms | 258 ms | 1,892 ms | 1,914 ms |
+
+### The first phone is set by the tick
+
+The push loop polls the stream every 100 ms — the fire loop's tick, so a
+call's ring and a participant's departure land with the same delay — and
+an event appended just after a pass waits for the next one. p50 at one
+tick and p99 a few milliseconds over it, at ten and at a hundred members,
+is that floor and nothing else. At a thousand it is a tick plus 150 ms,
+which is what judging a thousand rulesets costs: a profile read, an
+unread count and the rule evaluation for each reader, in the pass, before
+anything is sent.
+
+### The last phone is set by the batch
+
+Every member's notification goes to the same URL, and a gateway is sent
+at most 64 per pass, one round-trip each, so the last phone in a
+thousand-member room rings sixteen ticks after the first. Linear in the
+room and no worse, which is the shape to check; the constant is the batch
+size, chosen so a gateway that has stopped answering cannot hold a pass —
+and every other gateway's turn — for more than its share. Sending to one
+gateway concurrently would take the *last* column down to a handful of
+round-trips whatever the size, and is the next step if a deployment's
+rooms are large; the benchmark is what would show it.
+
+### And the two things the first run found
+
+Neither table above was the first run. At a thousand members the
+benchmark could not finish its own setup: the thousand invites that put
+the members in the room were delivered at about one per second, and the
+ring, once it went out, lost a phone.
+
+The rate was the ruleset. Every glob condition — and the default ruleset
+carries half a dozen, `contains_user_name` and `suppress_notices` among
+them — compiled its regex on every evaluation, and the loop evaluates a
+ruleset for every pushered reader of every event, so a thousand-member
+room paid about 100 µs a reader an event, three thousand membership
+events deep. Compiled globs are now kept, bounded by distinct pattern
+(users write their own), and the same setup takes twelve seconds.
+
+The lost phone was the queue. Notifications wait per gateway, and a
+gateway's queue was capped at a thousand: one ring in a thousand-member
+room to one URL filled it exactly, and the cap dropped the oldest — the
+first phone — before the loop reached it. The cap is sized for a room
+now, not a device.
+
+Both are the case #36 made, made again: a benchmark attached to a claim
+finds what a test cannot, because nothing about either was incorrect —
+only slow, and only at a size no test builds.

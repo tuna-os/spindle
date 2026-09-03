@@ -6878,6 +6878,23 @@ async fn send_event(
     axum::extract::Query(query): axum::extract::Query<DelayQuery>,
     Json(content): Json<Value>,
 ) -> Result<Json<Value>, MatrixError> {
+    // A ring has a budget of its own (#39): it is the one event that makes
+    // every phone in the room sound, so it is counted per sender before
+    // anything else looks at it, delayed or not. Counted on the attempt, so
+    // a sender the room refuses still spends budget; the budget is against
+    // the trying.
+    if crate::push::is_ring(&event_type) {
+        let limit = crate::ratelimit::Limit::new(
+            state.config.ratelimit.rings_per_minute,
+            std::time::Duration::from_secs(60),
+        );
+        if let Err(retry) = state
+            .limiter
+            .check(&format!("ring:{}", identity.user_id), limit)
+        {
+            return Err(MatrixError::limit_exceeded(retry.as_millis()));
+        }
+    }
     // MSC4140 rides the existing send rather than adding a parallel one: the
     // event, its authorization and its transaction handling are identical,
     // and only *when* it is appended changes. A separate endpoint would be a

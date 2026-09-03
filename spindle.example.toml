@@ -49,6 +49,11 @@ path = "./data"
 # requests as fast as the server will take them. Both would otherwise report
 # our own rate limit as the server's latency.
 enabled = true
+# How many MatrixRTC rings (MSC4075 `m.rtc.notification`) one account may send
+# per minute, across all its rooms. A ring makes every phone in the room sound
+# at high priority, so it has a budget of its own (#39). Zero is refused at
+# startup. Off with `enabled = false`.
+rings_per_minute = 10
 
 [previews]
 # URL previews make the server fetch attacker-chosen URLs, which is the
