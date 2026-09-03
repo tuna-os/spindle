@@ -205,12 +205,9 @@ async fn serve() -> ExitCode {
     // The key is established before the listener accepts anything. A server
     // that binds and then discovers it cannot sign has already told a client it
     // was ready to take events it cannot create.
-    let app = match spindle_server::app(config, Arc::clone(&store)) {
-        Ok(app) => app,
-        Err(error) => {
-            tracing::error!("cannot build the server: {error}");
-            return ExitCode::FAILURE;
-        }
+    let metrics = Arc::new(spindle_server::metrics::Metrics::new());
+    let Some(app) = build_app(config, Arc::clone(&store), Arc::clone(&metrics)) else {
+        return ExitCode::FAILURE;
     };
     // into_make_service_with_connect_info, so the rate limiter can see peer
     // addresses. Without it every request looks like it came from nowhere and
@@ -224,7 +221,7 @@ async fn serve() -> ExitCode {
     // meant to explain. Bound before the federation listener, which holds
     // the router: a failure here exits with no task left holding the store.
     if let Some(metrics_bind) = metrics_bind
-        && !serve_metrics(&metrics_bind).await
+        && !serve_metrics(&metrics_bind, metrics).await
     {
         return ExitCode::FAILURE;
     }
@@ -576,8 +573,23 @@ fn open_store_with_config(config_path: &str) -> Option<(FjallStore, Config)> {
     }
 }
 
+/// The router, or `None` with the reason logged.
+fn build_app(
+    config: spindle_server::Config,
+    store: Arc<FjallStore>,
+    metrics: Arc<spindle_server::metrics::Metrics>,
+) -> Option<axum::Router> {
+    match spindle_server::app_with_metrics(config, store, metrics) {
+        Ok(app) => Some(app),
+        Err(error) => {
+            tracing::error!("cannot build the server: {error}");
+            None
+        }
+    }
+}
+
 /// Serve `GET /metrics` on its own listener.
-async fn serve_metrics(bind: &str) -> bool {
+async fn serve_metrics(bind: &str, metrics: Arc<spindle_server::metrics::Metrics>) -> bool {
     let listener = match TcpListener::bind(bind).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -587,14 +599,17 @@ async fn serve_metrics(bind: &str) -> bool {
     };
     let app = axum::Router::new().route(
         "/metrics",
-        axum::routing::get(|| async {
-            (
-                [(
-                    axum::http::header::CONTENT_TYPE,
-                    "text/plain; version=0.0.4; charset=utf-8",
-                )],
-                spindle_server::metrics::render(),
-            )
+        axum::routing::get(move || {
+            let metrics = Arc::clone(&metrics);
+            async move {
+                (
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "text/plain; version=0.0.4; charset=utf-8",
+                    )],
+                    metrics.render(),
+                )
+            }
         }),
     );
     tracing::info!("metrics listening on {bind}");

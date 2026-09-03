@@ -81,6 +81,9 @@ pub struct AppState {
     /// (#159): this server is then its own MSC3861 issuer.
     pub oidc: Option<Arc<oidc::BuiltinOidc>>,
     pub federation: Arc<federation::Federation>,
+    /// The one registry every counter in this server records into, and
+    /// the one `/metrics` renders.
+    pub metrics: Arc<metrics::Metrics>,
     pub delayed: Arc<delayed::Delayed>,
     /// The push gateway client, and the judgement on which gateways it
     /// reaches; `set_pusher` asks it before storing a URL.
@@ -143,11 +146,26 @@ pub fn blobs_for(config: &Config) -> blobs::Blobs {
 /// nor created, or if the preview allow-list does not parse. Fatal rather
 /// than degraded in both cases — see [`AppError`].
 pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
+    app_with_metrics(config, store, Arc::new(metrics::Metrics::new()))
+}
+
+/// [`app`], recording into `metrics` -- the handle `main` serves on the
+/// scrape listener, and a test reads its assertions from.
+///
+/// # Errors
+///
+/// As [`app`].
+pub fn app_with_metrics(
+    config: Config,
+    store: Arc<FjallStore>,
+    metrics: Arc<metrics::Metrics>,
+) -> Result<Router, AppError> {
     let key =
         Arc::new(signing::ServerKey::load_or_create(store.as_ref()).map_err(AppError::Signing)?);
-    let rooms = Arc::new(rooms::Rooms::new(
+    let rooms = Arc::new(rooms::Rooms::with_metrics(
         Arc::clone(&store),
         config.server.name.clone(),
+        Arc::clone(&metrics),
     ));
     let limiter = Arc::new(ratelimit::RateLimiter::with_enabled(
         config.ratelimit.enabled,
@@ -189,7 +207,8 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
             config.federation.insecure_http,
             &config.federation.allow_internal,
         )
-        .map_err(|error| AppError::FederationConfig(error.to_string()))?,
+        .map_err(|error| AppError::FederationConfig(error.to_string()))?
+        .with_metrics(Arc::clone(&metrics)),
     );
     let delegated = config
         .auth
@@ -230,6 +249,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
             delayed_caps.max_per_room,
         )),
         push,
+        metrics,
     };
     spawn_delivery_loops(&state);
     Ok(routes::router(state))

@@ -119,6 +119,9 @@ pub use unread::{Receipt, Unread, Unscored};
 pub struct Rooms {
     store: Arc<FjallStore>,
     server_name: String,
+    /// Where appends, lock acquisitions and sync waits are counted; the
+    /// server's one registry, shared with everything else that records.
+    metrics: Arc<crate::metrics::Metrics>,
     open: RwLock<HashMap<String, Arc<RwLock<RoomLog>>>>,
     /// Lock order: `open` before `unread_index`, always. The fast path takes
     /// only `unread_index`; the build and append paths already hold `open`.
@@ -298,8 +301,19 @@ pub struct TimelineEvent {
 }
 
 impl Rooms {
+    /// A `Rooms` with a registry of its own, for tests and tools that do
+    /// not scrape it; the server uses [`Rooms::with_metrics`].
     #[must_use]
     pub fn new(store: Arc<FjallStore>, server_name: impl Into<String>) -> Self {
+        Self::with_metrics(store, server_name, Arc::default())
+    }
+
+    #[must_use]
+    pub fn with_metrics(
+        store: Arc<FjallStore>,
+        server_name: impl Into<String>,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) -> Self {
         let store_for_stream = Arc::clone(&store);
         // Read once and used twice: the stream's own high-water mark bounds
         // the index backfill and is one of the four drawers the counter
@@ -313,6 +327,7 @@ impl Rooms {
         Self {
             store,
             server_name: server_name.into(),
+            metrics,
             open: RwLock::new(HashMap::new()),
             unread_index: Mutex::new(HashMap::new()),
             highlights: Mutex::new(HashMap::new()),
@@ -2444,9 +2459,9 @@ impl Rooms {
         // the caller, or an append landing in between is missed and the client
         // waits out the full timeout for news that already arrived.
         let notified = self.appended.notified();
-        crate::metrics::sync_waiter_started();
+        self.metrics.sync_waiter_started();
         let _ = tokio::time::timeout(timeout, notified).await;
-        crate::metrics::sync_waiter_finished();
+        self.metrics.sync_waiter_finished();
     }
 
     /// Everything that happened after `since`, grouped by room.
@@ -2565,9 +2580,8 @@ impl Rooms {
                 .map_or(0, |since_epoch| {
                     u64::try_from(since_epoch.as_millis()).unwrap_or(u64::MAX)
                 });
-            crate::metrics::observe_sync_lag(std::time::Duration::from_millis(
-                now.saturating_sub(newest),
-            ));
+            self.metrics
+                .observe_sync_lag(std::time::Duration::from_millis(now.saturating_sub(newest)));
         }
 
         Ok(SyncResult {
@@ -3320,7 +3334,7 @@ impl Rooms {
     /// locks for one room, which is the same as no lock at all.
     fn room(&self, room_id: &str) -> Result<Arc<RwLock<RoomLog>>, RoomError> {
         {
-            crate::metrics::record_registry_lock(false);
+            self.metrics.record_registry_lock(false);
             let open = self
                 .open
                 .read()
@@ -3329,7 +3343,7 @@ impl Rooms {
                 return Ok(Arc::clone(room));
             }
         }
-        crate::metrics::record_registry_lock(true);
+        self.metrics.record_registry_lock(true);
         let mut open = self
             .open
             .write()
@@ -3360,7 +3374,7 @@ impl Rooms {
         work: impl FnOnce(&Self, &RoomLog) -> Result<T, RoomError>,
     ) -> Result<T, RoomError> {
         let room = self.room(room_id)?;
-        crate::metrics::record_room_lock(false);
+        self.metrics.record_room_lock(false);
         let log = room
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3375,7 +3389,7 @@ impl Rooms {
         let before = self.store.journalled();
         let room = self.room(room_id)?;
         let done = {
-            crate::metrics::record_room_lock(true);
+            self.metrics.record_room_lock(true);
             let mut log = room
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3411,7 +3425,7 @@ impl Rooms {
         content: &Value,
     ) -> Result<(String, Value), RoomError> {
         // Before `prev` is read, so the event names only tips that fold.
-        Self::set_aside_contested(log, room_id)?;
+        self.set_aside_contested(log, room_id)?;
         let depth = log
             .entries()
             .next_back()
@@ -3485,12 +3499,12 @@ impl Rooms {
     /// key the way `/state_ids` does and names the tip set aside, which is
     /// what an operator needs to find the branch this server is not
     /// showing.
-    fn set_aside_contested(log: &mut RoomLog, room_id: &str) -> Result<(), RoomError> {
+    fn set_aside_contested(&self, log: &mut RoomLog, room_id: &str) -> Result<(), RoomError> {
         let set_aside = log
             .set_aside_contested()
             .map_err(|error| RoomError::Append(format!("{error:?}")))?;
         for spindle_core::SetAside { extremity, key } in set_aside {
-            crate::metrics::record_contested_state();
+            self.metrics.record_contested_state();
             let key = format!("{}/{}", key.event_type().as_str(), key.state_key());
             tracing::warn!(
                 room = room_id,
@@ -3573,7 +3587,7 @@ impl Rooms {
                 // Counted where the decision is made (#166), whether it
                 // is then resolved or — as today — refused.
                 if let spindle_core::AppendError::NeedsStateResolution { key, .. } = &error {
-                    crate::metrics::record_contested_state();
+                    self.metrics.record_contested_state();
                     return RoomError::Contested {
                         // The `type/state_key` spelling `/state_ids` uses,
                         // so an operator can match this against what the
@@ -3584,7 +3598,8 @@ impl Rooms {
                 RoomError::Append(format!("{error:?}"))
             })?
             .clone();
-        crate::metrics::record_append(crate::metrics::Origin::Local, case_of(state_key.is_some()));
+        self.metrics
+            .record_append(crate::metrics::Origin::Local, case_of(state_key.is_some()));
 
         self.persist_entry(
             log,
@@ -3775,7 +3790,7 @@ impl Rooms {
             .append_remote(input)
             .map_err(|error| {
                 if let spindle_core::AppendError::NeedsStateResolution { key, .. } = &error {
-                    crate::metrics::record_contested_state();
+                    self.metrics.record_contested_state();
                     return RoomError::Contested {
                         // The `type/state_key` spelling `/state_ids` uses,
                         // so an operator can match this against what the
@@ -3786,7 +3801,7 @@ impl Rooms {
                 RoomError::Append(format!("{error:?}"))
             })?
             .clone();
-        crate::metrics::record_append(
+        self.metrics.record_append(
             crate::metrics::Origin::Federated,
             case_of(state_key.is_some()),
         );
@@ -3924,7 +3939,7 @@ impl Rooms {
             Err(_) => self.stream.abandon(stream_id),
         }
         landed?;
-        crate::metrics::observe_append("group", started.elapsed());
+        self.metrics.observe_append("group", started.elapsed());
 
         // The index is derived from the event that just landed, and only from
         // an event that landed: writing it before the commit would leave a

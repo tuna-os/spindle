@@ -39,6 +39,8 @@ pub struct Federation {
     server_name: String,
     key: Arc<ServerKey>,
     client: reqwest::Client,
+    /// Where the outbox depth gauge is set; the server's one registry.
+    metrics: Arc<crate::metrics::Metrics>,
     /// Fetch peer keys over plain http. For test rigs whose "servers" are
     /// loopback stubs; a production config leaving this on has disabled
     /// federation authentication in all but name, and the config comment
@@ -122,11 +124,25 @@ impl Federation {
             server_name: server_name.into(),
             key,
             client,
+            metrics: Arc::default(),
             insecure_http,
             allowed,
             negative: std::sync::Mutex::new(HashMap::new()),
             edu_queue: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// Record into `metrics` rather than a registry of this client's own.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<crate::metrics::Metrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// The registry this client records into.
+    #[must_use]
+    pub fn metrics(&self) -> &crate::metrics::Metrics {
+        &self.metrics
     }
 
     /// The URL a request to `name` goes to, or a refusal.
@@ -955,7 +971,7 @@ fn plan_transactions(
     // The pass already holds the whole picture, so the gauge is set
     // from it rather than counted separately — a second traversal
     // could disagree with the one that actually delivers.
-    crate::metrics::set_federation_queue(
+    federation.metrics().set_federation_queue(
         &by_destination
             .iter()
             .map(|(destination, rows)| (destination.clone(), rows.len() as u64))

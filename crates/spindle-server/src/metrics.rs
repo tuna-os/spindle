@@ -13,17 +13,20 @@
 //! Slice 2's histograms are where a library starts earning its keep; that
 //! is the point to reconsider, and reconsidering costs one module.
 //!
-//! The registry is process-global, as metrics registries conventionally
-//! are: threading a handle through every constructor to reach two call
-//! sites deep in the append path buys nothing. The consequence for tests
-//! is that counters accumulate across them, so assertions here are on
-//! *deltas* rather than absolute values — which is what a scrape does
-//! anyway.
+//! The registry is a value, [`Metrics`], owned by the server that produces
+//! it and handed to the few things that record into it. It was
+//! process-global for a while, as metrics registries conventionally are,
+//! and the cost showed up where #174 said it would: every integration
+//! test in one binary shared the counters, so an assertion was a delta
+//! across whatever the other tests were doing at that instant, and two of
+//! them flaked on exactly that. A handle costs one field in three
+//! constructors and buys tests that can say *equals*, and an exposition
+//! that is provably a rendering of the counters it sits beside.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, RwLock};
 use std::time::Duration;
 
 /// Which of §9.2's three cases an append took.
@@ -52,16 +55,37 @@ pub enum Origin {
     Federated,
 }
 
-// Relaxed throughout: these are counters read by a scrape, never used to
-// order anything. Paying for stronger ordering on the append hot path to
-// make a number that is sampled every 15 seconds marginally fresher would
-// be a poor trade.
-static FORK_CASES: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-static EVENTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-/// `[exclusive, shared]` acquisitions of one room's lock.
-static ROOM_LOCKS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-/// `[exclusive, shared]` acquisitions of the registry that finds rooms.
-static REGISTRY_LOCKS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// Every counter, gauge and histogram this server exposes.
+///
+/// One per server: `spindle_server::app` makes it and hands the same
+/// `Arc` to the rooms, the federation client and the request middleware,
+/// and `main` serves `render` from it. Relaxed ordering throughout: these
+/// are counters read by a scrape, never used to order anything, and
+/// paying for stronger ordering on the append hot path to make a number
+/// that is sampled every 15 seconds marginally fresher would be a poor
+/// trade.
+#[derive(Debug, Default)]
+pub struct Metrics {
+    fork_cases: [AtomicU64; 3],
+    events: [AtomicU64; 2],
+    /// `[exclusive, shared]` acquisitions of one room's lock.
+    room_locks: [AtomicU64; 2],
+    /// `[exclusive, shared]` acquisitions of the registry that finds rooms.
+    registry_locks: [AtomicU64; 2],
+    append_latency: Family,
+    http_latency: Family,
+    http_requests: RwLock<HashMap<String, AtomicU64>>,
+    federation_queue: RwLock<Vec<(String, u64)>>,
+    sync_subscribers: AtomicU64,
+    sync_lag: Family,
+}
+
+impl Metrics {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 impl ForkCase {
     fn index(self) -> usize {
@@ -98,60 +122,62 @@ impl Origin {
     }
 }
 
-/// Record one acquisition of a *room's* lock, and how it was taken.
-///
-/// Contention here is confined to that room: two requests for different
-/// rooms do not meet. Exclusive is what an append takes, and what makes
-/// concurrent writers to the same room queue -- which is the ordering the
-/// log rests on, not a defect.
-pub fn record_room_lock(exclusive: bool) {
-    ROOM_LOCKS[usize::from(!exclusive)].fetch_add(1, Ordering::Relaxed);
-}
+impl Metrics {
+    /// Record one acquisition of a *room's* lock, and how it was taken.
+    ///
+    /// Contention here is confined to that room: two requests for different
+    /// rooms do not meet. Exclusive is what an append takes, and what makes
+    /// concurrent writers to the same room queue -- which is the ordering the
+    /// log rests on, not a defect.
+    pub fn record_room_lock(&self, exclusive: bool) {
+        self.room_locks[usize::from(!exclusive)].fetch_add(1, Ordering::Relaxed);
+    }
 
-/// Record one acquisition of the registry that maps room ids to their locks.
-///
-/// This one *is* server-wide, so an exclusive acquisition stalls every
-/// request for every room. It should be rare: the registry is taken
-/// exclusively only to admit a room this process has not opened yet, and
-/// shared for every lookup after. A rising exclusive count on a server that
-/// is not opening new rooms means something is taking it that should not.
-pub fn record_registry_lock(exclusive: bool) {
-    REGISTRY_LOCKS[usize::from(!exclusive)].fetch_add(1, Ordering::Relaxed);
-}
+    /// Record one acquisition of the registry that maps room ids to their locks.
+    ///
+    /// This one *is* server-wide, so an exclusive acquisition stalls every
+    /// request for every room. It should be rare: the registry is taken
+    /// exclusively only to admit a room this process has not opened yet, and
+    /// shared for every lookup after. A rising exclusive count on a server that
+    /// is not opening new rooms means something is taking it that should not.
+    pub fn record_registry_lock(&self, exclusive: bool) {
+        self.registry_locks[usize::from(!exclusive)].fetch_add(1, Ordering::Relaxed);
+    }
 
-/// Record one event reaching the log, and which case carried it.
-pub fn record_append(origin: Origin, case: ForkCase) {
-    EVENTS[origin.index()].fetch_add(1, Ordering::Relaxed);
-    FORK_CASES[case.index()].fetch_add(1, Ordering::Relaxed);
-}
+    /// Record one event reaching the log, and which case carried it.
+    pub fn record_append(&self, origin: Origin, case: ForkCase) {
+        self.events[origin.index()].fetch_add(1, Ordering::Relaxed);
+        self.fork_cases[case.index()].fetch_add(1, Ordering::Relaxed);
+    }
 
-/// Record a fork that needed state resolution — case 3.
-///
-/// Not an append, so not [`record_append`]: nothing enters the log when
-/// this is recorded. Bounded resolution exists in `spindle-core` but is not
-/// yet wired into ingest (#16), so a contested fork is *deferred* rather
-/// than resolved. A federated event naming the contesting tips is refused;
-/// a local send sets the contesting tip aside and is authored without it
-/// (#225), and that send is then counted by [`record_append`] as the case
-/// it took. Counting an event here as well would count that send twice.
-/// The counter goes where the decision is made, so it keeps counting the
-/// same thing when the resolver lands and the deferral becomes a
-/// resolution.
-pub fn record_contested_state() {
-    FORK_CASES[ForkCase::StateContested.index()].fetch_add(1, Ordering::Relaxed);
-}
+    /// Record a fork that needed state resolution — case 3.
+    ///
+    /// Not an append, so not [`record_append`]: nothing enters the log when
+    /// this is recorded. Bounded resolution exists in `spindle-core` but is not
+    /// yet wired into ingest (#16), so a contested fork is *deferred* rather
+    /// than resolved. A federated event naming the contesting tips is refused;
+    /// a local send sets the contesting tip aside and is authored without it
+    /// (#225), and that send is then counted by [`record_append`] as the case
+    /// it took. Counting an event here as well would count that send twice.
+    /// The counter goes where the decision is made, so it keeps counting the
+    /// same thing when the resolver lands and the deferral becomes a
+    /// resolution.
+    pub fn record_contested_state(&self) {
+        self.fork_cases[ForkCase::StateContested.index()].fetch_add(1, Ordering::Relaxed);
+    }
 
-/// The exposition, in the Prometheus text format.
-#[must_use]
-pub fn render() -> String {
-    let mut out = String::with_capacity(2048);
-    render_build_info(&mut out);
-    render_appends(&mut out);
-    render_room_locks(&mut out);
-    render_http(&mut out);
-    render_federation(&mut out);
-    render_sync(&mut out);
-    out
+    /// The exposition, in the Prometheus text format.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut out = String::with_capacity(2048);
+        render_build_info(&mut out);
+        self.render_appends(&mut out);
+        self.render_room_locks(&mut out);
+        self.render_http(&mut out);
+        self.render_federation(&mut out);
+        self.render_sync(&mut out);
+        out
+    }
 }
 
 fn render_build_info(out: &mut String) {
@@ -166,155 +192,157 @@ fn render_build_info(out: &mut String) {
     );
 }
 
-/// The §9.2 case split, the federated-event denominator §18.3 needs, and
-/// the commit histogram those targets are stated against.
-fn render_appends(out: &mut String) {
-    out.push_str(
-        "# HELP spindle_events_appended_total Events appended to a room log.\n\
+impl Metrics {
+    /// The §9.2 case split, the federated-event denominator §18.3 needs, and
+    /// the commit histogram those targets are stated against.
+    fn render_appends(&self, out: &mut String) {
+        out.push_str(
+            "# HELP spindle_events_appended_total Events appended to a room log.\n\
          # TYPE spindle_events_appended_total counter\n",
-    );
-    for origin in [Origin::Local, Origin::Federated] {
-        let _ = writeln!(
-            out,
-            "spindle_events_appended_total{{origin=\"{}\"}} {}",
-            origin.label(),
-            EVENTS[origin.index()].load(Ordering::Relaxed)
         );
-    }
+        for origin in [Origin::Local, Origin::Federated] {
+            let _ = writeln!(
+                out,
+                "spindle_events_appended_total{{origin=\"{}\"}} {}",
+                origin.label(),
+                self.events[origin.index()].load(Ordering::Relaxed)
+            );
+        }
 
-    out.push_str(
-        "# HELP spindle_fork_resolutions_total Appends by SPEC 9.2 case; \
+        out.push_str(
+            "# HELP spindle_fork_resolutions_total Appends by SPEC 9.2 case; \
          case 3 is the expensive path and should stay near zero.\n\
          # TYPE spindle_fork_resolutions_total counter\n",
-    );
-    for case in [
-        ForkCase::NonState,
-        ForkCase::StateUncontested,
-        ForkCase::StateContested,
-    ] {
-        let _ = writeln!(
-            out,
-            "spindle_fork_resolutions_total{{case=\"{}\"}} {}",
-            case.label(),
-            FORK_CASES[case.index()].load(Ordering::Relaxed)
         );
+        for case in [
+            ForkCase::NonState,
+            ForkCase::StateUncontested,
+            ForkCase::StateContested,
+        ] {
+            let _ = writeln!(
+                out,
+                "spindle_fork_resolutions_total{{case=\"{}\"}} {}",
+                case.label(),
+                self.fork_cases[case.index()].load(Ordering::Relaxed)
+            );
+        }
+
+        out.push_str(
+            "# HELP spindle_append_duration_seconds Time to commit one event to a room log.\n\
+         # TYPE spindle_append_duration_seconds histogram\n",
+        );
+        if let Ok(read) = self.append_latency.read() {
+            for (durability, histogram) in read.iter() {
+                histogram.render_into(
+                    out,
+                    "spindle_append_duration_seconds",
+                    &format!("durability=\"{}\"", escape(durability)),
+                );
+            }
+        }
     }
 
-    out.push_str(
-        "# HELP spindle_append_duration_seconds Time to commit one event to a room log.\n\
-         # TYPE spindle_append_duration_seconds histogram\n",
-    );
-    if let Ok(read) = APPEND_LATENCY.read() {
-        for (durability, histogram) in read.iter() {
-            histogram.render_into(
+    fn render_room_locks(&self, out: &mut String) {
+        out.push_str(
+            "# HELP spindle_room_registry_acquisitions_total Room registry lock \
+         acquisitions, by mode.\n\
+         # TYPE spindle_room_registry_acquisitions_total counter\n",
+        );
+        for (index, mode) in ["exclusive", "shared"].into_iter().enumerate() {
+            let _ = writeln!(
                 out,
-                "spindle_append_duration_seconds",
-                &format!("durability=\"{}\"", escape(durability)),
+                "spindle_room_registry_acquisitions_total{{mode=\"{mode}\"}} {}",
+                self.registry_locks[index].load(Ordering::Relaxed)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_room_lock_acquisitions_total One room's lock \
+         acquisitions, by mode.\n\
+         # TYPE spindle_room_lock_acquisitions_total counter\n",
+        );
+        for (index, mode) in ["exclusive", "shared"].into_iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "spindle_room_lock_acquisitions_total{{mode=\"{mode}\"}} {}",
+                self.room_locks[index].load(Ordering::Relaxed)
             );
         }
     }
-}
 
-fn render_room_locks(out: &mut String) {
-    out.push_str(
-        "# HELP spindle_room_registry_acquisitions_total Room registry lock \
-         acquisitions, by mode.\n\
-         # TYPE spindle_room_registry_acquisitions_total counter\n",
-    );
-    for (index, mode) in ["exclusive", "shared"].into_iter().enumerate() {
-        let _ = writeln!(
-            out,
-            "spindle_room_registry_acquisitions_total{{mode=\"{mode}\"}} {}",
-            REGISTRY_LOCKS[index].load(Ordering::Relaxed)
-        );
-    }
-    out.push_str(
-        "# HELP spindle_room_lock_acquisitions_total One room's lock \
-         acquisitions, by mode.\n\
-         # TYPE spindle_room_lock_acquisitions_total counter\n",
-    );
-    for (index, mode) in ["exclusive", "shared"].into_iter().enumerate() {
-        let _ = writeln!(
-            out,
-            "spindle_room_lock_acquisitions_total{{mode=\"{mode}\"}} {}",
-            ROOM_LOCKS[index].load(Ordering::Relaxed)
-        );
-    }
-}
-
-fn render_http(out: &mut String) {
-    out.push_str(
+    fn render_http(&self, out: &mut String) {
+        out.push_str(
         "# HELP spindle_http_request_duration_seconds Time to serve one request, by matched route.\n\
          # TYPE spindle_http_request_duration_seconds histogram\n",
     );
-    if let Ok(read) = HTTP_LATENCY.read() {
-        for (route, histogram) in read.iter() {
-            histogram.render_into(
-                out,
-                "spindle_http_request_duration_seconds",
-                &format!("route=\"{}\"", escape(route)),
-            );
+        if let Ok(read) = self.http_latency.read() {
+            for (route, histogram) in read.iter() {
+                histogram.render_into(
+                    out,
+                    "spindle_http_request_duration_seconds",
+                    &format!("route=\"{}\"", escape(route)),
+                );
+            }
         }
-    }
 
-    out.push_str(
+        out.push_str(
         "# HELP spindle_http_requests_total Requests served, by matched route, method and status.\n\
          # TYPE spindle_http_requests_total counter\n",
     );
-    if let Ok(read) = HTTP_REQUESTS.read() {
-        for (key, counter) in read.iter() {
-            let mut parts = key.split('\u{1}');
-            let (Some(route), Some(method), Some(status)) =
-                (parts.next(), parts.next(), parts.next())
-            else {
-                continue;
-            };
-            let _ = writeln!(
-                out,
-                "spindle_http_requests_total{{route=\"{}\",method=\"{}\",status=\"{}\"}} {}",
-                escape(route),
-                escape(method),
-                escape(status),
-                counter.load(Ordering::Relaxed)
-            );
+        if let Ok(read) = self.http_requests.read() {
+            for (key, counter) in read.iter() {
+                let mut parts = key.split('\u{1}');
+                let (Some(route), Some(method), Some(status)) =
+                    (parts.next(), parts.next(), parts.next())
+                else {
+                    continue;
+                };
+                let _ = writeln!(
+                    out,
+                    "spindle_http_requests_total{{route=\"{}\",method=\"{}\",status=\"{}\"}} {}",
+                    escape(route),
+                    escape(method),
+                    escape(status),
+                    counter.load(Ordering::Relaxed)
+                );
+            }
         }
     }
-}
 
-fn render_federation(out: &mut String) {
-    out.push_str(
+    fn render_federation(&self, out: &mut String) {
+        out.push_str(
         "# HELP spindle_federation_queue_depth Events waiting to be delivered, by destination.\n\
          # TYPE spindle_federation_queue_depth gauge\n",
     );
-    if let Ok(read) = FEDERATION_QUEUE.read() {
-        for (destination, depth) in read.iter() {
-            let _ = writeln!(
-                out,
-                "spindle_federation_queue_depth{{destination=\"{}\"}} {depth}",
-                escape(destination)
-            );
+        if let Ok(read) = self.federation_queue.read() {
+            for (destination, depth) in read.iter() {
+                let _ = writeln!(
+                    out,
+                    "spindle_federation_queue_depth{{destination=\"{}\"}} {depth}",
+                    escape(destination)
+                );
+            }
         }
     }
-}
 
-fn render_sync(out: &mut String) {
-    out.push_str(
-        "# HELP spindle_sync_subscribers Clients currently blocked in a long-polling /sync.\n\
+    fn render_sync(&self, out: &mut String) {
+        out.push_str(
+            "# HELP spindle_sync_subscribers Clients currently blocked in a long-polling /sync.\n\
          # TYPE spindle_sync_subscribers gauge\n",
-    );
-    let _ = writeln!(
-        out,
-        "spindle_sync_subscribers {}",
-        SYNC_SUBSCRIBERS.load(Ordering::Relaxed)
-    );
+        );
+        let _ = writeln!(
+            out,
+            "spindle_sync_subscribers {}",
+            self.sync_subscribers.load(Ordering::Relaxed)
+        );
 
-    out.push_str(
-        "# HELP spindle_sync_lag_seconds Age of the newest event a /sync delivered.\n\
+        out.push_str(
+            "# HELP spindle_sync_lag_seconds Age of the newest event a /sync delivered.\n\
          # TYPE spindle_sync_lag_seconds histogram\n",
-    );
-    if let Ok(read) = SYNC_LAG.read() {
-        for histogram in read.values() {
-            histogram.render_into(out, "spindle_sync_lag_seconds", "");
+        );
+        if let Ok(read) = self.sync_lag.read() {
+            for histogram in read.values() {
+                histogram.render_into(out, "spindle_sync_lag_seconds", "");
+            }
         }
     }
 }
@@ -410,11 +438,7 @@ impl Histogram {
 /// sets are bounded by code — the durability modes the store offers,
 /// and the router's own matched paths — never by anything a caller
 /// chooses, which is the cardinality rule #166 sets.
-type Family = LazyLock<RwLock<HashMap<String, Histogram>>>;
-
-static APPEND_LATENCY: Family = LazyLock::new(RwLock::default);
-static HTTP_LATENCY: Family = LazyLock::new(RwLock::default);
-static HTTP_REQUESTS: LazyLock<RwLock<HashMap<String, AtomicU64>>> = LazyLock::new(RwLock::default);
+type Family = RwLock<HashMap<String, Histogram>>;
 
 fn observe_in(family: &Family, key: &str, elapsed: Duration) {
     if let Ok(read) = family.read()
@@ -431,35 +455,37 @@ fn observe_in(family: &Family, key: &str, elapsed: Duration) {
     }
 }
 
-/// Record how long a commit took, by the durability it was asked for.
-///
-/// SPEC §18.3's local-send targets are stated against `group`, so the
-/// label is what makes the number comparable to the target rather than
-/// an average over settings nobody runs together.
-pub fn observe_append(durability: &str, elapsed: Duration) {
-    observe_in(&APPEND_LATENCY, durability, elapsed);
-}
-
-/// Record one served request.
-///
-/// `route` must be the router's matched path (`/rooms/{room_id}/...`),
-/// never the raw URI: the raw path carries room and user IDs, and a
-/// label taking values from the request would let any caller mint
-/// series until the scrape falls over.
-pub fn observe_request(route: &str, method: &str, status: u16, elapsed: Duration) {
-    observe_in(&HTTP_LATENCY, route, elapsed);
-    let key = format!("{route}\u{1}{method}\u{1}{status}");
-    if let Ok(read) = HTTP_REQUESTS.read()
-        && let Some(counter) = read.get(&key)
-    {
-        counter.fetch_add(1, Ordering::Relaxed);
-        return;
+impl Metrics {
+    /// Record how long a commit took, by the durability it was asked for.
+    ///
+    /// SPEC §18.3's local-send targets are stated against `group`, so the
+    /// label is what makes the number comparable to the target rather than
+    /// an average over settings nobody runs together.
+    pub fn observe_append(&self, durability: &str, elapsed: Duration) {
+        observe_in(&self.append_latency, durability, elapsed);
     }
-    if let Ok(mut write) = HTTP_REQUESTS.write() {
-        write
-            .entry(key)
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(1, Ordering::Relaxed);
+
+    /// Record one served request.
+    ///
+    /// `route` must be the router's matched path (`/rooms/{room_id}/...`),
+    /// never the raw URI: the raw path carries room and user IDs, and a
+    /// label taking values from the request would let any caller mint
+    /// series until the scrape falls over.
+    pub fn observe_request(&self, route: &str, method: &str, status: u16, elapsed: Duration) {
+        observe_in(&self.http_latency, route, elapsed);
+        let key = format!("{route}\u{1}{method}\u{1}{status}");
+        if let Ok(read) = self.http_requests.read()
+            && let Some(counter) = read.get(&key)
+        {
+            counter.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if let Ok(mut write) = self.http_requests.write() {
+            write
+                .entry(key)
+                .or_insert_with(|| AtomicU64::new(0))
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -473,62 +499,62 @@ pub fn observe_request(route: &str, method: &str, status: u16, elapsed: Duration
 /// added up.
 const DESTINATION_CAP: usize = 20;
 
-static FEDERATION_QUEUE: LazyLock<RwLock<Vec<(String, u64)>>> = LazyLock::new(RwLock::default);
-static SYNC_SUBSCRIBERS: AtomicU64 = AtomicU64::new(0);
-static SYNC_LAG: Family = LazyLock::new(RwLock::default);
-
-/// Replace the federation queue depths with a fresh reading.
-///
-/// A gauge, so it is *set* rather than added to: the delivery loop knows
-/// the whole picture each pass, and carrying stale destinations forward
-/// would report a backlog for a peer that has none. Deepest first, with
-/// everything past the cap summed into `other`.
-pub fn set_federation_queue(depths: &[(String, u64)]) {
-    let mut sorted: Vec<(String, u64)> = depths.to_vec();
-    sorted.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    let mut capped: Vec<(String, u64)> = sorted.iter().take(DESTINATION_CAP).cloned().collect();
-    let rest: u64 = sorted
-        .iter()
-        .skip(DESTINATION_CAP)
-        .map(|(_, depth)| depth)
-        .sum();
-    if rest > 0 {
-        capped.push(("other".to_owned(), rest));
+impl Metrics {
+    /// Replace the federation queue depths with a fresh reading.
+    ///
+    /// A gauge, so it is *set* rather than added to: the delivery loop knows
+    /// the whole picture each pass, and carrying stale destinations forward
+    /// would report a backlog for a peer that has none. Deepest first, with
+    /// everything past the cap summed into `other`.
+    pub fn set_federation_queue(&self, depths: &[(String, u64)]) {
+        let mut sorted: Vec<(String, u64)> = depths.to_vec();
+        sorted.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        let mut capped: Vec<(String, u64)> = sorted.iter().take(DESTINATION_CAP).cloned().collect();
+        let rest: u64 = sorted
+            .iter()
+            .skip(DESTINATION_CAP)
+            .map(|(_, depth)| depth)
+            .sum();
+        if rest > 0 {
+            capped.push(("other".to_owned(), rest));
+        }
+        if let Ok(mut write) = self.federation_queue.write() {
+            *write = capped;
+        }
     }
-    if let Ok(mut write) = FEDERATION_QUEUE.write() {
-        *write = capped;
+
+    /// A `/sync` has started waiting.
+    pub fn sync_waiter_started(&self) {
+        self.sync_subscribers.fetch_add(1, Ordering::Relaxed);
     }
-}
 
-/// A `/sync` has started waiting.
-pub fn sync_waiter_started() {
-    SYNC_SUBSCRIBERS.fetch_add(1, Ordering::Relaxed);
-}
+    /// A `/sync` has stopped waiting, woken or timed out.
+    pub fn sync_waiter_finished(&self) {
+        // Saturating: an unbalanced decrement would wrap to u64::MAX and
+        // report every client on earth as connected to this server.
+        let _ =
+            self.sync_subscribers
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_sub(1))
+                });
+    }
 
-/// A `/sync` has stopped waiting, woken or timed out.
-pub fn sync_waiter_finished() {
-    // Saturating: an unbalanced decrement would wrap to u64::MAX and
-    // report every client on earth as connected to this server.
-    let _ = SYNC_SUBSCRIBERS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_sub(1))
-    });
-}
+    /// How far behind the newest event a sync response was.
+    ///
+    /// "Watermark lag" is ambiguous, so this picks the definition an
+    /// operator can act on: the age of the newest event a `/sync` actually
+    /// delivered, measured when it is delivered. A client keeping up sees
+    /// milliseconds; a server falling behind sees it climb, which is the
+    /// symptom #19's exit criteria ask to alert on.
+    pub fn observe_sync_lag(&self, elapsed: Duration) {
+        observe_in(&self.sync_lag, "", elapsed);
+    }
 
-/// How far behind the newest event a sync response was.
-///
-/// "Watermark lag" is ambiguous, so this picks the definition an
-/// operator can act on: the age of the newest event a `/sync` actually
-/// delivered, measured when it is delivered. A client keeping up sees
-/// milliseconds; a server falling behind sees it climb, which is the
-/// symptom #19's exit criteria ask to alert on.
-pub fn observe_sync_lag(elapsed: Duration) {
-    observe_in(&SYNC_LAG, "", elapsed);
-}
-
-/// Read the subscriber gauge, for tests that assert it moved.
-#[must_use]
-pub fn sync_subscribers() -> u64 {
-    SYNC_SUBSCRIBERS.load(Ordering::Relaxed)
+    /// Read the subscriber gauge, for tests that assert it moved.
+    #[must_use]
+    pub fn sync_subscribers(&self) -> u64 {
+        self.sync_subscribers.load(Ordering::Relaxed)
+    }
 }
 
 /// Escape a label value per the exposition format.
@@ -539,16 +565,18 @@ fn escape(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
-/// Read one counter, for tests that assert a metric actually moved.
-#[must_use]
-pub fn fork_case_count(case: ForkCase) -> u64 {
-    FORK_CASES[case.index()].load(Ordering::Relaxed)
-}
+impl Metrics {
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn fork_case_count(&self, case: ForkCase) -> u64 {
+        self.fork_cases[case.index()].load(Ordering::Relaxed)
+    }
 
-/// Read one counter, for tests that assert a metric actually moved.
-#[must_use]
-pub fn event_count(origin: Origin) -> u64 {
-    EVENTS[origin.index()].load(Ordering::Relaxed)
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn event_count(&self, origin: Origin) -> u64 {
+        self.events[origin.index()].load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -556,55 +584,41 @@ mod tests {
     use super::*;
 
     /// Every counter moves when its case does, and the exposition says so.
-    ///
-    /// Deltas, not absolutes: the registry is global and the test binary
-    /// shares it, which is the documented consequence of that choice.
     #[test]
     fn each_case_moves_its_own_counter() {
-        let before = (
-            fork_case_count(ForkCase::NonState),
-            fork_case_count(ForkCase::StateUncontested),
-            fork_case_count(ForkCase::StateContested),
-            event_count(Origin::Local),
-            event_count(Origin::Federated),
-        );
+        let metrics = Metrics::new();
+        metrics.record_append(Origin::Local, ForkCase::NonState);
+        metrics.record_append(Origin::Federated, ForkCase::StateUncontested);
+        metrics.record_contested_state();
 
-        record_append(Origin::Local, ForkCase::NonState);
-        record_append(Origin::Federated, ForkCase::StateUncontested);
-        record_contested_state();
-
-        assert_eq!(fork_case_count(ForkCase::NonState), before.0 + 1);
-        assert_eq!(fork_case_count(ForkCase::StateUncontested), before.1 + 1);
-        assert_eq!(fork_case_count(ForkCase::StateContested), before.2 + 1);
-        assert_eq!(event_count(Origin::Local), before.3 + 1);
+        assert_eq!(metrics.fork_case_count(ForkCase::NonState), 1);
+        assert_eq!(metrics.fork_case_count(ForkCase::StateUncontested), 1);
+        assert_eq!(metrics.fork_case_count(ForkCase::StateContested), 1);
+        assert_eq!(metrics.event_count(Origin::Local), 1);
         // One federated event: a contested fork is a decision, not an
         // append, and the send that steps around it is counted on its own.
-        assert_eq!(event_count(Origin::Federated), before.4 + 1);
+        assert_eq!(metrics.event_count(Origin::Federated), 1);
     }
 
     /// The subscriber gauge is balanced: what goes up comes back down,
     /// and an unbalanced decrement cannot wrap it.
-    ///
-    /// Here rather than in the integration tests because this binary does
-    /// not share the gauge with a concurrently running HTTP test, which
-    /// makes it deterministic instead of merely usually right.
     #[test]
     fn the_subscriber_gauge_is_balanced() {
-        let before = sync_subscribers();
-        sync_waiter_started();
-        assert_eq!(sync_subscribers(), before + 1);
-        sync_waiter_finished();
-        assert_eq!(sync_subscribers(), before);
+        let metrics = Metrics::new();
+        metrics.sync_waiter_started();
+        assert_eq!(metrics.sync_subscribers(), 1);
+        metrics.sync_waiter_finished();
+        assert_eq!(metrics.sync_subscribers(), 0);
         // One too many decrements must not wrap to u64::MAX and report
         // every client on earth as connected to this server.
-        sync_waiter_finished();
-        assert!(sync_subscribers() <= before);
+        metrics.sync_waiter_finished();
+        assert_eq!(metrics.sync_subscribers(), 0);
     }
 
     /// The exposition is the contract, so it is asserted rather than eyeballed.
     #[test]
     fn the_exposition_is_well_formed() {
-        let text = render();
+        let text = Metrics::new().render();
         for name in [
             "spindle_build_info",
             "spindle_events_appended_total",
@@ -619,7 +633,7 @@ mod tests {
         for case in ["1", "2", "3"] {
             assert!(
                 text.contains(&format!(
-                    "spindle_fork_resolutions_total{{case=\"{case}\"}} "
+                    "spindle_fork_resolutions_total{{case=\"{case}\"}} 0"
                 )),
                 "{text}"
             );
@@ -627,7 +641,7 @@ mod tests {
         for origin in ["local", "federated"] {
             assert!(
                 text.contains(&format!(
-                    "spindle_events_appended_total{{origin=\"{origin}\"}} "
+                    "spindle_events_appended_total{{origin=\"{origin}\"}} 0"
                 )),
                 "{text}"
             );

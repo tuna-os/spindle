@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use spindle_server::metrics::{self, ForkCase, Origin};
+use spindle_server::metrics::{ForkCase, Metrics, Origin};
 use spindle_store::FjallStore;
 use tempfile::TempDir;
 
@@ -16,6 +16,9 @@ struct Instance {
     _dir: TempDir,
     name: String,
     client: reqwest::Client,
+    /// The server's own registry: what its `/metrics` would render, read
+    /// directly so an assertion is about this instance and nothing else.
+    metrics: Arc<Metrics>,
 }
 
 impl Instance {
@@ -28,7 +31,9 @@ impl Instance {
             "[server]\nname = \"{name}\"\n[ratelimit]\nenabled = false\n"
         ))
         .unwrap();
-        let app = spindle_server::app(config, store).expect("the app builds");
+        let metrics = Arc::new(Metrics::new());
+        let app = spindle_server::app_with_metrics(config, store, Arc::clone(&metrics))
+            .expect("the app builds");
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -36,6 +41,7 @@ impl Instance {
             _dir: dir,
             name,
             client: reqwest::Client::new(),
+            metrics,
         }
     }
 
@@ -90,9 +96,9 @@ async fn ordinary_traffic_moves_the_case_counters() {
     let server = Instance::start().await;
     let token = server.register("alice").await;
 
-    let before_local = metrics::event_count(Origin::Local);
-    let before_case1 = metrics::fork_case_count(ForkCase::NonState);
-    let before_case2 = metrics::fork_case_count(ForkCase::StateUncontested);
+    let before_local = server.metrics.event_count(Origin::Local);
+    let before_case1 = server.metrics.fork_case_count(ForkCase::NonState);
+    let before_case2 = server.metrics.fork_case_count(ForkCase::StateUncontested);
 
     // Creating a room is a burst of state events (case 2); a message is a
     // non-state event (case 1). Both are local.
@@ -118,15 +124,15 @@ async fn ordinary_traffic_moves_the_case_counters() {
     assert_eq!(status, 200, "{body}");
 
     assert!(
-        metrics::fork_case_count(ForkCase::NonState) > before_case1,
+        server.metrics.fork_case_count(ForkCase::NonState) > before_case1,
         "the message is a case-1 append"
     );
     assert!(
-        metrics::fork_case_count(ForkCase::StateUncontested) > before_case2,
+        server.metrics.fork_case_count(ForkCase::StateUncontested) > before_case2,
         "the room's state events are case-2 appends"
     );
     assert!(
-        metrics::event_count(Origin::Local) > before_local,
+        server.metrics.event_count(Origin::Local) > before_local,
         "and all of them are local"
     );
 }
@@ -146,21 +152,17 @@ async fn the_exposition_carries_what_the_counters_hold() {
     assert_eq!(status, 200, "{body}");
 
     // The scrape is a rendering of the same counters, so it must agree
-    // with them rather than being assembled separately.
-    //
-    // Bracketed rather than compared to a single reading. The counters are
-    // process-global and every other test in this binary is appending to
-    // them concurrently, so `render()` and a reading taken after it are
-    // two different instants: asserting they are equal asserts that
-    // nothing happened in between, which is not a property of the code.
-    // The render happened inside this window, so its value has to lie in
-    // it -- an exposition assembled from anywhere but these counters still
-    // falls outside, which is what the test is for.
-    let before_local = metrics::event_count(Origin::Local);
-    let before_case2 = metrics::fork_case_count(ForkCase::StateUncontested);
-    let text = metrics::render();
-    let after_local = metrics::event_count(Origin::Local);
-    let after_case2 = metrics::fork_case_count(ForkCase::StateUncontested);
+    // with them rather than being assembled separately. Equal, not
+    // bracketed: the registry is this instance's own (#174), nothing else
+    // in this binary appends to it, so the render and the readings around
+    // it see one value.
+    let before_local = server.metrics.event_count(Origin::Local);
+    let before_case2 = server.metrics.fork_case_count(ForkCase::StateUncontested);
+    let text = server.metrics.render();
+    let after_local = server.metrics.event_count(Origin::Local);
+    let after_case2 = server.metrics.fork_case_count(ForkCase::StateUncontested);
+    assert_eq!(before_local, after_local, "nothing else appends here");
+    assert_eq!(before_case2, after_case2, "nothing else appends here");
     let scraped = |needle: &str| -> u64 {
         text.lines()
             .find(|line| line.starts_with(needle))
@@ -190,14 +192,13 @@ async fn the_exposition_carries_what_the_counters_hold() {
 /// #16's test has something to assert against when it lands.
 #[test]
 fn the_contested_case_is_wired_and_visible() {
-    let before = metrics::fork_case_count(ForkCase::StateContested);
-    metrics::record_contested_state();
-    assert_eq!(
-        metrics::fork_case_count(ForkCase::StateContested),
-        before + 1
-    );
+    let metrics = Metrics::new();
+    metrics.record_contested_state();
+    assert_eq!(metrics.fork_case_count(ForkCase::StateContested), 1);
     assert!(
-        metrics::render().contains("spindle_fork_resolutions_total{case=\"3\"}"),
+        metrics
+            .render()
+            .contains("spindle_fork_resolutions_total{case=\"3\"} 1"),
         "case 3 must have a series even at zero"
     );
 }
@@ -241,7 +242,7 @@ async fn serving_a_request_times_it_under_its_matched_route() {
         .await;
     assert_eq!(status, 200, "{body}");
 
-    let text = metrics::render();
+    let text = server.metrics.render();
     let template = "/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}";
     let count = scrape(
         &text,
@@ -272,7 +273,7 @@ async fn committing_an_event_times_the_append() {
     let server = Instance::start().await;
     let token = server.register("dave").await;
     let before = scrape(
-        &metrics::render(),
+        &server.metrics.render(),
         "spindle_append_duration_seconds_count{durability=\"group\"}",
     )
     .unwrap_or(0);
@@ -287,7 +288,7 @@ async fn committing_an_event_times_the_append() {
         .await;
     assert_eq!(status, 200, "{body}");
 
-    let text = metrics::render();
+    let text = server.metrics.render();
     let after = scrape(
         &text,
         "spindle_append_duration_seconds_count{durability=\"group\"}",
@@ -343,7 +344,7 @@ async fn syncing_records_how_stale_the_newest_event_was() {
         .await;
     assert_eq!(status, 200, "{body}");
 
-    let before = scrape(&metrics::render(), "spindle_sync_lag_seconds_count{}").unwrap_or(0);
+    let before = scrape(&server.metrics.render(), "spindle_sync_lag_seconds_count{}").unwrap_or(0);
     let (status, body) = server
         .request(
             reqwest::Method::GET,
@@ -354,7 +355,7 @@ async fn syncing_records_how_stale_the_newest_event_was() {
         .await;
     assert_eq!(status, 200, "{body}");
 
-    let text = metrics::render();
+    let text = server.metrics.render();
     let after = scrape(&text, "spindle_sync_lag_seconds_count{}")
         .expect("the lag histogram exists once a sync has delivered something");
     assert!(after > before, "{before} -> {after}");
@@ -377,9 +378,10 @@ async fn the_federation_queue_gauge_caps_its_label_set() {
     let many: Vec<(String, u64)> = (0..25u64)
         .map(|n| (format!("peer{n}.example"), n + 1))
         .collect();
-    spindle_server::metrics::set_federation_queue(&many);
+    let metrics = Metrics::new();
+    metrics.set_federation_queue(&many);
 
-    let text = metrics::render();
+    let text = metrics.render();
     let series = text
         .lines()
         .filter(|line| line.starts_with("spindle_federation_queue_depth{"))
@@ -398,8 +400,8 @@ async fn the_federation_queue_gauge_caps_its_label_set() {
         "{text}"
     );
     // And a fresh reading replaces rather than accumulates.
-    spindle_server::metrics::set_federation_queue(&[("solo.example".to_owned(), 3)]);
-    let text = metrics::render();
+    metrics.set_federation_queue(&[("solo.example".to_owned(), 3)]);
+    let text = metrics.render();
     assert!(!text.contains("peer24.example"), "stale gauge: {text}");
     assert!(text.contains("spindle_federation_queue_depth{destination=\"solo.example\"} 3"));
 }
@@ -428,6 +430,7 @@ async fn a_blocked_sync_shows_up_as_a_subscriber() {
     // can expire before the request even reaches the server, which is a
     // flaky test rather than a real signal.
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let metrics = Arc::clone(&server.metrics);
     let waiting = {
         let done = std::sync::Arc::clone(&done);
         async move {
@@ -446,7 +449,7 @@ async fn a_blocked_sync_shows_up_as_a_subscriber() {
     let observing = async {
         let mut peak = 0;
         while !done.load(std::sync::atomic::Ordering::Relaxed) {
-            peak = peak.max(metrics::sync_subscribers());
+            peak = peak.max(metrics.sync_subscribers());
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         peak
