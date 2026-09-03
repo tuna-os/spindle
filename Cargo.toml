@@ -12,18 +12,18 @@ rust-version = "1.90"
 repository = "https://github.com/tuna-os/spindle"
 
 [workspace.dependencies]
-argon2 = "0.5"
+argon2 = "0.6"
 axum = "0.8"
 form_urlencoded = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "gzip", "stream"] }
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-sha2 = "0.10"
+sha2 = "0.11"
 # TURN's REST credential scheme is specified as HMAC-SHA1 and coturn
 # implements exactly that, so this is interoperability rather than a choice:
 # a SHA-256 digest here would authenticate against nothing.
-sha1 = "0.10"
-hmac = "0.12"
+sha1 = "0.11"
+hmac = "0.13"
 blake3 = "1.8"
 # Thumbnails only. Default features off and codecs named, because the default
 # set drags in every format the crate knows -- each decoder is attack surface
