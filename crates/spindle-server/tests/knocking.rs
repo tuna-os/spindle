@@ -279,19 +279,78 @@ async fn a_member_can_answer_a_knock_with_an_invite() {
 }
 
 #[tokio::test]
-async fn knocking_on_a_room_this_server_does_not_hold_says_so() {
+async fn knocking_on_a_room_elsewhere_is_taken_to_the_server_that_holds_it() {
     let harness = Harness::new();
     let bob = harness.register("bob").await;
 
-    // Not a 404 that reads "no such room": the room may be perfectly real
-    // and simply elsewhere, and the federated knock is the next slice.
+    // Not a 404 that reads "no such room". The domain in the room ID names a
+    // server to ask, so the knock is carried there over
+    // `make_knock`/`send_knock` -- and `remote.example` does not resolve, so
+    // what comes back is a gateway failure. The distinction is the whole
+    // point: "nobody could be reached" is a transient fault worth retrying,
+    // and "no such room" is not.
     let (status, body) = harness.knock("!elsewhere:remote.example", &bob, None).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert!(
         body["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("federation"),
-        "the refusal does not say what is missing: {body}"
+            .contains("admitted the knock"),
+        "the refusal does not say what was attempted: {body}"
+    );
+}
+
+/// The subtest that stayed red after everything else about knocking passed
+/// (#229): *Users in the room see a user's membership update when they
+/// knock*. Complement knocks twice with different reasons, then reads the
+/// observer's initial sync and asserts the *first* reason on whichever
+/// member event it finds first -- and it looks in `state` before `timeline`.
+/// This server sent the state *after* the window as `state`, so the block
+/// named the second knock, and the checker failed on a reason the first
+/// knock never carried. The spec's `state` is the state before the window;
+/// with both knocks inside it, the knocker is not in the block at all.
+#[tokio::test]
+async fn an_observers_initial_sync_does_not_contradict_the_timeline_about_a_knocker() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness.private_room(&alice).await;
+    harness.set_join_rule(&room, &alice, "knock").await;
+    assert_eq!(
+        harness.knock(&room, &bob, Some("Let me in")).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        harness.knock(&room, &bob, Some("knock knock")).await.0,
+        StatusCode::OK
+    );
+
+    let sync = harness.sync(&alice).await;
+    let joined = &sync["rooms"]["join"][&room];
+    let bobs_reasons = |events: &Value| -> Vec<String> {
+        events
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                event["type"] == "m.room.member" && event["state_key"] == "@bob:example.org"
+            })
+            .map(|event| {
+                event["content"]["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect()
+    };
+    assert_eq!(
+        bobs_reasons(&joined["timeline"]["events"]),
+        vec!["Let me in", "knock knock"],
+        "both knocks, in order: {joined}"
+    );
+    assert_eq!(
+        bobs_reasons(&joined["state"]["events"]),
+        Vec::<String>::new(),
+        "the state block is the state before the window, and bob had not knocked yet: {joined}"
     );
 }
