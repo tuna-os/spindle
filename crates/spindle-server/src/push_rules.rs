@@ -439,7 +439,38 @@ fn property<'a>(event: &'a Value, key: &str) -> Option<&'a Value> {
 /// unbounded must cover the whole value. `None` only if the regex engine
 /// refuses what was built, which nothing here should be able to make it
 /// do; a rule that cannot be compiled matches nothing.
+///
+/// Compiled once per distinct pattern and kept. The default ruleset alone
+/// carries half a dozen globs, and the push loop evaluates it for every
+/// reader of every event: at a thousand members a single message was a
+/// thousand rulesets, and compiling the regexes was most of the ~100 µs
+/// each cost. Patterns come from users' own rules, so the cache is bounded
+/// rather than trusted: past `GLOB_CACHE_CAP` distinct patterns it starts
+/// over, which costs a recompile and never memory.
 fn glob(pattern: &str, bounded: bool) -> Option<regex::Regex> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    type Compiled = HashMap<(String, bool), Option<regex::Regex>>;
+    static CACHE: Mutex<Option<Compiled>> = Mutex::new(None);
+    const GLOB_CACHE_CAP: usize = 4_096;
+
+    let key = (pattern.to_owned(), bounded);
+    let mut guard = CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cache = guard.get_or_insert_with(HashMap::new);
+    if let Some(compiled) = cache.get(&key) {
+        return compiled.clone();
+    }
+    let compiled = compile_glob(pattern, bounded);
+    if cache.len() >= GLOB_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(key, compiled.clone());
+    compiled
+}
+
+fn compile_glob(pattern: &str, bounded: bool) -> Option<regex::Regex> {
     let mut source = String::from("(?i)");
     let first_is_word = pattern
         .chars()

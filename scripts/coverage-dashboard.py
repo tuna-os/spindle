@@ -146,10 +146,20 @@ MILESTONES = [
      "defines no push rule of its own: a ring is routed by `m.mentions`, "
      "so the default mention rules are what make a fresh account's phone "
      "ring, at high priority, and an MSC4310 decline carries no mention "
-     "and pushes nobody. What #39 still owes: the ring dispatch latency "
-     "benchmark and a ring budget separate from ordinary push. #38, #40 "
-     "and #41 are not started; #269 would run Element Call's own "
-     "Playwright suite against this server."),
+     "and pushes nobody. The ring has a budget of its own "
+     "(`[ratelimit] rings_per_minute`, ten by default), because it is the "
+     "one event that makes every phone in a room sound and no other send "
+     "is limited at all. The ring dispatch latency benchmark "
+     "(`--bench ring_latency`) is published in docs/benchmarks.md: the "
+     "first phone rings within the push loop's 100 ms tick up to a hundred "
+     "members and within a quarter second at a thousand, and the last "
+     "within one gateway round-trip per member, which is what one gateway "
+     "URL serving every device costs. Its first run found the loop "
+     "compiling every rule's glob per reader per event, and a per-gateway "
+     "queue cap one ring in a large room could fill; both are fixed and "
+     "written up there. #38, #40 "
+     "and #41 are next; #269 would run Element Call's own Playwright suite "
+     "against this server."),
 ]
 
 # ---------------------------------------------------------------------------

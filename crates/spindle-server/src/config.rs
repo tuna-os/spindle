@@ -373,12 +373,30 @@ pub struct ServerConfig {
 pub struct RateLimitConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// How many `MatrixRTC` rings (MSC4075 `m.rtc.notification`) one
+    /// account may send per minute, across all its rooms.
+    ///
+    /// A ring is the one event a sender can make every phone in a room
+    /// sound at once, at high priority and past do-not-disturb, which is
+    /// why it has a budget of its own rather than sharing whatever ordinary
+    /// sends get (#39). Ten a minute is a person redialling; a script
+    /// making a room ring continuously is what the budget is for. Off when
+    /// `enabled` is off, like every other rate here.
+    #[serde(default = "default_rings_per_minute")]
+    pub rings_per_minute: u32,
 }
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            rings_per_minute: default_rings_per_minute(),
+        }
     }
+}
+
+const fn default_rings_per_minute() -> u32 {
+    10
 }
 
 const fn default_true() -> bool {
@@ -581,6 +599,15 @@ impl Config {
                 field: "delayed_events.max_per_room",
                 message: "must be greater than zero; a zero cap refuses every delayed event"
                     .to_owned(),
+            });
+        }
+        // A ring budget of zero is not "unlimited" either: it refuses every
+        // ring, and a call nobody can be summoned to is a feature silently
+        // off.
+        if self.ratelimit.rings_per_minute == 0 {
+            return Err(ConfigError::Invalid {
+                field: "ratelimit.rings_per_minute",
+                message: "must be greater than zero; a zero budget refuses every ring".to_owned(),
             });
         }
         for (field, value) in [
