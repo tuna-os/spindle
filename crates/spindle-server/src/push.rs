@@ -212,6 +212,9 @@ pub async fn deliver_loop(sources: Sources, retry_base: Duration) {
                 .max(Duration::from_millis(25)),
         )
         .await;
+        // Plan under the strong references, send under none: a request in
+        // flight to a gateway that never answers must not be what keeps
+        // the store open while the runtime shuts down (#292).
         let (Some(store), Some(rooms), Some(pushers), Some(account_data), Some(profiles)) = (
             sources.store.upgrade(),
             sources.rooms.upgrade(),
@@ -253,21 +256,20 @@ pub async fn deliver_loop(sources: Sources, retry_base: Duration) {
                 Err(error) => tracing::warn!("push: reading the stream: {error}"),
             }
         }
+        drop((store, rooms, pushers, account_data, profiles));
 
-        let urls: Vec<String> = queues.keys().cloned().collect();
-        for url in urls {
-            if let Some((_, until)) = backoff.get(&url)
-                && *until > Instant::now()
-            {
-                continue;
-            }
-            let Some(queue) = queues.get_mut(&url) else {
-                continue;
-            };
-            let Some(mut pending) = queue.pop_front() else {
-                queues.remove(&url);
-                continue;
-            };
+        // One notification per gateway per pass, taken from the queues
+        // that are not backing off. The gateway client owns no store.
+        let now = Instant::now();
+        let due: Vec<(String, Pending)> = queues
+            .iter_mut()
+            .filter(|(url, _)| backoff.get(*url).is_none_or(|(_, until)| *until <= now))
+            .filter_map(|(url, queue)| queue.pop_front().map(|pending| (url.clone(), pending)))
+            .collect();
+        queues.retain(|_, queue| !queue.is_empty());
+
+        let mut removals: Vec<(String, String, String)> = Vec::new();
+        for (url, mut pending) in due {
             match gateway.notify(&url, &pending.body).await {
                 Ok(rejected) => {
                     backoff.remove(&url);
@@ -277,7 +279,11 @@ pub async fn deliver_loop(sources: Sources, retry_base: Duration) {
                             // (the app was uninstalled, the token
                             // revoked). The spec has the homeserver
                             // remove the pusher, and nothing else would.
-                            let _ = pushers.remove(&pending.user_id, app_id, pushkey);
+                            removals.push((
+                                pending.user_id.clone(),
+                                app_id.clone(),
+                                pushkey.clone(),
+                            ));
                         }
                     }
                 }
@@ -288,12 +294,23 @@ pub async fn deliver_loop(sources: Sources, retry_base: Duration) {
                     tracing::debug!("push to {url}: {why}");
                     pending.attempts += 1;
                     if pending.attempts < MAX_ATTEMPTS {
-                        queue.push_front(pending);
+                        queues.entry(url.clone()).or_default().push_front(pending);
                     }
                     let failures = backoff.get(&url).map_or(0, |(count, _)| *count) + 1;
                     let delay = retry_base * 2_u32.saturating_pow(failures.min(6));
-                    backoff.insert(url.clone(), (failures, Instant::now() + delay));
+                    backoff.insert(url, (failures, Instant::now() + delay));
                 }
+            }
+        }
+        if !removals.is_empty() {
+            // The registrations outlive a shutdown either way: a rejected
+            // pushkey the loop could not forget is forgotten on the next
+            // answer from that gateway.
+            let Some(pushers) = sources.pushers.upgrade() else {
+                return;
+            };
+            for (user_id, app_id, pushkey) in removals {
+                let _ = pushers.remove(&user_id, &app_id, &pushkey);
             }
         }
     }
