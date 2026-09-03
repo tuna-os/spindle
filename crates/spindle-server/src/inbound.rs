@@ -13,6 +13,8 @@
 //! dashboard and `surface.rs` check against. The outbound client
 //! (`federation.rs`) is the other half of the same protocol.
 
+use std::collections::HashMap;
+
 use axum::Json;
 use axum::http::StatusCode;
 use serde::Deserialize;
@@ -49,13 +51,26 @@ pub(crate) fn report_refused_pdu(origin: &str, event_id: &str, pdu: &Value, reas
     );
 }
 
+///
+/// `signer` is the server whose `keys` these are, and the sender has to live
+/// there: the transaction's origin for its own users' events, or, for a
+/// membership event the origin relays on behalf of a user elsewhere (a join,
+/// knock or leave it brokered), that user's own server -- see
+/// [`relayed_membership_signer`].
 pub(crate) fn receive_one_pdu(
     state: &AppState,
-    origin: &str,
+    signer: &str,
     keys: Option<&crate::federation::PeerKeys>,
     pdu: &Value,
+    delivery: Delivery,
 ) -> (String, Result<(), String>) {
     use ruma::CanonicalJsonValue;
+
+    // The same acceptance either way; only who fans the event out differs.
+    let receive = |room_id: &str, event_id: &str, json: &Value| match delivery {
+        Delivery::Transaction => state.rooms.receive_remote(room_id, event_id, json),
+        Delivery::Brokered => state.rooms.receive_brokered(room_id, event_id, json),
+    };
 
     let Ok(CanonicalJsonValue::Object(canonical)) = CanonicalJsonValue::try_from(pdu.clone())
     else {
@@ -65,14 +80,16 @@ pub(crate) fn receive_one_pdu(
         );
     };
 
-    // The sender must live on the origin: a transaction is a server
+    // The sender must live on the signer: a transaction is a server
     // speaking for its own users, and accepting someone else's would let
-    // any peer forge any server's events into our rooms.
+    // any peer forge any server's events into our rooms. The signature
+    // check below is against the signer's keys, so this is what ties the
+    // event to the server that can answer for it.
     let sender_domain = pdu["sender"]
         .as_str()
         .and_then(|sender| sender.split_once(':'))
         .map(|(_, domain)| domain);
-    if sender_domain != Some(origin) {
+    if sender_domain != Some(signer) {
         return (
             "$foreign-sender".to_owned(),
             Err("the sender does not live on the origin".to_owned()),
@@ -113,7 +130,7 @@ pub(crate) fn receive_one_pdu(
                         Err(error) => return (event_id, Err(format!("redaction: {error}"))),
                     };
                 let json = serde_json::to_value(&redacted).unwrap_or(Value::Null);
-                return match state.rooms.receive_remote(
+                return match receive(
                     pdu["room_id"].as_str().unwrap_or_default(),
                     &event_id,
                     &json,
@@ -129,10 +146,99 @@ pub(crate) fn receive_one_pdu(
     let Some(room_id) = pdu["room_id"].as_str() else {
         return (event_id, Err("no room_id".to_owned()));
     };
-    match state.rooms.receive_remote(room_id, &event_id, pdu) {
+    match receive(room_id, &event_id, pdu) {
         Ok(()) => (event_id, Ok(())),
         Err(error) => (event_id, Err(error.to_string())),
     }
+}
+
+/// Judge and apply each PDU of one transaction, keyed by the event ID this
+/// server computed for it.
+///
+/// A membership event the origin relays for a user elsewhere verifies
+/// against that user's server, fetched once per server per batch. A fetch
+/// that fails refuses that PDU alone, not the transaction: the origin's own
+/// events are still its to deliver.
+async fn receive_pdus(
+    state: &AppState,
+    origin: &str,
+    key_map: Option<&crate::federation::PeerKeys>,
+    pdus: &[Value],
+) -> serde_json::Map<String, Value> {
+    let mut relayed_keys: HashMap<String, Option<crate::federation::PeerKeys>> = HashMap::new();
+    let mut results = serde_json::Map::new();
+    for pdu in pdus {
+        let relayed = relayed_membership_signer(origin, pdu);
+        if let Some(domain) = &relayed
+            && !relayed_keys.contains_key(domain)
+        {
+            let fetched = state.federation.peer_keys(domain).await;
+            if let Err(error) = &fetched {
+                tracing::debug!("cannot fetch {domain} keys for a relayed membership: {error}");
+            }
+            relayed_keys.insert(domain.clone(), fetched.ok());
+        }
+        let (event_id, outcome) = match &relayed {
+            Some(domain) => match relayed_keys.get(domain).and_then(Option::as_ref) {
+                Some(keys) => {
+                    receive_one_pdu(state, domain, Some(keys), pdu, Delivery::Transaction)
+                }
+                None => (
+                    "$unverifiable".to_owned(),
+                    Err(format!(
+                        "{domain}'s keys cannot be fetched to verify its user's membership"
+                    )),
+                ),
+            },
+            None => receive_one_pdu(state, origin, key_map, pdu, Delivery::Transaction),
+        };
+        let result = match outcome {
+            Ok(()) => json!({}),
+            Err(reason) => {
+                report_refused_pdu(origin, &event_id, pdu, &reason);
+                json!({ "error": reason })
+            }
+        };
+        results.insert(event_id, result);
+    }
+    results
+}
+
+/// The server whose keys verify `pdu` when `origin` is relaying it: the
+/// sender's own, for a membership event about the sender from a server
+/// other than the origin. `None` when the origin speaks for itself.
+///
+/// This is the one shape a server legitimately sends on another's behalf.
+/// A join, knock or leave brokered through `send_join`/`send_knock`/
+/// `send_leave` is signed by the user's server, which is not in the room
+/// and cannot deliver it, so the resident that admitted it does
+/// (`Rooms::receive_brokered`) -- and every other server in the room then
+/// receives a PDU whose sender is not on the transaction's origin. Refusing
+/// those, as this server did, meant no remote user's federated join, knock
+/// or leave ever reached a room this server was merely in. Nothing else is
+/// relayed: a message claiming a sender elsewhere is still the forgery the
+/// origin rule exists to refuse, and it is refused without a key fetch.
+fn relayed_membership_signer(origin: &str, pdu: &Value) -> Option<String> {
+    let sender = pdu["sender"].as_str()?;
+    if pdu["type"].as_str() != Some("m.room.member") || pdu["state_key"].as_str() != Some(sender) {
+        return None;
+    }
+    let (_, domain) = sender.split_once(':')?;
+    (domain != origin).then(|| domain.to_owned())
+}
+
+/// How a PDU reached this server, which decides who fans it out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    /// In a `/send` transaction from a server in the room: the origin fans
+    /// its own events out, and forwarding it again would deliver everything
+    /// twice.
+    Transaction,
+    /// Handed back through a `send_join`/`send_knock`/`send_leave`
+    /// handshake by a server that is not in the room and cannot reach the
+    /// servers that are, so this one does it for them
+    /// (`Rooms::receive_brokered`).
+    Brokered,
 }
 
 /// Finish a membership template: stamp a timestamp if the resident server
@@ -356,18 +462,7 @@ pub(crate) async fn send_transaction(
         })?)
     };
 
-    let mut results = serde_json::Map::new();
-    for pdu in &pdus {
-        let (event_id, outcome) = receive_one_pdu(&state, &origin, key_map.as_ref(), pdu);
-        let result = match outcome {
-            Ok(()) => json!({}),
-            Err(reason) => {
-                report_refused_pdu(&origin, &event_id, pdu, &reason);
-                json!({ "error": reason })
-            }
-        };
-        results.insert(event_id, result);
-    }
+    let results = receive_pdus(&state, &origin, key_map.as_ref(), &pdus).await;
 
     // EDUs after PDUs, so a join and the typing that follows it land in
     // order within one transaction. `m.typing` only, and only about the
@@ -760,7 +855,8 @@ pub(crate) async fn send_knock(
             "the origin's keys cannot be verified".to_owned(),
         )
     })?;
-    let (computed_id, outcome) = receive_one_pdu(&state, &origin, Some(&key_map), &knock);
+    let (computed_id, outcome) =
+        receive_one_pdu(&state, &origin, Some(&key_map), &knock, Delivery::Brokered);
     if computed_id != event_id {
         return Err(MatrixError::bad_json(format!(
             "the event hashes to {computed_id}, not {event_id}"
@@ -1073,7 +1169,8 @@ pub(crate) async fn send_leave_common(
             "the origin's keys cannot be verified".to_owned(),
         )
     })?;
-    let (computed_id, outcome) = receive_one_pdu(&state, &origin, Some(&key_map), &leave);
+    let (computed_id, outcome) =
+        receive_one_pdu(&state, &origin, Some(&key_map), &leave, Delivery::Brokered);
     if computed_id != event_id {
         return Err(MatrixError::bad_json(format!(
             "the event hashes to {computed_id}, not {event_id}"
@@ -1154,7 +1251,8 @@ pub(crate) async fn send_join_common(
         // -- a nomination this server did not make is not one it endorses.
         _ => join,
     };
-    let (computed_id, outcome) = receive_one_pdu(&state, &origin, Some(&key_map), &join);
+    let (computed_id, outcome) =
+        receive_one_pdu(&state, &origin, Some(&key_map), &join, Delivery::Brokered);
     // The path names the event the peer computed; disagreement means one
     // side hashed a different event than the other signed.
     if computed_id != event_id {

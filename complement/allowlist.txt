@@ -309,3 +309,29 @@ TestRoomState/Parallel/PUT_/createRoom_with_creation_content
 TestRoomsInvite
 TestRoomsInvite/Parallel
 TestRoomsInvite/Parallel/Invited_user_can_see_room_metadata
+# Promoted 2026-09-03: the whole of both knocking suites (#229, #231).
+# Every `#01` here is Complement's federated variant, which failed on the
+# 404 the knock route answered with until the federated knock landed on
+# main; the two "Users in the room see..." subtests failed on the state
+# block naming the second knock. Each verified on two consecutive local
+# runs of both suites against the same image.
+TestKnocking
+TestKnocking/A_user_can_knock_on_a_room_without_a_reason#01
+TestKnocking/A_user_cannot_knock_on_a_room_they_are_already_invited_to#01
+TestKnocking/A_user_in_the_room_can_reject_a_knock#01
+TestKnocking/A_user_that_has_already_knocked_is_allowed_to_knock_again_on_the_same_room#01
+TestKnocking/Attempting_to_join_a_room_with_join_rule_'knock'_without_an_invite_should_fail#01
+TestKnocking/Knocking_on_a_room_with_a_join_rule_other_than_'knock'_should_fail#01
+TestKnocking/Knocking_on_a_room_with_join_rule_'knock'_should_succeed#01
+TestKnocking/Users_in_the_room_see_a_user's_membership_update_when_they_knock
+TestKnocking/Users_in_the_room_see_a_user's_membership_update_when_they_knock#01
+TestKnockingInMSC3787Room
+TestKnockingInMSC3787Room/A_user_can_knock_on_a_room_without_a_reason#01
+TestKnockingInMSC3787Room/A_user_cannot_knock_on_a_room_they_are_already_invited_to#01
+TestKnockingInMSC3787Room/A_user_in_the_room_can_reject_a_knock#01
+TestKnockingInMSC3787Room/A_user_that_has_already_knocked_is_allowed_to_knock_again_on_the_same_room#01
+TestKnockingInMSC3787Room/Attempting_to_join_a_room_with_join_rule_'knock'_without_an_invite_should_fail#01
+TestKnockingInMSC3787Room/Knocking_on_a_room_with_a_join_rule_other_than_'knock'_should_fail#01
+TestKnockingInMSC3787Room/Knocking_on_a_room_with_join_rule_'knock'_should_succeed#01
+TestKnockingInMSC3787Room/Users_in_the_room_see_a_user's_membership_update_when_they_knock
+TestKnockingInMSC3787Room/Users_in_the_room_see_a_user's_membership_update_when_they_knock#01

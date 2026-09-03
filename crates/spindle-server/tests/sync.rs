@@ -274,13 +274,13 @@ async fn a_room_joined_since_the_token_arrives_as_an_initial_sync_would_send_it(
     let joined = harness.sync(&bob, Some(&since)).await;
     let room = &joined["rooms"]["join"][&room_id];
     assert_eq!(bodies(room), vec!["before bob"], "{room}");
-    let kinds: Vec<&str> = room["state"]["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|event| event["type"].as_str().unwrap())
-        .collect();
-    assert!(kinds.contains(&"m.room.create"), "{room}");
+    // The whole room fit in the window, so there is no state *before* it
+    // and the client meets the room through its timeline, creation first.
+    assert!(
+        room["state"]["events"].as_array().unwrap().is_empty(),
+        "{room}"
+    );
+    assert!(kinds(room).contains(&"m.room.create"), "{room}");
     let from = room["timeline"]["prev_batch"]
         .as_str()
         .expect("the window says where it begins")
@@ -300,6 +300,89 @@ async fn a_room_joined_since_the_token_arrives_as_an_initial_sync_would_send_it(
         0,
         "{room}"
     );
+}
+
+/// The event types in a room's sync window, in order.
+fn kinds(room: &Value) -> Vec<&str> {
+    room["timeline"]["events"]
+        .as_array()
+        .expect("a timeline")
+        .iter()
+        .filter_map(|event| event["type"].as_str())
+        .collect()
+}
+
+/// `state` is the state before the window, as the spec has it, and MSC4222's
+/// `state_after` the state after it. Until #229 this server sent the state
+/// after the window under both names: a client folding the timeline onto it
+/// lands in the same place, so no client noticed, but a reader entitled to
+/// take `state` at its word -- Complement's sync checker looks there before
+/// the timeline -- found a knocker's second reason where it expected the
+/// first. The name is changed inside the window here so the two blocks are
+/// forced to differ.
+#[tokio::test]
+async fn the_state_block_is_the_state_before_the_window() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room_id = harness.create_room(&alice).await;
+    let name_path = format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.name");
+    harness
+        .put(&name_path, &alice, &json!({ "name": "before" }))
+        .await;
+    harness.say(&room_id, &alice, "one", "t0").await;
+    harness.say(&room_id, &alice, "two", "t1").await;
+    harness
+        .put(&name_path, &alice, &json!({ "name": "inside" }))
+        .await;
+    harness.say(&room_id, &alice, "three", "t2").await;
+
+    let name_in = |events: &Value| -> Option<String> {
+        events
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["type"] == "m.room.name")
+            .map(|event| event["content"]["name"].as_str().unwrap().to_owned())
+    };
+
+    // A two-event window: the rename and the message after it.
+    let (status, initial) = harness
+        .get("/_matrix/client/v3/sync?timeout=0&timeline_limit=2", &alice)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{initial}");
+    let room = &initial["rooms"]["join"][&room_id];
+    assert_eq!(kinds(room), vec!["m.room.name", "m.room.message"], "{room}");
+    assert_eq!(
+        name_in(&room["state"]["events"]),
+        Some("before".to_owned()),
+        "the state block must not know what the window is about to tell it: {room}"
+    );
+    // Everything set before the window is there in full.
+    let types: Vec<&str> = room["state"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["type"].as_str())
+        .collect();
+    assert!(types.contains(&"m.room.create"), "{types:?}");
+    assert!(types.contains(&"m.room.member"), "{types:?}");
+    assert!(room.get("state_after").is_none(), "{room}");
+
+    // Under MSC4222 the block is the state after the window, and says so.
+    let (status, after) = harness
+        .get(
+            "/_matrix/client/v3/sync?timeout=0&timeline_limit=2&use_state_after=true",
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    let room = &after["rooms"]["join"][&room_id];
+    assert_eq!(
+        name_in(&room["state_after"]["events"]),
+        Some("inside".to_owned()),
+        "{room}"
+    );
+    assert!(room.get("state").is_none(), "{room}");
 }
 
 fn bodies(room: &Value) -> Vec<String> {
@@ -326,16 +409,18 @@ async fn an_initial_sync_gives_state_and_a_tail_and_an_incremental_one_gives_the
     let room = &initial["rooms"]["join"][&room_id];
     assert!(!room.is_null(), "the joined room is missing: {initial}");
     assert_eq!(bodies(room), vec!["before"]);
-    // Initial sync carries state; a client has nothing to render the room from
-    // otherwise.
-    let kinds: Vec<&str> = room["state"]["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|event| event["type"].as_str().unwrap())
-        .collect();
-    assert!(kinds.contains(&"m.room.create"), "{room}");
-    assert!(kinds.contains(&"m.room.member"), "{room}");
+    // Initial sync carries the room's state, and a client has nothing to
+    // render the room from otherwise -- but `state` is the state *before*
+    // the window, and this window reaches back to the room's creation, so
+    // the state arrives as the timeline's own events and the block is
+    // empty. See `the_state_block_is_the_state_before_the_window` for the
+    // case where it is not.
+    assert!(
+        room["state"]["events"].as_array().unwrap().is_empty(),
+        "{room}"
+    );
+    assert!(kinds(room).contains(&"m.room.create"), "{room}");
+    assert!(kinds(room).contains(&"m.room.member"), "{room}");
 
     // Nothing has happened since, so the room is absent rather than present
     // and empty -- a client diffing what it was sent would read an empty
