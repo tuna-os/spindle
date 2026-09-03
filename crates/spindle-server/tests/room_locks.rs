@@ -21,9 +21,9 @@
 //! produces. A wall clock here would measure the machine's mood; a count
 //! is the same number everywhere.
 //!
-//! The counters are process-global, as `metrics` explains, so the reads
-//! and the write live in one sequential test rather than two that would
-//! race: one asserts an exact delta the other would perturb.
+//! Each harness has a registry of its own (#174), so the reads and the
+//! write could be two tests; they stay one because the write's exact
+//! delta is the point, and one sequence is the plainest way to state it.
 
 use std::sync::Arc;
 
@@ -37,6 +37,7 @@ use tower::ServiceExt;
 struct Harness {
     _dir: TempDir,
     app: axum::Router,
+    metrics: Arc<spindle_server::metrics::Metrics>,
 }
 
 impl Harness {
@@ -47,8 +48,13 @@ impl Harness {
             "[server]\nname = \"example.org\"\n\n[ratelimit]\nenabled = false\n",
         )
         .unwrap();
-        let app = spindle_server::app(config, store).unwrap();
-        Self { _dir: dir, app }
+        let metrics = Arc::new(spindle_server::metrics::Metrics::new());
+        let app = spindle_server::app_with_metrics(config, store, Arc::clone(&metrics)).unwrap();
+        Self {
+            _dir: dir,
+            app,
+            metrics,
+        }
     }
 
     async fn call(&self, request: Request<Body>) -> (StatusCode, Value) {
@@ -120,11 +126,11 @@ impl Harness {
 
     /// `(exclusive, shared)` acquisitions of the named counter.
     ///
-    /// Read out of `metrics::render()` -- the same function the `/metrics`
+    /// Read out of `Metrics::render()` -- the same function the `/metrics`
     /// listener serves -- rather than a test-only accessor, so the number
     /// the test trusts is the number an operator scrapes.
-    fn acquisitions(metric: &str) -> (u64, u64) {
-        let text = spindle_server::metrics::render();
+    fn acquisitions(&self, metric: &str) -> (u64, u64) {
+        let text = self.metrics.render();
         let read = |mode: &str| {
             text.lines()
                 .find(|line| line.starts_with(metric) && line.contains(mode))
@@ -135,12 +141,12 @@ impl Harness {
         (read("exclusive"), read("shared"))
     }
 
-    fn room_locks() -> (u64, u64) {
-        Self::acquisitions("spindle_room_lock_acquisitions_total")
+    fn room_locks(&self) -> (u64, u64) {
+        self.acquisitions("spindle_room_lock_acquisitions_total")
     }
 
-    fn registry_locks() -> (u64, u64) {
-        Self::acquisitions("spindle_room_registry_acquisitions_total")
+    fn registry_locks(&self) -> (u64, u64) {
+        self.acquisitions("spindle_room_registry_acquisitions_total")
     }
 
     async fn sync(&self, token: &str, since: Option<&str>) -> Value {
@@ -165,8 +171,9 @@ impl Harness {
 /// Reads take a room shared, writes take it exclusively, and neither
 /// touches the process-wide registry exclusively once the room is open.
 ///
-/// One test rather than three, because the counters are process-global and
-/// separate tests would perturb each other's deltas.
+/// One test rather than three: the counters are this harness's own
+/// (#174), but one sequence of read, read, write states the deltas most
+/// plainly.
 ///
 /// Which calls count as reads is decided by the compiler rather than by
 /// judgement: `with_room_read` hands its closure `&RoomLog`, so anything
@@ -208,11 +215,11 @@ async fn rooms_are_locked_but_the_registry_is_not() {
         ("a warm initial sync", None),
         ("a warm incremental sync", Some(batch.clone())),
     ] {
-        let rooms_before = Harness::room_locks();
-        let registry_before = Harness::registry_locks();
+        let rooms_before = harness.room_locks();
+        let registry_before = harness.registry_locks();
         harness.sync(&alice, since.as_deref()).await;
-        let rooms_after = Harness::room_locks();
-        let registry_after = Harness::registry_locks();
+        let rooms_after = harness.room_locks();
+        let registry_after = harness.registry_locks();
 
         assert_eq!(
             rooms_after.0,
@@ -230,11 +237,11 @@ async fn rooms_are_locked_but_the_registry_is_not() {
         );
     }
 
-    let rooms_before = Harness::room_locks();
-    let registry_before = Harness::registry_locks();
+    let rooms_before = harness.room_locks();
+    let registry_before = harness.registry_locks();
     harness.send(&room, &alice, "one-more").await;
-    let rooms_after = Harness::room_locks();
-    let registry_after = Harness::registry_locks();
+    let rooms_after = harness.room_locks();
+    let registry_after = harness.registry_locks();
     assert!(
         rooms_after.0 > rooms_before.0,
         "a send took no room exclusively: appends to one room are no longer serialised"

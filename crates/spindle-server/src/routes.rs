@@ -102,7 +102,7 @@ pub fn router(state: AppState) -> Router {
         // server does not speak that" from "the thing was not found".
         .fallback(unknown_endpoint)
         .layer(axum::middleware::from_fn(cors))
-        .layer(axum::middleware::from_fn(observe))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), observe))
         .with_state(state)
 }
 
@@ -117,6 +117,7 @@ pub fn router(state: AppState) -> Router {
 /// a single `unmatched` label rather than by whatever it asked for —
 /// otherwise a scanner walking random URLs is an unbounded label source.
 async fn observe(
+    State(state): State<AppState>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -127,7 +128,7 @@ async fn observe(
     let method = request.method().to_string();
     let started = std::time::Instant::now();
     let response = next.run(request).await;
-    crate::metrics::observe_request(
+    state.metrics.observe_request(
         &route,
         &method,
         response.status().as_u16(),

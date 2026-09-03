@@ -33,19 +33,19 @@ use axum::http::{Request, StatusCode};
 use ruma::RoomVersionId;
 use ruma::signatures::{Ed25519KeyPair, hash_and_sign_event};
 use serde_json::{Value, json};
-use spindle_server::metrics::{ForkCase, fork_case_count};
+use spindle_server::metrics::{ForkCase, Metrics};
 use spindle_store::FjallStore;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-/// The fork-case counters are process-global, as metrics registries are, so
-/// a delta is only attributable to one test while no other test is
-/// appending. These tests are the only ones in this binary and each holds
-/// this for its duration.
+/// Serialises the tests in this binary.
 ///
-/// Without it the counter assertions would be the kind that passes by
-/// accident, which is the specific failure #16's exit criterion names: *no
-/// test can pass by silently taking a more expensive path.*
+/// The fork-case counters were process-global once, and a delta was only
+/// attributable to one test while no other test was appending; each
+/// harness has a registry of its own now (#174), so the counters no
+/// longer need this. The two-instance peers below still bind real ports
+/// and share the runtime's clock for their backoff, and one at a time
+/// keeps their timing readable, so the lock stays.
 ///
 /// Each test holds it across its awaits, which clippy flags as a hazard and
 /// which here is the point: serializing them is the whole job. The hazard
@@ -64,11 +64,11 @@ struct Cases {
 }
 
 impl Cases {
-    fn read() -> Self {
+    fn read(metrics: &Metrics) -> Self {
         Self {
-            non_state: fork_case_count(ForkCase::NonState),
-            uncontested: fork_case_count(ForkCase::StateUncontested),
-            contested: fork_case_count(ForkCase::StateContested),
+            non_state: metrics.fork_case_count(ForkCase::NonState),
+            uncontested: metrics.fork_case_count(ForkCase::StateUncontested),
+            contested: metrics.fork_case_count(ForkCase::StateContested),
         }
     }
 
@@ -191,6 +191,7 @@ fn now_millis() -> u64 {
 struct Harness {
     _dir: TempDir,
     app: axum::Router,
+    metrics: Arc<Metrics>,
 }
 
 impl Harness {
@@ -202,8 +203,14 @@ impl Harness {
              [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n",
         )
         .unwrap();
-        let app = spindle_server::app(config, store).expect("the app builds");
-        Self { _dir: dir, app }
+        let metrics = Arc::new(Metrics::new());
+        let app = spindle_server::app_with_metrics(config, store, Arc::clone(&metrics))
+            .expect("the app builds");
+        Self {
+            _dir: dir,
+            app,
+            metrics,
+        }
     }
 
     async fn call(&self, request: Request<Body>) -> (StatusCode, Value) {
@@ -494,9 +501,9 @@ async fn a_fork_of_two_messages_costs_no_resolution() {
     harness.inject(&peer, "fork1", pdu).await;
 
     // The merge: one more local append, naming both extremities.
-    let before = Cases::read();
+    let before = Cases::read(&harness.metrics);
     assert_eq!(harness.say(&room, &alice, "after").await, StatusCode::OK);
-    let delta = Cases::read().since(before);
+    let delta = Cases::read(&harness.metrics).since(before);
 
     assert_eq!(
         delta.contested, 0,
@@ -561,9 +568,9 @@ async fn a_fork_on_slots_neither_branch_held_merges_without_resolution() {
     );
     harness.inject(&peer, "fork2", pdu).await;
 
-    let before = Cases::read();
+    let before = Cases::read(&harness.metrics);
     assert_eq!(harness.say(&room, &alice, "after").await, StatusCode::OK);
-    let delta = Cases::read().since(before);
+    let delta = Cases::read(&harness.metrics).since(before);
     assert_eq!(
         delta.contested, 0,
         "a disjoint-slot fork took the state-resolution path: {delta:?}"
@@ -626,9 +633,9 @@ async fn a_fork_on_the_same_slot_is_counted_once_and_leaves_the_room_writable() 
     );
     harness.inject(&peer, "fork3", pdu).await;
 
-    let before = Cases::read();
+    let before = Cases::read(&harness.metrics);
     let merged = harness.say(&room, &alice, "after").await;
-    let delta = Cases::read().since(before);
+    let delta = Cases::read(&harness.metrics).since(before);
 
     // The severe half of #225: the send after a contested fork answered 500
     // (503 once the error was mapped), and so did every send after it.
@@ -644,7 +651,7 @@ async fn a_fork_on_the_same_slot_is_counted_once_and_leaves_the_room_writable() 
 
     // The room stays writable, and the fork that is still open is not
     // counted again on every send that steps around it.
-    let before = Cases::read();
+    let before = Cases::read(&harness.metrics);
     for attempt in 0..3 {
         assert_eq!(
             harness.say(&room, &alice, &format!("retry{attempt}")).await,
@@ -659,7 +666,7 @@ async fn a_fork_on_the_same_slot_is_counted_once_and_leaves_the_room_writable() 
         StatusCode::OK,
         "a state write after the fork was refused"
     );
-    let delta = Cases::read().since(before);
+    let delta = Cases::read(&harness.metrics).since(before);
     assert_eq!(
         delta.contested, 0,
         "one open fork was counted again on later sends: {delta:?}"
@@ -737,9 +744,9 @@ async fn a_disjoint_fork_on_preexisting_slots_merges_and_leaves_the_room_writabl
     );
     harness.inject(&peer, "disjoint", pdu).await;
 
-    let before = Cases::read();
+    let before = Cases::read(&harness.metrics);
     let merged = harness.say(&room, &alice, "after").await;
-    let delta = Cases::read().since(before);
+    let delta = Cases::read(&harness.metrics).since(before);
 
     assert_eq!(merged, StatusCode::OK, "the disjoint fork was refused");
     assert_eq!(

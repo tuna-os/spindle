@@ -103,7 +103,7 @@ impl Rooms {
             // What this server would author on itself: a template naming
             // a tip this server cannot fold hands the user an event
             // `send_*` then refuses.
-            Self::set_aside_contested(log, room_id)?;
+            self.set_aside_contested(log, room_id)?;
             let head = log
                 .entries()
                 .next_back()
@@ -195,7 +195,7 @@ impl Rooms {
             // What this server would author on itself: a template naming
             // a tip this server cannot fold hands the user an event
             // `send_*` then refuses.
-            Self::set_aside_contested(log, room_id)?;
+            self.set_aside_contested(log, room_id)?;
             let head = log
                 .entries()
                 .next_back()
@@ -263,7 +263,7 @@ impl Rooms {
             // What this server would author on itself: a template naming
             // a tip this server cannot fold hands the user an event
             // `send_*` then refuses.
-            Self::set_aside_contested(log, room_id)?;
+            self.set_aside_contested(log, room_id)?;
             let head = log
                 .entries()
                 .next_back()
