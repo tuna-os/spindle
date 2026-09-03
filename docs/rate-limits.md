@@ -19,15 +19,17 @@ Two different things are bounded here, and they fail differently:
 
 ## Rates
 
-There are five. Three sit on the unauthenticated edge; the two that do not
-are the credential mints MatrixRTC introduced (#38), which are the first
-authenticated rates this server enforces.
+There are six. Three sit on the unauthenticated edge. The other three are
+MatrixRTC's, and they are the only authenticated rates this server
+enforces: the one thing an account can do that makes every phone in a
+room sound (#39), and the two credential mints a call needs (#38).
 
 | Endpoint | Key | Limit | Counted when |
 |---|---|---|---|
 | `POST /login` (password) | account | 5 per 60 s | a failed attempt; a success forgets both keys' history |
 | `POST /login` (password) | source address | 30 per 60 s | a failed attempt |
 | `POST /register` | source address | 5 per 300 s | a request that carries `auth`, i.e. after the mandatory first 401 |
+| `PUT /send/m.rtc.notification` (and the MSC4075 unstable name) | account | `[ratelimit] rings_per_minute`, 10 | every attempt, delayed or not, whether or not the room then refuses it |
 | `POST /user/{userId}/openid/request_token` | user | 20 per 60 s | every request, before the token is minted |
 | `POST /_spindle/rtc/livekit/sfu/get` (built-in LiveKit service) | user | 20 per 60 s | every request that carried a live OpenID token, before the membership check |
 
@@ -45,7 +47,11 @@ locks out everyone behind one NAT. The reasoning is in the module header.
 
 **Nothing else an authenticated account does is rate limited.** Event
 sends, room creation, invites, joins, media uploads, device registration,
-sync — none of it. That is a choice this document records rather than defends:
+sync — none of it. The ring is the exception because it is not an ordinary
+send: it is routed by `m.mentions` to every member it names at high
+priority, past do-not-disturb, and a script making a room ring
+continuously is a nuisance no other event can be (#39). That the rest is
+unlimited is a choice this document records rather than defends:
 the caps below bound what a single account can make the server *hold*,
 and the benchmark rig depends on being able to issue requests as fast as
 the server takes them. A per-account send rate is the obvious next limit

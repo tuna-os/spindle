@@ -273,6 +273,22 @@ fn a_zero_delayed_event_cap_is_refused_at_startup() {
 
 /// The defaults still apply when the section is absent, so an existing
 /// config keeps working and does not have to learn about this.
+/// A ring budget of zero would refuse every ring (#39): refused at startup
+/// like the other zero caps, and ten a minute without the field.
+#[test]
+fn a_zero_ring_budget_is_refused_and_the_default_is_ten() {
+    let error = parse("[server]\nname = \"example.org\"\n[ratelimit]\nrings_per_minute = 0\n")
+        .expect_err("a zero budget must not start the server");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("ratelimit.rings_per_minute"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("refuses every ring"), "{rendered}");
+    let config = parse("[server]\nname = \"example.org\"\n").expect("no section is fine");
+    assert_eq!(config.ratelimit.rings_per_minute, 10);
+}
+
 #[test]
 fn the_delayed_event_caps_default_without_the_section() {
     let config = parse("[server]\nname = \"example.org\"\n").expect("no section is fine");

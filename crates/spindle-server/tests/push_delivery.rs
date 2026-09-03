@@ -126,6 +126,11 @@ impl Instance {
     }
 
     async fn start_with(allow_loopback: bool) -> Instance {
+        Self::start_with_config(allow_loopback, "enabled = false\n").await
+    }
+
+    /// `ratelimit` is the `[ratelimit]` section's body.
+    async fn start_with_config(allow_loopback: bool, ratelimit: &str) -> Instance {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let dir = TempDir::new().unwrap();
@@ -136,7 +141,7 @@ impl Instance {
             ""
         };
         let config = spindle_server::Config::parse(&format!(
-            "[server]\nname = \"{name}\"\n[ratelimit]\nenabled = false\n\
+            "[server]\nname = \"{name}\"\n[ratelimit]\n{ratelimit}\
              [federation]\nretry_base_ms = 25\n[push]\n{allow}"
         ))
         .unwrap();
@@ -595,4 +600,42 @@ async fn a_gateway_inside_the_network_is_refused_at_registration() {
         )
         .await;
     assert_eq!(status, 200, "{body}");
+}
+
+/// A ring has a budget of its own (#39): with `rings_per_minute = 2`, the
+/// third ring in a minute is refused with 429 and a `retry_after_ms`, an
+/// ordinary message between them is not, and the refusal is per sender.
+#[tokio::test]
+async fn the_ring_budget_refuses_the_ring_over_it_and_nothing_else() {
+    let (gateway, url) = Gateway::serve().await;
+    let hs = Instance::start_with_config(true, "enabled = true\nrings_per_minute = 2\n").await;
+    let (alice, bob, _, room) = alice_and_bob(&hs, &gateway, &url).await;
+    let ring = json!({
+        "m.mentions": { "room": true },
+        "notification_type": "ring",
+        "lifetime": 30_000,
+    });
+    for _ in 0..2 {
+        hs.send(&alice, &room, "m.rtc.notification", &ring).await;
+    }
+    hs.say(&alice, &room, "still allowed to talk").await;
+    let txn = format!("txn{}", rand_suffix());
+    let (status, body) = hs
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{room}/send/m.rtc.notification/{txn}"),
+            &alice,
+            Some(&ring),
+        )
+        .await;
+    assert_eq!(status, 429, "{body}");
+    assert_eq!(body["errcode"], "M_LIMIT_EXCEEDED");
+    assert!(body["retry_after_ms"].as_u64().unwrap_or(0) > 0, "{body}");
+    // Bob's budget is his own.
+    hs.send(&bob, &room, "org.matrix.msc4075.rtc.notification", &ring)
+        .await;
+    // What got through was delivered: the invite, two rings and the
+    // message to bob, and bob's ring to alice's phone -- which she does
+    // not have. So four.
+    gateway.wait_for(4).await;
 }

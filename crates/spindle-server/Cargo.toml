@@ -73,3 +73,7 @@ harness = false
 [[bench]]
 name = "delayed_firing"
 harness = false
+
+[[bench]]
+name = "ring_latency"
+harness = false
