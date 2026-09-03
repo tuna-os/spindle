@@ -3385,7 +3385,7 @@ impl Rooms {
     /// must not be in the log until that server has.
     fn build_event(
         &self,
-        log: &RoomLog,
+        log: &mut RoomLog,
         room_id: &str,
         sender: &str,
         key: &Ed25519KeyPair,
@@ -3393,13 +3393,14 @@ impl Rooms {
         state_key: Option<&str>,
         content: &Value,
     ) -> Result<(String, Value), RoomError> {
+        // Before `prev` is read, so the event names only tips that fold.
+        Self::set_aside_contested(log, room_id)?;
         let depth = log
             .entries()
             .next_back()
             .map_or(0, |entry| entry.depth.saturating_add(1));
         let prev: Vec<String> = log
-            .forward_extremities()
-            .iter()
+            .authoring_extremities()
             .map(|id| id.as_str().to_owned())
             .collect();
 
@@ -3450,6 +3451,39 @@ impl Rooms {
         // exactly the bytes a peer would receive, event ID included.
         self.authorize(log, room_id, &event_id, &json)?;
         Ok((event_id, json))
+    }
+
+    /// Step around a fork this server cannot fold, and say so.
+    ///
+    /// SPEC §9.2 case 3 reaches here with no resolver behind it (#16). The
+    /// core sets the contesting tip aside so that what remains folds
+    /// (`RoomLog::set_aside_contested`); this is where that decision is
+    /// counted and logged. Once per tip, not once per send: the tip stays
+    /// set aside until something builds on it, so a later send finds
+    /// nothing to set aside and costs one fold. A count that moved on every
+    /// send while one fork stayed open would make §18.3's ratio a measure
+    /// of how chatty the local users are rather than of forks.
+    ///
+    /// The log line is the anomaly record SPEC §9.1 asks for. It spells the
+    /// key the way `/state_ids` does and names the tip set aside, which is
+    /// what an operator needs to find the branch this server is not
+    /// showing.
+    fn set_aside_contested(log: &mut RoomLog, room_id: &str) -> Result<(), RoomError> {
+        let set_aside = log
+            .set_aside_contested()
+            .map_err(|error| RoomError::Append(format!("{error:?}")))?;
+        for spindle_core::SetAside { extremity, key } in set_aside {
+            crate::metrics::record_contested_state();
+            let key = format!("{}/{}", key.event_type().as_str(), key.state_key());
+            tracing::warn!(
+                room = room_id,
+                extremity = extremity.as_str(),
+                key = key.as_str(),
+                "a federated fork contests a state key this server cannot resolve yet (#16); \
+                 the branch is set aside and local events are authored without it"
+            );
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments, reason = "an event is what it is")]
@@ -3515,11 +3549,14 @@ impl Rooms {
             .append_remote(input)
             .map_err(|error| {
                 // §9.2 case 3: the key is contested inside the window, so
-                // this append needs the resolver. Counted where the
-                // decision is made (#166), whether it is then resolved or
-                // — as today — refused.
+                // this append needs the resolver. `build_event` set the
+                // contesting tips aside before naming any, so this is
+                // reached only when the fork landed between building and
+                // committing -- the invite handshake leaves that gap open.
+                // Counted where the decision is made (#166), whether it
+                // is then resolved or — as today — refused.
                 if let spindle_core::AppendError::NeedsStateResolution { key, .. } = &error {
-                    crate::metrics::record_contested_state(crate::metrics::Origin::Local);
+                    crate::metrics::record_contested_state();
                     return RoomError::Contested {
                         // The `type/state_key` spelling `/state_ids` uses,
                         // so an operator can match this against what the
@@ -3721,7 +3758,7 @@ impl Rooms {
             .append_remote(input)
             .map_err(|error| {
                 if let spindle_core::AppendError::NeedsStateResolution { key, .. } = &error {
-                    crate::metrics::record_contested_state(crate::metrics::Origin::Federated);
+                    crate::metrics::record_contested_state();
                     return RoomError::Contested {
                         // The `type/state_key` spelling `/state_ids` uses,
                         // so an operator can match this against what the

@@ -100,6 +100,10 @@ impl Rooms {
             ));
         }
         self.with_room(room_id, |rooms, log| {
+            // What this server would author on itself: a template naming
+            // a tip this server cannot fold hands the user an event
+            // `send_*` then refuses.
+            Self::set_aside_contested(log, room_id)?;
             let head = log
                 .entries()
                 .next_back()
@@ -153,8 +157,7 @@ impl Rooms {
                 &content,
             )?;
             let prev: Vec<String> = log
-                .forward_extremities()
-                .iter()
+                .authoring_extremities()
                 .map(|id| id.as_str().to_owned())
                 .collect();
             let depth = head.depth.saturating_add(1);
@@ -187,6 +190,10 @@ impl Rooms {
     /// [`RoomError::Forbidden`] when the room does not accept knocks.
     pub fn make_knock_template(&self, room_id: &str, user_id: &str) -> Result<Value, RoomError> {
         self.with_room(room_id, |rooms, log| {
+            // What this server would author on itself: a template naming
+            // a tip this server cannot fold hands the user an event
+            // `send_*` then refuses.
+            Self::set_aside_contested(log, room_id)?;
             let head = log
                 .entries()
                 .next_back()
@@ -216,8 +223,7 @@ impl Rooms {
                 &content,
             )?;
             let prev: Vec<String> = log
-                .forward_extremities()
-                .iter()
+                .authoring_extremities()
                 .map(|id| id.as_str().to_owned())
                 .collect();
             let depth = head.depth.saturating_add(1);
@@ -252,6 +258,10 @@ impl Rooms {
     /// [`RoomError::Forbidden`] when the user has nothing to leave.
     pub fn make_leave_template(&self, room_id: &str, user_id: &str) -> Result<Value, RoomError> {
         self.with_room(room_id, |rooms, log| {
+            // What this server would author on itself: a template naming
+            // a tip this server cannot fold hands the user an event
+            // `send_*` then refuses.
+            Self::set_aside_contested(log, room_id)?;
             let head = log
                 .entries()
                 .next_back()
@@ -281,8 +291,7 @@ impl Rooms {
                 &content,
             )?;
             let prev: Vec<String> = log
-                .forward_extremities()
-                .iter()
+                .authoring_extremities()
                 .map(|id| id.as_str().to_owned())
                 .collect();
             let depth = head.depth.saturating_add(1);

@@ -140,6 +140,18 @@ This is the divergence with the most correctness risk attached, which is why
 §9.3's equivalence claim is tested differentially against the reference
 resolver rather than argued (#34, SPEC §19.2).
 
+Case 3 is found today but not yet resolved (#16). What happens instead is a
+deferral, and it is worth stating because the alternative was worse: when a
+local event finds the tips it would name contesting a key, the core sets the
+contesting tip aside (`RoomLog::set_aside_contested`). The room keeps taking
+local writes on its linear head; the tip stays a forward extremity with its
+state pinned, where the resolver will look for it; the case-3 counter moves
+once per tip; and the server logs the anomaly SPEC §9.1 asks for. A peer's
+event naming both tips is still refused, so the two servers' views of that
+key stay apart until the resolver lands. What #225 removed is the room
+becoming unwritable for its own users in the meantime — a refused merge that
+every later local append repeated, forever.
+
 ### 4.4 The log chain (`core/src/log.rs`, SPEC §5.3)
 
 `chain[li] = BLAKE3(DOMAIN || chain[li-1] || event_id[li])` — a transparency-log

@@ -125,15 +125,20 @@ pub fn record_append(origin: Origin, case: ForkCase) {
     FORK_CASES[case.index()].fetch_add(1, Ordering::Relaxed);
 }
 
-/// Record an append that needed state resolution — case 3.
+/// Record a fork that needed state resolution — case 3.
 ///
-/// Separate from [`record_append`] because today this is a path the ingest
-/// code *refuses* rather than resolves: bounded resolution exists in
-/// `spindle-core` but is not yet wired into ingest (#16). The counter goes
-/// where the decision is made, so it keeps counting the same thing when
-/// that lands and the refusal becomes a resolution.
-pub fn record_contested_state(origin: Origin) {
-    record_append(origin, ForkCase::StateContested);
+/// Not an append, so not [`record_append`]: nothing enters the log when
+/// this is recorded. Bounded resolution exists in `spindle-core` but is not
+/// yet wired into ingest (#16), so a contested fork is *deferred* rather
+/// than resolved. A federated event naming the contesting tips is refused;
+/// a local send sets the contesting tip aside and is authored without it
+/// (#225), and that send is then counted by [`record_append`] as the case
+/// it took. Counting an event here as well would count that send twice.
+/// The counter goes where the decision is made, so it keeps counting the
+/// same thing when the resolver lands and the deferral becomes a
+/// resolution.
+pub fn record_contested_state() {
+    FORK_CASES[ForkCase::StateContested.index()].fetch_add(1, Ordering::Relaxed);
 }
 
 /// The exposition, in the Prometheus text format.
@@ -566,14 +571,15 @@ mod tests {
 
         record_append(Origin::Local, ForkCase::NonState);
         record_append(Origin::Federated, ForkCase::StateUncontested);
-        record_contested_state(Origin::Federated);
+        record_contested_state();
 
         assert_eq!(fork_case_count(ForkCase::NonState), before.0 + 1);
         assert_eq!(fork_case_count(ForkCase::StateUncontested), before.1 + 1);
         assert_eq!(fork_case_count(ForkCase::StateContested), before.2 + 1);
         assert_eq!(event_count(Origin::Local), before.3 + 1);
-        // Two federated events: the uncontested one and the contested one.
-        assert_eq!(event_count(Origin::Federated), before.4 + 2);
+        // One federated event: a contested fork is a decision, not an
+        // append, and the send that steps around it is counted on its own.
+        assert_eq!(event_count(Origin::Federated), before.4 + 1);
     }
 
     /// The subscriber gauge is balanced: what goes up comes back down,
