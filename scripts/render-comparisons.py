@@ -15,9 +15,14 @@ a developer machine at milestone close (docs/benchmarks.md explains why a
 shared CI runner cannot host both sides honestly), and the page says where
 the numbers came from.
 
-File naming: `<group>.<server>.json`, where `<group>` sorts by milestone
-(`m1-…`, `m2-…`) and exactly one file per group has server `spindle*` — the
-side ratios are computed against.
+File naming: `<group>.<server>.r<N>.json` — one file per server per round
+of a sitting — where `<group>` sorts by milestone (`m1-…`, `m2-…`) and
+exactly one server per group is `spindle*`, the side ratios are computed
+against. The older `<group>.<server>.json` is a single-round sitting and
+still loads; the page labels those unresolved rather than pretending they
+have a spread to read. The arithmetic for reading the rounds -- median,
+observed range, the separation rule and its false-call rate -- is in
+`sitting.py`, shared with `compare-benchmarks.py`.
 
 Usage:
     scripts/render-comparisons.py docs/benchmarks/data comparisons.html
@@ -28,31 +33,18 @@ from __future__ import annotations
 import argparse
 import html
 import json
-import math
 import pathlib
-import statistics
 import sys
 
 import sitetheme
-
-# For a sitting that ran a single round there is no spread to read, so the
-# band has to be assumed rather than measured -- and the assumption is the
-# one docs/benchmarks.md actually measured: six rounds of the *same binary*
-# on the same idle host moved the median cell by 1.38x, and 21 of 21 cells
-# varied by more than the +/-10% band that used to colour this page.
-#
-# So a single-round cell below 1.38x is not a result in either direction,
-# and colouring it was the page contradicting its own caption -- the legend
-# said "treat anything inside roughly +/-0.4x as unmeasured" directly under
-# cells painted green at 1.19x and red at 0.90x. The band now matches the
-# evidence: only ratios that clear this host's own repeatability get a
-# colour. Nothing about the underlying numbers changes, and the large
-# ratios are untouched; what changes is which of them the page claims.
-#
-# A sitting with three rounds or more never reaches this: it has a real
-# spread, and `verdict` reads it instead of assuming one.
-SINGLE_ROUND_REPEATABILITY = 1.38
-NOISE_LOW_SINGLE_ROUND = (1 / SINGLE_ROUND_REPEATABILITY, SINGLE_ROUND_REPEATABILITY)
+import sitting
+from sitting import (
+    MIN_ROUNDS,
+    SINGLE_ROUND_REPEATABILITY,
+    chance_of_separating,
+    expected_false_calls,
+    verdict,
+)
 
 SERVER_COLORS = sitetheme.SERVER_COLORS
 
@@ -233,39 +225,28 @@ def cells_for(documents: list[dict]):
 
 
 def rounds_in(documents: list[dict]) -> int:
-    """How many rounds the thinnest server in this group was measured for.
-
-    A comparison is only as resolved as its least-measured side.
-    """
+    """How many rounds the thinnest server in this group was measured for."""
     counts: dict[str, int] = {}
     for document in documents:
         counts[document["server"]] = counts.get(document["server"], 0) + 1
-    return min(counts.values(), default=0)
+    return sitting.rounds_in(counts)
 
 
-def chance_of_separating(rounds: int) -> float:
-    """Odds two *identical* servers separate by luck, at this many rounds.
+def describe_ms(values: list[float]) -> str:
+    """`1.18 ms`, or with rounds `1.18 ms (5 rounds, 1.10–1.31)`.
 
-    2/C(2n, n): one in three at n=2, one in ten at n=3, one in thirty-five
-    at n=4, one in a hundred and twenty-six at n=5.
+    The median is the number; the range is what it is worth. Both sides of
+    a cell get this, because a spread printed for one server and not the
+    other invites reading the other as exact.
     """
-    if rounds < 1:
-        return 1.0
-    return 2 / math.comb(2 * rounds, rounds)
-
-
-def expected_false_calls(cells: int, rounds: int) -> float:
-    """How many of `cells` should separate by chance alone.
-
-    The separation rule bounds the false-call rate for *one* cell. A table
-    is many cells, and nothing in the rule accounts for that: at three
-    rounds a side the per-cell rate is one in ten, so eighteen cells expect
-    close to two spurious calls. Reading a lone called cell as a result is
-    then reading noise, which is the mistake #171 was filed for one level
-    down. Stating the number is the cheap half of the fix (#183); the other
-    half is `stands_alone` below.
-    """
-    return cells * chance_of_separating(rounds)
+    summary = sitting.spread(values)
+    text = f"{summary['median'] / 1e6:.2f} ms"
+    if summary["rounds"] >= 2:
+        text += (
+            f" ({summary['rounds']} rounds, {summary['low'] / 1e6:.2f}–"
+            f"{summary['high'] / 1e6:.2f})"
+        )
+    return text
 
 
 def stands_alone(calls: dict[int, str], measured: set[int], size: int) -> bool:
@@ -297,51 +278,20 @@ def stands_alone(calls: dict[int, str], measured: set[int], size: int) -> bool:
     )
 
 
-def verdict(ours: list[float], theirs: list[float]) -> tuple[str, str]:
-    """Colour and label for one cell, decided by whether the rounds separate.
-
-    With repeated rounds there is no noise band to pick: a cell is a win
-    only if our *slowest* round beat their *fastest*, and a loss only if our
-    fastest lost to their slowest. Anything else is two overlapping ranges,
-    which is not a result however far apart the medians happen to sit. That
-    replaces a +/-10% constant that was narrower than the harness's own
-    repeatability, so every cell on the page cleared it by construction.
-
-    Three rounds a side is the minimum, and that is arithmetic rather than
-    taste. If the two servers were identical, the chance that all of one
-    side's rounds happen to land below all of the other's is 2/C(2n, n):
-    **one in three at n=2**, one in ten at n=3, one in thirty-five at n=4.
-    Calling cells on two rounds would mis-colour about a third of the ties,
-    which is the +/-10% band's mistake wearing a better disguise. So two
-    rounds is treated as unresolved, and more rounds is how a smaller
-    difference gets resolved.
-
-    With fewer than three rounds each -- every sitting committed before
-    #171 -- there is no spread to read, so the band is the repeatability
-    this host was measured to have (see `SINGLE_ROUND_REPEATABILITY`) and
-    the group is labelled unresolved.
-    """
-    ratio = statistics.median(theirs) / statistics.median(ours)
-    if len(ours) < 3 or len(theirs) < 3:
-        if ratio >= NOISE_LOW_SINGLE_ROUND[1]:
-            return "win", f"{ratio:.2f}\u00d7"
-        if ratio <= NOISE_LOW_SINGLE_ROUND[0]:
-            return "loss", f"{1 / ratio:.2f}\u00d7 slower"
-        return "noise", f"{ratio:.2f}\u00d7"
-    if max(ours) < min(theirs):
-        return "win", f"{ratio:.2f}\u00d7"
-    if min(ours) > max(theirs):
-        return "loss", f"{1 / ratio:.2f}\u00d7 slower"
-    return "noise", f"{ratio:.2f}\u00d7"
-
-
 def svg_chart(
     operation: str,
     sizes: list[int],
-    series: dict[str, list[float | None]],
+    series: dict[str, list[dict | None]],
     dimension: str = "events",
 ) -> str:
-    """One small-multiple: mean latency across room sizes, a line per server.
+    """One small-multiple: median latency across room sizes, a line per server.
+
+    Each point is a `sitting.spread` -- the median over rounds, and the
+    lowest and highest round -- and the range is drawn as a band behind the
+    line whenever there is more than one round to draw it from. A line on
+    its own says the medians differ; the bands say whether that difference
+    is bigger than either server's own round-to-round movement, which is
+    the only question the separation rule asks.
 
     `dimension` is what the x-axis counts -- events in the room, or joined
     members in it. It is read from the results rather than assumed, because
@@ -356,7 +306,7 @@ def svg_chart(
     left, right, top, bottom = 46, 10, 26, 34
     plot_w, plot_h = width - left - right, height - top - bottom
     peak = max(
-        (v for values in series.values() for v in values if v is not None),
+        (v["high"] for values in series.values() for v in values if v is not None),
         default=1.0,
     )
     peak *= 1.08
@@ -408,11 +358,10 @@ def svg_chart(
     for server, values in ordered:
         mine = server.startswith("spindle")
         color = color_for(server)
-        points = [
-            (x(i), y(v)) for i, v in enumerate(values) if v is not None
-        ]
-        if not points:
+        measured = [(x(i), v) for i, v in enumerate(values) if v is not None]
+        if not measured:
             continue
+        points = [(px, y(v["median"])) for px, v in measured]
         path = " ".join(
             f"{'M' if i == 0 else 'L'}{px:.1f},{py:.1f}"
             for i, (px, py) in enumerate(points)
@@ -422,23 +371,39 @@ def svg_chart(
         stroke = "3.4" if mine else "1.6"
         radius = "3.2" if mine else "2.2"
         fade = "" if mine else ' opacity="0.62"'
+        parts.append(f'<g class="{group}" data-server="{safe}">')
+        # The observed range across rounds, behind the line. Drawn only when
+        # there is a range: a single-round sitting has none, and a band of
+        # zero height would claim a precision it never measured.
+        if any(v["rounds"] >= 2 for _, v in measured):
+            upper = [f"{px:.1f},{y(v['high']):.1f}" for px, v in measured]
+            lower = [f"{px:.1f},{y(v['low']):.1f}" for px, v in reversed(measured)]
+            parts.append(
+                f'<polygon class="band" points="{" ".join(upper + lower)}" '
+                f'fill="{color}" opacity="{0.18 if mine else 0.11}"/>'
+            )
         parts.append(
-            f'<g class="{group}" data-server="{safe}">'
             f'<path d="{path}" fill="none" stroke="{color}" '
             f'stroke-width="{stroke}" stroke-linejoin="round" '
             f'stroke-linecap="round"{fade}/>'
         )
-        for (px, py), value in zip(points, (v for v in values if v is not None)):
+        for (px, py), (_, value) in zip(points, measured):
             # Ours get a halo so the marker reads against a crossing line.
             if mine:
                 parts.append(
                     f'<circle cx="{px:.1f}" cy="{py:.1f}" r="4.6" '
                     f'fill="var(--bg)"/>'
                 )
+            tip = f"{value['median'] / 1e6:.2f} ms"
+            if value["rounds"] >= 2:
+                tip += (
+                    f" ({value['rounds']} rounds, {value['low'] / 1e6:.2f}–"
+                    f"{value['high'] / 1e6:.2f})"
+                )
             parts.append(
                 f'<circle cx="{px:.1f}" cy="{py:.1f}" r="{radius}" '
                 f'fill="{color}"{fade}>'
-                f"<title>{safe}: {value / 1e6:.2f} ms</title></circle>"
+                f"<title>{safe}: {tip}</title></circle>"
             )
         # Named on the line itself, at its last point: the one series worth
         # identifying without a trip to the legend.
@@ -524,7 +489,7 @@ def render_heatmap(group: str, documents: list[dict]) -> list[str]:
     # fewer rounds than that is coloured by the old band instead, where
     # 2/C(2n, n) says nothing, so neither the count nor the marker applies.
     # Every sitting published before #171 is in that case.
-    resolved = rounds_in(documents) >= 3
+    resolved = rounds_in(documents) >= MIN_ROUNDS
 
     for operation in operations:
         title = OPERATIONS.get(operation, (operation, ""))[0]
@@ -579,17 +544,21 @@ def render_heatmap(group: str, documents: list[dict]) -> list[str]:
                 if lone:
                     css = f"{css} lone"
                     body += " <span class='lone-mark'>†</span>"
-                spread = (
-                    ""
-                    if len(mine) < 2
-                    else f" (of {len(mine)} rounds, "
-                    f"{min(mine) / 1e6:.2f}–{max(mine) / 1e6:.2f} ms)"
-                )
                 tip = (
-                    f"spindle {statistics.median(mine) / 1e6:.2f} ms{spread} · "
-                    f'{html.escape(document["server"])} '
-                    f"{statistics.median(other) / 1e6:.2f} ms"
+                    f"spindle {describe_ms(mine)} · "
+                    f'{html.escape(document["server"])} {describe_ms(other)}'
                 )
+                # The ratio is a median against a median; the band under it
+                # is what the rounds actually allow, from their fastest
+                # against our slowest to their slowest against our fastest.
+                # A call is exactly a band that excludes 1.0x, so the reader
+                # can see the rule applied rather than take the colour on
+                # trust. Single-round cells have no band, and printing one
+                # would be printing a spread that was never measured.
+                if len(mine) >= 2 and len(other) >= 2:
+                    low, high = sitting.ratio_band(mine, other)
+                    body += f'<span class="band">{low:.2f}–{high:.2f}×</span>'
+                    tip += f" · the rounds allow {low:.2f}–{high:.2f}×"
                 if lone:
                     tip += (
                         " · stands alone: this operation is not called the "
@@ -602,18 +571,23 @@ def render_heatmap(group: str, documents: list[dict]) -> list[str]:
         lines.append("</tr>")
     lines.append("</tbody></table></div>")
     rounds = rounds_in(documents)
-    if rounds >= 3:
+    if rounds >= MIN_ROUNDS:
         lines.append(
             f'<p class="legend">Measured over <strong>{rounds} rounds</strong> '
-            "per server. A cell is called only when the two servers' rounds "
-            '<em>separate</em>: <span class="chip win">win</span> our slowest '
-            'round beat their fastest · <span class="chip noise">overlapping'
-            "</span> the ranges cross, so the difference is not resolved by "
-            'this many rounds, whatever the medians say · <span class="chip '
-            'loss">loss</span> our fastest round lost to their slowest — every '
-            "such cell links to its investigation, because the roadmap treats "
-            "it as a defect until explained. Hover any cell for the median and "
-            "the observed spread.</p>"
+            "per server. The large figure in a cell is the median over rounds "
+            "against the median over rounds; the small range under it is the "
+            "band the rounds allow — their fastest round against our slowest, "
+            "to their slowest against our fastest. A cell is called only when "
+            "that band excludes 1.0×, which is the same as saying the two "
+            "servers' rounds <em>separate</em>: "
+            '<span class="chip win">win</span> our slowest round beat their '
+            'fastest · <span class="chip noise">overlapping</span> the ranges '
+            "cross, so the difference is not resolved by this many rounds, "
+            'whatever the medians say · <span class="chip loss">loss</span> '
+            "our fastest round lost to their slowest — every such cell links "
+            "to its investigation, because the roadmap treats it as a defect "
+            "until explained. Hover any cell for both servers' medians and "
+            "observed ranges in milliseconds.</p>"
         )
         expected = expected_false_calls(comparable, rounds)
         lines.append(
@@ -711,7 +685,7 @@ def render_charts(documents: list[dict]) -> list[str]:
         series = {
             server: [
                 (
-                    statistics.median(rounds)
+                    sitting.spread(rounds)
                     if (rounds := table.get((operation, size), {}).get(server))
                     else None
                 )
@@ -841,22 +815,32 @@ is the cost that grows with the room. Room size has a second axis —
 <em>joined members</em> — and the sweep held it at two until M5, which hid
 a sliding-window read that grew linearly with the member list. Membership
 is now its own sweep, on its own chart, labelled by what it counts.</li>
-<li><strong>Means over 25 samples after warmup</strong>, raw results
-committed to the repository exactly as the driver wrote them
-(<code>docs/benchmarks/data/</code>); this page is regenerated from those
-files and cannot change a measurement.</li>
+<li><strong>A sitting is several rounds, not one.</strong> Each round
+takes the median of 25 samples after warmup, per cell; a sitting repeats
+that five times per server by default (three is the minimum that means
+anything — see below), reversing the order of the servers every round so a
+drift in the machine becomes spread the page can see rather than bias it
+cannot. Every round is committed exactly as the driver wrote it
+(<code>docs/benchmarks/data/&lt;group&gt;.&lt;server&gt;.r&lt;N&gt;.json</code>);
+a published cell is the median across rounds with the observed range
+beside it, and this page is regenerated from those files and cannot change
+a measurement.</li>
 <li><strong>Losses publish with the same prominence as wins.</strong>
-Cells outside the ±10% band are printed as wins or losses, and a loss
-links to its investigation.</li>
-<li><strong>That ±10% band is narrower than this harness can currently
-resolve, and saying so is part of the method.</strong> Six rounds of the
-same binary on the same idle host move the median cell by 1.38× and the
-worst by 2.80× — so every cell here varies more between runs of identical
-code than the band that colours it. The large ratios clear that floor
-comfortably and the conclusions rest on those; the cells near 1.0× should
-be read as "not measured", whichever way they lean. Making a sitting
-several rounds and deriving the band from the observed spread is
-<a href="https://github.com/tuna-os/spindle/issues/171">#171</a>.</li>
+A cell is called, either way, only when the two servers' rounds separate,
+and a loss links to its investigation.</li>
+<li><strong>The instrument's own spread is on the page, because it is
+wider than the band this page used to colour by.</strong> Six rounds of
+the same binary on the same idle host moved the median cell by 1.38× and
+the worst by 2.80×, so every cell varied more between runs of identical
+code than the ±10% that used to decide its colour. That is why the band
+was replaced rather than tuned
+(<a href="https://github.com/tuna-os/spindle/issues/171">#171</a>): a cell
+is now decided by whether the two servers' own round-to-round ranges
+overlap, and the range is printed under every ratio so a reader can see
+what it had to clear. Sittings collected before #171 are one round each,
+have no range to read, and are coloured by the measured 1.38× floor
+instead — labelled unresolved, and never given the count and marker that
+only the separation rule can justify.</li>
 </ul>
 <p>Versions measured, ports, registration quirks and the full narrative per
 sitting: <a href="https://github.com/tuna-os/spindle/blob/main/docs/benchmarks.md">
@@ -940,6 +924,10 @@ STYLE = """
 .heatmap td.loss a { color: inherit; }
 .heatmap td.noise { background: var(--noise-bg); color: var(--noise-fg); }
 .heatmap td.absent { color: var(--muted); }
+/* The range the rounds allow, under the ratio of medians. Quiet on
+   purpose: it is the evidence for the colour, not a second headline. */
+.heatmap td .band { display: block; font-size: .68rem; font-weight: 400;
+  opacity: .72; line-height: 1.2; font-variant-numeric: tabular-nums; }
 .heatmap td[data-tip] { position: relative; cursor: help; }
 .heatmap td[data-tip]:hover::after { content: attr(data-tip);
   position: absolute; right: 0; bottom: calc(100% + 6px); z-index: 6;

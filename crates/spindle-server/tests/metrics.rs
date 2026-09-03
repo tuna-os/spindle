@@ -184,14 +184,14 @@ async fn the_exposition_carries_what_the_counters_hold() {
 }
 
 /// Case 3 is the number the design is judged by, so its counter is wired
-/// even though ingest cannot yet reach it: bounded resolution lives in
+/// even though ingest cannot yet resolve it: bounded resolution lives in
 /// `spindle-core` but is not on the ingest path (#16). This asserts the
 /// wiring — the counter and its series exist and are reachable — so that
 /// #16's test has something to assert against when it lands.
 #[test]
 fn the_contested_case_is_wired_and_visible() {
     let before = metrics::fork_case_count(ForkCase::StateContested);
-    metrics::record_contested_state(Origin::Federated);
+    metrics::record_contested_state();
     assert_eq!(
         metrics::fork_case_count(ForkCase::StateContested),
         before + 1

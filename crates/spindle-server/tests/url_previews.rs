@@ -327,3 +327,28 @@ async fn previews_are_cached_for_a_while() {
         "the cache absorbed the repeat"
     );
 }
+
+#[tokio::test]
+async fn a_bad_allow_list_entry_refuses_to_start() {
+    // The federation list has this test already; the previews list is
+    // parsed by the same guard and must fail the same way: a typo'd range
+    // is a startup error, never a list that silently opens less (or more)
+    // than the operator meant.
+    for entry in ["127.0.0.0/33", "localhost", "127.0.0.0/8 "] {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let config = spindle_server::Config::parse(&format!(
+            "[server]\nname = \"example.org\"\n[previews]\nallow_private = [\"{entry}\"]\n"
+        ))
+        .unwrap();
+        let error = match spindle_server::app(config, store) {
+            Ok(_) => panic!("allow_private = [{entry:?}] built an app"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("preview config"), "{entry:?}: {error}");
+        assert!(
+            error.contains(entry),
+            "{entry:?}: {error} does not name the entry"
+        );
+    }
+}
