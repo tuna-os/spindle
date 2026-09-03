@@ -874,6 +874,8 @@ fn bare_room(state: &AppState, creator: &str) -> Result<String, MatrixError> {
             None,
             None,
             &[],
+            &[],
+            None,
             None,
             None,
             &serde_json::Map::new(),
