@@ -228,15 +228,25 @@ async fn the_block_holds_the_state_at_the_end_of_the_timeline() {
         "state_after is the state *after* the timeline: {sync}"
     );
 
-    // And the unflagged block carries the same value, which is the point of
-    // the commit message: this server was already sending state-after under
-    // the name `state`. The flag corrects the label, not the content.
+    // And the unflagged block does *not*: `state` is the state before the
+    // window, and both topics were set inside it, so the block has no topic
+    // at all and the timeline carries the two in order (#229). This server
+    // once sent state-after under the name `state` and the flag only
+    // corrected the label; now the two blocks differ, as the MSC has them.
     let unflagged = harness.sync(&alice, "").await;
     assert_eq!(
         topic(&unflagged, &room, "state").as_deref(),
-        Some("second topic"),
-        "the content was always state-after; only the name was wrong"
+        None,
+        "`state` is the state before the window: {unflagged}"
     );
+    let topics: Vec<&str> = unflagged["rooms"]["join"][&room]["timeline"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["type"] == "m.room.topic")
+        .filter_map(|event| event["content"]["topic"].as_str())
+        .collect();
+    assert_eq!(topics, vec!["first topic", "second topic"], "{unflagged}");
 }
 
 #[tokio::test]

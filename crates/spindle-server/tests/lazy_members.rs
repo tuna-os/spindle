@@ -253,8 +253,13 @@ async fn lazy_load_false_is_the_default_not_the_opt_in() {
     let harness = Harness::new();
     let (room, _alice, bob) = build_room(&harness, 3).await;
 
-    let filter: Value =
-        serde_json::from_str(r#"{"room":{"state":{"lazy_load_members":false}}}"#).unwrap();
+    // The same timeline limit as above, for the same reason: the state
+    // block is the state *before* the window, so the joins have to be
+    // outside it to be in the block at all.
+    let filter: Value = serde_json::from_str(
+        r#"{"room":{"state":{"lazy_load_members":false},"timeline":{"limit":2}}}"#,
+    )
+    .unwrap();
     let sync = harness.sync_with_filter(&bob, &filter).await;
     assert_eq!(members(&sync, &room).len(), 5);
 }

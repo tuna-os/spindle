@@ -178,8 +178,10 @@ impl Rooms {
     /// A knock-event template for a remote user, for `make_knock`.
     ///
     /// The precondition mirrors the auth rule that will judge the signed
-    /// event on the way back in: the room's join rule must be `knock`.
-    /// Anything else is refused here, at the cheap step.
+    /// event on the way back in: the room's join rule must be `knock`, or
+    /// MSC3787's `knock_restricted`, which admits a knock on the same
+    /// terms and a join on restricted ones. Anything else is refused here,
+    /// at the cheap step.
     ///
     /// # Errors
     ///
@@ -200,7 +202,7 @@ impl Rooms {
                 .and_then(|id| rooms.read_event(room_id, &EventId::new(id.as_str())).ok())
                 .and_then(|event| event["content"]["join_rule"].as_str().map(str::to_owned))
                 .unwrap_or_else(|| "invite".to_owned());
-            if join_rule != "knock" {
+            if !matches!(join_rule.as_str(), "knock" | "knock_restricted") {
                 return Err(RoomError::Forbidden(
                     "the room does not accept knocks".to_owned(),
                 ));
@@ -536,10 +538,19 @@ impl Rooms {
             // the inviting server handed over stripped state exactly for
             // this moment, and it was recorded beside the membership row.
             Err(RoomError::UnknownRoom(_)) => {
-                return Ok(self
+                // A knock is read the same way and from its own row. Invite
+                // first: if both stand, the room answered, and the answer is
+                // the newer truth.
+                let stripped = match self
                     .pending_invite(user_id, room_id)?
                     .and_then(|record| record["invite_state"].as_array().cloned())
-                    .unwrap_or_default());
+                {
+                    Some(invite_state) => Some(invite_state),
+                    None => self
+                        .pending_knock(user_id, room_id)?
+                        .and_then(|record| record["knock_state"].as_array().cloned()),
+                };
+                return Ok(stripped.unwrap_or_default());
             }
             Err(error) => return Err(error),
         };
@@ -790,6 +801,33 @@ impl Rooms {
             return Ok(());
         }
         received
+    }
+
+    /// Accept a membership event another server's user made *through*
+    /// this server -- the signed template a `send_join`, `send_knock` or
+    /// `send_leave` handshake hands back -- and fan it out.
+    ///
+    /// The one exception to "each server fans out its own events". The
+    /// event's origin is not in the room: a joiner is not yet, a knocker
+    /// never will be until answered, a leaver just stopped being. None of
+    /// them will be sent the room's traffic, and none can send this event
+    /// to the room's other servers, so the resident that admitted it is the
+    /// only server placed to. Complement's synthetic peer is joined to the
+    /// room and waits five seconds for a knock brokered this way; through
+    /// [`Self::receive_remote`] it never arrived (#229).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::receive_remote`].
+    pub fn receive_brokered(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        json: &Value,
+    ) -> Result<(), RoomError> {
+        self.with_room(room_id, |rooms, log| {
+            rooms.ingest(log, room_id, event_id, json, true)
+        })
     }
 
     /// Append an event this server authored but a peer completed.
