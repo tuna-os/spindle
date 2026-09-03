@@ -846,7 +846,8 @@ fn compute_pending(
 ///
 /// Holds everything it reads weakly and ends when it is gone, for the
 /// reason `spawn_delivery_loops` gives; like the outbox drain, a pass holds
-/// its sources strongly only from its upgrade to its end.
+/// its sources strongly only while it reads and writes, and lets go of
+/// them before a request is sent.
 pub async fn push_loop(
     store: Weak<FjallStore>,
     appservices: Weak<Appservices>,
@@ -871,42 +872,57 @@ pub async fn push_loop(
                 .max(Duration::from_millis(25)),
         )
         .await;
-        let (Some(store), Some(appservices), Some(rooms), Some(typing), Some(devices)) = (
-            store.upgrade(),
-            appservices.upgrade(),
-            rooms.upgrade(),
-            typing.upgrade(),
-            devices.upgrade(),
-        ) else {
-            return;
-        };
-        let sources = PushSources {
-            store: &store,
-            devices: &devices,
-            rooms: &rooms,
-            typing: &typing,
-            server_name: &server_name,
-        };
-        for registration in appservices.all() {
-            let Some(url) = &registration.url else {
-                continue;
+        // The services owed a transaction this pass, each transaction
+        // computed. Every read of the store happens in this block, under
+        // the strong references, which are gone before anything is sent:
+        // `pending` is the loop's own and a registration is the operator's
+        // file, so a request in flight holds nothing the store's close
+        // could wait on.
+        let due: Vec<Arc<Registration>> = {
+            let (Some(store), Some(appservices), Some(rooms), Some(typing), Some(devices)) = (
+                store.upgrade(),
+                appservices.upgrade(),
+                rooms.upgrade(),
+                typing.upgrade(),
+                devices.upgrade(),
+            ) else {
+                return;
             };
-            if let Some((_, until)) = backoff.get(&registration.id)
-                && *until > std::time::Instant::now()
-            {
-                continue;
+            let sources = PushSources {
+                store: &store,
+                devices: &devices,
+                rooms: &rooms,
+                typing: &typing,
+                server_name: &server_name,
+            };
+            let mut due = Vec::new();
+            for registration in appservices.all() {
+                if registration.url.is_none() {
+                    continue;
+                }
+                if let Some((_, until)) = backoff.get(&registration.id)
+                    && *until > std::time::Instant::now()
+                {
+                    continue;
+                }
+                if !pending.contains_key(&registration.id)
+                    && let Some(push) = compute_pending(
+                        &sources,
+                        registration,
+                        typing_sent.entry(registration.id.clone()).or_default(),
+                        &mut ephemeral_txn,
+                    )
+                {
+                    pending.insert(registration.id.clone(), push);
+                }
+                if pending.contains_key(&registration.id) {
+                    due.push(Arc::clone(registration));
+                }
             }
-            if !pending.contains_key(&registration.id)
-                && let Some(push) = compute_pending(
-                    &sources,
-                    registration,
-                    typing_sent.entry(registration.id.clone()).or_default(),
-                    &mut ephemeral_txn,
-                )
-            {
-                pending.insert(registration.id.clone(), push);
-            }
-            let Some(push) = pending.get(&registration.id) else {
+            due
+        };
+        for registration in due {
+            let (Some(url), Some(push)) = (&registration.url, pending.get(&registration.id)) else {
                 continue;
             };
             match deliver(&client, url, &registration.hs_token, push).await {
@@ -916,6 +932,15 @@ pub async fn push_loop(
                     // strand rows below the cursor forever, while this
                     // order at worst deletes what the 200 already proved
                     // received.
+                    //
+                    // Both through a fresh upgrade: the router may have
+                    // gone while the request was in flight, and then the
+                    // loop ends here and the next start re-delivers from
+                    // the cursor under a fresh ID -- at-least-once,
+                    // exactly as promised.
+                    let (Some(store), Some(devices)) = (store.upgrade(), devices.upgrade()) else {
+                        return;
+                    };
                     for key in &push.to_device_keys {
                         let _ = devices.delete_queued(key);
                     }

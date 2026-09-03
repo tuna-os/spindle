@@ -239,6 +239,11 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
 /// there. With the loops holding only weak references the store closes
 /// where its last owner is dropped -- the router, on the thread that
 /// served it -- and the loops notice on their next pass and return.
+///
+/// The same holds inside a pass: a loop upgrades to read and to write,
+/// never across a request in flight, so a cancellation mid-send finds
+/// nothing to drop either. `delivery_loops.rs` pins both -- the router
+/// dropped while every loop is idle, and while each is mid-request.
 fn spawn_delivery_loops(state: &AppState) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
