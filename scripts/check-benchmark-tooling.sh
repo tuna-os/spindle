@@ -191,7 +191,40 @@ assert "win" in kinds, f"the separated cell was not called: {found}"
 overlap = [c for c in found if c[1].startswith("1.50")]
 assert overlap and overlap[0][0] == "noise", f"a 1.50x overlap was coloured: {overlap}"
 print("rounds: overlapping rounds are not called; separated rounds are")
+
+# The spread is rendered, not just consulted. Under each ratio sits the
+# band the rounds allow -- their fastest against our slowest, to their
+# slowest against our fastest -- and a call is exactly a band that
+# excludes 1.0x. Overlap: rival 2-4 ms over spindle 1-3 ms is 0.67x-4.00x,
+# which straddles 1; clear: 5-6 ms over 1.0-1.2 ms is 4.17x-6.00x.
+bands = re.findall(r'<span class="band">([^<]*)</span>', text)
+assert "0.67–4.00×" in bands, f"the overlapping cell's band is not shown: {bands}"
+assert "4.17–6.00×" in bands, f"the separated cell's band is not shown: {bands}"
+# Both sides carry their median and range in the tooltip. The rival used to
+# get a bare median, which invited reading it as exact.
+assert "rival 3.00 ms (3 rounds, 2.00–4.00)" in text, "the rival's spread is missing"
+assert "spindle 2.00 ms (3 rounds, 1.00–3.00)" in text, "spindle's spread is missing"
+# And the charts draw the range as a band behind the median line.
+assert '<polygon class="band"' in text, "the charts do not draw the observed range"
+print("rounds: median and observed range rendered for both sides, in cells and charts")
 PY
+
+# The terminal comparison reads the same rule as the page, from the same
+# round files, so a sitting run through compare-against.sh is judged the
+# way it will be judged once committed.
+python3 "$here/compare-benchmarks.py" \
+    "$rounds/m9-overlap.spindle.r*.json" "$rounds/m9-overlap.rival.r*.json" > "$work/overlap.txt"
+grep -q "overlapping" "$work/overlap.txt"
+grep -q "2.00 (1.00–3.00)" "$work/overlap.txt"
+if grep -q "faster" "$work/overlap.txt"; then
+    echo "compare-benchmarks called an overlapping cell" >&2
+    exit 1
+fi
+python3 "$here/compare-benchmarks.py" \
+    "$rounds/m9-clear.spindle.r*.json" "$rounds/m9-clear.rival.r*.json" > "$work/clear.txt"
+grep -q "faster" "$work/clear.txt"
+grep -q "4.17–6.00×" "$work/clear.txt"
+echo "compare-benchmarks: rounds summarised as median and range, called by the same rule as the page"
 
 # A single-round sitting has no spread to read, so the band is assumed --
 # and the assumption has to be the one the host was measured to have. Six
@@ -242,8 +275,19 @@ assert rows["clears"][0][0] == "win", (
     f"a 3.00x single-round cell was not called: {rows['clears']}"
 )
 assert "1 round(s) per server" in text, "the sitting was not labelled unresolved"
+# No range was measured, so none may be drawn: a band of one round would be
+# a precision the sitting never had.
+assert 'class="band"' not in text, "a single-round sitting was given a spread"
 print("comparisons: a single round colours only what clears the host's own variance")
 PY
+
+# The old two-file form still works -- one round a side -- and says it is
+# unresolved rather than calling the 1.20x cell.
+python3 "$here/compare-benchmarks.py" \
+    "$single/m9-single.spindle.json" "$single/m9-single.rival.json" > "$work/single.txt"
+grep -q "unresolved" "$work/single.txt"
+grep -q "faster" "$work/single.txt"
+echo "compare-benchmarks: a single round a side is printed as unresolved below the measured floor"
 
 # Multiplicity. The separation rule bounds the false-call rate for one cell,
 # and a table is many cells: at three rounds a side it is one in ten, so

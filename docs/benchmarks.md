@@ -63,13 +63,61 @@ cargo bench -p spindle-core --bench fork_window
 cargo test -p spindle-store --release --test scale -- --ignored --nocapture
 ```
 
+### A sitting is several rounds
+
+Every server-to-server table below was collected by `scripts/api-benchmark.py`,
+which takes 25 samples per cell and reports their median. That damps the
+within-round tail and says nothing about the between-round one: fresh store,
+page cache, CPU frequency, the registration history the driver builds up.
+Six rounds of an *identical* binary on the same idle host moved the median
+cell by 1.38× and the worst by 2.80× (#171, and "M5: the axis the sweep never
+varied" below), so a single round cannot tell a 1.1× from noise, and the
+page used to colour it anyway.
+
+So a sitting is now several rounds, and the tooling enforces the shape:
+
+- **`scripts/bench-rounds.sh`** runs every server N times against servers the
+  caller already brought up, **five rounds by default** and three at minimum,
+  reversing the order each round so a drift in the machine becomes spread
+  the page can see rather than bias baked into whichever server ran last. It
+  refuses to start above load 0.6. `scripts/bench-four-way.sh` is the launch
+  recipe for the four servers; `scripts/compare-against.sh` owns Spindle and
+  Synapse itself and runs the same rounds for a two-way check.
+- **Every round is kept.** One file per server per round,
+  `docs/benchmarks/data/<group>.<server>.r<N>.json`, exactly as the driver
+  wrote it. The spread is in the committed data, not in whoever ran it.
+- **A published cell is the median across rounds, with the range beside
+  it.** The comparisons page prints the ratio of medians and, under it, the
+  band the rounds allow — their fastest round against our slowest, to their
+  slowest against our fastest — and the tooltip carries both servers'
+  medians and min–max in milliseconds. The charts draw the same range as a
+  band behind each line.
+- **A cell is called only when the rounds separate** (#176): a win when our
+  slowest round beat their fastest, a loss when our fastest lost to their
+  slowest, and grey otherwise however far apart the medians sit. Three
+  rounds is the minimum because two identical servers separate by luck
+  `2/C(2n, n)` of the time: one in three at two rounds, one in ten at three,
+  one in 126 at five. The page states that expected chance-call count for
+  each table and marks a call no neighbouring size agrees with (#183).
+- **Sittings collected before #171 are one round each** and still render.
+  They have no spread to read, so they are coloured by the measured 1.38×
+  floor instead of the retired ±10% band, labelled unresolved, and never
+  given the count or the marker that only the separation rule can justify.
+
+`scripts/compare-benchmarks.py` prints a fresh sitting from the terminal
+with the same arithmetic — each side a glob over its round files — so a
+sitting reads the same on the console as it will on the page.
+
 ## Client-server API vs Synapse, at M1
 
 Run with `scripts/compare-against.sh`, which owns both servers: it installs
-Synapse into a virtualenv, generates its config, runs the driver against it,
-then builds Spindle and runs the same driver against that — same host, same
-sitting, same `api-benchmark.py`. A number from one machine set against a
-number from another is not evidence, so the script does not offer the option.
+Synapse into a virtualenv, generates its config, builds Spindle, and runs
+the same driver against both — same host, same sitting, same
+`api-benchmark.py`. A number from one machine set against a number from
+another is not evidence, so the script does not offer the option. (At M1
+the script ran each server once; since #171 it keeps both up and runs them
+in alternating rounds, so the tables in this section are single-round and
+should be read under the caveat in "A sitting is several rounds".)
 
 Synapse runs from a virtualenv rather than Docker deliberately. A Docker
 daemon is not available in the sandbox where most of this work happens, and a
