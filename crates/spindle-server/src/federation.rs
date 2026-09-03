@@ -67,6 +67,22 @@ pub enum FederationError {
     Unauthorized(String),
     /// The origin's keys cannot be fetched or do not verify the signature.
     Refused(String),
+    /// The peer answered, and the answer was no: a `4xx` with a Matrix
+    /// error body, kept whole.
+    ///
+    /// Separate from [`Self::Refused`] because the two call for different
+    /// things from a caller brokering a membership change. A resident's
+    /// 403 to `make_join` or `make_knock` *is the room's answer* -- the
+    /// join rule refused this user -- and the client asking most needs to
+    /// be told exactly that. Folded into a transport error it reaches them
+    /// as "no server could be reached", a transient fault inviting a retry
+    /// of something that will be refused every time (#231). A `5xx`, a
+    /// timeout, or an unparseable body stays [`Self::Refused`]: those are
+    /// the peer failing to answer, not answering.
+    Answered {
+        status: u16,
+        body: Value,
+    },
     Storage(String),
 }
 
@@ -75,8 +91,28 @@ impl std::fmt::Display for FederationError {
         match self {
             Self::Unauthorized(why) => write!(formatter, "unauthorized: {why}"),
             Self::Refused(why) => write!(formatter, "refused: {why}"),
+            Self::Answered { status, body } => write!(formatter, "answered {status}: {body}"),
             Self::Storage(why) => write!(formatter, "storage: {why}"),
         }
+    }
+}
+
+/// A peer's non-success response, sorted into the two errors above.
+///
+/// `what` names the request for the message, e.g. `make_join`.
+fn peer_refusal(
+    destination: &str,
+    what: &str,
+    status: reqwest::StatusCode,
+    body: Value,
+) -> FederationError {
+    if status.is_client_error() && body.is_object() {
+        FederationError::Answered {
+            status: status.as_u16(),
+            body,
+        }
+    } else {
+        FederationError::Refused(format!("{destination} refused {what}: {status} {body}"))
     }
 }
 
@@ -459,9 +495,104 @@ impl Federation {
                     .map_err(|error| FederationError::Refused(format!("make_join body: {error}")))
             })?;
         if !status.is_success() {
-            return Err(FederationError::Refused(format!(
-                "{destination} refused make_join: {status} {body}"
-            )));
+            return Err(peer_refusal(destination, "make_join", status, body));
+        }
+        Ok(body)
+    }
+
+    /// Ask a resident server for a knock template — the client half of the
+    /// handshake our own `make_knock` route serves.
+    ///
+    /// Same version list as [`Self::remote_make_join`], for the same reason:
+    /// the resident answers with the room's real version and refuses if this
+    /// server did not name it. A refusal the resident chose comes back as
+    /// [`FederationError::Answered`], because a 403 here is the room saying
+    /// it does not take knocks, and the knocking client is owed that answer
+    /// rather than a gateway error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] if the request cannot be signed or sent,
+    /// or the peer refuses.
+    pub async fn remote_make_knock(
+        &self,
+        destination: &str,
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<Value, FederationError> {
+        let versions = crate::surface::ROOM_VERSIONS
+            .iter()
+            .map(|version| format!("ver={version}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let uri = format!("/_matrix/federation/v1/make_knock/{room_id}/{user_id}?{versions}");
+        let authorization = self.sign_request("GET", &uri, destination, None)?;
+        let response = self
+            .client
+            .get(format!("{}{uri}", self.base_url(destination)?))
+            .header("authorization", authorization)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|error| FederationError::Refused(format!("make_knock: {error}")))?;
+        let status = response.status();
+        let body: Value = response
+            .bytes()
+            .await
+            .map_err(|error| FederationError::Refused(format!("make_knock body: {error}")))
+            .and_then(|bytes| {
+                serde_json::from_slice(&bytes)
+                    .map_err(|error| FederationError::Refused(format!("make_knock body: {error}")))
+            })?;
+        if !status.is_success() {
+            return Err(peer_refusal(destination, "make_knock", status, body));
+        }
+        Ok(body)
+    }
+
+    /// Send the signed knock back — the client half of `send_knock`.
+    ///
+    /// What comes back is `knock_room_state`, not the room: a knock admits
+    /// nobody, so there is no state block and no auth chain to seed from,
+    /// only the stripped view the knocker is allowed to render while they
+    /// wait to be answered. The resident re-authorizes the signed event, so
+    /// a refusal here is still the room speaking and comes back as
+    /// [`FederationError::Answered`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] if the request cannot be signed or sent,
+    /// or the peer refuses.
+    pub async fn remote_send_knock(
+        &self,
+        destination: &str,
+        room_id: &str,
+        event_id: &str,
+        knock: &Value,
+    ) -> Result<Value, FederationError> {
+        let uri = format!("/_matrix/federation/v1/send_knock/{room_id}/{event_id}");
+        let authorization = self.sign_request("PUT", &uri, destination, Some(knock))?;
+        let response = self
+            .client
+            .put(format!("{}{uri}", self.base_url(destination)?))
+            .header("authorization", authorization)
+            .header("content-type", "application/json")
+            .timeout(Duration::from_secs(60))
+            .body(knock.to_string())
+            .send()
+            .await
+            .map_err(|error| FederationError::Refused(format!("send_knock: {error}")))?;
+        let status = response.status();
+        let body: Value = response
+            .bytes()
+            .await
+            .map_err(|error| FederationError::Refused(format!("send_knock body: {error}")))
+            .and_then(|bytes| {
+                serde_json::from_slice(&bytes)
+                    .map_err(|error| FederationError::Refused(format!("send_knock body: {error}")))
+            })?;
+        if !status.is_success() {
+            return Err(peer_refusal(destination, "send_knock", status, body));
         }
         Ok(body)
     }
@@ -581,9 +712,7 @@ impl Federation {
                     .map_err(|error| FederationError::Refused(format!("send_join body: {error}")))
             })?;
         if !status.is_success() {
-            return Err(FederationError::Refused(format!(
-                "{destination} refused send_join: {status} {body}"
-            )));
+            return Err(peer_refusal(destination, "send_join", status, body));
         }
         Ok(body)
     }

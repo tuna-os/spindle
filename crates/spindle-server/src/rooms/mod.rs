@@ -249,6 +249,11 @@ pub struct SyncRoom {
     /// window at all -- a joiner's window starts at their join, so they saw
     /// no history.
     pub prev_batch: Option<i64>,
+    /// Whether `state` was left empty for the caller to serve from the
+    /// current-state render cache instead. True only when the window
+    /// carries no state event, so the state before it is the state now and
+    /// the cached render is exactly the block -- see `Rooms::initial_state`.
+    pub cached_state: bool,
 }
 
 /// A room as MSC3266 describes it to someone who may not be in it.
@@ -720,6 +725,17 @@ impl Rooms {
                 room_id,
             ),
         )?;
+        // An invite is the answer to a knock, so any standing knock record
+        // for the pair is spent. Left behind it would be a question the room
+        // has already answered, still readable beside the answer.
+        spindle_store::Store::delete(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::PendingKnock,
+                user_id,
+                room_id,
+            ),
+        )?;
         self.wake_sync_waiters();
         Ok(())
     }
@@ -741,6 +757,105 @@ impl Rooms {
         Ok(row.and_then(|bytes| serde_json::from_slice(&bytes).ok()))
     }
 
+    /// Record a knock on a room this server holds no log for.
+    ///
+    /// The federated twin of [`Self::record_pending_invite`], and separate
+    /// from it for the reason the keyspaces are separate: an invite is an
+    /// answer and a knock is a question. The membership row says `knock`, so
+    /// `/sync` renders the room in the knock section and never in the invite
+    /// one, and the `knock_state` the resident server returned from
+    /// `send_knock` is what the user sees the room as until somebody answers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the store refuses the writes.
+    pub fn record_pending_knock(
+        &self,
+        user_id: &str,
+        room_id: &str,
+        origin: &str,
+        knock_state: &[Value],
+    ) -> Result<(), RoomError> {
+        spindle_store::Store::put(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::PendingKnock,
+                user_id,
+                room_id,
+            ),
+            serde_json::json!({ "origin": origin, "knock_state": knock_state })
+                .to_string()
+                .as_bytes(),
+        )?;
+        spindle_store::Store::put(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::Membership,
+                user_id,
+                room_id,
+            ),
+            KNOCK,
+        )?;
+        // A knock un-forgets too, but on the user's own action: forgetting
+        // is them wanting the room out of their list, and asking to be let
+        // in is the same user changing their mind.
+        spindle_store::Store::delete(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::Forgotten,
+                user_id,
+                room_id,
+            ),
+        )?;
+        self.wake_sync_waiters();
+        Ok(())
+    }
+
+    /// The pending-knock record for a user and room, if one stands.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the store cannot be read.
+    pub fn pending_knock(&self, user_id: &str, room_id: &str) -> Result<Option<Value>, RoomError> {
+        let row = spindle_store::ReadView::get(
+            self.store.as_ref(),
+            &spindle_core::keys::user_room(
+                spindle_core::keys::Keyspace::PendingKnock,
+                user_id,
+                room_id,
+            ),
+        )?;
+        Ok(row.and_then(|bytes| serde_json::from_slice(&bytes).ok()))
+    }
+
+    /// Withdraw a knock on a room this server holds no log for.
+    ///
+    /// The knock's twin of [`Self::clear_pending_invite`], with the same
+    /// shape and the same reason for it: there is no log to append a leave
+    /// to, so the knock simply stops being shown, which is what a client
+    /// does with a knock it withdrew. A no-op when no knock record stands,
+    /// so it cannot clear a membership that came from somewhere else.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the store refuses the deletes.
+    pub fn clear_pending_knock(&self, user_id: &str, room_id: &str) -> Result<(), RoomError> {
+        if self.pending_knock(user_id, room_id)?.is_none() {
+            return Ok(());
+        }
+        for keyspace in [
+            spindle_core::keys::Keyspace::Membership,
+            spindle_core::keys::Keyspace::PendingKnock,
+        ] {
+            spindle_store::Store::delete(
+                self.store.as_ref(),
+                &spindle_core::keys::user_room(keyspace, user_id, room_id),
+            )?;
+        }
+        self.wake_sync_waiters();
+        Ok(())
+    }
+
     /// Every current state event of a room, as full events.
     ///
     /// This is the one read that is `O(state)` rather than `O(1)`, and it is
@@ -757,7 +872,27 @@ impl Rooms {
         self.state_where(room_id, |_| true)
     }
 
-    /// The state block for one room on an initial sync.
+    /// The state block for one room on an initial sync, or on the sync that
+    /// joins it.
+    ///
+    /// The block is the state *before* the window: what the spec's `state`
+    /// promises -- "all state up to the start of the timeline" -- and what a
+    /// client applies before it walks the timeline. This server used to send
+    /// the state *after* the window under that name, on the reasoning that
+    /// the head snapshot already holds it. A client folding the timeline
+    /// onto that lands in the same place, which is why nothing noticed until
+    /// Complement's knock tests did: an observer's block named a knocker's
+    /// *second* knock, and a checker that reads `state` before `timeline`,
+    /// as the spec entitles it to, found a reason the first knock never
+    /// carried (#229). Under MSC4222 (`state_after`) the block is the state
+    /// after the window, which the head snapshot is exactly.
+    ///
+    /// Returns the events and whether the caller may serve the cached
+    /// current-state render instead. That is only true when nothing in the
+    /// window is a state event, so the state before it *is* the state now
+    /// -- the common case in a busy room, and the one the cache was built
+    /// for. `window_start` is the position of the window's first event;
+    /// `None` is an empty window, whose "before" is the state now.
     ///
     /// With `lazy_members`, membership is narrowed to the senders the
     /// client is about to see in this room's timeline, plus the syncing
@@ -777,21 +912,82 @@ impl Rooms {
         user_id: &str,
         state_block: StateBlock,
         timeline: &[Value],
-    ) -> Result<Vec<Value>, RoomError> {
-        match state_block {
-            // Nothing to do: the caller serves the cached render.
-            StateBlock::Deferred => return Ok(Vec::new()),
-            StateBlock::Rendered => return self.state(room_id),
-            StateBlock::LazyMembers => {}
-        }
-        let mut needed: HashSet<&str> = timeline
+        window_start: Option<i64>,
+        state_after: bool,
+    ) -> Result<(Vec<Value>, bool), RoomError> {
+        let state_in_window = timeline
             .iter()
-            .filter_map(|event| event["sender"].as_str())
-            .collect();
-        needed.insert(user_id);
-        self.state_where(room_id, |key| {
-            key.event_type().as_str() != "m.room.member" || needed.contains(key.state_key())
-        })
+            .any(|event| event.get("state_key").is_some());
+        let current = state_after || !state_in_window;
+        if state_block == StateBlock::Deferred && current {
+            // Nothing to do: the caller serves the cached render.
+            return Ok((Vec::new(), true));
+        }
+        let mut needed: HashSet<&str> = HashSet::new();
+        if state_block == StateBlock::LazyMembers {
+            needed.extend(timeline.iter().filter_map(|event| event["sender"].as_str()));
+            needed.insert(user_id);
+        }
+        let want = |key: &StateKey| {
+            state_block != StateBlock::LazyMembers
+                || key.event_type().as_str() != "m.room.member"
+                || needed.contains(key.state_key())
+        };
+        let events = match (current, window_start) {
+            (false, Some(start)) => self.state_before(room_id, start, want)?,
+            _ => self.state_where(room_id, want)?,
+        };
+        Ok((events, false))
+    }
+
+    /// The room's state as it stood before position `li`, keeping the keys
+    /// `want` admits: the snapshot after the entry preceding `li`, or an
+    /// empty room when nothing precedes it.
+    ///
+    /// Decided on the key before the body is read, as [`Self::state_where`]
+    /// does and for the same reason. The snapshot is rebuilt from its
+    /// content address rather than taken from the resident window, because
+    /// a sync window may begin further back than that window keeps.
+    fn state_before(
+        &self,
+        room_id: &str,
+        li: i64,
+        want: impl Fn(&StateKey) -> bool,
+    ) -> Result<Vec<Value>, RoomError> {
+        let root = self.with_room_read(room_id, |_, log| {
+            Ok(log
+                .entry_at_or_before(li.saturating_sub(1))
+                .filter(|entry| entry.li.get() < li)
+                .map(|entry| entry.state_root))
+        })?;
+        let Some(root) = root else {
+            return Ok(Vec::new());
+        };
+        let mut load = |address: &spindle_core::StateRoot| {
+            spindle_store::ReadView::get(
+                self.store.as_ref(),
+                &spindle_core::keys::content_addressed(
+                    spindle_core::keys::Keyspace::StateNode,
+                    address.as_bytes(),
+                ),
+            )
+            .ok()
+            .flatten()
+        };
+        let snapshot = spindle_core::StateSnapshot::rehydrate(root, &mut load)
+            .map_err(|error| RoomError::Build(format!("cannot rebuild state: {error:?}")))?;
+        let mut ids = Vec::new();
+        snapshot.for_each(|key, event_id| {
+            if want(key) {
+                ids.push(event_id.to_owned());
+            }
+        });
+        let mut events = Vec::with_capacity(ids.len());
+        for event_id in ids {
+            let event = self.read_event(room_id, &EventId::new(event_id.as_str()))?;
+            events.push(stamp(event, &event_id));
+        }
+        Ok(events)
     }
 
     /// The current state, skipping keys the caller does not want.
@@ -2487,6 +2683,7 @@ impl Rooms {
         since: Option<u64>,
         timeline_limit: usize,
         state_block: StateBlock,
+        state_after: bool,
     ) -> Result<SyncResult, RoomError> {
         let position = self.stream_position();
         let joined = self.joined(user_id)?;
@@ -2544,20 +2741,29 @@ impl Rooms {
             if since.is_some() && events.is_empty() {
                 continue;
             }
+            // State only when the client is meeting the room: on an
+            // initial sync, or on the sync that joins it. Otherwise the
+            // state events are in the timeline already, and sending them
+            // twice would make a client apply each one twice.
+            let (state, cached_state) = if fresh {
+                self.initial_state(
+                    &room_id,
+                    user_id,
+                    state_block,
+                    &events,
+                    prev_batch,
+                    state_after,
+                )?
+            } else {
+                (Vec::new(), false)
+            };
             rooms.push(SyncRoom {
                 room_id: room_id.clone(),
-                // State only when the client is meeting the room: on an
-                // initial sync, or on the sync that joins it. Otherwise the
-                // state events are in the timeline already, and sending them
-                // twice would make a client apply each one twice.
-                state: if fresh {
-                    self.initial_state(&room_id, user_id, state_block, &events)?
-                } else {
-                    Vec::new()
-                },
+                state,
                 events,
                 limited,
                 prev_batch,
+                cached_state,
             });
         }
 
@@ -2671,6 +2877,7 @@ impl Rooms {
                     events,
                     limited: false,
                     prev_batch,
+                    cached_state: false,
                 });
             }
         }
@@ -3999,16 +4206,18 @@ impl Rooms {
             )?;
         }
         // A membership event in a log this server holds supersedes any
-        // out-of-room invite record: the room is here now, and stripped
-        // state read from a live log beats a snapshot from the inviter.
-        spindle_store::Store::delete(
-            self.store.as_ref(),
-            &spindle_core::keys::user_room(
-                spindle_core::keys::Keyspace::PendingInvite,
-                user_id,
-                room_id,
-            ),
-        )?;
+        // out-of-room invite or knock record: the room is here now, and
+        // stripped state read from a live log beats a snapshot from the
+        // inviter -- or from the server that took the knock.
+        for keyspace in [
+            spindle_core::keys::Keyspace::PendingInvite,
+            spindle_core::keys::Keyspace::PendingKnock,
+        ] {
+            spindle_store::Store::delete(
+                self.store.as_ref(),
+                &spindle_core::keys::user_room(keyspace, user_id, room_id),
+            )?;
+        }
         Ok(())
     }
 
