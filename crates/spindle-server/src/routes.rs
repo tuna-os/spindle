@@ -3767,10 +3767,11 @@ struct SetPusherRequest {
 /// `POST /_matrix/client/v3/pushers/set`
 ///
 /// Register, replace or (with `kind: null`) remove one of the caller's
-/// pushers. Registrations are kept, not yet driven: nothing evaluates a
-/// push rule against an event yet (#7), so nothing is sent to the URL a
-/// client hands over -- which is also why that URL is not fetched, vetted
-/// or otherwise touched here.
+/// pushers. An http pusher's URL is what `push::deliver_loop` will fetch
+/// for as long as the registration stands, so it is vetted here the way
+/// the loop vets it: the spec's path, http or https, and not a literal
+/// address inside this server's network -- a hostname is judged by what it
+/// resolves to, at every delivery.
 async fn set_pusher(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
@@ -3786,9 +3787,13 @@ async fn set_pusher(
     };
     match kind {
         "http" => {
-            if request.data["url"].as_str().is_none() {
+            let Some(url) = request.data["url"].as_str() else {
                 return Err(MatrixError::missing_param("an http pusher needs data.url"));
-            }
+            };
+            state
+                .push
+                .vet_url(url)
+                .map_err(|why| MatrixError::new(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", why))?;
         }
         "email" => {}
         other => {

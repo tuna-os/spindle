@@ -329,6 +329,17 @@ pub enum Keyspace {
     /// joined again -- and a scan of the room to reconstruct it is exactly
     /// the whole-room read every hot path here avoids.
     MemberHistory = 0x30,
+    /// The one row holding the push delivery cursor: a big-endian `u64`
+    /// position in the global stream.
+    ///
+    /// One cursor for every pusher rather than one per pusher, because the
+    /// walk it guards is the expensive half -- reading the stream, finding
+    /// each event's readers and asking their rules -- and doing that once
+    /// per registered device would multiply it by the number of phones.
+    /// It advances when a batch has been *computed*, not delivered: what a
+    /// gateway has not yet acknowledged waits in memory, per gateway, so
+    /// one dead gateway holds up nobody else's notifications.
+    PushCursor = 0x31,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -346,6 +357,12 @@ pub fn profile(user_id: &str) -> Vec<u8> {
     let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::Profile as u8];
     key.extend_from_slice(user_id.as_bytes());
     key
+}
+
+/// The push delivery cursor -- the one row of [`Keyspace::PushCursor`].
+#[must_use]
+pub fn push_cursor() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::PushCursor as u8]
 }
 
 /// The transaction-push cursor for one appservice.

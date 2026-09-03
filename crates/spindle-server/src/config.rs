@@ -37,6 +37,42 @@ pub struct Config {
     pub turn: TurnConfig,
     #[serde(default)]
     pub rtc: RtcConfig,
+    #[serde(default)]
+    pub push: PushConfig,
+}
+
+/// Push notification delivery.
+///
+/// A pusher is a URL a client handed this server, to be fetched every time
+/// one of that client's rooms has something to say -- which makes it the
+/// same request-forgery vector as a URL preview, with the difference that a
+/// preview is fetched once and a pusher for as long as it is registered.
+/// The gateway address is therefore vetted the way a preview's is: refused
+/// by resolved address when it points inward, unless its range is listed
+/// here, and refused at registration when it is a literal address that
+/// would be.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PushConfig {
+    /// Deliver to registered pushers at all. Off keeps registrations and
+    /// sends nothing, which is what the server did before delivery existed.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// CIDR ranges a push gateway may sit in although they are not
+    /// routable, e.g. `["127.0.0.0/8"]` for a test rig whose gateway is a
+    /// loopback stub. Same judgement, same shape as `[previews]
+    /// allow_private` and `[federation] allow_internal`.
+    #[serde(default)]
+    pub allow_internal: Vec<String>,
+}
+
+impl Default for PushConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_internal: Vec::new(),
+        }
+    }
 }
 
 /// The caps on MSC4140 delayed events (#36).

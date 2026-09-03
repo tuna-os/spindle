@@ -1,8 +1,8 @@
 //! The delivery loops do not own what they read (#292).
 //!
-//! `spindle_server::app` spawns three loops that run for the life of the
-//! process: delayed-event firing, the federation outbox drain and the
-//! appservice push. A runtime tears its tasks down as it shuts down, and a
+//! `spindle_server::app` spawns four loops that run for the life of the
+//! process: delayed-event firing, the federation outbox drain, the
+//! appservice push and push-gateway delivery. A runtime tears its tasks down as it shuts down, and a
 //! task dropped that way is the wrong place for the store to close: fjall's
 //! close joins its worker threads, and #292 caught it waiting forever there,
 //! in a test whose assertions had all passed. So the loops hold their
@@ -15,7 +15,7 @@ use std::time::Duration;
 use spindle_store::FjallStore;
 use tempfile::TempDir;
 
-/// A router with all three loops running: the appservice push only starts
+/// A router with all four loops running: the appservice push only starts
 /// for a registration with a URL, so one is supplied (nothing listens on
 /// it, and nothing is ever queued for it).
 fn app_with_every_loop(dir: &TempDir, store: Arc<FjallStore>) -> axum::Router {
@@ -44,12 +44,12 @@ async fn dropping_the_router_closes_the_store_and_ends_every_loop() {
     let observer: Weak<FjallStore> = Arc::downgrade(&store);
     let app = app_with_every_loop(&dir, store);
     let tasks = tokio::runtime::Handle::current().metrics();
-    assert_eq!(tasks.num_alive_tasks(), 3, "the three delivery loops");
+    assert_eq!(tasks.num_alive_tasks(), 4, "the four delivery loops");
 
     // Every loop has taken at least one pass with the router alive, which
     // is where a loop that upgraded once and kept the result would show.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
-    assert_eq!(tasks.num_alive_tasks(), 3, "the loops outlive a pass");
+    assert_eq!(tasks.num_alive_tasks(), 4, "the loops outlive a pass");
 
     drop(app);
     assert!(
