@@ -202,9 +202,12 @@ registrations = []
 #     { type = "livekit", livekit_service_url = "https://livekit.example.org/jwt" },
 # ]
 
-[rtc.livekit]
-# The built-in LiveKit JWT service (#38, MSC4195) — off unless this section
-# is set. See docs/matrix-rtc.md for the deployment end to end.
+# The built-in LiveKit JWT service (#38, MSC4195) — off unless the
+# `[rtc.livekit]` section below is set, with all three of url, key and
+# secret. The header is commented out with the rest for that reason: a
+# section that is present but empty is a misconfiguration, not "off".
+# See docs/matrix-rtc.md for the deployment end to end.
+# [rtc.livekit]
 #
 # With it set, this server mints the tokens clients present to the SFU
 # itself, and a deployment needs no lk-jwt-service. It advertises itself
