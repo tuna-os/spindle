@@ -38,7 +38,7 @@ rand = "0.10"
 # `synapse-import` feature. `bundled` compiles SQLite itself: a one-shot
 # migration tool is not a reason to make every operator install a system
 # library, nor to make the default build pay for one.
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 imbl = "6"
 # `state-res` is a runtime dependency, not just an oracle: SPEC 9.3 and
 # docs/divergence.md both require the local send path to use the same auth
