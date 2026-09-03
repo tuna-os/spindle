@@ -32,6 +32,7 @@ pub mod oidc;
 pub mod presence;
 pub mod previews;
 pub mod profiles;
+pub mod push;
 pub mod push_rules;
 pub mod pushers;
 pub mod ratelimit;
@@ -81,6 +82,9 @@ pub struct AppState {
     pub oidc: Option<Arc<oidc::BuiltinOidc>>,
     pub federation: Arc<federation::Federation>,
     pub delayed: Arc<delayed::Delayed>,
+    /// The push gateway client, and the judgement on which gateways it
+    /// reaches; `set_pusher` asks it before storing a URL.
+    pub push: Arc<push::Gateway>,
 }
 
 /// Why the application cannot be built. Both are startup-fatal on purpose:
@@ -91,6 +95,7 @@ pub enum AppError {
     Signing(signing::SigningError),
     PreviewConfig(String),
     FederationConfig(String),
+    PushConfig(String),
     Appservice(String),
 }
 
@@ -100,6 +105,7 @@ impl std::fmt::Display for AppError {
             Self::Signing(error) => write!(formatter, "signing key: {error}"),
             Self::PreviewConfig(why) => write!(formatter, "preview config: {why}"),
             Self::FederationConfig(why) => write!(formatter, "federation config: {why}"),
+            Self::PushConfig(why) => write!(formatter, "push config: {why}"),
             Self::Appservice(why) => write!(formatter, "appservice registration: {why}"),
         }
     }
@@ -194,6 +200,8 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
         .auth
         .builtin_oidc
         .then(|| Arc::new(oidc::BuiltinOidc::new()));
+    let push =
+        Arc::new(push::Gateway::new(&config.push.allow_internal).map_err(AppError::PushConfig)?);
     let delayed_caps = config.delayed_events.clone();
     let state = AppState {
         config: Arc::new(config),
@@ -221,6 +229,7 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
             delayed_caps.max_delay_ms,
             delayed_caps.max_per_room,
         )),
+        push,
     };
     spawn_delivery_loops(&state);
     Ok(routes::router(state))
@@ -239,6 +248,11 @@ pub fn app(config: Config, store: Arc<FjallStore>) -> Result<Router, AppError> {
 /// there. With the loops holding only weak references the store closes
 /// where its last owner is dropped -- the router, on the thread that
 /// served it -- and the loops notice on their next pass and return.
+///
+/// The same holds inside a pass: a loop upgrades to read and to write,
+/// never across a request in flight, so a cancellation mid-send finds
+/// nothing to drop either. `delivery_loops.rs` pins both -- the router
+/// dropped while every loop is idle, and while each is mid-request.
 fn spawn_delivery_loops(state: &AppState) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
@@ -257,6 +271,21 @@ fn spawn_delivery_loops(state: &AppState) {
         Arc::downgrade(&state.federation),
         std::time::Duration::from_millis(state.config.federation.retry_base_ms),
     ));
+    // Push delivery shares the outbox's retry base for the same reason
+    // the appservice push does, below.
+    if state.config.push.enabled {
+        tokio::spawn(push::deliver_loop(
+            push::Sources {
+                store: Arc::downgrade(&state.store),
+                rooms: Arc::downgrade(&state.rooms),
+                pushers: Arc::downgrade(&state.pushers),
+                account_data: Arc::downgrade(&state.account_data),
+                profiles: Arc::downgrade(&state.profiles),
+                gateway: Arc::downgrade(&state.push),
+            },
+            std::time::Duration::from_millis(state.config.federation.retry_base_ms),
+        ));
+    }
     // The appservice push shares the outbox's retry base: both are
     // at-least-once delivery loops, and one knob for "how patient is
     // this server with a peer" is one knob to explain.

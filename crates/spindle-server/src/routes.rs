@@ -2353,6 +2353,12 @@ struct CreateRoomRequest {
     /// The server keeps `room_version` and `creator` for itself; see
     /// [`crate::rooms::Rooms::create`].
     creation_content: Option<serde_json::Map<String, Value>>,
+    /// Applied on top of the default `m.room.power_levels` content.
+    ///
+    /// The field every Element client uses to make a room one where a
+    /// call can happen: `events` naming the call membership type at 0.
+    /// See `power_levels_content` in the rooms module for the rules.
+    power_level_content_override: Option<serde_json::Map<String, Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2383,6 +2389,7 @@ async fn create_room(
             request.name.as_deref(),
             request.topic.as_deref(),
             request.preset.as_deref(),
+            &request.invite,
             &initial_state,
             // Honour a version this server advertises; ignore one it does
             // not. Both halves are deliberate, and they are deliberate for
@@ -2408,9 +2415,10 @@ async fn create_room(
                 .as_deref()
                 .filter(|version| crate::surface::supports_room_version(version)),
             request.creation_content.as_ref(),
+            request.power_level_content_override.as_ref(),
             &member_profile(&state, &identity.user_id),
         )
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        .map_err(room_error)?;
     // Invites after the room stands, refused invites failing the create the
     // way the spec asks (the room still exists; the error names why).
     for target in &request.invite {
@@ -4007,10 +4015,11 @@ struct SetPusherRequest {
 /// `POST /_matrix/client/v3/pushers/set`
 ///
 /// Register, replace or (with `kind: null`) remove one of the caller's
-/// pushers. Registrations are kept, not yet driven: nothing evaluates a
-/// push rule against an event yet (#7), so nothing is sent to the URL a
-/// client hands over -- which is also why that URL is not fetched, vetted
-/// or otherwise touched here.
+/// pushers. An http pusher's URL is what `push::deliver_loop` will fetch
+/// for as long as the registration stands, so it is vetted here the way
+/// the loop vets it: the spec's path, http or https, and not a literal
+/// address inside this server's network -- a hostname is judged by what it
+/// resolves to, at every delivery.
 async fn set_pusher(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
@@ -4026,9 +4035,13 @@ async fn set_pusher(
     };
     match kind {
         "http" => {
-            if request.data["url"].as_str().is_none() {
+            let Some(url) = request.data["url"].as_str() else {
                 return Err(MatrixError::missing_param("an http pusher needs data.url"));
-            }
+            };
+            state
+                .push
+                .vet_url(url)
+                .map_err(|why| MatrixError::new(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", why))?;
         }
         "email" => {}
         other => {
@@ -7028,6 +7041,11 @@ pub(crate) fn room_error(error: crate::rooms::RoomError) -> MatrixError {
         crate::rooms::RoomError::MissingBody(_) => {
             MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such event")
         }
+        crate::rooms::RoomError::InvalidPowerLevels(why) => MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            format!("power_level_content_override: {why}"),
+        ),
         // The message is ruma's own wording for the rule that refused, which
         // is the same explanation a federating peer would give. A generic
         // "forbidden" would make a client's bug report useless.
@@ -7037,13 +7055,17 @@ pub(crate) fn room_error(error: crate::rooms::RoomError) -> MatrixError {
         // the server is working correctly and the *room* is in a state it
         // cannot fold until #16 wires the resolver into ingest. 503 says
         // "this server, this room, not now", which is the true shape of it,
-        // and naming the contested key makes it diagnosable.
+        // and naming the contested key makes it diagnosable. An ordinary
+        // local send no longer reaches this: it is authored around the
+        // contested tip instead. What still does is an event built before
+        // the fork landed and committed after, and a retry names the new
+        // head.
         crate::rooms::RoomError::Contested { key } => MatrixError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "M_UNKNOWN",
             format!(
                 "this room has a fork contesting {key}, which this server cannot \
-                 resolve yet; sends are refused until it is settled"
+                 resolve yet; this event cannot be folded onto it, retry"
             ),
         ),
         other => MatrixError::internal(&other.to_string()),
@@ -8604,9 +8626,11 @@ async fn upgrade_room(
             None,
             None,
             None,
+            &[],
             &carried,
             Some(&request.new_version),
             Some(&creation_content),
+            None,
             &member_profile(&state, &identity.user_id),
         )
         .map_err(room_error)?;

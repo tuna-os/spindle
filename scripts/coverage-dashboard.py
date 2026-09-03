@@ -40,7 +40,7 @@ MILESTONES = [
      "covered by restart and torn-write tests."),
     ("M1", "Usable local homeserver", "**Done**",
      "Full local CS-API surface with classic `/sync`; leftovers tracked on #7 "
-     "(room upgrade, spaces, search, pushers, OpenAPI validation, Element Web rig). "
+     "(room upgrade, spaces, search, OpenAPI validation, Element Web rig). "
      "Benchmarked vs Synapse and Continuwuity — see docs/benchmarks.md."),
     ("M2", "Modern encrypted clients", "**Done**",
      "Media + thumbnails (#99, #104), Simplified Sliding Sync (#105), E2EE "
@@ -138,8 +138,45 @@ MILESTONES = [
      "endpoint's presence is the claim to implement the MSC, and the list "
      "is what it currently has. MSC4158 needed nothing separate — it was "
      "folded into MSC4143 and closed, so the well-known key is "
-     "`org.matrix.msc4143.rtc_foci`. #38–#41 are not started; #269 would "
-     "run Element Call's own Playwright suite against this server."),
+     "`org.matrix.msc4143.rtc_foci`. #39's server half is served: pushers "
+     "are driven — a delivery loop walks the stream, asks every reader's "
+     "rules, and posts the spec's notification body to the gateway each "
+     "device registered, with the gateway address vetted like a preview's "
+     "and a `rejected` pushkey forgotten. MSC4075 in its current form "
+     "defines no push rule of its own: a ring is routed by `m.mentions`, "
+     "so the default mention rules are what make a fresh account's phone "
+     "ring, at high priority, and an MSC4310 decline carries no mention "
+     "and pushes nobody. What #39 still owes: the ring dispatch latency "
+     "benchmark and a ring budget separate from ordinary push. #40's "
+     "server half is served, and it is smaller than the issue supposed: "
+     "MatrixRTC membership is room state and to-device traffic, and both "
+     "were already carried. What the server owed was what the reference "
+     "clients rely on to get a call off the ground. "
+     "`power_level_content_override` on `/createRoom` is honoured -- "
+     "Element X names `org.matrix.msc3401.call.member` at 0 on every room "
+     "it creates, because a fresh room's `state_default` of 50 otherwise "
+     "keeps every ordinary member out of the call -- and "
+     "`trusted_private_chat` gives the invitee the creator's power, as a "
+     "`users` entry before v12 and as an additional creator (MSC4289) "
+     "from it, which is what lets a DM call be answered. The state-key "
+     "rule is the spec's own, run by ruma: a key starting with `@` "
+     "belongs to that user, which is exactly why Element Call's "
+     "per-device key starts with `_` -- and the server invents no owner "
+     "for that key, since MSC3757 (which would have) is closed and "
+     "MSC4354 is where the problem is being solved. The lifecycle is "
+     "pinned end to end in the order Element Call drives it: the delayed "
+     "leave is scheduled *before* the join and survives it, heartbeats "
+     "keep the membership, silence fires the leave, everyone else sees it "
+     "on `/sync`, and the scheduler reads it back under MSC4309. "
+     "To-device signalling (MSC3401) needed nothing: a burst of call "
+     "invites rides the per-device stream in order and the room's own "
+     "timeline arrives beside it. What #40 still owes: MSC4354 sticky "
+     "events, which MSC4143 now makes `m.rtc.member` -- a new primitive "
+     "(a `sticky` key on the PDU, its own `/sync` section, eager "
+     "federation push) that no shipped client requires yet and is its "
+     "own piece of work -- and the 5/20/100-participant churn benchmarks. "
+     "#38 and #41 are not started; #269 would run Element Call's own "
+     "Playwright suite against this server."),
 ]
 
 # ---------------------------------------------------------------------------

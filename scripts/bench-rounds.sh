@@ -21,9 +21,17 @@
 # in this project was discarded for beginning at load 2.28. Idleness is part
 # of the method, so it is checked rather than assumed.
 #
-#   scripts/bench-rounds.sh --group m5-final --rounds 3 \
+#   scripts/bench-rounds.sh --group m5-final \
 #       --server spindle=http://127.0.0.1:8099 \
 #       --server continuwuity=http://127.0.0.1:8097
+#
+# Five rounds a side unless `--rounds` says otherwise. Three is the floor at
+# which the separation rule means anything -- two identical servers separate
+# by luck one time in ten at three rounds -- and five brings that to one in
+# 126, which on a 27-cell table is the difference between expecting three
+# spurious calls and expecting none. The cost is linear in rounds; the
+# default is the honest setting and the flag is for when the hour is not
+# available. (`sitting.py` carries the same default for the Python side.)
 #
 # Servers must already be running: what they are and how they are configured
 # is the caller's business, and baking it in here is what made the previous
@@ -33,7 +41,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 GROUP=
-ROUNDS=3
+ROUNDS=5
 SIZES=200,800,3200
 SAMPLES=25
 WARMUP=5
@@ -64,7 +72,7 @@ done
 [ -n "$GROUP" ] || { echo "--group is required" >&2; exit 2; }
 case $GROUP in *.*) echo "--group must not contain a dot: the renderer takes the group from the first segment of the filename" >&2; exit 2 ;; esac
 [ "${#SERVERS[@]}" -ge 1 ] || { echo "--server name=url is required at least once" >&2; exit 2; }
-[ "$ROUNDS" -ge 2 ] || echo "warning: $ROUNDS round(s) cannot separate anything; the renderer will mark this sitting unresolved" >&2
+[ "$ROUNDS" -ge 3 ] || echo "warning: $ROUNDS round(s) cannot separate anything -- three a side is the minimum; the renderer will mark this sitting unresolved" >&2
 
 # The driver talks to loopback; a proxy would send it somewhere else entirely
 # and the failure looks like a hung server.

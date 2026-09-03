@@ -347,9 +347,18 @@ impl Rooms {
     /// ones established, so a power-levels event before a membership has no
     /// sender in the room to authorise it.
     ///
+    /// `invitees` are the users the request will invite once the room
+    /// stands. They are named here, before any invite is sent, because two
+    /// of the birth options turn on them: `trusted_private_chat` gives them
+    /// the creator's power, and `power_levels` is the request's
+    /// `power_level_content_override`, applied on top of the defaults. See
+    /// [`power_levels_content`] for what that means and why it matters.
+    ///
     /// # Errors
     ///
-    /// Returns [`RoomError`] if an event cannot be signed or stored.
+    /// Returns [`RoomError`] if an event cannot be signed or stored, or
+    /// [`RoomError::InvalidPowerLevels`] if the override would lock the
+    /// creator out of the room they are creating.
     #[allow(clippy::too_many_arguments, reason = "a room's birth options")]
     pub fn create(
         &self,
@@ -358,9 +367,11 @@ impl Rooms {
         name: Option<&str>,
         topic: Option<&str>,
         preset: Option<&str>,
+        invitees: &[String],
         initial_state: &[(String, String, Value)],
         version: Option<&str>,
         creation_content: Option<&serde_json::Map<String, Value>>,
+        power_levels: Option<&serde_json::Map<String, Value>>,
         creator_profile: &serde_json::Map<String, Value>,
     ) -> Result<String, RoomError> {
         // The requested version, or this build's default. Refused rather
@@ -378,8 +389,31 @@ impl Rooms {
             .ok()
             .and_then(|id| id.rules())
             .is_some_and(|rules| rules.authorization.explicitly_privilege_room_creators);
-        let create_content =
-            build_create_content(version, creator, privileges_creators, creation_content);
+        let trusted = preset == Some("trusted_private_chat");
+        // `trusted_private_chat` gives every invitee the creator's own
+        // power. Before v12 that is a `users` entry at 100. From v12 the
+        // creator's power is implicit and may not be named (MSC4289), so
+        // the invitees become additional creators instead -- which is how
+        // Synapse reads it, and the only reading of "the same power level
+        // as the room creator" a v12 room can express.
+        let creation_content = if privileges_creators && trusted {
+            with_additional_creators(creation_content, creator, invitees)
+        } else {
+            creation_content.cloned()
+        };
+        let create_content = build_create_content(
+            version,
+            creator,
+            privileges_creators,
+            creation_content.as_ref(),
+        );
+        let power = power_levels_content(
+            creator,
+            &create_content,
+            privileges_creators,
+            if trusted { invitees } else { &[] },
+            power_levels,
+        )?;
         // MSC4291 inverts the order a room is born in. Before v12 the ID
         // was chosen and the create event then named it; from v12 the ID
         // *is* the create event's hash, so the event must be signed before
@@ -405,24 +439,7 @@ impl Rooms {
         creator_join["membership"] = Value::String("join".to_owned());
         let mut events: Vec<(&str, String, Value)> = vec![
             ("m.room.member", creator.to_owned(), creator_join),
-            (
-                "m.room.power_levels",
-                String::new(),
-                serde_json::json!({
-                    // MSC4289: a v12 room privileges its creators
-                    // implicitly and *forbids* naming them here -- the
-                    // create fails authorization if they appear.
-                    "users": if privileges_creators {
-                        serde_json::json!({})
-                    } else {
-                        serde_json::json!({ creator: 100 })
-                    },
-                    "users_default": 0,
-                    "events_default": 0,
-                    "state_default": 50,
-                    "ban": 50, "kick": 50, "redact": 50, "invite": 0,
-                }),
-            ),
+            ("m.room.power_levels", String::new(), power),
             (
                 "m.room.join_rules",
                 String::new(),
@@ -3592,7 +3609,7 @@ impl Rooms {
     /// must not be in the log until that server has.
     fn build_event(
         &self,
-        log: &RoomLog,
+        log: &mut RoomLog,
         room_id: &str,
         sender: &str,
         key: &Ed25519KeyPair,
@@ -3600,13 +3617,14 @@ impl Rooms {
         state_key: Option<&str>,
         content: &Value,
     ) -> Result<(String, Value), RoomError> {
+        // Before `prev` is read, so the event names only tips that fold.
+        Self::set_aside_contested(log, room_id)?;
         let depth = log
             .entries()
             .next_back()
             .map_or(0, |entry| entry.depth.saturating_add(1));
         let prev: Vec<String> = log
-            .forward_extremities()
-            .iter()
+            .authoring_extremities()
             .map(|id| id.as_str().to_owned())
             .collect();
 
@@ -3657,6 +3675,39 @@ impl Rooms {
         // exactly the bytes a peer would receive, event ID included.
         self.authorize(log, room_id, &event_id, &json)?;
         Ok((event_id, json))
+    }
+
+    /// Step around a fork this server cannot fold, and say so.
+    ///
+    /// SPEC §9.2 case 3 reaches here with no resolver behind it (#16). The
+    /// core sets the contesting tip aside so that what remains folds
+    /// (`RoomLog::set_aside_contested`); this is where that decision is
+    /// counted and logged. Once per tip, not once per send: the tip stays
+    /// set aside until something builds on it, so a later send finds
+    /// nothing to set aside and costs one fold. A count that moved on every
+    /// send while one fork stayed open would make §18.3's ratio a measure
+    /// of how chatty the local users are rather than of forks.
+    ///
+    /// The log line is the anomaly record SPEC §9.1 asks for. It spells the
+    /// key the way `/state_ids` does and names the tip set aside, which is
+    /// what an operator needs to find the branch this server is not
+    /// showing.
+    fn set_aside_contested(log: &mut RoomLog, room_id: &str) -> Result<(), RoomError> {
+        let set_aside = log
+            .set_aside_contested()
+            .map_err(|error| RoomError::Append(format!("{error:?}")))?;
+        for spindle_core::SetAside { extremity, key } in set_aside {
+            crate::metrics::record_contested_state();
+            let key = format!("{}/{}", key.event_type().as_str(), key.state_key());
+            tracing::warn!(
+                room = room_id,
+                extremity = extremity.as_str(),
+                key = key.as_str(),
+                "a federated fork contests a state key this server cannot resolve yet (#16); \
+                 the branch is set aside and local events are authored without it"
+            );
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments, reason = "an event is what it is")]
@@ -3722,11 +3773,14 @@ impl Rooms {
             .append_remote(input)
             .map_err(|error| {
                 // §9.2 case 3: the key is contested inside the window, so
-                // this append needs the resolver. Counted where the
-                // decision is made (#166), whether it is then resolved or
-                // — as today — refused.
+                // this append needs the resolver. `build_event` set the
+                // contesting tips aside before naming any, so this is
+                // reached only when the fork landed between building and
+                // committing -- the invite handshake leaves that gap open.
+                // Counted where the decision is made (#166), whether it
+                // is then resolved or — as today — refused.
                 if let spindle_core::AppendError::NeedsStateResolution { key, .. } = &error {
-                    crate::metrics::record_contested_state(crate::metrics::Origin::Local);
+                    crate::metrics::record_contested_state();
                     return RoomError::Contested {
                         // The `type/state_key` spelling `/state_ids` uses,
                         // so an operator can match this against what the
@@ -3928,7 +3982,7 @@ impl Rooms {
             .append_remote(input)
             .map_err(|error| {
                 if let spindle_core::AppendError::NeedsStateResolution { key, .. } = &error {
-                    crate::metrics::record_contested_state(crate::metrics::Origin::Federated);
+                    crate::metrics::record_contested_state();
                     return RoomError::Contested {
                         // The `type/state_key` spelling `/state_ids` uses,
                         // so an operator can match this against what the
@@ -4596,6 +4650,14 @@ pub enum RoomError {
     /// create rooms at it, because nothing here has been exercised
     /// against one.
     UnsupportedVersion(String),
+    /// A `power_level_content_override` the room could not be born with:
+    /// one that names a `users` map without the creator in it, in a
+    /// version where the creator's power is that entry and nothing else.
+    /// The creator sends the event, so honouring it would have them lock
+    /// themself out of the room they are creating. Refused with the
+    /// reason rather than sent to the rules, whose refusal would name a
+    /// rule rather than the field.
+    InvalidPowerLevels(String),
     UnknownRoom(String),
     MissingBody(String),
     Build(String),
@@ -4644,6 +4706,9 @@ impl std::fmt::Display for RoomError {
                 formatter,
                 "the state key {key} is contested between two branches of a                  fork and needs state resolution"
             ),
+            Self::InvalidPowerLevels(why) => {
+                write!(formatter, "invalid power_level_content_override: {why}")
+            }
             Self::UnknownRoom(id) => write!(formatter, "no such room: {id}"),
             Self::MissingBody(id) => write!(formatter, "the body of {id} is missing"),
             Self::Build(message) => write!(formatter, "cannot build the event: {message}"),
@@ -5048,7 +5113,9 @@ mod room_version_tests {
                 None,
                 None,
                 &[],
+                &[],
                 Some(unsupported),
+                None,
                 None,
                 &serde_json::Map::new(),
             );
@@ -5072,7 +5139,9 @@ mod room_version_tests {
                 None,
                 None,
                 &[],
+                &[],
                 Some("11"),
+                None,
                 None,
                 &serde_json::Map::new(),
             )
@@ -5111,6 +5180,8 @@ mod room_version_tests {
                 None,
                 None,
                 &[],
+                &[],
+                None,
                 None,
                 None,
                 &serde_json::Map::new(),
@@ -5154,7 +5225,9 @@ mod room_version_tests {
                 None,
                 None,
                 &[],
+                &[],
                 Some("12"),
+                None,
                 None,
                 &serde_json::Map::new(),
             )
@@ -5196,7 +5269,9 @@ mod room_version_tests {
                 None,
                 None,
                 &[],
+                &[],
                 Some("12"),
+                None,
                 None,
                 &serde_json::Map::new(),
             )
@@ -5237,7 +5312,9 @@ mod room_version_tests {
                 None,
                 None,
                 &[],
+                &[],
                 Some("11"),
+                None,
                 None,
                 &serde_json::Map::new(),
             )
@@ -5270,7 +5347,9 @@ mod room_version_tests {
                 None,
                 None,
                 &[],
+                &[],
                 Some("12"),
+                None,
                 None,
                 &serde_json::Map::new(),
             )
@@ -5330,6 +5409,8 @@ mod room_version_tests {
                 None,
                 None,
                 &[],
+                &[],
+                None,
                 None,
                 None,
                 &serde_json::Map::new(),
@@ -5388,6 +5469,8 @@ mod room_version_tests {
                 None,
                 None,
                 &[],
+                &[],
+                None,
                 None,
                 None,
                 &serde_json::Map::new(),
@@ -5446,4 +5529,116 @@ fn build_create_content(
         content.extend(reserved);
     }
     Value::Object(content)
+}
+
+/// `supplied` with `invitees` named as additional creators (MSC4289).
+///
+/// Keeps whatever the request already named, and never repeats a name: a
+/// creator who invites themself or lists the same user twice gets one
+/// entry, because the auth rules read the array and a duplicate is not
+/// obviously harmless to every implementation of them.
+fn with_additional_creators(
+    supplied: Option<&serde_json::Map<String, Value>>,
+    creator: &str,
+    invitees: &[String],
+) -> Option<serde_json::Map<String, Value>> {
+    if invitees.is_empty() {
+        return supplied.cloned();
+    }
+    let mut content = supplied.cloned().unwrap_or_default();
+    let mut creators: Vec<Value> = content
+        .get("additional_creators")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for invitee in invitees {
+        if invitee != creator
+            && !creators
+                .iter()
+                .any(|named| named.as_str() == Some(invitee.as_str()))
+        {
+            creators.push(Value::String(invitee.clone()));
+        }
+    }
+    content.insert("additional_creators".to_owned(), Value::Array(creators));
+    Some(content)
+}
+
+/// The `m.room.power_levels` content a new room is born with.
+///
+/// The spec's defaults, then what the request asked for on top -- and the
+/// request is load-bearing for `MatrixRTC` (#40). A fresh room's
+/// `state_default` is 50, so at the defaults nobody but the creator may
+/// write the per-device call membership Element Call keeps in state
+/// (`org.matrix.msc3401.call.member`, keyed `_@user:server_DEVICE…`). The
+/// reference clients do not expect the server to know that: Element X
+/// sends `power_level_content_override` naming that type at 0 on every
+/// room it creates, and its DMs use `trusted_private_chat`, the preset
+/// that makes the other party as powerful as the creator. Honouring both
+/// is what "default power levels correct for a call" means on the server;
+/// the defaults themselves stay the spec's, and MSC4196 keeps it that way
+/// by riding its slot event in `initial_state` for the same reason.
+///
+/// The override is applied a key at a time, which is how the spec's
+/// "applied on top of the generated content" reads and how Synapse does
+/// it: a client that sends `events` sends the whole map it wants. Two
+/// rules keep the result one the auth rules will accept. Before v12, a
+/// `users` map that drops the creator is refused rather than honoured,
+/// because the creator sends this event and would be locking themself out
+/// of the room they are creating. From v12 the creators are struck from
+/// `users` however they got there -- MSC4289 forbids naming them, and a
+/// client whose habit is `users: { self: 100 }` should get its room, not
+/// a refusal citing a rule it has never heard of.
+fn power_levels_content(
+    creator: &str,
+    create_content: &Value,
+    privileges_creators: bool,
+    trusted_invitees: &[String],
+    supplied: Option<&serde_json::Map<String, Value>>,
+) -> Result<Value, RoomError> {
+    let mut users = serde_json::Map::new();
+    if !privileges_creators {
+        users.insert(creator.to_owned(), serde_json::json!(100));
+        for invitee in trusted_invitees {
+            users.insert(invitee.clone(), serde_json::json!(100));
+        }
+    }
+    let mut content = serde_json::json!({
+        "users": users,
+        "users_default": 0,
+        "events_default": 0,
+        "state_default": 50,
+        "ban": 50, "kick": 50, "redact": 50, "invite": 0,
+    });
+    if let Some(supplied) = supplied {
+        if !privileges_creators
+            && let Some(named) = supplied.get("users").and_then(Value::as_object)
+            && !named.contains_key(creator)
+        {
+            return Err(RoomError::InvalidPowerLevels(format!(
+                "`users` does not name the creator {creator}"
+            )));
+        }
+        if let Value::Object(content) = &mut content {
+            content.extend(
+                supplied
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        }
+    }
+    if privileges_creators && let Some(users) = content["users"].as_object_mut() {
+        users.remove(creator);
+        let additional = create_content["additional_creators"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        for named in additional {
+            users.remove(&named);
+        }
+    }
+    Ok(content)
 }

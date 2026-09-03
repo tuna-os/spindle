@@ -175,6 +175,17 @@ pub struct ForkWindow {
     pub visited: usize,
 }
 
+/// A forward extremity this server has stopped authoring on, and why.
+///
+/// Returned by [`RoomLog::set_aside_contested`]: `extremity` is a tip whose
+/// branch moved `key` away from the value it shared with the linear head's
+/// branch, which is SPEC §9.2 case 3 and needs the room-version resolver.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetAside {
+    pub extremity: EventId,
+    pub key: StateKey,
+}
+
 /// A per-room log in linear-index order, plus the minimal DAG overlay
 /// federation requires.
 ///
@@ -186,6 +197,15 @@ pub struct RoomLog {
     entries: BTreeMap<i64, LogEntry>,
     positions: HashMap<EventId, i64>,
     forward_extremities: BTreeSet<EventId>,
+    /// Forward extremities a local event no longer names, because folding
+    /// them needs the resolver (SPEC §9.2 case 3). Always a subset of
+    /// `forward_extremities`: they are still tips of the DAG, still pinned
+    /// resident, and still persisted as extremities, so the resolver finds
+    /// them where it expects to. Only the *decision* not to author on them
+    /// is held here, and it is in-memory by design: a reopen retries the
+    /// fold once, which is cheap, rather than trusting a stored verdict
+    /// about state it has not looked at.
+    set_aside: BTreeSet<EventId>,
     next_forward: i64,
     next_backward: i64,
     head_chain: ChainHash,
@@ -204,6 +224,7 @@ impl Default for RoomLog {
             entries: BTreeMap::new(),
             positions: HashMap::new(),
             forward_extremities: BTreeSet::new(),
+            set_aside: BTreeSet::new(),
             next_forward: 1,
             next_backward: 0,
             head_chain: ChainHash::seed(),
@@ -352,9 +373,30 @@ impl RoomLog {
             .map(|(_, entry)| entry)
     }
 
+    /// Every tip of the federation DAG, including any set aside.
+    ///
+    /// This is what a peer would compute from the same events, and what
+    /// the store persists. It is not what a local event names -- that is
+    /// [`Self::authoring_extremities`].
     #[must_use]
     pub fn forward_extremities(&self) -> &BTreeSet<EventId> {
         &self.forward_extremities
+    }
+
+    /// The forward extremities a locally authored event names: every tip
+    /// except those [`Self::set_aside_contested`] has set aside.
+    ///
+    /// In a linear room this is exactly one entry, the head.
+    pub fn authoring_extremities(&self) -> impl Iterator<Item = &EventId> {
+        self.forward_extremities
+            .iter()
+            .filter(|tip| !self.set_aside.contains(*tip))
+    }
+
+    /// The forward extremities this server has stopped authoring on.
+    #[must_use]
+    pub fn set_aside_extremities(&self) -> &BTreeSet<EventId> {
+        &self.set_aside
     }
 
     /// Next index a live append will take. Durable state; a reopen must
@@ -528,11 +570,13 @@ impl RoomLog {
         self.append(input)
     }
 
-    /// Author an event on every current extremity.
+    /// Author an event on every current extremity this server can fold.
     ///
     /// In a linear room this is exactly one parent. After a stale class-D PDU it
     /// is a bounded set of parents, which collapses the federation DAG back to
     /// one extremity while the event still receives one linear storage index.
+    /// A tip set aside by [`Self::set_aside_contested`] is left out, and stays
+    /// a forward extremity for the resolver.
     ///
     /// # Errors
     ///
@@ -546,10 +590,128 @@ impl RoomLog {
     ) -> Result<&LogEntry, AppendError> {
         let input = EventInput {
             event_id: EventId::new(event_id),
-            prev_events: self.forward_extremities.iter().cloned().collect(),
+            prev_events: self.authoring_extremities().cloned().collect(),
             state_key,
         };
         self.append(input)
+    }
+
+    /// Stop authoring on every tip that contests a state key with the linear
+    /// head, until what remains folds. Returns what was set aside, and why.
+    ///
+    /// SPEC §9.2 case 3 is the one case the log cannot fold on its own: two
+    /// branches moved the same key away from the value they inherited, and
+    /// choosing between them is the room-version resolver's call (ADR 0001).
+    /// Until that is wired into ingest (#16) the choice is not made here --
+    /// it is *deferred*. The contested tip keeps its place as a forward
+    /// extremity, its state stays pinned, and local events simply stop
+    /// naming it, so the room keeps taking writes on its linear log instead
+    /// of refusing every one of them (#225).
+    ///
+    /// The tip that stays is the linear head: the entry this server's own
+    /// order puts last, whose state is what authorization already reads.
+    /// The tips set aside are the ones that *claim* the key -- whose branch
+    /// moved it from the inherited value -- other than the head. A tip that
+    /// merely inherited the key is not in the argument and is kept, so a
+    /// three-way fork loses only the branch that actually disagrees.
+    ///
+    /// Idempotent and cheap once done: with the contested tips out of the
+    /// authoring set the remaining fold succeeds on the first pass, and the
+    /// result is empty. Each pass costs one bounded fork window (SPEC §9.1)
+    /// and one fold, and there are at most as many passes as tips.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppendError`] when a tip's state is not resident, which the
+    /// extremity pin makes unreachable, or when the fold is contested by no
+    /// tip other than the head, which the definition of contested makes
+    /// unreachable; both are refused rather than guessed at.
+    pub fn set_aside_contested(&mut self) -> Result<Vec<SetAside>, AppendError> {
+        let mut set_aside = Vec::new();
+        loop {
+            let tips: Vec<EventId> = self.authoring_extremities().cloned().collect();
+            if tips.len() < 2 {
+                return Ok(set_aside);
+            }
+            let parents = self.parents_of(&tips)?;
+            let Err(error) = merge_states(&parents.states, parents.base) else {
+                return Ok(set_aside);
+            };
+            let AppendError::NeedsStateResolution { key, .. } = &error else {
+                return Err(error);
+            };
+            let inherited = parents.base.and_then(|base| base.get(key));
+            let head = tips.iter().max_by_key(|tip| self.positions.get(*tip));
+            let claimants: Vec<EventId> = tips
+                .iter()
+                .zip(&parents.states)
+                .filter(|(tip, state)| {
+                    Some(*tip) != head
+                        && state.get(key).is_some_and(|value| Some(value) != inherited)
+                })
+                .map(|(tip, _)| tip.clone())
+                .collect();
+            if claimants.is_empty() {
+                return Err(error);
+            }
+            for extremity in claimants {
+                self.set_aside.insert(extremity.clone());
+                set_aside.push(SetAside {
+                    extremity,
+                    key: key.clone(),
+                });
+            }
+        }
+    }
+
+    /// The inputs to folding a set of parents into one state.
+    ///
+    /// Every parent an append can name is either recent or a pinned
+    /// extremity, so a parent whose state is not resident is unreachable by
+    /// construction. It is an error rather than a panic because "unreachable
+    /// by construction" is a claim about code that can be changed.
+    fn parents_of(&self, prev_events: &[EventId]) -> Result<Parents<'_>, AppendError> {
+        let mut states = Vec::with_capacity(prev_events.len());
+        let mut depth = 0_u64;
+        for parent in prev_events {
+            let Some(entry) = self.get(parent) else {
+                return Err(AppendError::UnknownPredecessor(parent.clone()));
+            };
+            let Some(state) = self.resident.get(&entry.li.get()) else {
+                return Err(AppendError::StateNotResident {
+                    li: entry.li,
+                    event_id: parent.clone(),
+                });
+            };
+            states.push(state);
+            depth = depth.max(entry.depth.saturating_add(1));
+        }
+
+        // The merge base: the state as both branches last agreed on it.
+        // Without it a key only one branch touched looks contested, because
+        // the untouched branch still carries the older event ID -- see the
+        // rule in `merge_states`. Only forks need one; a single parent has
+        // nothing to disagree with.
+        //
+        // `fork_window` is bounded by the resident window, which is the same
+        // bound the fast path already lives inside (SPEC §9.1): a fork deeper
+        // than that has no resident snapshot to merge from anyway. When it
+        // cannot answer, `base` stays `None` and the merge falls back to the
+        // conservative rule -- refusing rather than guessing.
+        let base = if prev_events.len() > 1 {
+            self.fork_window(prev_events, self.resident_window)
+                .ok()
+                .and_then(|window| self.positions.get(&window.nearest_common_ancestor).copied())
+                .and_then(|li| self.resident.get(&li))
+        } else {
+            None
+        };
+
+        Ok(Parents {
+            states,
+            base,
+            depth,
+        })
     }
 
     fn append(&mut self, input: EventInput) -> Result<&LogEntry, AppendError> {
@@ -568,49 +730,12 @@ impl RoomLog {
             return Err(AppendError::MissingPredecessor);
         }
 
-        let mut parent_states = Vec::with_capacity(input.prev_events.len());
-        let mut depth = 0_u64;
-        for parent in &input.prev_events {
-            let Some(entry) = self.get(parent) else {
-                return Err(AppendError::UnknownPredecessor(parent.clone()));
-            };
-            let entry_li = entry.li;
-            let entry_depth = entry.depth;
-            let Some(state) = self.resident.get(&entry_li.get()) else {
-                // Every parent an append can name is either recent or a pinned
-                // extremity, so this is unreachable by construction. It is an
-                // error rather than a panic because "unreachable by
-                // construction" is a claim about code that can be changed.
-                return Err(AppendError::StateNotResident {
-                    li: entry_li,
-                    event_id: parent.clone(),
-                });
-            };
-            parent_states.push(state);
-            depth = depth.max(entry_depth.saturating_add(1));
-        }
-
-        // The merge base: the state as both branches last agreed on it.
-        // Without it a key only one branch touched looks contested, because
-        // the untouched branch still carries the older event ID -- see the
-        // rule in `merge_states`. Only forks need one; a single parent has
-        // nothing to disagree with.
-        //
-        // `fork_window` is bounded by the resident window, which is the same
-        // bound the fast path already lives inside (SPEC §9.1): a fork deeper
-        // than that has no resident snapshot to merge from anyway. When it
-        // cannot answer, `base` stays `None` and the merge falls back to the
-        // conservative rule -- refusing rather than guessing.
-        let base = if input.prev_events.len() > 1 {
-            self.fork_window(&input.prev_events, self.resident_window)
-                .ok()
-                .and_then(|window| self.positions.get(&window.nearest_common_ancestor).copied())
-                .and_then(|li| self.resident.get(&li))
-        } else {
-            None
-        };
-
-        let mut state_after = merge_states(&parent_states, base)?;
+        let Parents {
+            states,
+            base,
+            depth,
+        } = self.parents_of(&input.prev_events)?;
+        let mut state_after = merge_states(&states, base)?;
         let state_key = input.state_key;
         if let Some(state_key) = state_key.clone() {
             state_after = state_after.apply(state_key, input.event_id.as_str());
@@ -636,6 +761,9 @@ impl RoomLog {
 
         for parent in &entry.prev_events {
             self.forward_extremities.remove(parent);
+            // A tip somebody built on is a tip no longer, set aside or not;
+            // whatever was built on it is a fresh tip, judged afresh.
+            self.set_aside.remove(parent);
         }
         self.forward_extremities.insert(entry.event_id.clone());
         self.positions.insert(entry.event_id.clone(), li);
@@ -695,6 +823,7 @@ impl RoomLog {
         };
 
         self.forward_extremities.clear();
+        self.set_aside.clear();
         self.forward_extremities.insert(entry.event_id.clone());
         self.positions.insert(entry.event_id.clone(), li);
         self.entries.insert(li, entry);
@@ -883,6 +1012,7 @@ impl RoomLog {
             entries: BTreeMap::new(),
             positions: HashMap::new(),
             forward_extremities: forward_extremities.into_iter().collect(),
+            set_aside: BTreeSet::new(),
             next_forward,
             next_backward,
             head_chain: ChainHash::seed(),
@@ -995,6 +1125,16 @@ impl RoomLog {
             unverified,
         })
     }
+}
+
+/// What [`RoomLog::parents_of`] hands a fold: the parents' resident
+/// snapshots in the parents' order, the state at their nearest common
+/// ancestor when there is a fork and the window can find it, and the depth
+/// the child takes.
+struct Parents<'a> {
+    states: Vec<&'a StateSnapshot>,
+    base: Option<&'a StateSnapshot>,
+    depth: u64,
 }
 
 /// Fold the parents of a fork into one state, or refuse if they disagree.

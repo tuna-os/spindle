@@ -31,7 +31,7 @@ mod state;
 pub use log::{
     AppendError, ChainHash, DEFAULT_RESIDENT_WINDOW, EventId, EventInput, ForkWindow,
     ForkWindowError, LinearIndex, LogEntry, NodeLoader, RestoreError, RestoredEntry, RestoredLog,
-    RoomLog,
+    RoomLog, SetAside,
 };
 pub use pdu::{Pdu, PduError};
 pub use state::{

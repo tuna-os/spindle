@@ -2,6 +2,7 @@
 
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use spindle_server::Config;
 use spindle_store::FjallStore;
@@ -163,6 +164,12 @@ async fn serve() -> ExitCode {
         .with_target(false)
         .init();
 
+    // Listened for from here, before the store is opened or anything is
+    // bound: a signal that arrives during startup is then kept and
+    // answered by draining the moment the server is up, instead of taking
+    // the default action and killing the process mid-open.
+    let stop = shutdown();
+
     // Storage opens before the listener. A server that binds first and then
     // discovers it cannot read its own database has already accepted
     // connections it cannot answer.
@@ -198,7 +205,7 @@ async fn serve() -> ExitCode {
     // The key is established before the listener accepts anything. A server
     // that binds and then discovers it cannot sign has already told a client it
     // was ready to take events it cannot create.
-    let app = match spindle_server::app(config, store) {
+    let app = match spindle_server::app(config, Arc::clone(&store)) {
         Ok(app) => app,
         Err(error) => {
             tracing::error!("cannot build the server: {error}");
@@ -210,39 +217,99 @@ async fn serve() -> ExitCode {
     // the per-source limit collapses onto one key.
     let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
 
-    // The federation listener is the same router over TLS: peers speak https
-    // to 8448 and check the certificate against our name, so this listener
-    // exists exactly when there is TLS material to answer them with. Failing
-    // to bind or to load the material is fatal, not a warning — a server
-    // configured to federate that silently cannot is worse than one that
-    // says so and exits.
-    if let Some(fed_bind) = federation_bind
-        && !serve_federation(&fed_bind, federation_tls, &name, service.clone()).await
-    {
-        return ExitCode::FAILURE;
-    }
-
     // The scrape surface (#166), on its own listener so it is not reachable
     // wherever the client API is. Failing to bind is fatal for the same
     // reason it is for federation: a server configured to be observable
     // that silently is not will be discovered during the incident it was
-    // meant to explain.
+    // meant to explain. Bound before the federation listener, which holds
+    // the router: a failure here exits with no task left holding the store.
     if let Some(metrics_bind) = metrics_bind
         && !serve_metrics(&metrics_bind).await
     {
         return ExitCode::FAILURE;
     }
 
-    if let Err(error) = axum::serve(listener, service)
-        .with_graceful_shutdown(shutdown())
-        .await
-    {
-        tracing::error!("server stopped: {error}");
-        return ExitCode::FAILURE;
-    }
+    // The federation listener is the same router over TLS: peers speak https
+    // to 8448 and check the certificate against our name, so this listener
+    // exists exactly when there is TLS material to answer them with. Failing
+    // to bind or to load the material is fatal, not a warning — a server
+    // configured to federate that silently cannot is worse than one that
+    // says so and exits.
+    let federation = match federation_bind {
+        Some(fed_bind) => {
+            match serve_federation(&fed_bind, federation_tls, &name, service.clone()).await {
+                Some(listener) => Some(listener),
+                None => return ExitCode::FAILURE,
+            }
+        }
+        None => None,
+    };
 
-    tracing::info!("shut down cleanly");
-    ExitCode::SUCCESS
+    // One signal drains both listeners. The main one stops accepting and
+    // waits for its connections itself; the federation one is told the
+    // same and joined below, so that when the store closes no task still
+    // holds a copy of the router.
+    let federation_handle = federation.as_ref().map(|listener| listener.handle.clone());
+    let stop = async move {
+        stop.await;
+        if let Some(handle) = federation_handle {
+            handle.graceful_shutdown(Some(Duration::from_secs(30)));
+        }
+    };
+    let served = axum::serve(listener, service)
+        .with_graceful_shutdown(stop)
+        .await;
+    if let Some(listener) = federation {
+        if served.is_err() {
+            listener.handle.shutdown();
+        }
+        if let Err(error) = listener.task.await {
+            tracing::error!("federation listener did not stop cleanly: {error}");
+        }
+    }
+    close_store(store).await;
+    match served {
+        Ok(()) => {
+            tracing::info!("shut down cleanly");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            tracing::error!("server stopped: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Close the store here, on the thread that opened it, once nothing else
+/// holds it.
+///
+/// Every listener has been joined by now, so what may still hold the
+/// store is a delivery loop inside one pass. The loops hold it only from
+/// an upgrade to the end of a read or a write, never across an await, so
+/// that pass ends within milliseconds; waiting for it keeps the close out
+/// of a task the runtime is about to tear down. fjall's close joins its
+/// worker threads, and #292 caught it waiting forever inside exactly such
+/// a task.
+async fn close_store(mut store: Arc<FjallStore>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match Arc::try_unwrap(store) {
+            Ok(store) => {
+                drop(store);
+                tracing::info!("storage closed");
+                return;
+            }
+            Err(shared) if Instant::now() < deadline => {
+                store = shared;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(shared) => {
+                tracing::warn!("storage is still in use; it closes with its last holder");
+                drop(shared);
+                return;
+            }
+        }
+    }
 }
 
 /// Set the admin flag on an existing account, offline.
@@ -509,11 +576,6 @@ fn open_store_with_config(config_path: &str) -> Option<(FjallStore, Config)> {
     }
 }
 
-/// Bring up the TLS federation listener, spawned beside the main service.
-///
-/// Returns false when the configuration cannot be served — missing TLS
-/// material, unloadable PEM, an unparseable bind — because each of those is
-/// a server that was told to federate and cannot.
 /// Serve `GET /metrics` on its own listener.
 async fn serve_metrics(bind: &str) -> bool {
     let listener = match TcpListener::bind(bind).await {
@@ -544,6 +606,21 @@ async fn serve_metrics(bind: &str) -> bool {
     true
 }
 
+/// The federation listener while it serves: the handle that tells it to
+/// drain, and the task to join once it has. Joined rather than abandoned
+/// because the task holds a copy of the router, and through it the store,
+/// and a task the runtime tears down at exit is the wrong place for the
+/// store to close (#292).
+struct FederationListener {
+    handle: axum_server::Handle<std::net::SocketAddr>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Bring up the TLS federation listener, spawned beside the main service.
+///
+/// Returns `None` when the configuration cannot be served — missing TLS
+/// material, unloadable PEM, an unparseable bind — because each of those is
+/// a server that was told to federate and cannot.
 async fn serve_federation(
     bind: &str,
     tls_material: Option<(std::path::PathBuf, std::path::PathBuf)>,
@@ -552,10 +629,10 @@ async fn serve_federation(
         axum::Router,
         std::net::SocketAddr,
     >,
-) -> bool {
+) -> Option<FederationListener> {
     let Some((cert, key)) = tls_material else {
         tracing::error!("[federation] bind is set without tls_cert and tls_key");
-        return false;
+        return None;
     };
     // The ring provider, installed explicitly: the default provider is
     // aws-lc, whose C build both bloats the image build and links a newer
@@ -575,23 +652,31 @@ async fn serve_federation(
                 cert.display(),
                 key.display()
             );
-            return false;
+            return None;
         }
     };
     let address: std::net::SocketAddr = match bind.parse() {
         Ok(address) => address,
         Err(error) => {
             tracing::error!("cannot parse federation bind {bind}: {error}");
-            return false;
+            return None;
         }
     };
     tracing::info!("federation listening on {bind} as {name}");
-    tokio::spawn(async move {
-        if let Err(error) = axum_server::bind_rustls(address, tls).serve(service).await {
-            tracing::error!("federation listener stopped: {error}");
+    let handle = axum_server::Handle::new();
+    let task = tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            if let Err(error) = axum_server::bind_rustls(address, tls)
+                .handle(handle)
+                .serve(service)
+                .await
+            {
+                tracing::error!("federation listener stopped: {error}");
+            }
         }
     });
-    true
+    Some(FederationListener { handle, task })
 }
 
 /// Resolve on the first shutdown signal.
@@ -600,25 +685,49 @@ async fn serve_federation(
 /// developer sends SIGINT. Handling only one means the other kills the process
 /// where it stands, which is survivable given the log's durability guarantees
 /// but discards in-flight requests for no reason.
-async fn shutdown() {
-    let interrupt = async {
-        let _ = signal::ctrl_c().await;
-    };
-
+///
+/// The signals are listened for from the call, not from the first poll,
+/// which is later than it looks: the server polls this from a task of its
+/// own once it is accepting. A signal before that would take the default
+/// action; from the call on it is kept until the future is polled.
+fn shutdown() -> impl Future<Output = ()> {
     #[cfg(unix)]
-    let terminate = async {
-        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
-            Ok(mut stream) => {
-                stream.recv().await;
-            }
-            Err(error) => tracing::warn!("cannot listen for SIGTERM: {error}"),
+    let listen = |kind: signal::unix::SignalKind, name: &str| match signal::unix::signal(kind) {
+        Ok(stream) => Some(stream),
+        Err(error) => {
+            tracing::warn!("cannot listen for {name}: {error}");
+            None
         }
     };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+    #[cfg(unix)]
+    let interrupt = listen(signal::unix::SignalKind::interrupt(), "SIGINT");
+    #[cfg(unix)]
+    let terminate = listen(signal::unix::SignalKind::terminate(), "SIGTERM");
 
-    tokio::select! {
-        () = interrupt => tracing::info!("interrupted, draining"),
-        () = terminate => tracing::info!("terminating, draining"),
+    async move {
+        #[cfg(unix)]
+        {
+            let interrupt = async move {
+                match interrupt {
+                    Some(mut stream) => stream.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let terminate = async move {
+                match terminate {
+                    Some(mut stream) => stream.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                _ = interrupt => tracing::info!("interrupted, draining"),
+                _ = terminate => tracing::info!("terminating, draining"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = signal::ctrl_c().await;
+            tracing::info!("interrupted, draining");
+        }
     }
 }
