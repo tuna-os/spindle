@@ -8,7 +8,7 @@
 # Build from the repository root:
 #   docker build -f complement/Dockerfile -t complement-spindle:latest .
 
-FROM rust:1.90-bookworm AS build
+FROM rust:1.98-bookworm AS build
 WORKDIR /src
 
 # The dependency layer: manifests only, with placeholder sources, so the
