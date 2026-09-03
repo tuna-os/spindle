@@ -789,30 +789,72 @@ impl Federation {
         txn_id: &str,
         body: &Value,
     ) -> Result<(), FederationError> {
+        deliver(
+            self.transaction_request(destination, txn_id, body)?,
+            destination,
+        )
+        .await
+    }
+
+    /// The signed request carrying one transaction, built but not sent.
+    ///
+    /// Split from the send so the outbox drain can build every request of
+    /// a pass while it holds the store and the federation strongly, and
+    /// send them once it has let go: what the builder carries is a client
+    /// handle, a signature and the body, none of which the store's close
+    /// waits on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] if the request cannot be signed, or the
+    /// destination is not one this server reaches.
+    fn transaction_request(
+        &self,
+        destination: &str,
+        txn_id: &str,
+        body: &Value,
+    ) -> Result<reqwest::RequestBuilder, FederationError> {
         let uri = format!("/_matrix/federation/v1/send/{txn_id}");
         let authorization = self.sign_request("PUT", &uri, destination, Some(body))?;
-        let response = self
+        Ok(self
             .client
             .put(format!("{}{uri}", self.base_url(destination)?))
             .header("authorization", authorization)
             .header("content-type", "application/json")
             .timeout(Duration::from_secs(30))
-            .body(body.to_string())
-            .send()
-            .await
-            .map_err(|error| FederationError::Refused(format!("send: {error}")))?;
-        if !response.status().is_success() {
-            return Err(FederationError::Refused(format!(
-                "{destination} answered {}",
-                response.status()
-            )));
-        }
-        Ok(())
+            .body(body.to_string()))
     }
+}
+
+/// Send one built transaction and read the peer's verdict.
+async fn deliver(
+    request: reqwest::RequestBuilder,
+    destination: &str,
+) -> Result<(), FederationError> {
+    let response = request
+        .send()
+        .await
+        .map_err(|error| FederationError::Refused(format!("send: {error}")))?;
+    if !response.status().is_success() {
+        return Err(FederationError::Refused(format!(
+            "{destination} answered {}",
+            response.status()
+        )));
+    }
+    Ok(())
 }
 
 /// One pending delivery: its store key and the PDU it carries.
 type OutboxRow = (Vec<u8>, Vec<u8>);
+
+/// One transaction a pass will send: where it goes, the rows it carries
+/// -- deleted once the peer acknowledges -- and the request, or the reason
+/// one could not be built, which backs the destination off like a refusal.
+struct OutboundTransaction {
+    destination: String,
+    keys: Vec<Vec<u8>>,
+    request: Result<reqwest::RequestBuilder, FederationError>,
+}
 
 /// Drain the outbound queue, forever.
 ///
@@ -824,17 +866,17 @@ type OutboxRow = (Vec<u8>, Vec<u8>);
 /// row's sequence lets the peer's replay table absorb the duplicate.
 ///
 /// Holds the store and the federation weakly and ends when they are gone,
-/// for the reason `spawn_delivery_loops` gives. A pass holds them strongly
-/// only from its upgrade to its end, so a cancellation at the idle sleep --
-/// where a quiet server spends almost all of its time -- finds nothing to
-/// drop.
+/// for the reason `spawn_delivery_loops` gives. A pass upgrades them to
+/// plan -- scan, group, sign -- and lets go before the first request is
+/// sent, upgrading the store again for each acknowledgement. So neither
+/// await this task can be cancelled at, the idle sleep or a send in
+/// flight, finds it holding anything the store's close could wait on.
 pub async fn drain_outbox(
     store: Weak<FjallStore>,
     federation: Weak<Federation>,
     retry_base: Duration,
 ) {
-    let mut backoff: std::collections::HashMap<String, (u32, std::time::Instant)> =
-        std::collections::HashMap::new();
+    let mut backoff: HashMap<String, (u32, Instant)> = HashMap::new();
     loop {
         tokio::time::sleep(
             retry_base
@@ -842,92 +884,33 @@ pub async fn drain_outbox(
                 .max(Duration::from_millis(25)),
         )
         .await;
-        let (Some(store), Some(federation)) = (store.upgrade(), federation.upgrade()) else {
-            return;
-        };
-        let Ok(rows) = ReadView::scan_prefix(store.as_ref(), &keys::federation_outbox_all()) else {
-            continue;
-        };
-        let mut by_destination: std::collections::BTreeMap<String, Vec<OutboxRow>> =
-            std::collections::BTreeMap::new();
-        for (key, value) in rows {
-            if let Some(destination) = keys::federation_outbox_destination(&key) {
-                by_destination
-                    .entry(destination)
-                    .or_default()
-                    .push((key, value));
-            }
-        }
-        // A destination with only EDUs waiting still gets a transaction:
-        // typing must not wait for the next event.
-        for destination in federation.edu_destinations() {
-            by_destination.entry(destination).or_default();
-        }
-        // The loop already holds the whole picture, so the gauge is set
-        // from it rather than counted separately — a second traversal
-        // could disagree with the one that actually delivers.
-        crate::metrics::set_federation_queue(
-            &by_destination
-                .iter()
-                .map(|(destination, rows)| (destination.clone(), rows.len() as u64))
-                .collect::<Vec<_>>(),
-        );
-        if by_destination.is_empty() {
-            continue;
-        }
-        for (destination, rows) in by_destination {
-            if let Some((_, until)) = backoff.get(&destination)
-                && *until > std::time::Instant::now()
-            {
-                continue;
-            }
-            // At most fifty PDUs per transaction, by spec; the rest wait
-            // for the next pass.
-            let batch: Vec<_> = rows.into_iter().take(50).collect();
-            let pdus: Vec<Value> = batch
-                .iter()
-                .filter_map(|(_, value)| serde_json::from_slice(value).ok())
-                .collect();
-            // EDUs ride whatever transaction goes out next; on failure they
-            // are dropped, never retried — a stale ephemeral redelivered
-            // late is a lie about the present.
-            let edus = federation.take_edus(&destination);
-            if pdus.is_empty() && edus.is_empty() {
-                continue;
-            }
-            let txn_id = if let Some((key, _)) = batch.first() {
-                let first_seq = key
-                    .get(key.len() - 8..)
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .map_or(0, u64::from_be_bytes);
-                // Deterministic by content, not by attempt: a retry after a
-                // crash reuses the same ID, which is what makes redelivery
-                // a no-op on the peer.
-                format!("o{first_seq}")
-            } else {
-                // EDU-only: fire-once by design, so uniqueness is all the
-                // ID owes anyone.
-                static EDU_TXN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                format!(
-                    "e{}-{}",
-                    now_millis(),
-                    EDU_TXN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                )
+        let transactions = {
+            let (Some(store), Some(federation)) = (store.upgrade(), federation.upgrade()) else {
+                return;
             };
-            let mut body = serde_json::json!({
-                "origin": federation.server_name,
-                "origin_server_ts": now_millis(),
-                "pdus": pdus,
-            });
-            if !edus.is_empty() {
-                body["edus"] = Value::Array(edus);
-            }
-            match federation
-                .send_transaction(&destination, &txn_id, &body)
-                .await
-            {
+            plan_transactions(&store, &federation, &backoff)
+        };
+        for OutboundTransaction {
+            destination,
+            keys,
+            request,
+        } in transactions
+        {
+            let sent = match request {
+                Ok(request) => deliver(request, &destination).await,
+                Err(error) => Err(error),
+            };
+            match sent {
                 Ok(()) => {
-                    for (key, _) in &batch {
+                    // Acknowledged. The rows go through a fresh upgrade: the
+                    // router may have gone while the request was in flight,
+                    // and then the loop ends here and the rows wait for the
+                    // next start to re-send them -- the at-least-once a
+                    // crash between send and delete already promises.
+                    let Some(store) = store.upgrade() else {
+                        return;
+                    };
+                    for key in &keys {
                         let _ = Store::delete(store.as_ref(), key);
                     }
                     backoff.remove(&destination);
@@ -936,11 +919,104 @@ pub async fn drain_outbox(
                     tracing::debug!("outbox to {destination}: {error}");
                     let failures = backoff.get(&destination).map_or(0, |(count, _)| *count) + 1;
                     let delay = retry_base * 2_u32.saturating_pow(failures.min(6));
-                    backoff.insert(destination, (failures, std::time::Instant::now() + delay));
+                    backoff.insert(destination, (failures, Instant::now() + delay));
                 }
             }
         }
     }
+}
+
+/// One pass's transactions: every destination owed one and not backing
+/// off, its request signed and ready. Every read of the store and every
+/// take from the EDU queue happens here, under the strong references the
+/// caller holds for exactly this long; nothing here awaits.
+fn plan_transactions(
+    store: &FjallStore,
+    federation: &Federation,
+    backoff: &HashMap<String, (u32, Instant)>,
+) -> Vec<OutboundTransaction> {
+    let Ok(rows) = ReadView::scan_prefix(store, &keys::federation_outbox_all()) else {
+        return Vec::new();
+    };
+    let mut by_destination: BTreeMap<String, Vec<OutboxRow>> = BTreeMap::new();
+    for (key, value) in rows {
+        if let Some(destination) = keys::federation_outbox_destination(&key) {
+            by_destination
+                .entry(destination)
+                .or_default()
+                .push((key, value));
+        }
+    }
+    // A destination with only EDUs waiting still gets a transaction:
+    // typing must not wait for the next event.
+    for destination in federation.edu_destinations() {
+        by_destination.entry(destination).or_default();
+    }
+    // The pass already holds the whole picture, so the gauge is set
+    // from it rather than counted separately — a second traversal
+    // could disagree with the one that actually delivers.
+    crate::metrics::set_federation_queue(
+        &by_destination
+            .iter()
+            .map(|(destination, rows)| (destination.clone(), rows.len() as u64))
+            .collect::<Vec<_>>(),
+    );
+    let mut transactions = Vec::new();
+    for (destination, rows) in by_destination {
+        if let Some((_, until)) = backoff.get(&destination)
+            && *until > Instant::now()
+        {
+            continue;
+        }
+        // At most fifty PDUs per transaction, by spec; the rest wait
+        // for the next pass.
+        let batch: Vec<_> = rows.into_iter().take(50).collect();
+        let pdus: Vec<Value> = batch
+            .iter()
+            .filter_map(|(_, value)| serde_json::from_slice(value).ok())
+            .collect();
+        // EDUs ride whatever transaction goes out next; on failure they
+        // are dropped, never retried — a stale ephemeral redelivered
+        // late is a lie about the present.
+        let edus = federation.take_edus(&destination);
+        if pdus.is_empty() && edus.is_empty() {
+            continue;
+        }
+        let txn_id = if let Some((key, _)) = batch.first() {
+            let first_seq = key
+                .get(key.len() - 8..)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map_or(0, u64::from_be_bytes);
+            // Deterministic by content, not by attempt: a retry after a
+            // crash reuses the same ID, which is what makes redelivery
+            // a no-op on the peer.
+            format!("o{first_seq}")
+        } else {
+            // EDU-only: fire-once by design, so uniqueness is all the
+            // ID owes anyone.
+            static EDU_TXN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            format!(
+                "e{}-{}",
+                now_millis(),
+                EDU_TXN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
+        };
+        let mut body = serde_json::json!({
+            "origin": federation.server_name,
+            "origin_server_ts": now_millis(),
+            "pdus": pdus,
+        });
+        if !edus.is_empty() {
+            body["edus"] = Value::Array(edus);
+        }
+        let request = federation.transaction_request(&destination, &txn_id, &body);
+        transactions.push(OutboundTransaction {
+            destination,
+            keys: batch.into_iter().map(|(key, _)| key).collect(),
+            request,
+        });
+    }
+    transactions
 }
 
 /// The object the X-Matrix signature covers.
