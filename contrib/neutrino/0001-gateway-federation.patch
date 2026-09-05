@@ -1,0 +1,973 @@
+From 3f1201e7ed96c3102fa20f988ea6fff54cb34e5b Mon Sep 17 00:00:00 2001
+From: Spindle interop <spindle@tuna-os.invalid>
+Date: Sat, 5 Sep 2026 23:29:03 +0000
+Subject: [PATCH] Dial named peers directly, sign federation requests, and
+ fetch a named peer's keys
+
+A node whose sidecar rides a datagram link can only address node ids;
+a peer known by name (a venue gateway's upstream homeserver) is now
+dialled over HTTP directly. Every outbound request carries a real
+X-Matrix signature under ed25519:1 when the deployment signs, so a
+Matrix peer can authenticate it against /_matrix/key/v2/server. Inbound,
+a key resolver wraps the medium's and fetches a named peer's key
+document, checking its self-signature. The lb ingress forwards
+/_matrix/key/ so peers can fetch this node's document over the
+federation port.
+---
+ crates/neutrino-ctl/src/lib.rs                |   9 +
+ crates/neutrino-event/src/sign.rs             |  36 ++-
+ crates/neutrino-http/src/federation/client.rs | 275 ++++++++++++++----
+ crates/neutrino-http/src/federation/invite.rs |   7 +-
+ crates/neutrino-http/src/federation/join.rs   |   7 +-
+ crates/neutrino-http/src/federation/leave.rs  |   9 +-
+ crates/neutrino-http/src/lib.rs               |  37 ++-
+ crates/neutrino-lb/src/ingress.rs             |  10 +-
+ crates/neutrino-main/Cargo.toml               |   4 +
+ crates/neutrino-main/src/keys.rs              | 163 +++++++++++
+ crates/neutrino-main/src/lib.rs               |  10 +
+ 11 files changed, 490 insertions(+), 77 deletions(-)
+ create mode 100644 crates/neutrino-main/src/keys.rs
+
+diff --git a/crates/neutrino-ctl/src/lib.rs b/crates/neutrino-ctl/src/lib.rs
+index b674c86..71c50b2 100644
+--- a/crates/neutrino-ctl/src/lib.rs
++++ b/crates/neutrino-ctl/src/lib.rs
+@@ -57,6 +57,14 @@ pub struct Config {
+     /// loopback egress it allocates; `neutrino-http` reads it to route outbound
+     /// federation through the egress. `None` = direct federation (the default).
+     pub federation_proxy: Option<String>,
++    /// Route a destination that is **not** a 64-hex node id (a hostname or an
++    /// `ip:port`) straight over HTTP instead of through `federation_proxy`.
++    /// **Internal / derived — not operator-set.** `neutrino-main` sets it when
++    /// the sidecar rides an injected datagram link: the link addresses peers
++    /// by node id and nothing else, so a named peer (a venue gateway's
++    /// upstream homeserver, say) can only be reached by dialling the name.
++    /// Ignored when `federation_proxy` is `None` (everything is direct then).
++    pub federation_direct_names: bool,
+     /// When set, `neutrino-main` runs a `neutrino-lb` sidecar **in-process**
+     /// alongside the homeserver (the embedded-on-mobile target), with the CoAP
+     /// low-bandwidth wire. This is the public federation port peers'
+@@ -145,6 +153,7 @@ impl Default for Config {
+             outbound_concurrency: DEFAULT_OUTBOUND_CONCURRENCY,
+             storage_dir: PathBuf::from(DEFAULT_STORAGE_DIR),
+             federation_proxy: None,
++            federation_direct_names: false,
+             lb_federation_port: None,
+             startup_jitter: Duration::from_millis(DEFAULT_STARTUP_JITTER_MS),
+             join_ingest_timeout: Duration::from_millis(DEFAULT_JOIN_INGEST_TIMEOUT_MS),
+diff --git a/crates/neutrino-event/src/sign.rs b/crates/neutrino-event/src/sign.rs
+index 2d57c55..3813aeb 100644
+--- a/crates/neutrino-event/src/sign.rs
++++ b/crates/neutrino-event/src/sign.rs
+@@ -191,7 +191,7 @@ impl EventSigner {
+ /// `unpaddedbase64`, libsodium-based stacks), and the spec's own signing
+ /// seed (`…MW+3XA1`) has a non-zero trailing sextet — a strict decoder
+ /// cannot even load the golden vectors.
+-fn b64_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
++pub fn b64_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
+     use base64::Engine;
+     use base64::engine::general_purpose::GeneralPurposeConfig;
+     use base64::engine::{DecodePaddingMode, GeneralPurpose};
+@@ -206,7 +206,7 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
+ 
+ /// Canonical bytes of `obj` minus `signatures`/`unsigned` — the "Signing
+ /// JSON" byte string (no redaction).
+-fn signable_json_bytes(obj: &CanonicalJsonObject) -> Vec<u8> {
++pub fn signable_json_bytes(obj: &CanonicalJsonObject) -> Vec<u8> {
+     let mut clone = obj.clone();
+     clone.remove("signatures");
+     clone.remove("unsigned");
+@@ -448,6 +448,38 @@ fn decode_node_id(server_name: &str) -> Option<[u8; 32]> {
+     hex::decode(server_name).ok()?.try_into().ok()
+ }
+ 
++/// Verify a plain (non-event) JSON object's signature by `origin` under
++/// `key_id` — appendices "Checking for a signature" — over the canonical
++/// form minus `signatures`/`unsigned`. Used for a fetched key document,
++/// which must be signed by the key it advertises.
++pub async fn verify_json_signature(
++    obj: &CanonicalJsonObject,
++    origin: &str,
++    key_id: &str,
++    resolver: &dyn KeyResolver,
++) -> Result<(), String> {
++    let sig = obj
++        .get("signatures")
++        .and_then(|s| match s {
++            CanonicalJsonValue::Object(o) => o.get(origin),
++            _ => None,
++        })
++        .and_then(|s| match s {
++            CanonicalJsonValue::Object(o) => o.get(key_id),
++            _ => None,
++        })
++        .and_then(|s| match s {
++            CanonicalJsonValue::String(s) => Some(s.clone()),
++            _ => None,
++        })
++        .ok_or_else(|| format!("no signature by {origin} under {key_id}"))?;
++    let key = resolver
++        .verify_key(origin, key_id)
++        .await
++        .map_err(|e| e.reason)?;
++    verify_one(&signable_json_bytes(obj), &key, &sig)
++}
++
+ /// Verify that `obj` carries a valid signature by `origin`: iterate the
+ /// origin's `ed25519:*` signature entries, resolve each key id through
+ /// `resolver`, and accept on the first signature that verifies over the
+diff --git a/crates/neutrino-http/src/federation/client.rs b/crates/neutrino-http/src/federation/client.rs
+index 20a7ddd..43ab8f9 100644
+--- a/crates/neutrino-http/src/federation/client.rs
++++ b/crates/neutrino-http/src/federation/client.rs
+@@ -6,8 +6,15 @@
+ //!
+ //! - **Resolution** is `http://{server_name}` — raw IP:port, no TLS, no
+ //!   `.well-known` / SRV lookup.
+-//! - **X-Matrix header sent** (network-attested origin + destination, no
+-//!   key/sig — see [`crate::federation::auth`]); no request signing.
++//! - **X-Matrix header sent**: with a signer (signed mode) the request is
++//!   signed per the Server-Server API (`method`, `uri`, `origin`,
++//!   `destination`, `content`) under [`neutrino_event::SIGNING_KEY_ID`], so a
++//!   real Matrix peer can verify it against `/_matrix/key/v2/server`; without
++//!   one it carries only origin + destination (network-attested — see
++//!   [`crate::federation::auth`]).
++//! - **Routing**: through the `neutrino-lb` egress when configured; with
++//!   `federation_direct_names` a destination that is not a node id is dialled
++//!   directly, because a datagram link cannot address a hostname.
+ //! - PDUs are opaque `RawValue`s on the wire, never re-parsed here.
+ //!
+ //! Consumed by the per-destination sender pool (`federation::sender`).
+@@ -17,6 +24,7 @@ use std::time::Duration;
+ 
+ use std::collections::BTreeMap;
+ 
++use neutrino_event::EventSigner;
+ use reqwest::Client;
+ use ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId, ServerName, UserId};
+ use serde::de::DeserializeOwned;
+@@ -73,6 +81,14 @@ pub(crate) struct FederationClient {
+     /// Whether outbound requests route through the `neutrino-lb` egress proxy.
+     /// Decides what goes in the request URL's authority (see [`Self::url_authority`]).
+     proxied: bool,
++    /// A second, never-proxied client for destinations that are dialled by
++    /// name (see [`Config::federation_direct_names`]). Built lazily-cheap:
++    /// reqwest clients are pooled handles.
++    direct: Client,
++    /// Whether non-node-id destinations bypass the proxy.
++    direct_names: bool,
++    /// The event signer, when this deployment signs; also signs requests.
++    signer: Option<Arc<EventSigner>>,
+ }
+ 
+ /// Sentinel appended to the URL host on the proxied path, stripped by the
+@@ -139,13 +155,80 @@ impl FederationClient {
+         let http = builder
+             .build()
+             .expect("plaintext reqwest client always builds; no TLS backend to init");
++        let direct = Client::builder()
++            .connect_timeout(CONNECT_TIMEOUT)
++            .timeout(REQUEST_TIMEOUT)
++            .no_proxy()
++            .build()
++            .expect("plaintext reqwest client always builds; no TLS backend to init");
+         Self {
+             http,
+             origin,
+             proxied,
++            direct,
++            direct_names: false,
++            signer: None,
++        }
++    }
++
++    /// Sign every outbound request with `signer` (the deployment's event
++    /// signer: the same key the key document advertises). `None` keeps the
++    /// unsigned, network-attested header.
++    pub(crate) fn with_signer(mut self, signer: Option<Arc<EventSigner>>) -> Self {
++        self.signer = signer;
++        self
++    }
++
++    /// Dial destinations that are not 64-hex node ids directly, even when a
++    /// proxy is configured (`Config::federation_direct_names`).
++    pub(crate) fn with_direct_names(mut self, direct_names: bool) -> Self {
++        self.direct_names = direct_names;
++        self
++    }
++
++    /// Whether `dest` rides the proxy: only when one is configured, and — with
++    /// `direct_names` — only for a node-id destination.
++    fn via_proxy(&self, dest: &ServerName) -> bool {
++        self.proxied && !(self.direct_names && !is_node_id(dest.host()))
++    }
++
++    fn client_for(&self, dest: &ServerName) -> &Client {
++        if self.via_proxy(dest) {
++            &self.http
++        } else {
++            &self.direct
+         }
+     }
+ 
++    /// Build a request to `url` for `dest`: the right client for the route
++    /// and an `Authorization: X-Matrix` header signed over `(method, uri,
++    /// origin, destination, content)` when a signer is set. `content` is the
++    /// JSON body, sent as-is.
++    fn request(
++        &self,
++        method: reqwest::Method,
++        dest: &ServerName,
++        url: impl reqwest::IntoUrl,
++        content: Option<&Value>,
++    ) -> Result<reqwest::RequestBuilder, FederationClientError> {
++        let url = url
++            .into_url()
++            .map_err(|_| FederationClientError::InvalidUrl)?;
++        let uri = match url.query() {
++            Some(q) => format!("{}?{q}", url.path()),
++            None => url.path().to_owned(),
++        };
++        let auth = self.x_matrix(dest, method.as_str(), &uri, content);
++        let mut builder = self
++            .client_for(dest)
++            .request(method, url)
++            .header(reqwest::header::AUTHORIZATION, auth);
++        if let Some(content) = content {
++            builder = builder.json(content);
++        }
++        Ok(builder)
++    }
++
+     /// The authority for a request URL. Proxied: the destination with
+     /// [`HOST_SENTINEL`] appended to its host — the URL only ferries the
+     /// request to the egress (which strips the sentinel), and the suffix keeps
+@@ -154,7 +237,7 @@ impl FederationClient {
+     /// numeric-host path (and a suffix would break the bracket syntax).
+     /// Direct: the real name verbatim, since reqwest dials it.
+     fn url_authority(&self, dest: &ServerName) -> String {
+-        if !self.proxied || dest.host().starts_with('[') {
++        if !self.via_proxy(dest) || dest.host().starts_with('[') {
+             return dest.as_str().to_owned();
+         }
+         match dest.port() {
+@@ -163,15 +246,56 @@ impl FederationClient {
+         }
+     }
+ 
+-    /// The `Authorization: X-Matrix origin="…",destination="…"` header value for
+-    /// an outbound request to `dest`. No `key`/`sig`: we have no signing key, so
+-    /// this is a network-attested identity, not a signature (see
+-    /// [`crate::federation::auth`]). Server names contain no `"`/`,`, so the
+-    /// values need no escaping.
+-    fn x_matrix(&self, dest: &ServerName) -> String {
++    /// The `Authorization: X-Matrix …` header value for an outbound request
++    /// to `dest`. With a signer: `origin`, `destination`, `key` and `sig`,
++    /// the signature being over the canonical JSON of `{method, uri, origin,
++    /// destination[, content]}` (Server-Server API, "Request authentication").
++    /// Without one: `origin` and `destination` only — a network-attested
++    /// identity, not a signature (see [`crate::federation::auth`]). Server
++    /// names contain no `"`/`,`, so the values need no escaping.
++    fn x_matrix(
++        &self,
++        dest: &ServerName,
++        method: &str,
++        uri: &str,
++        content: Option<&Value>,
++    ) -> String {
++        let Some(signer) = &self.signer else {
++            return format!(
++                "X-Matrix origin=\"{}\",destination=\"{}\"",
++                self.origin, dest
++            );
++        };
++        let mut object = serde_json::json!({
++            "method": method,
++            "uri": uri,
++            "origin": self.origin,
++            "destination": dest.as_str(),
++        });
++        if let Some(content) = content {
++            object["content"] = content.clone();
++        }
++        let sig = match ruma::CanonicalJsonValue::try_from(object) {
++            Ok(ruma::CanonicalJsonValue::Object(obj)) => {
++                signer.sign_bytes(&neutrino_event::sign::signable_json_bytes(&obj))
++            }
++            // A body that is not canonical-JSON-safe (a float, a huge int)
++            // cannot be signed; send the unsigned form and let the peer
++            // refuse it, rather than fail the whole request here.
++            _ => {
++                warn!(target: "neutrino_http", %dest, "request body is not canonical JSON; sending unsigned X-Matrix");
++                return format!(
++                    "X-Matrix origin=\"{}\",destination=\"{}\"",
++                    self.origin, dest
++                );
++            }
++        };
+         format!(
+-            "X-Matrix origin=\"{}\",destination=\"{}\"",
+-            self.origin, dest
++            "X-Matrix origin=\"{}\",destination=\"{}\",key=\"{}\",sig=\"{}\"",
++            self.origin,
++            dest,
++            neutrino_event::SIGNING_KEY_ID,
++            sig
+         )
+     }
+ 
+@@ -204,10 +328,7 @@ impl FederationClient {
+             forward_extremities,
+         };
+         let resp = self
+-            .http
+-            .put(&url)
+-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+-            .json(&body)
++            .request(reqwest::Method::PUT, dest, &url, Some(&json_value(&body)?))?
+             .send()
+             .await?;
+         if !resp.status().is_success() {
+@@ -238,10 +359,12 @@ impl FederationClient {
+         );
+         info!(target: "neutrino_http", %dest, users = requested.len(), "outbound POST /_matrix/federation/v1/user/keys/query");
+         let resp = self
+-            .http
+-            .post(&url)
+-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+-            .json(&serde_json::json!({ "device_keys": requested }))
++            .request(
++                reqwest::Method::POST,
++                dest,
++                &url,
++                Some(&serde_json::json!({ "device_keys": requested })),
++            )?
+             .send()
+             .await?;
+         if !resp.status().is_success() {
+@@ -267,9 +390,7 @@ impl FederationClient {
+         );
+         info!(target: "neutrino_http", %dest, %media_id, "outbound GET /_matrix/federation/v1/media/download");
+         let resp = self
+-            .http
+-            .get(&url)
+-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
++            .request(reqwest::Method::GET, dest, &url, None)?
+             .send()
+             .await?;
+         if !resp.status().is_success() {
+@@ -318,10 +439,12 @@ impl FederationClient {
+         );
+         info!(target: "neutrino_http", %dest, users = requested.len(), "outbound POST /_matrix/federation/v1/user/keys/claim");
+         let resp = self
+-            .http
+-            .post(&url)
+-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+-            .json(&serde_json::json!({ "one_time_keys": requested }))
++            .request(
++                reqwest::Method::POST,
++                dest,
++                &url,
++                Some(&serde_json::json!({ "one_time_keys": requested })),
++            )?
+             .send()
+             .await?;
+         if !resp.status().is_success() {
+@@ -379,10 +502,7 @@ impl FederationClient {
+             include_latest_events,
+         };
+         let resp = self
+-            .http
+-            .post(url)
+-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+-            .json(&body)
++            .request(reqwest::Method::POST, dest, url, Some(&json_value(&body)?))?
+             .send()
+             .await?;
+         if !resp.status().is_success() {
+@@ -431,9 +551,7 @@ impl FederationClient {
+         }
+ 
+         let resp = self
+-            .http
+-            .get(url)
+-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
++            .request(reqwest::Method::GET, dest, url, None)?
+             .send()
+             .await?;
+         if !resp.status().is_success() {
+@@ -475,9 +593,7 @@ impl FederationClient {
+         }
+ 
+         let resp = self
+-            .http
+-            .get(url)
+-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
++            .request(reqwest::Method::GET, dest, url, None)?
+             .send()
+             .await?;
+         if !resp.status().is_success() {
+@@ -507,9 +623,7 @@ impl FederationClient {
+         url.query_pairs_mut().append_pair("room_alias", room_alias);
+ 
+         let resp = self
+-            .http
+-            .get(url)
+-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
++            .request(reqwest::Method::GET, dest, url, None)?
+             .send()
+             .await?;
+         if !resp.status().is_success() {
+@@ -540,10 +654,7 @@ impl FederationClient {
+             .push(event_id.as_str());
+ 
+         let resp = self
+-            .http
+-            .put(url)
+-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+-            .json(&event)
++            .request(reqwest::Method::PUT, dest, url, Some(&json_value(&event)?))?
+             .send()
+             .await?;
+         if !resp.status().is_success() {
+@@ -584,10 +695,7 @@ impl FederationClient {
+             invite_room_state,
+         };
+         let resp = self
+-            .http
+-            .put(url)
+-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+-            .json(&body)
++            .request(reqwest::Method::PUT, dest, url, Some(&json_value(&body)?))?
+             .send()
+             .await?;
+         if !resp.status().is_success() {
+@@ -625,9 +733,7 @@ impl FederationClient {
+         }
+ 
+         let resp = self
+-            .http
+-            .get(url)
+-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
++            .request(reqwest::Method::GET, dest, url, None)?
+             .send()
+             .await?;
+         if !resp.status().is_success() {
+@@ -659,10 +765,7 @@ impl FederationClient {
+             .push(event_id.as_str());
+ 
+         let resp = self
+-            .http
+-            .put(url)
+-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+-            .json(&event)
++            .request(reqwest::Method::PUT, dest, url, Some(&json_value(&event)?))?
+             .send()
+             .await?;
+         if !resp.status().is_success() {
+@@ -883,6 +986,17 @@ struct MissingEventsRequest<'a> {
+     include_latest_events: bool,
+ }
+ 
++/// Is `host` a 64-hex node id — an address on a datagram link rather than a
++/// name to dial?
++fn is_node_id(host: &str) -> bool {
++    host.len() == 64 && host.bytes().all(|b| b.is_ascii_hexdigit())
++}
++
++/// Serialise a typed body to the JSON value that is both signed and sent.
++fn json_value<T: Serialize>(body: &T) -> Result<Value, FederationClientError> {
++    serde_json::to_value(body).map_err(|_| FederationClientError::Malformed("body is not JSON"))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use std::sync::{Arc, Mutex};
+@@ -932,6 +1046,59 @@ mod tests {
+         );
+     }
+ 
++    // With `direct_names`, only a node id rides the proxy (and gets the
++    // sentinel); a named peer is dialled verbatim, since a datagram link
++    // cannot address a hostname.
++    #[test]
++    fn direct_names_routes_only_node_ids_through_the_proxy() {
++        let client = FederationClient::new("origin".to_owned(), Some("http://127.0.0.1:1"))
++            .with_direct_names(true);
++        let name = |s: &str| <&ServerName>::try_from(s).unwrap().to_owned();
++        let node = "a".repeat(64);
++        assert!(client.via_proxy(&name(&node)));
++        assert_eq!(client.url_authority(&name(&node)), format!("{node}~"));
++        assert!(!client.via_proxy(&name("gateway.example:8008")));
++        assert_eq!(
++            client.url_authority(&name("gateway.example:8008")),
++            "gateway.example:8008"
++        );
++    }
++
++    // A signer turns the header into a real X-Matrix signature over the
++    // request object, under the key id the key document advertises.
++    #[test]
++    fn x_matrix_is_signed_when_a_signer_is_set() {
++        let signer = Arc::new(EventSigner::new(&[7u8; 32], "origin"));
++        let client =
++            FederationClient::new("origin".to_owned(), None).with_signer(Some(signer.clone()));
++        let name = |s: &str| <&ServerName>::try_from(s).unwrap().to_owned();
++        let header = client.x_matrix(
++            &name("peer.example"),
++            "PUT",
++            "/_matrix/federation/v1/send/1",
++            Some(&serde_json::json!({"pdus": []})),
++        );
++        assert!(header.starts_with(
++            "X-Matrix origin=\"origin\",destination=\"peer.example\",key=\"ed25519:1\",sig=\""
++        ));
++        let sig = header
++            .rsplit("sig=\"")
++            .next()
++            .unwrap()
++            .trim_end_matches('"');
++        let obj = match ruma::CanonicalJsonValue::try_from(serde_json::json!({
++            "method": "PUT", "uri": "/_matrix/federation/v1/send/1", "origin": "origin",
++            "destination": "peer.example", "content": {"pdus": []}
++        })) {
++            Ok(ruma::CanonicalJsonValue::Object(o)) => o,
++            _ => unreachable!(),
++        };
++        assert_eq!(
++            sig,
++            signer.sign_bytes(&neutrino_event::sign::signable_json_bytes(&obj))
++        );
++    }
++
+     // The whole reason the sentinel exists: prove the URL layer preserves a
+     // suffixed all-digit name where the bare one is rewritten or rejected.
+     #[test]
+diff --git a/crates/neutrino-http/src/federation/invite.rs b/crates/neutrino-http/src/federation/invite.rs
+index ba21c16..f28b8b2 100644
+--- a/crates/neutrino-http/src/federation/invite.rs
++++ b/crates/neutrino-http/src/federation/invite.rs
+@@ -241,7 +241,7 @@ pub(crate) async fn federated_invite(
+     target: &UserId,
+     reason: Option<String>,
+ ) -> Response {
+-    let (store, registry, policy, own_server, federation_proxy) = {
++    let (store, registry, policy, own_server, federation_proxy, direct_names) = {
+         let app = lock_app(state);
+         (
+             app.store.clone(),
+@@ -249,6 +249,7 @@ pub(crate) async fn federated_invite(
+             app.policy.clone(),
+             app.config.server_name.clone(),
+             app.config.federation_proxy.clone(),
++            app.config.federation_direct_names,
+         )
+     };
+ 
+@@ -299,7 +300,9 @@ pub(crate) async fn federated_invite(
+         }
+     };
+     let irs = build_invite_room_state(&*store, room_id, &sender).await;
+-    let client = FederationClient::new(own_server, federation_proxy.as_deref());
++    let client = FederationClient::new(own_server, federation_proxy.as_deref())
++        .with_signer(policy.signer().cloned())
++        .with_direct_names(direct_names);
+     let returned = match client
+         .invite(
+             target.server_name(),
+diff --git a/crates/neutrino-http/src/federation/join.rs b/crates/neutrino-http/src/federation/join.rs
+index a5df992..8927d81 100644
+--- a/crates/neutrino-http/src/federation/join.rs
++++ b/crates/neutrino-http/src/federation/join.rs
+@@ -140,7 +140,7 @@ async fn run_join_dance(
+     candidates: &[OwnedServerName],
+     timeout: Duration,
+ ) -> JoinOutcome {
+-    let (store, worker_poke, policy, own_server, federation_proxy) = {
++    let (store, worker_poke, policy, own_server, federation_proxy, direct_names) = {
+         let app = lock_app(state);
+         (
+             app.store.clone(),
+@@ -148,9 +148,12 @@ async fn run_join_dance(
+             app.policy.clone(),
+             app.config.server_name.clone(),
+             app.config.federation_proxy.clone(),
++            app.config.federation_direct_names,
+         )
+     };
+-    let client = FederationClient::new(own_server, federation_proxy.as_deref());
++    let client = FederationClient::new(own_server, federation_proxy.as_deref())
++        .with_signer(policy.signer().cloned())
++        .with_direct_names(direct_names);
+     let display_name = crate::local_display_name(&store).await;
+ 
+     // Subscribe to the persist watch *before* staging anything (subscribe-
+diff --git a/crates/neutrino-http/src/federation/leave.rs b/crates/neutrino-http/src/federation/leave.rs
+index 519c3b8..9803ba6 100644
+--- a/crates/neutrino-http/src/federation/leave.rs
++++ b/crates/neutrino-http/src/federation/leave.rs
+@@ -45,13 +45,14 @@ pub(crate) async fn reject_invite(
+     room_id: &RoomId,
+     invite: neutrino_event::Event,
+ ) -> Response {
+-    let (store, policy, own_server, federation_proxy) = {
++    let (store, policy, own_server, federation_proxy, direct_names) = {
+         let app = lock_app(state);
+         (
+             app.store.clone(),
+             app.policy.clone(),
+             app.config.server_name.clone(),
+             app.config.federation_proxy.clone(),
++            app.config.federation_direct_names,
+         )
+     };
+ 
+@@ -64,6 +65,7 @@ pub(crate) async fn reject_invite(
+     if let Err(e) = try_federated_leave(
+         &own_server,
+         federation_proxy.as_deref(),
++        direct_names,
+         &policy,
+         &dest,
+         room_id,
+@@ -93,13 +95,16 @@ pub(crate) async fn reject_invite(
+ async fn try_federated_leave(
+     own_server: &str,
+     proxy: Option<&str>,
++    direct_names: bool,
+     policy: &neutrino_event::EventPolicy,
+     dest: &ServerName,
+     room_id: &RoomId,
+     user: &UserId,
+     display_name: &str,
+ ) -> Result<(), String> {
+-    let client = FederationClient::new(own_server.to_owned(), proxy);
++    let client = FederationClient::new(own_server.to_owned(), proxy)
++        .with_signer(policy.signer().cloned())
++        .with_direct_names(direct_names);
+     let offered: Vec<&str> = policy.versions.ids().collect();
+     let template = client
+         .make_leave(dest, room_id, user, &offered)
+diff --git a/crates/neutrino-http/src/lib.rs b/crates/neutrino-http/src/lib.rs
+index ef67ea6..24bae80 100644
+--- a/crates/neutrino-http/src/lib.rs
++++ b/crates/neutrino-http/src/lib.rs
+@@ -313,10 +313,14 @@ impl AppState {
+         discovery: Arc<DiscoveryRegistry>,
+         policy: EventPolicy,
+     ) -> Self {
+-        let client = Arc::new(FederationClient::new(
+-            config.server_name.clone(),
+-            config.federation_proxy.as_deref(),
+-        ));
++        let client = Arc::new(
++            FederationClient::new(
++                config.server_name.clone(),
++                config.federation_proxy.as_deref(),
++            )
++            .with_signer(policy.signer().cloned())
++            .with_direct_names(config.federation_direct_names),
++        );
+         let fetcher: Arc<dyn MissingEventsFetcher> = Arc::new(ReqwestFetcher::new(client));
+         Self::from_store_with_fetcher(config, store, fetcher, discovery, policy)
+     }
+@@ -364,10 +368,14 @@ impl AppState {
+         let (kick_backoff, _) = watch::channel(());
+         // Outbound federation client, built once here and shared (rather than
+         // rebuilt per back-page in `messages.rs`'s backfill path).
+-        let fed_client = Arc::new(FederationClient::new(
+-            config.server_name.clone(),
+-            config.federation_proxy.as_deref(),
+-        ));
++        let fed_client = Arc::new(
++            FederationClient::new(
++                config.server_name.clone(),
++                config.federation_proxy.as_deref(),
++            )
++            .with_signer(policy.signer().cloned())
++            .with_direct_names(config.federation_direct_names),
++        );
+         let app = App {
+             store,
+             room_registry,
+@@ -479,6 +487,10 @@ impl AppState {
+         lock_app(self).policy.signer().cloned()
+     }
+ 
++    fn federation_direct_names(&self) -> bool {
++        lock_app(self).config.federation_direct_names
++    }
++
+     /// The shared `get_missing_events` fetcher, for the outbound sender pool's
+     /// anti-entropy reconciliation (a peer's forward extremities arrive on a
+     /// transaction *response*, which the sender — not a handler — processes).
+@@ -577,10 +589,11 @@ pub async fn serve(
+     // Start draining the federation outbox before serving. Outbox rows survive
+     // restarts, so this is also the "retry on restart" path — startup
+     // enumeration resumes delivery of anything left undelivered.
+-    let transport = Arc::new(FederationClient::new(
+-        state.server_name(),
+-        state.federation_proxy().as_deref(),
+-    ));
++    let transport = Arc::new(
++        FederationClient::new(state.server_name(), state.federation_proxy().as_deref())
++            .with_signer(state.signer())
++            .with_direct_names(state.federation_direct_names()),
++    );
+     let sender_task = neutrino_engine::sender::spawn(
+         state.store(),
+         transport,
+diff --git a/crates/neutrino-lb/src/ingress.rs b/crates/neutrino-lb/src/ingress.rs
+index 626baea..804461d 100644
+--- a/crates/neutrino-lb/src/ingress.rs
++++ b/crates/neutrino-lb/src/ingress.rs
+@@ -21,9 +21,12 @@ use crate::transport::{WireHandler, WireRequest, WireResponse};
+ /// API on the same listener (see `build_router`). Forwarding only
+ /// `/_matrix/federation/*` keeps a peer from reaching CSAPI/other routes
+ /// through the proxy — restoring the route boundary the single-port homeserver
+-/// used to imply when it wasn't network-exposed. No `/_matrix/key/` prefix:
+-/// this server has no signing keys and serves no key endpoints.
++/// used to imply when it wasn't network-exposed. `/_matrix/key/` is the one
++/// other namespace let through: a signing peer publishes its key document
++/// there, and a real Matrix peer must be able to fetch it over the
++/// federation port to verify this server's events and requests.
+ const FEDERATION_PREFIX: &str = "/_matrix/federation/";
++const KEY_PREFIX: &str = "/_matrix/key/";
+ 
+ /// Join an error's source chain into `": "`-separated causes. reqwest's `Display`
+ /// stops at its own message and drops the underlying cause (connect / reset /
+@@ -135,7 +138,8 @@ impl WireHandler for IngressHandler {
+                 return Self::bad_gateway();
+             }
+         };
+-        if !parsed.path().starts_with(FEDERATION_PREFIX) {
++        if !(parsed.path().starts_with(FEDERATION_PREFIX) || parsed.path().starts_with(KEY_PREFIX))
++        {
+             warn!(path = %parsed.path(), "ingress: rejecting non-federation path");
+             record_response(&self.capture, exchange, 404, &[], b"");
+             return WireResponse {
+diff --git a/crates/neutrino-main/Cargo.toml b/crates/neutrino-main/Cargo.toml
+index 4123838..bd94f31 100644
+--- a/crates/neutrino-main/Cargo.toml
++++ b/crates/neutrino-main/Cargo.toml
+@@ -36,6 +36,10 @@ neutrino-store-sqlite = { path = "../neutrino-store-sqlite" }
+ ed25519-dalek = "2.2.0"
+ hex = "0.4.3"
+ rand.workspace = true
++# Key documents of peers known by name (`keys::HttpKeyResolver`): a plain
++# HTTP fetch of `/_matrix/key/v2/server`, parsed by hand.
++reqwest = { version = "0.13.4", default-features = false }
++serde_json.workspace = true
+ 
+ [target.'cfg(target_os = "android")'.dependencies]
+ paranoid-android = "0.2.2"
+diff --git a/crates/neutrino-main/src/keys.rs b/crates/neutrino-main/src/keys.rs
+new file mode 100644
+index 0000000..b9cf198
+--- /dev/null
++++ b/crates/neutrino-main/src/keys.rs
+@@ -0,0 +1,163 @@
++//! Key resolution for a node that federates beyond its own medium.
++//!
++//! On the datagram link a peer's `server_name` *is* its verify key
++//! ([`NodeIdKeyResolver`]). A peer reached by name — a venue gateway's
++//! upstream homeserver, an ordinary Matrix server — publishes its keys at
++//! `/_matrix/key/v2/server` instead. [`HttpKeyResolver`] tries the medium's
++//! resolver first and falls back to fetching that document over plain HTTP
++//! for any name the medium does not understand.
++//!
++//! Scope: the document is fetched from the name itself (`http://{name}`),
++//! with no `.well-known` / SRV delegation and no TLS — the same stance as
++//! the outbound federation client, and enough for a gateway whose upstream
++//! is one host the operator configured. The document's own signature is
++//! checked against the key it advertises before the key is trusted, and a
++//! resolved key is cached until the document's `valid_until_ts`.
++
++use std::collections::HashMap;
++use std::future::Future;
++use std::pin::Pin;
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
++
++use neutrino_event::{KeyResolveError, KeyResolver};
++use tracing::{debug, warn};
++
++/// How long a fetched key is kept when the document names no
++/// `valid_until_ts` (or one already in the past — the spec says to treat
++/// such a key as usable for events before that time, but we have no use
++/// for it beyond the fetch that found it).
++const FALLBACK_TTL_MS: u64 = 60 * 60 * 1000;
++
++struct Cached {
++    key: [u8; 32],
++    expires_ms: u64,
++}
++
++pub struct HttpKeyResolver {
++    medium: Arc<dyn KeyResolver>,
++    http: reqwest::Client,
++    cache: Mutex<HashMap<(String, String), Cached>>,
++}
++
++impl HttpKeyResolver {
++    /// Wrap the medium's resolver; anything it rejects is fetched by name.
++    pub fn new(medium: Arc<dyn KeyResolver>) -> Self {
++        let http = reqwest::Client::builder()
++            .connect_timeout(Duration::from_secs(10))
++            .timeout(Duration::from_secs(30))
++            .no_proxy()
++            .build()
++            .expect("plaintext reqwest client always builds; no TLS backend to init");
++        Self {
++            medium,
++            http,
++            cache: Mutex::new(HashMap::new()),
++        }
++    }
++
++    async fn fetch(&self, server_name: &str, key_id: &str) -> Result<[u8; 32], KeyResolveError> {
++        let err = |reason: String| KeyResolveError {
++            server_name: server_name.to_owned(),
++            key_id: key_id.to_owned(),
++            reason,
++        };
++        // Only a plausible authority is dialled: a name with a scheme, a
++        // path, or whitespace is not a host.
++        if server_name.is_empty()
++            || server_name.contains(|c: char| c == '/' || c == '?' || c == '#' || c.is_whitespace())
++        {
++            return Err(err("server name is not an authority".to_owned()));
++        }
++        let url = format!("http://{server_name}/_matrix/key/v2/server");
++        let bytes = self
++            .http
++            .get(&url)
++            .send()
++            .await
++            .and_then(|r| r.error_for_status())
++            .map_err(|e| err(format!("key document fetch failed: {e}")))?
++            .bytes()
++            .await
++            .map_err(|e| err(format!("key document read failed: {e}")))?;
++        let doc: serde_json::Value = serde_json::from_slice(&bytes)
++            .map_err(|e| err(format!("key document is not JSON: {e}")))?;
++        if doc.get("server_name").and_then(|v| v.as_str()) != Some(server_name) {
++            return Err(err("key document names a different server".to_owned()));
++        }
++        let key_b64 = doc
++            .get("verify_keys")
++            .and_then(|v| v.get(key_id))
++            .and_then(|v| v.get("key"))
++            .and_then(|v| v.as_str())
++            .ok_or_else(|| err(format!("key document has no verify key {key_id}")))?;
++        let key: [u8; 32] = neutrino_event::sign::b64_decode(key_b64)
++            .ok()
++            .and_then(|k| k.try_into().ok())
++            .ok_or_else(|| err("verify key is not 32 base64 bytes".to_owned()))?;
++        // The document must be signed by the key it advertises, or anyone on
++        // the path could hand us a key of their own.
++        let obj = match neutrino_event::ruma::CanonicalJsonValue::try_from(doc.clone()) {
++            Ok(neutrino_event::ruma::CanonicalJsonValue::Object(o)) => o,
++            _ => return Err(err("key document is not canonical JSON".to_owned())),
++        };
++        let resolver = FixedKey(key);
++        neutrino_event::sign::verify_json_signature(&obj, server_name, key_id, &resolver)
++            .await
++            .map_err(|e| err(format!("key document signature: {e}")))?;
++        let expires_ms = doc
++            .get("valid_until_ts")
++            .and_then(|v| v.as_u64())
++            .filter(|ts| *ts > neutrino_event::now_ms())
++            .unwrap_or_else(|| neutrino_event::now_ms() + FALLBACK_TTL_MS);
++        debug!(target: "neutrino_main", %server_name, %key_id, "fetched verify key over HTTP");
++        self.cache.lock().expect("key cache lock").insert(
++            (server_name.to_owned(), key_id.to_owned()),
++            Cached { key, expires_ms },
++        );
++        Ok(key)
++    }
++}
++
++/// A resolver that answers one key, for checking a document against itself.
++struct FixedKey([u8; 32]);
++
++impl KeyResolver for FixedKey {
++    fn verify_key<'a>(
++        &'a self,
++        _server_name: &'a str,
++        _key_id: &'a str,
++    ) -> Pin<Box<dyn Future<Output = Result<[u8; 32], KeyResolveError>> + Send + 'a>> {
++        Box::pin(std::future::ready(Ok(self.0)))
++    }
++}
++
++impl KeyResolver for HttpKeyResolver {
++    fn verify_key<'a>(
++        &'a self,
++        server_name: &'a str,
++        key_id: &'a str,
++    ) -> Pin<Box<dyn Future<Output = Result<[u8; 32], KeyResolveError>> + Send + 'a>> {
++        Box::pin(async move {
++            match self.medium.verify_key(server_name, key_id).await {
++                Ok(key) => return Ok(key),
++                Err(e) => {
++                    debug!(target: "neutrino_main", %server_name, %key_id, reason = %e.reason, "medium resolver declined; fetching by name")
++                }
++            }
++            let cached = self
++                .cache
++                .lock()
++                .expect("key cache lock")
++                .get(&(server_name.to_owned(), key_id.to_owned()))
++                .filter(|c| c.expires_ms > neutrino_event::now_ms())
++                .map(|c| c.key);
++            if let Some(key) = cached {
++                return Ok(key);
++            }
++            self.fetch(server_name, key_id).await.inspect_err(|e| {
++                warn!(target: "neutrino_main", %server_name, %key_id, reason = %e.reason, "verify key unresolved")
++            })
++        })
++    }
++}
+diff --git a/crates/neutrino-main/src/lib.rs b/crates/neutrino-main/src/lib.rs
+index 9035314..088cb7d 100644
+--- a/crates/neutrino-main/src/lib.rs
++++ b/crates/neutrino-main/src/lib.rs
+@@ -1,9 +1,11 @@
++mod keys;
+ mod platform;
+ mod resolver;
+ 
+ use std::net::SocketAddr;
+ use std::sync::Arc;
+ 
++pub use keys::HttpKeyResolver;
+ pub use neutrino_ctl::{Command, Config, DiscoveredPeer, DiscoveryRegistry};
+ pub use neutrino_event::event_id::{EventIdError, EventIdScheme};
+ pub use neutrino_event::{KeyResolver, NodeIdKeyResolver, RedactionKeys, RoomVersion, ruma};
+@@ -327,6 +329,9 @@ pub async fn entrypoint(
+         Some(port) => {
+             let egress_bind = alloc_loopback_egress()?;
+             config.federation_proxy = Some(format!("http://{egress_bind}"));
++            // A datagram link addresses peers by node id and nothing else;
++            // a peer known by name (a gateway's upstream) is dialled directly.
++            config.federation_direct_names = link.is_some();
+             Some(build_lb_config(
+                 &config,
+                 port,
+@@ -501,6 +506,11 @@ fn event_security(
+     let resolver = key_resolver.ok_or(
+         "trusted_network = false requires a key resolver, but the federation          medium provides none (FederationLink.key_resolver) — inbound events          could never be verified",
+     )?;
++    // Beyond the medium's own namespace a peer is known by name and publishes
++    // its keys: a gateway's upstream homeserver, an ordinary Matrix server.
++    // Wrap the medium's resolver so those verify too (see `keys`).
++    let resolver: Arc<dyn neutrino_event::KeyResolver> =
++        Arc::new(keys::HttpKeyResolver::new(resolver));
+     Ok(neutrino_event::EventSecurity::Signed {
+         signer: Arc::new(neutrino_event::EventSigner::new(secret, server_name)),
+         resolver,
+-- 
+2.43.0
+

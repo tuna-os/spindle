@@ -198,6 +198,7 @@ The risks that would invalidate the headline claim are enumerated in
 | [docs/lifecycle.md](docs/lifecycle.md) | Backup, restore, migrations |
 | [docs/rate-limits.md](docs/rate-limits.md) | Every rate and cap, and the growth nothing bounds yet |
 | [docs/matrix-rtc.md](docs/matrix-rtc.md) | Calls end to end: the SFU, the JWT service built in or beside, and what a token cannot promise |
+| [docs/mesh-federation.md](docs/mesh-federation.md) | Federating with a Bluetooth mesh: the venue system, the loopback evidence, and the Neutrino gateway patch |
 | [docs/dashboard.md](docs/dashboard.md) | Generated endpoint and milestone coverage |
 
 ---
