@@ -130,7 +130,7 @@ row "mesh node claims one of alice's one-time keys" \
   "$(echo "$OUT" | grep -q aliceotk && echo claimed || echo missing)" "$(echo "$OUT" | head -c 90)"
 
 curl -s -X POST "$N/_matrix/client/v3/keys/upload" -H 'content-type: application/json' \
-  -d "{\"device_keys\":{\"user_id\":\"@n:$NODE\",\"device_id\":\"PHONE\",\"algorithms\":[\"m.olm.v1.curve25519-aes-sha2\"],\"keys\":{\"curve25519:PHONE\":\"meshcurve\"},\"signatures\":{}}}" >/dev/null
+  -d "{\"device_keys\":{\"user_id\":\"@n:$NODE\",\"device_id\":\"DEVICEID\",\"algorithms\":[\"m.olm.v1.curve25519-aes-sha2\"],\"keys\":{\"curve25519:DEVICEID\":\"meshcurve\"},\"signatures\":{}}}" >/dev/null
 OUT="$(curl -s -X POST "$S/_matrix/client/v3/keys/query" -H "authorization: Bearer $TOK" -H 'content-type: application/json' \
   -d "{\"device_keys\":{\"@n:$NODE\":[]}}")"
 row "Spindle finds the mesh user's device keys via the node's user/keys/query" \
@@ -143,7 +143,7 @@ row "the mesh user's new device reaches alice as device_lists.changed" \
   "$([ "$DL" != "0" ] && echo announced || echo missing)" "m.device_list_update from the node, through Spindle's sync"
 
 curl -s -X PUT "$S/_matrix/client/v3/sendToDevice/m.room_key/td1" -H "authorization: Bearer $TOK" -H 'content-type: application/json' \
-  -d "{\"messages\":{\"@n:$NODE\":{\"PHONE\":{\"marker\":\"key-from-spindle\"}}}}" >/dev/null
+  -d "{\"messages\":{\"@n:$NODE\":{\"DEVICEID\":{\"marker\":\"key-from-spindle\"}}}}" >/dev/null
 for _ in $(seq 1 40); do
   TD="$(curl -s "$N/_matrix/client/v3/sync?timeout=0" | grep -c 'key-from-spindle' || true)"
   [ "$TD" != "0" ] && break; sleep 0.25
