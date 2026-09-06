@@ -86,13 +86,16 @@ curl -sf "$S/_matrix/client/versions" >/dev/null || { echo "Spindle did not star
 # in cargo's own line shape, so the checker reads it as the failure it is.
 echo "--- building the suite"
 cargo_test=(cargo ${RUST_SDK_TOOLCHAIN:+"+$RUST_SDK_TOOLCHAIN"} test --manifest-path "$RUST_SDK_SRC/Cargo.toml" -p matrix-sdk-integration-testing --lib)
-suite_bin=$("${cargo_test[@]}" --no-run --message-format=json 2>/dev/null \
+# cargo names a lib target with underscores whatever the package is
+# called, so the match is on the kind and the package, not the name.
+suite_bin=$("${cargo_test[@]}" --no-run --message-format=json \
   | python3 -c 'import json,sys
 for line in sys.stdin:
     try: m = json.loads(line)
     except ValueError: continue
-    if m.get("executable") and m.get("target", {}).get("name") == "matrix-sdk-integration-testing":
-        print(m["executable"])')
+    if m.get("executable") and "matrix-sdk-integration-testing" in m.get("package_id", "") \
+       and "lib" in m.get("target", {}).get("kind", []):
+        print(m["executable"])' | tail -1)
 [ -x "$suite_bin" ] || { echo "the suite binary was not built" >&2; exit 1; }
 
 mapfile -t tests < <("$suite_bin" --list --format terse ${RUST_SDK_TESTS:-} | sed -n 's/^\(.*\): test$/\1/p')
