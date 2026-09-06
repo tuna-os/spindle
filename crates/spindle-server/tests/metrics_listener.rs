@@ -57,14 +57,13 @@ async fn wait_for(output: &Mutex<Vec<String>>, marker: &str, child: &mut std::pr
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_metrics_listener_serves_prometheus_text_and_traces_reach_the_collector() {
-    // The stand-in collector: any OTLP/HTTP trace export is a 200 and a
-    // count. It knows nothing of protobuf, and need not: the assertion is
-    // that the exporter was wired to the endpoint named and flushed.
+/// The stand-in collector: any OTLP/HTTP trace export is a 200 and a
+/// count. It knows nothing of protobuf, and need not: the assertion is
+/// that the exporter was wired to the endpoint named and flushed.
+async fn collector() -> (u16, Arc<AtomicUsize>) {
     let received = Arc::new(AtomicUsize::new(0));
-    let collector = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let collector_port = collector.local_addr().unwrap().port();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
     let app = axum::Router::new().route(
         "/v1/traces",
         axum::routing::post({
@@ -76,8 +75,35 @@ async fn the_metrics_listener_serves_prometheus_text_and_traces_reach_the_collec
         }),
     );
     tokio::spawn(async move {
-        axum::serve(collector, app).await.unwrap();
+        axum::serve(listener, app).await.unwrap();
     });
+    (port, received)
+}
+
+/// SIGTERM the server and wait for it to exit cleanly.
+async fn stop(child: &mut std::process::Child) {
+    let signalled = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(signalled.success());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "the server exited {status}");
+            return;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the server did not exit within 30 s of SIGTERM");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_metrics_listener_serves_prometheus_text_and_traces_reach_the_collector() {
+    let (collector_port, received) = collector().await;
 
     let work = TempDir::new().unwrap();
     let server_port = free_port();
@@ -160,23 +186,7 @@ async fn the_metrics_listener_serves_prometheus_text_and_traces_reach_the_collec
 
     // A stop flushes the batch exporter, so the span reaches the collector
     // before the process is gone.
-    let signalled = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status()
-        .unwrap();
-    assert!(signalled.success());
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "the server exited {status}");
-            break;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            panic!("the server did not exit within 30 s of SIGTERM");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    stop(&mut child).await;
     reader.join().unwrap();
     assert!(
         received.load(Ordering::SeqCst) >= 1,
