@@ -196,6 +196,8 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::EventReport, 0x35),
         (Keyspace::DehydratedDevice, 0x36),
         (Keyspace::TransactionEcho, 0x37),
+        (Keyspace::RegistrationToken, 0x3a),
+        (Keyspace::ServerNoticeRoom, 0x3b),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(

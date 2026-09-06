@@ -382,6 +382,14 @@ pub enum Keyspace {
     /// device that sent it with the `unsigned.transaction_id` the spec
     /// promises that device, and no other.
     TransactionEcho = 0x37,
+    /// A registration token (`m.login.registration_token`, spec v1.2):
+    /// how many uses it allows, how many it has had, and when it lapses.
+    /// Keyed by the token itself. 0x38 and 0x39 are taken by the media
+    /// reservation and login-token rows.
+    RegistrationToken = 0x3a,
+    /// `user_id` -> the room this server sends its notices to that user
+    /// in, so a second notice lands in the same room as the first.
+    ServerNoticeRoom = 0x3b,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -839,6 +847,28 @@ pub fn media(media_id: &str) -> Vec<u8> {
     key.push(Keyspace::Media as u8);
     key.extend_from_slice(&len.to_be_bytes());
     key.extend_from_slice(id);
+    key
+}
+
+/// One registration token's row.
+#[must_use]
+pub fn registration_token(token: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::RegistrationToken as u8];
+    key.extend_from_slice(token.as_bytes());
+    key
+}
+
+/// Every registration token.
+#[must_use]
+pub fn registration_tokens_prefix() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::RegistrationToken as u8]
+}
+
+/// The server-notices room of one user.
+#[must_use]
+pub fn server_notice_room(user_id: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::ServerNoticeRoom as u8];
+    key.extend_from_slice(user_id.as_bytes());
     key
 }
 

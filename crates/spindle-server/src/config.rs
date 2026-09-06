@@ -39,6 +39,49 @@ pub struct Config {
     pub rtc: RtcConfig,
     #[serde(default)]
     pub push: PushConfig,
+    #[serde(default)]
+    pub registration: RegistrationConfig,
+    /// Absent means this server sends no notices and the admin endpoint
+    /// says so.
+    #[serde(default)]
+    pub server_notices: Option<ServerNoticesConfig>,
+}
+
+/// Who may register.
+///
+/// Registration is open unless a token is required: an operator who
+/// wants a closed server hands out tokens from the admin API
+/// (`/registration_tokens`), each good for so many uses until a time.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistrationConfig {
+    /// Require an `m.login.registration_token` stage at registration.
+    #[serde(default)]
+    pub require_token: bool,
+}
+
+/// The account this server speaks through when an admin sends a notice
+/// (`POST /send_server_notice`), and the room it opens with each user.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerNoticesConfig {
+    /// The localpart of the notices account, created on first use.
+    #[serde(default = "default_notices_localpart")]
+    pub localpart: String,
+    /// The account's display name, as members of the notices room see it.
+    #[serde(default = "default_notices_name")]
+    pub display_name: String,
+    /// The name each notices room is created with.
+    #[serde(default = "default_notices_name")]
+    pub room_name: String,
+}
+
+fn default_notices_localpart() -> String {
+    "server".to_owned()
+}
+
+fn default_notices_name() -> String {
+    "Server Notices".to_owned()
 }
 
 /// Push notification delivery.

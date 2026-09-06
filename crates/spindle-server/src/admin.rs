@@ -96,6 +96,24 @@ pub fn routes() -> Router<AppState> {
                 get(get_event_report),
             )
             .route(&format!("{prefix}/audit"), get(audit_log))
+            .route(
+                &format!("{prefix}/registration_tokens"),
+                get(list_registration_tokens),
+            )
+            .route(
+                &format!("{prefix}/registration_tokens/new"),
+                post(new_registration_token),
+            )
+            .route(
+                &format!("{prefix}/registration_tokens/{{token}}"),
+                get(get_registration_token)
+                    .put(update_registration_token)
+                    .delete(delete_registration_token),
+            )
+            .route(
+                &format!("{prefix}/send_server_notice"),
+                post(send_server_notice),
+            )
     };
     group("/_spindle/admin/v1")
         .merge(group("/_synapse/admin/v1"))
@@ -272,7 +290,7 @@ pub fn is_server_admin(
         .is_some_and(|account| account.admin && !account.deactivated))
 }
 
-fn local_localpart(state: &AppState, user_id: &str) -> Option<String> {
+pub(crate) fn local_localpart(state: &AppState, user_id: &str) -> Option<String> {
     user_id
         .strip_prefix('@')
         .and_then(|rest| rest.split_once(':'))
@@ -1287,6 +1305,194 @@ async fn get_event_report(
     };
     record["event_json"] = event.unwrap_or(Value::Null);
     Ok(Json(record))
+}
+
+#[derive(Deserialize)]
+struct TokenListQuery {
+    valid: Option<bool>,
+}
+
+fn tokens(state: &AppState) -> crate::registration_tokens::RegistrationTokens {
+    crate::registration_tokens::RegistrationTokens::new(std::sync::Arc::clone(&state.store))
+}
+
+fn store_error(error: &spindle_store::StoreError) -> MatrixError {
+    MatrixError::internal(&error.to_string())
+}
+
+/// `GET /registration_tokens?valid=`
+async fn list_registration_tokens(
+    State(state): State<AppState>,
+    _actor: AdminActor,
+    Query(query): Query<TokenListQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    let list = tokens(&state)
+        .list(query.valid)
+        .map_err(|error| store_error(&error))?;
+    Ok(Json(json!({ "registration_tokens": list })))
+}
+
+#[derive(Deserialize)]
+struct NewTokenRequest {
+    token: Option<String>,
+    uses_allowed: Option<u64>,
+    expiry_time: Option<u64>,
+    length: Option<usize>,
+}
+
+/// `POST /registration_tokens/new`
+async fn new_registration_token(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Json(request): Json<NewTokenRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    use crate::registration_tokens::{DEFAULT_TOKEN_LEN, TokenError};
+    let row = tokens(&state)
+        .create(
+            request.token,
+            request.uses_allowed,
+            request.expiry_time,
+            request.length.unwrap_or(DEFAULT_TOKEN_LEN),
+        )
+        .map_err(|error| match error {
+            TokenError::InUse | TokenError::Invalid => MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                error.to_string(),
+            ),
+            TokenError::Storage(inner) => store_error(&inner),
+        })?;
+    audit(
+        &state,
+        &actor.identity().user_id,
+        "registration_token.create",
+        &row.token,
+        &json!({ "uses_allowed": row.uses_allowed, "expiry_time": row.expiry_time }),
+    )?;
+    Ok(Json(serde_json::to_value(row).unwrap_or_default()))
+}
+
+/// `GET /registration_tokens/{token}`
+async fn get_registration_token(
+    State(state): State<AppState>,
+    _actor: AdminActor,
+    Path(token): Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    match tokens(&state)
+        .get(&token)
+        .map_err(|error| store_error(&error))?
+    {
+        Some(row) => Ok(Json(serde_json::to_value(row).unwrap_or_default())),
+        None => Err(no_such_token()),
+    }
+}
+
+fn no_such_token() -> MatrixError {
+    MatrixError::new(
+        StatusCode::NOT_FOUND,
+        "M_NOT_FOUND",
+        "no such registration token",
+    )
+}
+
+/// `PUT /registration_tokens/{token}` with `uses_allowed` and
+/// `expiry_time`, each absent to keep, `null` to clear.
+async fn update_registration_token(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path(token): Path<String>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, MatrixError> {
+    let bound = |field: &str| -> Result<Option<Option<u64>>, MatrixError> {
+        match request.get(field) {
+            None => Ok(None),
+            Some(Value::Null) => Ok(Some(None)),
+            Some(value) => value.as_u64().map(|n| Some(Some(n))).ok_or_else(|| {
+                MatrixError::new(
+                    StatusCode::BAD_REQUEST,
+                    "M_INVALID_PARAM",
+                    format!("{field} is a non-negative integer or null"),
+                )
+            }),
+        }
+    };
+    let uses_allowed = bound("uses_allowed")?;
+    let expiry_time = bound("expiry_time")?;
+    let Some(row) = tokens(&state)
+        .update(&token, uses_allowed, expiry_time)
+        .map_err(|error| store_error(&error))?
+    else {
+        return Err(no_such_token());
+    };
+    audit(
+        &state,
+        &actor.identity().user_id,
+        "registration_token.update",
+        &token,
+        &json!({ "uses_allowed": row.uses_allowed, "expiry_time": row.expiry_time }),
+    )?;
+    Ok(Json(serde_json::to_value(row).unwrap_or_default()))
+}
+
+/// `DELETE /registration_tokens/{token}`
+async fn delete_registration_token(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path(token): Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    if !tokens(&state)
+        .delete(&token)
+        .map_err(|error| store_error(&error))?
+    {
+        return Err(no_such_token());
+    }
+    audit(
+        &state,
+        &actor.identity().user_id,
+        "registration_token.delete",
+        &token,
+        &json!({}),
+    )?;
+    Ok(Json(json!({})))
+}
+
+#[derive(Deserialize)]
+struct ServerNoticeRequest {
+    user_id: String,
+    content: Value,
+    #[serde(rename = "type")]
+    event_type: Option<String>,
+}
+
+/// `POST /send_server_notice`
+///
+/// A message from the operator to one user, as a real event in a room
+/// this server opens for the two of them (`crate::server_notices`).
+async fn send_server_notice(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Json(request): Json<ServerNoticeRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    if !request.content.is_object() {
+        return Err(MatrixError::bad_json("content is an object"));
+    }
+    let event_type = request.event_type.as_deref().unwrap_or("m.room.message");
+    let event_id = crate::server_notices::send(
+        &state,
+        &crate::server_notices::Notice {
+            user_id: &request.user_id,
+            content: &request.content,
+            event_type,
+        },
+    )?;
+    audit(
+        &state,
+        &actor.identity().user_id,
+        "server_notice",
+        &request.user_id,
+        &json!({ "event_id": event_id, "type": event_type }),
+    )?;
+    Ok(Json(json!({ "event_id": event_id })))
 }
 
 /// `GET /audit?from&limit&actor&action`

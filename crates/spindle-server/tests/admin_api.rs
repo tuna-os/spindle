@@ -104,6 +104,7 @@ impl Instance {
 
 /// Every admin route, both prefixes, as (method, path-template) pairs.
 /// New endpoints must be added here — the refusal test walks this list.
+#[allow(clippy::too_many_lines, reason = "one row per route")]
 fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
     let mut routes = Vec::new();
     // The paths Synapse spells differently, served for its tooling.
@@ -172,6 +173,30 @@ fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
             (
                 reqwest::Method::GET,
                 format!("{prefix}/rooms/!r:x/state_at"),
+            ),
+            (
+                reqwest::Method::GET,
+                format!("{prefix}/registration_tokens"),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("{prefix}/registration_tokens/new"),
+            ),
+            (
+                reqwest::Method::GET,
+                format!("{prefix}/registration_tokens/tok"),
+            ),
+            (
+                reqwest::Method::PUT,
+                format!("{prefix}/registration_tokens/tok"),
+            ),
+            (
+                reqwest::Method::DELETE,
+                format!("{prefix}/registration_tokens/tok"),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("{prefix}/send_server_notice"),
             ),
             (
                 reqwest::Method::GET,
