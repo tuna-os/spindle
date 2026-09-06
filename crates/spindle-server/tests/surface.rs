@@ -135,7 +135,14 @@ async fn capabilities_omits_room_versions_rather_than_claiming_none() {
         let versions = &capabilities["m.room_versions"];
         assert!(versions["default"].is_string());
         for version in surface::ROOM_VERSIONS {
-            assert_eq!(versions["available"][version], "stable");
+            // MSC4242's state-DAG version is advertised, and advertised as
+            // what it is: unstable until it is assigned a number.
+            let expected = if *version == spindle_core::STATE_DAG_V12 {
+                "unstable"
+            } else {
+                "stable"
+            };
+            assert_eq!(versions["available"][version], expected, "{version}");
         }
     }
 }

@@ -1178,7 +1178,14 @@ async fn capabilities() -> Json<Value> {
     if let Some(default) = surface::DEFAULT_ROOM_VERSION {
         let available: serde_json::Map<String, Value> = surface::ROOM_VERSIONS
             .iter()
-            .map(|version| ((*version).to_owned(), json!("stable")))
+            .map(|version| {
+                let stability = if *version == spindle_core::STATE_DAG_V12 {
+                    "unstable"
+                } else {
+                    "stable"
+                };
+                ((*version).to_owned(), json!(stability))
+            })
             .collect();
         capabilities.insert(
             "m.room_versions".to_owned(),
@@ -2733,10 +2740,13 @@ async fn invite_user(
         "sender": event["sender"],
         "content": event["content"],
     }));
+    // The room's version, not this build's default: the invitee hashes
+    // the event under what this names.
+    let version = state.rooms.room_version(room_id).map_err(room_error)?;
     let body = json!({
         "event": event,
         "invite_room_state": invite_state,
-        "room_version": crate::rooms::ROOM_VERSION,
+        "room_version": version.as_str(),
     });
     let response = state
         .federation
@@ -2753,17 +2763,13 @@ async fn invite_user(
     // What comes back must be the same event, co-signature aside — and the
     // reference hash proves it, because signatures are outside the hash.
     let cosigned = response["event"].clone();
-    let rules = ruma::RoomVersionId::try_from(crate::rooms::ROOM_VERSION)
-        .ok()
-        .and_then(|version| version.rules())
-        .ok_or_else(|| MatrixError::internal("the room version rules are unavailable"))?;
     let same = ruma::CanonicalJsonValue::try_from(cosigned.clone())
         .ok()
         .and_then(|value| match value {
             ruma::CanonicalJsonValue::Object(object) => Some(object),
             _ => None,
         })
-        .and_then(|object| ruma::signatures::reference_hash(&object, &rules).ok())
+        .and_then(|object| spindle_core::version::reference_hash(&object, &version).ok())
         .is_some_and(|hash| format!("${hash}") == event_id);
     if !same {
         return Err(MatrixError::new(
@@ -3494,15 +3500,17 @@ async fn join_remote(
 
         let arrays =
             |key: &str| -> Vec<Value> { response[key].as_array().cloned().unwrap_or_default() };
+        // A stock room answers with `state` and `auth_chain`; a state-DAG
+        // room (MSC4242) with `state_dag` and `timeline`. Both are the
+        // events to seed from, and the seeding tells them apart by the
+        // room's version.
+        let mut seed_state = arrays("state");
+        seed_state.extend(arrays("state_dag"));
+        let mut seed_rest = arrays("auth_chain");
+        seed_rest.extend(arrays("timeline"));
         state
             .rooms
-            .join_remote(
-                room_id,
-                &arrays("state"),
-                &arrays("auth_chain"),
-                &join,
-                &join_id,
-            )
+            .join_remote(room_id, &seed_state, &seed_rest, &join, &join_id)
             .map_err(room_error)?;
         state.rooms.wake_sync_waiters();
         return Ok(Json(json!({ "room_id": room_id })));

@@ -2661,6 +2661,7 @@ dependencies = [
  "proptest",
  "ruma",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
