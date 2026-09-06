@@ -652,6 +652,109 @@ impl Federation {
         Ok(body)
     }
 
+    /// A signed request to a peer, answered as JSON. `body` makes it a
+    /// POST; without one it is a GET.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] if the request cannot be signed or
+    /// sent, or the peer refuses.
+    async fn signed_json(
+        &self,
+        destination: &str,
+        uri: &str,
+        body: Option<&Value>,
+        what: &'static str,
+    ) -> Result<Value, FederationError> {
+        let method = if body.is_some() { "POST" } else { "GET" };
+        let authorization = self.sign_request(method, uri, destination, body)?;
+        let endpoint = format!("{}{uri}", self.base_url(destination)?);
+        let request = match body {
+            Some(body) => self
+                .client
+                .post(endpoint)
+                .header("content-type", "application/json")
+                .body(body.to_string()),
+            None => self.client.get(endpoint),
+        };
+        let response = request
+            .header("authorization", authorization)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|error| FederationError::Refused(format!("{what}: {error}")))?;
+        let status = response.status();
+        let answer: Value = response
+            .bytes()
+            .await
+            .map_err(|error| FederationError::Refused(format!("{what} body: {error}")))
+            .and_then(|bytes| {
+                serde_json::from_slice(&bytes)
+                    .map_err(|error| FederationError::Refused(format!("{what} body: {error}")))
+            })?;
+        if !status.is_success() {
+            return Err(peer_refusal(destination, what, status, answer));
+        }
+        Ok(answer)
+    }
+
+    /// Ask a peer for its users' device keys (`user/keys/query`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::signed_json`].
+    pub async fn remote_keys_query(
+        &self,
+        destination: &str,
+        device_keys: &serde_json::Map<String, Value>,
+    ) -> Result<Value, FederationError> {
+        self.signed_json(
+            destination,
+            "/_matrix/federation/v1/user/keys/query",
+            Some(&serde_json::json!({ "device_keys": device_keys })),
+            "keys/query",
+        )
+        .await
+    }
+
+    /// Claim one-time keys from a peer for its users (`user/keys/claim`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::signed_json`].
+    pub async fn remote_keys_claim(
+        &self,
+        destination: &str,
+        one_time_keys: &serde_json::Map<String, Value>,
+    ) -> Result<Value, FederationError> {
+        self.signed_json(
+            destination,
+            "/_matrix/federation/v1/user/keys/claim",
+            Some(&serde_json::json!({ "one_time_keys": one_time_keys })),
+            "keys/claim",
+        )
+        .await
+    }
+
+    /// A peer's whole device list for one of its users (`user/devices`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::signed_json`].
+    pub async fn remote_user_devices(
+        &self,
+        destination: &str,
+        user_id: &str,
+    ) -> Result<Value, FederationError> {
+        self.signed_json(
+            destination,
+            &format!("/_matrix/federation/v1/user/devices/{user_id}"),
+            None,
+            "user/devices",
+        )
+        .await
+    }
+
     /// Resolve a room alias on the server that owns it — the client half
     /// of `query/directory`.
     ///

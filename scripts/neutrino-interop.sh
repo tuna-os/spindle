@@ -64,8 +64,10 @@ KEYS="$(curl -s "$N/_matrix/key/v2/server")"
 row "mesh node key document at its loopback URL" "$(echo "$KEYS" | grep -q verify_keys && echo served || echo missing)" \
   "server_name is the node id; key ed25519:1"
 
-TOK="$(curl -s -X POST "$S/_matrix/client/v3/register" -H 'content-type: application/json' \
-  -d '{"username":"alice","password":"hunter2","auth":{"type":"m.login.dummy","session":"s"}}' | json access_token)"
+REG="$(curl -s -X POST "$S/_matrix/client/v3/register" -H 'content-type: application/json' \
+  -d '{"username":"alice","password":"hunter2","auth":{"type":"m.login.dummy","session":"s"}}')"
+TOK="$(echo "$REG" | json access_token)"
+ADEV="$(echo "$REG" | json device_id)"
 ROOM="$(curl -s -X POST "$S/_matrix/client/v3/createRoom" -H "authorization: Bearer $TOK" \
   -H 'content-type: application/json' -d '{"name":"Interop","room_version":"org.matrix.msc4242.12","preset":"public_chat"}' | json room_id)"
 
@@ -111,6 +113,51 @@ for _ in $(seq 1 40); do
 done
 row "messages cross Spindle -> mesh and mesh -> Spindle" \
   "$([ "$A" != "0" ] && [ "$B" != "0" ] && echo both || echo "spindle->mesh=$A mesh->spindle=$B")" "in the room the mesh user joined"
+
+# 2e. End-to-end encryption across the seam: DMs and group chats are
+# encrypted by default, so the key directory, one-time keys, to-device
+# messages and device-list changes must cross in both directions.
+SINCE="$(curl -s "$S/_matrix/client/v3/sync?timeout=0" -H "authorization: Bearer $TOK" | json next_batch)"
+curl -s -X POST "$S/_matrix/client/v3/keys/upload" -H "authorization: Bearer $TOK" -H 'content-type: application/json' \
+  -d "{\"device_keys\":{\"user_id\":\"@alice:127.0.0.1:8008\",\"device_id\":\"$ADEV\",\"algorithms\":[\"m.olm.v1.curve25519-aes-sha2\"],\"keys\":{\"curve25519:$ADEV\":\"alicecurve\"},\"signatures\":{}},\"one_time_keys\":{\"signed_curve25519:AAAA\":{\"key\":\"aliceotk\"}}}" >/dev/null
+OUT="$(curl -s -X POST "$N/_matrix/client/v3/keys/query" -H 'content-type: application/json' \
+  -d '{"device_keys":{"@alice:127.0.0.1:8008":[]}}')"
+row "mesh node finds alice's device keys via Spindle's user/keys/query" \
+  "$(echo "$OUT" | grep -q alicecurve && echo found || echo missing)" "$(echo "$OUT" | head -c 90)"
+OUT="$(curl -s -X POST "$N/_matrix/client/v3/keys/claim" -H 'content-type: application/json' \
+  -d "{\"one_time_keys\":{\"@alice:127.0.0.1:8008\":{\"$ADEV\":\"signed_curve25519\"}}}")"
+row "mesh node claims one of alice's one-time keys" \
+  "$(echo "$OUT" | grep -q aliceotk && echo claimed || echo missing)" "$(echo "$OUT" | head -c 90)"
+
+curl -s -X POST "$N/_matrix/client/v3/keys/upload" -H 'content-type: application/json' \
+  -d "{\"device_keys\":{\"user_id\":\"@n:$NODE\",\"device_id\":\"PHONE\",\"algorithms\":[\"m.olm.v1.curve25519-aes-sha2\"],\"keys\":{\"curve25519:PHONE\":\"meshcurve\"},\"signatures\":{}}}" >/dev/null
+OUT="$(curl -s -X POST "$S/_matrix/client/v3/keys/query" -H "authorization: Bearer $TOK" -H 'content-type: application/json' \
+  -d "{\"device_keys\":{\"@n:$NODE\":[]}}")"
+row "Spindle finds the mesh user's device keys via the node's user/keys/query" \
+  "$(echo "$OUT" | grep -q meshcurve && echo found || echo missing)" "$(echo "$OUT" | head -c 90)"
+for _ in $(seq 1 40); do
+  DL="$(curl -s "$S/_matrix/client/v3/sync?timeout=0&since=$SINCE" -H "authorization: Bearer $TOK" | grep -c "\"@n:$NODE\"" || true)"
+  [ "$DL" != "0" ] && break; sleep 0.25
+done
+row "the mesh user's new device reaches alice as device_lists.changed" \
+  "$([ "$DL" != "0" ] && echo announced || echo missing)" "m.device_list_update from the node, through Spindle's sync"
+
+curl -s -X PUT "$S/_matrix/client/v3/sendToDevice/m.room_key/td1" -H "authorization: Bearer $TOK" -H 'content-type: application/json' \
+  -d "{\"messages\":{\"@n:$NODE\":{\"PHONE\":{\"marker\":\"key-from-spindle\"}}}}" >/dev/null
+for _ in $(seq 1 40); do
+  TD="$(curl -s "$N/_matrix/client/v3/sync?timeout=0" | grep -c 'key-from-spindle' || true)"
+  [ "$TD" != "0" ] && break; sleep 0.25
+done
+row "a to-device message from alice reaches the mesh user's device" \
+  "$([ "$TD" != "0" ] && echo delivered || echo missing)" "m.direct_to_device EDU in Spindle's transaction"
+curl -s -X PUT "$N/_matrix/client/v3/sendToDevice/m.room_key/td2" -H 'content-type: application/json' \
+  -d "{\"messages\":{\"@alice:127.0.0.1:8008\":{\"$ADEV\":{\"marker\":\"key-from-mesh\"}}}}" >/dev/null
+for _ in $(seq 1 40); do
+  TD="$(curl -s "$S/_matrix/client/v3/sync?timeout=0" -H "authorization: Bearer $TOK" | grep -c 'key-from-mesh' || true)"
+  [ "$TD" != "0" ] && break; sleep 0.25
+done
+row "a to-device message from the mesh user reaches alice's device" \
+  "$([ "$TD" != "0" ] && echo delivered || echo missing)" "m.direct_to_device EDU in the node's transaction"
 
 # 2d. Alice accepts the mesh node's invite: Spindle joins the mesh room,
 # seeded from the node's state DAG, and a message crosses back.

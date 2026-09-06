@@ -1102,6 +1102,18 @@ fn discovery_routes() -> Router<AppState> {
             post(federation_missing_events),
         )
         .route(
+            "/_matrix/federation/v1/user/keys/query",
+            post(federation_keys_query),
+        )
+        .route(
+            "/_matrix/federation/v1/user/keys/claim",
+            post(federation_keys_claim),
+        )
+        .route(
+            "/_matrix/federation/v1/user/devices/{user_id}",
+            get(federation_user_devices),
+        )
+        .route(
             "/_matrix/federation/v1/make_join/{room_id}/{user_id}",
             get(federation_make_join),
         )
@@ -1953,6 +1965,13 @@ async fn delete_device(
         .mark_device_list_changed(&identity.user_id, seq)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
     state.rooms.wake_sync_waiters();
+    crate::e2ee_federation::announce_device_change(
+        &state,
+        &identity.user_id,
+        &device_id,
+        None,
+        seq,
+    );
     Ok((StatusCode::OK, Json(json!({}))))
 }
 
@@ -2137,6 +2156,37 @@ async fn federation_backfill(
     request: axum::http::Request<axum::body::Body>,
 ) -> Result<Json<Value>, MatrixError> {
     crate::inbound::backfill(state, headers, room_id, request).await
+}
+
+/// `POST /_matrix/federation/v1/user/keys/query`
+/// Extractor shell; the handler is [`crate::e2ee_federation::keys_query`].
+async fn federation_keys_query(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    crate::e2ee_federation::keys_query(state, headers, request).await
+}
+
+/// `POST /_matrix/federation/v1/user/keys/claim`
+/// Extractor shell; the handler is [`crate::e2ee_federation::keys_claim`].
+async fn federation_keys_claim(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    crate::e2ee_federation::keys_claim(state, headers, request).await
+}
+
+/// `GET /_matrix/federation/v1/user/devices/{userId}`
+/// Extractor shell; the handler is [`crate::e2ee_federation::user_devices`].
+async fn federation_user_devices(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    crate::e2ee_federation::user_devices(state, headers, user_id, request).await
 }
 
 /// `POST /_matrix/federation/v1/get_missing_events/{roomId}`
@@ -4680,6 +4730,15 @@ async fn upload_keys(
         // Anyone long-polling `/sync` should hear about it now, not at the
         // timeout: encrypting to a stale device set is the failure mode.
         state.rooms.wake_sync_waiters();
+        // And every server sharing a room with this user, through the
+        // outbox, so a peer's clients re-query before encrypting.
+        crate::e2ee_federation::announce_device_change(
+            &state,
+            &identity.user_id,
+            &identity.device_id,
+            Some(device_keys),
+            seq,
+        );
     }
     if let Some(fallback_keys) = &request.fallback_keys {
         state
@@ -4727,7 +4786,13 @@ async fn query_keys(
     Json(request): Json<QueryKeysRequest>,
 ) -> Result<Json<Value>, MatrixError> {
     let mut device_keys = serde_json::Map::new();
+    let local = |user_id: &str| {
+        user_id.split_once(':').map(|(_, domain)| domain) == Some(state.config.server.name.as_str())
+    };
     for (user_id, wanted) in &request.device_keys {
+        if !local(user_id) {
+            continue;
+        }
         let all = state
             .devices
             .all_device_keys(user_id)
@@ -4764,7 +4829,7 @@ async fn query_keys(
     let mut master_keys = serde_json::Map::new();
     let mut self_signing_keys = serde_json::Map::new();
     let mut user_signing_keys = serde_json::Map::new();
-    for user_id in request.device_keys.keys() {
+    for user_id in request.device_keys.keys().filter(|user_id| local(user_id)) {
         let fetch = |key_type: &str| {
             state
                 .devices
@@ -4783,13 +4848,21 @@ async fn query_keys(
             user_signing_keys.insert(user_id.clone(), key);
         }
     }
-    Ok(Json(json!({
-        "device_keys": device_keys,
-        "master_keys": master_keys,
-        "self_signing_keys": self_signing_keys,
-        "user_signing_keys": user_signing_keys,
-        "failures": {},
-    })))
+    let mut response = serde_json::Map::new();
+    response.insert("device_keys".to_owned(), Value::Object(device_keys));
+    response.insert("master_keys".to_owned(), Value::Object(master_keys));
+    response.insert(
+        "self_signing_keys".to_owned(),
+        Value::Object(self_signing_keys),
+    );
+    response.insert(
+        "user_signing_keys".to_owned(),
+        Value::Object(user_signing_keys),
+    );
+    response.insert("failures".to_owned(), json!({}));
+    // Users elsewhere are asked of their servers, one request per server.
+    crate::e2ee_federation::query_remote_keys(&state, &request.device_keys, &mut response).await;
+    Ok(Json(Value::Object(response)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -4804,7 +4877,20 @@ async fn claim_keys(
     Json(request): Json<ClaimKeysRequest>,
 ) -> Result<Json<Value>, MatrixError> {
     let mut claimed = serde_json::Map::new();
+    let mut failures = serde_json::Map::new();
+    crate::e2ee_federation::claim_remote_keys(
+        &state,
+        &request.one_time_keys,
+        &mut claimed,
+        &mut failures,
+    )
+    .await;
     for (user_id, devices) in &request.one_time_keys {
+        if user_id.split_once(':').map(|(_, domain)| domain)
+            != Some(state.config.server.name.as_str())
+        {
+            continue;
+        }
         let Some(devices) = devices.as_object() else {
             continue;
         };
@@ -4844,7 +4930,9 @@ async fn claim_keys(
             claimed.insert(user_id.clone(), Value::Object(per_user));
         }
     }
-    Ok(Json(json!({ "one_time_keys": claimed, "failures": {} })))
+    Ok(Json(
+        json!({ "one_time_keys": claimed, "failures": failures }),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -4923,6 +5011,7 @@ async fn upload_cross_signing(
         .mark_device_list_changed(&identity.user_id, seq)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
     state.rooms.wake_sync_waiters();
+    crate::e2ee_federation::announce_signing_keys(&state, &identity.user_id);
     Ok(Json(json!({})))
 }
 
@@ -5376,7 +5465,20 @@ async fn send_to_device(
         return Ok(Json(json!({})));
     }
 
+    // Recipients on other servers go out as one EDU per server.
+    crate::e2ee_federation::queue_remote_to_device(
+        &state,
+        &identity.user_id,
+        &event_type,
+        &txn_id,
+        &request.messages,
+    );
     for (target_user, per_device) in &request.messages {
+        if target_user.split_once(':').map(|(_, domain)| domain)
+            != Some(state.config.server.name.as_str())
+        {
+            continue;
+        }
         let Some(per_device) = per_device.as_object() else {
             continue;
         };
@@ -8471,6 +8573,15 @@ async fn delete_devices(
             .mark_device_list_changed(&identity.user_id, seq)
             .map_err(|error| MatrixError::internal(&error.to_string()))?;
         state.rooms.wake_sync_waiters();
+        for device_id in &request.devices {
+            crate::e2ee_federation::announce_device_change(
+                &state,
+                &identity.user_id,
+                device_id,
+                None,
+                seq,
+            );
+        }
     }
     Ok((StatusCode::OK, Json(json!({}))))
 }
