@@ -2088,12 +2088,21 @@ async fn report_room(
     axum::extract::Path(room_id): axum::extract::Path<String>,
     Json(request): Json<ReasonOnly>,
 ) -> Result<Json<Value>, MatrixError> {
-    if state.rooms.summary(&room_id).is_err() {
-        return Err(MatrixError::new(
-            StatusCode::NOT_FOUND,
-            "M_NOT_FOUND",
-            "no such room",
-        ));
+    // Deliberately open to strangers. A report is how somebody *outside*
+    // a room tells the admins about it (spec v1.13 says a reporter need
+    // not be joined), so the caller's own view of the room is not the
+    // gate here. What is checked is that the room exists at all: a
+    // member already knows that, and a stranger learns nothing more from
+    // the 404 than they would from a join attempt.
+    if may_read_room(&state, &identity.user_id, &room_id).is_err() {
+        // A stranger: still allowed to report, but only a room that exists.
+        if state.rooms.summary(&room_id).is_err() {
+            return Err(MatrixError::new(
+                StatusCode::NOT_FOUND,
+                "M_NOT_FOUND",
+                "no such room",
+            ));
+        }
     }
     let report_id = crate::admin::file_report(
         &state,
