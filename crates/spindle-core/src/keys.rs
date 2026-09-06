@@ -365,6 +365,11 @@ pub enum Keyspace {
     /// stream id the event was persisted under, so `/sync` can tell which
     /// sticky events are news to a client since its token.
     Sticky = 0x34,
+    /// MSC3814: the one dehydrated device a user may park, keyed by user:
+    /// which device it is and the encrypted `device_data` that rehydrates
+    /// it. The device's keys and queue live in the device keyspaces like
+    /// any other device's. 0x35 is taken by the event-report keyspace.
+    DehydratedDevice = 0x36,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes

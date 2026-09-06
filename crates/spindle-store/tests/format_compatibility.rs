@@ -192,6 +192,8 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::PushCursor, 0x31),
         (Keyspace::PendingKnock, 0x32),
         (Keyspace::OpenIdToken, 0x33),
+        (Keyspace::Sticky, 0x34),
+        (Keyspace::DehydratedDevice, 0x36),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(

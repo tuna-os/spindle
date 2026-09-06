@@ -90,6 +90,7 @@ pub fn router(state: AppState) -> Router {
         .merge(account_routes())
         .merge(push_routes())
         .merge(appservice_routes())
+        .merge(crate::dehydrated::routes())
         .merge(device_routes())
         .merge(profile_routes())
         .merge(room_routes())
