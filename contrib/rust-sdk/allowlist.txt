@@ -53,7 +53,26 @@ tests::room_privacy::test_publishing_room_alias
 # run and the one after it.
 tests::e2ee::test_encryption_missing_member_keys
 tests::e2ee::test_mutual_sas_verification_with_notification_client_ignores_verification_events
-tests::room::test_latest_event_few_rooms
 tests::room_privacy::test_removing_published_room_alias
 tests::sliding_sync::room::test_delayed_invite_response_and_sent_message_decryption
 tests::timeline::test_room_keys_received_on_notification_client_trigger_redecryption
+
+# Run 34038593414 (matrix-sdk-0.18.0 at 1c44fb66, Spindle at ea7213c):
+# 33 passed, 17 failed, 5 ignored. #417 (a signature upload is a
+# device-list change, user-signing signatures returned to the signer
+# alone) settles the interactive verification group: SAS, QR code and the
+# secret gossip that follows. #418 (the sending device reads its
+# transaction ID back) settles the stale-local-echo edit. The first
+# shared-history test to pass is the pin-violation one, which needs no
+# key forwarding.
+#
+# Withdrawn: test_latest_event_few_rooms, promoted on the run before this
+# one and failing on this one with the same five-second wait on the
+# latest-event observer. Two runs disagreeing is the definition of a
+# test that cannot be protected yet; it goes back in when the cause is
+# found, not when it next happens to pass.
+tests::e2ee::shared_history::test_history_share_on_invite_pin_violation
+tests::e2ee::test_mutual_qrcode_verification
+tests::e2ee::test_mutual_sas_verification
+tests::e2ee::test_secret_gossip_after_interactive_verification
+tests::timeline::test_stale_local_echo_time_abort_edit
