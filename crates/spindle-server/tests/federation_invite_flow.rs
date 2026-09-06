@@ -420,10 +420,18 @@ async fn a_rejected_invite_leaves_both_sides_clean() {
         )
         .await;
     assert_eq!(status, 200, "a re-invite after rejection works: {body}");
-    let sync = local.sync(&bob).await;
+    // The invite reaches bob's server over federation, through the
+    // inviter's outbox, after the inviter has already answered alice: one
+    // sync taken at once can land before the PDU does, and did, on a busy
+    // runner (two CI runs on unrelated branches). Poll, as the rejection's
+    // own federation leg above is polled.
     assert!(
-        !sync["rooms"]["invite"][&room].is_null(),
-        "the new invite renders: {sync}"
+        eventually(async || {
+            let sync = local.sync(&bob).await;
+            !sync["rooms"]["invite"][&room].is_null()
+        })
+        .await,
+        "the new invite renders"
     );
 }
 
