@@ -2143,9 +2143,10 @@ impl Rooms {
         &self,
         room_id: &str,
         event_id: &str,
-        limit: usize,
+        before: usize,
+        after: usize,
     ) -> Result<Context, RoomError> {
-        self.context_within(room_id, event_id, limit, None)
+        self.context_within(room_id, event_id, before, after, None)
     }
 
     /// [`Self::context`], seeing nothing above `bound`.
@@ -2161,10 +2162,11 @@ impl Rooms {
         &self,
         room_id: &str,
         event_id: &str,
-        limit: usize,
+        before: usize,
+        after: usize,
         bound: Option<i64>,
     ) -> Result<Context, RoomError> {
-        self.context_visible(room_id, event_id, limit, &|li| {
+        self.context_visible(room_id, event_id, before, after, &|li| {
             bound.is_none_or(|bound| li <= bound)
         })
     }
@@ -2181,7 +2183,8 @@ impl Rooms {
         &self,
         room_id: &str,
         event_id: &str,
-        limit: usize,
+        before_limit: usize,
+        after_limit: usize,
         visible: &(dyn Fn(i64) -> bool + Sync),
     ) -> Result<Context, RoomError> {
         let found = self.with_room_read(room_id, |_, log| {
@@ -2194,19 +2197,19 @@ impl Rooms {
             }
             let state_root = entry.state_root;
 
-            // Symmetric, and each side stops at the end of the log rather than
-            // running off it.
+            // Each side has its own limit and stops at the end of the log
+            // rather than running off it.
             let before: Vec<String> = log
                 .entries()
                 .rev()
                 .filter(|entry| entry.li.get() < target && visible(entry.li.get()))
-                .take(limit)
+                .take(before_limit)
                 .map(|entry| entry.event_id.as_str().to_owned())
                 .collect();
             let after: Vec<String> = log
                 .entries()
                 .filter(|entry| entry.li.get() > target && visible(entry.li.get()))
-                .take(limit)
+                .take(after_limit)
                 .map(|entry| entry.event_id.as_str().to_owned())
                 .collect();
 

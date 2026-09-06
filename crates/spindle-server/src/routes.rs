@@ -3926,22 +3926,22 @@ async fn room_members(
 
 /// `GET /_matrix/client/v3/rooms/{room_id}/joined_members`
 ///
-/// Restricted to members: the response is the room's roster, and handing it to
-/// a non-member would leak who is in a room they cannot see. `joined()` is a
-/// prefix scan over the caller's own rooms, so the check costs a scan of what
-/// the caller is in rather than a walk of the room.
+/// Restricted to those who may read the room: its members, and anybody
+/// at all when the room is world-readable. The roster is the room's
+/// state, and the spec lets a world-readable room's state be read by
+/// anyone; a preview of such a room (matrix-rust-sdk's `RoomPreview`)
+/// reads `/state` and this together, and a 403 here made the whole
+/// preview fail. Handing the roster to a non-member of any other room
+/// would leak who is in a room they cannot see, which `may_read` refuses.
 async fn room_joined_members(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
     axum::extract::Path(room_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, MatrixError> {
-    let joined = state.rooms.joined(&identity.user_id).map_err(room_error)?;
-    if !joined.iter().any(|room| room == &room_id) {
-        return Err(MatrixError::forbidden(format!(
-            "{} is not in {room_id}",
-            identity.user_id
-        )));
-    }
+    state
+        .rooms
+        .may_read(&identity.user_id, &room_id)
+        .map_err(room_error)?;
     let members = state.rooms.joined_members(&room_id).map_err(room_error)?;
     Ok(Json(json!({ "joined": members })))
 }
@@ -6213,6 +6213,45 @@ fn sliding_room_entry(
         .state_event_unscoped(room_id, "m.room.name", "")
         .ok()
         .and_then(|content| content["name"].as_str().map(str::to_owned));
+    let (events, limited, prev_batch) = if timeline_limit == 0 {
+        (Vec::new(), false, None)
+    } else {
+        state
+            .rooms
+            .timeline_tail_public(room_id, timeline_limit.min(50))
+            .map_err(room_error)?
+    };
+    let timeline = crate::sliding::Timeline {
+        events: events
+            .into_iter()
+            .map(|event| with_transaction_id(state, identity, event))
+            .collect(),
+        limited,
+        prev_batch: prev_batch.map(|li| crate::tokens::Pagination(li).to_string()),
+    };
+    // `$LAZY` (MSC4186's lazy-loaded members) is the member events of
+    // whoever sent something in the window just built: what a client needs
+    // to render that timeline, the sender names and avatars, and nothing
+    // more. Expanded here into concrete keys so the two paths below need
+    // know nothing about it. A window with no senders wants no members.
+    let senders: std::collections::BTreeSet<&str> = timeline
+        .events
+        .iter()
+        .filter_map(|event| event["sender"].as_str())
+        .collect();
+    let required_state: Vec<(String, String)> = required_state
+        .iter()
+        .flat_map(|(event_type, state_key)| {
+            if state_key == "$LAZY" {
+                senders
+                    .iter()
+                    .map(|sender| (event_type.clone(), (*sender).to_owned()))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![(event_type.clone(), state_key.clone())]
+            }
+        })
+        .collect();
     // A wildcard has to be answered by looking at everything; a list of
     // named keys does not. Element X asks for a handful of concrete keys
     // and gets sent the whole room state to filter down — a stored-body
@@ -6255,29 +6294,13 @@ fn sliding_room_entry(
                 let event_type = event["type"].as_str().unwrap_or_default();
                 let state_key = event["state_key"].as_str().unwrap_or_default();
                 crate::sliding::wants_state(
-                    required_state,
+                    &required_state,
                     &identity.user_id,
                     event_type,
                     state_key,
                 )
             })
             .collect()
-    };
-    let (events, limited, prev_batch) = if timeline_limit == 0 {
-        (Vec::new(), false, None)
-    } else {
-        state
-            .rooms
-            .timeline_tail_public(room_id, timeline_limit.min(50))
-            .map_err(room_error)?
-    };
-    let timeline = crate::sliding::Timeline {
-        events: events
-            .into_iter()
-            .map(|event| with_transaction_id(state, identity, event))
-            .collect(),
-        limited,
-        prev_batch: prev_batch.map(|li| crate::tokens::Pagination(li).to_string()),
     };
     let roster = state.rooms.roster(room_id).map_err(room_error)?;
     let avatar = state
@@ -7733,17 +7756,20 @@ async fn room_context(
     axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
     axum::extract::Query(query): axum::extract::Query<ContextQuery>,
 ) -> Result<Json<Value>, MatrixError> {
-    // The spec's limit is the total window, so each side gets half. Zero
-    // is a real ask -- the event alone, with tokens to page out from --
-    // and matrix-rust-sdk makes it; clamping it up to one handed back a
-    // neighbour the client had said it did not want.
+    // The spec's limit is the total window. It is split the way Synapse
+    // splits it -- the floor before, the rest after -- because that is the
+    // split clients have learned: matrix-rust-sdk's permalink timeline asks
+    // for one context event and lays out a window of two, and an extra
+    // neighbour on the earlier side shifted every item it then indexed.
+    // Zero is a real ask, the event alone with tokens to page out from.
     let limit = query.limit.unwrap_or(10).min(100);
-    let each_side = limit.div_ceil(2);
+    let before = limit / 2;
+    let after = limit - before;
 
     let context = state
         .rooms
         .reader(&identity.user_id, &room_id)
-        .and_then(|reader| reader.context(&event_id, each_side))
+        .and_then(|reader| reader.context(&event_id, before, after))
         .map_err(room_error)?;
 
     Ok(Json(json!({
@@ -8975,16 +9001,12 @@ fn search_context(
     let Ok(context) = state
         .rooms
         .reader_with(&hit.room_id, scope.clone())
-        .context(&hit.event.event_id, before_limit.max(after_limit))
+        .context(&hit.event.event_id, before_limit, after_limit)
     else {
         return Value::Null;
     };
-    let events_before: Vec<Value> = context
-        .events_before
-        .into_iter()
-        .take(before_limit)
-        .collect();
-    let events_after: Vec<Value> = context.events_after.into_iter().take(after_limit).collect();
+    let events_before = context.events_before;
+    let events_after = context.events_after;
     let mut out = json!({
         "events_before": events_before,
         "events_after": events_after,
