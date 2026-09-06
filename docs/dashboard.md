@@ -26,12 +26,12 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**187 routes implemented; 0 known gaps in scope.**
+**194 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
 
-### Admin & moderation — 40 implemented, 0 planned
+### Admin & moderation — 47 implemented, 0 planned
 
 - `GET /_spindle/admin/v1/audit`
 - `GET /_spindle/admin/v1/event_reports`
@@ -54,8 +54,11 @@ neither implemented nor counted.
 - `POST /_spindle/admin/v1/users/{user_id}/reset_password`
 - `GET /_spindle/admin/v1/whois/{user_id}`
 - `GET /_synapse/admin/v1/audit`
+- `POST /_synapse/admin/v1/deactivate/{user_id}`
 - `GET /_synapse/admin/v1/event_reports`
 - `GET /_synapse/admin/v1/event_reports/{report_id}`
+- `POST /_synapse/admin/v1/purge_history/{room_id}`
+- `POST /_synapse/admin/v1/reset_password/{user_id}`
 - `GET /_synapse/admin/v1/rooms`
 - `GET/DELETE /_synapse/admin/v1/rooms/{room_id}`
 - `POST /_synapse/admin/v1/rooms/{room_id}/make_room_admin`
@@ -73,6 +76,10 @@ neither implemented nor counted.
 - `GET /_synapse/admin/v1/users/{user_id}/joined_rooms`
 - `POST /_synapse/admin/v1/users/{user_id}/reset_password`
 - `GET /_synapse/admin/v1/whois/{user_id}`
+- `GET /_synapse/admin/v2/users`
+- `GET/PUT /_synapse/admin/v2/users/{user_id}`
+- `POST /_synapse/admin/v2/users/{user_id}/delete_devices`
+- `GET /_synapse/admin/v2/users/{user_id}/devices`
 
 ### Delegated auth & OIDC — 19 implemented, 0 planned
 
