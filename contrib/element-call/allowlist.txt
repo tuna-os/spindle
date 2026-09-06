@@ -19,3 +19,18 @@ access.spec.ts :: As a guest, create a call, share link and other join
 access.spec.ts :: Sign up a new account, then login, then logout
 landing.spec.ts :: Landing page
 landing.spec.ts :: has title
+#
+# Recorded on the wide run (workflow run 34015938780, element-call pin
+# a03f23e, chromium): thirteen of thirteen. spa-call-sticky is MatrixRTC
+# 2.0 -- sticky events from #377 driven by the real client -- and its
+# improper-leave case is the kill scenario #41 names; errors covers the
+# JWT failure paths; the reconnect pair covers an SFU going away.
+create-call.spec.ts :: BugFix: When unmuting in lobby, you had to click twice to unmute in call
+create-call.spec.ts :: Start a new call then leave and show the feedback screen
+errors.spec.ts :: Should automatically retry non fatal JWT errors
+errors.spec.ts :: Should show error screen if call creation is restricted
+errors.spec.ts :: Should show error screen if fails to get JWT token
+reconnect.spec.ts :: can only interact with header and footer while reconnecting
+sfu-reconnect-bug.spec.ts :: When creator left, avoid reconnect to the same SFU
+spa-call-sticky.spec.ts :: One to One call using matrix rtc 2.0 aka sticky events
+spa-call-sticky.spec.ts :: One to One rejoin after improper leave does not crash EC

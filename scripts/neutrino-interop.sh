@@ -170,7 +170,7 @@ FEAT="$(curl -s "$N/_matrix/client/versions" | python3 -c 'import sys,json;f=jso
 row "mesh node advertises msc4140 / msc4143 / msc4354" \
   "$(echo "$FEAT" | grep -q 'msc4140\|msc4143\|msc4354' && echo some || echo none)" "unstable_features: $(echo "$FEAT" | head -c 80)"
 CODE="$(curl -s -o /dev/null -w '%{http_code}' "$N/_matrix/client/v1/rtc/transports")"
-row "mesh node serves /rtc/transports (MSC4143)" "$CODE" "a client on the mesh finds no SFU through the node"
+row "mesh node serves /rtc/transports (MSC4143)" "$CODE" "$([ "$CODE" = 200 ] && echo "a client on the mesh finds the SFU through the node" || echo "a client on the mesh finds no SFU through the node")"
 CODE="$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$N/_matrix/client/v3/rooms/$ROOM/send/m.room.message/d0?org.matrix.msc4140.delay=60000" \
   -H 'content-type: application/json' -d '{"msgtype":"m.text","body":"never"}')"
 DELAYED="$(curl -s "$N/_matrix/client/v3/rooms/$ROOM/messages?dir=b&limit=5" | grep -c '"never"' || true)"
@@ -216,6 +216,22 @@ for _ in $(seq 1 60); do
   [ "$D" != "0" ] && break; sleep 0.25
 done
 row "alice's delayed event fires and reaches the node" "$([ "$D" != "0" ] && echo delivered || echo missing)" "MSC4140 on Spindle; the node needs nothing"
+
+# And the other way: the mesh user's delayed departure fires on the node
+# without its client and reaches Spindle. Restarted once first, as a
+# heartbeat would, so a restart that shortened the delay would show.
+OUT="$(curl -s -X PUT "$N/_matrix/client/v3/rooms/$ROOM/send/m.room.message/d2?org.matrix.msc4140.delay=1500" \
+  -H 'content-type: application/json' -d '{"msgtype":"m.text","body":"mesh delay fired"}')"
+DID="$(echo "$OUT" | json delay_id)"
+curl -s -X POST "$N/_matrix/client/unstable/org.matrix.msc4140/delayed_events/$DID" \
+  -H 'content-type: application/json' -d '{"action":"restart"}' >/dev/null
+EARLY="$(curl -s "$S/_matrix/client/v3/rooms/$ROOM/messages?dir=b&limit=20" -H "authorization: Bearer $TOK" | grep -c 'mesh delay fired' || true)"
+for _ in $(seq 1 60); do
+  D="$(curl -s "$S/_matrix/client/v3/rooms/$ROOM/messages?dir=b&limit=20" -H "authorization: Bearer $TOK" | grep -c 'mesh delay fired' || true)"
+  [ "$D" != "0" ] && break; sleep 0.25
+done
+row "the mesh user's delayed event fires on the node and reaches Spindle" \
+  "$([ "$D" != "0" ] && [ "$EARLY" = "0" ] && echo delivered || echo "early=$EARLY delivered=$D")" "delay_id ${DID:-none}; restarted once, then fired without the client"
 
 # 2d. Alice accepts the mesh node's invite: Spindle joins the mesh room,
 # seeded from the node's state DAG, and a message crosses back.
