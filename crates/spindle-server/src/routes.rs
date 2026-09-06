@@ -86,7 +86,7 @@ pub const MOUNTED: &[&str] = &[
 /// of them short enough to read at a glance, which a single chain of forty
 /// routes had stopped being.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let routes = Router::new()
         .merge(account_routes())
         .merge(push_routes())
         .merge(appservice_routes())
@@ -108,7 +108,48 @@ pub fn router(state: AppState) -> Router {
         .fallback(unknown_endpoint)
         .layer(axum::middleware::from_fn(cors))
         .layer(axum::middleware::from_fn_with_state(state.clone(), observe))
-        .with_state(state)
+        .with_state(state);
+    // The prefix rewrite has to run *before* routing, and a layer on a
+    // router runs after it, so the router sits behind the rewrite as the
+    // only service of an outer one.
+    Router::new().fallback_service(tower::Layer::layer(
+        &axum::middleware::map_request(legacy_prefix),
+        routes,
+    ))
+}
+
+/// Serve the `r0` client and media API prefixes as the `v3` ones.
+///
+/// `r0` is what every client built before spec v1.1 (late 2021) asks for,
+/// and what matrix-js-sdk kept asking for on some endpoints for two years
+/// after -- Element Call's full-mesh branch, the peer-to-peer call client
+/// (contrib/element-call-full-mesh), registers at `/r0/register` and gets
+/// `M_UNRECOGNIZED` from a server that answers only `v3`. The spec has
+/// deprecated `r0` but every homeserver in the wild still serves it, and
+/// a client that speaks it is refused for no reason a user could act on.
+/// The paths are the same endpoints; only the prefix moved.
+async fn legacy_prefix(mut request: axum::extract::Request) -> axum::extract::Request {
+    const REWRITES: [(&str, &str); 2] = [
+        ("/_matrix/client/r0/", "/_matrix/client/v3/"),
+        ("/_matrix/media/r0/", "/_matrix/media/v3/"),
+    ];
+    let path = request.uri().path();
+    let Some((from, to)) = REWRITES.iter().find(|(from, _)| path.starts_with(from)) else {
+        return request;
+    };
+    let rewritten = format!("{to}{}", &path[from.len()..]);
+    let mut parts = request.uri().clone().into_parts();
+    let with_query = match request.uri().query() {
+        Some(query) => format!("{rewritten}?{query}"),
+        None => rewritten,
+    };
+    if let Ok(path_and_query) = with_query.parse() {
+        parts.path_and_query = Some(path_and_query);
+        if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+            *request.uri_mut() = uri;
+        }
+    }
+    request
 }
 
 /// Time every request and count it, by the route the router matched.

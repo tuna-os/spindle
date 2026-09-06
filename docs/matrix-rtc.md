@@ -164,6 +164,12 @@ override; `spindle.toml` and `spindle-othersite.toml` stand in for
 the same ratchet shape as Complement's. The `element-call-e2e` job in
 `.github/workflows/compliance.yml` runs it nightly and on demand.
 
+## Calls with no SFU
+
+A room of a handful of people can call peer to peer, full mesh, with no
+media server in the path; that is a different client build and its own
+page, docs/p2p-calls.md, with the rig that proves it against this server.
+
 ## What is not here
 
 - **Remote users on the built-in service.** MSC4195's current draft adds
@@ -171,7 +177,4 @@ the same ratchet shape as Complement's. The `element-call-e2e` job in
   speak it, a federated caller needs the external service.
 - **MSC4195's homeserver token endpoint**
   (`/_matrix/client/v1/rtc/livekit/get_token`). Shipping clients post to
-  `/sfu/get`; the homeserver endpoint is added when they move, with the
-  same minting behind it.
-- **The SFU and the relay themselves.** Their own documentation covers
-  them; this server never speaks to either.
+  `/sfu/get`; the homeserver

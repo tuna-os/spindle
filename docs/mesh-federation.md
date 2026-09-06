@@ -134,6 +134,15 @@ membership. MSC4354 is the smaller gap: the node already keeps the key on
 the PDU, so what is missing is the index and the `/sync` section, and
 `msc4354` on the versions list.
 
+And the call that needs no SFU at all: a full-mesh call, media straight
+between the browsers, signalled over to-device messages and
+`org.matrix.msc3401.call.member` state. docs/p2p-calls.md proves it
+against this server with Element Call's full-mesh build, two browsers on
+a host-to-host candidate pair. Every piece it rides is in the tables
+above as crossing the seam, so a full-mesh call between a Spindle
+participant and a mesh-node participant has nothing in its way at the
+protocol level; driving one across the seam is the next measurement.
+
 ## Encryption: session rooms in the clear, everything else encrypted
 
 The policy is the app's: a session room, a hall room, the announcements
