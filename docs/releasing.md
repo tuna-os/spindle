@@ -4,16 +4,35 @@ ROADMAP.md is the contract: what a `v0.0.x` tag promises (nothing beyond
 addressability) and what `v0.1.0` has to show first. This page is the
 mechanics.
 
-## Cutting a tag
+## When a tag is cut
 
-A tag is a decision for a person, and one command:
+`.github/workflows/release.yml` cuts tags itself. Every Monday at 06:17
+UTC it looks at `main` and, if both of the following hold, tags the
+commit with the next patch number (`v0.0.1`, `v0.0.2`, ...) and releases
+it in the same run:
+
+- `main` has moved since the last `v*` tag. A week with nothing merged
+  produces nothing: a tag names a build, and the same build does not need
+  two names.
+- CI has finished on that commit and nothing failed. The Rust quality gate
+  must have passed; a nightly-only job that was skipped is fine; a check
+  still running means "not yet", and the next Monday asks again.
+
+The decision is `scripts/release-cut.sh`, which prints what it would do
+when run from a checkout of `main`; the workflow's `dry_run` input runs
+only that. Between Mondays, `workflow_dispatch` cuts one on demand, and
+`bump: minor` starts a new line (`v0.1.0`) when ROADMAP.md's evidence for
+it exists. Only one release runs at a time, so a dispatch during the
+Monday run waits rather than racing it for the number.
+
+A tag pushed by hand still works, and goes through the same build jobs:
 
 ```sh
 git tag -a v0.0.1 -m "v0.0.1: an addressable prerelease" origin/main
 git push origin v0.0.1
 ```
 
-`.github/workflows/release.yml` does the rest on the push of any `v*` tag:
+Either way the run then:
 
 - builds `spindle` for `x86_64-unknown-linux-gnu` and
   `aarch64-unknown-linux-gnu` from the tagged tree with `--locked`, and
@@ -27,8 +46,13 @@ git push origin v0.0.1
   Sigstore, tied to the workflow's own identity; the image attestations
   are pushed to the registry beside the images;
 - creates the GitHub release with the tarballs, the checksums, the SBOMs
-  and notes that say what the tag is, marked a prerelease for every
+  and notes that say what the tag is, followed by the titles of the pull
+  requests merged since the previous tag, marked a prerelease for every
   `v0.*` tag.
+
+The crate version in `Cargo.toml` is not the release version and is not
+bumped by a release; the tag is the name, and the binary carries the
+commit it was built from.
 
 Nothing is published under `latest`. A tag names a build; the next tag
 names the next one.

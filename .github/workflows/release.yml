@@ -9,13 +9,38 @@ name: Release
 # the file name; the SBOM says what is inside it.
 # ROADMAP.md is the contract for what a tag means; v0.0.x is a prerelease
 # that promises nothing, and this workflow marks every v0.* tag as one.
-# Cutting the tag is a decision for a person:
 #
-#   git tag -a v0.0.1 -m "v0.0.1: an addressable prerelease" && git push origin v0.0.1
+# Tags are cut by this workflow, not by hand. Every Monday it looks at
+# `main`: if it has moved since the last tag and CI on that commit is
+# green, the next patch number is tagged and released. `workflow_dispatch`
+# does the same on demand (with `bump: minor` for a new line, or
+# `dry_run` to see what would be cut). A tag pushed by hand still works
+# and goes through the same jobs; a tag this workflow pushes cannot
+# re-trigger it (GitHub does not chain workflows off a token's own push),
+# which is why the build jobs follow the cut in one run.
 
 on:
   push:
     tags: ['v*']
+  schedule:
+    - cron: "17 6 * * 1"   # Mondays, 06:17 UTC, after the upkeep issue is written
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which number to advance from the last tag
+        type: choice
+        options: [patch, minor]
+        default: patch
+      dry_run:
+        description: Decide the tag and stop; push nothing, build nothing
+        type: boolean
+        default: false
+
+# One release at a time: a dispatch during the Monday run would otherwise
+# race it for the same next number.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -30,10 +55,41 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  cut:
+    name: Decide the tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.decide.outputs.tag }}
+      sha: ${{ steps.decide.outputs.sha }}
+      previous: ${{ steps.decide.outputs.previous }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUMP: ${{ inputs.bump || 'patch' }}
+        run: scripts/release-cut.sh
+      - name: Tag
+        if: github.event_name != 'push' && steps.decide.outputs.tag != '' && !inputs.dry_run
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.decide.outputs.tag }}" -m "${{ steps.decide.outputs.tag }}: an addressable prerelease" "${{ steps.decide.outputs.sha }}"
+          git push origin "refs/tags/${{ steps.decide.outputs.tag }}"
+
   binaries:
     name: Build ${{ matrix.target }}
+    needs: cut
+    if: needs.cut.outputs.tag != '' && !inputs.dry_run
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
+    env:
+      TAG: ${{ needs.cut.outputs.tag }}
     strategy:
       matrix:
         include:
@@ -43,6 +99,8 @@ jobs:
             target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.cut.outputs.sha }}
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: 1.90.0
@@ -50,7 +108,7 @@ jobs:
         run: cargo build --release -p spindle-server --bin spindle --locked
       - name: Package
         run: |
-          name="spindle-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="spindle-${TAG}-${{ matrix.target }}"
           mkdir -p "dist/$name"
           cp target/release/spindle LICENSE-MIT LICENSE-APACHE README.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
@@ -86,8 +144,12 @@ jobs:
 
   image:
     name: Image for ${{ matrix.arch }}
+    needs: cut
+    if: needs.cut.outputs.tag != '' && !inputs.dry_run
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
+    env:
+      TAG: ${{ needs.cut.outputs.tag }}
     strategy:
       matrix:
         include:
@@ -97,12 +159,14 @@ jobs:
             arch: arm64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.cut.outputs.sha }}
       - name: Log in to the registry
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: Build and push the per-architecture image
         id: push
         run: |
-          image="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME}-${{ matrix.arch }}"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${TAG}-${{ matrix.arch }}"
           docker build -t "$image" .
           docker push "$image"
           # The digest is the subject of the attestation: a tag can be moved,
@@ -120,11 +184,17 @@ jobs:
 
   publish:
     name: Publish the release
-    needs: [binaries, image]
+    needs: [cut, binaries, image]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      TAG: ${{ needs.cut.outputs.tag }}
+      SHA: ${{ needs.cut.outputs.sha }}
+      PREVIOUS: ${{ needs.cut.outputs.previous }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.cut.outputs.sha }}
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: dist
@@ -134,24 +204,26 @@ jobs:
       - name: Join the per-architecture images under the tag
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
-          docker manifest create "$image:${GITHUB_REF_NAME}" \
-            "$image:${GITHUB_REF_NAME}-amd64" "$image:${GITHUB_REF_NAME}-arm64"
-          docker manifest push "$image:${GITHUB_REF_NAME}"
+          docker manifest create "$image:${TAG}" \
+            "$image:${TAG}-amd64" "$image:${TAG}-arm64"
+          docker manifest push "$image:${TAG}"
       - name: Write the notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           {
-            echo "Built from \`${GITHUB_SHA}\`."
+            echo "Built from \`${SHA}\`."
             echo
-            echo "Image: \`ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME}\` (amd64, arm64)."
+            echo "Image: \`ghcr.io/${GITHUB_REPOSITORY,,}:${TAG}\` (amd64, arm64)."
             echo
             echo "Every tarball and both images carry a Sigstore-signed provenance attestation, and each tarball an SBOM (\`.spdx.json\`) attested to it. To check one came from this workflow on this commit:"
             echo
             echo '```'
-            echo "gh attestation verify spindle-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz --repo ${GITHUB_REPOSITORY}"
-            echo "gh attestation verify oci://ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME} --repo ${GITHUB_REPOSITORY}"
+            echo "gh attestation verify spindle-${TAG}-x86_64-unknown-linux-gnu.tar.gz --repo ${GITHUB_REPOSITORY}"
+            echo "gh attestation verify oci://ghcr.io/${GITHUB_REPOSITORY,,}:${TAG} --repo ${GITHUB_REPOSITORY}"
             echo '```'
             echo
-            case "$GITHUB_REF_NAME" in
+            case "$TAG" in
               v0.0.*)
                 echo "An addressable prerelease, per ROADMAP.md: no upgrade path, no support window, storage format unstable. It exists so that benchmarks, bug reports and security fixes can name a build." ;;
               v0.*)
@@ -161,11 +233,19 @@ jobs:
             echo '```'
             cat dist/*.sha256
             echo '```'
+            # What merged since the previous tag, from the pull request
+            # titles; the first tag has no previous and lists nothing.
+            if [ -n "$PREVIOUS" ]; then
+              echo
+              gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+                -f tag_name="$TAG" -f previous_tag_name="$PREVIOUS" -f target_commitish="$SHA" \
+                --jq .body
+            fi
           } > notes.md
       - name: Create the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           prerelease=""
-          case "$GITHUB_REF_NAME" in v0.*) prerelease="--prerelease" ;; esac
-          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md $prerelease dist/*.tar.gz dist/*.sha256 dist/*.spdx.json
+          case "$TAG" in v0.*) prerelease="--prerelease" ;; esac
+          gh release create "$TAG" --target "$SHA" --title "$TAG" --notes-file notes.md $prerelease dist/*.tar.gz dist/*.sha256 dist/*.spdx.json

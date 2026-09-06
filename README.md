@@ -10,8 +10,9 @@ never runs on the hot path.**
 
 > **Status: an experiment under construction, not a deployment.** The
 > client-server surface is broad and tested, federation interoperates with real
-> Synapse, and nothing here has ever run in production. There is no release, no
-> upgrade path promise, and the storage format has already broken once —
+> Synapse, and nothing here has ever run in production. Releases are weekly
+> `v0.0.x` prereleases that name a build and promise nothing else: no
+> upgrade path, and the storage format has already broken once —
 > deliberately, with the [test that caught it](crates/spindle-store/tests/backend_compatibility.rs)
 > kept and inverted rather than deleted.
 
