@@ -377,6 +377,11 @@ pub enum Keyspace {
     /// it. The device's keys and queue live in the device keyspaces like
     /// any other device's.
     DehydratedDevice = 0x36,
+    /// `(user_id, event_id)` -> `(device_id, txn_id)`: the inverse of
+    /// [`Keyspace::Transaction`], so an event can be handed back to the
+    /// device that sent it with the `unsigned.transaction_id` the spec
+    /// promises that device, and no other.
+    TransactionEcho = 0x37,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -849,6 +854,36 @@ pub fn media_id(key: &[u8]) -> Option<String> {
     let rest = key.strip_prefix(media_all().as_slice())?;
     let len = usize::from(u16::from_be_bytes(rest.get(..2)?.try_into().ok()?));
     String::from_utf8(rest.get(2..2 + len)?.to_vec()).ok()
+}
+
+/// The echo row for one event: which user's event, so the sender's own
+/// reads can look it up by the ID alone.
+#[must_use]
+pub fn transaction_echo(user_id: &str, event_id: &str) -> Vec<u8> {
+    let mut key = user_prefix(Keyspace::TransactionEcho, user_id);
+    key.extend_from_slice(event_id.as_bytes());
+    key
+}
+
+/// The value of a [`transaction_echo`] row: the device, length-prefixed,
+/// then the transaction ID it chose.
+#[must_use]
+pub fn transaction_echo_value(device_id: &str, txn_id: &str) -> Vec<u8> {
+    let (len, device) = framed(device_id.as_bytes());
+    let mut value = Vec::with_capacity(2 + device.len() + txn_id.len());
+    value.extend_from_slice(&len.to_be_bytes());
+    value.extend_from_slice(device);
+    value.extend_from_slice(txn_id.as_bytes());
+    value
+}
+
+/// Read a [`transaction_echo_value`] back: `(device_id, txn_id)`.
+#[must_use]
+pub fn transaction_echo_parts(value: &[u8]) -> Option<(String, String)> {
+    let len = usize::from(u16::from_be_bytes(value.get(..2)?.try_into().ok()?));
+    let device = String::from_utf8(value.get(2..2 + len)?.to_vec()).ok()?;
+    let txn = String::from_utf8(value.get(2 + len..)?.to_vec()).ok()?;
+    Some((device, txn))
 }
 
 /// One transaction's key: who sent it, from which device, under what name.
