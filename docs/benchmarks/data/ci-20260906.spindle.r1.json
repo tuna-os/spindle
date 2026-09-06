@@ -2,166 +2,166 @@
   "base_url": "http://127.0.0.1:8099",
   "benchmarks": {
     "context_deep/200": {
-      "lower_ns": 573625.0,
-      "mean_ns": 599503.0,
+      "lower_ns": 591861.0,
+      "mean_ns": 622229.0,
       "samples": 25,
-      "upper_ns": 663806.0
+      "upper_ns": 669456.0
     },
     "context_deep/3200": {
-      "lower_ns": 621163.0,
-      "mean_ns": 673801.0,
+      "lower_ns": 625243.0,
+      "mean_ns": 668845.0,
       "samples": 25,
-      "upper_ns": 1355929.0
+      "upper_ns": 768090.0
     },
     "context_deep/800": {
-      "lower_ns": 589485.0,
-      "mean_ns": 615573.0,
+      "lower_ns": 637416.0,
+      "mean_ns": 684304.0,
       "samples": 25,
-      "upper_ns": 660087.0
+      "upper_ns": 878194.0
     },
     "join/200": {
-      "lower_ns": 658373.0,
-      "mean_ns": 926736.0,
+      "lower_ns": 647305.0,
+      "mean_ns": 923959.0,
       "samples": 25,
-      "upper_ns": 1157719.0
+      "upper_ns": 1096701.0
     },
     "join/3200": {
-      "lower_ns": 623467.0,
-      "mean_ns": 908851.0,
+      "lower_ns": 667773.0,
+      "mean_ns": 950629.0,
       "samples": 25,
-      "upper_ns": 1151927.0
+      "upper_ns": 1185897.0
     },
     "join/800": {
-      "lower_ns": 609681.0,
-      "mean_ns": 905966.0,
+      "lower_ns": 651383.0,
+      "mean_ns": 946040.0,
       "samples": 25,
-      "upper_ns": 1135677.0
+      "upper_ns": 3933311.0
     },
     "messages_page/200": {
-      "lower_ns": 677720.0,
-      "mean_ns": 708808.0,
+      "lower_ns": 689984.0,
+      "mean_ns": 728817.0,
       "samples": 25,
-      "upper_ns": 756577.0
+      "upper_ns": 907479.0
     },
     "messages_page/3200": {
-      "lower_ns": 659144.0,
-      "mean_ns": 687217.0,
+      "lower_ns": 688502.0,
+      "mean_ns": 730280.0,
       "samples": 25,
-      "upper_ns": 737581.0
+      "upper_ns": 769122.0
     },
     "messages_page/800": {
-      "lower_ns": 679022.0,
-      "mean_ns": 725259.0,
+      "lower_ns": 691507.0,
+      "mean_ns": 721173.0,
       "samples": 25,
-      "upper_ns": 1247697.0
+      "upper_ns": 797765.0
     },
     "send/200": {
-      "lower_ns": 625432.0,
-      "mean_ns": 673582.0,
+      "lower_ns": 649458.0,
+      "mean_ns": 726031.0,
       "samples": 25,
-      "upper_ns": 1043174.0
+      "upper_ns": 1019297.0
     },
     "send/3200": {
-      "lower_ns": 604001.0,
-      "mean_ns": 669864.0,
+      "lower_ns": 654248.0,
+      "mean_ns": 714170.0,
       "samples": 25,
-      "upper_ns": 1036350.0
+      "upper_ns": 1288999.0
     },
     "send/800": {
-      "lower_ns": 643896.0,
-      "mean_ns": 684522.0,
+      "lower_ns": 622869.0,
+      "mean_ns": 803235.0,
       "samples": 25,
-      "upper_ns": 1033747.0
+      "upper_ns": 5278755.0
     },
     "sliding_window/200": {
-      "lower_ns": 481613.0,
-      "mean_ns": 499706.0,
+      "lower_ns": 494550.0,
+      "mean_ns": 508787.0,
       "samples": 25,
-      "upper_ns": 530023.0
+      "upper_ns": 545966.0
     },
     "sliding_window/3200": {
-      "lower_ns": 465772.0,
-      "mean_ns": 488765.0,
+      "lower_ns": 484482.0,
+      "mean_ns": 516271.0,
       "samples": 25,
-      "upper_ns": 533799.0
+      "upper_ns": 594778.0
     },
     "sliding_window/800": {
-      "lower_ns": 458900.0,
-      "mean_ns": 489948.0,
+      "lower_ns": 485934.0,
+      "mean_ns": 521751.0,
       "samples": 25,
-      "upper_ns": 519473.0
+      "upper_ns": 654338.0
     },
     "state/200": {
-      "lower_ns": 359634.0,
-      "mean_ns": 379992.0,
+      "lower_ns": 375950.0,
+      "mean_ns": 401468.0,
       "samples": 25,
-      "upper_ns": 406331.0
+      "upper_ns": 454406.0
     },
     "state/3200": {
-      "lower_ns": 360135.0,
-      "mean_ns": 372608.0,
+      "lower_ns": 370841.0,
+      "mean_ns": 422486.0,
       "samples": 25,
-      "upper_ns": 410358.0
+      "upper_ns": 998398.0
     },
     "state/800": {
-      "lower_ns": 355857.0,
-      "mean_ns": 368500.0,
+      "lower_ns": 367424.0,
+      "mean_ns": 394164.0,
       "samples": 25,
-      "upper_ns": 416039.0
+      "upper_ns": 436493.0
     },
     "sync_delta/200": {
-      "lower_ns": 783408.0,
-      "mean_ns": 817331.0,
+      "lower_ns": 807914.0,
+      "mean_ns": 859179.0,
       "samples": 25,
-      "upper_ns": 869610.0
+      "upper_ns": 908321.0
     },
     "sync_delta/3200": {
-      "lower_ns": 806851.0,
-      "mean_ns": 832359.0,
+      "lower_ns": 864228.0,
+      "mean_ns": 901858.0,
       "samples": 25,
-      "upper_ns": 994846.0
+      "upper_ns": 1118041.0
     },
     "sync_delta/800": {
-      "lower_ns": 795059.0,
-      "mean_ns": 843640.0,
+      "lower_ns": 861873.0,
+      "mean_ns": 894825.0,
       "samples": 25,
-      "upper_ns": 914553.0
+      "upper_ns": 989051.0
     },
     "sync_initial/200": {
-      "lower_ns": 951523.0,
-      "mean_ns": 976319.0,
+      "lower_ns": 1008948.0,
+      "mean_ns": 1030868.0,
       "samples": 25,
-      "upper_ns": 1049677.0
+      "upper_ns": 1115977.0
     },
     "sync_initial/3200": {
-      "lower_ns": 989783.0,
-      "mean_ns": 1020210.0,
+      "lower_ns": 1024768.0,
+      "mean_ns": 1056446.0,
       "samples": 25,
-      "upper_ns": 1199576.0
+      "upper_ns": 1293047.0
     },
     "sync_initial/800": {
-      "lower_ns": 934650.0,
-      "mean_ns": 968944.0,
+      "lower_ns": 1013777.0,
+      "mean_ns": 1041609.0,
       "samples": 25,
-      "upper_ns": 999832.0
+      "upper_ns": 1352036.0
     },
     "sync_poll/200": {
-      "lower_ns": 519874.0,
-      "mean_ns": 549359.0,
+      "lower_ns": 559712.0,
+      "mean_ns": 596640.0,
       "samples": 25,
-      "upper_ns": 591619.0
+      "upper_ns": 635592.0
     },
     "sync_poll/3200": {
-      "lower_ns": 535222.0,
-      "mean_ns": 568945.0,
+      "lower_ns": 575842.0,
+      "mean_ns": 614384.0,
       "samples": 25,
-      "upper_ns": 598290.0
+      "upper_ns": 728977.0
     },
     "sync_poll/800": {
-      "lower_ns": 525554.0,
-      "mean_ns": 541143.0,
+      "lower_ns": 548010.0,
+      "mean_ns": 594757.0,
       "samples": 25,
-      "upper_ns": 574175.0
+      "upper_ns": 712065.0
     }
   },
   "clients": null,
