@@ -843,3 +843,82 @@ async fn the_typing_extension_says_who_is_typing() {
         "{response}"
     );
 }
+
+#[tokio::test]
+async fn a_room_entry_carries_what_a_row_is_drawn_from() {
+    // MSC4186 sends, beside the counts, what a room-list row needs when the
+    // room has no name: the members' own names and avatars (`heroes`), the
+    // room avatar, who is invited, and a recency stamp comparable across
+    // rooms. Without them a client asks for every member's state to label
+    // a direct chat, and sorts its list by a timeline it did not want.
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let carol = harness.register("carol").await;
+    let (status, body) = harness
+        .request(
+            "PUT",
+            "/_matrix/client/v3/profile/@bob:example.org/displayname",
+            &bob,
+            &json!({ "displayname": "Bob" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness
+        .request("POST", "/_matrix/client/v3/createRoom", &alice, &json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    harness.invite(&room, &alice, "bob").await;
+    harness.join(&room, &bob).await;
+    harness.invite(&room, &alice, "carol").await;
+    let (status, body) = harness
+        .request(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.avatar/"),
+            &alice,
+            &json!({ "url": "mxc://example.org/room" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let response = harness.sliding(&alice, None, &window()).await;
+    let entry = &response["rooms"][&room];
+    assert_eq!(entry["joined_count"], json!(2), "{entry}");
+    assert_eq!(entry["invited_count"], json!(1), "{entry}");
+    assert_eq!(entry["avatar"], json!("mxc://example.org/room"), "{entry}");
+    // Heroes leave the viewer out and come joined first, then invited,
+    // with the name the member event carries.
+    let heroes = entry["heroes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{entry}"));
+    let ids: Vec<&str> = heroes
+        .iter()
+        .filter_map(|hero| hero["user_id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["@bob:example.org", "@carol:example.org"],
+        "{entry}"
+    );
+    assert_eq!(heroes[0]["name"], json!("Bob"), "{entry}");
+    assert!(
+        heroes[1].get("name").is_none(),
+        "carol never set one: {entry}"
+    );
+
+    // The bump stamp is the newest event's timestamp, so it moves when the
+    // room does and orders rooms without a timeline in the response.
+    let before = entry["bump_stamp"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("{entry}"));
+    let newest = entry["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["origin_server_ts"].as_i64())
+        .max()
+        .unwrap();
+    assert_eq!(before, newest, "{entry}");
+    drop(carol);
+}

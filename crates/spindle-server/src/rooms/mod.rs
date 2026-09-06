@@ -106,7 +106,36 @@ pub enum StateBlock {
 }
 
 /// A room's joined user IDs, with the state root they were read from.
-type MemberIds = ([u8; 32], Arc<Vec<String>>);
+type MemberIds = ([u8; 32], Arc<Roster>);
+
+/// Who is in a room and who is asked in, read once per state root.
+///
+/// One pass over the member bodies serves three askers: the joined IDs
+/// (sliding sync's `joined_count`, the appservice fan-out, push), the
+/// invited IDs (`invited_count`), and the first few members with the name
+/// and avatar their member event carries, which is what MSC4186's
+/// `heroes` are made of. Reading the bodies again per asker was the cost
+/// the cache exists to avoid, so the second and third answers ride the
+/// first read.
+#[derive(Debug, Default)]
+pub struct Roster {
+    pub joined: Arc<Vec<String>>,
+    pub invited: Arc<Vec<String>>,
+    /// Up to six members, joined first then invited, in state order: one
+    /// more than the five heroes a room shows, so the viewer can be left
+    /// out and five remain.
+    pub heroes: Vec<Hero>,
+}
+
+/// One member as a room-list row shows them: the name and avatar from
+/// their own member event, not their global profile, because that is what
+/// they chose to be called in this room.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hero {
+    pub user_id: String,
+    pub displayname: Option<String>,
+    pub avatar_url: Option<String>,
+}
 /// Remote domains to fan out to, and the state root they were read from.
 type Destinations = ([u8; 32], Arc<Vec<String>>);
 
@@ -1551,6 +1580,16 @@ impl Rooms {
     ///
     /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
     pub fn joined_member_ids(&self, room_id: &str) -> Result<Arc<Vec<String>>, RoomError> {
+        Ok(Arc::clone(&self.roster(room_id)?.joined))
+    }
+
+    /// Who is joined, who is invited, and the first few of them with a
+    /// name and an avatar -- see [`Roster`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
+    pub fn roster(&self, room_id: &str) -> Result<Arc<Roster>, RoomError> {
         let (root, members) = self.with_room_read(room_id, |_, log| {
             let root = log
                 .entries()
@@ -1566,33 +1605,59 @@ impl Rooms {
             Ok((root, members))
         })?;
         let Some(root) = root else {
-            return Ok(Arc::new(Vec::new()));
+            return Ok(Arc::new(Roster::default()));
         };
-        if let Some((cached_root, ids)) = self
+        if let Some((cached_root, roster)) = self
             .member_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(room_id)
             && *cached_root == root
         {
-            return Ok(Arc::clone(ids));
+            return Ok(Arc::clone(roster));
         }
-        let mut ids = Vec::new();
+        let mut joined = Vec::new();
+        let mut invited = Vec::new();
+        let mut invited_heroes = Vec::new();
+        let mut heroes = Vec::new();
         for (user_id, event_id) in members {
             // `read_event`, not `event`: the room's existence is already
             // established above, and `event` re-proves it under the room
             // lock once per member.
             let event = self.read_event(room_id, &EventId::new(event_id.as_str()))?;
-            if event["content"]["membership"].as_str() == Some(JOIN_STR) {
-                ids.push(user_id);
+            let hero = || Hero {
+                user_id: user_id.clone(),
+                displayname: event["content"]["displayname"].as_str().map(str::to_owned),
+                avatar_url: event["content"]["avatar_url"].as_str().map(str::to_owned),
+            };
+            match event["content"]["membership"].as_str() {
+                Some(JOIN_STR) => {
+                    if heroes.len() < 6 {
+                        heroes.push(hero());
+                    }
+                    joined.push(user_id);
+                }
+                Some(INVITE_STR) => {
+                    if invited_heroes.len() < 6 {
+                        invited_heroes.push(hero());
+                    }
+                    invited.push(user_id);
+                }
+                _ => {}
             }
         }
-        let ids = Arc::new(ids);
+        heroes.extend(invited_heroes);
+        heroes.truncate(6);
+        let roster = Arc::new(Roster {
+            joined: Arc::new(joined),
+            invited: Arc::new(invited),
+            heroes,
+        });
         self.member_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(room_id.to_owned(), (root, Arc::clone(&ids)));
-        Ok(ids)
+            .insert(room_id.to_owned(), (root, Arc::clone(&roster)));
+        Ok(roster)
     }
 
     /// Set a state event.

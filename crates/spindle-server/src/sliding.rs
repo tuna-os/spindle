@@ -172,6 +172,29 @@ pub fn wants_state(
     })
 }
 
+/// MSC4186 `heroes`: up to five members other than `viewer`, each as
+/// `{user_id, name?, avatar?}` from their own member event. Six candidates
+/// come in so that leaving the viewer out still leaves five.
+#[must_use]
+pub fn heroes(candidates: &[crate::rooms::Hero], viewer: &str) -> Vec<Value> {
+    candidates
+        .iter()
+        .filter(|hero| hero.user_id != viewer)
+        .take(5)
+        .map(|hero| {
+            let mut entry = Map::new();
+            entry.insert("user_id".to_owned(), json!(hero.user_id));
+            if let Some(name) = &hero.displayname {
+                entry.insert("name".to_owned(), json!(name));
+            }
+            if let Some(avatar) = &hero.avatar_url {
+                entry.insert("avatar".to_owned(), json!(avatar));
+            }
+            Value::Object(entry)
+        })
+        .collect()
+}
+
 /// Clip `ranges` to a list of `len` rooms, yielding the indices in view.
 ///
 /// Ranges are inclusive on both ends, as the MSC writes them. Out-of-bounds
@@ -211,27 +234,48 @@ pub struct Timeline {
     pub prev_batch: Option<String>,
 }
 
+/// What a room-list row is drawn from when the room has no name: the
+/// members' own names and avatars, the room's avatar, and who is invited.
+/// MSC4186 sends these beside the counts so a client need not ask for every
+/// member's state to label a direct chat.
+pub struct Summary {
+    pub name: Option<String>,
+    pub avatar: Option<String>,
+    pub joined_count: usize,
+    pub invited_count: usize,
+    /// Up to five members other than the viewer, joined first.
+    pub heroes: Vec<Value>,
+    /// The room's recency, comparable across rooms: the timestamp of its
+    /// newest event. A client sorts its list by this without a timeline.
+    pub bump_stamp: i64,
+}
+
 /// The `rooms` entry for one room, from the pieces the caller fetched.
 #[must_use]
 pub fn room_entry(
-    name: Option<String>,
+    summary: Summary,
     required_state: Vec<Value>,
     timeline: Timeline,
-    joined_count: usize,
     unread: Counts,
     initial: bool,
 ) -> Value {
     let mut entry = Map::new();
-    if let Some(name) = name {
+    if let Some(name) = summary.name {
         entry.insert("name".to_owned(), json!(name));
     }
+    if let Some(avatar) = summary.avatar {
+        entry.insert("avatar".to_owned(), json!(avatar));
+    }
+    entry.insert("heroes".to_owned(), Value::Array(summary.heroes));
+    entry.insert("invited_count".to_owned(), json!(summary.invited_count));
+    entry.insert("bump_stamp".to_owned(), json!(summary.bump_stamp));
     entry.insert("required_state".to_owned(), Value::Array(required_state));
     entry.insert("timeline".to_owned(), Value::Array(timeline.events));
     entry.insert("limited".to_owned(), json!(timeline.limited));
     if let Some(prev_batch) = timeline.prev_batch {
         entry.insert("prev_batch".to_owned(), json!(prev_batch));
     }
-    entry.insert("joined_count".to_owned(), json!(joined_count));
+    entry.insert("joined_count".to_owned(), json!(summary.joined_count));
     entry.insert(
         "notification_count".to_owned(),
         json!(unread.notification_count),
