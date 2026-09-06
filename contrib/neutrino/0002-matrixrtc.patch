@@ -1,0 +1,534 @@
+From 11afefb736432bb9b7dcdf8a26c1b21a2e0f66d3 Mon Sep 17 00:00:00 2001
+From: Spindle rig <spindle@localhost>
+Date: Sun, 6 Sep 2026 06:22:23 +0000
+Subject: [PATCH] Serve MatrixRTC transports (MSC4143) and delayed events
+ (MSC4140)
+
+A call client checks unstable_features for both before it will place a
+call, and a mesh node served neither: a client that trusted the 200 from
+a plain send removed itself from the call at once, and Element Call did
+not schedule the departure at all and left the ghost.
+
+- GET /_matrix/client/v1/rtc/transports (and the MSC4143 unstable path)
+  answers the LiveKit JWT services named in NEUTRINO_RTC_LIVEKIT_URL,
+  comma separated; empty is a working configuration
+- org.matrix.msc4140.delay on /send and /state holds the event, with
+  list, send, cancel and restart under the MSC4140 unstable prefix;
+  restart re-applies the whole original delay, which is what makes it a
+  heartbeat; the send is authorised by the room actor when it fires, not
+  when it is scheduled; a day is the longest delay and a thousand the
+  most one user may hold
+- both advertised on /versions
+
+Delays are kept in memory: a restart drops them, and rtc.rs says why
+that is the accepted trade on a phone and what the next step is.
+---
+ .../src/federation/query_directory.rs         |   5 +-
+ crates/neutrino-http/src/lib.rs               |  66 +++-
+ crates/neutrino-http/src/rtc.rs               | 355 ++++++++++++++++++
+ 3 files changed, 415 insertions(+), 11 deletions(-)
+ create mode 100644 crates/neutrino-http/src/rtc.rs
+
+diff --git a/crates/neutrino-http/src/federation/query_directory.rs b/crates/neutrino-http/src/federation/query_directory.rs
+index 300a1d5..fd7e229 100644
+--- a/crates/neutrino-http/src/federation/query_directory.rs
++++ b/crates/neutrino-http/src/federation/query_directory.rs
+@@ -100,7 +100,10 @@ mod tests {
+         assert_eq!(alias_domain("#s:example.org"), Some("example.org"));
+         // A mesh node id: 64 hex, no colon.
+         let node = "0".repeat(64);
+-        assert_eq!(alias_domain(&format!("#s:{node}")).map(str::to_owned), Some(node));
++        assert_eq!(
++            alias_domain(&format!("#s:{node}")).map(str::to_owned),
++            Some(node)
++        );
+     }
+ 
+     #[test]
+diff --git a/crates/neutrino-http/src/lib.rs b/crates/neutrino-http/src/lib.rs
+index 24bae80..584c771 100644
+--- a/crates/neutrino-http/src/lib.rs
++++ b/crates/neutrino-http/src/lib.rs
+@@ -45,6 +45,7 @@ mod media;
+ mod membership;
+ mod messages;
+ mod redactions;
++mod rtc;
+ mod sliding_sync;
+ 
+ #[cfg(feature = "multi-user-shim")]
+@@ -112,6 +113,8 @@ struct App {
+     /// locally-authored events, and the room versions this build speaks.
+     policy: EventPolicy,
+     config: Config,
++    /// MatrixRTC: transports and pending delayed events. See [`rtc`].
++    rtc: Arc<rtc::RtcState>,
+     /// Latching cancellation signal shared with long-polls and the outbound
+     /// federation sender. Fired once by [`AppState::begin_shutdown`]; after
+     /// that, every `cancelled().await` on any clone resolves immediately.
+@@ -390,6 +393,7 @@ impl AppState {
+             display_name_tx: None,
+             policy,
+             config,
++            rtc: Arc::new(rtc::RtcState::from_env()),
+             shutdown,
+             kick_backoff,
+             joins: HashMap::new(),
+@@ -845,6 +849,19 @@ fn build_router(state: &AppState) -> Router {
+         )
+         .route("/_matrix/client/v3/pushers/set", post(pushers_set))
+         .route("/_matrix/client/v3/capabilities", get(get_capabilities))
++        .route("/_matrix/client/v1/rtc/transports", get(rtc::transports))
++        .route(
++            "/_matrix/client/unstable/org.matrix.msc4143/rtc/transports",
++            get(rtc::transports),
++        )
++        .route(
++            "/_matrix/client/unstable/org.matrix.msc4140/delayed_events",
++            get(rtc::list),
++        )
++        .route(
++            "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}",
++            post(rtc::act),
++        )
+         .route(
+             "/_matrix/federation/v1/get_missing_events/{room_id}",
+             post(federation::get_missing_events::handle),
+@@ -1009,6 +1026,8 @@ async fn versions() -> Json<Value> {
+         "unstable_features": {
+             "org.matrix.simplified_msc3575": true,
+             "org.matrix.msc4222": true,
++            "org.matrix.msc4140": true,
++            "org.matrix.msc4143": true,
+         },
+         "versions": ["v1.16"]
+     }))
+@@ -2626,9 +2645,17 @@ async fn put_event(
+         String,
+         String,
+     )>,
++    params: rtc::Params,
+     body: Json<Value>,
+ ) -> axum::response::Response {
+-    send_via_actor(&state.0, sender, room_id, event_type, None, body.0).await
++    // MSC4140: a send with a delay is held, not sent.
++    match rtc::requested_delay(&params.0) {
++        Err(response) => response,
++        Ok(Some(delay)) => {
++            rtc::schedule(&state.0, sender, room_id, event_type, None, body.0, delay).await
++        }
++        Ok(None) => send_via_actor(&state.0, sender, room_id, event_type, None, body.0).await,
++    }
+ }
+ 
+ /// The servers, other than ours, that have a joined member in `room`: where
+@@ -2848,17 +2875,36 @@ async fn put_state(
+         String,
+         String,
+     )>,
++    params: rtc::Params,
+     body: Json<Value>,
+ ) -> axum::response::Response {
+-    send_via_actor(
+-        &state.0,
+-        sender,
+-        room_id,
+-        event_type,
+-        Some(state_key),
+-        body.0,
+-    )
+-    .await
++    // MSC4140: the delayed state event is the MatrixRTC departure itself.
++    match rtc::requested_delay(&params.0) {
++        Err(response) => response,
++        Ok(Some(delay)) => {
++            rtc::schedule(
++                &state.0,
++                sender,
++                room_id,
++                event_type,
++                Some(state_key),
++                body.0,
++                delay,
++            )
++            .await
++        }
++        Ok(None) => {
++            send_via_actor(
++                &state.0,
++                sender,
++                room_id,
++                event_type,
++                Some(state_key),
++                body.0,
++            )
++            .await
++        }
++    }
+ }
+ 
+ /// `PUT /rooms/{room}/state/{type}` — a state event with the empty state key
+diff --git a/crates/neutrino-http/src/rtc.rs b/crates/neutrino-http/src/rtc.rs
+new file mode 100644
+index 0000000..1bcc887
+--- /dev/null
++++ b/crates/neutrino-http/src/rtc.rs
+@@ -0,0 +1,355 @@
++//! MatrixRTC on the node: transport discovery (MSC4143) and delayed events
++//! (MSC4140), the two homeserver pieces a call client checks before it
++//! will place a call, and the two a mesh node did not serve.
++//!
++//! A call's media never touches the node: a LiveKit SFU carries it, and
++//! the client finds the SFU through the JWT service named here. What the
++//! node owes the client is the dead-man's switch -- an `m.rtc.member`
++//! departure handed over in advance and kept from firing by heartbeats
++//! -- so a participant that vanishes leaves the call instead of haunting
++//! it. Without it a client that trusts the 200 from a plain send removes
++//! itself at once, and Element Call, which checks `unstable_features`
++//! first, does not schedule the leave at all.
++//!
++//! Delays are kept in memory. A node restart drops them, which is the
++//! ghost this mechanism exists to prevent; on a phone the process is the
++//! node, and the whole call goes with it, so what a restart loses is a
++//! departure the client re-sends on its own reconnect. A durable table is
++//! the next step if that stops being true.
++
++use std::collections::HashMap;
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant};
++
++use axum::{
++    Json,
++    extract::{Path, Query, State},
++    http::StatusCode,
++    response::IntoResponse,
++};
++use neutrino_engine::RoomRegistry;
++use neutrino_store::RoomStore;
++use neutrino_store_sqlite::SqliteStore;
++use ruma::{OwnedRoomId, OwnedUserId};
++use serde_json::{Value, json};
++use tracing::{info, warn};
++
++use crate::{AppState, AuthUser, error_response, lock_app};
++
++/// The query parameter a delayed send carries, in milliseconds.
++pub const DELAY_PARAM: &str = "org.matrix.msc4140.delay";
++/// The longest delay accepted: a day, as Element Call's own Synapse config
++/// sets `max_event_delay_duration`.
++pub const MAX_DELAY_MS: u64 = 24 * 60 * 60 * 1000;
++/// Pending delays one user may hold across all rooms. A client refreshes
++/// one per call it is in; a thousand is a client that never cancels.
++pub const MAX_PENDING_PER_USER: usize = 1000;
++/// The environment variable naming LiveKit JWT services, comma separated:
++/// `NEUTRINO_RTC_LIVEKIT_URL=https://rtc.example/livekit/jwt`. Read once at
++/// startup. An env var rather than a config field so the host binaries
++/// need no change to try it.
++pub const LIVEKIT_URL_ENV: &str = "NEUTRINO_RTC_LIVEKIT_URL";
++
++/// One delayed event, waiting.
++struct Delayed {
++    room_id: OwnedRoomId,
++    sender: OwnedUserId,
++    event_type: String,
++    state_key: Option<String>,
++    content: Value,
++    delay_ms: u64,
++    /// When it fires unless restarted or cancelled.
++    deadline: Instant,
++    /// Bumped by every restart; a firing task whose generation is stale
++    /// was superseded and does nothing.
++    generation: u64,
++}
++
++/// What the node serves for calls: the transports it advertises and the
++/// delays it holds.
++pub struct RtcState {
++    foci: Vec<Value>,
++    delayed: Mutex<HashMap<String, Delayed>>,
++    next_id: Mutex<u64>,
++}
++
++impl RtcState {
++    /// Built from the environment: every URL in [`LIVEKIT_URL_ENV`] becomes
++    /// a `livekit` transport, in the order given.
++    pub fn from_env() -> Self {
++        let foci: Vec<Value> = std::env::var(LIVEKIT_URL_ENV)
++            .ok()
++            .map(|urls| {
++                urls.split(',')
++                    .map(str::trim)
++                    .filter(|url| !url.is_empty())
++                    .map(|url| json!({ "type": "livekit", "livekit_service_url": url }))
++                    .collect()
++            })
++            .unwrap_or_default();
++        if foci.is_empty() {
++            info!("no {LIVEKIT_URL_ENV}: /rtc/transports answers an empty list");
++        }
++        Self {
++            foci,
++            delayed: Mutex::new(HashMap::new()),
++            next_id: Mutex::new(0),
++        }
++    }
++
++    fn allocate_id(&self) -> String {
++        let mut next = self.next_id.lock().unwrap_or_else(|e| e.into_inner());
++        *next += 1;
++        format!("delay{}", *next)
++    }
++}
++
++/// `GET /_matrix/client/v1/rtc/transports` (and the MSC4143 unstable path):
++/// where a call's media can be carried, as a client reads it before it
++/// asks a JWT service for a token.
++pub async fn transports(state: State<AppState>, AuthUser(_): AuthUser) -> Json<Value> {
++    let foci = lock_app(&state.0).rtc.foci.clone();
++    Json(json!({ "rtc_transports": foci }))
++}
++
++/// The delay a send asked for, if any: `Ok(None)` for an ordinary send,
++/// `Err` for a delay the node refuses.
++pub fn requested_delay(
++    params: &HashMap<String, String>,
++) -> Result<Option<u64>, axum::response::Response> {
++    let Some(raw) = params.get(DELAY_PARAM) else {
++        return Ok(None);
++    };
++    let Ok(delay) = raw.parse::<u64>() else {
++        return Err(error_response(
++            StatusCode::BAD_REQUEST,
++            "M_INVALID_PARAM",
++            "the delay is not a whole number of milliseconds",
++        ));
++    };
++    if delay > MAX_DELAY_MS {
++        return Err(error_response(
++            StatusCode::BAD_REQUEST,
++            "M_INVALID_PARAM",
++            &format!("the delay exceeds the maximum of {MAX_DELAY_MS} ms"),
++        ));
++    }
++    Ok(Some(delay))
++}
++
++/// Hold an event to be sent after `delay_ms`, and answer as MSC4140 says:
++/// `{"delay_id": …}` and nothing sent yet.
++pub async fn schedule(
++    state: &AppState,
++    sender: OwnedUserId,
++    room_id: String,
++    event_type: String,
++    state_key: Option<String>,
++    content: Value,
++    delay_ms: u64,
++) -> axum::response::Response {
++    let room_id: OwnedRoomId = match room_id.parse() {
++        Ok(room) => room,
++        Err(e) => {
++            return error_response(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", &e.to_string());
++        }
++    };
++    let (rtc, registry) = {
++        let app = lock_app(state);
++        (app.rtc.clone(), app.room_registry.clone())
++    };
++    // The room must be one this node holds: a delay is not a way to send
++    // into a room the node has never seen. The send itself is authorised
++    // when it fires, against the room's state then.
++    let known = {
++        let store = lock_app(state).store.clone();
++        store
++            .get_room_version(&room_id)
++            .await
++            .ok()
++            .flatten()
++            .is_some()
++    };
++    if !known {
++        return error_response(StatusCode::NOT_FOUND, "M_NOT_FOUND", "unknown room");
++    }
++    let delay_id = {
++        let mut delayed = rtc.delayed.lock().unwrap_or_else(|e| e.into_inner());
++        let held = delayed.values().filter(|d| d.sender == sender).count();
++        if held >= MAX_PENDING_PER_USER {
++            return error_response(
++                StatusCode::TOO_MANY_REQUESTS,
++                "M_LIMIT_EXCEEDED",
++                &format!("{MAX_PENDING_PER_USER} delayed events already pending"),
++            );
++        }
++        let delay_id = rtc.allocate_id();
++        delayed.insert(
++            delay_id.clone(),
++            Delayed {
++                room_id,
++                sender,
++                event_type,
++                state_key,
++                content,
++                delay_ms,
++                deadline: Instant::now() + Duration::from_millis(delay_ms),
++                generation: 0,
++            },
++        );
++        delay_id
++    };
++    spawn_firing(
++        rtc,
++        registry,
++        delay_id.clone(),
++        0,
++        Duration::from_millis(delay_ms),
++    );
++    (StatusCode::OK, Json(json!({ "delay_id": delay_id }))).into_response()
++}
++
++/// Sleep out one delay and fire it if it is still the same delay: not
++/// cancelled, not sent by hand, not restarted (which spawns a fresh task
++/// under a new generation and leaves this one to find itself stale).
++fn spawn_firing(
++    rtc: Arc<RtcState>,
++    registry: Arc<RoomRegistry<SqliteStore>>,
++    delay_id: String,
++    generation: u64,
++    after: Duration,
++) {
++    tokio::spawn(async move {
++        tokio::time::sleep(after).await;
++        let taken = {
++            let mut delayed = rtc.delayed.lock().unwrap_or_else(|e| e.into_inner());
++            match delayed.get(&delay_id) {
++                Some(d) if d.generation == generation => delayed.remove(&delay_id),
++                _ => None,
++            }
++        };
++        if let Some(d) = taken {
++            fire(&registry, &delay_id, d).await;
++        }
++    });
++}
++
++/// Send a delay's event through the room actor, which authorises it
++/// against the room's state *now* -- a sender who lost the right to send
++/// since scheduling is refused here, and the refusal is only logged: the
++/// client that scheduled it may be exactly the one that is gone.
++async fn fire(registry: &RoomRegistry<SqliteStore>, delay_id: &str, d: Delayed) {
++    match registry
++        .send_event(&d.room_id, d.sender, d.event_type, d.state_key, d.content)
++        .await
++    {
++        Ok(event) => info!(%delay_id, event_id = %event.event_id, "delayed event sent"),
++        Err(e) => warn!(%delay_id, error = %e, "delayed event refused when it fired"),
++    }
++}
++
++/// `GET /_matrix/client/unstable/org.matrix.msc4140/delayed_events`: the
++/// caller's pending delays.
++pub async fn list(state: State<AppState>, AuthUser(user): AuthUser) -> Json<Value> {
++    let rtc = lock_app(&state.0).rtc.clone();
++    let now = Instant::now();
++    let delayed = rtc.delayed.lock().unwrap_or_else(|e| e.into_inner());
++    let mut entries: Vec<(&String, &Delayed)> =
++        delayed.iter().filter(|(_, d)| d.sender == user).collect();
++    entries.sort_by_key(|(id, _)| (*id).clone());
++    let events: Vec<Value> = entries
++        .into_iter()
++        .map(|(id, d)| {
++            let remaining = d.deadline.saturating_duration_since(now).as_millis();
++            let mut entry = json!({
++                "delay_id": id,
++                "room_id": d.room_id,
++                "type": d.event_type,
++                "content": d.content,
++                "delay": d.delay_ms,
++                "running_since": unix_ms().saturating_sub(d.delay_ms.saturating_sub(remaining as u64)),
++            });
++            if let Some(key) = &d.state_key {
++                entry["state_key"] = Value::String(key.clone());
++            }
++            entry
++        })
++        .collect();
++    Json(json!({ "delayed_events": events }))
++}
++
++/// `POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{id}`
++/// with `{"action": "send" | "cancel" | "restart"}`. `restart` re-applies
++/// the whole original delay, which is what makes it a heartbeat.
++pub async fn act(
++    state: State<AppState>,
++    AuthUser(user): AuthUser,
++    Path(delay_id): Path<String>,
++    body: Json<Value>,
++) -> axum::response::Response {
++    let action = body.0["action"].as_str().unwrap_or_default().to_owned();
++    let (rtc, registry) = {
++        let app = lock_app(&state.0);
++        (app.rtc.clone(), app.room_registry.clone())
++    };
++    let outcome = {
++        let mut delayed = rtc.delayed.lock().unwrap_or_else(|e| e.into_inner());
++        match delayed.get_mut(&delay_id) {
++            None => Err(error_response(
++                StatusCode::NOT_FOUND,
++                "M_NOT_FOUND",
++                "no such delayed event",
++            )),
++            Some(d) if d.sender != user => Err(error_response(
++                StatusCode::NOT_FOUND,
++                "M_NOT_FOUND",
++                "no such delayed event",
++            )),
++            Some(d) => match action.as_str() {
++                "cancel" => {
++                    delayed.remove(&delay_id);
++                    Ok(None)
++                }
++                "send" => Ok(delayed.remove(&delay_id)),
++                "restart" => {
++                    d.generation += 1;
++                    d.deadline = Instant::now() + Duration::from_millis(d.delay_ms);
++                    let generation = d.generation;
++                    let after = Duration::from_millis(d.delay_ms);
++                    spawn_firing(
++                        rtc.clone(),
++                        registry.clone(),
++                        delay_id.clone(),
++                        generation,
++                        after,
++                    );
++                    Ok(None)
++                }
++                _ => Err(error_response(
++                    StatusCode::BAD_REQUEST,
++                    "M_INVALID_PARAM",
++                    "action must be send, cancel or restart",
++                )),
++            },
++        }
++    };
++    match outcome {
++        Err(response) => response,
++        Ok(Some(d)) => {
++            fire(&registry, &delay_id, d).await;
++            Json(json!({})).into_response()
++        }
++        Ok(None) => Json(json!({})).into_response(),
++    }
++}
++
++/// Query wrapper so handlers can take the delay parameter alongside their
++/// path and body without changing their other extractors.
++pub type Params = Query<HashMap<String, String>>;
++
++fn unix_ms() -> u64 {
++    std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|d| d.as_millis() as u64)
++        .unwrap_or_default()
++}
+-- 
+2.43.0
+
