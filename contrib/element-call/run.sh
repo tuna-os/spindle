@@ -19,17 +19,19 @@
 # Needs docker with compose, node at the checkout's .node-version and
 # corepack for pnpm -- the same things upstream's own CI needs.
 #
-# The subset is stage 1 of #269: the specs that need only a browser, a
-# homeserver that registers and logs users in, and a room. What breaks
-# here breaks every other spec too. The call specs (create-call,
-# spa-call-sticky, reconnect) are the next stage and run when named in
-# ELEMENT_CALL_SPECS; the widget and restricted-sfu specs register users
-# through Synapse's admin API with a shared secret, which this server does
-# not serve, and are out of scope until they are made to use /register.
+# The subset is every SPA spec that needs only a browser, a homeserver
+# that registers and logs users in, a room and a call: the landing and
+# access specs of #269's stage 1, and the call specs -- create-call,
+# spa-call-sticky (MatrixRTC 2.0 and the improper-leave case), the two
+# reconnect specs and errors. Running a spec costs a minute; protecting
+# it is the allowlist's decision, so the default runs wide. The widget
+# and restricted-sfu specs register users through Synapse's admin API with
+# a shared secret, which this server does not serve, and are out of scope
+# until they are made to use /register.
 set -euo pipefail
 
 ELEMENT_CALL_REV=a03f23e7206fa7d45911ec3da6af988452804614
-DEFAULT_SPECS="landing.spec.ts access.spec.ts"
+DEFAULT_SPECS="landing.spec.ts access.spec.ts create-call.spec.ts spa-call-sticky.spec.ts reconnect.spec.ts sfu-reconnect-bug.spec.ts errors.spec.ts"
 
 results="${1:-tmp/element-call-results.json}"
 toplevel="$(git rev-parse --show-toplevel)"
