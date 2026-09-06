@@ -114,7 +114,11 @@ jobs:
           git add docs/benchmarks/data/"$GROUP".*.json
           git commit -m "Benchmark sitting $GROUP on a shared runner" \
             -m "Filed by the bench-sitting workflow. The sidecar names the host, the load and the versions; the page renders it in its own shared-runner section, apart from the milestone sittings."
-          git push -u origin "$branch"
+          # A second sitting on the same day supersedes the first: the branch
+          # is this workflow's own, so it is replaced rather than refused
+          # (run 34045231782 ran the whole Postgres sitting and lost it here
+          # to a branch the SQLite run had left behind).
+          git push --force -u origin "$branch"
           # Opening the pull request needs "Allow GitHub Actions to create
           # and approve pull requests" under Settings > Actions > General,
           # which is off by default and was off for the first sitting that
