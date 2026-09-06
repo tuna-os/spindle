@@ -365,6 +365,13 @@ pub enum Keyspace {
     /// stream id the event was persisted under, so `/sync` can tell which
     /// sticky events are news to a client since its token.
     Sticky = 0x34,
+    /// `(seq: u64 be)` → one event report a user filed (#83).
+    ///
+    /// Its own keyspace rather than a row in [`Self::AuditLog`]: a report
+    /// is filed by anyone, an audit record by an operator, and a
+    /// moderation queue an admin walks by id is a different thing from a
+    /// log of what admins did. The sequence number is the report's id.
+    EventReport = 0x35,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -439,6 +446,20 @@ pub fn audit_entry(seq: u64) -> Vec<u8> {
     let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::AuditLog as u8];
     key.extend_from_slice(&seq.to_be_bytes());
     key
+}
+
+/// One event report, by the sequence number that is its id.
+#[must_use]
+pub fn event_report(seq: u64) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::EventReport as u8];
+    key.extend_from_slice(&seq.to_be_bytes());
+    key
+}
+
+/// Every event report, oldest first.
+#[must_use]
+pub fn event_reports_prefix() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::EventReport as u8]
 }
 
 /// One dynamically registered OAuth 2.0 client.
