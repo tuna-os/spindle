@@ -32,6 +32,7 @@ stale on a runner change. Wall times do.
 | Bounded fork search vs the exhaustive walk it replaced | Done (#33) |
 | Persistent state trie vs `im` and vs cloning per event | Done, below |
 | Structural sharing: nodes created per update | Done, asserted as a test |
+| What content addressing buys: bytes per state change, state at a past point (#80) | Done, below, both sides of the trade |
 | Storage append and reopen at a million events | Done (#47) |
 | Durability cost: strict vs relaxed | Done (#47) |
 | Our fast path vs `ruma-state-res`, **correctness** | Done (#55), below |
@@ -45,6 +46,47 @@ stale on a runner change. Wall times do.
 Everything here is **algorithmic**, measured inside the library. None of it is a
 server throughput figure and none of it should be quoted as one. Server-to-
 server comparison starts at M1 and is defined in #42.
+
+### The other side of the trie's losses (#80)
+
+The micro-benchmark page has always shown the trie losing to `im` on retained
+updates (1.4–2.1×) and to a `HashMap` on a single lookup (about 12×). Both
+rows are fair and both stay. What they left out is what the trie does that
+neither alternative can: its nodes have content addresses, so persisting a
+state change writes the copied path and stops at the first node the previous
+snapshot already held. `benches/state_snapshot.rs` now measures that beside
+the losses, and `tests/state_sharing.rs` asserts the bytes.
+
+| Entries | Bytes per change, ours | Bytes per change, `im` serialised whole | Time, ours | Time, `im` |
+|---|---|---|---|---|
+| 100 | 1,368 | 5,310 | 5.1 µs | **3.5 µs** |
+| 1,000 | 1,880 | 54,810 | 6.1 µs | 22.7 µs |
+| 10,000 | 2,590 | 567,810 | 8.5 µs | 244.7 µs |
+
+The `im` side is charged nothing for format: length-framed key/value pairs,
+the floor of any serialisation. At a hundred entries it still wins on time,
+because hashing a path costs more than copying five kilobytes. From a
+thousand on, the bytes are the story: the delta stays under three kilobytes
+while the whole-state write grows with the room, and the test holds the
+10,000-entry ratio at fifty or better.
+
+State at a past point is the same trade seen from the read side. Three ways
+to answer "what was the state after `li`", all measured at 100, 1,000 and
+10,000 entries:
+
+| Way | 100 | 1,000 | 10,000 |
+|---|---|---|---|
+| Resident snapshot (inside the window the log keeps in memory) | 29 ns | 36 ns | 36 ns |
+| Rehydrate from the node store (outside the window) | 35 µs | 392 µs | **5.5 ms** |
+| A hundred-hop delta replay on an `im` map (Synapse's `_MAX_STATE_DELTA_HOPS`) | 19 µs | 84 µs | 178 µs |
+
+Inside the resident window the linear log answers in constant time, three
+orders of magnitude under the delta walk. Outside it, rehydration reads the
+whole state by address and verifies every node, and at ten thousand entries
+that is thirty times slower than the replay. That row is a loss and it is
+published as one: the window is what makes the trade pay, so where it ends
+(`DEFAULT_RESIDENT_WINDOW`, 512 snapshots) is a tuning question with a
+measured cost on either side, not a constant.
 
 ## Method
 
