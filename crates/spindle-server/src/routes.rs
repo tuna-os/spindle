@@ -6190,7 +6190,7 @@ async fn sync(
     // staring at nothing for the whole timeout.
     if let Some(since) = since {
         let timeout = std::time::Duration::from_millis(query.timeout.unwrap_or(0).min(60_000));
-        if result.rooms.is_empty() && !timeout.is_zero() {
+        if result.is_empty() && !timeout.is_zero() {
             // Either an appended event or a change in who is typing ends the
             // wait. Typing is not an event and has no stream position, so it
             // cannot be discovered by re-reading the log -- without this arm a
@@ -6305,6 +6305,18 @@ fn sync_account_data(
         .account_data
         .all(&identity.user_id, "")
         .map_err(|error| account_data_error(&error))?;
+    // The ruleset is stored bare -- `/pushrules/` edits it a rule at a
+    // time and wraps it in `global` on the way out -- but the account-data
+    // event's content is `{"global": ruleset}` by the spec, and a client
+    // that finds the kinds at the top level refuses the whole event:
+    // matrix-rust-sdk logged "missing field `global`" and carried on with
+    // no push rules at all, which is every notification count wrong.
+    for event in &mut global {
+        if event["type"] == crate::push_rules::TYPE {
+            let ruleset = event["content"].take();
+            event["content"] = json!({ "global": ruleset });
+        }
+    }
     // A user who has never edited a rule still has a ruleset, and a client
     // reads it from here rather than from `/pushrules/`. Injected rather than
     // written at registration for the reason `ruleset_of` gives: only an edit
@@ -6316,7 +6328,7 @@ fn sync_account_data(
     {
         global.push(json!({
             "type": crate::push_rules::TYPE,
-            "content": crate::push_rules::defaults(&identity.user_id),
+            "content": { "global": crate::push_rules::defaults(&identity.user_id) },
         }));
     }
     Ok(crate::filters::Filter::apply(

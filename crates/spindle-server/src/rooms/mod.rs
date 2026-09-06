@@ -247,6 +247,25 @@ pub struct SyncResult {
     pub left: Vec<SyncRoom>,
 }
 
+impl SyncResult {
+    /// Nothing in *any* section, which is the only state a long-poll may
+    /// wait in.
+    ///
+    /// The wait once looked at the joined rooms alone, so a client whose
+    /// only news was a fresh invite (or a knock answered, or a room left)
+    /// entered it with the invite already in hand and did not return until
+    /// the next unrelated event or the timeout. matrix-rust-sdk's suite
+    /// found it: an invitee polling at 30 s never saw the room inside the
+    /// 8 s its test allowed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rooms.is_empty()
+            && self.invited.is_empty()
+            && self.knocked.is_empty()
+            && self.left.is_empty()
+    }
+}
+
 /// One room's share of a sync response.
 pub struct SyncRoom {
     pub room_id: String,

@@ -703,15 +703,44 @@ impl Rooms {
             }
             Err(error) => return Err(error),
         };
-        let mut stripped = Vec::with_capacity(ids.len());
+        let mut stripped = Vec::with_capacity(ids.len() + 1);
+        let mut inviter: Option<String> = None;
         for (event_type, state_key, id) in ids {
             let event = self.read_event(room_id, &EventId::new(id.as_str()))?;
+            if event_type == "m.room.member" && state_key == user_id {
+                inviter = event["sender"].as_str().map(str::to_owned);
+            }
             stripped.push(serde_json::json!({
                 "type": event_type,
                 "state_key": state_key,
                 "sender": event["sender"],
                 "content": event["content"],
             }));
+        }
+        // The inviter's own membership rides along, as Synapse's does: an
+        // invite is rendered as "<name> invited you", and the name lives in
+        // the inviter's member event. Without it a client has a sender it
+        // cannot show -- matrix-rust-sdk's `invite_details` has no inviter,
+        // and Element X renders the invite from a bare user ID.
+        if let Some(inviter) = inviter.filter(|inviter| inviter != user_id) {
+            let key = spindle_core::StateKey::new("m.room.member", inviter.as_str());
+            let id = self.with_room_read(room_id, |_, log| {
+                let Some(head) = log.entries().next_back() else {
+                    return Ok(None);
+                };
+                Ok(log
+                    .state_after(head.li)
+                    .and_then(|state| state.get(&key).map(str::to_owned)))
+            })?;
+            if let Some(id) = id {
+                let event = self.read_event(room_id, &EventId::new(id.as_str()))?;
+                stripped.push(serde_json::json!({
+                    "type": "m.room.member",
+                    "state_key": inviter,
+                    "sender": event["sender"],
+                    "content": event["content"],
+                }));
+            }
         }
         Ok(stripped)
     }

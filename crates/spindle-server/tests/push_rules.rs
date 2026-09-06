@@ -112,7 +112,7 @@ impl Harness {
             .unwrap()
             .iter()
             .find(|event| event["type"] == "m.push_rules")
-            .unwrap_or_else(|| panic!("no m.push_rules in {body}"))["content"]
+            .unwrap_or_else(|| panic!("no m.push_rules in {body}"))["content"]["global"]
             .clone()
     }
 }
