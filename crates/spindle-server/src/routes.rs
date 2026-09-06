@@ -340,9 +340,11 @@ struct PresenceRequest {
 /// `POST /_matrix/client/v3/rooms/{room_id}/report/{event_id}`
 ///
 /// A user tells the server's operators that an event is a problem. The
-/// report goes into the admin audit log, which is the feed an operator
-/// already reads -- a report stored somewhere nobody looks is not a
-/// moderation feature, it is the appearance of one.
+/// report is filed where the admin API's `/event_reports` reads it, by
+/// an id an operator can quote, and a line goes into the audit log too,
+/// which is the feed an operator already reads -- a report stored
+/// somewhere nobody looks is not a moderation feature, it is the
+/// appearance of one.
 ///
 /// **404 covers both "no such event" and "you cannot see it", deliberately
 /// and per the spec.** Distinguishing them would turn this endpoint into an
@@ -368,11 +370,20 @@ async fn report_event(
     if may_read_room(&state, &identity.user_id, &room_id).is_err() {
         return Err(not_found());
     }
-    state
+    let event = state
         .rooms
         .event(&room_id, &event_id)
         .map_err(|_| not_found())?;
 
+    let report_id = crate::admin::file_event_report(
+        &state,
+        &identity.user_id,
+        &room_id,
+        &event_id,
+        event["sender"].as_str(),
+        request.reason.as_deref(),
+        request.score,
+    )?;
     crate::admin::audit(
         &state,
         &identity.user_id,
@@ -382,6 +393,7 @@ async fn report_event(
             "room_id": room_id,
             "reason": request.reason,
             "score": request.score,
+            "report_id": report_id,
         }),
     )?;
     Ok(Json(json!({})))
