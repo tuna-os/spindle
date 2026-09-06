@@ -56,7 +56,7 @@ tempfile = "3"
 # federation listener, made on the spot rather than checked in as a key.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
-toml = "0.8"
+toml = "1.1"
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
