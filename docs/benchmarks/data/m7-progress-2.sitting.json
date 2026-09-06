@@ -1,0 +1,21 @@
+{
+  "group": "m7-progress-2",
+  "rounds": 3,
+  "started": "2026-09-06T10:21:57Z",
+  "finished": "2026-09-06T10:42:25Z",
+  "host": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "cores": 4,
+    "kernel": "6.18.44-fc-v24",
+    "runner": "developer machine"
+  },
+  "spindle_commit": "5707ffecece5",
+  "versions": [
+    "spindle 0.1.0 @ 5707ffecece5",
+    "synapse 1.160.0",
+    "continuwuity 26.8.1 (ab3c05d)",
+    "tuwunel 1.9.0",
+    "dendrite 0.15.2+e546df2"
+  ],
+  "absent": []
+}

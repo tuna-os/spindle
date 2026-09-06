@@ -46,7 +46,8 @@ version_of() {
     # tree it was built from: the crate version and the commit.
     spindle) echo "spindle $(grep -m1 '^version' crates/spindle-server/Cargo.toml | cut -d'"' -f2) @ $(git rev-parse --short=12 HEAD)" ;;
     synapse) "$VENV/bin/python" -c 'import synapse; print("synapse", synapse.__version__)' ;;
-    dendrite) echo "dendrite $(cat "$BIN/dendrite.tag" 2>/dev/null || echo unknown)" ;;
+    # Dendrite prints "0.15.2+e546df2" (tag plus commit) with no name.
+    dendrite) echo "dendrite $("$BIN/dendrite" --version 2>/dev/null | head -1 || echo unknown)" ;;
     *) "$BIN/$1" --version 2>/dev/null | head -1 ;;
   esac
 }
