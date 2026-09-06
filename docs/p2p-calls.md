@@ -76,17 +76,55 @@ today it is two clients: the current Element Call for LiveKit rooms, the
 full-mesh build for rooms with no SFU. The venue serves both from the
 same homeserver; docs/venue-playbook.md says where each is linked from.
 
-Across the mesh seam, the pieces a full-mesh call rides -- to-device
-messages, device keys, `org.matrix.msc3401.call.member` state -- all
-cross to a Neutrino node (docs/mesh-federation.md, the encryption and
-calls tables), so a full-mesh call between a participant on a Spindle
-and one on a mesh node has nothing in its way at the protocol level. It
-has not been driven end to end: the rig above is one server, two
-browsers. Doing it across the seam is the next measurement.
+A node with no uplink cannot lean on an SFU, so on the mesh the call
+*is* the full-mesh call, and the SFU is for the session rooms that have
+one. That makes the measurement that matters the one across the seam: a
+participant whose homeserver is a mesh node, in a call with one whose
+homeserver is a Spindle.
+
+## Evidence, across the seam
+
+The same rig with `NEUTRINO_LAN` set starts a Neutrino node beside the
+Spindle (contrib/neutrino, all three patches), serves a second copy of
+the client with the node as its homeserver, and swaps the roles: the
+creator is on the node, so the room is the node's in the version it
+speaks, and the joiner on the Spindle reaches it by its alias on the
+node, resolved and joined over federation.
+
+```
+the creator is on the mesh node b88fa5b0…c408d37, the joiner on the Spindle
+--- alice creates the call as a guest
+--- alice joins
+--- bob opens the invite as a guest
+--- bob joins
+--- media flows both ways, peer to peer
+alice: 2 tiles, both playing
+bob: 2 tiles, both playing
+alice: candidate pairs ["host->host"]
+bob: candidate pairs ["host->host"]
+--- bob leaves and alice sees it
+full-mesh call: ok
+```
+
+Every piece of the call crossed the seam: the alias, the join, the
+`org.matrix.msc3401.call.member` state in both directions, the device
+keys and one-time keys for the Olm session, the encrypted to-device
+offer, answer and candidates, and the leave. The media went between the
+two browsers directly.
+
+What the node needed, and now carries as
+`contrib/neutrino/0003-browser-clients.patch`: the `r0` prefix served
+as `v3` (the same rewrite as this server's), push rules that answer
+empty instead of 404 (the client retries that forever), sync filters
+that are stored and named (its sync ignores them anyway), TURN discovery
+that answers empty, and `power_level_content_override` honoured on
+`createRoom` -- without the last, the joiner's call membership is refused
+by auth rules, correctly, because the room's `state_default` of 50 keeps
+an ordinary member out of the call.
 
 What the client does not do, and no server can add: a call of more than
 a handful. Above that, media has to go through something, and that is
-the LiveKit path.
+the LiveKit path, which needs the uplink.
 
 ## Running it
 
@@ -97,6 +135,10 @@ contrib/element-call-full-mesh/run.sh
 
 # with a prebuilt client
 FULL_MESH_DIST=/path/to/element-call/dist contrib/element-call-full-mesh/run.sh
+
+# across the mesh seam: a neutrino-lan built with contrib/neutrino's
+# patches (its README says how)
+NEUTRINO_LAN=/path/to/neutrino-lan contrib/element-call-full-mesh/run.sh
 ```
 
 It needs the pinned Playwright from `scripts/element-web-e2e` (`npm ci`

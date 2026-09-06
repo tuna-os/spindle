@@ -1,0 +1,286 @@
+From 38ae3c490c6064c510cebd4a0ce5d5e708dd2bec Mon Sep 17 00:00:00 2001
+From: Spindle rig <spindle@localhost>
+Date: Sun, 6 Sep 2026 07:04:52 +0000
+Subject: [PATCH] Be a browser client's homeserver: r0 prefix, push rules,
+ filters, TURN, power-level override
+
+A full-mesh call needs the node to be a browser's homeserver, and a
+2023 matrix-js-sdk would not sync from it: it fetches push rules and
+retries a 404 forever, creates a sync filter before its first /sync,
+and asks for those and key upload under the deprecated r0 prefix.
+
+- /_matrix/client/r0/ and /_matrix/media/r0/ are served as v3, by a
+  rewrite in front of the router
+- GET /pushrules/ answers no rules (a node pushes nothing), and a PUT
+  rule is kept so the client sees its own back
+- POST /user/{id}/filter stores the filter and names it; sync already
+  ignores the parameter
+- GET /voip/turnServer answers an empty object: no relay on a mesh
+- createRoom honours power_level_content_override, merged over the
+  defaults with the creator dropped from users as v12 requires: a call
+  client sets org.matrix.msc3401.call.member to 0 on every room it
+  creates, and without it every joiner is refused by auth rules
+
+With these, Element Call's full-mesh build meets in a call with the
+creator on a node and the joiner on a Spindle, media host-to-host.
+---
+ crates/neutrino-http/Cargo.toml    |   1 +
+ crates/neutrino-http/src/compat.rs | 112 +++++++++++++++++++++++++++++
+ crates/neutrino-http/src/lib.rs    |  75 ++++++++++++++++++-
+ 3 files changed, 186 insertions(+), 2 deletions(-)
+ create mode 100644 crates/neutrino-http/src/compat.rs
+
+diff --git a/crates/neutrino-http/Cargo.toml b/crates/neutrino-http/Cargo.toml
+index 500260f..d88b0b8 100644
+--- a/crates/neutrino-http/Cargo.toml
++++ b/crates/neutrino-http/Cargo.toml
+@@ -29,6 +29,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+ axum = "0.8.7"
+ indexmap = "2"
+ tower-http = { version = "0.6.6", features = ["trace", "cors"] }
++tower = "0.5"
+ 
+ async-trait.workspace = true
+ rand.workspace = true
+diff --git a/crates/neutrino-http/src/compat.rs b/crates/neutrino-http/src/compat.rs
+new file mode 100644
+index 0000000..8cf995e
+--- /dev/null
++++ b/crates/neutrino-http/src/compat.rs
+@@ -0,0 +1,112 @@
++//! The client-API odds and ends a browser client asks for before it will
++//! sync, none of which a mesh node has any use for: push rules (a phone
++//! that is its own homeserver pushes nothing), sync filters (the node's
++//! sync ignores the filter parameter, so a stored filter is a name and
++//! nothing else), and TURN discovery (no relay on a mesh; the client
++//! proceeds without).
++//!
++//! What made this necessary: matrix-js-sdk's `startClient` fetches push
++//! rules and retries a 404 forever, and creates a sync filter before its
++//! first `/sync`, so a homeserver without both is one the client never
++//! syncs from -- and a full-mesh call (docs/p2p-calls.md in the Spindle
++//! tree) needs the node to be a browser's homeserver.
++
++use std::collections::HashMap;
++use std::sync::Mutex;
++
++use axum::{Json, extract::Path, http::StatusCode, response::IntoResponse};
++use serde_json::{Value, json};
++
++use crate::AuthUser;
++
++static FILTERS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
++static RULES: Mutex<Option<HashMap<String, Value>>> = Mutex::new(None);
++
++/// `GET /pushrules/` — no rules. A node has no push gateway to feed.
++pub async fn push_rules(AuthUser(_): AuthUser) -> Json<Value> {
++    let rules = RULES.lock().unwrap_or_else(|e| e.into_inner());
++    let underride: Vec<Value> = rules
++        .as_ref()
++        .map(|r| r.values().cloned().collect())
++        .unwrap_or_default();
++    Json(json!({
++        "global": { "content": [], "override": [], "room": [], "sender": [], "underride": underride }
++    }))
++}
++
++/// `PUT /pushrules/{scope}/{kind}/{rule_id}` — kept so the client sees
++/// its own rule back, and otherwise ignored.
++pub async fn put_push_rule(
++    AuthUser(_): AuthUser,
++    Path((_scope, kind, rule_id)): Path<(String, String, String)>,
++    body: Json<Value>,
++) -> Json<Value> {
++    let mut rule = body.0;
++    rule["rule_id"] = Value::String(rule_id.clone());
++    rule["default"] = Value::Bool(false);
++    rule["enabled"] = Value::Bool(true);
++    let mut rules = RULES.lock().unwrap_or_else(|e| e.into_inner());
++    rules
++        .get_or_insert_with(HashMap::new)
++        .insert(format!("{kind}/{rule_id}"), rule);
++    Json(json!({}))
++}
++
++/// `POST /user/{user_id}/filter` — a filter is a number; sync ignores it.
++pub async fn create_filter(
++    AuthUser(_): AuthUser,
++    Path(_user_id): Path<String>,
++    body: Json<Value>,
++) -> Json<Value> {
++    let mut filters = FILTERS.lock().unwrap_or_else(|e| e.into_inner());
++    filters.push(body.0);
++    Json(json!({ "filter_id": (filters.len() - 1).to_string() }))
++}
++
++/// `GET /user/{user_id}/filter/{filter_id}` — what was stored.
++pub async fn get_filter(
++    AuthUser(_): AuthUser,
++    Path((_user_id, filter_id)): Path<(String, String)>,
++) -> axum::response::Response {
++    let filters = FILTERS.lock().unwrap_or_else(|e| e.into_inner());
++    match filter_id.parse::<usize>().ok().and_then(|i| filters.get(i)) {
++        Some(filter) => Json(filter.clone()).into_response(),
++        None => (
++            StatusCode::NOT_FOUND,
++            Json(json!({ "errcode": "M_NOT_FOUND", "error": "no such filter" })),
++        )
++            .into_response(),
++    }
++}
++
++/// `GET /voip/turnServer` — no relay: an empty object, which the spec
++/// allows and clients read as "connect directly".
++pub async fn turn_server(AuthUser(_): AuthUser) -> Json<Value> {
++    Json(json!({}))
++}
++
++/// Rewrite `/_matrix/client/r0/…` and `/_matrix/media/r0/…` to `v3`,
++/// query string intact. The endpoints are the same; only the prefix moved.
++pub async fn legacy_prefix(mut request: axum::extract::Request) -> axum::extract::Request {
++    const REWRITES: [(&str, &str); 2] = [
++        ("/_matrix/client/r0/", "/_matrix/client/v3/"),
++        ("/_matrix/media/r0/", "/_matrix/media/v3/"),
++    ];
++    let path = request.uri().path();
++    let Some((from, to)) = REWRITES.iter().find(|(from, _)| path.starts_with(from)) else {
++        return request;
++    };
++    let rewritten = format!("{to}{}", &path[from.len()..]);
++    let with_query = match request.uri().query() {
++        Some(query) => format!("{rewritten}?{query}"),
++        None => rewritten,
++    };
++    let mut parts = request.uri().clone().into_parts();
++    if let Ok(path_and_query) = with_query.parse() {
++        parts.path_and_query = Some(path_and_query);
++        if let Ok(uri) = axum::http::Uri::from_parts(parts) {
++            *request.uri_mut() = uri;
++        }
++    }
++    request
++}
+diff --git a/crates/neutrino-http/src/lib.rs b/crates/neutrino-http/src/lib.rs
+index 584c771..45c1cb9 100644
+--- a/crates/neutrino-http/src/lib.rs
++++ b/crates/neutrino-http/src/lib.rs
+@@ -36,6 +36,7 @@ use tower_http::trace::TraceLayer;
+ use tracing::{Span, error, info, info_span, warn};
+ 
+ mod account_data;
++mod compat;
+ mod directory;
+ mod e2ee;
+ mod ephemeral;
+@@ -704,6 +705,20 @@ pub(crate) fn router_with_store_and_fetcher(
+ }
+ 
+ fn build_router(state: &AppState) -> Router {
++    // The `r0` client and media prefixes served as `v3`: every client
++    // built before spec v1.1 asks for them, and matrix-js-sdk kept asking
++    // on some endpoints (push rules, key upload, TURN) for two years
++    // after. The rewrite has to run before routing, and a layer on a
++    // router runs after it, so the router sits behind the rewrite as the
++    // only service of an outer one.
++    let routes = build_routes(state);
++    Router::new().fallback_service(tower::Layer::layer(
++        &axum::middleware::map_request(compat::legacy_prefix),
++        routes,
++    ))
++}
++
++fn build_routes(state: &AppState) -> Router {
+     Router::new()
+         .route("/", get(root))
+         .route("/_matrix/client/versions", get(versions))
+@@ -849,6 +864,24 @@ fn build_router(state: &AppState) -> Router {
+         )
+         .route("/_matrix/client/v3/pushers/set", post(pushers_set))
+         .route("/_matrix/client/v3/capabilities", get(get_capabilities))
++        .route("/_matrix/client/v3/pushrules/", get(compat::push_rules))
++        .route("/_matrix/client/v3/pushrules", get(compat::push_rules))
++        .route(
++            "/_matrix/client/v3/pushrules/{scope}/{kind}/{rule_id}",
++            put(compat::put_push_rule),
++        )
++        .route(
++            "/_matrix/client/v3/user/{user_id}/filter",
++            post(compat::create_filter),
++        )
++        .route(
++            "/_matrix/client/v3/user/{user_id}/filter/{filter_id}",
++            get(compat::get_filter),
++        )
++        .route(
++            "/_matrix/client/v3/voip/turnServer",
++            get(compat::turn_server),
++        )
+         .route("/_matrix/client/v1/rtc/transports", get(rtc::transports))
+         .route(
+             "/_matrix/client/unstable/org.matrix.msc4143/rtc/transports",
+@@ -2469,7 +2502,8 @@ fn persisted_event(effects: Vec<Effect>) -> Result<Arc<Event>, CreateRoomError>
+ /// `join_rules` is taken from the request's `preset` (or `visibility` when no
+ /// preset is given — see [`join_rule_for`]); `history_visibility` is `shared`,
+ /// which every standard preset agrees on. Aliases, guest access, and arbitrary
+-/// `initial_state` / `power_level_content_override` overrides are not honoured.
++/// `initial_state` overrides are not honoured; `power_level_content_override`
++/// is, see [`power_levels_for`].
+ fn build_initial_events(
+     sender: &OwnedUserId,
+     body: &Value,
+@@ -2516,7 +2550,11 @@ fn build_initial_events(
+     let mut join_content = json!({ "membership": "join" });
+     set_member_displayname(&mut join_content, display_name);
+     add("m.room.member", sender.as_str(), join_content)?;
+-    add("m.room.power_levels", "", default_power_levels())?;
++    add(
++        "m.room.power_levels",
++        "",
++        power_levels_for(sender, body.get("power_level_content_override")),
++    )?;
+     add(
+         "m.room.join_rules",
+         "",
+@@ -2559,6 +2597,39 @@ fn build_initial_events(
+     Ok((create, initial))
+ }
+ 
++/// The room's first power levels: the defaults with the request's
++/// `power_level_content_override` merged over them, as the spec says
++/// (`createRoom`: "the power level content to override in the default
++/// power level event"). A call client needs this -- Element Call sets
++/// `org.matrix.msc3401.call.member` to 0 on every room it creates, since
++/// the default `state_default` of 50 keeps every ordinary member out of
++/// the call. Object-valued keys (`events`, `users`, `notifications`) merge
++/// entry by entry; scalars replace. Room v12 forbids naming a creator in
++/// `users` (rule 10.4), so the creator is dropped from an override that
++/// names them: they are all-powerful already.
++fn power_levels_for(sender: &OwnedUserId, override_: Option<&Value>) -> Value {
++    let mut levels = default_power_levels();
++    let Some(Value::Object(override_)) = override_ else {
++        return levels;
++    };
++    for (key, value) in override_ {
++        match (levels.get_mut(key), value) {
++            (Some(Value::Object(existing)), Value::Object(incoming)) => {
++                for (k, v) in incoming {
++                    existing.insert(k.clone(), v.clone());
++                }
++            }
++            _ => {
++                levels[key] = value.clone();
++            }
++        }
++    }
++    if let Some(Value::Object(users)) = levels.get_mut("users") {
++        users.remove(sender.as_str());
++    }
++    levels
++}
++
+ /// Spec-default `m.room.power_levels` content for a new room. Room v12 makes
+ /// the creator implicitly all-powerful (and rule 10.4 forbids naming a creator
+ /// in `users`), so `users` is left empty rather than pinning the creator at a
+-- 
+2.43.0
+

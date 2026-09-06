@@ -5,6 +5,11 @@
 //
 //   WEB_URL   where the full-mesh build is served
 //   OUT_DIR   where screenshots go (one per step on failure, final on success)
+//   WEB_URL_CREATOR, CREATOR_SERVER
+//             across the mesh seam: a second copy of the build whose
+//             homeserver is a Neutrino node, and that node's name. The
+//             creator uses it; the joiner stays on WEB_URL and reaches the
+//             room by its alias on the node, over federation.
 //
 // The call is MSC3401 as the full-mesh branch speaks it: call membership as
 // `org.matrix.msc3401.call.member` room state, WebRTC offers, answers and
@@ -19,6 +24,8 @@ const { chromium } = require('playwright');
 const path = require('node:path');
 
 const WEB_URL = process.env.WEB_URL;
+const WEB_URL_CREATOR = process.env.WEB_URL_CREATOR || WEB_URL;
+const CREATOR_SERVER = process.env.CREATOR_SERVER;
 const OUT_DIR = process.env.OUT_DIR || '.';
 const CALL = `venue-${Date.now().toString(36)}`;
 const SLOW = 45_000;
@@ -175,7 +182,7 @@ async function waitForTiles(page, count) {
   let inviteUrl;
 
   await step('alice creates the call as a guest', async () => {
-    await alice.goto(`${WEB_URL}/`);
+    await alice.goto(`${WEB_URL_CREATOR}/`);
     await alice.getByTestId('home_callName').fill(CALL, { timeout: SLOW });
     await alice.getByTestId('home_displayName').fill('Alice');
     await alice.getByTestId('home_go').click();
@@ -183,6 +190,12 @@ async function waitForTiles(page, count) {
     // MSC3401 power levels, then the lobby.
     await alice.getByTestId('lobby_joinCall').waitFor({ timeout: SLOW });
     inviteUrl = alice.url();
+    if (CREATOR_SERVER) {
+      // The creator's own app shortens its alias to a bare path; the
+      // joiner is on another server and needs the full alias, which the
+      // joiner's homeserver resolves over federation.
+      inviteUrl = `${WEB_URL}/room/#${CALL}:${CREATOR_SERVER}`;
+    }
     console.log(`call url: ${inviteUrl}`);
   });
 
