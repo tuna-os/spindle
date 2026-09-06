@@ -144,6 +144,18 @@ The tests that pin each of these: `crates/spindle-server/tests/openid.rs`,
 `livekit_jwt.rs`, `rtc_transports.rs`, `rtc_membership.rs` and
 `delayed_events.rs`.
 
+## Running Element Call's own suite
+
+`contrib/element-call/run.sh` stands up Element Call's two-homeserver
+Playwright stack (LiveKit, lk-jwt-service, Element Web, nginx, all
+upstream's and pinned) with Spindle in both of Synapse's seats, and runs
+their specs against it. `docker-compose-spindle.yml` is the whole
+override; `spindle.toml` and `spindle-othersite.toml` stand in for
+`backend/playwright_homeserver*.yaml`. Results go through
+`scripts/element-call-check.py` against `contrib/element-call/allowlist.txt`,
+the same ratchet shape as Complement's. The `element-call-e2e` job in
+`.github/workflows/compliance.yml` runs it nightly and on demand.
+
 ## What is not here
 
 - **Remote users on the built-in service.** MSC4195's current draft adds

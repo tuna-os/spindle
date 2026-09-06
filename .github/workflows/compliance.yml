@@ -452,3 +452,52 @@ jobs:
             tmp/compliance-interop-inverse.jsonl
             tmp/compliance-interop-inverse.md
           if-no-files-found: ignore
+
+  # Element Call's own Playwright suite with Spindle in Synapse's seat
+  # (#269, the acceptance gate #41 asks for): upstream's two-homeserver
+  # stack, unforked and pinned, driven by their specs through a real
+  # browser. Nightly and on demand rather than per pull request, because it
+  # pulls six upstream images and builds Element Call, and because the
+  # ratchet it enforces (contrib/element-call/allowlist.txt) starts empty:
+  # the rig was authored without a Docker host to run it on, so the first
+  # recorded run is what fills it in. Until an entry is protected the check
+  # cannot fail on a spec, only on the stack not coming up -- which is a
+  # finding worth a red run, so it is not continue-on-error.
+  element-call-e2e:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Build the Spindle image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: complement/Dockerfile
+          tags: complement-spindle:latest
+          load: true
+          cache-from: type=gha,scope=complement-image
+      - name: Check out Element Call at the pin
+        run: |
+          set -euo pipefail
+          rev=$(sed -n 's/^ELEMENT_CALL_REV=//p' contrib/element-call/run.sh)
+          git clone --quiet https://github.com/element-hq/element-call.git tmp/element-call
+          git -C tmp/element-call checkout --quiet "$rev"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: tmp/element-call/.node-version
+      - name: Run the suite against Spindle
+        env:
+          SPINDLE_IMAGE: complement-spindle:latest
+          ELEMENT_CALL_SRC: tmp/element-call
+        run: contrib/element-call/run.sh tmp/element-call-results/results.json
+      - name: Keep the report and the server logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: element-call-e2e
+          path: |
+            tmp/element-call-results/
+            tmp/element-call/playwright-report/
+          if-no-files-found: ignore

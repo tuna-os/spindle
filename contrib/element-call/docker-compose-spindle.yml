@@ -1,0 +1,37 @@
+# Element Call's own Playwright stack with Spindle in Synapse's seat (#269).
+#
+# An override on top of element-call's docker-compose-dev.yml and
+# docker-compose-playwright.yml, never a fork of them: only the two
+# homeserver services change. Everything else -- the two LiveKit SFUs, the
+# two lk-jwt-services, the two Element Webs and the nginx that fronts them
+# under *.m.localhost -- is upstream's, at the revision run.sh pins.
+#
+#   docker compose -f docker-compose-dev.yml -f docker-compose-playwright.yml \
+#       -f /path/to/this/docker-compose-spindle.yml up -d
+#
+# The image is the Complement one (complement/Dockerfile): the same server
+# binary, with the entrypoint swapped for one that trusts upstream's dev CA
+# instead of Complement's. nginx proxies /_matrix on 80, 443 and 8448 to
+# homeserver:8008 and homeserver-1:18008, so neither Spindle terminates TLS
+# and neither needs a federation listener of its own.
+services:
+  synapse:
+    image: ${SPINDLE_IMAGE:-complement-spindle:latest}
+    pull_policy: never
+    entrypoint: ["/usr/local/bin/spindle-element-call-entrypoint.sh"]
+    environment:
+      - SPINDLE_LOG=${SPINDLE_LOG:-info}
+    volumes:
+      - ${SPINDLE_CONTRIB:-.}/entrypoint.sh:/usr/local/bin/spindle-element-call-entrypoint.sh:ro,Z
+      - ${SPINDLE_CONTRIB:-.}/spindle.toml:/cfg/spindle.toml:ro,Z
+      - ./backend/dev_tls_local-ca.crt:/cfg/dev-ca.crt:ro,Z
+  synapse-1:
+    image: ${SPINDLE_IMAGE:-complement-spindle:latest}
+    pull_policy: never
+    entrypoint: ["/usr/local/bin/spindle-element-call-entrypoint.sh"]
+    environment:
+      - SPINDLE_LOG=${SPINDLE_LOG:-info}
+    volumes:
+      - ${SPINDLE_CONTRIB:-.}/entrypoint.sh:/usr/local/bin/spindle-element-call-entrypoint.sh:ro,Z
+      - ${SPINDLE_CONTRIB:-.}/spindle-othersite.toml:/cfg/spindle.toml:ro,Z
+      - ./backend/dev_tls_local-ca.crt:/cfg/dev-ca.crt:ro,Z
