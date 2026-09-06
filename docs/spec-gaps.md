@@ -10,13 +10,12 @@ and the diff is the work the release brought.
 
 ## Client-Server API
 
-122 of 166 operations served.
+126 of 166 operations served.
 
 ### Not served, in the spec since before v1.1
 
 8 of these are deprecated upstream and can stay unserved.
 
-- `GET /_matrix/client/v1/mutual_rooms` — `mutual_rooms.yaml`
 - `GET /_matrix/client/v3/account/3pid` — `administrative_contact.yaml`
 - `POST /_matrix/client/v3/account/3pid` *(deprecated)* — `administrative_contact.yaml`
 - `POST /_matrix/client/v3/account/3pid/add` — `administrative_contact.yaml`
@@ -63,12 +62,6 @@ and the diff is the work the release brought.
 
 - `GET /_matrix/client/v1/register/m.login.registration_token/validity` — `registration_tokens.yaml`
 
-### Not served, added in v1.7
-
-- `POST /_matrix/client/v1/login/get_token` — `login_token.yaml`
-- `POST /_matrix/media/v1/create` — `content-repo.yaml`
-- `PUT /_matrix/media/v3/upload/{serverName}/{mediaId}` — `content-repo.yaml`
-
 ### Not served, added in v1.18
 
 - `GET /.well-known/matrix/policy_server` — `policy_server.yaml`
@@ -79,32 +72,15 @@ and the diff is the work the release brought.
 
 ## Server-Server API
 
-23 of 36 operations served.
+31 of 36 operations served.
 
 ### Not served, in the spec since before v1.1
 
 - `PUT /_matrix/federation/v1/3pid/onbind` — `third_party_invite.yaml`
-- `GET /_matrix/federation/v1/event_auth/{roomId}/{eventId}` — `event_auth.yaml`
 - `PUT /_matrix/federation/v1/exchange_third_party_invite/{roomId}` — `third_party_invite.yaml`
 - `PUT /_matrix/federation/v1/invite/{roomId}/{eventId}` — `invites-v1.yaml`
-- `GET /_matrix/federation/v1/publicRooms` — `public_rooms.yaml`
-- `POST /_matrix/federation/v1/publicRooms` — `public_rooms.yaml`
 - `GET /_matrix/federation/v1/query/{queryType}` — `query.yaml`
-- `POST /_matrix/key/v2/query` — `keys_query.yaml`
-- `GET /_matrix/key/v2/query/{serverName}` — `keys_query.yaml`
 - `POST /_matrix/policy/v1/sign` — `room_policy.yaml`
-
-### Not served, added in v1.2
-
-- `GET /_matrix/federation/v1/hierarchy/{roomId}` — `space_hierarchy.yaml`
-
-### Not served, added in v1.6
-
-- `GET /_matrix/federation/v1/timestamp_to_event/{roomId}` — `events.yaml`
-
-### Not served, added in v1.11
-
-- `GET /_matrix/federation/v1/media/thumbnail/{mediaId}` — `content_repository.yaml`
 
 ## Served beyond the spec at this pin
 

@@ -594,21 +594,34 @@ impl Rooms {
 
         // The auth chain is every event the state transitively cites: a
         // walk over stored bodies, deduplicated, no network.
-        let mut seen = std::collections::BTreeSet::new();
-        let mut frontier: Vec<String> = pdus
+        let frontier: Vec<String> = pdus
             .iter()
-            .flat_map(|(_, event)| {
-                event["auth_events"]
-                    .as_array()
-                    .map(|ids| {
-                        ids.iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-            })
+            .flat_map(|(_, event)| cited_auth_events(event))
             .collect();
+        let auth_chain = self.auth_chain_from(room_id, frontier);
+        Ok((pdus, auth_chain))
+    }
+
+    /// The auth chain of one event (`GET /event_auth/{roomId}/{eventId}`):
+    /// every event it cites, and every event those cite, to the create.
+    ///
+    /// # Errors
+    ///
+    /// [`RoomError::UnknownRoom`] for a room this server is not in, and
+    /// the event lookup's error when the room has no such event.
+    pub fn auth_chain(&self, room_id: &str, event_id: &str) -> Result<Vec<Value>, RoomError> {
+        let event = self.event(room_id, event_id)?;
+        Ok(self
+            .auth_chain_from(room_id, cited_auth_events(&event))
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect())
+    }
+
+    /// Walk `auth_events` from `frontier` to the create event, each event
+    /// once, from stored bodies alone.
+    fn auth_chain_from(&self, room_id: &str, mut frontier: Vec<String>) -> Vec<IdentifiedEvent> {
+        let mut seen = std::collections::BTreeSet::new();
         let mut auth_chain = Vec::new();
         while let Some(id) = frontier.pop() {
             if !seen.insert(id.clone()) {
@@ -617,12 +630,10 @@ impl Rooms {
             let Ok(event) = self.event(room_id, &id) else {
                 continue;
             };
-            if let Some(ids) = event["auth_events"].as_array() {
-                frontier.extend(ids.iter().filter_map(Value::as_str).map(str::to_owned));
-            }
+            frontier.extend(cited_auth_events(&event));
             auth_chain.push((id, event));
         }
-        Ok((pdus, auth_chain))
+        auth_chain
     }
 
     /// Every remote domain with a live member in the room — the EDU
@@ -1140,4 +1151,17 @@ fn order_state_dag(events: Vec<(String, Value)>) -> Vec<(String, Value)> {
         .sort_by_key(|(id, event)| (event["origin_server_ts"].as_u64().unwrap_or(0), id.clone()));
     ordered.extend(timeline);
     ordered
+}
+
+/// The event ids an event's `auth_events` names.
+fn cited_auth_events(event: &Value) -> Vec<String> {
+    event["auth_events"]
+        .as_array()
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }

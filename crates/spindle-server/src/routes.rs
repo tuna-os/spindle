@@ -72,6 +72,17 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/v3/rooms/{room_id}/event/{event_id}",
     "/_matrix/client/v3/rooms/{room_id}/context/{event_id}",
     "/_matrix/key/v2/server",
+    "/_matrix/key/v2/query",
+    "/_matrix/key/v2/query/{server_name}",
+    "/_matrix/media/v1/create",
+    "/_matrix/media/v3/upload/{server_name}/{media_id}",
+    "/_matrix/client/v1/login/get_token",
+    "/_matrix/client/v1/mutual_rooms",
+    "/_matrix/federation/v1/media/thumbnail/{media_id}",
+    "/_matrix/federation/v1/event_auth/{room_id}/{event_id}",
+    "/_matrix/federation/v1/publicRooms",
+    "/_matrix/federation/v1/hierarchy/{room_id}",
+    "/_matrix/federation/v1/timestamp_to_event/{room_id}",
     "/.well-known/matrix/client",
     "/.well-known/matrix/server",
     "/health",
@@ -98,6 +109,7 @@ pub fn router(state: AppState) -> Router {
         .merge(timeline_routes())
         .merge(media_routes())
         .merge(discovery_routes())
+        .merge(federation_read_routes())
         .merge(crate::mas::routes())
         .merge(crate::admin::routes())
         .merge(crate::oidc::routes())
@@ -485,6 +497,8 @@ fn account_routes() -> Router<AppState> {
         )
         .route("/_matrix/client/v3/logout", post(logout))
         .route("/_matrix/client/v3/logout/all", post(logout_all))
+        .route("/_matrix/client/v1/login/get_token", post(login_get_token))
+        .route("/_matrix/client/v1/mutual_rooms", get(mutual_rooms))
         .route("/_matrix/client/v3/refresh", post(refresh))
         .route("/_matrix/client/v3/account/whoami", get(whoami))
         .route("/_matrix/client/v3/keys/upload", post(upload_keys))
@@ -815,6 +829,13 @@ fn media_routes() -> Router<AppState> {
                     crate::media::MAX_UPLOAD + 1,
                 )),
         )
+        .route("/_matrix/media/v1/create", post(create_media))
+        .route(
+            "/_matrix/media/v3/upload/{server_name}/{media_id}",
+            axum::routing::put(upload_reserved_media).layer(axum::extract::DefaultBodyLimit::max(
+                crate::media::MAX_UPLOAD + 1,
+            )),
+        )
         .route("/_matrix/media/v3/config", get(media_config))
         .route("/_matrix/client/v1/media/config", get(media_config))
         .route("/_matrix/client/v1/media/preview_url", get(preview_url))
@@ -1059,7 +1080,64 @@ async fn federation_media_download(
         .bytes(&media_id)
         .await
         .map_err(|error| media_error(&error))?;
+    multipart_media(
+        &record.content_type,
+        Some(&record.content_disposition()),
+        &bytes,
+    )
+}
 
+/// `GET /_matrix/federation/v1/media/thumbnail/{mediaId}` (spec v1.11)
+///
+/// The authenticated-media twin of the client thumbnail, in the same
+/// `multipart/mixed` framing as the federation download.
+async fn federation_media_thumbnail(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(media_id): axum::extract::Path<String>,
+    // Every field optional so a missing one is refused after the
+    // signature check, in the spec's JSON shape, not by the extractor.
+    axum::extract::Query(query): axum::extract::Query<FederationThumbnailQuery>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<axum::response::Response, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    federation_origin(&state, &headers, "GET", &uri, None).await?;
+    let (Some(width), Some(height)) = (query.width, query.height) else {
+        return Err(MatrixError::missing_param("width and height are required"));
+    };
+    if width == 0 || height == 0 {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            "width and height must be positive",
+        ));
+    }
+    let crop = query.method.as_deref() == Some("crop");
+    let (content_type, bytes) = state
+        .media
+        .thumbnail(&media_id, width, height, crop)
+        .await
+        .map_err(|error| media_error(&error))?;
+    multipart_media(&content_type, None, &bytes)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FederationThumbnailQuery {
+    width: Option<u32>,
+    height: Option<u32>,
+    method: Option<String>,
+}
+
+/// The `multipart/mixed` body authenticated federation media travels in:
+/// an empty JSON metadata part, then the bytes.
+fn multipart_media(
+    content_type: &str,
+    disposition: Option<&str>,
+    bytes: &[u8],
+) -> Result<axum::response::Response, MatrixError> {
     // The boundary need only be absent from the payload's *framing*, and a
     // random 32-hex string followed by the exact dash-CRLF framing has no
     // way to occur inside the file; fixed randomness per response keeps
@@ -1077,15 +1155,12 @@ async fn federation_media_download(
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
     body.extend_from_slice(b"content-type: application/json\r\n\r\n{}\r\n");
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(format!("content-type: {}\r\n", record.content_type).as_bytes());
-    body.extend_from_slice(
-        format!(
-            "content-disposition: {}\r\n\r\n",
-            record.content_disposition()
-        )
-        .as_bytes(),
-    );
-    body.extend_from_slice(&bytes);
+    body.extend_from_slice(format!("content-type: {content_type}\r\n").as_bytes());
+    if let Some(disposition) = disposition {
+        body.extend_from_slice(format!("content-disposition: {disposition}\r\n").as_bytes());
+    }
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(bytes);
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
     axum::response::Response::builder()
@@ -1148,6 +1223,24 @@ fn media_error(error: &crate::media::MediaError) -> MatrixError {
         Error::Unknown(_) | Error::Missing { .. } => {
             MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", error.to_string())
         }
+        // 504, as the spec has it: the bytes are on their way from another
+        // client, and the asker should try again rather than give up.
+        Error::NotYetUploaded(_) => MatrixError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "M_NOT_YET_UPLOADED",
+            error.to_string(),
+        ),
+        Error::AlreadyUploaded(_) => MatrixError::new(
+            StatusCode::CONFLICT,
+            "M_CANNOT_OVERWRITE_MEDIA",
+            error.to_string(),
+        ),
+        Error::NotReserver(_) => MatrixError::forbidden(error.to_string()),
+        Error::TooManyPending(_) => MatrixError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "M_LIMIT_EXCEEDED",
+            error.to_string(),
+        ),
         Error::TooLarge { .. } => MatrixError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             "M_TOO_LARGE",
@@ -1165,6 +1258,34 @@ fn media_error(error: &crate::media::MediaError) -> MatrixError {
 }
 
 /// What a client or a peer reads before it knows anything else.
+/// The read-side federation surface added with the second spec-gap wave,
+/// and the key notary.
+fn federation_read_routes() -> Router<AppState> {
+    Router::new()
+        .route("/_matrix/key/v2/query", post(key_query_batch))
+        .route("/_matrix/key/v2/query/{server_name}", get(key_query_one))
+        .route(
+            "/_matrix/federation/v1/media/thumbnail/{media_id}",
+            get(federation_media_thumbnail),
+        )
+        .route(
+            "/_matrix/federation/v1/event_auth/{room_id}/{event_id}",
+            get(federation_event_auth),
+        )
+        .route(
+            "/_matrix/federation/v1/publicRooms",
+            get(federation_public_rooms).post(federation_public_rooms_filtered),
+        )
+        .route(
+            "/_matrix/federation/v1/hierarchy/{room_id}",
+            get(federation_hierarchy),
+        )
+        .route(
+            "/_matrix/federation/v1/timestamp_to_event/{room_id}",
+            get(federation_timestamp_to_event),
+        )
+}
+
 fn discovery_routes() -> Router<AppState> {
     Router::new()
         .route("/_matrix/client/versions", get(versions))
@@ -1307,6 +1428,7 @@ async fn capabilities() -> Json<Value> {
             json!({ "default": default, "available": Value::Object(available) }),
         );
     }
+    capabilities.insert("m.get_login_token".to_owned(), json!({ "enabled": true }));
     Json(json!({ "capabilities": Value::Object(capabilities) }))
 }
 
@@ -1446,6 +1568,8 @@ struct LoginRequest {
     /// The deprecated top-level form, still sent by older clients.
     user: Option<String>,
     password: Option<String>,
+    /// `m.login.token`: a token from `POST /login/get_token`.
+    token: Option<String>,
     device_id: Option<String>,
     initial_device_display_name: Option<String>,
     #[serde(default)]
@@ -1495,14 +1619,79 @@ fn session_body(user_id: &str, session: &crate::accounts::Session) -> Value {
 
 /// `GET /_matrix/client/v3/login`
 ///
-/// Only password login. SSO and token login are advertised by servers that
-/// implement them; listing a flow we cannot complete would send a client down
-/// a path that dead-ends.
+/// Password login, and token login for the tokens `POST /login/get_token`
+/// mints (spec v1.7), which is what `get_login_token: true` tells an
+/// unauthenticated client. SSO is advertised by servers that implement it;
+/// listing a flow we cannot complete would send a client down a path that
+/// dead-ends.
 async fn login_flows(State(state): State<AppState>) -> Result<Json<Value>, MatrixError> {
     if state.delegated.is_some() {
         return Err(delegated_refusal());
     }
-    Ok(Json(json!({ "flows": [{ "type": "m.login.password" }] })))
+    Ok(Json(json!({ "flows": [
+        { "type": "m.login.password" },
+        { "type": "m.login.token", "get_login_token": true },
+    ] })))
+}
+
+/// The `m.login.token` half of `POST /login`: one token, one session.
+fn login_with_token(state: &AppState, request: LoginRequest) -> Result<Json<Value>, MatrixError> {
+    let token = request
+        .token
+        .as_deref()
+        .ok_or_else(|| MatrixError::bad_json("no token"))?;
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let localpart = accounts
+        .redeem_login_token(token)
+        .map_err(|error| match error {
+            AccountError::UnknownToken => MatrixError::forbidden("the login token is not valid"),
+            other => internal(&other),
+        })?;
+    let session = accounts
+        .create_session(
+            &localpart,
+            request.device_id,
+            request.initial_device_display_name,
+            request.refresh_token,
+        )
+        .map_err(|error| internal(&error))?;
+    Ok(Json(session_body(&accounts.user_id(&localpart), &session)))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GetLoginTokenRequest {
+    auth: Option<Value>,
+}
+
+/// `POST /_matrix/client/v1/login/get_token` (spec v1.7)
+///
+/// Behind the password stage of UIA, as the spec asks: the token logs a
+/// second client in as this user, so minting one is as strong as a login.
+async fn login_get_token(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<Value>), MatrixError> {
+    let request: GetLoginTokenRequest = optional_body(&body)?;
+    let localpart = localpart_of(&identity.user_id);
+    if let Some(challenge) = password_uia(
+        &state,
+        &localpart,
+        &headers,
+        request.auth.as_ref(),
+        "get_login_token",
+    )? {
+        return Ok((StatusCode::UNAUTHORIZED, challenge));
+    }
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let (login_token, expires_in_ms) = accounts
+        .issue_login_token(&localpart)
+        .map_err(|error| internal(&error))?;
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "login_token": login_token, "expires_in_ms": expires_in_ms })),
+    ))
 }
 
 /// `POST /_matrix/client/v3/login`
@@ -1513,6 +1702,9 @@ async fn login(
 ) -> Result<Json<Value>, MatrixError> {
     if state.delegated.is_some() {
         return Err(delegated_refusal());
+    }
+    if request.kind == "m.login.token" {
+        return login_with_token(&state, request);
     }
     if request.kind != "m.login.password" {
         return Err(MatrixError::new(
@@ -2748,6 +2940,11 @@ pub(crate) fn record_invite(
 /// trusting a key we may have had to rotate, and the cost of it being wrong is
 /// borne by whoever has to explain why signatures stopped verifying.
 async fn server_keys(State(state): State<AppState>) -> Json<Value> {
+    Json(own_key_document(&state))
+}
+
+/// This server's signed key document, as `/_matrix/key/v2/server` serves it.
+fn own_key_document(state: &AppState) -> Value {
     let valid_until = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_millis().saturating_add(24 * 60 * 60 * 1000))
@@ -2770,7 +2967,12 @@ async fn server_keys(State(state): State<AppState>) -> Json<Value> {
     // the network path. Our own verifier refuses unsigned documents, so an
     // unsigned one here would mean no other Spindle could ever trust us —
     // which is exactly how the first server-to-server test found this.
-    let signed = ruma::CanonicalJsonValue::try_from(document.clone())
+    sign_with_own_key(state, document)
+}
+
+/// Add this server's signature to a JSON object, keeping any it carries.
+fn sign_with_own_key(state: &AppState, document: Value) -> Value {
+    ruma::CanonicalJsonValue::try_from(document.clone())
         .ok()
         .and_then(|canonical| match canonical {
             ruma::CanonicalJsonValue::Object(mut object) => {
@@ -2784,8 +2986,65 @@ async fn server_keys(State(state): State<AppState>) -> Json<Value> {
             }
             _ => None,
         })
-        .unwrap_or(document);
-    Json(signed)
+        .unwrap_or(document)
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyQueryParams {
+    /// Accepted and not acted on: a document is served as cached, and a
+    /// document that lapsed is refetched by the cache itself.
+    #[allow(dead_code)]
+    minimum_valid_until_ts: Option<u64>,
+}
+
+/// `GET /_matrix/key/v2/query/{serverName}`
+///
+/// The notary form: another server's key document, from this server's
+/// cache (fetched if unseen), with this server's signature added so the
+/// asker can hold us to what we handed on. Our own name answers with our
+/// own document. A server whose keys cannot be had is simply absent.
+async fn key_query_one(
+    State(state): State<AppState>,
+    axum::extract::Path(server_name): axum::extract::Path<String>,
+    axum::extract::Query(_query): axum::extract::Query<KeyQueryParams>,
+) -> Json<Value> {
+    let server_keys = notary_documents(&state, &[server_name]).await;
+    Json(json!({ "server_keys": server_keys }))
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyQueryBatch {
+    #[serde(default)]
+    server_keys: BTreeMap<String, Value>,
+}
+
+/// `POST /_matrix/key/v2/query`
+async fn key_query_batch(
+    State(state): State<AppState>,
+    Json(request): Json<KeyQueryBatch>,
+) -> Json<Value> {
+    let names: Vec<String> = request.server_keys.into_keys().collect();
+    let server_keys = notary_documents(&state, &names).await;
+    Json(json!({ "server_keys": server_keys }))
+}
+
+async fn notary_documents(state: &AppState, names: &[String]) -> Vec<Value> {
+    let mut documents = Vec::new();
+    for name in names {
+        let document = if *name == state.config.server.name {
+            own_key_document(state)
+        } else {
+            match state.federation.peer_key_document(name).await {
+                Ok(document) => sign_with_own_key(state, document),
+                Err(error) => {
+                    tracing::debug!(server = %name, "notary: no key document: {error}");
+                    continue;
+                }
+            }
+        };
+        documents.push(document);
+    }
+    documents
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -7573,6 +7832,15 @@ async fn room_timestamp_to_event(
     axum::extract::Query(query): axum::extract::Query<TimestampToEventQuery>,
 ) -> Result<Json<Value>, MatrixError> {
     may_read_room(&state, &identity.user_id, &room_id)?;
+    timestamp_lookup(&state, &room_id, &query)
+}
+
+/// The lookup behind both spellings of `timestamp_to_event`.
+fn timestamp_lookup(
+    state: &AppState,
+    room_id: &str,
+    query: &TimestampToEventQuery,
+) -> Result<Json<Value>, MatrixError> {
     let ts = query
         .ts
         .ok_or_else(|| MatrixError::missing_param("ts is required"))?;
@@ -7588,12 +7856,28 @@ async fn room_timestamp_to_event(
     };
     let (event_id, origin_server_ts) = state
         .rooms
-        .event_at_timestamp(&room_id, ts, direction)
+        .event_at_timestamp(room_id, ts, direction)
         .map_err(room_error)?;
     Ok(Json(json!({
         "event_id": event_id,
         "origin_server_ts": origin_server_ts,
     })))
+}
+
+/// `GET /_matrix/federation/v1/timestamp_to_event/{roomId}` (spec v1.6)
+async fn federation_timestamp_to_event(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<TimestampToEventQuery>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    crate::inbound::federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
+    timestamp_lookup(&state, &room_id, &query)
 }
 
 /// MSC4140's delay, spelled as the unstable query parameter.
@@ -10079,4 +10363,229 @@ async fn room_hierarchy(
         body.insert("next_batch".to_owned(), json!((offset + limit).to_string()));
     }
     Ok(Json(Value::Object(body)))
+}
+
+/// `POST /_matrix/media/v1/create` (spec v1.7)
+///
+/// An `mxc://` URI ahead of its bytes, so a client can put the URI in an
+/// event while the upload is still going.
+async fn create_media(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+) -> Result<Json<Value>, MatrixError> {
+    let (media_id, unused_expires_at) = state
+        .media
+        .reserve(&identity.user_id)
+        .map_err(|error| media_error(&error))?;
+    Ok(Json(json!({
+        "content_uri": state.media.mxc(&media_id),
+        "unused_expires_at": unused_expires_at,
+    })))
+}
+
+/// `PUT /_matrix/media/v3/upload/{serverName}/{mediaId}` (spec v1.7)
+async fn upload_reserved_media(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<UploadQuery>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, MatrixError> {
+    if !state.media.is_ours(&server_name) {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            format!("{server_name} is not this server"),
+        ));
+    }
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+    state
+        .media
+        .put_reserved(
+            &media_id,
+            &body,
+            &content_type,
+            query.filename.as_deref(),
+            &identity.user_id,
+        )
+        .await
+        .map_err(|error| media_error(&error))?;
+    Ok(Json(json!({})))
+}
+
+#[derive(Debug, Deserialize)]
+struct MutualRoomsQuery {
+    user_id: String,
+    /// Accepted for the shape of the spec: every answer fits one page.
+    #[allow(dead_code)]
+    from: Option<String>,
+}
+
+/// `GET /_matrix/client/v1/mutual_rooms?user_id=` (MSC2666)
+///
+/// The rooms both the caller and `user_id` are joined to. Nothing the
+/// caller could not learn from their own rooms' member lists, one query
+/// instead of many.
+async fn mutual_rooms(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Query(query): axum::extract::Query<MutualRoomsQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    if query.user_id == identity.user_id {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            "mutual rooms are with someone else",
+        ));
+    }
+    let mine = state.rooms.joined(&identity.user_id).map_err(room_error)?;
+    let joined: Vec<String> = mine
+        .into_iter()
+        .filter(|room_id| {
+            state
+                .rooms
+                .is_joined(&query.user_id, room_id)
+                .unwrap_or(false)
+        })
+        .collect();
+    Ok(Json(json!({ "joined": joined, "count": joined.len() })))
+}
+
+/// `GET /_matrix/federation/v1/event_auth/{roomId}/{eventId}`
+async fn federation_event_auth(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    crate::inbound::federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
+    let auth_chain = state
+        .rooms
+        .auth_chain(&room_id, &event_id)
+        .map_err(room_error)?;
+    Ok(Json(json!({ "auth_chain": auth_chain })))
+}
+
+/// `GET /_matrix/federation/v1/publicRooms`
+///
+/// This server's published directory, for a peer that asks. The same
+/// page a client gets, since the directory is public by definition.
+async fn federation_public_rooms(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<PublicRoomsQuery>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    federation_origin(&state, &headers, "GET", &uri, None).await?;
+    directory_page(&state, query.limit, query.since.as_deref(), None, &[])
+}
+
+/// `POST /_matrix/federation/v1/publicRooms`
+async fn federation_public_rooms_filtered(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let bytes = axum::body::to_bytes(request.into_body(), 64 * 1024)
+        .await
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let body: Value =
+        serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    federation_origin(&state, &headers, "POST", &uri, Some(&body)).await?;
+    let filter: PublicRoomsRequest =
+        serde_json::from_value(body).map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    directory_page(
+        &state,
+        filter.limit,
+        filter.since.as_deref(),
+        filter.filter.generic_search_term.as_deref(),
+        &filter.filter.room_types,
+    )
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FederationHierarchyQuery {
+    #[serde(default)]
+    suggested_only: bool,
+}
+
+/// `GET /_matrix/federation/v1/hierarchy/{roomId}` (spec v1.2)
+///
+/// One level of a space for a peer walking it: the space and its direct
+/// children, each as a room summary with its own `m.space.child` state.
+/// A child the requesting server may not see (not public, not knockable,
+/// not world-readable, and no member of theirs in it) is named in
+/// `inaccessible_children` rather than described.
+async fn federation_hierarchy(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<FederationHierarchyQuery>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let origin = federation_origin(&state, &headers, "GET", &uri, None).await?;
+    let visible = |room: &str| -> Option<crate::rooms::RoomSummary> {
+        let summary = state.rooms.summary(room).ok()?;
+        if state.rooms.server_in_room(room, &origin).unwrap_or(false) {
+            return Some(summary);
+        }
+        let open = summary.world_readable
+            || matches!(summary.join_rule.as_deref(), Some("public" | "knock"));
+        open.then_some(summary)
+    };
+    let Some(root) = visible(&room_id) else {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "the room is not known here, or not visible to the requesting server",
+        ));
+    };
+    let with_children = |summary: &crate::rooms::RoomSummary| -> Value {
+        let mut entry = match chunk_of(summary) {
+            Value::Object(entry) => entry,
+            _ => serde_json::Map::new(),
+        };
+        let children = space_children(&state, &summary.room_id, query.suggested_only);
+        entry.insert("children_state".to_owned(), Value::Array(children));
+        entry.insert("allowed_room_ids".to_owned(), json!([]));
+        Value::Object(entry)
+    };
+    let parent = with_children(&root);
+    let mut children = Vec::new();
+    let mut inaccessible = Vec::new();
+    for child in space_children(&state, &room_id, query.suggested_only) {
+        let Some(child_id) = child["state_key"].as_str() else {
+            continue;
+        };
+        match visible(child_id) {
+            Some(summary) => children.push(with_children(&summary)),
+            None => inaccessible.push(json!(child_id)),
+        }
+    }
+    Ok(Json(json!({
+        "room": parent,
+        "children": children,
+        "inaccessible_children": inaccessible,
+    })))
 }

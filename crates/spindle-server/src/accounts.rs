@@ -18,7 +18,7 @@ use argon2::Argon2;
 use argon2::password_hash::phc::{PasswordHash, Salt};
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use serde::{Deserialize, Serialize};
-use spindle_core::keys::{Keyspace, room_prefix};
+use spindle_core::keys::{self, Keyspace, room_prefix};
 use spindle_store::{Store, StoreError};
 
 /// How many bytes of entropy an access token carries.
@@ -99,6 +99,17 @@ pub struct Session {
 /// that does not expire -- which is why `expires_in_ms` is absent there rather
 /// than merely large.
 const ACCESS_TOKEN_LIFETIME_MS: u64 = 60 * 60 * 1000;
+
+/// How long a `get_token` login token stays redeemable: the spec's two
+/// minutes, enough to hand it to the other client and no more.
+pub const LOGIN_TOKEN_TTL_MS: u64 = 2 * 60 * 1000;
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
 
 /// The identity behind an authenticated request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -218,6 +229,46 @@ impl<'a, S: Store> Accounts<'a, S> {
         // A deactivated account keeps its hash (the row is the localpart
         // reservation) but no longer authenticates.
         Ok(matches && account.is_some_and(|account| !account.deactivated))
+    }
+
+    /// Mint a single-use login token for `localpart` (`POST
+    /// /login/get_token`, spec v1.7), good for [`LOGIN_TOKEN_TTL_MS`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountError`] if the row cannot be written.
+    pub fn issue_login_token(&self, localpart: &str) -> Result<(String, u64), AccountError> {
+        let token = format!("spt_{}", random_id(""));
+        let expires_at = now_millis().saturating_add(LOGIN_TOKEN_TTL_MS);
+        let row = serde_json::json!({ "localpart": localpart, "expires_at": expires_at });
+        self.store
+            .put(&keys::login_token(&token), row.to_string().as_bytes())?;
+        Ok((token, LOGIN_TOKEN_TTL_MS))
+    }
+
+    /// Spend a login token: the localpart it logs in, once. A token that
+    /// is unknown, already spent or lapsed is [`AccountError::UnknownToken`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountError`] if the store cannot be read or written.
+    pub fn redeem_login_token(&self, token: &str) -> Result<String, AccountError> {
+        let key = keys::login_token(token);
+        let Some(bytes) = self.store.get(&key)? else {
+            return Err(AccountError::UnknownToken);
+        };
+        // Spent on sight, whether or not it is still good: a lapsed token
+        // is not one to leave lying around.
+        self.store.delete(&key)?;
+        let row: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| AccountError::Codec(error.to_string()))?;
+        let live = row["expires_at"]
+            .as_u64()
+            .is_some_and(|until| until > now_millis());
+        match row["localpart"].as_str() {
+            Some(localpart) if live => Ok(localpart.to_owned()),
+            _ => Err(AccountError::UnknownToken),
+        }
     }
 
     /// Create a device and an access token for it.

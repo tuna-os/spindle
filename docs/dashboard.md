@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**204 routes implemented; 0 known gaps in scope.**
+**215 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -126,15 +126,19 @@ neither implemented nor counted.
 - `POST/GET /_matrix/client/v3/room_keys/version`
 - `GET/PUT/DELETE /_matrix/client/v3/room_keys/version/{version}`
 
-### Federation — 22 implemented, 0 planned
+### Federation — 27 implemented, 0 planned
 
 - `GET /_matrix/federation/v1/backfill/{room_id}`
 - `GET /_matrix/federation/v1/event/{event_id}`
+- `GET /_matrix/federation/v1/event_auth/{room_id}/{event_id}`
 - `POST /_matrix/federation/v1/get_missing_events/{room_id}`
+- `GET /_matrix/federation/v1/hierarchy/{room_id}`
 - `GET /_matrix/federation/v1/make_join/{room_id}/{user_id}`
 - `GET /_matrix/federation/v1/make_knock/{room_id}/{user_id}`
 - `GET /_matrix/federation/v1/make_leave/{room_id}/{user_id}`
 - `GET /_matrix/federation/v1/media/download/{media_id}`
+- `GET /_matrix/federation/v1/media/thumbnail/{media_id}`
+- `GET/POST /_matrix/federation/v1/publicRooms`
 - `GET /_matrix/federation/v1/query/directory`
 - `GET /_matrix/federation/v1/query/profile`
 - `PUT /_matrix/federation/v1/send/{txn_id}`
@@ -143,6 +147,7 @@ neither implemented nor counted.
 - `PUT /_matrix/federation/v1/send_leave/{room_id}/{event_id}`
 - `GET /_matrix/federation/v1/state/{room_id}`
 - `GET /_matrix/federation/v1/state_ids/{room_id}`
+- `GET /_matrix/federation/v1/timestamp_to_event/{room_id}`
 - `GET /_matrix/federation/v1/user/devices/{user_id}`
 - `POST /_matrix/federation/v1/user/keys/claim`
 - `POST /_matrix/federation/v1/user/keys/query`
@@ -179,7 +184,7 @@ neither implemented nor counted.
 - `GET /_matrix/client/v3/user/{user_id}/rooms/{room_id}/tags`
 - `PUT/DELETE /_matrix/client/v3/user/{user_id}/rooms/{room_id}/tags/{tag}`
 
-### Media — 7 implemented, 0 planned
+### Media — 8 implemented, 0 planned
 
 - `GET /_matrix/client/v1/media/config`
 - `GET /_matrix/client/v1/media/download/{server_name}/{media_id}`
@@ -188,6 +193,7 @@ neither implemented nor counted.
 - `GET /_matrix/client/v1/media/thumbnail/{server_name}/{media_id}`
 - `GET /_matrix/media/v3/config`
 - `POST /_matrix/media/v3/upload`
+- `PUT /_matrix/media/v3/upload/{server_name}/{media_id}`
 
 ### Timeline, messaging & search — 13 implemented, 0 planned
 
@@ -256,7 +262,7 @@ neither implemented nor counted.
 - `POST /_matrix/client/v3/register`
 - `GET /_matrix/client/v3/register/available`
 
-### Server, discovery & operations — 21 implemented, 0 planned
+### Server, discovery & operations — 26 implemented, 0 planned
 
 - `GET /.well-known/matrix/client`
 - `GET /.well-known/matrix/server`
@@ -265,6 +271,8 @@ neither implemented nor counted.
 - `POST /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device/{device_id}/events`
 - `GET/PUT /_matrix/client/v1/admin/lock/{user_id}`
 - `GET/PUT /_matrix/client/v1/admin/suspend/{user_id}`
+- `POST /_matrix/client/v1/login/get_token`
+- `GET /_matrix/client/v1/mutual_rooms`
 - `GET /_matrix/client/v1/rooms/{room_id}/hierarchy`
 - `GET /_matrix/client/v1/rooms/{room_id}/threads`
 - `GET /_matrix/client/v1/rooms/{room_id}/timestamp_to_event`
@@ -276,7 +284,10 @@ neither implemented nor counted.
 - `POST /_matrix/client/v3/user_directory/search`
 - `POST /_matrix/client/v3/users/{user_id}/report`
 - `GET /_matrix/client/versions`
+- `POST /_matrix/key/v2/query`
+- `GET /_matrix/key/v2/query/{server_name}`
 - `GET /_matrix/key/v2/server`
+- `POST /_matrix/media/v1/create`
 - `GET /health`
 - `GET /ready`
 
