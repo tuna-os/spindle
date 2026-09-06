@@ -73,6 +73,19 @@ impl Harness {
         .await
     }
 
+    async fn put(&self, path: &str, token: &str, payload: &Value) -> (StatusCode, Value) {
+        self.call(
+            Request::builder()
+                .method("PUT")
+                .uri(path)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+    }
+
     async fn get(&self, path: &str, token: &str) -> (StatusCode, Value) {
         self.call(
             Request::builder()
@@ -201,5 +214,154 @@ async fn an_invite_carries_the_inviter_s_membership() {
     assert!(
         events.iter().all(|event| event.get("event_id").is_none()),
         "stripped events carry no event IDs: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_context_window_of_zero_is_the_event_alone() {
+    // `tests::room::test_event_with_context`: the SDK asks `/context` with
+    // `limit=0` for the event and its tokens and nothing around it. The
+    // limit was clamped up to one, so a neighbour came back.
+    let server = Harness::new();
+    let alice = server.register("alice").await;
+    let room = server.room_with_invite(&alice, "@bob:example.org").await;
+    let mut ids = Vec::new();
+    for index in 0..3 {
+        let (status, body) = server
+            .put(
+                &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/txn{index}"),
+                &alice,
+                &json!({ "msgtype": "m.text", "body": index.to_string() }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        ids.push(body["event_id"].as_str().unwrap().to_owned());
+    }
+
+    let (status, context) = server
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/context/{}?limit=0", ids[1]),
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{context}");
+    assert_eq!(context["event"]["event_id"], json!(ids[1]));
+    assert_eq!(context["events_before"], json!([]), "{context}");
+    assert_eq!(context["events_after"], json!([]), "{context}");
+    assert!(
+        context["start"].is_string() && context["end"].is_string(),
+        "{context}"
+    );
+}
+
+#[tokio::test]
+async fn a_direct_room_s_invites_say_so() {
+    // `tests::sliding_sync::notification_client::test_notification`: a room
+    // created with `is_direct` invites with `is_direct: true` on the member
+    // event, which is how the invitee's client knows to file it as a DM.
+    // The flag was accepted and dropped.
+    let server = Harness::new();
+    let alice = server.register("alice").await;
+    let bob = server.register("bob").await;
+    let (status, body) = server
+        .post(
+            "/_matrix/client/v3/createRoom",
+            &alice,
+            &json!({ "invite": ["@bob:example.org"], "is_direct": true }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+
+    let sync = server.sync(&bob, "").await;
+    let events = sync["rooms"]["invite"][&room]["invite_state"]["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{sync}"));
+    let own = events
+        .iter()
+        .find(|event| event["type"] == "m.room.member" && event["state_key"] == "@bob:example.org")
+        .unwrap_or_else(|| panic!("{sync}"));
+    assert_eq!(own["content"]["is_direct"], json!(true), "{own}");
+
+    // And a plain invite says nothing, so a client does not file a group
+    // room as a DM.
+    let (status, body) = server
+        .post("/_matrix/client/v3/createRoom", &alice, &json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let plain = body["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = server
+        .post(
+            &format!("/_matrix/client/v3/rooms/{plain}/invite"),
+            &alice,
+            &json!({ "user_id": "@bob:example.org" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sync = server.sync(&bob, "").await;
+    let own = sync["rooms"]["invite"][&plain]["invite_state"]["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{sync}"))
+        .iter()
+        .find(|event| event["type"] == "m.room.member" && event["state_key"] == "@bob:example.org")
+        .cloned()
+        .unwrap_or_else(|| panic!("{sync}"));
+    assert!(own["content"].get("is_direct").is_none(), "{own}");
+}
+
+#[tokio::test]
+async fn a_room_created_with_an_alias_names_it_as_canonical() {
+    // `tests::sliding_sync::room::test_room_preview`: the preview reads the
+    // canonical alias from room state, and the spec has the server write
+    // `m.room.canonical_alias` for a room created with `room_alias_name`.
+    // The alias was claimed in the directory and the state left unwritten.
+    let server = Harness::new();
+    let alice = server.register("alice").await;
+    let (status, body) = server
+        .post(
+            "/_matrix/client/v3/createRoom",
+            &alice,
+            &json!({ "room_alias_name": "reading-circle" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    let (status, canonical) = server
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.canonical_alias/"),
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{canonical}");
+    assert_eq!(canonical["alias"], json!("#reading-circle:example.org"));
+
+    // A client that set its own canonical alias in initial_state keeps it:
+    // the server does not overwrite what the room already said.
+    let (status, body) = server
+        .post(
+            "/_matrix/client/v3/createRoom",
+            &alice,
+            &json!({
+                "room_alias_name": "second",
+                "initial_state": [{
+                    "type": "m.room.canonical_alias",
+                    "state_key": "",
+                    "content": { "alias": "#second:example.org", "alt_aliases": ["#other:example.org"] }
+                }]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    let (_, canonical) = server
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.canonical_alias/"),
+            &alice,
+        )
+        .await;
+    assert_eq!(
+        canonical["alt_aliases"],
+        json!(["#other:example.org"]),
+        "{canonical}"
     );
 }
