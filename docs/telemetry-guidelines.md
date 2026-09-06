@@ -29,8 +29,27 @@
 - **Local Network Boundary:** All telemetry data stays strictly within local boundaries unless explicitly routed by network operators via local scrapers or reverse proxies.
 - **Cardinality Limits:** Custom metrics must maintain bounded label dimensions (e.g., standard HTTP status codes, specific durability modes, or case types) to prevent memory expansion.
 
-## Future OpenTelemetry Roadmap
+## Traces
 
-Should an operator request external OpenTelemetry distributed tracing:
-- OpenTelemetry SDK integration must remain strictly opt-in via configuration flags.
-- Endpoint destinations must be specified via standard environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`) without hardcoded backend addresses.
+Distributed tracing exists and is off. It is switched on by naming the
+exporter in the config, and by nothing else:
+
+```toml
+[logging]
+traces = "otlp"
+```
+
+With that line the server exports every span it records -- one per
+request, named by the matched route, with OpenTelemetry's HTTP semantic
+fields -- over OTLP/HTTP with protobuf bodies. The destination is not a
+setting in the file: the SDK reads the standard `OTEL_EXPORTER_OTLP_ENDPOINT`
+(default `http://localhost:4318`), `OTEL_EXPORTER_OTLP_HEADERS` and
+`OTEL_EXPORTER_OTLP_TIMEOUT`, so no collector address is ever hardcoded
+and the same config runs against any backend that speaks OTLP. Spans are
+batched on a thread of the SDK's own: a slow collector delays no request,
+and past the queue spans drop rather than back up.
+
+Without the line, no exporter is built and nothing leaves the process,
+which keeps the two rules above true by default. A malformed OTLP
+environment fails the start with the SDK's error rather than starting a
+server that silently exports nothing.

@@ -48,6 +48,7 @@ pub mod signing;
 pub mod sliding;
 pub mod stream;
 pub mod surface;
+pub mod telemetry;
 pub mod tokens;
 pub mod typing;
 
