@@ -4274,21 +4274,27 @@ impl Rooms {
                 input.json["origin_server_ts"].as_i64().unwrap_or(0),
             );
 
-        // The signed JSON is stored beside the log entry. The log holds
-        // ordering and state; the event body is what a client actually reads
-        // back, and reconstructing it from the log would mean re-signing, which
-        // would produce a different event ID.
+        // The signed JSON is stored beside the log entry, in the entry's own
+        // batch. The log holds ordering and state; the event body is what a
+        // client actually reads back, and reconstructing it from the log
+        // would mean re-signing, which would produce a different event ID.
+        //
+        // In the batch, not a `put` before it (#84 §4). Written separately,
+        // the body survived a crash only because fjall keeps one journal
+        // that the entry's sync happened to flush -- an ordering nothing
+        // stated and nothing tested, whose failure would surface as
+        // `MissingBody` on a read far from the cause. One batch has no
+        // ordering to get wrong: the body lands if and only if the entry
+        // does. `an_append_writes_nothing_outside_its_batch` holds it.
         let room_store = RoomStore::new(self.store.as_ref(), room_id);
-        spindle_store::Store::put(
-            self.store.as_ref(),
-            &event_body_key(room_id, event_id),
-            &serde_json::to_vec(input.json)?,
-        )?;
+        let mut extra = vec![(
+            event_body_key(room_id, event_id),
+            serde_json::to_vec(input.json)?,
+        )];
         // A relation is indexed in the entry's own batch too, and for the same
         // reason: an index entry written separately can outlive a commit that
         // failed, leaving `/relations` pointing at an event the room does not
         // have.
-        let mut extra = Vec::new();
         if let Some((rel_type, target)) = relates_to(input.content) {
             // The type goes in the value, not the key -- see `keys::relation`.
             let mut value = Vec::with_capacity(2 + rel_type.len() + event_id.len());
