@@ -26,7 +26,7 @@
 #
 # Leaves its results in tmp/bench/, which is gitignored: a Synapse run drops a
 # database and a signing key there. To publish a sitting, run the four-way
-# recipe instead (`bench-four-way.sh` then `bench-rounds.sh`), which writes
+# recipe instead (`bench-servers.sh` then `bench-rounds.sh`), which writes
 # under docs/benchmarks/data/ where the renderer reads.
 set -euo pipefail
 cd "$(dirname "$0")/.."

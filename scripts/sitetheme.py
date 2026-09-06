@@ -129,6 +129,7 @@ SERVER_COLORS = {
     "synapse": "#e05252",
     "continuwuity": "#d9930d",
     "tuwunel": "#0d9d6d",
+    "dendrite": "#2563eb",
 }
 
 # The site's pages, in the order the nav lists them. One tuple per page so a
@@ -140,8 +141,11 @@ PAGES = [
 ]
 
 
-def nav(active: str, sections: list[tuple[str, str]] | None = None,
-        repository: str = "tuna-os/spindle") -> str:
+def nav(
+    active: str,
+    sections: list[tuple[str, str]] | None = None,
+    repository: str = "tuna-os/spindle",
+) -> str:
     """The shared nav, marking whichever page is rendering it.
 
     `sections` are the current page's own in-page anchors, rendered after a
@@ -162,7 +166,9 @@ def nav(active: str, sections: list[tuple[str, str]] | None = None,
         f'<a class="sect" href="https://github.com/{html.escape(repository)}">GitHub</a>'
     )
     inner = "".join(links)
-    return f'<nav><div class="inner"><span class="brand">Spindle</span>{inner}</div></nav>'
+    return (
+        f'<nav><div class="inner"><span class="brand">Spindle</span>{inner}</div></nav>'
+    )
 
 
 def head(title: str, extra_css: str = "") -> str:

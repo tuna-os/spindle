@@ -48,6 +48,54 @@ from sitting import (
 
 SERVER_COLORS = sitetheme.SERVER_COLORS
 
+# The field, by server-name prefix: what each one is, in words the page can
+# put beside its column. A comparison against a name means little; against
+# "the reference implementation, Python, on SQLite here" it means something,
+# and the reader should not have to know the Matrix ecosystem to read it.
+FIELD = {
+    "spindle": (
+        "Spindle",
+        "Rust · fjall (embedded LSM)",
+        "the subject: one append-only log per room, materialized state, no "
+        "state resolution on the hot path",
+    ),
+    "synapse": (
+        "Synapse",
+        "Python · SQLite in these sittings",
+        "the reference implementation and what most deployments run; on its "
+        "development database here, which its own docs say is slower than "
+        "Postgres for real load -- so its column is a floor for Synapse, not "
+        "a ceiling",
+    ),
+    "continuwuity": (
+        "Continuwuity",
+        "Rust · RocksDB",
+        "the conduwuit lineage (Conduit → conduwuit → continuwuity): the "
+        "performance bar, and the comparison that matters most",
+    ),
+    "tuwunel": (
+        "Tuwunel",
+        "Rust · RocksDB",
+        "the other conduwuit descendant, by conduwuit's original author; "
+        "built from source at its tag because its release assets are gated",
+    ),
+    "dendrite": (
+        "Dendrite",
+        "Go · SQLite per component, NATS in-process",
+        "Element's second-generation server, a different design again "
+        "(components on an event bus); the server an operator reaches for "
+        "when Synapse is too heavy and a Rust build is not on the table",
+    ),
+}
+
+
+def field_entry(server: str) -> tuple[str, str, str]:
+    for prefix, entry in FIELD.items():
+        if server.startswith(prefix):
+            return entry
+    return (server, "", "")
+
+
 # What each benchmarked operation actually asks the server to do, and why the
 # storage architecture shows up in it. Rendered beside the latest charts so a
 # reader never has to guess what a row measures.
@@ -169,6 +217,58 @@ INVESTIGATIONS = {
 }
 
 
+# Sidecars by group, filled by `load_groups`.
+SIDECARS: dict[str, dict] = {}
+
+
+def render_provenance(group: str, documents: list[dict]) -> str:
+    """Where a sitting's numbers came from, from its sidecar when it has one.
+
+    Every published cell already traces to a committed file; the sidecar
+    adds the host it ran on, the versions measured and the servers that
+    were absent, so a reader can tell a developer-machine sitting from a
+    shared-runner one without opening the JSON.
+    """
+    files = " · ".join(
+        f'{html.escape(d["server"])} <span class="provenance">'
+        f"({html.escape(d['_file'])})</span>"
+        for d in sorted(documents, key=lambda d: d["server"])
+    )
+    raw = (
+        '<details class="raw"><summary class="provenance">the committed '
+        f'files ({len(documents)})</summary><p class="provenance">{files}</p>'
+        "</details>"
+    )
+    side = SIDECARS.get(group)
+    if not side:
+        return raw
+    host = side.get("host", {})
+    bits = [
+        f"<strong>{html.escape(str(host.get('runner', 'developer machine')))}</strong>",
+        html.escape(
+            f"{host.get('cpu', 'unknown cpu')}, {host.get('cores', '?')} cores, "
+            f"kernel {host.get('kernel', '?')}"
+        ),
+        html.escape(
+            f"{side.get('rounds', '?')} rounds, {side.get('started', '')[:10]}"
+        ),
+        "spindle @ " + html.escape(str(side.get("spindle_commit", "?"))),
+    ]
+    versions = ", ".join(html.escape(v) for v in side.get("versions", []))
+    absent = side.get("absent") or []
+    lines = [f'<p class="provenance">{" · ".join(bits)}</p>']
+    if versions:
+        lines.append(f'<p class="provenance">measured: {versions}</p>')
+    if absent:
+        lines.append(
+            '<p class="provenance">not in this sitting (no binary on the host): '
+            + ", ".join(html.escape(a) for a in absent)
+            + "</p>"
+        )
+    lines.append(raw)
+    return "\n".join(lines)
+
+
 def load_groups(data_dir: pathlib.Path) -> dict[str, list[dict]]:
     groups: dict[str, list[dict]] = {}
     for path in sorted(data_dir.glob("*.json")):
@@ -176,6 +276,12 @@ def load_groups(data_dir: pathlib.Path) -> dict[str, list[dict]]:
         # repeated sitting. The group is the first segment either way, which
         # is why group names must not contain a dot.
         group = path.name.split(".")[0]
+        # `group.sitting.json` is the sitting's sidecar -- host, versions,
+        # what was absent -- written by bench-sitting.sh and rendered as
+        # provenance by `render_provenance`. Not a result.
+        if path.name.endswith(".sitting.json"):
+            SIDECARS[group] = json.loads(path.read_text())
+            continue
         document = json.loads(path.read_text())
         document["_file"] = path.name
         groups.setdefault(group, []).append(document)
@@ -183,9 +289,7 @@ def load_groups(data_dir: pathlib.Path) -> dict[str, list[dict]]:
         # Refuse to render nothing: a blank page reads as "no losses".
         sys.exit(f"render-comparisons: no result files in {data_dir}")
     for group, documents in groups.items():
-        ours = {
-            d["server"] for d in documents if d["server"].startswith("spindle")
-        }
+        ours = {d["server"] for d in documents if d["server"].startswith("spindle")}
         if len(ours) != 1:
             sys.exit(
                 f"render-comparisons: group {group} needs exactly one spindle "
@@ -273,9 +377,7 @@ def stands_alone(calls: dict[int, str], measured: set[int], size: int) -> bool:
     if len(measured) < 2:
         return False
     mine = calls.get(size)
-    return not any(
-        other == mine for at_size, other in calls.items() if at_size != size
-    )
+    return not any(other == mine for at_size, other in calls.items() if at_size != size)
 
 
 def svg_chart(
@@ -323,9 +425,7 @@ def svg_chart(
         f'{html.escape(AXIS[dimension])}">'
     ]
     title = OPERATIONS.get(operation, (operation, ""))[0]
-    parts.append(
-        f'<text x="{left}" y="15" class="ctitle">{html.escape(title)}</text>'
-    )
+    parts.append(f'<text x="{left}" y="15" class="ctitle">{html.escape(title)}</text>')
     # Gridlines at 0, half, peak.
     for value in (0.0, peak / 2, peak):
         parts.append(
@@ -391,8 +491,7 @@ def svg_chart(
             # Ours get a halo so the marker reads against a crossing line.
             if mine:
                 parts.append(
-                    f'<circle cx="{px:.1f}" cy="{py:.1f}" r="4.6" '
-                    f'fill="var(--bg)"/>'
+                    f'<circle cx="{px:.1f}" cy="{py:.1f}" r="4.6" fill="var(--bg)"/>'
                 )
             tip = f"{value['median'] / 1e6:.2f} ms"
             if value["rounds"] >= 2:
@@ -442,6 +541,24 @@ def scoreboard(documents: list[dict]):
     return won, noise, lost
 
 
+def scoreboard_by_rival(documents: list[dict]) -> dict[str, tuple[int, int, int]]:
+    """won / within-noise / lost cells, per rival, for one group."""
+    us = next(d["server"] for d in documents if d["server"].startswith("spindle"))
+    table = cells_for(documents)
+    tallies: dict[str, list[int]] = {}
+    for by_server in table.values():
+        mine = by_server.get(us)
+        if not mine:
+            continue
+        for server, theirs in by_server.items():
+            if server == us:
+                continue
+            css, _ = verdict(mine, theirs)
+            tally = tallies.setdefault(server, [0, 0, 0])
+            tally[{"win": 0, "noise": 1, "loss": 2}.get(css, 1)] += 1
+    return {server: tuple(t) for server, t in sorted(tallies.items())}
+
+
 def render_heatmap(group: str, documents: list[dict]) -> list[str]:
     ours = next(d for d in documents if d["server"].startswith("spindle"))
     # One column group per *server*, not per document. A multi-round sitting
@@ -460,13 +577,17 @@ def render_heatmap(group: str, documents: list[dict]) -> list[str]:
 
     lines = ['<div class="scroll"><table class="heatmap"><thead><tr><th>operation</th>']
     for document in theirs:
+        safe = html.escape(document["server"], quote=True)
         lines.append(
-            f'<th colspan="{len(sizes)}">vs {html.escape(document["server"])}</th>'
+            f'<th colspan="{len(sizes)}" data-server="{safe}">'
+            f'<span class="dot" style="background:{color_for(document["server"])}"></span>'
+            f"vs {html.escape(document['server'])}</th>"
         )
     lines.append("</tr><tr><th></th>")
-    for _ in theirs:
+    for document in theirs:
+        safe = html.escape(document["server"], quote=True)
         for size in sizes:
-            lines.append(f'<th class="num">{size:,}</th>')
+            lines.append(f'<th class="num" data-server="{safe}">{size:,}</th>')
     lines.append("</tr></thead><tbody>")
 
     # Every cell's verdict up front, because whether a call stands alone is a
@@ -512,8 +633,9 @@ def render_heatmap(group: str, documents: list[dict]) -> list[str]:
                 cell = table.get((operation, size), {})
                 mine = cell.get(ours["server"])
                 other = cell.get(document["server"])
+                safe = html.escape(document["server"], quote=True)
                 if not mine or not other:
-                    lines.append('<td class="num absent">—</td>')
+                    lines.append(f'<td class="num absent" data-server="{safe}">—</td>')
                     continue
                 note_id = None
                 if (group, operation) in INVESTIGATIONS:
@@ -546,7 +668,7 @@ def render_heatmap(group: str, documents: list[dict]) -> list[str]:
                     body += " <span class='lone-mark'>†</span>"
                 tip = (
                     f"spindle {describe_ms(mine)} · "
-                    f'{html.escape(document["server"])} {describe_ms(other)}'
+                    f"{html.escape(document['server'])} {describe_ms(other)}"
                 )
                 # The ratio is a median against a median; the band under it
                 # is what the rounds actually allow, from their fastest
@@ -565,8 +687,8 @@ def render_heatmap(group: str, documents: list[dict]) -> list[str]:
                         "same way at any other size"
                     )
                 lines.append(
-                    f'<td class="num {css}" data-tip="{tip}" title="{tip}">'
-                    f"{body}</td>"
+                    f'<td class="num {css}" data-server="{safe}" '
+                    f'data-tip="{tip}" title="{tip}">{body}</td>'
                 )
         lines.append("</tr>")
     lines.append("</tbody></table></div>")
@@ -598,7 +720,7 @@ def render_heatmap(group: str, documents: list[dict]) -> list[str]:
             f"rounds, so about <strong>{expected:.1f}</strong> of these cells "
             f"should be called by chance alone — against {called} actually "
             "called. The arithmetic cannot say <em>which</em> ones, so a call "
-            "marked <span class=\"chip lone\">†</span> is one that stands "
+            'marked <span class="chip lone">†</span> is one that stands '
             "alone: the same operation is not called the same way at any "
             "other size. A cost that is real in a per-item measure normally "
             "shows across the size axis, so an isolated call is the shape a "
@@ -621,9 +743,9 @@ def render_heatmap(group: str, documents: list[dict]) -> list[str]:
             f'<span class="chip win">&ge;{SINGLE_ROUND_REPEATABILITY:.2f}'
             "&times;</span> · "
             f'<span class="chip noise">{1 / SINGLE_ROUND_REPEATABILITY:.2f}'
-            f'–{SINGLE_ROUND_REPEATABILITY:.2f}×</span> · '
+            f"–{SINGLE_ROUND_REPEATABILITY:.2f}×</span> · "
             f'<span class="chip loss">&le;'
-            f'{1 / SINGLE_ROUND_REPEATABILITY:.2f}&times;</span>. '
+            f"{1 / SINGLE_ROUND_REPEATABILITY:.2f}&times;</span>. "
             "A grey cell is not a tie — it is a difference this sitting "
             "cannot see, and only more rounds can (#171). The large ratios "
             "are unaffected. Hover any cell for the raw milliseconds.</p>"
@@ -677,9 +799,10 @@ def render_charts(documents: list[dict]) -> list[str]:
     sizes = sorted({size for _, size in table})
     operations = sorted({operation for operation, _ in table})
     servers = sorted(
-        (d["server"] for d in documents),
+        {d["server"] for d in documents},
         key=lambda s: (not s.startswith("spindle"), s),
     )
+    dimension = dimension_of(documents)
     lines = ['<div class="charts">']
     for operation in operations:
         series = {
@@ -693,27 +816,75 @@ def render_charts(documents: list[dict]) -> list[str]:
             ]
             for server in servers
         }
-        explainer = OPERATIONS.get(operation, (operation, ""))[1]
-        lines.append('<figure class="chart">')
-        lines.append(svg_chart(operation, sizes, series, dimension_of(documents)))
+        title, explainer = OPERATIONS.get(operation, (operation, ""))
+        # The same numbers the SVG below was drawn from, for the script to
+        # redraw when a server is hidden or the scale changes. The SVG is
+        # the page without JavaScript; the data is the page with it. One
+        # source either way.
+        payload = json.dumps(
+            {
+                "operation": operation,
+                "title": title,
+                "sizes": sizes,
+                "dimension": AXIS[dimension],
+                "series": series,
+            },
+            separators=(",", ":"),
+        )
+        lines.append(
+            f'<figure class="chart" data-chart="{html.escape(payload, quote=True)}">'
+        )
+        lines.append(svg_chart(operation, sizes, series, dimension))
         if explainer:
             lines.append(f"<figcaption>{html.escape(explainer)}</figcaption>")
         lines.append("</figure>")
     lines.append("</div>")
     # Ours first and marked, matching the charts: the reader should meet the
-    # subject before the field it is being compared against.
-    legend = " ".join(
-        f'<span class="serverchip{" mine" if server.startswith("spindle") else ""}" '
-        f'data-server="{html.escape(server, quote=True)}">'
-        f'<span class="dot" style="background:{color_for(server)}"></span>'
-        f"{html.escape(server)}</span>"
-        for server in sorted(servers, key=lambda s: not s.startswith("spindle"))
+    # subject before the field it is being compared against. Every rival is
+    # a toggle: a server that dwarfs the rest -- Synapse, on most rows --
+    # flattens every other line to the axis, and the honest fix is to let
+    # the reader take it out of the frame while the numbers stay on the
+    # page, not to leave it out ourselves.
+    chips = []
+    for server in sorted(servers, key=lambda s: not s.startswith("spindle")):
+        mine = server.startswith("spindle")
+        safe = html.escape(server, quote=True)
+        name = field_entry(server)[0]
+        chips.append(
+            f'<button type="button" class="serverchip{" mine" if mine else ""}" '
+            f'data-server="{safe}" aria-pressed="true"'
+            f"{' disabled' if mine else ''} "
+            f'title="{"the subject of every chart" if mine else "click to hide or show " + safe}">'
+            f'<span class="dot" style="background:{color_for(server)}"></span>'
+            f"{html.escape(name)}"
+            f"{'' if mine or name.lower() == server.lower() else f' <small>{html.escape(server)}</small>'}"
+            "</button>"
+        )
+    rivals = [server for server in servers if not server.startswith("spindle")]
+    non_rust = [
+        server
+        for server in rivals
+        if not (server.startswith("continuwuity") or server.startswith("tuwunel"))
+    ]
+    presets = (
+        '<span class="presets">'
+        '<button type="button" class="preset" data-hide="" title="every server measured">'
+        "everyone</button>"
+        f'<button type="button" class="preset" data-hide="{html.escape(",".join(non_rust), quote=True)}" '
+        'title="the conduwuit lineage only: Rust on RocksDB, the performance bar">'
+        "Rust servers only</button>"
+        '<label class="scale"><input type="checkbox" id="logscale"> log scale</label>'
+        "</span>"
     )
-    legend += (
-        '<span class="legend"> — hover a server to isolate its line in every '
-        "chart</span>"
+    legend = (
+        '<div class="controls" role="group" aria-label="servers shown">'
+        + "".join(chips)
+        + presets
+        + '<span class="legend">hover a server to isolate it; click to hide '
+        "it from every chart and table on this page. Hiding changes what is "
+        "drawn, never what was measured.</span></div>"
     )
-    lines.insert(1, f'<p class="serverlegend">{legend}</p>')
+    lines.insert(0, legend)
     return lines
 
 
@@ -792,9 +963,50 @@ never taxed on reads.</p>
 </p>
 <p>That is the bet these pages test. The comparisons below measure the same
 client operations against the same workloads on Synapse (the reference
-implementation) and on Continuwuity and Tuwunel (the two Rust siblings,
-both descended from Conduit) — and when a cell goes the wrong way, the
-roadmap's rule is that it gets investigated, not explained away.</p>
+implementation), on Continuwuity and Tuwunel (the two Rust siblings, both
+descended from Conduit) and, from the M7 sittings on, Dendrite (Element's
+Go server) — and when a cell goes the wrong way, the roadmap's rule is that
+it gets investigated, not explained away.</p>
+</section>
+"""
+
+WHY = """
+<section class="why" id="why">
+<h2>Why Spindle exists</h2>
+<div class="whygrid">
+<div class="whycol">
+<h3>The problem it starts from</h3>
+<p>A Matrix room is a directed graph of events, and every homeserver in a
+room appends to that graph on its own. That is what makes Matrix federated
+and what makes it expensive: two servers can extend the graph at once, the
+result is a fork, and answering <em>"what is the state of this room?"</em>
+means running state resolution over the branches. Every established
+server does that work somewhere on the path a client's request takes, and
+its cost grows with the room.</p>
+</div>
+<div class="whycol">
+<h3>The bet</h3>
+<p>Spindle keeps the graph at the door and a <em>line</em> behind it. Each
+room is one append-only log; each entry carries the content address of the
+state after it; forks arriving over federation are collapsed once, on the
+way in, and never taxed on reads. Sending, syncing, paginating and reading
+state become index arithmetic over that log. If the bet is right, the
+operations a client performs thousands of times a day should cost less and,
+more to the point, should not grow with the room.</p>
+</div>
+<div class="whycol">
+<h3>What this page can and cannot show</h3>
+<p>It can show whether the bet pays on the client path, measured by one
+driver, on one idle machine, against servers configured the way their own
+documentation suggests for a single node. It cannot show a federated room
+under contention, where forks are real and Spindle's collapse-at-the-door
+has a cost of its own; that is measured elsewhere (the interop rigs) and
+not yet as a benchmark. Synapse runs on SQLite here, its development
+database, so its column is a floor for Synapse rather than a ceiling. And
+nothing here has run in production. Read the wins as evidence for a
+design, not for a deployment.</p>
+</div>
+</div>
 </section>
 """
 
@@ -825,6 +1037,23 @@ cannot. Every round is committed exactly as the driver wrote it
 a published cell is the median across rounds with the observed range
 beside it, and this page is regenerated from those files and cannot change
 a measurement.</li>
+<li><strong>Each server runs as its own documentation suggests for one
+node, with its rate limits lifted.</strong> Synapse from a virtualenv on
+SQLite; Continuwuity from its static release binary and Tuwunel built from
+source at its tag, both on RocksDB with a registration token because they
+refuse open registration; Dendrite from source with SQLite per component,
+its NATS bus in-process, federation off and open registration on. Nothing
+is tuned, on any side, and the launch recipe is committed
+(<code>scripts/bench-servers.sh</code>). A server whose binary is absent
+from a sitting is absent from that sitting's table, never carried forward
+from an older one.</li>
+<li><strong>Hiding a server changes the drawing, not the data.</strong>
+The chips above the charts take a server out of the frame -- Synapse's
+column is often ten times the Rust servers' and flattens their lines to
+the axis -- and the charts rescale and the tables drop the column. The
+committed files, the tallies and every ratio are computed before the page
+knows what you chose, and a log scale is one click away when you would
+rather keep everyone in view.</li>
 <li><strong>Losses publish with the same prominence as wins.</strong>
 A cell is called, either way, only when the two servers' rounds separate,
 and a loss links to its investigation.</li>
@@ -1015,6 +1244,51 @@ STYLE = """
   .anim .a, .ticker .cell.on, .ticker .root-chip { animation: none !important; }
   .chart, .archcol { opacity: 1; transform: none; transition: none; }
 }
+
+/* ---------- the field, per rival ---------- */
+.rivals { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 12px; margin-top: 18px; }
+.rival { background: color-mix(in srgb, var(--bg) 82%, transparent);
+  border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px;
+  box-shadow: var(--shadow); font-size: .9rem; }
+.rival[hidden] { display: none; }
+.rivalhead { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.rivalhead b { font-size: 1rem; }
+.rivalhead .stack { color: var(--muted); font-size: .8rem; }
+.tally { display: flex; gap: 10px; margin: 6px 0 4px; font-variant-numeric: tabular-nums;
+  font-weight: 600; flex-wrap: wrap; }
+.tally .win { color: var(--win-fg); } .tally .loss { color: var(--loss-fg); }
+.tally .noise { color: var(--noise-fg); }
+.rivalwhy { margin: 0; color: var(--muted); font-size: .82rem; line-height: 1.35; }
+
+/* ---------- why ---------- */
+.why p { max-width: 70ch; }
+.whygrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 18px; }
+.whycol { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  padding: 6px 18px 10px; box-shadow: var(--shadow); }
+.whycol h3 { margin: 10px 0 6px; font-size: 1rem; }
+.whycol p { font-size: .93rem; }
+
+/* ---------- controls ---------- */
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 4px;
+  margin: 6px 0 0; }
+.controls .legend { flex-basis: 100%; margin: 2px 0 0; }
+button.serverchip { font: inherit; background: transparent; }
+button.serverchip[aria-pressed="false"] { opacity: .45; text-decoration: line-through; }
+button.serverchip small { color: var(--muted); font-weight: 400; margin-left: 4px; }
+button.serverchip:disabled { cursor: default; }
+.presets { margin-left: auto; display: inline-flex; gap: 6px; align-items: center;
+  flex-wrap: wrap; }
+.preset { font: inherit; font-size: .82rem; color: var(--fg); background: var(--card);
+  border: 1px solid var(--line); border-radius: 999px; padding: 3px 11px;
+  cursor: pointer; }
+.preset:hover, .preset.on { border-color: var(--accent); color: var(--accent); }
+.scale { font-size: .82rem; color: var(--muted); display: inline-flex; gap: 5px;
+  align-items: center; cursor: pointer; }
+.heatmap th[hidden], .heatmap td[hidden] { display: none; }
+.heatmap th .dot { margin-right: 5px; vertical-align: middle; }
+details.raw { margin: 4px 0 10px; } details.raw summary { font-weight: 400; }
 .lineage { display: flex; gap: 10px; flex-wrap: wrap; margin: 14px 0 0; }
 .lineage span { background: var(--card); border: 1px solid var(--line);
   border-radius: 999px; padding: 3px 12px; font-size: .85rem;
@@ -1058,19 +1332,171 @@ SCRIPT = """
   document.querySelectorAll(".chart, .archcol, .scoreline").forEach(function (el) {
     io.observe(el);
   });
-  // Hovering a server chip isolates that server's line in every chart.
-  var chips = document.querySelectorAll(".serverchip[data-server]");
-  var series = document.querySelectorAll(".series[data-server]");
-  chips.forEach(function (chip) {
-    chip.addEventListener("mouseenter", function () {
-      series.forEach(function (g) {
-        g.classList.toggle("dim", g.dataset.server !== chip.dataset.server);
+
+  // ----- toggles: which servers are drawn, and on what scale -----
+  // The page without JavaScript is the SVG as rendered. With it, every chart
+  // is redrawn from the same numbers whenever the frame changes, so a hidden
+  // server rescales the rest instead of leaving a gap at the top.
+  var KEY = "spindle-bench-frame";
+  var frame = { hidden: [], log: false };
+  function load() {
+    try {
+      var hash = location.hash.replace(/^#/, "");
+      var fromHash = null;
+      hash.split("&").forEach(function (kv) {
+        var m = /^(hide|scale)=(.*)$/.exec(kv);
+        if (!m) return;
+        fromHash = fromHash || { hidden: [], log: false };
+        if (m[1] === "hide") fromHash.hidden = m[2] ? decodeURIComponent(m[2]).split(",") : [];
+        if (m[1] === "scale") fromHash.log = m[2] === "log";
       });
+      if (fromHash) return fromHash;
+      var stored = localStorage.getItem(KEY);
+      if (stored) return JSON.parse(stored);
+    } catch (e) {}
+    return { hidden: [], log: false };
+  }
+  function save() {
+    try { localStorage.setItem(KEY, JSON.stringify(frame)); } catch (e) {}
+    var parts = [];
+    if (frame.hidden.length) parts.push("hide=" + encodeURIComponent(frame.hidden.join(",")));
+    if (frame.log) parts.push("scale=log");
+    var next = parts.length ? "#" + parts.join("&") : location.pathname + location.search;
+    try { history.replaceState(null, "", next); } catch (e) {}
+  }
+  function isHidden(server) { return frame.hidden.indexOf(server) !== -1; }
+  function esc(text) {
+    return String(text).replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
     });
-    chip.addEventListener("mouseleave", function () {
-      series.forEach(function (g) { g.classList.remove("dim"); });
+  }
+  var colors = {};
+  document.querySelectorAll(".controls .serverchip[data-server]").forEach(function (chip) {
+    var dot = chip.querySelector(".dot");
+    if (dot) colors[chip.dataset.server] = dot.style.background;
+  });
+  function draw(fig) {
+    var data;
+    try { data = JSON.parse(fig.dataset.chart); } catch (e) { return; }
+    var width = 320, height = 190, left = 46, right = 10, top = 26, bottom = 34;
+    var plotW = width - left - right, plotH = height - top - bottom;
+    var servers = Object.keys(data.series).filter(function (s) { return !isHidden(s); });
+    var values = [];
+    servers.forEach(function (s) {
+      data.series[s].forEach(function (v) { if (v) values.push(v); });
+    });
+    if (!values.length) {
+      fig.querySelector("svg").innerHTML =
+        '<text x="' + (width / 2) + '" y="' + (height / 2) + '" class="tick" text-anchor="middle">every server hidden</text>';
+      return;
+    }
+    var peak = Math.max.apply(null, values.map(function (v) { return v.high; })) * 1.08;
+    var floor = Math.min.apply(null, values.map(function (v) { return v.low; })) / 1.25;
+    var log = frame.log && floor > 0;
+    function x(i) { return left + plotW * (i / Math.max(1, data.sizes.length - 1)); }
+    function y(v) {
+      if (log) return top + plotH * (1 - (Math.log(v) - Math.log(floor)) / (Math.log(peak) - Math.log(floor)));
+      return top + plotH * (1 - v / peak);
+    }
+    var out = ['<text x="' + left + '" y="15" class="ctitle">' + esc(data.title) +
+               (log ? ' <tspan class="tick">(log)</tspan>' : "") + "</text>"];
+    var ticks = log ? [floor, Math.sqrt(floor * peak), peak] : [0, peak / 2, peak];
+    ticks.forEach(function (v) {
+      var yy = y(v).toFixed(1);
+      out.push('<line x1="' + left + '" y1="' + yy + '" x2="' + (width - right) + '" y2="' + yy + '" class="grid"/>');
+      var label = v / 1e6;
+      out.push('<text x="' + (left - 4) + '" y="' + (y(v) + 3).toFixed(1) + '" class="tick" text-anchor="end">' +
+               (label >= 10 ? label.toFixed(0) : label.toFixed(log && label < 1 ? 2 : 1)) + "</text>");
+    });
+    var mid = (top + plotH / 2).toFixed(0);
+    out.push('<text x="12" y="' + mid + '" class="tick" transform="rotate(-90 12 ' + mid + ')" text-anchor="middle">ms</text>');
+    data.sizes.forEach(function (size, i) {
+      out.push('<text x="' + x(i).toFixed(1) + '" y="' + (height - 18) + '" class="tick" text-anchor="middle">' + size.toLocaleString() + "</text>");
+    });
+    out.push('<text x="' + (left + plotW / 2).toFixed(0) + '" y="' + (height - 4) + '" class="tick" text-anchor="middle">' + esc(data.dimension) + "</text>");
+    servers.sort(function (a, b) { return (a.indexOf("spindle") === 0) - (b.indexOf("spindle") === 0); });
+    servers.forEach(function (server) {
+      var mine = server.indexOf("spindle") === 0;
+      var color = colors[server] || "#888";
+      var measured = [];
+      data.series[server].forEach(function (v, i) { if (v) measured.push([x(i), v]); });
+      if (!measured.length) return;
+      var pts = measured.map(function (m) { return [m[0], y(m[1].median)]; });
+      var path = pts.map(function (pt, i) { return (i ? "L" : "M") + pt[0].toFixed(1) + "," + pt[1].toFixed(1); }).join(" ");
+      var fade = mine ? "" : ' opacity="0.62"';
+      out.push('<g class="series' + (mine ? " mine" : "") + '" data-server="' + esc(server) + '">');
+      if (measured.some(function (m) { return m[1].rounds >= 2; })) {
+        var upper = measured.map(function (m) { return m[0].toFixed(1) + "," + y(m[1].high).toFixed(1); });
+        var lower = measured.slice().reverse().map(function (m) { return m[0].toFixed(1) + "," + y(m[1].low).toFixed(1); });
+        out.push('<polygon class="band" points="' + upper.concat(lower).join(" ") + '" fill="' + color + '" opacity="' + (mine ? 0.18 : 0.11) + '"/>');
+      }
+      out.push('<path d="' + path + '" fill="none" stroke="' + color + '" stroke-width="' + (mine ? 3.4 : 1.6) +
+               '" stroke-linejoin="round" stroke-linecap="round"' + fade + "/>");
+      pts.forEach(function (pt, i) {
+        var v = measured[i][1];
+        if (mine) out.push('<circle cx="' + pt[0].toFixed(1) + '" cy="' + pt[1].toFixed(1) + '" r="4.6" fill="var(--bg)"/>');
+        var tip = (v.median / 1e6).toFixed(2) + " ms";
+        if (v.rounds >= 2) tip += " (" + v.rounds + " rounds, " + (v.low / 1e6).toFixed(2) + "–" + (v.high / 1e6).toFixed(2) + ")";
+        out.push('<circle cx="' + pt[0].toFixed(1) + '" cy="' + pt[1].toFixed(1) + '" r="' + (mine ? 3.2 : 2.2) + '" fill="' + color + '"' + fade + ">" +
+                 "<title>" + esc(server) + ": " + esc(tip) + "</title></circle>");
+      });
+      if (mine) {
+        var end = pts[pts.length - 1];
+        var anchor = end[0] > left + plotW * 0.6 ? "end" : "start";
+        out.push('<text x="' + (end[0] + (anchor === "end" ? -6 : 6)).toFixed(1) + '" y="' + (end[1] - 8).toFixed(1) +
+                 '" class="mine-label" text-anchor="' + anchor + '">Spindle</text>');
+      }
+      out.push("</g>");
+    });
+    fig.querySelector("svg").innerHTML = out.join("");
+    bindHover();
+  }
+  function apply() {
+    document.querySelectorAll(".controls .serverchip[data-server]").forEach(function (chip) {
+      chip.setAttribute("aria-pressed", isHidden(chip.dataset.server) ? "false" : "true");
+    });
+    document.querySelectorAll(".heatmap [data-server], .rival[data-server]").forEach(function (el) {
+      el.hidden = isHidden(el.dataset.server);
+    });
+    document.querySelectorAll(".preset[data-hide]").forEach(function (b) {
+      var want = b.dataset.hide ? b.dataset.hide.split(",") : [];
+      b.classList.toggle("on", want.length === frame.hidden.length &&
+        want.every(function (s) { return isHidden(s); }));
+    });
+    var box = document.getElementById("logscale");
+    if (box) box.checked = frame.log;
+    document.querySelectorAll(".chart[data-chart]").forEach(draw);
+    save();
+  }
+  function bindHover() {
+    var series = document.querySelectorAll(".series[data-server]");
+    document.querySelectorAll(".serverchip[data-server]").forEach(function (chip) {
+      chip.onmouseenter = function () {
+        series.forEach(function (g) { g.classList.toggle("dim", g.dataset.server !== chip.dataset.server); });
+      };
+      chip.onmouseleave = function () {
+        series.forEach(function (g) { g.classList.remove("dim"); });
+      };
+    });
+  }
+  document.querySelectorAll(".controls .serverchip[data-server]:not([disabled])").forEach(function (chip) {
+    chip.addEventListener("click", function () {
+      var s = chip.dataset.server;
+      if (isHidden(s)) frame.hidden = frame.hidden.filter(function (h) { return h !== s; });
+      else frame.hidden.push(s);
+      apply();
     });
   });
+  document.querySelectorAll(".preset[data-hide]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      frame.hidden = b.dataset.hide ? b.dataset.hide.split(",") : [];
+      apply();
+    });
+  });
+  var box = document.getElementById("logscale");
+  if (box) box.addEventListener("change", function () { frame.log = box.checked; apply(); });
+  frame = load();
+  if (document.querySelector(".controls")) apply(); else bindHover();
 })();
 </script>
 """
@@ -1091,12 +1517,65 @@ def sitting_order(group: str) -> tuple[int, int, str]:
         number = int(milestone.lstrip("m"))
     except ValueError:
         return (-1, -1, group)
-    ranks = {"progress": 0, "final": 1}
-    return (number, ranks.get(phase, -1), group)
+    # `progress`, then `progress-2`, `progress-3`, ... as a milestone is
+    # re-measured on its way to `final`: a second progress sitting is later
+    # than the first and earlier than the close-out.
+    if phase == "final":
+        rank = 1000
+    elif phase == "progress":
+        rank = 0
+    elif phase.startswith("progress-") and phase[9:].isdigit():
+        rank = int(phase[9:])
+    else:
+        rank = -1
+    return (number, rank, group)
+
+
+def render_rivals(documents: list[dict], group: str) -> str:
+    """One card per rival in the latest sitting: what it is, and the tally.
+
+    The hero's three big numbers add every rival together, which is the
+    honest headline and a useless comparison: a reader wants to know how
+    Spindle does against the Rust bar specifically, and against the
+    reference implementation specifically. So the tally is also broken out
+    per rival, with what the rival is, from the same cells.
+    """
+    cards = []
+    for server, (won, noise, lost) in scoreboard_by_rival(documents).items():
+        name, stack, why = field_entry(server)
+        safe = html.escape(server, quote=True)
+        cards.append(
+            f'<div class="rival" data-server="{safe}">'
+            f'<div class="rivalhead"><span class="dot" style="background:'
+            f'{color_for(server)}"></span><b>vs {html.escape(name)}</b>'
+            f'<span class="stack">{html.escape(stack)}</span></div>'
+            f'<div class="tally"><span class="win">{won} faster</span>'
+            f'<span class="noise">{noise} within noise</span>'
+            f'<span class="loss">{lost} slower</span></div>'
+            f'<p class="rivalwhy">{html.escape(why)}.</p>'
+            "</div>"
+        )
+    if not cards:
+        return ""
+    return (
+        f'<div class="rivals" aria-label="per-server tally for {html.escape(group)}">'
+        + "".join(cards)
+        + "</div>"
+    )
 
 
 def render(groups: dict[str, list[dict]]) -> str:
-    ordered = sorted(groups, key=sitting_order, reverse=True)
+    # Shared-runner sittings (`ci-<date>`) are kept apart from the milestone
+    # sittings: a GitHub runner is a noisier and slower host than the
+    # developer machine the milestone numbers come from, so the two are not
+    # one series and must not be read as one. They get their own section,
+    # latest first, with the same charts and the same rules.
+    ci_groups = sorted((g for g in groups if g.startswith("ci-")), reverse=True)
+    ordered = sorted(
+        (g for g in groups if not g.startswith("ci-")),
+        key=sitting_order,
+        reverse=True,
+    )
     latest, older = ordered[0], ordered[1:]
 
     documents = groups[latest]
@@ -1108,11 +1587,16 @@ def render(groups: dict[str, list[dict]]) -> str:
     )
     parts = [
         sitetheme.head("Spindle vs the field", STYLE),
-        sitetheme.nav("comparisons.html", [
-            ("#architecture", "How it works"),
-            ("#latest", "Latest sitting"),
-            ("#method", "Method"),
-        ]),
+        sitetheme.nav(
+            "comparisons.html",
+            [
+                ("#why", "Why"),
+                ("#architecture", "How it works"),
+                ("#latest", "Latest sitting"),
+                ("#ci", "Shared runner"),
+                ("#method", "Method"),
+            ],
+        ),
         "<main>",
         '<header class="hero">',
         ticker,
@@ -1120,28 +1604,54 @@ def render(groups: dict[str, list[dict]]) -> str:
         '<p class="sub">A linearized Matrix homeserver: an append-only log '
         "per room, materialized state, and no state resolution on the hot "
         "path. Every milestone, the same client operations are measured "
-        "against Synapse and both Rust siblings — wins, noise and losses "
-        "all published from the committed raw numbers.</p>",
+        "against the field — Synapse, Dendrite, and the two Rust servers of "
+        "the conduwuit lineage — and wins, noise and losses are all "
+        "published from the committed raw numbers.</p>",
         '<div class="scoreline">'
         f'<div class="score win"><b data-count="{won}">0</b>cells faster</div>'
         f'<div class="score noise"><b data-count="{noise}">0</b>within noise</div>'
         f'<div class="score loss"><b data-count="{lost}">0</b>slower — '
         "investigated</div></div>",
+        render_rivals(documents, latest),
         "</header>",
+        WHY,
         ARCHITECTURE,
     ]
-    provenance = " · ".join(
-        f"{html.escape(d['server'])} <span class=\"provenance\">"
-        f"({html.escape(d['_file'])})</span>"
-        for d in sorted(documents, key=lambda d: d["server"])
-    )
-    parts.append(
-        f'<h2 id="latest">Latest sitting — {html.escape(latest)}</h2>'
-    )
-    parts.append(f'<p class="provenance">{provenance}</p>')
+    parts.append(f'<h2 id="latest">Latest sitting — {html.escape(latest)}</h2>')
+    parts.append(render_provenance(latest, documents))
     parts.extend(render_charts(documents))
     parts.append("<h3>Every cell</h3>")
     parts.extend(render_heatmap(latest, documents))
+
+    if ci_groups:
+        newest = ci_groups[0]
+        won, noise, lost = scoreboard(groups[newest])
+        parts.append(
+            f'<h2 id="ci">Latest shared-runner sitting — {html.escape(newest)}</h2>'
+        )
+        parts.append(
+            '<p class="legend">Run by the weekly <code>bench-sitting</code> '
+            "workflow on a GitHub-hosted runner: the same driver, the same "
+            "field, the same rules, on a host that is slower, noisier and "
+            "shared. It keeps the page current between milestone sittings "
+            "and cannot be compared cell for cell with them -- the two hosts "
+            "are two instruments. Tally on this host: "
+            f"<strong>{won}</strong> faster · <strong>{noise}</strong> within "
+            f"noise · <strong>{lost}</strong> slower.</p>"
+        )
+        parts.append(render_provenance(newest, groups[newest]))
+        parts.extend(render_charts(groups[newest]))
+        parts.append("<h3>Every cell</h3>")
+        parts.extend(render_heatmap(newest, groups[newest]))
+        for group in ci_groups[1:]:
+            won, noise, lost = scoreboard(groups[group])
+            parts.append(
+                f"<details><summary>{html.escape(group)} — {won} faster · "
+                f"{noise} within noise · {lost} slower</summary>"
+            )
+            parts.append(render_provenance(group, groups[group]))
+            parts.extend(render_heatmap(group, groups[group]))
+            parts.append("</details>")
 
     if older:
         parts.append("<h2>Earlier sittings</h2>")
@@ -1161,9 +1671,11 @@ def render(groups: dict[str, list[dict]]) -> str:
 
     parts.append(METHOD)
     parts.append("</main>")
-    parts.append(sitetheme.footer(
-        "numbers from the raw results committed under docs/benchmarks/data/"
-    ))
+    parts.append(
+        sitetheme.footer(
+            "numbers from the raw results committed under docs/benchmarks/data/"
+        )
+    )
     parts.append(SCRIPT)
     return "\n".join(parts)
 

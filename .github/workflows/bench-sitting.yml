@@ -1,0 +1,100 @@
+name: Benchmark sitting
+
+# The competitive sitting, on a schedule, so the comparison page stays
+# current between the milestone sittings a developer machine produces.
+# A GitHub-hosted runner is a slower, noisier and shared host, which is
+# why its results are filed under their own `ci-<date>` group and rendered
+# in their own section (render-comparisons.py keeps the two apart), and
+# why they arrive as a pull request rather than a push: a person looks at
+# the sidecar's load and versions before the numbers join the record.
+#
+# The same three commands run a sitting locally: `just bench-field`,
+# `just bench-build`, `just bench-sitting <group>`.
+on:
+  schedule:
+    - cron: "17 3 * * 1"   # Mondays, 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: rounds per server (3 is the floor at which a call means anything)
+        default: "3"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: bench-sitting
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  BENCH_BIN: tmp/bench-bin
+  SYNAPSE_VENV: tmp/synvenv
+  BENCH_SRC: tmp/bench-src
+
+jobs:
+  sitting:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            . -> target
+            tmp/bench-src/tuwunel -> target
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.24"
+      - name: Tuwunel's RocksDB wants liburing
+        run: sudo apt-get install -y -qq liburing-dev
+      # The competitors' pinned binaries survive between runs, so the slow
+      # Tuwunel source build happens once per pin bump, not once per sitting.
+      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.0
+        with:
+          path: |
+            tmp/bench-bin
+            tmp/synvenv
+          key: bench-field-${{ hashFiles('scripts/bench-field.sh') }}
+      - name: The field, at its pins
+        run: scripts/bench-field.sh
+      - name: Spindle, release build
+        run: cargo build --release -p spindle-server --bin spindle
+      - name: The sitting
+        env:
+          BENCH_RUNNER: github-actions/ubuntu-24.04 (shared runner)
+        run: |
+          group="ci-$(date -u +%Y%m%d)"
+          echo "GROUP=$group" >> "$GITHUB_ENV"
+          scripts/bench-sitting.sh --group "$group" --rounds "${{ inputs.rounds || '3' }}" --max-load 4
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-sitting
+          path: |
+            docs/benchmarks/data/ci-*.json
+            tmp/bench/*.log
+          if-no-files-found: ignore
+      - name: Render the page with the new sitting, as a check
+        run: python3 scripts/render-comparisons.py docs/benchmarks/data /tmp/comparisons.html
+      - name: Open the pull request that files the sitting
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "bench-sitting"
+          git config user.email "bench-sitting@users.noreply.github.com"
+          branch="bench/$GROUP"
+          git checkout -b "$branch"
+          git add docs/benchmarks/data/"$GROUP".*.json
+          git commit -m "Benchmark sitting $GROUP on a shared runner" \
+            -m "Filed by the bench-sitting workflow. The sidecar names the host, the load and the versions; the page renders it in its own shared-runner section, apart from the milestone sittings."
+          git push -u origin "$branch"
+          gh pr create --title "Benchmark sitting $GROUP (shared runner)" \
+            --body "The weekly competitive sitting on a GitHub-hosted runner, filed as its own \`ci-\` group. Read \`docs/benchmarks/data/$GROUP.sitting.json\` for the host and the versions before merging; the page keeps shared-runner sittings apart from milestone ones." \
+            --base main --head "$branch"

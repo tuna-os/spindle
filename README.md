@@ -3,7 +3,7 @@
 **A Matrix homeserver that stores rooms as a linear log, so state resolution
 never runs on the hot path.**
 
-[**Benchmarks vs Synapse, Continuwuity and Tuwunel**](https://tuna-os.github.io/spindle/comparisons.html)
+[**Benchmarks vs Synapse, Dendrite, Continuwuity and Tuwunel**](https://tuna-os.github.io/spindle/comparisons.html)
 · [micro-benchmarks](https://tuna-os.github.io/spindle/)
 · [spec coverage dashboard](https://tuna-os.github.io/spindle/dashboard.html)
 · [SPEC.md](SPEC.md)
