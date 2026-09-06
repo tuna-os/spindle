@@ -43,8 +43,10 @@ done
 version_of() {
   case $1 in
     # The server takes a config path and nothing else, so its version is the
-    # tree it was built from: the crate version and the commit.
-    spindle) echo "spindle $(grep -m1 '^version' crates/spindle-server/Cargo.toml | cut -d'"' -f2) @ $(git rev-parse --short=12 HEAD)" ;;
+    # tree it was built from: the crate version, the nearest tag when one
+    # exists (`v0.0.1-12-gabc123def456`, or the bare tag on a release
+    # commit), and the commit either way.
+    spindle) echo "spindle $(grep -m1 '^version' crates/spindle-server/Cargo.toml | cut -d'"' -f2) $(git describe --tags --always --dirty 2>/dev/null || git rev-parse --short=12 HEAD) @ $(git rev-parse --short=12 HEAD)" ;;
     # The database is part of the version: Synapse on SQLite and on
     # Postgres are two different things to compare against.
     synapse) echo "$("$VENV/bin/python" -c 'import synapse; print("synapse", synapse.__version__)') on $([ -n "${BENCH_PG_URL:-}" ] && echo postgres || echo sqlite)" ;;
