@@ -1,0 +1,32 @@
+# Spindle in place of backend/playwright_homeserver.yaml (#269): the
+# same server name, base URL, listener port and RTC transport upstream's
+# config names, so nginx, Element Web and the specs see no difference.
+#
+# What their config enables and where it is here: msc3266 (room summary),
+# msc4222 (state_after), msc4140 (delayed events, 24h cap by default),
+# msc4143 (the transport below) and msc4354 (sticky events) are all served
+# and need no switch; registration is open by default; the rate limiter is
+# off because the suite registers and sends as fast as a browser can.
+[server]
+name = "synapse.m.localhost"
+bind = "0.0.0.0:8008"
+public_base_url = "https://synapse.m.localhost"
+
+[storage]
+path = "/data/store"
+
+[logging]
+filter = "info"
+
+[ratelimit]
+enabled = false
+
+[federation]
+# The other site is reached through nginx on the compose network, which is
+# RFC 1918 space the address guard refuses by default (#288).
+allow_internal = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+[rtc]
+foci = [
+    { type = "livekit", livekit_service_url = "https://matrix-rtc.m.localhost/livekit/jwt" },
+]

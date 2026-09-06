@@ -234,8 +234,19 @@ MILESTONES = [
      "cannot do is be revoked when its holder leaves, and docs/matrix-rtc.md "
      "says so in those words rather than implying a guarantee the "
      "mechanism cannot make; it also lays out both deployments end to "
-     "end. #41 is not started; #269 would run Element Call's own "
-     "Playwright suite against this server."),
+     "end. #269's rig is authored (contrib/element-call): Element Call's "
+     "own Playwright stack, upstream and pinned, with Spindle in both of "
+     "Synapse's seats through a compose override, and a ratchet over their"
+     " specs in the shape of the Complement one "
+     "(scripts/element-call-check.py). It runs nightly and on demand "
+     "rather than per pull request, and its allowlist starts empty: the "
+     "rig was written without a Docker host to run it on, so the first "
+     "recorded run is what fills it in, beginning with landing.spec.ts and"
+     " the sign-up half of access.spec.ts. The widget and restricted-SFU "
+     "specs register users through Synapse's admin API with a shared "
+     "secret, which this server does not serve, and stay out of scope. "
+     "#41's scenarios beyond that -- the kill, the restart, the federated "
+     "call -- wait on that first run."),
 ]
 
 # ---------------------------------------------------------------------------

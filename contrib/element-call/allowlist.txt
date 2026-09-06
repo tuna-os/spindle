@@ -1,0 +1,13 @@
+# Element Call specs Spindle must pass -- the ratchet over upstream's own
+# Playwright suite (#269), enforced by scripts/element-call-check.py the
+# way complement/allowlist.txt is by complement-check.py.
+#
+# One entry per line: `<spec file> :: <test title>`, as the checker prints
+# them. A test that passes and is not here is printed as a candidate;
+# adding it is a reviewed promotion, never automatic, so a flaky spec cannot
+# teach everyone to ignore this gate.
+#
+# Empty until the first recorded run: nothing is claimed that has not been
+# seen to pass. The rig has been authored without a Docker host to run it
+# on (the sandbox this was written in has none); the first green run
+# promotes landing.spec.ts and the sign-up half of access.spec.ts.
