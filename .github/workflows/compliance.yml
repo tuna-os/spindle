@@ -551,10 +551,10 @@ jobs:
             git -C "$1" fetch --quiet --depth 1 "$2" "$3"
             git -C "$1" checkout --quiet FETCH_HEAD
           }
-          fetch tmp/neutrino https://github.com/hanthor/neutrino 3fb6945
+          fetch tmp/neutrino https://github.com/hanthor/neutrino 3fb6945f8b17d7d9f7ae4814d3939238ceef21e9
           git -C tmp/neutrino -c user.name=ci -c user.email=ci@localhost \
             am "$GITHUB_WORKSPACE"/contrib/neutrino/000{1,2,3}-*.patch
-          fetch tmp/neutrino-iroh https://github.com/hanthor/neutrino-iroh 6a16f66
+          fetch tmp/neutrino-iroh https://github.com/hanthor/neutrino-iroh 6a16f66bf6b247c41977958a4750ae735dc24a2a
           cat >> tmp/neutrino-iroh/Cargo.toml <<'TOML'
 
           [patch."https://github.com/hanthor/neutrino"]
