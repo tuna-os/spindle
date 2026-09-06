@@ -6200,6 +6200,35 @@ fn sliding_invite_entry(
     Ok(Value::Object(entry))
 }
 
+/// `required_state` with `$LAZY` (MSC4186's lazy-loaded members) made
+/// concrete: the member events of whoever sent something in `window`,
+/// which is what a client needs to render that timeline -- the sender
+/// names and avatars -- and nothing more. Expanded before either state
+/// path runs so neither need know about it. A window with no senders
+/// wants no members.
+fn lazy_members_expanded(
+    required_state: &[(String, String)],
+    window: &[Value],
+) -> Vec<(String, String)> {
+    let senders: std::collections::BTreeSet<&str> = window
+        .iter()
+        .filter_map(|event| event["sender"].as_str())
+        .collect();
+    required_state
+        .iter()
+        .flat_map(|(event_type, state_key)| {
+            if state_key == "$LAZY" {
+                senders
+                    .iter()
+                    .map(|sender| (event_type.clone(), (*sender).to_owned()))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![(event_type.clone(), state_key.clone())]
+            }
+        })
+        .collect()
+}
+
 fn sliding_room_entry(
     state: &AppState,
     identity: &crate::accounts::Identity,
@@ -6229,29 +6258,7 @@ fn sliding_room_entry(
         limited,
         prev_batch: prev_batch.map(|li| crate::tokens::Pagination(li).to_string()),
     };
-    // `$LAZY` (MSC4186's lazy-loaded members) is the member events of
-    // whoever sent something in the window just built: what a client needs
-    // to render that timeline, the sender names and avatars, and nothing
-    // more. Expanded here into concrete keys so the two paths below need
-    // know nothing about it. A window with no senders wants no members.
-    let senders: std::collections::BTreeSet<&str> = timeline
-        .events
-        .iter()
-        .filter_map(|event| event["sender"].as_str())
-        .collect();
-    let required_state: Vec<(String, String)> = required_state
-        .iter()
-        .flat_map(|(event_type, state_key)| {
-            if state_key == "$LAZY" {
-                senders
-                    .iter()
-                    .map(|sender| (event_type.clone(), (*sender).to_owned()))
-                    .collect::<Vec<_>>()
-            } else {
-                vec![(event_type.clone(), state_key.clone())]
-            }
-        })
-        .collect();
+    let required_state = lazy_members_expanded(required_state, &timeline.events);
     // A wildcard has to be answered by looking at everything; a list of
     // named keys does not. Element X asks for a handful of concrete keys
     // and gets sent the whole room state to filter down — a stored-body
