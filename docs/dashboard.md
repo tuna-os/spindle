@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**180 routes implemented; 0 known gaps in scope.**
+**183 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -115,7 +115,7 @@ neither implemented nor counted.
 - `POST/GET /_matrix/client/v3/room_keys/version`
 - `GET/PUT/DELETE /_matrix/client/v3/room_keys/version/{version}`
 
-### Federation — 19 implemented, 0 planned
+### Federation — 22 implemented, 0 planned
 
 - `GET /_matrix/federation/v1/backfill/{room_id}`
 - `GET /_matrix/federation/v1/event/{event_id}`
@@ -132,6 +132,9 @@ neither implemented nor counted.
 - `PUT /_matrix/federation/v1/send_leave/{room_id}/{event_id}`
 - `GET /_matrix/federation/v1/state/{room_id}`
 - `GET /_matrix/federation/v1/state_ids/{room_id}`
+- `GET /_matrix/federation/v1/user/devices/{user_id}`
+- `POST /_matrix/federation/v1/user/keys/claim`
+- `POST /_matrix/federation/v1/user/keys/query`
 - `GET /_matrix/federation/v1/version`
 - `PUT /_matrix/federation/v2/invite/{room_id}/{event_id}`
 - `PUT /_matrix/federation/v2/send_join/{room_id}/{event_id}`
