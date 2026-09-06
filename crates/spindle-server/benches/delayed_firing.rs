@@ -102,6 +102,7 @@ fn lateness(participants: usize) -> Vec<i64> {
                 Some(&sender),
                 &serde_json::json!({ "memberships": [] }),
                 delay_ms,
+                None,
             )
             .expect("the delay is scheduled");
         let deadline = scheduled_at.saturating_add(delay_ms);

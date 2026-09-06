@@ -3558,6 +3558,10 @@ async fn join_remote(
         seed_state.extend(arrays("state_dag"));
         let mut seed_rest = arrays("auth_chain");
         seed_rest.extend(arrays("timeline"));
+        // MSC4354: a Spindle resident adds the room's unexpired sticky
+        // events, which a joiner that backfills nothing could not
+        // otherwise hold -- their predecessors are history it never sees.
+        seed_rest.extend(arrays("msc4354_sticky"));
         state
             .rooms
             .join_remote(room_id, &seed_state, &seed_rest, &join, &join_id)
@@ -5939,6 +5943,7 @@ async fn sync(
         result.rooms,
         filter.as_ref(),
         state_after,
+        since,
     )?;
 
     let invite = sync_invite(&state, &identity, result.invited, filter.as_ref());
@@ -6157,12 +6162,48 @@ fn timeline_block(events: Vec<Value>, limited: bool, prev_batch: Option<i64>) ->
     Value::Object(block)
 }
 
+/// MSC4354: the room's unexpired sticky events this client has not been
+/// sent -- all of them on an initial sync or on joining, those since the
+/// token otherwise -- minus what the timeline already carries, each
+/// stamped with the time it has left. Not subject to the room filter, as
+/// the MSC says. Empty when there is nothing to hand over, so the section
+/// is left out.
+fn sticky_section(
+    state: &AppState,
+    user_id: &str,
+    room_id: &str,
+    timeline: &[Value],
+    since: Option<u64>,
+) -> Result<Vec<Value>, MatrixError> {
+    let joined_now = timeline.iter().any(|event| {
+        event["type"] == "m.room.member"
+            && event["state_key"] == json!(user_id)
+            && event["content"]["membership"] == json!("join")
+    });
+    let in_timeline: std::collections::HashSet<&str> = timeline
+        .iter()
+        .filter_map(|event| event["event_id"].as_str())
+        .collect();
+    Ok(state
+        .rooms
+        .sticky_events(room_id, if joined_now { None } else { since })
+        .map_err(room_error)?
+        .into_iter()
+        .filter(|(id, _, _)| !in_timeline.contains(id.as_str()))
+        .map(|(_, mut event, ttl)| {
+            event["unsigned"]["msc4354_sticky_duration_ttl_ms"] = json!(ttl);
+            event
+        })
+        .collect())
+}
+
 fn sync_join(
     state: &AppState,
     identity: &crate::accounts::Identity,
     rooms: Vec<crate::rooms::SyncRoom>,
     filter: Option<&crate::filters::Filter>,
     state_after: bool,
+    since: Option<u64>,
 ) -> Result<BTreeMap<String, Box<RawValue>>, MatrixError> {
     let mut join: BTreeMap<String, Box<RawValue>> = BTreeMap::new();
     for room in rooms {
@@ -6223,11 +6264,15 @@ fn sync_join(
             room_filter.and_then(|room| room.account_data.as_ref()),
             room_data,
         );
+        let sticky = sticky_section(state, &identity.user_id, &room.room_id, &events, since)?;
         let mut entry: BTreeMap<&str, Box<RawValue>> = BTreeMap::new();
         entry.insert(
             "timeline",
             raw(&timeline_block(events, room.limited, room.prev_batch))?,
         );
+        if !sticky.is_empty() {
+            entry.insert("msc4354_sticky", raw(&json!({ "events": sticky }))?);
+        }
         // `state` is the state before the window and `state_after` (MSC4222)
         // the state after it; `Rooms::sync` read whichever the flag asked
         // for, so here the flag only picks the label. The cached case:
@@ -6544,6 +6589,11 @@ async fn room_timestamp_to_event(
 struct DelayQuery {
     #[serde(rename = "org.matrix.msc4140.delay")]
     delay: Option<u64>,
+    /// MSC4354's sticky duration, spelled as its unstable query parameter.
+    /// Capped at an hour by the room layer rather than refused, as the
+    /// MSC computes it.
+    #[serde(rename = "org.matrix.msc4354.sticky_duration_ms")]
+    sticky: Option<u64>,
 }
 
 /// Turn a delay failure into the response a client can act on.
@@ -7003,19 +7053,21 @@ async fn set_room_state(
                 Some(&state_key),
                 &content,
                 delay_ms,
+                query.sticky,
             )
             .map_err(delay_error)?;
         return Ok(Json(json!({ "delay_id": delay_id })));
     }
     let event_id = state
         .rooms
-        .set_state(
+        .set_state_sticky(
             &room_id,
             &identity.user_id,
             state.key.pair(),
             &event_type,
             &state_key,
             &content,
+            query.sticky,
         )
         .map_err(room_error)?;
     Ok(Json(json!({ "event_id": event_id })))
@@ -7279,6 +7331,7 @@ async fn send_event(
                 None,
                 &content,
                 delay_ms,
+                query.sticky,
             )
             .map_err(delay_error)?;
         return Ok(Json(json!({ "delay_id": delay_id })));
@@ -7286,12 +7339,13 @@ async fn send_event(
     with_transaction(&state, &identity, &txn_id, || {
         state
             .rooms
-            .send(
+            .send_sticky(
                 &room_id,
                 &identity.user_id,
                 state.key.pair(),
                 &event_type,
                 &content,
+                query.sticky,
             )
             .map_err(room_error)
     })

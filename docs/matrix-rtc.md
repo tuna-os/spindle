@@ -10,9 +10,10 @@ A MatrixRTC call (Element Call, Element X, Element Web) touches four
 things:
 
 1. **The homeserver** — room state for the call membership, delayed
-   events (MSC4140) to expire it, to-device signalling, and transport
-   discovery (MSC4143). All served here; docs/dashboard.md's M7 row is
-   the inventory.
+   events (MSC4140) to expire it, sticky events (MSC4354) so a
+   membership can lapse without becoming permanent state, to-device
+   signalling, and transport discovery (MSC4143). All served here;
+   docs/dashboard.md's M7 row is the inventory.
 2. **A LiveKit SFU** — carries the media. Not bundled (#4 lists media
    servers under what not to build); run
    [livekit-server](https://github.com/livekit/livekit).
@@ -130,9 +131,16 @@ clients read the list as a priority order.
 - `curl https://matrix.example.org/.well-known/matrix/client` names
   the transport under `org.matrix.msc4143.rtc_foci`. If it does not,
   neither `[rtc.livekit]` nor `[rtc] foci` is set.
-- `GET /_matrix/client/versions` lists `org.matrix.msc4140` and
-  `org.matrix.msc4143` under `unstable_features`; Element Call checks
-  both before it will rely on the server.
+- `GET /_matrix/client/versions` lists `org.matrix.msc4140`,
+  `org.matrix.msc4143` and `org.matrix.msc4354` under
+  `unstable_features`; Element Call checks them before it will rely on
+  the server.
+- A send with `?org.matrix.msc4354.sticky_duration_ms=30000` comes back
+  from `GET .../event/{id}` carrying `msc4354_sticky.duration_ms`, and a
+  client that joins the room afterwards finds it under
+  `rooms.join.{room}.msc4354_sticky.events` in its first `/sync`, with
+  `unsigned.msc4354_sticky_duration_ttl_ms` counting down. Durations
+  above an hour are capped to it.
 - For option A: a joined user's `POST .../sfu/get` returns a `jwt` whose
   decoded `video.room` is the Matrix room ID and whose `exp - nbf` is
   `token_ttl_seconds`. A user who has left gets `403 M_FORBIDDEN`.
@@ -141,8 +149,8 @@ clients read the list as a priority order.
   expired or invented one, `401 M_UNKNOWN_TOKEN`.
 
 The tests that pin each of these: `crates/spindle-server/tests/openid.rs`,
-`livekit_jwt.rs`, `rtc_transports.rs`, `rtc_membership.rs` and
-`delayed_events.rs`.
+`livekit_jwt.rs`, `rtc_transports.rs`, `rtc_membership.rs`,
+`delayed_events.rs` and `sticky_events.rs`.
 
 ## What is not here
 
