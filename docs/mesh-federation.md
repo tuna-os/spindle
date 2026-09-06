@@ -115,24 +115,34 @@ creates:
 | the mesh user's `m.rtc.member` state reaches Spindle | arrived | MatrixRTC 1.0 membership as room state; without the power-level override the node refuses it by auth rules, correctly |
 | alice's delayed event fires and reaches the node | delivered | MSC4140 on Spindle; the node needs nothing to receive the result |
 
+That was the node before `contrib/neutrino/0002-matrixrtc.patch`. With
+it applied -- MSC4143 transports from `NEUTRINO_RTC_LIVEKIT_URL`, MSC4140
+delayed events held in memory with list, send, cancel and restart, both
+on the versions list -- the same rig reports:
+
+| probe | outcome | detail |
+|---|---|---|
+| mesh node advertises msc4140 / msc4143 / msc4354 | some | `unstable_features` names msc4140 and msc4143; msc4354 still absent |
+| mesh node serves `/rtc/transports` (MSC4143) | 200 | the LiveKit JWT service the node was started with |
+| mesh node honours a delayed send (MSC4140) | held | HTTP 200 with a `delay_id` and nothing sent |
+| the mesh user's delayed event fires on the node and reaches Spindle | delivered | restarted once as a heartbeat would, then fired without the client, authorised by the room actor when it fired |
+
 What that means for the venue. A participant whose homeserver is a
 Spindle -- the gateway, or a hub -- has the whole mechanism: their
 membership expires when their phone dies, and their sticky membership
 reaches every server in the room, mesh nodes included, as an ordinary PDU.
-A participant whose homeserver is their own mesh node has none of it yet,
-and the delayed-event row is the one that bites: the node answers 200 to a
-delayed leave and sends it immediately, so a client that trusts the
-answer removes itself from the call the moment it joins. Element Call
-checks `unstable_features` before relying on the server and would not
-schedule the leave against this node at all -- which leaves the ghost the
-mechanism exists to prevent, when a mesh participant's phone dies. Until
-the fork carries MSC4140 (a delay parameter, a timer, a restart endpoint;
-Spindle's `delayed.rs` is the shape) and MSC4143 (a static transport list
-pointing at the venue's SFU), a call at the venue is hosted with the
-participants on Spindles, and a mesh node is a spectator to its
-membership. MSC4354 is the smaller gap: the node already keeps the key on
-the PDU, so what is missing is the index and the `/sync` section, and
-`msc4354` on the versions list.
+A participant whose homeserver is their own patched mesh node has the two
+pieces Element Call checks before it will place a call, and the one that
+bit before is closed: the node holds a delayed leave instead of sending it
+at once, and fires it when the heartbeats stop. What the node keeps in
+memory it loses on a restart, and the patch says why that is the accepted
+trade on a phone -- the process is the node, and the call goes with it --
+and that a durable table is the next step if that stops being true. MSC4354
+is the remaining gap: the node keeps the key on the PDU, so what is missing
+is the index and the `/sync` section, and `msc4354` on the versions list;
+until then a mesh client runs MatrixRTC 1.0 membership (state events), which
+the rig shows crossing to Spindle, while Spindle clients' sticky memberships
+reach the node's timeline and not its sticky section.
 
 ## Encryption: session rooms in the clear, everything else encrypted
 
@@ -261,7 +271,13 @@ mesh's question, and the harder one; the Companion project's
    the same gap #16 names, now with a version whose whole point is that
    the resolver's inputs are trustworthy.
 
-4. **The MSC3995 hub protocol.** SPEC.md §12 is the design; nothing
+4. **MatrixRTC on the node: done here, as a patch.**
+   `contrib/neutrino/0002-matrixrtc.patch` serves MSC4143 transports and
+   MSC4140 delayed events on the node, the two a call client checks
+   before it will place a call. Delays live in memory; MSC4354 on the
+   node is what remains, and is small.
+
+5. **The MSC3995 hub protocol.** SPEC.md §12 is the design; nothing
    implements it, on either side. Not on the path to the venue.
 
 ## The gateway patch
