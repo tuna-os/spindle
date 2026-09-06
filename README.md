@@ -200,6 +200,7 @@ The risks that would invalidate the headline claim are enumerated in
 | [docs/matrix-rtc.md](docs/matrix-rtc.md) | Calls end to end: the SFU, the JWT service built in or beside, and what a token cannot promise |
 | [docs/mesh-federation.md](docs/mesh-federation.md) | Federating with a Bluetooth mesh: the venue system, the loopback evidence, and the Neutrino gateway patch |
 | [docs/venue-playbook.md](docs/venue-playbook.md) | Setting up the mesh and the conference Spindle, the test ladder, and the go/no-go list for 3,000 attendees |
+| [docs/venue-gateway.md](docs/venue-gateway.md) | The venue gateway: the Neutrino node with the uplink, how to build, run, pair, and troubleshoot it |
 | [docs/dashboard.md](docs/dashboard.md) | Generated endpoint and milestone coverage |
 
 ---
