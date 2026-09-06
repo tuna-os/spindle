@@ -35,7 +35,7 @@ set -euo pipefail
 
 # The last commit of the full-mesh branch (2023-07), pinned so an upstream
 # force-push cannot repaint the result.
-FULL_MESH_REV=ec810cd5c02f3ea51a3ee7264ec8ecf2c81ee0b5
+FULL_MESH_REV=ec810cde5eed90fdb0b9685645eadd3a5f55a6a2
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd "$here/../.." && pwd)
