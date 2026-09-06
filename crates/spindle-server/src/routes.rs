@@ -2476,6 +2476,12 @@ struct CreateRoomRequest {
     preset: Option<String>,
     #[serde(default)]
     invite: Vec<String>,
+    /// The invites carry `is_direct: true`, which is how the invitee's
+    /// client knows to file the room under direct chats (and, by the
+    /// spec, to write its own `m.direct`). Not a room property here: the
+    /// server keeps no notion of a DM beyond what the member events say.
+    #[serde(default)]
+    is_direct: bool,
     #[serde(default)]
     initial_state: Vec<InitialStateEvent>,
     room_alias_name: Option<String>,
@@ -2560,7 +2566,15 @@ async fn create_room(
     // Invites after the room stands, refused invites failing the create the
     // way the spec asks (the room still exists; the error names why).
     for target in &request.invite {
-        invite_user(&state, &identity.user_id, &room_id, target, None).await?;
+        invite_user(
+            &state,
+            &identity.user_id,
+            &room_id,
+            target,
+            None,
+            request.is_direct,
+        )
+        .await?;
     }
     if request.visibility.as_deref() == Some("public") {
         // The creator is joined by construction, so `may_advertise` would pass;
@@ -2576,6 +2590,27 @@ async fn create_room(
             .directory
             .create(&alias, &room_id, &identity.user_id)
             .map_err(|error| directory_error(&error))?;
+        // The spec has the server write `m.room.canonical_alias` for a
+        // room created with an alias, unless the client set one itself in
+        // `initial_state`. Claiming an alias later through the directory
+        // writes nothing (`aliases.rs`); this is the one place the server
+        // speaks for the room, and only because the spec says it does.
+        let client_set_one = initial_state
+            .iter()
+            .any(|(event_type, _, _)| event_type == "m.room.canonical_alias");
+        if !client_set_one {
+            state
+                .rooms
+                .set_state(
+                    &room_id,
+                    &identity.user_id,
+                    state.key.pair(),
+                    "m.room.canonical_alias",
+                    "",
+                    &json!({ "alias": alias }),
+                )
+                .map_err(room_error)?;
+        }
     }
     Ok(Json(json!({ "room_id": room_id })))
 }
@@ -2799,6 +2834,7 @@ async fn invite_to_room(
         &room_id,
         &request.user_id,
         request.reason.as_deref(),
+        false,
     )
     .await?;
     Ok(Json(json!({})))
@@ -2819,6 +2855,7 @@ async fn invite_user(
     room_id: &str,
     target: &str,
     reason: Option<&str>,
+    is_direct: bool,
 ) -> Result<(), MatrixError> {
     let Some((_, domain)) = target.split_once(':') else {
         return Err(MatrixError::bad_json(format!("{target} is not a user ID")));
@@ -2833,6 +2870,10 @@ async fn invite_user(
             .appservices
             .query_user(target, &state.config.server.name)
             .await;
+        let mut extra = member_profile(state, target);
+        if is_direct {
+            extra.insert("is_direct".to_owned(), json!(true));
+        }
         state
             .rooms
             .set_membership_with(
@@ -2841,7 +2882,7 @@ async fn invite_user(
                 target,
                 "invite",
                 reason,
-                &member_profile(state, target),
+                &extra,
                 state.key.pair(),
             )
             .map_err(room_error)?;
@@ -2850,7 +2891,7 @@ async fn invite_user(
 
     let (event_id, event) = state
         .rooms
-        .build_invite_event(room_id, sender, target, reason, state.key.pair())
+        .build_invite_event(room_id, sender, target, reason, is_direct, state.key.pair())
         .map_err(room_error)?;
     // The stripped state the invited user renders the invite from — plus
     // the invite itself, which is not yet state anywhere and is exactly the
@@ -7518,8 +7559,11 @@ async fn room_context(
     axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
     axum::extract::Query(query): axum::extract::Query<ContextQuery>,
 ) -> Result<Json<Value>, MatrixError> {
-    // The spec's limit is the total window, so each side gets half.
-    let limit = query.limit.unwrap_or(10).clamp(1, 100);
+    // The spec's limit is the total window, so each side gets half. Zero
+    // is a real ask -- the event alone, with tokens to page out from --
+    // and matrix-rust-sdk makes it; clamping it up to one handed back a
+    // neighbour the client had said it did not want.
+    let limit = query.limit.unwrap_or(10).min(100);
     let each_side = limit.div_ceil(2);
 
     let context = state

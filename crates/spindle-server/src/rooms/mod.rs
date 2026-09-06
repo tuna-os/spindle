@@ -763,11 +763,15 @@ impl Rooms {
         sender: &str,
         target: &str,
         reason: Option<&str>,
+        is_direct: bool,
         key: &Ed25519KeyPair,
     ) -> Result<(String, Value), RoomError> {
         let mut content = serde_json::json!({ "membership": INVITE_STR });
         if let Some(reason) = reason {
             content["reason"] = Value::String(reason.to_owned());
+        }
+        if is_direct {
+            content["is_direct"] = Value::Bool(true);
         }
         self.with_room(room_id, |rooms, log| {
             rooms.build_event(
