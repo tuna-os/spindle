@@ -352,3 +352,29 @@ number = 4038
 title = "Key backup for MLS"
 status = "planned"
 evidence = ["SPEC.md"]
+
+[[msc]]
+number = 3771
+title = "Read receipts for threads"
+status = "served"
+stable = "1.4"
+evidence = ["crates/spindle-server/tests/thread_badges.rs"]
+notes = "A receipt names its thread (`main` or a root) and is echoed with it; a threaded receipt moves only its thread's count."
+
+[[msc]]
+number = 3773
+title = "Notifications for threads"
+status = "served"
+stable = "1.4"
+evidence = ["crates/spindle-server/tests/thread_badges.rs"]
+notes = "With `unread_thread_notifications` on the timeline filter, /sync counts the main timeline apart and each thread under `unread_thread_notifications`. Counts are what the reader's push rules notify for."
+
+[[msc]]
+number = 3881
+title = "Remotely toggling push notifications for another client"
+status = "served"
+stable = ""
+unstable = ["org.matrix.msc3881"]
+evidence = ["crates/spindle-server/tests/pushers.rs"]
+notes = "Pushers carry `enabled` and `device_id` under the unstable and the plain names; a disabled pusher stays registered and receives nothing."
+

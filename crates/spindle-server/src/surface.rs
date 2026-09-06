@@ -168,6 +168,10 @@ pub const UNSTABLE_FEATURES: &[(&str, bool)] = &[
     // MSC3814's dehydrated devices. Element X checks this flag before it
     // offers to keep room keys across the last device being lost.
     ("org.matrix.msc3814", true),
+    // MSC3881: pushers carry `enabled` and `device_id` (under the
+    // unstable and the plain names), and a disabled pusher receives
+    // nothing. A client checks here before showing the toggle.
+    ("org.matrix.msc3881", true),
 ];
 
 #[must_use]

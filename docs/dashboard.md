@@ -26,16 +26,19 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**215 routes implemented; 0 known gaps in scope.**
+**224 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
 
-### Admin & moderation — 47 implemented, 0 planned
+### Admin & moderation — 55 implemented, 0 planned
 
 - `GET /_spindle/admin/v1/audit`
 - `GET /_spindle/admin/v1/event_reports`
 - `GET /_spindle/admin/v1/event_reports/{report_id}`
+- `GET /_spindle/admin/v1/registration_tokens`
+- `POST /_spindle/admin/v1/registration_tokens/new`
+- `GET/PUT/DELETE /_spindle/admin/v1/registration_tokens/{token}`
 - `GET /_spindle/admin/v1/rooms`
 - `GET/DELETE /_spindle/admin/v1/rooms/{room_id}`
 - `POST /_spindle/admin/v1/rooms/{room_id}/make_room_admin`
@@ -44,6 +47,7 @@ neither implemented nor counted.
 - `GET /_spindle/admin/v1/rooms/{room_id}/state`
 - `GET /_spindle/admin/v1/rooms/{room_id}/state_at`
 - `GET /_spindle/admin/v1/rooms/{room_id}/timeline`
+- `POST /_spindle/admin/v1/send_server_notice`
 - `GET /_spindle/admin/v1/server_version`
 - `GET /_spindle/admin/v1/users`
 - `GET/PUT /_spindle/admin/v1/users/{user_id}`
@@ -58,6 +62,9 @@ neither implemented nor counted.
 - `GET /_synapse/admin/v1/event_reports`
 - `GET /_synapse/admin/v1/event_reports/{report_id}`
 - `POST /_synapse/admin/v1/purge_history/{room_id}`
+- `GET /_synapse/admin/v1/registration_tokens`
+- `POST /_synapse/admin/v1/registration_tokens/new`
+- `GET/PUT/DELETE /_synapse/admin/v1/registration_tokens/{token}`
 - `POST /_synapse/admin/v1/reset_password/{user_id}`
 - `GET /_synapse/admin/v1/rooms`
 - `GET/DELETE /_synapse/admin/v1/rooms/{room_id}`
@@ -67,6 +74,7 @@ neither implemented nor counted.
 - `GET /_synapse/admin/v1/rooms/{room_id}/state`
 - `GET /_synapse/admin/v1/rooms/{room_id}/state_at`
 - `GET /_synapse/admin/v1/rooms/{room_id}/timeline`
+- `POST /_synapse/admin/v1/send_server_notice`
 - `GET /_synapse/admin/v1/server_version`
 - `GET /_synapse/admin/v1/users`
 - `GET/PUT /_synapse/admin/v1/users/{user_id}`
@@ -262,7 +270,7 @@ neither implemented nor counted.
 - `POST /_matrix/client/v3/register`
 - `GET /_matrix/client/v3/register/available`
 
-### Server, discovery & operations — 26 implemented, 0 planned
+### Server, discovery & operations — 27 implemented, 0 planned
 
 - `GET /.well-known/matrix/client`
 - `GET /.well-known/matrix/server`
@@ -273,6 +281,7 @@ neither implemented nor counted.
 - `GET/PUT /_matrix/client/v1/admin/suspend/{user_id}`
 - `POST /_matrix/client/v1/login/get_token`
 - `GET /_matrix/client/v1/mutual_rooms`
+- `GET /_matrix/client/v1/register/m.login.registration_token/validity`
 - `GET /_matrix/client/v1/rooms/{room_id}/hierarchy`
 - `GET /_matrix/client/v1/rooms/{room_id}/threads`
 - `GET /_matrix/client/v1/rooms/{room_id}/timestamp_to_event`

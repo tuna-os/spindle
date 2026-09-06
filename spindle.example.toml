@@ -77,6 +77,18 @@ enabled = true
 # genuinely wants previews of an internal wiki and says so range by range.
 allow_private = []
 
+# Who may register. Open by default; with `require_token = true` a new
+# account needs a token an admin minted at `/_spindle/admin/v1/registration_tokens`.
+# [registration]
+# require_token = false
+
+# Notices from the operator to a user (`POST /_spindle/admin/v1/send_server_notice`).
+# Absent, the endpoint refuses and says so. The account is created on first use.
+# [server_notices]
+# localpart = "server"
+# display_name = "Server Notices"
+# room_name = "Server Notices"
+
 [push]
 # Deliver notifications to the push gateways clients register (`POST
 # /pushers/set`). Off keeps the registrations and sends nothing.

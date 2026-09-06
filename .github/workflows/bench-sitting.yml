@@ -72,11 +72,17 @@ jobs:
         run: |
           docker run -d --name bench-pg -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench \
             -p 127.0.0.1:5433:5432 postgres:16-alpine
-          for _ in $(seq 1 30); do
-            docker exec bench-pg pg_isready -U bench -q && break
+          # Over TCP, not the socket: the image's entrypoint first runs a
+          # throwaway server on the socket alone to initialise the cluster,
+          # then stops it and starts the real one. A socket check answers
+          # "ready" during that first life (run 34042463777 did, and the
+          # final check then met the restart); the TCP listener exists only
+          # once the real server is up.
+          for _ in $(seq 1 60); do
+            docker exec bench-pg pg_isready -U bench -h 127.0.0.1 -q && break
             sleep 1
           done
-          docker exec bench-pg pg_isready -U bench
+          docker exec bench-pg pg_isready -U bench -h 127.0.0.1
           echo "BENCH_PG_URL=postgres://bench:bench@127.0.0.1:5433/postgres" >> "$GITHUB_ENV"
       - name: The sitting
         env:
