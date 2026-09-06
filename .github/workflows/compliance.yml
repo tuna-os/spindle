@@ -545,6 +545,205 @@ jobs:
           path: tmp/synadm/
           if-no-files-found: ignore
 
+  # A peer-to-peer call with no SFU anywhere: Element Call's frozen
+  # full-mesh branch, built at its last commit and pointed at a Spindle,
+  # two browsers meeting in a call over a host-to-host candidate pair
+  # (docs/p2p-calls.md). Nightly and on demand, because building the
+  # branch is a yarn install and a vite build of a 2023 tree.
+  # The mesh seam, nightly: a Neutrino node built from the fork at the
+  # pinned revision with contrib/neutrino's patches, beside a Spindle, run
+  # through scripts/neutrino-interop.sh against the table it is expected
+  # to produce, then Element Call's full-mesh client in a call with the
+  # creator on the node (docs/p2p-calls.md). Not on pull requests: two
+  # extra Rust trees to build, and nothing on the seam can regress from a
+  # change to this repository alone.
+  mesh-seam:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            . -> target
+            tmp/neutrino-iroh -> target
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Check out the fork at the pin and apply the patches
+        # Fetched into directories that may already hold a restored
+        # `target/` from the cache, so not `git clone`, which refuses a
+        # non-empty destination.
+        run: |
+          fetch() {
+            mkdir -p "$1"
+            git -C "$1" init --quiet
+            git -C "$1" fetch --quiet --depth 1 "$2" "$3"
+            git -C "$1" checkout --quiet FETCH_HEAD
+          }
+          fetch tmp/neutrino https://github.com/hanthor/neutrino 3fb6945f8b17d7d9f7ae4814d3939238ceef21e9
+          git -C tmp/neutrino -c user.name=ci -c user.email=ci@localhost \
+            am "$GITHUB_WORKSPACE"/contrib/neutrino/000{1,2,3}-*.patch
+          fetch tmp/neutrino-iroh https://github.com/hanthor/neutrino-iroh 6a16f66bf6b247c41977958a4750ae735dc24a2a
+          cat >> tmp/neutrino-iroh/Cargo.toml <<'TOML'
+
+          [patch."https://github.com/hanthor/neutrino"]
+          neutrino-ffi = { path = "../neutrino/crates/neutrino-ffi" }
+          neutrino-main = { path = "../neutrino/crates/neutrino-main" }
+          TOML
+      - name: Build the node
+        run: cargo build --release --manifest-path tmp/neutrino-iroh/Cargo.toml -p neutrino-ffi-ble --bin neutrino-lan
+      - name: Build the server
+        run: cargo build --release -p spindle-server --bin spindle
+      - name: Probe the seam against the expected table
+        env:
+          EXPECT: scripts/testdata/neutrino-interop.expected
+          NEUTRINO_LAN: tmp/neutrino-iroh/target/release/neutrino-lan
+          SPINDLE_BIN: target/release/spindle
+        run: scripts/neutrino-interop.sh
+      - name: Install the pinned Playwright and its Chromium
+        working-directory: scripts/element-web-e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Meet in a peer-to-peer call across the seam
+        env:
+          NEUTRINO_LAN: tmp/neutrino-iroh/target/release/neutrino-lan
+          SPINDLE_BIN: target/release/spindle
+        run: contrib/element-call-full-mesh/run.sh
+      - name: Keep the screenshots and logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mesh-seam
+          path: |
+            tmp/element-call-full-mesh/
+            /tmp/neutrino-interop-*/*.log
+          if-no-files-found: ignore
+
+  # A real bridge, nightly: matrix-hookshot through the Application
+  # Service API, invited, joined, answering a command and relaying a
+  # webhook into the room from a ghost it minted (contrib/hookshot). The
+  # bridge evidence #18 asks for, one bridge at a time.
+  hookshot-bridge:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Build the server
+        run: cargo build -p spindle-server --bin spindle
+      - name: Bridge a webhook through hookshot
+        env:
+          SPINDLE_BIN: target/debug/spindle
+        run: contrib/hookshot/run.sh
+      - name: Keep the logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hookshot-bridge
+          path: tmp/hookshot/
+          if-no-files-found: ignore
+
+  # The mautrix-go harness under evidence/: a bridge written against the
+  # library most bridges are written against, registering, provisioning
+  # ghosts, echoing. Its transcript is in docs/evidence; this keeps the
+  # transcript true. Not on pull requests, with the other bridge.
+  mautrix-echo:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: evidence/mautrix-echo/go.mod
+          cache-dependency-path: evidence/mautrix-echo/go.sum
+      - name: Run the harness against a fresh build
+        run: evidence/mautrix-echo/run.sh
+
+  # A real bridge, nightly: matrix-hookshot through the Application
+  # Service API, invited, joined, answering a command and relaying a
+  # webhook into the room from a ghost it minted (contrib/hookshot). The
+  # bridge evidence #18 asks for, one bridge at a time.
+  hookshot-bridge:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Build the server
+        run: cargo build -p spindle-server --bin spindle
+      - name: Bridge a webhook through hookshot
+        env:
+          SPINDLE_BIN: target/debug/spindle
+        run: contrib/hookshot/run.sh
+      - name: Keep the logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hookshot-bridge
+          path: tmp/hookshot/
+          if-no-files-found: ignore
+
+  # The mautrix-go harness under evidence/: a bridge written against the
+  # library most bridges are written against, registering, provisioning
+  # ghosts, echoing. Its transcript is in docs/evidence; this keeps the
+  # transcript true. Not on pull requests, with the other bridge.
+  mautrix-echo:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: evidence/mautrix-echo/go.mod
+          cache-dependency-path: evidence/mautrix-echo/go.sum
+      - name: Run the harness against a fresh build
+        run: evidence/mautrix-echo/run.sh
+
+  # The mautrix-go harness under evidence/: a bridge written against the
+  # library most bridges are written against, registering, provisioning
+  # ghosts, echoing. Its transcript is in docs/evidence; this keeps the
+  # transcript true. Not on pull requests, with the other bridge.
+  mautrix-echo:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: evidence/mautrix-echo/go.mod
+          cache-dependency-path: evidence/mautrix-echo/go.sum
+      - name: Run the harness against a fresh build
+        run: evidence/mautrix-echo/run.sh
+
   full-mesh-e2e:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
