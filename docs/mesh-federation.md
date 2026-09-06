@@ -11,12 +11,17 @@ attendees using the mesh and public federation in a venue with poor
 connectivity, without noticing the seam.
 
 This page is the design for that system and the evidence behind it. It is
-written from both code bases as they stand (Spindle `main`, Neutrino fork
-branch `e2ee-key-transport` at 3fb6945, neutrino-iroh at its head), it
-records what a loopback federation between the two actually did, and it
-answers the open issues on the Companion side from Spindle's side. The rig
-that produced the evidence is `scripts/neutrino-interop.sh`; the Neutrino
-change it was re-run against is `contrib/neutrino/`.
+written from both code bases as they stand (this branch of Spindle, the
+Neutrino fork branch `e2ee-key-transport` at 3fb6945, neutrino-iroh at its
+head), it records what a loopback federation between the two actually did,
+and it answers the open issues on the Companion side from Spindle's side.
+The rig that produced the evidence is `scripts/neutrino-interop.sh`; the
+Neutrino change it runs against is `contrib/neutrino/`.
+
+The short version: with the patch on the mesh side and MSC4242 on this
+side, **a mesh user joins a room on the Spindle, the Spindle joins a room
+on the mesh, and messages cross in both directions**, over plain
+federation, with every event signed and verified.
 
 The design decision the RFC makes -- plain federation, no portal bridge --
 is right for Spindle too: this server relays ciphertext and key material
@@ -31,7 +36,7 @@ Neutrino is stale; the fork has moved. Read from the code:
 
 | | Spindle | Neutrino fork (`trusted_network = false`, as neutrino-lan runs it) |
 |---|---|---|
-| Room versions | 11 and 12, created as 11 | `org.matrix.msc4242.12` only: v12 auth rules over a state DAG (`prev_state_events`, no `auth_events`) |
+| Room versions | 11 and 12, and now `org.matrix.msc4242.12` (MSC4242 state DAGs, Hydra phase 2) | `org.matrix.msc4242.12` only: v12 auth rules over a state DAG (`prev_state_events`, no `auth_events`) |
 | Event signatures | required on every inbound PDU (ruma `verify_event`) | produced on every event; verified against the origin's node id |
 | Key document | served, fetched from peers over `/_matrix/key/v2/server` | served in signed mode (`server_name` = 64-hex node id, key `ed25519:1`, the node id is the key) |
 | Request signing | every federation request signed and verified | not produced (`X-Matrix origin,destination` only) and not verified inbound |
@@ -43,37 +48,49 @@ Neutrino is stale; the fork has moved. Read from the code:
 
 The consequences fall out directly. Events already cross the seam
 signed, so "may the older mesh events be unsigned" is moot: they are not.
-Requests do not, so a Neutrino node cannot yet be authenticated by a
-Spindle, and a Spindle's requests are accepted by a Neutrino node on
-faith. A Neutrino node can be reached by a Spindle (the `peers` map) but
-cannot reach a Spindle, because its only route is a link that addresses
-node ids. And the two sides create rooms in versions the other refuses.
+Requests do not, so a Neutrino node cannot be authenticated by a Spindle
+without the patch below, and a Spindle's requests are accepted by a
+Neutrino node on faith. A Neutrino node can be reached by a Spindle (the
+`peers` map) but cannot reach a Spindle without the patch, because its
+only route is a link that addresses node ids. And the two sides created
+rooms in versions the other refused, until this branch taught Spindle the
+mesh's.
 
 ## Evidence: one Neutrino node and one Spindle on loopback
 
 `scripts/neutrino-interop.sh` starts `neutrino-lan` (the LAN build of the
 fork: iroh, mDNS, no BLE) and a Spindle that lists the node in `peers`,
-then runs six probes. Against the unpatched fork:
+then runs nine probes. Against the unpatched fork and a Spindle without
+MSC4242, the picture was: the key document served, Spindle's invite refused
+for the room version, the node's invite failing after sixty seconds because
+the request went to `http://127.0.0.1~:8008` through the egress and the
+link could not address it, the alias resolved in 13 ms, the unauthenticated
+query answered, the key document fetched. So the transport and naming
+layers met in the middle already, and the two gaps were the direction mesh
+to Spindle and the room version.
+
+With `contrib/neutrino/` applied on the node and this branch on the
+Spindle, every probe passes:
 
 | probe | outcome | detail |
 |---|---|---|
 | mesh node key document at its loopback URL | served | `server_name` is the node id; key `ed25519:1` |
-| Spindle invites `@n:<node>` into a v12 room | refused | `400 M_INCOMPATIBLE_ROOM_VERSION`, `room_version: org.matrix.msc4242.12` |
-| mesh node invites `@alice:<spindle>` | failed | after 60 s: the request went to `http://127.0.0.1~:8008` through the egress, and the link could not address it |
-| Spindle resolves `#mesh-session-1:<node>` over federation | resolved | 13 ms; the fork's alias patch answers `query/directory` |
-| mesh node answers a federation query with no `X-Matrix` header | 200 | inbound requests are not verified |
-| Spindle key document over plain http | 200 | what a key resolver on the gateway fetches |
+| Spindle invites `@n:<node>` into a state-DAG room | accepted | the node holds the invite |
+| mesh node invites `@alice:<spindle>` | accepted | signed request, verified against the node's key document, in milliseconds |
+| mesh user joins Spindle's state-DAG room | joined | `make_join`/`send_join` against Spindle; the node seeds itself from the `state_dag` response |
+| messages cross Spindle to mesh and mesh to Spindle | both | in the room the mesh user joined |
+| Spindle joins the mesh node's room, a message reaches the node | joined | Spindle seeds itself from the node's `state_dag`, which carries the join itself as a head |
+| Spindle resolves `#mesh-session-1:<node>` over federation | resolved | the fork's alias patch answers `query/directory` |
+| mesh node answers a federation query with no `X-Matrix` header | 200 | inbound requests are still not verified (step 2 below) |
+| Spindle key document over plain http | 200 | what the node's HTTP key resolver fetches |
 
-So the transport and naming layers meet in the middle already -- a
-Spindle reaches a node, fetches its keys, and resolves its aliases -- and
-the two gaps are the direction mesh to Spindle and the room version. The
-first is a small patch; the second is the real work.
-
-Against the fork with `contrib/neutrino/` applied (see below), the third
-probe changes: the node dials the Spindle directly, the request carries a
-signature Spindle verifies against the node's key document, and the
-refusal moves from the transport to the room version -- which is the
-right place for it to be.
+Two things the run also showed. A Neutrino node drops a PDU for a room
+it has not yet registered ("no version on record for this room"): Spindle
+fans the node's own join out to it before the node has finished seeding
+from the `send_join` response, and that copy is lost, harmlessly, because
+the node already holds the event. And a state-DAG resident answers
+`send_join` with the DAG *after* the join, in which the join is a head;
+Spindle's seeding accepts that shape and seeds the join last.
 
 ## The system
 

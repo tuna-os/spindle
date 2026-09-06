@@ -29,7 +29,8 @@ cargo build --release -p neutrino-ffi-ble --bin neutrino-lan
 NEUTRINO_LAN=neutrino-iroh/target/release/neutrino-lan scripts/neutrino-interop.sh
 ```
 
-Before the patch the third probe fails after sixty seconds (the request
-went to `http://127.0.0.1~:8008` through the egress); after it, Spindle
-authenticates the node's request and answers `400
-M_INCOMPATIBLE_ROOM_VERSION` at once, which is the next gap, on purpose.
+Before the patch the node's invite fails after sixty seconds (the
+request went to `http://127.0.0.1~:8008` through the egress); after it,
+and with this branch's MSC4242 support on the Spindle, every probe
+passes: invites both ways, a mesh user joining a Spindle room, the
+Spindle joining a mesh room, and messages crossing in both directions.
