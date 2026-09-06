@@ -193,8 +193,9 @@ async fn registration_without_auth_returns_the_uia_flows() {
 async fn username_verdicts_outrank_the_uia_dance() {
     // A client should hear M_USER_IN_USE or M_INVALID_USERNAME on its first
     // request — not complete an auth flow to learn its username was never
-    // going to work. And an auth dict naming no session has not completed
-    // anything: it gets the challenge again, not an account.
+    // going to work. And an auth dict naming neither a session nor the
+    // dummy stage has not completed anything: it gets the challenge again,
+    // not an account.
     let harness = Harness::new();
     harness.register("alice", "hunter2").await;
 
@@ -222,12 +223,34 @@ async fn username_verdicts_outrank_the_uia_dance() {
             &json!({
                 "username": "bob",
                 "password": "hunter2",
-                "auth": { "type": "m.login.dummy" },
+                "auth": { "type": "m.login.password" },
             }),
         )
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
     assert!(body["session"].is_string(), "{body}");
+}
+
+/// The dummy stage completes without a session: `session` is optional in
+/// the auth dict, the stage carries no state a session would tie back to,
+/// and matrix-rust-sdk (so Element X) registers exactly this way. Its
+/// integration suite was refused on every test until this passed.
+#[tokio::test]
+async fn the_dummy_stage_completes_without_a_session() {
+    let harness = Harness::new();
+    let (status, body) = harness
+        .post(
+            "/_matrix/client/v3/register",
+            &json!({
+                "username": "bob",
+                "password": "hunter2",
+                "auth": { "type": "m.login.dummy" },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["user_id"], "@bob:example.org");
+    assert!(body["access_token"].is_string(), "{body}");
 }
 
 #[tokio::test]
