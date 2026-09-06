@@ -226,8 +226,12 @@ async fn threads_are_counted_apart_and_read_apart() {
         .say(&room, &alice, "in the main timeline", "m1")
         .await;
     let thread_root = server.say(&room, &alice, "a thread starts here", "r").await;
-    let _t1 = server.reply_in_thread(&room, &alice, &root, "t1").await;
-    let t2 = server.reply_in_thread(&room, &alice, &root, "t2").await;
+    let _t1 = server
+        .reply_in_thread(&room, &alice, &thread_root, "t1")
+        .await;
+    let t2 = server
+        .reply_in_thread(&room, &alice, &thread_root, "t2")
+        .await;
 
     // One badge for everything, as before.
     let (total, threads) = server.badge(&bob, &room, false).await;
@@ -241,7 +245,7 @@ async fn threads_are_counted_apart_and_read_apart() {
     assert_eq!(counts(&threads[&thread_root]), (2, 0), "{threads}");
 
     // Reading the thread reads only the thread.
-    server.receipt(&room, &bob, &t2, Some(&root)).await;
+    server.receipt(&room, &bob, &t2, Some(&thread_root)).await;
     let (main, threads) = server.badge(&bob, &room, true).await;
     assert_eq!(counts(&main), (2, 0), "{main}");
     assert!(threads.get(&thread_root).is_none(), "{threads}");
@@ -253,7 +257,9 @@ async fn threads_are_counted_apart_and_read_apart() {
     );
 
     // A `main` receipt reads the main timeline alone.
-    server.receipt(&room, &bob, &root, Some("main")).await;
+    server
+        .receipt(&room, &bob, &thread_root, Some("main"))
+        .await;
     let (main, _) = server.badge(&bob, &room, true).await;
     assert_eq!(counts(&main), (0, 0), "{main}");
 
@@ -329,8 +335,10 @@ async fn a_threaded_receipt_names_its_thread_to_everyone() {
     let bob = server.register("bob").await;
     let room = server.shared_room(&alice, &bob).await;
     let thread_root = server.say(&room, &alice, "root", "r").await;
-    let t1 = server.reply_in_thread(&room, &alice, &root, "t1").await;
-    server.receipt(&room, &bob, &t1, Some(&root)).await;
+    let t1 = server
+        .reply_in_thread(&room, &alice, &thread_root, "t1")
+        .await;
+    server.receipt(&room, &bob, &t1, Some(&thread_root)).await;
 
     let (status, body) = server
         .send(
