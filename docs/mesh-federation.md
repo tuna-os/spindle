@@ -144,6 +144,16 @@ until then a mesh client runs MatrixRTC 1.0 membership (state events), which
 the rig shows crossing to Spindle, while Spindle clients' sticky memberships
 reach the node's timeline and not its sticky section.
 
+And the call that needs no SFU at all: a full-mesh call, media straight
+between the browsers, signalled over to-device messages and
+`org.matrix.msc3401.call.member` state. docs/p2p-calls.md proves it
+with Element Call's full-mesh build, first on one Spindle and then across
+this seam: the creator on a mesh node, the joiner on a Spindle, the room
+the node's, and the media between the two browsers on a host-to-host
+candidate pair. A node with no uplink cannot lean on an SFU, so on the
+mesh that is the call; the node needed `0003-browser-clients.patch` to be
+a browser's homeserver at all, and the page says what that patch is.
+
 ## Encryption: session rooms in the clear, everything else encrypted
 
 The policy is the app's: a session room, a hall room, the announcements
@@ -277,7 +287,15 @@ mesh's question, and the harder one; the Companion project's
    before it will place a call. Delays live in memory; MSC4354 on the
    node is what remains, and is small.
 
-5. **The MSC3995 hub protocol.** SPEC.md §12 is the design; nothing
+5. **A browser's homeserver: done here, as a patch.**
+   `contrib/neutrino/0003-browser-clients.patch` is what a 2023
+   matrix-js-sdk needs before it will sync from the node -- the `r0`
+   prefix, push rules, sync filters, TURN discovery -- and
+   `power_level_content_override` on `createRoom`, which every call
+   client relies on. With it, docs/p2p-calls.md's full-mesh call runs
+   with the creator on the node.
+
+6. **The MSC3995 hub protocol.** SPEC.md §12 is the design; nothing
    implements it, on either side. Not on the path to the venue.
 
 ## The gateway patch

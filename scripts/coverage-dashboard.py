@@ -253,7 +253,16 @@ MILESTONES = [
      "scope. What #41 still owes beyond upstream's suite: ringing and "
      "decline, five-party churn and a server restart mid-call, which no "
      "upstream spec drives, and the federated call across the rig's two "
-     "Spindles."),
+     "Spindles. And the call with no SFU at all, which a mesh with no "
+     "uplink has to make: Element Call's frozen full-mesh branch, the "
+     "peer-to-peer client, meets in a call against this server with media "
+     "on a host-to-host candidate pair, on one Spindle and then across the"
+     " mesh seam with the creator on a Neutrino node "
+     "(contrib/element-call-full-mesh, docs/p2p-calls.md). This server "
+     "needed one thing for it, the deprecated r0 API prefix a 2023 "
+     "matrix-js-sdk still asks for, now served as v3; the node needed "
+     "contrib/neutrino/0003-browser-clients.patch to be a browser's "
+     "homeserver at all."),
 ]
 
 # ---------------------------------------------------------------------------
