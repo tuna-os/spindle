@@ -32,6 +32,12 @@ cd "$(dirname "$0")/.."
 BENCH=${BENCH_DIR:-tmp/bench}
 BIN=${BENCH_BIN:-/home/user/bench-bin}
 VENV=${SYNAPSE_VENV:-/tmp/synvenv}
+# Absolute, whatever the caller passed: the Dendrite steps below `cd` into
+# the server's own directory before running its binaries, and CI names the
+# field as `tmp/bench-bin`. The first scheduled sitting died there with a
+# silent 127 -- "no such file", from a path that was right one directory up.
+case $BIN in /*) ;; *) BIN=$PWD/$BIN ;; esac
+case $VENV in /*) ;; *) VENV=$PWD/$VENV ;; esac
 TOKEN=${BENCH_TOKEN:-benchtoken}
 export NO_PROXY='*' no_proxy='*'
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy || true
@@ -149,7 +155,9 @@ TOML
   # loopback benchmark, not a deployment.
   if [ -x "$BIN/dendrite" ]; then
     rm -rf "$BENCH/dendrite"; mkdir -p "$BENCH/dendrite"
-    ( cd "$BENCH/dendrite" && "$BIN/generate-keys" --private-key matrix_key.pem >/dev/null 2>&1 )
+    # stderr kept: a key generator that cannot run must say so, not fail
+    # the sitting with a bare exit code.
+    ( cd "$BENCH/dendrite" && "$BIN/generate-keys" --private-key matrix_key.pem >/dev/null )
     {
       cat <<'YAML'
 version: 2
