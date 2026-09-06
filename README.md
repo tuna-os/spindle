@@ -220,7 +220,8 @@ so there is no database to provision.
 
 CI gates on all of the above plus the Complement ratchet, a config-drift check,
 a generated-dashboard drift check, and pinned-action and benchmark-tooling
-checks. New performance work is expected to arrive with a counting assertion
+checks. CONTRIBUTING.md has the longer version, and docs/releasing.md what a
+tag does. New performance work is expected to arrive with a counting assertion
 rather than a timing one, for the reason given above.
 
 ## License

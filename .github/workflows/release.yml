@@ -1,0 +1,119 @@
+name: Release
+
+# A tag becomes a release: binaries for the two Linux architectures, a
+# checksum file, and a container image at ghcr.io/tuna-os/spindle:<tag>.
+# ROADMAP.md is the contract for what a tag means; v0.0.x is a prerelease
+# that promises nothing, and this workflow marks every v0.* tag as one.
+# Cutting the tag is a decision for a person:
+#
+#   git tag -a v0.0.1 -m "v0.0.1: an addressable prerelease" && git push origin v0.0.1
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  binaries:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.90.0
+      - name: Build
+        run: cargo build --release -p spindle-server --bin spindle --locked
+      - name: Package
+        run: |
+          name="spindle-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp target/release/spindle LICENSE-MIT LICENSE-APACHE README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  image:
+    name: Image for ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Log in to the registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Build and push the per-architecture image
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME}-${{ matrix.arch }}"
+          docker build -t "$image" .
+          docker push "$image"
+
+  publish:
+    name: Publish the release
+    needs: [binaries, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Log in to the registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Join the per-architecture images under the tag
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker manifest create "$image:${GITHUB_REF_NAME}" \
+            "$image:${GITHUB_REF_NAME}-amd64" "$image:${GITHUB_REF_NAME}-arm64"
+          docker manifest push "$image:${GITHUB_REF_NAME}"
+      - name: Write the notes
+        run: |
+          {
+            echo "Built from \`${GITHUB_SHA}\`."
+            echo
+            echo "Image: \`ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME}\` (amd64, arm64)."
+            echo
+            case "$GITHUB_REF_NAME" in
+              v0.0.*)
+                echo "An addressable prerelease, per ROADMAP.md: no upgrade path, no support window, storage format unstable. It exists so that benchmarks, bug reports and security fixes can name a build." ;;
+              v0.*)
+                echo "A prerelease: see ROADMAP.md for what this line promises and the evidence behind it." ;;
+            esac
+            echo
+            echo '```'
+            cat dist/*.sha256
+            echo '```'
+          } > notes.md
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          prerelease=""
+          case "$GITHUB_REF_NAME" in v0.*) prerelease="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md $prerelease dist/*.tar.gz dist/*.sha256
