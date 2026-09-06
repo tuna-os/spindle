@@ -1639,14 +1639,18 @@ async fn register(
     // SPEC (client-server §UIA) has clients read `flows`/`params`/`session`
     // at the top level, and a challenge folded into an `error` string is
     // invisible to every generic UIA implementation. Complement's
-    // RegisterUser is what caught this. An auth dict that names no session
-    // gets the same challenge — the session is how a completed stage is
-    // tied back to the flow it completed.
-    let session_named = request
+    // RegisterUser is what caught this. An auth dict that names a session
+    // completes the stage; so does one that names the dummy stage and no
+    // session at all, which is how matrix-rust-sdk (and so Element X)
+    // registers: the spec makes `session` optional in the auth dict, the
+    // dummy stage carries no state a session would tie back to, and
+    // Synapse accepts it. Its integration suite was refused here on every
+    // test until this did.
+    let stage_completed = request
         .auth
         .as_ref()
-        .is_some_and(|auth| auth["session"].is_string());
-    if !session_named {
+        .is_some_and(|auth| auth["session"].is_string() || auth["type"] == "m.login.dummy");
+    if !stage_completed {
         return Ok((
             StatusCode::UNAUTHORIZED,
             Json(json!({
