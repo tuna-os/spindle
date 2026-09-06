@@ -112,7 +112,7 @@ impossible and the exception path is dead code.
 | **M4** Ecosystem | Substantial | Appservices (transactions, MSC2409 to-device, MSC4190), MSC3861 delegated auth, the `/_synapse/mas/*` surface, and a built-in OIDC provider so Element X login needs one binary |
 | **M5** Lifecycle | Substantial | 18 admin endpoints (also at `/_synapse/admin/v1`), `/metrics` with the fork-case counter, backup/restore/verify-media, versioned migrations |
 | **M6** Differentiators | Not started | Hub mode, MLS |
-| **M7** MatrixRTC | Server side served | **MSC4140 delayed events** — the dead-man's switch that stops calls accumulating ghost participants, which no other Rust homeserver has — plus MSC4354 sticky events, MSC4143 transport discovery, a built-in LiveKit JWT service or the OpenID round trip for an external one, ringing and decline. What remains is the gate: Element Call's own Playwright suite with Spindle in Synapse's seat, rigged and awaiting its first recorded run |
+| **M7** MatrixRTC | Server side served | **MSC4140 delayed events** — the dead-man's switch that stops calls accumulating ghost participants, which no other Rust homeserver has — plus MSC4354 sticky events, MSC4143 transport discovery, a built-in LiveKit JWT service or the OpenID round trip for an external one, ringing and decline. Element Call's own Playwright suite runs with Spindle in Synapse's seat, and its first run put a two-party call with video through LiveKit; the call and crash scenarios of the gate are what remains |
 
 **183 routes** and a **311-test Complement ratchet** in CI, over a workspace of
 100+ test suites. The first two are gated — the [dashboard](docs/dashboard.md)

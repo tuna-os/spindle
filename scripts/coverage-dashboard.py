@@ -234,19 +234,23 @@ MILESTONES = [
      "cannot do is be revoked when its holder leaves, and docs/matrix-rtc.md "
      "says so in those words rather than implying a guarantee the "
      "mechanism cannot make; it also lays out both deployments end to "
-     "end. #269's rig is authored (contrib/element-call): Element Call's "
+     "end. #269's rig is on main (contrib/element-call): Element Call's "
      "own Playwright stack, upstream and pinned, with Spindle in both of "
      "Synapse's seats through a compose override, and a ratchet over their"
      " specs in the shape of the Complement one "
-     "(scripts/element-call-check.py). It runs nightly and on demand "
-     "rather than per pull request, and its allowlist starts empty: the "
-     "rig was written without a Docker host to run it on, so the first "
-     "recorded run is what fills it in, beginning with landing.spec.ts and"
-     " the sign-up half of access.spec.ts. The widget and restricted-SFU "
-     "specs register users through Synapse's admin API with a shared "
-     "secret, which this server does not serve, and stay out of scope. "
-     "#41's scenarios beyond that -- the kill, the restart, the federated "
-     "call -- wait on that first run."),
+     "(scripts/element-call-check.py), run nightly and on demand. Its "
+     "first recorded run passed four of four: the landing page, sign-up "
+     "then login then logout, and a guest creating a call, sharing the "
+     "link and a second guest joining with video tiles on both sides -- "
+     "LiveKit, lk-jwt-service and this server's transport discovery "
+     "composing in a real browser, which is the composition #41 says no "
+     "unit test reaches. All four are protected in the allowlist. The "
+     "widget and restricted-SFU specs register users through Synapse's "
+     "admin API with a shared secret, which this server does not serve, "
+     "and stay out of scope. What #41 still owes: the call specs "
+     "(create-call, spa-call-sticky with its improper-leave case, "
+     "reconnect), the kill and restart scenarios, and the federated call, "
+     "each a named subset away in ELEMENT_CALL_SPECS."),
 ]
 
 # ---------------------------------------------------------------------------
