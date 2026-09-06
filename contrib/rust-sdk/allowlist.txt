@@ -1,0 +1,11 @@
+# matrix-rust-sdk integration tests Spindle must pass -- the ratchet over
+# upstream's own suite, enforced by scripts/rust-sdk-check.py the way
+# contrib/element-call/allowlist.txt is by element-call-check.py.
+#
+# One entry per line: the test's path as `cargo test` prints it
+# (`module::submodule::test_name`). A test that passes and is not here is
+# printed as a candidate; adding it is a reviewed promotion, never
+# automatic, so a flaky test cannot teach everyone to ignore this gate.
+#
+# Nothing is claimed that has not been seen to pass: every entry names the
+# run that recorded it. Empty until the first run reports.
