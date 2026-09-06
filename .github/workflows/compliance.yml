@@ -541,14 +541,20 @@ jobs:
         with:
           node-version: 22
       - name: Check out the fork at the pin and apply the patches
+        # Fetched into directories that may already hold a restored
+        # `target/` from the cache, so not `git clone`, which refuses a
+        # non-empty destination.
         run: |
-          mkdir -p tmp
-          git clone --quiet --branch e2ee-key-transport https://github.com/hanthor/neutrino tmp/neutrino
-          git -C tmp/neutrino checkout --quiet 3fb6945
+          fetch() {
+            mkdir -p "$1"
+            git -C "$1" init --quiet
+            git -C "$1" fetch --quiet --depth 1 "$2" "$3"
+            git -C "$1" checkout --quiet FETCH_HEAD
+          }
+          fetch tmp/neutrino https://github.com/hanthor/neutrino 3fb6945
           git -C tmp/neutrino -c user.name=ci -c user.email=ci@localhost \
             am "$GITHUB_WORKSPACE"/contrib/neutrino/000{1,2,3}-*.patch
-          git clone --quiet https://github.com/hanthor/neutrino-iroh tmp/neutrino-iroh
-          git -C tmp/neutrino-iroh checkout --quiet 6a16f66
+          fetch tmp/neutrino-iroh https://github.com/hanthor/neutrino-iroh 6a16f66
           cat >> tmp/neutrino-iroh/Cargo.toml <<'TOML'
 
           [patch."https://github.com/hanthor/neutrino"]
