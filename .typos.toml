@@ -35,6 +35,9 @@ extend-ignore-re = [
 "pring" = "pring"
 
 [files]
+# A patch against another project carries git blob hashes in its index
+# lines, which the checker reads as words.
+extend-exclude = ["contrib/neutrino/*.patch"]
 # Vendored, generated, or measured: not ours to spell-check.
 extend-exclude = [
     "Cargo.lock",
