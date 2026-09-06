@@ -92,9 +92,10 @@ MILESTONES = [
      "separate MAS. 17 of the router's endpoints come from `mas.rs` and "
      "`oidc.rs`. #17 and #18 stay open for the remaining bridge evidence."),
     ("M5", "Production lifecycle", "In progress",
-     "#83's admin API is served: 18 endpoints under `/_spindle/admin/v1`, "
+     "#83's admin API is served: 20 endpoints under `/_spindle/admin/v1`, "
      "each also mounted at `/_synapse/admin/v1` for existing tooling — users, "
-     "rooms, state-at, purge_history, room deletion, make_room_admin and the "
+     "rooms, state-at, purge_history, room deletion, make_room_admin, event "
+     "reports and the "
      "audit log. #166's observability landed too: a `/metrics` exposition on "
      "its own listener with the fork-case counter, append and HTTP "
      "histograms. #21 has its counting performance gate (`read_budget.rs`, "
