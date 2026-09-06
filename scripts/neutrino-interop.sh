@@ -69,7 +69,10 @@ REG="$(curl -s -X POST "$S/_matrix/client/v3/register" -H 'content-type: applica
 TOK="$(echo "$REG" | json access_token)"
 ADEV="$(echo "$REG" | json device_id)"
 ROOM="$(curl -s -X POST "$S/_matrix/client/v3/createRoom" -H "authorization: Bearer $TOK" \
-  -H 'content-type: application/json' -d '{"name":"Interop","room_version":"org.matrix.msc4242.12","preset":"public_chat"}' | json room_id)"
+  -H 'content-type: application/json' -d '{"name":"Interop","room_version":"org.matrix.msc4242.12","preset":"public_chat","power_level_content_override":{"events":{"m.rtc.member":0,"org.matrix.msc3401.call.member":0}}}' | json room_id)"
+# The override is what Element X sets on every room it creates: a fresh
+# room's state_default of 50 otherwise keeps every ordinary member out of
+# the call, on the mesh as anywhere.
 
 # 1. Spindle invites the mesh user into a state-DAG room (MSC4242, the
 # version the mesh creates rooms under and Spindle now speaks).
@@ -158,6 +161,61 @@ for _ in $(seq 1 40); do
 done
 row "a to-device message from the mesh user reaches alice's device" \
   "$([ "$TD" != "0" ] && echo delivered || echo missing)" "m.direct_to_device EDU in the node's transaction"
+
+# 2f. MatrixRTC across the seam. A call in a session room needs the
+# primitives on both sides: transport discovery (MSC4143), delayed events
+# (MSC4140) and sticky events (MSC4354). What the node advertises and
+# serves, and what of Spindle's crosses to it, is measured here.
+FEAT="$(curl -s "$N/_matrix/client/versions" | python3 -c 'import sys,json;f=json.load(sys.stdin).get("unstable_features",{});print(",".join(sorted(k for k in f if f[k])) or "none")')"
+row "mesh node advertises msc4140 / msc4143 / msc4354" \
+  "$(echo "$FEAT" | grep -q 'msc4140\|msc4143\|msc4354' && echo some || echo none)" "unstable_features: $(echo "$FEAT" | head -c 80)"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' "$N/_matrix/client/v1/rtc/transports")"
+row "mesh node serves /rtc/transports (MSC4143)" "$CODE" "a client on the mesh finds no SFU through the node"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$N/_matrix/client/v3/rooms/$ROOM/send/m.room.message/d0?org.matrix.msc4140.delay=60000" \
+  -H 'content-type: application/json' -d '{"msgtype":"m.text","body":"never"}')"
+DELAYED="$(curl -s "$N/_matrix/client/v3/rooms/$ROOM/messages?dir=b&limit=5" | grep -c '"never"' || true)"
+row "mesh node honours a delayed send (MSC4140)" \
+  "$([ "$CODE" = 200 ] && [ "$DELAYED" = 0 ] && echo held || echo "sent now")" "HTTP $CODE; the delay parameter is $([ "$DELAYED" = 0 ] && echo honoured || echo ignored)"
+
+# Spindle's sticky m.rtc.member (MatrixRTC 2.0, non-state, sticky for a
+# minute) crosses to the node as a PDU. Does the node keep the
+# `msc4354_sticky` key on it, and does the node's copy of the event carry
+# it to a client?
+curl -s -X PUT "$S/_matrix/client/v3/rooms/$ROOM/send/m.rtc.member/rtc1?org.matrix.msc4354.sticky_duration_ms=60000" -H "authorization: Bearer $TOK" \
+  -H 'content-type: application/json' -d "{\"application\":\"m.call\",\"call_id\":\"\",\"device_id\":\"$ADEV\",\"msc4354_sticky_key\":\"$ADEV\",\"focus_active\":{\"type\":\"livekit\",\"focus_selection\":\"oldest_membership\"}}" >/dev/null
+for _ in $(seq 1 40); do
+  RTC="$(curl -s "$N/_matrix/client/v3/rooms/$ROOM/messages?dir=b&limit=20" | python3 -c 'import sys,json
+for e in json.load(sys.stdin).get("chunk",[]):
+    if e.get("type")=="m.rtc.member" and e.get("sender","").startswith("@alice"):
+        print("sticky-kept" if "msc4354_sticky" in e else "sticky-dropped"); break
+else: print("missing")' 2>/dev/null || echo missing)"
+  [ "$RTC" != "missing" ] && break; sleep 0.25
+done
+row "alice's sticky m.rtc.member reaches the node" "$RTC" "MSC4354 key on the PDU $([ "$RTC" = sticky-kept ] && echo survives || echo "is lost or the event is missing")"
+STICKY="$(curl -s "$N/_matrix/client/v3/sync?timeout=0" | python3 -c 'import sys,json
+rooms=json.load(sys.stdin).get("rooms",{}).get("join",{})
+print("yes" if any("msc4354_sticky" in r for r in rooms.values()) else "no")' 2>/dev/null || echo no)"
+row "the node's /sync has an msc4354_sticky section" "$STICKY" "a later mesh joiner would $([ "$STICKY" = yes ] && echo see || echo "not be handed") the membership"
+
+# The node's m.rtc.member (state, as MatrixRTC 1.0 has it) crosses to Spindle.
+OUT="$(curl -s -X PUT "$N/_matrix/client/v3/rooms/$ROOM/state/m.rtc.member/_%40n%3A${NODE}_DEVICEID" \
+  -H 'content-type: application/json' -d '{"application":"m.call","call_id":"","device_id":"DEVICEID","focus_active":{"type":"livekit","focus_selection":"oldest_membership"}}')"
+for _ in $(seq 1 40); do
+  M="$(curl -s "$S/_matrix/client/v3/rooms/$ROOM/state" -H "authorization: Bearer $TOK" | grep -c '"m.rtc.member"' || true)"
+  [ "$M" != "0" ] && break; sleep 0.25
+done
+row "the mesh user's m.rtc.member state reaches Spindle" "$([ "$M" != "0" ] && echo arrived || echo missing)" "MatrixRTC 1.0 membership as room state; node said $(echo "$OUT" | head -c 70)"
+
+# Spindle's delayed leave of the call (MSC4140), fired without the client,
+# reaches the node: the dead-man's switch a mesh call needs works from
+# Spindle's side of the seam.
+curl -s -X PUT "$S/_matrix/client/v3/rooms/$ROOM/send/m.room.message/d1?org.matrix.msc4140.delay=500" -H "authorization: Bearer $TOK" \
+  -H 'content-type: application/json' -d '{"msgtype":"m.text","body":"fired after a delay"}' >/dev/null
+for _ in $(seq 1 60); do
+  D="$(curl -s "$N/_matrix/client/v3/rooms/$ROOM/messages?dir=b&limit=20" | grep -c 'fired after a delay' || true)"
+  [ "$D" != "0" ] && break; sleep 0.25
+done
+row "alice's delayed event fires and reaches the node" "$([ "$D" != "0" ] && echo delivered || echo missing)" "MSC4140 on Spindle; the node needs nothing"
 
 # 2d. Alice accepts the mesh node's invite: Spindle joins the mesh room,
 # seeded from the node's state DAG, and a message crosses back.
