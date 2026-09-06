@@ -72,6 +72,7 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/v3/rooms/{room_id}/event/{event_id}",
     "/_matrix/client/v3/rooms/{room_id}/context/{event_id}",
     "/_matrix/key/v2/server",
+    "/_matrix/client/v1/register/m.login.registration_token/validity",
     "/.well-known/matrix/client",
     "/.well-known/matrix/server",
     "/health",
@@ -482,6 +483,10 @@ fn account_routes() -> Router<AppState> {
         .route(
             "/_matrix/client/v3/register/available",
             get(register_available),
+        )
+        .route(
+            "/_matrix/client/v1/register/m.login.registration_token/validity",
+            get(registration_token_validity),
         )
         .route("/_matrix/client/v3/logout", post(logout))
         .route("/_matrix/client/v3/logout/all", post(logout_all))
@@ -1592,6 +1597,97 @@ async fn refresh(
     Ok(Json(session_body(&user_id, &session)))
 }
 
+#[derive(Debug, Deserialize)]
+struct TokenValidityQuery {
+    token: Option<String>,
+}
+
+/// `GET /_matrix/client/v1/register/m.login.registration_token/validity`
+/// (spec v1.2)
+///
+/// Whether a token would be accepted now. Rate-limited with registration
+/// itself: this is the endpoint a guesser would hammer.
+async fn registration_token_validity(
+    State(state): State<AppState>,
+    source: ClientAddr,
+    axum::extract::Query(query): axum::extract::Query<TokenValidityQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    if let Err(retry) = state
+        .limiter
+        .check(&format!("register:source:{source}"), REGISTER_PER_SOURCE)
+    {
+        return Err(MatrixError::limit_exceeded(retry.as_millis()));
+    }
+    let token = query
+        .token
+        .ok_or_else(|| MatrixError::missing_param("token is required"))?;
+    let valid =
+        crate::registration_tokens::RegistrationTokens::new(std::sync::Arc::clone(&state.store))
+            .is_valid(&token)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    Ok(Json(json!({ "valid": valid })))
+}
+
+/// `Ok(token)` when the stage is complete, `Err(challenge)` to send back.
+type StageOutcome = Result<Option<String>, (StatusCode, Json<Value>)>;
+
+/// The one UIA stage registration asks for, and whether `auth` completes
+/// it. `Ok(Err(challenge))` is the 401 to send back; `Ok(Ok(token))` is
+/// the registration token to spend once the account exists, `None` on an
+/// open server.
+///
+/// With `[registration] require_token` on, the stage is
+/// `m.login.registration_token` (spec v1.2) and the token in the auth dict
+/// has to be one an admin minted and not yet spent; it is spent by the
+/// caller, once the account exists, so a flow that fails later costs
+/// nothing.
+fn registration_stage(state: &AppState, auth: Option<&Value>) -> Result<StageOutcome, MatrixError> {
+    let require_token = state.config.registration.require_token;
+    let uia_stage = if require_token {
+        "m.login.registration_token"
+    } else {
+        "m.login.dummy"
+    };
+    let challenge = |error: Option<(&str, &str)>| {
+        let mut body = json!({
+            "flows": [{ "stages": [uia_stage] }],
+            "params": {},
+            "session": "register",
+        });
+        if let Some((errcode, message)) = error {
+            body["errcode"] = json!(errcode);
+            body["error"] = json!(message);
+        }
+        (StatusCode::UNAUTHORIZED, Json(body))
+    };
+    let stage_completed = if require_token {
+        auth.is_some_and(|auth| auth["type"] == uia_stage && auth["token"].is_string())
+    } else {
+        auth.is_some_and(|auth| auth["session"].is_string() || auth["type"] == "m.login.dummy")
+    };
+    if !stage_completed {
+        return Ok(Err(challenge(None)));
+    }
+    if !require_token {
+        return Ok(Ok(None));
+    }
+    let token = auth
+        .and_then(|auth| auth["token"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let valid =
+        crate::registration_tokens::RegistrationTokens::new(std::sync::Arc::clone(&state.store))
+            .is_valid(&token)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    if !valid {
+        return Ok(Err(challenge(Some((
+            "M_UNAUTHORIZED",
+            "the registration token is not valid",
+        )))));
+    }
+    Ok(Ok(Some(token)))
+}
+
 /// `GET /_matrix/client/v3/register/available`
 ///
 /// The same verdicts registration itself would give, without spending a UIA
@@ -1695,20 +1791,10 @@ async fn register(
     // dummy stage carries no state a session would tie back to, and
     // Synapse accepts it. Its integration suite was refused here on every
     // test until this did.
-    let stage_completed = request
-        .auth
-        .as_ref()
-        .is_some_and(|auth| auth["session"].is_string() || auth["type"] == "m.login.dummy");
-    if !stage_completed {
-        return Ok((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "flows": [{ "stages": ["m.login.dummy"] }],
-                "params": {},
-                "session": "register",
-            })),
-        ));
-    }
+    let registration_token = match registration_stage(&state, request.auth.as_ref())? {
+        Ok(token) => token,
+        Err(challenge) => return Ok(challenge),
+    };
 
     let username = username.ok_or_else(|| MatrixError::bad_json("no username"))?;
     let username = username.as_str();
@@ -1726,6 +1812,11 @@ async fn register(
         })?;
 
     let user_id = accounts.user_id(username);
+    if let Some(token) = registration_token {
+        crate::registration_tokens::RegistrationTokens::new(std::sync::Arc::clone(&state.store))
+            .consume(&token)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    }
     if request.inhibit_login {
         return Ok((StatusCode::OK, Json(json!({ "user_id": user_id }))));
     }
@@ -4683,6 +4774,9 @@ struct SetPusherRequest {
     #[serde(default)]
     #[allow(dead_code)]
     append: bool,
+    /// MSC3881: whether this pusher receives anything. Absent is on.
+    #[serde(default, alias = "org.matrix.msc3881.enabled")]
+    enabled: Option<bool>,
 }
 
 /// `POST /_matrix/client/v3/pushers/set`
@@ -4751,6 +4845,13 @@ async fn set_pusher(
                 "profile_tag": request.profile_tag,
                 "lang": request.lang,
                 "data": request.data,
+                // MSC3881, under both spellings until the stable one is
+                // in a spec this server claims: the device that owns the
+                // pusher, so another client can name it, and the switch.
+                "enabled": request.enabled.unwrap_or(true),
+                "org.matrix.msc3881.enabled": request.enabled.unwrap_or(true),
+                "device_id": identity.device_id,
+                "org.matrix.msc3881.device_id": identity.device_id,
             }),
         )
         .map_err(internal)?;
@@ -4777,57 +4878,147 @@ fn save_ruleset(state: &AppState, user_id: &str, ruleset: &Value) -> Result<(), 
         .put(user_id, "", crate::push_rules::TYPE, ruleset)
         .map_err(|error| account_data_error(&error))?;
     // What was scored under the old rules says nothing under the new.
-    state.rooms.forget_highlights(user_id);
+    state.rooms.forget_scores(user_id);
     Ok(())
 }
 
-/// `unread_notifications.highlight_count`: the reader's unread events in
-/// `room_id` that their push rules highlight.
+/// A room's badge for one reader: the unread events their push rules
+/// notify for and the highlights among them, in total and split by
+/// thread (MSC3773).
+pub(crate) struct Badge {
+    /// Everything after the unthreaded receipt, threads included.
+    pub notification_count: usize,
+    pub highlight_count: usize,
+    /// The main timeline alone, after the later of the unthreaded and
+    /// the `main` receipt.
+    pub main: (usize, usize),
+    /// Each thread root to its counts after the later of the unthreaded
+    /// and that thread's receipt; threads with nothing unread are absent.
+    pub threads: BTreeMap<String, (usize, usize)>,
+}
+
+impl Badge {
+    const NONE: Self = Self {
+        notification_count: 0,
+        highlight_count: 0,
+        main: (0, 0),
+        threads: BTreeMap::new(),
+    };
+}
+
+/// The reader's badge in `room_id`.
 ///
-/// Scored through the reader's tally ([`crate::rooms::Rooms::unscored_highlights`]):
-/// only the bodies after the position last scored are put to the rules, and
-/// the ruleset, profile and room context are read only when there is
-/// something to score. Nothing unread means nothing highlighted, before any
-/// of that.
-fn highlight_count(
+/// Scored through the reader's tally ([`crate::rooms::Rooms::unscored`]):
+/// only the bodies after the position last scored are put to the rules,
+/// and the ruleset, profile and room context are read only when there is
+/// something to score. Nothing unread (by the arithmetic count, which
+/// never reads a body) means nothing to score, before any of that.
+fn badge(
     state: &AppState,
     identity: &crate::accounts::Identity,
     room_id: &str,
     unread: &crate::rooms::Unread,
-) -> Result<usize, MatrixError> {
+) -> Result<Badge, MatrixError> {
     let Some(boundary) = unread.boundary else {
-        return Ok(0);
+        return Ok(Badge::NONE);
     };
     if unread.notification_count == 0 {
-        return Ok(0);
+        return Ok(Badge::NONE);
     }
     let pending = state
         .rooms
-        .unscored_highlights(room_id, &identity.user_id, boundary)
+        .unscored(room_id, &identity.user_id, boundary)
         .map_err(room_error)?;
-    if pending.events.is_empty() {
-        return Ok(pending.count);
+    let mut scored = pending.scored;
+    if !pending.events.is_empty() {
+        let ruleset = ruleset_of(state, &identity.user_id)?;
+        let profile = state
+            .profiles
+            .get(&identity.user_id)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        let room = RoomRuleContext::of(state, room_id)?;
+        let context = room.for_reader(&identity.user_id, profile.displayname.as_deref(), room_id);
+        for (li, event) in &pending.events {
+            let actions = crate::push_rules::evaluate(&ruleset, event, &context);
+            let relation = &event["content"]["m.relates_to"];
+            let thread = (relation["rel_type"] == "m.thread")
+                .then(|| relation["event_id"].as_str().map(str::to_owned))
+                .flatten();
+            scored.push(crate::rooms::Scored {
+                li: *li,
+                notifies: actions.is_some(),
+                highlights: actions
+                    .as_deref()
+                    .is_some_and(crate::push_rules::is_highlight),
+                thread,
+            });
+        }
+        state.rooms.record_scores(
+            room_id,
+            &identity.user_id,
+            boundary,
+            pending.upto,
+            scored.clone(),
+        );
     }
-    let ruleset = ruleset_of(state, &identity.user_id)?;
-    let profile = state
-        .profiles
-        .get(&identity.user_id)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    let room = RoomRuleContext::of(state, room_id)?;
-    let context = room.for_reader(&identity.user_id, profile.displayname.as_deref(), room_id);
-    let count = pending.count
-        + pending
-            .events
-            .iter()
-            .filter(|event| {
-                crate::push_rules::evaluate(&ruleset, event, &context)
-                    .is_some_and(|actions| crate::push_rules::is_highlight(&actions))
-            })
-            .count();
-    state
+    let floors = state
         .rooms
-        .record_highlights(room_id, &identity.user_id, boundary, pending.upto, count);
-    Ok(count)
+        .thread_receipts(room_id, &identity.user_id)
+        .map_err(room_error)?;
+    let main_floor = floors.get("main").copied().unwrap_or(i64::MIN);
+    let mut counts = Badge::NONE;
+    for event in &scored {
+        if !event.notifies {
+            continue;
+        }
+        let highlight = usize::from(event.highlights);
+        counts.notification_count += 1;
+        counts.highlight_count += highlight;
+        match &event.thread {
+            None if event.li > main_floor => {
+                counts.main.0 += 1;
+                counts.main.1 += highlight;
+            }
+            Some(root) if event.li > floors.get(root).copied().unwrap_or(i64::MIN) => {
+                let thread = counts.threads.entry(root.clone()).or_insert((0, 0));
+                thread.0 += 1;
+                thread.1 += highlight;
+            }
+            _ => {}
+        }
+    }
+    Ok(counts)
+}
+
+/// The `unread_notifications` section of a room in `/sync`, and, when
+/// the timeline filter asks (MSC3773), `unread_thread_notifications`:
+/// then the badge is the main timeline alone and each thread has its
+/// own; without it, one badge covers everything.
+fn badge_sections(
+    badge: &Badge,
+    by_thread: bool,
+) -> Result<Vec<(&'static str, Box<RawValue>)>, MatrixError> {
+    let counts = |notifications: usize, highlights: usize| json!({ "notification_count": notifications, "highlight_count": highlights });
+    if !by_thread {
+        return Ok(vec![(
+            "unread_notifications",
+            raw(&counts(badge.notification_count, badge.highlight_count))?,
+        )]);
+    }
+    let threads: serde_json::Map<String, Value> = badge
+        .threads
+        .iter()
+        .map(|(root, (notifications, highlights))| {
+            (root.clone(), counts(*notifications, *highlights))
+        })
+        .collect();
+    Ok(vec![
+        (
+            "unread_notifications",
+            raw(&counts(badge.main.0, badge.main.1))?,
+        ),
+        ("unread_thread_notifications", raw(&Value::Object(threads))?),
+    ])
 }
 
 /// Reject a scope the spec does not define.
@@ -6501,11 +6692,15 @@ fn receipts_extension(
     let mut rooms = serde_json::Map::new();
     for room_id in in_view {
         let mut content: serde_json::Map<String, Value> = serde_json::Map::new();
-        for (user, receipt_type, event_id, ts) in
+        for (user, receipt_type, event_id, ts, thread) in
             state.rooms.room_receipts(room_id).map_err(room_error)?
         {
             if receipt_type == "m.read.private" && user != identity.user_id {
                 continue;
+            }
+            let mut data = json!({ "ts": ts });
+            if let Some(thread) = thread {
+                data["thread_id"] = json!(thread);
             }
             content
                 .entry(event_id)
@@ -6516,7 +6711,7 @@ fn receipts_extension(
                 .or_insert_with(|| json!({}))
                 .as_object_mut()
                 .expect("inserted as an object")
-                .insert(user, json!({ "ts": ts }));
+                .insert(user, data);
         }
         if !content.is_empty() {
             rooms.insert(
@@ -6757,7 +6952,7 @@ fn sliding_room_entry(
         .rooms
         .unread(room_id, &identity.user_id)
         .map_err(room_error)?;
-    let highlight_count = highlight_count(state, identity, room_id, &unread)?;
+    let badge = badge(state, identity, room_id, &unread)?;
     Ok(crate::sliding::room_entry(
         crate::sliding::Summary {
             name,
@@ -6770,8 +6965,8 @@ fn sliding_room_entry(
         state_events,
         timeline,
         crate::sliding::Counts {
-            notification_count: unread.notification_count,
-            highlight_count,
+            notification_count: badge.notification_count,
+            highlight_count: badge.highlight_count,
         },
         initial,
     ))
@@ -7252,7 +7447,7 @@ fn sync_join(
             .rooms
             .unread(&room.room_id, &identity.user_id)
             .map_err(room_error)?;
-        let highlight_count = highlight_count(state, identity, &room.room_id, &unread)?;
+        let badge = badge(state, identity, &room.room_id, &unread)?;
         // Sent in full on every sync, incremental ones included, rather than
         // only when it changed. Account data has no stream position of its
         // own -- the sync token counts room events, and a `PUT` to
@@ -7340,13 +7535,13 @@ fn sync_join(
                 ),
             }))?,
         );
-        entry.insert(
-            "unread_notifications",
-            raw(&json!({
-                "notification_count": unread.notification_count,
-                "highlight_count": highlight_count,
-            }))?,
-        );
+        let by_thread = room_filter
+            .and_then(|room| room.timeline.as_ref())
+            .and_then(|timeline| timeline.unread_thread_notifications)
+            .unwrap_or(false);
+        for (key, value) in badge_sections(&badge, by_thread)? {
+            entry.insert(key, value);
+        }
         join.insert(room.room_id, raw(&entry)?);
     }
 
@@ -7370,6 +7565,10 @@ fn sync_join(
 }
 
 /// `POST /_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}`
+///
+/// The body may name a thread (MSC3771, spec v1.4): `main` for the main
+/// timeline or a thread root's event ID. A receipt with no thread is
+/// unthreaded and covers everything.
 async fn set_receipt(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
@@ -7378,12 +7577,25 @@ async fn set_receipt(
         String,
         String,
     )>,
+    body: axum::body::Bytes,
 ) -> Result<Json<Value>, MatrixError> {
+    let request: ReceiptRequest = optional_body(&body)?;
     state
         .rooms
-        .set_receipt(&room_id, &identity.user_id, &receipt_type, &event_id)
+        .set_receipt(
+            &room_id,
+            &identity.user_id,
+            &receipt_type,
+            &event_id,
+            request.thread_id.as_deref(),
+        )
         .map_err(room_error)?;
     Ok(Json(json!({})))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ReceiptRequest {
+    thread_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7413,7 +7625,7 @@ async fn read_markers(
         if let Some(event_id) = event_id {
             state
                 .rooms
-                .set_receipt(&room_id, &identity.user_id, receipt_type, event_id)
+                .set_receipt(&room_id, &identity.user_id, receipt_type, event_id, None)
                 .map_err(room_error)?;
         }
     }

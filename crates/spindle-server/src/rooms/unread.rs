@@ -53,29 +53,44 @@ impl UnreadIndex {
     }
 }
 
-/// How far one reader's unread highlights in one room have been scored.
+/// How far one reader's unread events in one room have been scored
+/// against their push rules.
 ///
-/// The count is arithmetic for notifications ([`UnreadIndex`]) and cannot
-/// be for highlights: whether an event highlights is a push-rule question
-/// answered against its body. Scoring every unread body on every sync would
-/// bring back the walk #81 removed, so the tally remembers the position it
-/// was scored to and only what came after it is read again. It is keyed on
-/// the boundary it counted from: a receipt that moves, or a rejoin, starts
-/// a fresh count over the new unread range.
-#[derive(Clone, Copy)]
-pub(super) struct HighlightTally {
+/// The arithmetic index ([`UnreadIndex`]) says how many events sit after
+/// the boundary; which of them *notify* or *highlight*, and which thread
+/// each belongs to, is a push-rule question answered against the body.
+/// Scoring every unread body on every sync would bring back the walk #81
+/// removed, so the tally remembers the position it was scored to and only
+/// what came after it is read again. It is keyed on the boundary it
+/// counted from: a receipt that moves, or a rejoin, starts a fresh count
+/// over the new unread range.
+#[derive(Clone)]
+pub(super) struct ScoreTally {
     boundary: i64,
     upto: i64,
-    count: usize,
+    scored: Vec<Scored>,
 }
 
-/// The unread events one reader's highlight tally has not scored yet.
+/// One unread event, scored: whether the reader's rules notify or
+/// highlight for it, and the thread it belongs to (`None` for the main
+/// timeline). Kept per event rather than as counts so a receipt inside a
+/// thread (MSC3771) can be answered without rescoring.
+#[derive(Clone, Debug)]
+pub struct Scored {
+    pub li: i64,
+    pub notifies: bool,
+    pub highlights: bool,
+    pub thread: Option<String>,
+}
+
+/// The unread events one reader's tally has not scored yet.
 pub struct Unscored {
-    /// Highlights already counted after the boundary.
-    pub count: usize,
+    /// Already scored after the boundary, oldest first.
+    pub scored: Vec<Scored>,
     /// Bodies after the scored position, oldest first, none the reader's
-    /// own; the caller puts these to the reader's rules.
-    pub events: Vec<Value>,
+    /// own, each with its position; the caller puts these to the reader's
+    /// rules.
+    pub events: Vec<(i64, Value)>,
     /// The position the tally covers once `events` are scored.
     pub upto: i64,
 }
@@ -119,6 +134,7 @@ impl Rooms {
         user_id: &str,
         receipt_type: &str,
         event_id: &str,
+        thread_id: Option<&str>,
     ) -> Result<(), RoomError> {
         if !self.is_joined(user_id, room_id)? {
             return Err(RoomError::Forbidden(format!(
@@ -133,7 +149,7 @@ impl Rooms {
 
         spindle_store::Store::put(
             self.store.as_ref(),
-            &receipt_key(room_id, user_id, receipt_type),
+            &receipt_key(room_id, user_id, receipt_type, thread_id),
             &ReceiptRecord {
                 event_id: event_id.to_owned(),
                 li,
@@ -162,10 +178,10 @@ impl Rooms {
     /// cost for a long-absent one, and the reason SPEC §15's per-room executor
     /// eventually caches it.
     ///
-    /// Push rules are not applied, because there are none yet (#7 lists them
-    /// separately). Until then every message from somebody else counts, which
-    /// is an over-count for a room with a mute rule and the honest behaviour
-    /// for a server that has no rules to consult.
+    /// This count is arithmetic: every timeline event after the boundary
+    /// that is not the reader's own. It is the upper bound the badge starts
+    /// from; which of those events notify under the reader's push rules is
+    /// scored on top by the caller ([`Self::unscored`]), body by body, once.
     ///
     /// # Errors
     ///
@@ -252,10 +268,10 @@ impl Rooms {
         })
     }
 
-    /// What `user_id`'s highlight tally in `room_id` has not scored yet:
-    /// the count so far after `boundary`, and the bodies after the scored
-    /// position that are not the reader's own. A tally counted from another
-    /// boundary is stale, and the range starts over at `boundary`.
+    /// What `user_id`'s tally in `room_id` has not scored yet: the events
+    /// scored so far after `boundary`, and the bodies after the scored
+    /// position that are not the reader's own. A tally counted from
+    /// another boundary is stale, and the range starts over at `boundary`.
     ///
     /// Timeline entries only, as the notification count is; a purged body
     /// is nothing to score. The spine is read under the room's read lock and
@@ -266,7 +282,7 @@ impl Rooms {
     /// # Errors
     ///
     /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
-    pub fn unscored_highlights(
+    pub fn unscored(
         &self,
         room_id: &str,
         user_id: &str,
@@ -278,9 +294,10 @@ impl Rooms {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
-            .copied()
+            .cloned()
             .filter(|tally| tally.boundary == boundary);
-        let (count, from) = tally.map_or((0, boundary), |tally| (tally.count, tally.upto));
+        let (scored, from) =
+            tally.map_or((Vec::new(), boundary), |tally| (tally.scored, tally.upto));
         let pending: Vec<(i64, String)> = self.with_room_read(room_id, |_, log| {
             Ok(log
                 .entries()
@@ -297,7 +314,7 @@ impl Rooms {
             match self.read_event(room_id, &EventId::new(event_id.as_str())) {
                 Ok(json) => {
                     if json["sender"] != user_id {
-                        events.push(json);
+                        events.push((*li, json));
                     }
                 }
                 Err(RoomError::MissingBody(_)) if watermark.is_some_and(|mark| *li < mark) => {}
@@ -305,42 +322,75 @@ impl Rooms {
             }
         }
         Ok(Unscored {
-            count,
+            scored,
             events,
             upto,
         })
     }
 
-    /// Remember that `user_id`'s highlights in `room_id` after `boundary`
-    /// number `count`, scored up to `upto`.
-    pub fn record_highlights(
+    /// Remember `user_id`'s scored events in `room_id` after `boundary`,
+    /// scored up to `upto`.
+    pub fn record_scores(
         &self,
         room_id: &str,
         user_id: &str,
         boundary: i64,
         upto: i64,
-        count: usize,
+        scored: Vec<Scored>,
     ) {
         self.highlights
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(
                 (room_id.to_owned(), user_id.to_owned()),
-                HighlightTally {
+                ScoreTally {
                     boundary,
                     upto,
-                    count,
+                    scored,
                 },
             );
     }
 
-    /// Drop every highlight tally of `user_id`: their rules changed, so
-    /// what was scored under the old ones no longer says anything.
-    pub fn forget_highlights(&self, user_id: &str) {
+    /// Drop every tally of `user_id`: their rules changed, so what was
+    /// scored under the old ones no longer says anything.
+    pub fn forget_scores(&self, user_id: &str) {
         self.highlights
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|(_, reader), _| reader != user_id);
+    }
+
+    /// Where `user_id` has read up to inside each thread of `room_id`
+    /// (MSC3771): thread root (or `main`) to the position of the later of
+    /// their public and private receipt there. Unthreaded receipts are
+    /// [`Self::receipt`]'s business and are not in this map.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the records cannot be read.
+    pub fn thread_receipts(
+        &self,
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<HashMap<String, i64>, RoomError> {
+        let prefix = receipt_key(room_id, user_id, "", None);
+        let mut floors = HashMap::new();
+        for (key, value) in spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)? {
+            let Ok(tail) = std::str::from_utf8(&key[prefix.len()..]) else {
+                continue;
+            };
+            let Some((receipt_type, thread)) = tail.split_once('\0') else {
+                continue;
+            };
+            if receipt_type != "m.read" && receipt_type != "m.read.private" {
+                continue;
+            }
+            if let Some(record) = ReceiptRecord::decode(&value) {
+                let floor = floors.entry(thread.to_owned()).or_insert(record.li);
+                *floor = (*floor).max(record.li);
+            }
+        }
+        Ok(floors)
     }
 
     /// One user's receipt of one type, if they have set it.
@@ -356,7 +406,7 @@ impl Rooms {
     ) -> Result<Option<Receipt>, RoomError> {
         let Some(raw) = spindle_store::ReadView::get(
             self.store.as_ref(),
-            &receipt_key(room_id, user_id, receipt_type),
+            &receipt_key(room_id, user_id, receipt_type, None),
         )?
         else {
             return Ok(None);
@@ -370,26 +420,30 @@ impl Rooms {
 }
 
 impl Rooms {
-    /// Every receipt in a room, as `(user_id, receipt_type, event_id, ts)`.
+    /// Every receipt in a room, as `(user_id, receipt_type, event_id, ts,
+    /// thread_id)`.
     ///
     /// What an `m.receipt` ephemeral event is built from. The private
     /// kind (`m.read.private`) is the reader's own business: the caller
-    /// keeps those for their owner and hands the rest to everyone.
+    /// keeps those for their owner and hands the rest to everyone. A
+    /// threaded receipt (MSC3771) names its thread; an unthreaded one has
+    /// `None`.
     ///
     /// # Errors
     ///
     /// Returns [`RoomError`] if the records cannot be read.
+    #[allow(clippy::type_complexity, reason = "one row per receipt")]
     pub fn room_receipts(
         &self,
         room_id: &str,
-    ) -> Result<Vec<(String, String, String, u64)>, RoomError> {
+    ) -> Result<Vec<(String, String, String, u64, Option<String>)>, RoomError> {
         let prefix =
             spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::Receipt, room_id);
         let mut receipts = Vec::new();
         for (key, value) in spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)? {
             let rest = &key[prefix.len()..];
             // The key's tail is what `receipt_key` wrote: a length-prefixed
-            // user, then the type.
+            // user, then the type, then a NUL and the thread when threaded.
             let Some((len, rest)) = rest.split_first_chunk::<2>() else {
                 continue;
             };
@@ -397,11 +451,14 @@ impl Rooms {
             if rest.len() < len {
                 continue;
             }
-            let (user, receipt_type) = rest.split_at(len);
-            let (Ok(user), Ok(receipt_type)) =
-                (std::str::from_utf8(user), std::str::from_utf8(receipt_type))
+            let (user, tail) = rest.split_at(len);
+            let (Ok(user), Ok(tail)) = (std::str::from_utf8(user), std::str::from_utf8(tail))
             else {
                 continue;
+            };
+            let (receipt_type, thread) = match tail.split_once('\0') {
+                Some((receipt_type, thread)) => (receipt_type, Some(thread.to_owned())),
+                None => (tail, None),
             };
             if let Some(record) = ReceiptRecord::decode(&value) {
                 receipts.push((
@@ -409,6 +466,7 @@ impl Rooms {
                     receipt_type.to_owned(),
                     record.event_id,
                     record.ts,
+                    thread,
                 ));
             }
         }
@@ -416,8 +474,15 @@ impl Rooms {
     }
 }
 
-/// Receipts live per room, per user, per type.
-fn receipt_key(room_id: &str, user_id: &str, receipt_type: &str) -> Vec<u8> {
+/// Receipts live per room, per user, per type, and per thread when
+/// threaded (MSC3771): the thread follows the type after a NUL, which no
+/// type contains, so the unthreaded key is what it always was.
+fn receipt_key(
+    room_id: &str,
+    user_id: &str,
+    receipt_type: &str,
+    thread_id: Option<&str>,
+) -> Vec<u8> {
     let mut key = spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::Receipt, room_id);
     // Length-prefixed for the same reason room and user keys are: `@ab` must
     // not be read as `@a` followed by a type beginning `b`.
@@ -425,6 +490,10 @@ fn receipt_key(room_id: &str, user_id: &str, receipt_type: &str) -> Vec<u8> {
     key.extend_from_slice(&u16::try_from(user.len()).unwrap_or(u16::MAX).to_be_bytes());
     key.extend_from_slice(user);
     key.extend_from_slice(receipt_type.as_bytes());
+    if let Some(thread_id) = thread_id {
+        key.push(0);
+        key.extend_from_slice(thread_id.as_bytes());
+    }
     key
 }
 

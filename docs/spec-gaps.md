@@ -10,7 +10,7 @@ and the diff is the work the release brought.
 
 ## Client-Server API
 
-129 of 166 operations served.
+130 of 166 operations served.
 
 ### Not served, in the spec since before v1.1
 
@@ -51,10 +51,6 @@ and the diff is the work the release brought.
 
 - `GET /_matrix/client/v3/login/sso/redirect` — `sso_login_redirect.yaml`
 - `GET /_matrix/client/v3/login/sso/redirect/{idpId}` — `sso_login_redirect.yaml`
-
-### Not served, added in v1.2
-
-- `GET /_matrix/client/v1/register/m.login.registration_token/validity` — `registration_tokens.yaml`
 
 ### Not served, added in v1.7
 
@@ -100,7 +96,7 @@ and the diff is the work the release brought.
 
 ## Served beyond the spec at this pin
 
-79 routes the pinned spec does not define: MSC surfaces under
+87 routes the pinned spec does not define: MSC surfaces under
 `unstable/`, the admin and MAS-compatibility APIs, and stable spellings
 newer than the pin. Each MSC route must be accounted for in
 `contrib/msc/ledger.toml`; `scripts/msc-ledger.py --check` enforces that.
@@ -121,6 +117,9 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_spindle/admin/v1/audit`
 - `/_spindle/admin/v1/event_reports`
 - `/_spindle/admin/v1/event_reports/{}`
+- `/_spindle/admin/v1/registration_tokens`
+- `/_spindle/admin/v1/registration_tokens/new`
+- `/_spindle/admin/v1/registration_tokens/{}`
 - `/_spindle/admin/v1/rooms`
 - `/_spindle/admin/v1/rooms/{}`
 - `/_spindle/admin/v1/rooms/{}/make_room_admin`
@@ -129,6 +128,7 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_spindle/admin/v1/rooms/{}/state`
 - `/_spindle/admin/v1/rooms/{}/state_at`
 - `/_spindle/admin/v1/rooms/{}/timeline`
+- `/_spindle/admin/v1/send_server_notice`
 - `/_spindle/admin/v1/server_version`
 - `/_spindle/admin/v1/users`
 - `/_spindle/admin/v1/users/{}`
@@ -144,6 +144,9 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_synapse/admin/v1/event_reports`
 - `/_synapse/admin/v1/event_reports/{}`
 - `/_synapse/admin/v1/purge_history/{}`
+- `/_synapse/admin/v1/registration_tokens`
+- `/_synapse/admin/v1/registration_tokens/new`
+- `/_synapse/admin/v1/registration_tokens/{}`
 - `/_synapse/admin/v1/reset_password/{}`
 - `/_synapse/admin/v1/rooms`
 - `/_synapse/admin/v1/rooms/{}`
@@ -153,6 +156,7 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_synapse/admin/v1/rooms/{}/state`
 - `/_synapse/admin/v1/rooms/{}/state_at`
 - `/_synapse/admin/v1/rooms/{}/timeline`
+- `/_synapse/admin/v1/send_server_notice`
 - `/_synapse/admin/v1/server_version`
 - `/_synapse/admin/v1/users`
 - `/_synapse/admin/v1/users/{}`

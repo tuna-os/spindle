@@ -76,3 +76,14 @@ tests::e2ee::test_mutual_qrcode_verification
 tests::e2ee::test_mutual_sas_verification
 tests::e2ee::test_secret_gossip_after_interactive_verification
 tests::timeline::test_stale_local_echo_time_abort_edit
+
+# Run 34043758918 (matrix-sdk-0.18.0 at 1c44fb66, Spindle at 4497773):
+# 36 passed, 14 failed, 5 ignored. #425 (a world-readable roster, the
+# `/context` split, `$LAZY` members) settles the room preview, the
+# notification client's sender lookup and the permalink timeline's
+# redecryption. #429 (a receipt is a change to the reader's room) was
+# meant for test_room_notification_count as well, which still waits out
+# its observer; it stays a candidate until a second run agrees.
+tests::sliding_sync::notification_client::test_notification
+tests::sliding_sync::room::test_room_preview
+tests::timeline::test_permalink_timelines_redecrypt
