@@ -516,6 +516,35 @@ jobs:
   # two browsers meeting in a call over a host-to-host candidate pair
   # (docs/p2p-calls.md). Nightly and on demand, because building the
   # branch is a yarn install and a vite build of a 2023 tree.
+  # synadm, the Synapse admin CLI, against the /_synapse/admin alias: the
+  # question "does tooling written for Synapse drive this server?" asked
+  # with the tool itself (contrib/synadm). Cheap enough to run on pull
+  # requests: a pip install and the debug build every other job makes.
+  synadm-interop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Build the server
+        run: cargo build -p spindle-server --bin spindle
+      - name: Install synadm
+        run: pip install --quiet synadm==0.49.2
+      - name: Drive the admin API the way an operator does
+        env:
+          SPINDLE_BIN: target/debug/spindle
+        run: contrib/synadm/run.sh
+      - name: Keep the logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: synadm-interop
+          path: tmp/synadm/
+          if-no-files-found: ignore
+
   full-mesh-e2e:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
