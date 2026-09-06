@@ -162,10 +162,12 @@ NEUTRINO_LAN=neutrino-iroh/target/release/neutrino-lan \
 SPINDLE_BIN=target/release/spindle scripts/neutrino-interop.sh
 ```
 
-*Pass:* nine of nine probes, as recorded in docs/mesh-federation.md:
-invites both ways accepted, the mesh user joined through `make_join` and
+*Pass:* every probe, as recorded in docs/mesh-federation.md: invites
+both ways accepted, the mesh user joined through `make_join` and
 `send_join`, messages crossing both ways, the Spindle joined a mesh room
-seeded from its state DAG, the alias resolved. *A failure here* is a
+seeded from its state DAG, the alias resolved, and the six encryption
+probes -- keys found and claimed in both directions, a device change
+announced, to-device messages delivered both ways. *A failure here* is a
 version or signing mismatch; the rig prints the peer's refusal.
 
 ### Rung 2: a swarm on a shaped link, with a gateway tier
@@ -253,16 +255,23 @@ first line. Everything it needed beyond that becomes a rung above.
 
 The population is not one room. It is:
 
-- **The announcements room**, everyone in it. This lives on the Spindle,
-  and the Spindle is built for exactly this shape: one append, three
-  thousand sync waiters woken. Rung 4 measures it. Attendees with any
-  internet, including the venue Wi-Fi, read it from the Spindle directly.
+- **The announcements room**, everyone in it, unencrypted. This lives on
+  the Spindle, and the Spindle is built for exactly this shape: one
+  append, three thousand sync waiters woken. Rung 4 measures it.
+  Attendees with any internet, including the venue Wi-Fi, read it from
+  the Spindle directly.
 - **Session rooms**, tens to low hundreds each, one per talk, booth and
-  hall. These are the mesh's rooms. A hundred is the ceiling the loopback
-  swarm converged at when joins were spread over seconds, and the join
-  storm is the failure mode: the app's join jitter is what keeps it a
-  ceiling and not a cliff.
-- **Direct messages**, two nodes. Free.
+  hall, unencrypted, so a phone that joins late reads them without a key
+  exchange over Bluetooth. These are the mesh's rooms. A hundred is the
+  ceiling the loopback swarm converged at when joins were spread over
+  seconds, and the join storm is the failure mode: the app's join jitter
+  is what keeps it a ceiling and not a cliff.
+- **Direct messages and the groups people make**, encrypted by default.
+  Two nodes for a DM, and free; a group is a small session room with a
+  key exchange on top. The key material crosses the seam through the
+  federation key endpoints and to-device EDUs (docs/mesh-federation.md,
+  "Encryption"), which rung 1 exercises in both directions. A gateway
+  relays ciphertext and keys and never sees plaintext.
 
 The open question, and the only one that could sink the announcements
 room for the offline, is **announcements to phones with only BLE**. A
