@@ -61,11 +61,13 @@ FIELD = {
     ),
     "synapse": (
         "Synapse",
-        "Python · SQLite in these sittings",
-        "the reference implementation and what most deployments run; on its "
-        "development database here, which its own docs say is slower than "
-        "Postgres for real load -- so its column is a floor for Synapse, not "
-        "a ceiling",
+        "Python · Postgres on the shared runner, SQLite in the milestone sittings",
+        "the reference implementation and what most deployments run. Each "
+        "sitting's provenance line says which database it ran on: the "
+        "milestone sittings used SQLite, which its own docs call a "
+        "development database, so those columns are a floor for Synapse; "
+        "the shared-runner sittings from September 2026 run it on Postgres, "
+        "as its docs say to",
     ),
     "continuwuity": (
         "Continuwuity",
