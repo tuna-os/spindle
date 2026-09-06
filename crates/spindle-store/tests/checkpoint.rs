@@ -8,7 +8,7 @@
 //! make impossible, arrived at through a backup rather than through a crash.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 
 use spindle_core::RoomLog;
@@ -75,9 +75,16 @@ fn a_room_read_during_concurrent_appends_is_never_torn() {
     }
 
     let stop = Arc::new(AtomicBool::new(false));
+    // How many entries the writer has committed so far, so the reader can
+    // wait for the first one: on a loaded machine the reader's sixty loads
+    // can all finish before the writer thread is even scheduled, and a test
+    // that then complains the writer never committed has measured the
+    // scheduler, not the store.
+    let committed = Arc::new(AtomicU32::new(0));
     let writer = {
         let store = Arc::clone(&store);
         let stop = Arc::clone(&stop);
+        let committed = Arc::clone(&committed);
         thread::spawn(move || {
             let room_store = RoomStore::new(store.as_ref(), ROOM);
             let mut log = room_store.load().unwrap().unwrap().log;
@@ -95,10 +102,21 @@ fn a_room_read_during_concurrent_appends_is_never_torn() {
                     .commit_entry(&entry, &log, Durability::Relaxed)
                     .unwrap();
                 number += 1;
+                committed.store(number, Ordering::Release);
             }
             number
         })
     };
+
+    // Reads count as concurrent only once the writer is writing.
+    let started = std::time::Instant::now();
+    while committed.load(Ordering::Acquire) == 0 {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the writer did not commit within thirty seconds"
+        );
+        thread::yield_now();
+    }
 
     let room_store = RoomStore::new(store.as_ref(), ROOM);
     let mut reads = 0;
