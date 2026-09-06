@@ -80,9 +80,9 @@ name = "conf.example"
 # The gateways, by node id (the 64-hex key each one prints at start).
 # Plain http on the venue LAN, and an hour's patience for one that is dark.
 peers = {
-  "<gateway-1 node id>" = { url = "http://10.20.0.11:8448", max_backoff_ms = 3600000 },
-  "<gateway-2 node id>" = { url = "http://10.20.0.12:8448", max_backoff_ms = 3600000 },
-  "<gateway-3 node id>" = { url = "http://10.20.0.13:8448", max_backoff_ms = 3600000 },
+  "<gateway-1 node id>" = { url = "http://10.20.0.11:8008", max_backoff_ms = 3600000 },
+  "<gateway-2 node id>" = { url = "http://10.20.0.12:8008", max_backoff_ms = 3600000 },
+  "<gateway-3 node id>" = { url = "http://10.20.0.13:8008", max_backoff_ms = 3600000 },
 }
 # The venue's range, so those literal addresses are allowed.
 allow_internal = ["10.20.0.0/16"]
