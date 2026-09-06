@@ -342,9 +342,16 @@ impl RoomReader<'_> {
     /// # Errors
     ///
     /// Returns [`RoomError`] if the room or the event is unknown.
-    pub fn context(&self, event_id: &str, limit: usize) -> Result<Context, RoomError> {
+    pub fn context(
+        &self,
+        event_id: &str,
+        before: usize,
+        after: usize,
+    ) -> Result<Context, RoomError> {
         self.rooms
-            .context_visible(&self.room_id, event_id, limit, &|li| self.scope.admits(li))
+            .context_visible(&self.room_id, event_id, before, after, &|li| {
+                self.scope.admits(li)
+            })
     }
 
     /// The events in this room matching `matches`, as this caller may see
