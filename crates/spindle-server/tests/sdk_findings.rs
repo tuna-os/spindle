@@ -192,11 +192,11 @@ async fn an_invite_carries_the_inviter_s_membership() {
             .iter()
             .find(|event| event["type"] == "m.room.member" && event["state_key"] == json!(user))
     };
-    let invitee = member("@bob:example.org").expect("the invitee's own member event");
-    assert_eq!(invitee["sender"], json!("@alice:example.org"));
-    assert_eq!(invitee["content"]["membership"], json!("invite"));
-    let inviter = member("@alice:example.org").expect("the inviter's member event");
-    assert_eq!(inviter["content"]["membership"], json!("join"));
+    let bob_event = member("@bob:example.org").expect("the invitee's own member event");
+    assert_eq!(bob_event["sender"], json!("@alice:example.org"));
+    assert_eq!(bob_event["content"]["membership"], json!("invite"));
+    let alice_event = member("@alice:example.org").expect("the inviter's member event");
+    assert_eq!(alice_event["content"]["membership"], json!("join"));
     // Still stripped: nothing an invitee is not entitled to.
     assert!(
         events.iter().all(|event| event.get("event_id").is_none()),

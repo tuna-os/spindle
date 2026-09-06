@@ -266,6 +266,28 @@ impl SyncResult {
     }
 }
 
+/// The state a window changed, as MSC4222's `state_after` wants it: the
+/// last event in the window for each `(type, state_key)` it touched. The
+/// window runs to the head, so the last event for a key *is* the state
+/// after the window for that key, and every key the window did not touch
+/// is unchanged and stays out.
+fn state_changed_in(events: &[Value]) -> Vec<Value> {
+    let mut latest: Vec<((String, String), Value)> = Vec::new();
+    for event in events {
+        let (Some(event_type), Some(state_key)) =
+            (event["type"].as_str(), event["state_key"].as_str())
+        else {
+            continue;
+        };
+        let key = (event_type.to_owned(), state_key.to_owned());
+        match latest.iter_mut().find(|(seen, _)| *seen == key) {
+            Some((_, slot)) => *slot = event.clone(),
+            None => latest.push((key, event.clone())),
+        }
+    }
+    latest.into_iter().map(|(_, event)| event).collect()
+}
+
 /// One room's share of a sync response.
 pub struct SyncRoom {
     pub room_id: String,
@@ -2908,6 +2930,14 @@ impl Rooms {
             // initial sync, or on the sync that joins it. Otherwise the
             // state events are in the timeline already, and sending them
             // twice would make a client apply each one twice.
+            //
+            // Except under MSC4222. `state_after` tells the client *not* to
+            // fold the timeline's state events into its state -- the block
+            // is the whole answer -- so an incremental sync must carry
+            // every key that changed in the window, or the change is lost.
+            // It was: this branch sent an empty block, and matrix-rust-sdk,
+            // which always asks for `state_after`, never saw a room name,
+            // topic, alias or power level change after its first sync.
             let (state, cached_state) = if fresh {
                 self.initial_state(
                     &room_id,
@@ -2917,6 +2947,8 @@ impl Rooms {
                     prev_batch,
                     state_after,
                 )?
+            } else if state_after {
+                (state_changed_in(&events), false)
             } else {
                 (Vec::new(), false)
             };
