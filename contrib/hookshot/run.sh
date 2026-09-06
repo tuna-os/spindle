@@ -20,11 +20,11 @@
 #   2. the bot joins a room it is invited to (an inbound transaction
 #      carried the invite, the bridge acted on it through the client API
 #      with its as_token)
-#   3. `!hookshot webhook ci` gets an answer: the bot opens an admin room,
+#   3. `!hookshot webhook ci-hook` gets an answer: the bot opens an admin room,
 #      invites alice into it, and hands over the webhook URL there (its
 #      real flow; the URL is a secret and the bridged room may be public)
 #   4. a POST to that URL lands in the room as a message from the
-#      webhook's ghost user, `@_webhook_ci:<server>`, a user the bridge
+#      webhook's ghost user, `@_webhook_ci-hook:<server>`, a user the bridge
 #      minted in its exclusive namespace
 #   5. the bridge restarted comes back with the connection it stored as
 #      room state on the homeserver, and the same URL still routes
@@ -169,7 +169,7 @@ echo "@hookshot:$SERVER_NAME is joined"
 # --- the command, and the URL it answers with -----------------------------------
 step "alice asks for a webhook"
 curl -s -X PUT "$S/_matrix/client/v3/rooms/$ROOM/send/m.room.message/cmd1" -H "authorization: Bearer $TOK" \
-  -H 'content-type: application/json' -d '{"msgtype":"m.text","body":"!hookshot webhook ci"}' >/dev/null
+  -H 'content-type: application/json' -d '{"msgtype":"m.text","body":"!hookshot webhook ci-hook"}' >/dev/null
 # The bot answers by opening an admin room and inviting alice into it;
 # the invite shows up in her sync. Join every room the bot invites her to
 # and look for the URL in all of them, the bridged room included.
