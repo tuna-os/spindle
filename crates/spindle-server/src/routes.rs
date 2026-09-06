@@ -6054,20 +6054,29 @@ fn sliding_room_entry(
         limited,
         prev_batch: prev_batch.map(|li| crate::tokens::Pagination(li).to_string()),
     };
-    let joined_count = state
+    let roster = state.rooms.roster(room_id).map_err(room_error)?;
+    let avatar = state
         .rooms
-        .joined_member_count(room_id)
-        .map_err(room_error)?;
+        .state_event_unscoped(room_id, "m.room.avatar", "")
+        .ok()
+        .and_then(|content| content["url"].as_str().map(str::to_owned));
+    let bump_stamp = state.rooms.last_activity(room_id).map_err(room_error)?;
     let unread = state
         .rooms
         .unread(room_id, &identity.user_id)
         .map_err(room_error)?;
     let highlight_count = highlight_count(state, identity, room_id, &unread)?;
     Ok(crate::sliding::room_entry(
-        name,
+        crate::sliding::Summary {
+            name,
+            avatar,
+            joined_count: roster.joined.len(),
+            invited_count: roster.invited.len(),
+            heroes: crate::sliding::heroes(&roster.heroes, &identity.user_id),
+            bump_stamp,
+        },
         state_events,
         timeline,
-        joined_count,
         crate::sliding::Counts {
             notification_count: unread.notification_count,
             highlight_count,
