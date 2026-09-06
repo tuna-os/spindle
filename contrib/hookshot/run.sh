@@ -152,7 +152,7 @@ echo "the bridge's transaction endpoint answers, and its webhook listener is up"
 # --- a user, a room, the bot ----------------------------------------------------
 step "alice invites the bot and it joins"
 REG="$(curl -s -X POST "$S/_matrix/client/v3/register" -H 'content-type: application/json' \
-  -d '{"username":"alice","password":"correct-horse","auth":{"type":"m.login.dummy"}}')"
+  -d '{"username":"alice","password":"correct-horse","auth":{"type":"m.login.dummy","session":"register"}}')"
 TOK="$(echo "$REG" | json access_token)"
 ROOM="$(curl -s -X POST "$S/_matrix/client/v3/createRoom" -H "authorization: Bearer $TOK" -H 'content-type: application/json' \
   -d "{\"name\":\"bridged\",\"preset\":\"private_chat\",\"invite\":[\"@hookshot:$SERVER_NAME\"],\"power_level_content_override\":{\"users\":{\"@alice:$SERVER_NAME\":100,\"@hookshot:$SERVER_NAME\":50}}}" | json room_id)"
