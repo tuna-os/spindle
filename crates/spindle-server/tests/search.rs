@@ -137,6 +137,11 @@ impl Harness {
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        // Search orders across rooms by `origin_server_ts`, which is a
+        // millisecond, and two sends here can land in the same one; the
+        // server then breaks the tie by room ID, which is random. Let the
+        // clock move on so "newest first" means what the test says.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         body["event_id"].as_str().unwrap().to_owned()
     }
 
