@@ -95,6 +95,14 @@ jobs:
           git commit -m "Benchmark sitting $GROUP on a shared runner" \
             -m "Filed by the bench-sitting workflow. The sidecar names the host, the load and the versions; the page renders it in its own shared-runner section, apart from the milestone sittings."
           git push -u origin "$branch"
-          gh pr create --title "Benchmark sitting $GROUP (shared runner)" \
+          # Opening the pull request needs "Allow GitHub Actions to create
+          # and approve pull requests" under Settings > Actions > General,
+          # which is off by default and was off for the first sitting that
+          # got this far (#414). The sitting has run and its results are
+          # pushed by now, so a refusal here is a notice, not a failed run:
+          # somebody opens the pull request from the branch by hand.
+          if ! gh pr create --title "Benchmark sitting $GROUP (shared runner)" \
             --body "The weekly competitive sitting on a GitHub-hosted runner, filed as its own \`ci-\` group. Read \`docs/benchmarks/data/$GROUP.sitting.json\` for the host and the versions before merging; the page keeps shared-runner sittings apart from milestone ones." \
-            --base main --head "$branch"
+            --base main --head "$branch"; then
+            echo "::warning title=Sitting pushed, pull request not opened::The results are on branch $branch. Open the pull request by hand at https://github.com/${{ github.repository }}/compare/main...$branch, or allow GitHub Actions to create pull requests under Settings > Actions > General so the next sitting files its own."
+          fi
