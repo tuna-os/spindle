@@ -1013,10 +1013,40 @@ impl Rooms {
             && let Some(target) = json["state_key"].as_str()
             && target.split_once(':').map(|(_, domain)| domain) == Some(self.server_name.as_str())
         {
-            self.clear_pending_invite(target, room_id)?;
+            if self.leave_ends_pending_invite(target, room_id, json)? {
+                self.clear_pending_invite(target, room_id)?;
+            }
             return Ok(());
         }
         received
+    }
+
+    /// Whether a leave or ban that arrived for a room this server does
+    /// not hold is about the invite standing for the user, rather than an
+    /// earlier one. The resident server fans a rejection out to the
+    /// invitee's domain after the rejecting server has already answered
+    /// its user, so a fresh invite can be recorded before the old leave
+    /// lands; that leave names the old invite among its auth and prev
+    /// events and must not take the new one with it. A record written
+    /// before the invite's id was kept yields to any leave, as before.
+    fn leave_ends_pending_invite(
+        &self,
+        user_id: &str,
+        room_id: &str,
+        leave: &Value,
+    ) -> Result<bool, RoomError> {
+        let Some(pending) = self.pending_invite(user_id, room_id)? else {
+            return Ok(false);
+        };
+        let Some(invite_id) = pending["event_id"].as_str() else {
+            return Ok(true);
+        };
+        let names_invite = |key: &str| {
+            leave[key]
+                .as_array()
+                .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(invite_id)))
+        };
+        Ok(names_invite("auth_events") || names_invite("prev_events"))
     }
 
     /// Accept a membership event another server's user made *through*

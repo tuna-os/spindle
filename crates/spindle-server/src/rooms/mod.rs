@@ -804,6 +804,7 @@ impl Rooms {
         user_id: &str,
         room_id: &str,
         origin: &str,
+        event_id: &str,
         invite_state: &[Value],
     ) -> Result<(), RoomError> {
         spindle_store::Store::put(
@@ -813,9 +814,13 @@ impl Rooms {
                 user_id,
                 room_id,
             ),
-            serde_json::json!({ "origin": origin, "invite_state": invite_state })
-                .to_string()
-                .as_bytes(),
+            serde_json::json!({
+                "origin": origin,
+                "event_id": event_id,
+                "invite_state": invite_state,
+            })
+            .to_string()
+            .as_bytes(),
         )?;
         spindle_store::Store::put(
             self.store.as_ref(),
