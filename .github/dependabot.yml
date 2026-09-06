@@ -71,6 +71,13 @@ updates:
       interval: weekly
     open-pull-requests-limit: 3
 
+  # The runtime image at the root, which release.yml publishes.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+
   # The mautrix bridge harness under evidence/. Small, but it is a Go module
   # with its own lockfile, and "nothing updates it" was the finding that
   # started all of this.
