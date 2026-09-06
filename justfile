@@ -71,3 +71,21 @@ bench-render:
     python3 scripts/render-comparisons.py docs/benchmarks/data site/comparisons.html
     python3 scripts/coverage-dashboard.py --html site/dashboard.html
     @echo "site/comparisons.html"
+
+# --- Upkeep: what the spec, the proposals and the pinned upstreams did
+# since the last look. The weekly workflow (upkeep.yml) files the same three
+# reports into one issue; run this before bumping a pin, and read
+# docs/maintenance.md for what to do with what it says.
+upkeep:
+    python3 scripts/upstream-pins.py --upstream
+    @echo
+    python3 scripts/msc-ledger.py --upstream
+    @echo
+    python3 scripts/spec-drift.py --preview | sed -n '/^## Client-Server/,/^## Served beyond/p' | grep -E '^(##|[0-9]+ of)'
+
+# Regenerate the pages CI holds to the code: docs/spec-gaps.md from the
+# router and the pinned spec, docs/mscs.md from contrib/msc/ledger.toml.
+regen:
+    python3 scripts/spec-drift.py
+    python3 scripts/msc-ledger.py
+    python3 scripts/coverage-dashboard.py

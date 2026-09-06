@@ -202,6 +202,9 @@ The risks that would invalidate the headline claim are enumerated in
 | [docs/venue-playbook.md](docs/venue-playbook.md) | Setting up the mesh and the conference Spindle, the test ladder, and the go/no-go list for 3,000 attendees |
 | [docs/venue-gateway.md](docs/venue-gateway.md) | The venue gateway: the Neutrino node with the uplink, how to build, run, pair, and troubleshoot it |
 | [docs/dashboard.md](docs/dashboard.md) | Generated endpoint and milestone coverage |
+| [docs/mscs.md](docs/mscs.md) | Every MSC served, partly served, planned or declined — generated from the ledger CI holds to the code |
+| [docs/spec-gaps.md](docs/spec-gaps.md) | What the pinned Matrix spec defines that the router does not serve, by the version that added it |
+| [docs/maintenance.md](docs/maintenance.md) | Keeping up: the gates, the ratchets, the weekly upkeep report, and how a spec release or an MSC is absorbed |
 
 ---
 

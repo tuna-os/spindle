@@ -1,4 +1,4 @@
-//! Lazy-loaded members.
+//! Lazy-loaded members (MSC1227's `lazy_load_members` filter).
 //!
 //! In a 10,000-member room the roster *is* the initial sync: thousands of
 //! `m.room.member` events a client renders none of until someone speaks.

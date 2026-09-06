@@ -1,0 +1,324 @@
+# Every MSC Spindle serves, partly serves, has planned, or has declined --
+# the one place that says so, and the one `scripts/msc-ledger.py` reads.
+#
+# The check (`--check`, run in CI) holds this file to the code: every
+# `org.matrix.mscNNNN` flag `/versions` advertises and every route served
+# under an `unstable/org.matrix.mscNNNN` prefix must have an entry here
+# that is `served` or `partial`, every entry that claims either must name a
+# test that mentions the MSC, and the rendered page docs/mscs.md must match.
+# The upstream pass (`--upstream`, run weekly by upkeep.yml) asks GitHub
+# what became of each proposal, so a merge that hands a stable spelling to
+# something served here under its unstable name is noticed, and a proposal
+# closed unmerged is not carried forward as "planned".
+#
+# status:  served    -- the MSC's behaviour is built and a test proves it
+#          partial   -- some of it; `notes` says which part
+#          planned   -- on the roadmap, nothing built
+#          design    -- shapes the architecture; nothing to serve or test
+#          superseded -- absorbed by another MSC named in `notes`
+#          declined  -- looked at and not taken; `notes` says why
+# stable:  the spec version the MSC landed in, or "" while it has not.
+# unstable: the `/versions` unstable_features flags advertised for it.
+# evidence: files that prove the status; a served or partial entry needs
+#          at least one test file that mentions the MSC number.
+
+[[msc]]
+number = 3995
+title = "Linearized Matrix"
+status = "design"
+evidence = ["SPEC.md", "docs/divergence.md"]
+notes = "The design basis: an append-only per-room log with materialized state and no state resolution on the hot path. Hub mode is opt-in per room."
+
+[[msc]]
+number = 4242
+title = "State DAGs (Hydra phase 2)"
+status = "served"
+evidence = ["crates/spindle-server/tests/state_dag_rooms.rs", "crates/spindle-server/tests/surface.rs", "docs/mesh-federation.md"]
+notes = "State-DAG rooms are built, ingested and served; proven across the seam to a Neutrino mesh node by the loopback rig."
+
+[[msc]]
+number = 4428
+title = "Hydra: stable member identifiers"
+status = "planned"
+evidence = ["docs/mesh-federation.md"]
+notes = "Named with MSC4242 as the phase-2 set; not started."
+
+[[msc]]
+number = 4430
+title = "Hydra: member keys"
+status = "planned"
+evidence = ["docs/mesh-federation.md"]
+notes = "Named with MSC4242 as the phase-2 set; not started."
+
+[[msc]]
+number = 4354
+title = "Sticky events"
+status = "served"
+unstable = ["org.matrix.msc4354"]
+evidence = ["crates/spindle-server/tests/sticky_events.rs", "crates/spindle-server/tests/rtc_membership.rs"]
+notes = "sticky_duration_ms on a send, the key on the event, the sync section, federation push, and delayed+sticky. What MatrixRTC 2.0 makes m.rtc.member."
+
+[[msc]]
+number = 4143
+title = "MatrixRTC transport discovery (rtc/transports)"
+status = "served"
+unstable = ["org.matrix.msc4143"]
+evidence = ["crates/spindle-server/tests/rtc_transports.rs", "docs/matrix-rtc.md"]
+notes = "Served under the unstable and the v1 path; answers an empty list when no backend is configured. Absorbed MSC4158."
+
+[[msc]]
+number = 4158
+title = "MatrixRTC foci (earlier form)"
+status = "superseded"
+evidence = ["crates/spindle-server/tests/rtc_transports.rs"]
+notes = "Absorbed into MSC4143."
+
+[[msc]]
+number = 4195
+title = "LiveKit as a MatrixRTC transport"
+status = "served"
+evidence = ["crates/spindle-server/tests/livekit_jwt.rs", "docs/matrix-rtc.md"]
+notes = "The built-in JWT service, or the OpenID round trip for an external one."
+
+[[msc]]
+number = 4140
+title = "Delayed events"
+status = "served"
+unstable = ["org.matrix.msc4140"]
+evidence = ["crates/spindle-server/tests/delayed_events.rs", "crates/spindle-server/tests/rtc_membership.rs"]
+notes = "All four endpoints; the dead-man's switch MatrixRTC members rely on."
+
+[[msc]]
+number = 4309
+title = "Finalised delayed events in sync"
+status = "served"
+evidence = ["crates/spindle-server/tests/delayed_events.rs"]
+notes = "The org.matrix.msc4140.finalised_delayed_events sync section."
+
+[[msc]]
+number = 4075
+title = "MatrixRTC ringing (m.rtc.notification)"
+status = "served"
+evidence = ["crates/spindle-server/tests/push_delivery.rs", "docs/rate-limits.md"]
+notes = "Rings are pushed and budgeted per sender (rings_per_minute)."
+
+[[msc]]
+number = 4310
+title = "MatrixRTC ring decline"
+status = "served"
+evidence = ["crates/spindle-server/tests/push_delivery.rs"]
+
+[[msc]]
+number = 3757
+title = "Restricting state keys to a user's own ID"
+status = "served"
+evidence = ["crates/spindle-server/tests/rtc_membership.rs"]
+notes = "What lets m.rtc.member state keys carry the sender."
+
+[[msc]]
+number = 3401
+title = "Native group VoIP signalling"
+status = "declined"
+evidence = ["docs/p2p-calls.md"]
+notes = "The full-mesh branch built on it is frozen; MatrixRTC (MSC4143 and friends) is the direction."
+
+[[msc]]
+number = 3861
+title = "Delegated authentication (OIDC)"
+status = "served"
+evidence = ["crates/spindle-server/tests/delegated_auth.rs", "docs/delegated-auth.md"]
+notes = "Both ways: the built-in provider, or a real MAS through the /_synapse/mas/* surface."
+
+[[msc]]
+number = 2965
+title = "OAuth 2.0 server metadata discovery"
+status = "served"
+stable = "1.15"
+evidence = ["crates/spindle-server/tests/delegated_auth.rs"]
+notes = "Served at /v1/auth_metadata and the unstable path js-sdk asks first."
+
+[[msc]]
+number = 2967
+title = "OAuth 2.0 API scopes"
+status = "served"
+stable = "1.15"
+evidence = ["crates/spindle-server/tests/delegated_auth.rs"]
+notes = "The v1.15 scope spelling and the draft one older clients still send."
+
+[[msc]]
+number = 3575
+title = "Sliding sync (original)"
+status = "superseded"
+evidence = ["crates/spindle-server/tests/sliding_sync.rs"]
+notes = "Superseded by MSC4186, which kept the org.matrix.simplified_msc3575 route prefix; that is why the route names this number."
+
+[[msc]]
+number = 4186
+title = "Simplified sliding sync"
+status = "served"
+evidence = ["crates/spindle-server/tests/sliding_sync.rs"]
+notes = "Lists, room subscriptions, required_state, timeline, extensions, invites in the list, heroes and bump_stamp. What Element X syncs with."
+
+[[msc]]
+number = 4222
+title = "use_state_after in sync"
+status = "served"
+stable = "1.16"
+unstable = ["org.matrix.msc4222.use_state_after"]
+evidence = ["crates/spindle-server/tests/state_after.rs", "crates/spindle-server/tests/sync.rs"]
+
+[[msc]]
+number = 3266
+title = "Room summary API"
+status = "served"
+stable = "1.15"
+unstable = ["im.nheko.summary"]
+evidence = ["crates/spindle-server/tests/room_summary.rs"]
+
+[[msc]]
+number = 3814
+title = "Dehydrated devices"
+status = "served"
+unstable = ["org.matrix.msc3814"]
+evidence = ["crates/spindle-server/tests/dehydrated_devices.rs"]
+
+[[msc]]
+number = 2409
+title = "Appservices receive to-device messages and ephemeral events"
+status = "served"
+stable = "1.13"
+evidence = ["crates/spindle-server/tests/appservice_transactions.rs"]
+
+[[msc]]
+number = 3202
+title = "Appservice E2EE: device masquerading and OTK counts"
+status = "served"
+evidence = ["crates/spindle-server/tests/appservice_transactions.rs", "crates/spindle-server/tests/appservice_key_proxy.rs"]
+
+[[msc]]
+number = 4190
+title = "Appservice device management"
+status = "served"
+evidence = ["crates/spindle-server/tests/appservice_devices.rs", "crates/spindle-server/tests/appservice_transactions.rs"]
+
+[[msc]]
+number = 3983
+title = "Appservices claim one-time keys"
+status = "served"
+evidence = ["crates/spindle-server/tests/appservice_key_proxy.rs"]
+
+[[msc]]
+number = 3984
+title = "Appservices answer key queries"
+status = "served"
+evidence = ["crates/spindle-server/tests/appservice_key_proxy.rs"]
+
+[[msc]]
+number = 2659
+title = "Appservice ping"
+status = "served"
+stable = "1.7"
+evidence = ["crates/spindle-server/tests/appservice_ping.rs"]
+
+[[msc]]
+number = 3916
+title = "Authenticated media"
+status = "served"
+stable = "1.11"
+evidence = ["crates/spindle-server/tests/federation_media.rs", "crates/spindle-server/tests/media.rs"]
+
+[[msc]]
+number = 3083
+title = "Restricted room joins"
+status = "served"
+stable = "1.2"
+evidence = ["crates/spindle-server/tests/restricted_join.rs"]
+
+[[msc]]
+number = 3787
+title = "knock_restricted join rule"
+status = "served"
+stable = "1.3"
+evidence = ["crates/spindle-server/tests/federation_knock.rs"]
+
+[[msc]]
+number = 4291
+title = "Room IDs as hashes of the create event (room v12)"
+status = "served"
+stable = "1.16"
+evidence = ["crates/spindle-server/tests/rooms.rs", "crates/spindle-server/tests/federation_remote_join.rs"]
+
+[[msc]]
+number = 4289
+title = "Explicitly privilege room creators (room v12)"
+status = "served"
+stable = "1.16"
+evidence = ["crates/spindle-server/tests/restricted_join.rs", "crates/spindle-server/tests/rtc_membership.rs"]
+
+[[msc]]
+number = 3820
+title = "Room version 11"
+status = "served"
+stable = "1.8"
+evidence = ["crates/spindle-server/tests/redaction.rs"]
+notes = "With its parts: MSC2174 (redacts in content), MSC2175, MSC2176, MSC3821, MSC3989."
+
+[[msc]]
+number = 2174
+title = "Move the redacts key into content"
+status = "served"
+stable = "1.8"
+evidence = ["crates/spindle-server/tests/redaction.rs"]
+
+[[msc]]
+number = 2675
+title = "Serverside aggregations of relations"
+status = "served"
+stable = "1.3"
+evidence = ["crates/spindle-server/tests/aggregation.rs"]
+
+[[msc]]
+number = 3856
+title = "Threads list API"
+status = "served"
+stable = "1.4"
+evidence = ["crates/spindle-server/tests/threads.rs"]
+
+[[msc]]
+number = 1227
+title = "Lazy-loading room members"
+status = "served"
+stable = "1.1"
+evidence = ["crates/spindle-server/tests/lazy_members.rs"]
+
+[[msc]]
+number = 4196
+title = "Push rule defaults"
+status = "served"
+evidence = ["crates/spindle-server/tests/push_rules.rs"]
+
+[[msc]]
+number = 3706
+title = "Faster joins: partial state on send_join"
+status = "planned"
+evidence = ["SPEC.md"]
+notes = "SPEC.md says partial-state joins are accepted on the receive side; nothing in the code or the tests handles members_omitted, so this ledger does not repeat the claim. Not started."
+
+[[msc]]
+number = 4244
+title = "MLS over Matrix"
+status = "planned"
+evidence = ["SPEC.md", "ROADMAP.md"]
+notes = "Milestone M6, behind a feature flag, deliberately last. The linear index is epoch order for free."
+
+[[msc]]
+number = 4256
+title = "MLS mode with deterministic epochs"
+status = "planned"
+evidence = ["SPEC.md", "ROADMAP.md"]
+
+[[msc]]
+number = 4038
+title = "Key backup for MLS"
+status = "planned"
+evidence = ["SPEC.md"]

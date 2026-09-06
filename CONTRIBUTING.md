@@ -56,6 +56,15 @@ is the list; each job's comment says why it runs where it runs.
   by recording the reason, the alternative that was rejected, or the
   failure that motivated it.
 
+## Adding an endpoint or an MSC
+
+Both have a generated page CI holds to the code. A new route must
+appear in `docs/dashboard.md` and leave `docs/spec-gaps.md` (run `just
+regen`); a new MSC surface needs an entry in `contrib/msc/ledger.toml`
+naming the test that proves it, and the flag it advertises. The whole
+procedure, with the spec-release and pin-bump cases, is in
+[docs/maintenance.md](docs/maintenance.md).
+
 ## Finding something to do
 
 Issues labelled `good first issue` are self-contained with a design in the
