@@ -5678,13 +5678,7 @@ async fn sliding_sync(
     // sort is recomputed per request because it is what the ranges index
     // into, and a stale order would make the client's window show the wrong
     // rooms — the exact bug sliding sync exists to avoid.
-    let joined = state.rooms.joined(&identity.user_id).map_err(room_error)?;
-    let mut ordered: Vec<(String, i64)> = Vec::with_capacity(joined.len());
-    for room_id in joined {
-        let activity = state.rooms.last_activity(&room_id).map_err(room_error)?;
-        ordered.push((room_id, activity));
-    }
-    ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let (ordered, invited) = sliding_room_order(&state, &identity)?;
 
     // Every room this request may be answered with. A list window can only
     // produce rooms out of `ordered`, which came from the caller's own
@@ -5759,14 +5753,18 @@ async fn sliding_sync(
         {
             continue;
         }
-        let entry = sliding_room_entry(
-            &state,
-            &identity,
-            &room_id,
-            &required_state,
-            timeline_limit,
-            since.is_none(),
-        )?;
+        let entry = if invited.contains(&room_id) {
+            sliding_invite_entry(&state, &identity, &room_id)?
+        } else {
+            sliding_room_entry(
+                &state,
+                &identity,
+                &room_id,
+                &required_state,
+                timeline_limit,
+                since.is_none(),
+            )?
+        };
         rooms_out.insert(room_id, entry);
     }
 
@@ -5995,6 +5993,114 @@ fn receipts_extension(
 }
 
 /// One room's sliding-sync entry.
+/// `(rooms newest first with their recency, the invited ones among them)`.
+type SlidingRoomOrder = (Vec<(String, i64)>, std::collections::HashSet<String>);
+
+/// The sorted room list: every joined room and every invite, newest
+/// activity first. Recomputed per request because it is what the ranges
+/// index into, and a stale order would make the client's window show the
+/// wrong rooms -- the exact bug sliding sync exists to avoid. The invited
+/// set comes back too: those entries render differently.
+fn sliding_room_order(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+) -> Result<SlidingRoomOrder, MatrixError> {
+    let joined = state.rooms.joined(&identity.user_id).map_err(room_error)?;
+    // Invites are rooms in the list too (MSC4186), or a client has no way
+    // to show one: there is no separate section, the way classic sync has.
+    // The entry differs -- stripped state, no timeline -- so which rooms
+    // are invites is remembered for the render below.
+    let invited: std::collections::HashSet<String> = state
+        .rooms
+        .invited(&identity.user_id)
+        .map_err(room_error)?
+        .into_iter()
+        .collect();
+    let mut ordered: Vec<(String, i64)> = Vec::with_capacity(joined.len() + invited.len());
+    for room_id in joined {
+        let activity = state.rooms.last_activity(&room_id).map_err(room_error)?;
+        ordered.push((room_id, activity));
+    }
+    for room_id in &invited {
+        // A room this server holds has a newest event to date the invite
+        // by. One it does not (a federated invite, no log here) is dated
+        // now: the invite is the newest thing the invitee knows of it.
+        let activity = state
+            .rooms
+            .last_activity(room_id)
+            .unwrap_or_else(|_| now_ms());
+        ordered.push((room_id.clone(), activity));
+    }
+    ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Ok((ordered, invited))
+}
+
+/// Milliseconds since the epoch, for dating what has no event to date it.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since_epoch| {
+            i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+/// The `rooms` entry for a room the asker is invited to: the stripped state
+/// an invite is rendered from, and nothing an invitee is not yet entitled
+/// to -- no timeline, no counts. Always `initial`, since there is nothing
+/// incremental about an invite; and the name and heroes come from the
+/// stripped events themselves, which is all the client would have had.
+fn sliding_invite_entry(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    room_id: &str,
+) -> Result<Value, MatrixError> {
+    let events = state
+        .rooms
+        .stripped_state(room_id, &identity.user_id)
+        .map_err(room_error)?;
+    let mut entry = serde_json::Map::new();
+    if let Some(name) = events
+        .iter()
+        .find(|event| event["type"] == "m.room.name")
+        .and_then(|event| event["content"]["name"].as_str())
+    {
+        entry.insert("name".to_owned(), json!(name));
+    }
+    let heroes: Vec<Value> = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "m.room.member"
+                && event["state_key"] != json!(identity.user_id)
+                && event["content"]["membership"] == "join"
+        })
+        .take(5)
+        .map(|event| {
+            let mut hero = serde_json::Map::new();
+            hero.insert("user_id".to_owned(), event["state_key"].clone());
+            if let Some(name) = event["content"]["displayname"].as_str() {
+                hero.insert("name".to_owned(), json!(name));
+            }
+            if let Some(avatar) = event["content"]["avatar_url"].as_str() {
+                hero.insert("avatar".to_owned(), json!(avatar));
+            }
+            Value::Object(hero)
+        })
+        .collect();
+    entry.insert("heroes".to_owned(), Value::Array(heroes));
+    entry.insert("invite_state".to_owned(), Value::Array(events));
+    entry.insert(
+        "bump_stamp".to_owned(),
+        json!(
+            state
+                .rooms
+                .last_activity(room_id)
+                .unwrap_or_else(|_| now_ms())
+        ),
+    );
+    entry.insert("initial".to_owned(), json!(true));
+    Ok(Value::Object(entry))
+}
+
 fn sliding_room_entry(
     state: &AppState,
     identity: &crate::accounts::Identity,

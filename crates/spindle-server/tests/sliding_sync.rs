@@ -922,3 +922,74 @@ async fn a_room_entry_carries_what_a_row_is_drawn_from() {
     assert_eq!(before, newest, "{entry}");
     drop(carol);
 }
+
+#[tokio::test]
+async fn an_invite_is_a_room_in_the_list() {
+    // MSC4186 has no invite section: an invited room is in the list like any
+    // other, with the stripped state the invite is rendered from and no
+    // timeline. Without it a sliding-sync client -- Element X -- never sees
+    // an invite at all (matrix-rust-sdk's
+    // `test_delayed_invite_response_and_sent_message_decryption` waited on
+    // one for three seconds and gave up).
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+
+    // Bob is up to date, then the invite lands: the incremental response
+    // names the room, and it is an invite entry.
+    let before = harness.sliding(&bob, None, &window()).await;
+    assert_eq!(before["lists"]["main"]["count"], json!(0), "{before}");
+    let pos = before["pos"].as_str().unwrap().to_owned();
+    let room = harness.named_room(&alice, "the reading circle").await;
+    harness.invite(&room, &alice, "bob").await;
+
+    let response = harness.sliding(&bob, Some(&pos), &window()).await;
+    assert_eq!(response["lists"]["main"]["count"], json!(1), "{response}");
+    let entry = &response["rooms"][&room];
+    assert_eq!(entry["initial"], json!(true), "{response}");
+    assert_eq!(entry["name"], json!("the reading circle"), "{entry}");
+    let stripped = entry["invite_state"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{entry}"));
+    assert!(
+        stripped.iter().any(|event| event["type"] == "m.room.member"
+            && event["state_key"] == "@bob:example.org"
+            && event["content"]["membership"] == "invite"),
+        "the invite itself is in the stripped state: {entry}"
+    );
+    assert!(
+        stripped.iter().all(|event| event.get("event_id").is_none()),
+        "stripped events carry no event IDs: {entry}"
+    );
+    assert!(
+        entry.get("timeline").is_none(),
+        "an invitee gets no timeline: {entry}"
+    );
+    assert!(entry.get("joined_count").is_none(), "nor counts: {entry}");
+    let ids: Vec<&str> = entry["heroes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|hero| hero["user_id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["@alice:example.org"],
+        "the inviter is the hero: {entry}"
+    );
+
+    // On an initial request the invite is there too, sorted with the rest.
+    let initial = harness.sliding(&bob, None, &window()).await;
+    assert_eq!(initial["lists"]["main"]["count"], json!(1), "{initial}");
+    assert!(
+        initial["rooms"][&room]["invite_state"].is_array(),
+        "{initial}"
+    );
+
+    // Once Bob joins, the same room is an ordinary entry.
+    harness.join(&room, &bob).await;
+    let joined = harness.sliding(&bob, None, &window()).await;
+    let entry = &joined["rooms"][&room];
+    assert!(entry.get("invite_state").is_none(), "{entry}");
+    assert_eq!(entry["joined_count"], json!(2), "{entry}");
+}
