@@ -43,9 +43,11 @@ fi
 # declined its own release that way), so runs belonging to this workflow
 # run are left out of the verdict.
 if [ -n "${GH_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
+  # `gh api --paginate` prints one JSON document per page; jq reads the
+  # stream. (`--arg` is jq's flag, not gh's: run 34056194964 died on it.)
   own="/runs/${GITHUB_RUN_ID:-none}/"
   gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs?per_page=100" --paginate \
-    --jq --arg own "$own" '.check_runs[] | select((.html_url // "") | contains($own) | not)
+    | jq -r --arg own "$own" '.check_runs[] | select((.html_url // "") | contains($own) | not)
       | [.name, .status, (.conclusion // "")] | @tsv' > checks.tsv
   if ! grep -Pq '^Rust quality gate\tcompleted\tsuccess$' checks.tsv; then
     echo "The Rust quality gate has not passed on ${sha}; not releasing it."
