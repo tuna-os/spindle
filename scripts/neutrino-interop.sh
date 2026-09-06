@@ -13,6 +13,13 @@
 #
 # Needs: a release Spindle (`cargo build --release -p spindle-server`),
 # curl, python3, and NEUTRINO_LAN. Ports 8008 and 8101 on loopback.
+#
+# With EXPECT=path, every probe's outcome is compared with that file
+# (one `probe|outcome` per line, details ignored) and the script fails on
+# any difference, which is what makes it a gate rather than a report:
+# scripts/testdata/neutrino-interop.expected is the current table, and a
+# row that improves is a row to update there in the same change. With
+# EXPECT_WRITE=path it writes the file instead.
 set -eu -o pipefail
 
 NEUTRINO_LAN="${NEUTRINO_LAN:?set NEUTRINO_LAN to a neutrino-lan binary}"
@@ -54,7 +61,8 @@ PIDS="$PIDS $!"
 for _ in $(seq 1 60); do curl -sf "$S/_matrix/client/versions" >/dev/null 2>&1 && break; sleep 0.5; done
 
 json() { python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get(sys.argv[1], d))' "$1"; }
-row() { printf '| %-52s | %-12s | %s\n' "$1" "$2" "$3"; }
+ROWS=()
+row() { ROWS+=("$1|$2"); printf '| %-52s | %-12s | %s\n' "$1" "$2" "$3"; }
 
 echo "| probe | outcome | detail"
 echo "|---|---|---|"
@@ -263,3 +271,18 @@ row "mesh node answers federation query with no X-Matrix header" "$CODE" "inboun
 # 5. Spindle's own key document, as the mesh node would need to fetch it.
 CODE="$(curl -s -o /dev/null -w '%{http_code}' "$S/_matrix/key/v2/server")"
 row "Spindle key document over plain http" "$CODE" "what an HTTP KeyResolver on the gateway would fetch"
+
+# --- the gate ---------------------------------------------------------------
+if [ -n "${EXPECT_WRITE:-}" ]; then
+  printf '%s\n' "${ROWS[@]}" > "$EXPECT_WRITE"
+  echo "wrote $EXPECT_WRITE"
+fi
+if [ -n "${EXPECT:-}" ]; then
+  printf '%s\n' "${ROWS[@]}" > "$RIG/actual"
+  if diff -u "$EXPECT" "$RIG/actual"; then
+    echo "every probe answered as $EXPECT expects"
+  else
+    echo "the table differs from $EXPECT (above: - expected, + actual)"
+    exit 1
+  fi
+fi
