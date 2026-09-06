@@ -18,6 +18,9 @@
 #          superseded -- absorbed by another MSC named in `notes`
 #          declined  -- looked at and not taken; `notes` says why
 # stable:  the spec version the MSC landed in, or "" while it has not.
+# merged:  true when the proposal has merged upstream but no spec release
+#          names it yet, so there is no stable version to record and no
+#          stable spelling to adopt; the weekly report stops asking.
 # unstable: the `/versions` unstable_features flags advertised for it.
 # evidence: files that prove the status; a served or partial entry needs
 #          at least one test file that mentions the MSC number.
@@ -113,7 +116,7 @@ number = 3757
 title = "Restricting state keys to a user's own ID"
 status = "served"
 evidence = ["crates/spindle-server/tests/rtc_membership.rs"]
-notes = "What lets m.rtc.member state keys carry the sender."
+notes = "What lets m.rtc.member state keys carry the sender. Closed unmerged upstream; MatrixRTC clients send the underscore-prefixed keys regardless, so the rule stays served."
 
 [[msc]]
 number = 3401
@@ -126,6 +129,7 @@ notes = "The full-mesh branch built on it is frozen; MatrixRTC (MSC4143 and frie
 number = 3861
 title = "Delegated authentication (OIDC)"
 status = "served"
+stable = "1.15"
 evidence = ["crates/spindle-server/tests/delegated_auth.rs", "docs/delegated-auth.md"]
 notes = "Both ways: the built-in provider, or a real MAS through the /_synapse/mas/* surface."
 
@@ -156,6 +160,7 @@ notes = "Superseded by MSC4186, which kept the org.matrix.simplified_msc3575 rou
 number = 4186
 title = "Simplified sliding sync"
 status = "served"
+merged = true
 evidence = ["crates/spindle-server/tests/sliding_sync.rs"]
 notes = "Lists, room subscriptions, required_state, timeline, extensions, invites in the list, heroes and bump_stamp. What Element X syncs with."
 
@@ -199,6 +204,7 @@ evidence = ["crates/spindle-server/tests/appservice_transactions.rs", "crates/sp
 number = 4190
 title = "Appservice device management"
 status = "served"
+merged = true
 evidence = ["crates/spindle-server/tests/appservice_devices.rs", "crates/spindle-server/tests/appservice_transactions.rs"]
 
 [[msc]]

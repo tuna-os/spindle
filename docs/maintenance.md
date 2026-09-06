@@ -138,7 +138,9 @@ one goes through the same life:
    stable spelling exists. Serve both — the stable path and the unstable
    one, with the same handler, as `auth_metadata` does — record the spec
    version in the entry's `stable` field, and keep the flag until the
-   clients that check it have moved.
+   clients that check it have moved. A proposal that has merged but that
+   no spec release names yet gets `merged = true` instead: there is no
+   stable spelling to adopt, and the report stops asking until there is.
 3. **Retire.** The unstable route and flag go once no pinned client sends
    them; the entry stays, with its `stable` version, so the page still says
    what was served and when.
