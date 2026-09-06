@@ -13,9 +13,11 @@
 //! sternest form: an admin endpoint that is routed must work, because a
 //! stub returning `{}` is indistinguishable from success to the tooling
 //! that calls it. This module carries the groups of #83's spec that are
-//! built — the users group and the rooms group entire — and routes
-//! nothing beyond what it serves: event reports, registration tokens and
-//! server notices are not here because they are not built.
+//! built — the users group, the rooms group and event reports — and
+//! routes nothing beyond what it serves: registration tokens are not
+//! here because `m.login.registration_token` is not a flow this server
+//! offers, and server notices are not here because there is no
+//! server-notices room to send them into.
 
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::StatusCode;
@@ -88,9 +90,46 @@ pub fn routes() -> Router<AppState> {
                 &format!("{prefix}/rooms/{{room_id}}/make_room_admin"),
                 post(make_room_admin),
             )
+            .route(&format!("{prefix}/event_reports"), get(list_event_reports))
+            .route(
+                &format!("{prefix}/event_reports/{{report_id}}"),
+                get(get_event_report),
+            )
             .route(&format!("{prefix}/audit"), get(audit_log))
     };
-    group("/_spindle/admin/v1").merge(group("/_synapse/admin/v1"))
+    group("/_spindle/admin/v1")
+        .merge(group("/_synapse/admin/v1"))
+        .merge(synapse_spellings())
+}
+
+/// The paths Synapse spells differently, so that the tooling written
+/// against it -- synadm, the admin panels -- drives this server without
+/// a patch. Same handlers; only the URL differs. Synapse's v2 user
+/// endpoints are its current ones (v1's were retired), its `deactivate`,
+/// `reset_password` and `purge_history` put the verb first and the target
+/// second, and `delete_devices` takes a list where this API takes one
+/// device per DELETE.
+fn synapse_spellings() -> Router<AppState> {
+    Router::new()
+        .route("/_synapse/admin/v2/users", get(list_users))
+        .route(
+            "/_synapse/admin/v2/users/{user_id}",
+            get(get_user).put(put_user),
+        )
+        .route("/_synapse/admin/v2/users/{user_id}/devices", get(devices))
+        .route(
+            "/_synapse/admin/v2/users/{user_id}/delete_devices",
+            post(delete_devices),
+        )
+        .route("/_synapse/admin/v1/deactivate/{user_id}", post(deactivate))
+        .route(
+            "/_synapse/admin/v1/reset_password/{user_id}",
+            post(reset_password),
+        )
+        .route(
+            "/_synapse/admin/v1/purge_history/{room_id}",
+            post(purge_history),
+        )
 }
 
 /// The caller, proven to be a server admin.
@@ -150,12 +189,7 @@ pub(crate) fn audit(
         "action": action,
         "target": target,
         "detail": detail,
-        "ts_ms": u64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_millis()),
-        )
-        .unwrap_or(u64::MAX),
+        "ts_ms": now_ms(),
     });
     let seq = state.rooms.allocate_stream_id();
     Store::put(
@@ -166,6 +200,52 @@ pub(crate) fn audit(
             .as_slice(),
     )
     .map_err(|error| MatrixError::internal(&error.to_string()))
+}
+
+/// File one event report and return its id.
+///
+/// Called from the client `/report` handler, which has already checked
+/// the reporter may see the event; this only records. The id is a fresh
+/// stream sequence number, so reports list in the order they were filed
+/// and an operator can quote one without ambiguity.
+pub(crate) fn file_event_report(
+    state: &AppState,
+    reporter: &str,
+    room_id: &str,
+    event_id: &str,
+    sender: Option<&str>,
+    reason: Option<&str>,
+    score: Option<i64>,
+) -> Result<u64, MatrixError> {
+    let seq = state.rooms.allocate_stream_id();
+    let record = json!({
+        "id": seq,
+        "received_ts": now_ms(),
+        "room_id": room_id,
+        "event_id": event_id,
+        "user_id": reporter,
+        "sender": sender,
+        "reason": reason,
+        "score": score,
+    });
+    Store::put(
+        state.store.as_ref(),
+        &keys::event_report(seq),
+        serde_json::to_vec(&record)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?
+            .as_slice(),
+    )
+    .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    Ok(seq)
+}
+
+fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis()),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 /// `@name:this.server` → `name`; anything else is not ours.
@@ -483,6 +563,39 @@ async fn delete_device(
         &user_id,
         &json!({ "device_id": device_id }),
     )?;
+    Ok(Json(json!({})))
+}
+
+#[derive(Deserialize)]
+struct DeleteDevices {
+    #[serde(default)]
+    devices: Vec<String>,
+}
+
+/// `POST /_synapse/admin/v2/users/{userId}/delete_devices`, Synapse's
+/// list form of the DELETE above: one audit record per device, as if each
+/// had been deleted on its own, so the log reads the same either way.
+async fn delete_devices(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path(user_id): Path<String>,
+    Json(request): Json<DeleteDevices>,
+) -> Result<Json<Value>, MatrixError> {
+    let (localpart, _) = target_account(&state, &user_id)?;
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    for device_id in &request.devices {
+        crate::mas::remove_device(&state, &accounts, &localpart, device_id)?;
+        audit(
+            &state,
+            &actor.identity().user_id,
+            "delete_device",
+            &user_id,
+            &json!({ "device_id": device_id }),
+        )?;
+    }
+    if !request.devices.is_empty() {
+        crate::mas::device_list_changed(&state, &accounts.user_id(&localpart));
+    }
     Ok(Json(json!({})))
 }
 
@@ -1091,6 +1204,89 @@ async fn make_room_admin(
         "user_id": target,
         "power_level": granted,
     })))
+}
+
+/// The room's current name and canonical alias, as Synapse's report
+/// listing carries them: read at listing time, so a renamed room shows
+/// its present name, and null rather than an error for a room that has
+/// neither or is gone.
+fn report_room_labels(state: &AppState, actor: &AdminActor, record: &mut Value) {
+    let Some(room_id) = record["room_id"].as_str().map(str::to_owned) else {
+        return;
+    };
+    let admin = state.rooms.admin(actor);
+    let content = |event_type: &str, field: &str| -> Value {
+        admin
+            .state_event(&room_id, event_type, "")
+            .map_or(Value::Null, |content| content[field].clone())
+    };
+    record["name"] = content("m.room.name", "name");
+    record["canonical_alias"] = content("m.room.canonical_alias", "alias");
+}
+
+/// `GET /event_reports?from&limit`
+///
+/// Newest first, as Synapse lists them: the report an operator has not
+/// yet seen is the one filed most recently.
+async fn list_event_reports(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    let mut reports = Vec::new();
+    for (_, raw) in
+        spindle_store::ReadView::scan_prefix(state.store.as_ref(), &keys::event_reports_prefix())
+            .map_err(|error| MatrixError::internal(&error.to_string()))?
+    {
+        let record: Value = serde_json::from_slice(&raw)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        reports.push(record);
+    }
+    reports.reverse();
+    let total = reports.len();
+    let limit = query.limit.unwrap_or(100);
+    let page: Vec<Value> = reports
+        .into_iter()
+        .skip(query.from)
+        .take(limit)
+        .map(|mut record| {
+            report_room_labels(&state, &actor, &mut record);
+            record
+        })
+        .collect();
+    let mut body = json!({ "event_reports": page, "total": total });
+    if query.from + limit < total {
+        body["next_token"] = json!((query.from + limit).to_string());
+    }
+    Ok(Json(body))
+}
+
+/// `GET /event_reports/{reportId}`
+///
+/// The report with the reported event itself under `event_json`, so the
+/// operator reads what was reported without a second round trip. The
+/// event is read through the operator's view rather than the reporter's:
+/// the report is the reason it is being looked at. If the event has been
+/// purged since, `event_json` is null and the report still stands.
+async fn get_event_report(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path(report_id): Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    let not_found = || MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such report");
+    let seq: u64 = report_id.parse().map_err(|_| not_found())?;
+    let raw = spindle_store::ReadView::get(state.store.as_ref(), &keys::event_report(seq))
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+        .ok_or_else(not_found)?;
+    let mut record: Value =
+        serde_json::from_slice(&raw).map_err(|error| MatrixError::internal(&error.to_string()))?;
+    report_room_labels(&state, &actor, &mut record);
+    let event = match (record["room_id"].as_str(), record["event_id"].as_str()) {
+        (Some(room_id), Some(event_id)) => state.rooms.event(room_id, event_id).ok(),
+        _ => None,
+    };
+    record["event_json"] = event.unwrap_or(Value::Null);
+    Ok(Json(record))
 }
 
 /// `GET /audit?from&limit&actor&action`

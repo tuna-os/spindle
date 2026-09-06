@@ -106,6 +106,38 @@ impl Instance {
 /// New endpoints must be added here — the refusal test walks this list.
 fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
     let mut routes = Vec::new();
+    // The paths Synapse spells differently, served for its tooling.
+    routes.extend([
+        (reqwest::Method::GET, "/_synapse/admin/v2/users".to_owned()),
+        (
+            reqwest::Method::GET,
+            format!("/_synapse/admin/v2/users/{user}"),
+        ),
+        (
+            reqwest::Method::PUT,
+            format!("/_synapse/admin/v2/users/{user}"),
+        ),
+        (
+            reqwest::Method::GET,
+            format!("/_synapse/admin/v2/users/{user}/devices"),
+        ),
+        (
+            reqwest::Method::POST,
+            format!("/_synapse/admin/v2/users/{user}/delete_devices"),
+        ),
+        (
+            reqwest::Method::POST,
+            format!("/_synapse/admin/v1/deactivate/{user}"),
+        ),
+        (
+            reqwest::Method::POST,
+            format!("/_synapse/admin/v1/reset_password/{user}"),
+        ),
+        (
+            reqwest::Method::POST,
+            "/_synapse/admin/v1/purge_history/!r:x".to_owned(),
+        ),
+    ]);
     for prefix in ["/_spindle/admin/v1", "/_synapse/admin/v1"] {
         routes.extend([
             (reqwest::Method::GET, format!("{prefix}/server_version")),
@@ -154,6 +186,8 @@ fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
                 format!("{prefix}/rooms/!r:x/make_room_admin"),
             ),
             (reqwest::Method::DELETE, format!("{prefix}/rooms/!r:x")),
+            (reqwest::Method::GET, format!("{prefix}/event_reports")),
+            (reqwest::Method::GET, format!("{prefix}/event_reports/1")),
             (reqwest::Method::GET, format!("{prefix}/audit")),
         ]);
     }
@@ -1332,4 +1366,284 @@ async fn make_room_admin_says_so_when_nobody_local_can_author() {
             .is_some_and(|text| text.contains("no local user")),
         "{body}"
     );
+}
+
+/// Alice joins the admin's named room, says two things and reports both
+/// through the client API; the admin reads them back through the
+/// moderation queue. Returns the admin token, the room and the two
+/// reported event IDs in the order they were reported.
+async fn reports_fixture(server: &Instance) -> (String, String, String, String) {
+    let admin_token = server.register("root").await;
+    server.promote("root");
+    let alice_token = server.register("alice").await;
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/createRoom",
+            Some(&admin_token),
+            Some(&json!({ "name": "Operations", "preset": "public_chat" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/join/{room}"),
+            Some(&alice_token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let mut events = Vec::new();
+    for (n, text) in ["spam", "worse spam"].iter().enumerate() {
+        let (status, body) = server
+            .request(
+                reqwest::Method::PUT,
+                &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/r{n}"),
+                Some(&alice_token),
+                Some(&json!({ "msgtype": "m.text", "body": text })),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        let event_id = body["event_id"].as_str().unwrap().to_owned();
+        let (status, body) = server
+            .request(
+                reqwest::Method::POST,
+                &format!("/_matrix/client/v3/rooms/{room}/report/{event_id}"),
+                Some(&alice_token),
+                Some(&json!({ "reason": text, "score": -100 })),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        events.push(event_id);
+    }
+    let second = events.pop().unwrap();
+    let first = events.pop().unwrap();
+    (admin_token, room, first, second)
+}
+
+#[tokio::test]
+async fn event_reports_list_newest_first_and_paginate() {
+    let server = Instance::start().await;
+    let (admin_token, room, first, second) = reports_fixture(&server).await;
+    let alice = server.user("alice");
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_spindle/admin/v1/event_reports",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total"], 2, "{body}");
+    let reports = body["event_reports"].as_array().unwrap();
+    assert_eq!(
+        reports[0]["event_id"],
+        second.as_str(),
+        "newest first: {body}"
+    );
+    assert_eq!(reports[1]["event_id"], first.as_str(), "{body}");
+    for report in reports {
+        assert!(
+            report["id"].is_u64(),
+            "an id an operator can quote: {report}"
+        );
+        assert_eq!(report["room_id"], room.as_str(), "{report}");
+        assert_eq!(report["user_id"], alice.as_str(), "who reported: {report}");
+        assert_eq!(report["sender"], alice.as_str(), "who sent it: {report}");
+        assert_eq!(report["score"], -100, "{report}");
+        assert_eq!(report["name"], "Operations", "the room's name: {report}");
+        assert!(report["received_ts"].is_u64(), "{report}");
+    }
+    assert_eq!(reports[0]["reason"], "worse spam", "{body}");
+    assert!(
+        body.get("next_token").is_none(),
+        "two reports fit in one page: {body}"
+    );
+
+    // One at a time pages through both, and the token walks forward.
+    let (status, page) = server
+        .request(
+            reqwest::Method::GET,
+            "/_spindle/admin/v1/event_reports?limit=1",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(page["event_reports"].as_array().unwrap().len(), 1, "{page}");
+    assert_eq!(page["next_token"], "1", "{page}");
+    let (_, page) = server
+        .request(
+            reqwest::Method::GET,
+            "/_spindle/admin/v1/event_reports?limit=1&from=1",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        page["event_reports"][0]["event_id"],
+        first.as_str(),
+        "{page}"
+    );
+    assert!(page.get("next_token").is_none(), "{page}");
+
+    // The alias answers the same.
+    let (status, aliased) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/event_reports",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{aliased}");
+    assert_eq!(aliased["total"], 2, "{aliased}");
+}
+
+#[tokio::test]
+async fn one_event_report_carries_the_event_it_is_about() {
+    let server = Instance::start().await;
+    let (admin_token, room, first, _) = reports_fixture(&server).await;
+
+    let (_, listing) = server
+        .request(
+            reqwest::Method::GET,
+            "/_spindle/admin/v1/event_reports",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    let id = listing["event_reports"][1]["id"].as_u64().unwrap();
+
+    let (status, report) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_spindle/admin/v1/event_reports/{id}"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["id"], id, "{report}");
+    assert_eq!(report["event_id"], first.as_str(), "{report}");
+    assert_eq!(report["room_id"], room.as_str(), "{report}");
+    assert_eq!(report["reason"], "spam", "{report}");
+    assert_eq!(
+        report["event_json"]["content"]["body"], "spam",
+        "the reported event rides along: {report}"
+    );
+    assert_eq!(report["event_json"]["event_id"], first.as_str(), "{report}");
+
+    // A report nobody filed, and an id that is not one, are the same 404.
+    for path in [
+        "/_spindle/admin/v1/event_reports/999999",
+        "/_spindle/admin/v1/event_reports/not-a-number",
+    ] {
+        let (status, body) = server
+            .request(reqwest::Method::GET, path, Some(&admin_token), None)
+            .await;
+        assert_eq!(status, 404, "{path}: {body}");
+        assert_eq!(body["errcode"], "M_NOT_FOUND", "{path}: {body}");
+    }
+}
+
+/// synadm and the admin panels speak Synapse's spellings: v2 for users,
+/// the verb before the target for `deactivate` and `reset_password`, and a
+/// list form of device deletion. Same handlers behind them.
+#[tokio::test]
+async fn synapse_spellings_reach_the_same_handlers() {
+    let server = Instance::start().await;
+    let admin = server.register("admin").await;
+    server.promote("admin");
+    server.register("alice").await;
+    let alice = server.user("alice");
+
+    let (status, v2) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v2/users",
+            Some(&admin),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{v2}");
+    let (_, v1) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/users",
+            Some(&admin),
+            None,
+        )
+        .await;
+    assert_eq!(v2["users"], v1["users"], "v2 lists what v1 lists");
+
+    let (status, devices) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v2/users/{alice}/devices"),
+            Some(&admin),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{devices}");
+    let device_id = devices["devices"][0]["device_id"]
+        .as_str()
+        .expect("alice's session is a device")
+        .to_owned();
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_synapse/admin/v2/users/{alice}/delete_devices"),
+            Some(&admin),
+            Some(&json!({ "devices": [device_id] })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (_, after) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v1/users/{alice}/devices"),
+            Some(&admin),
+            None,
+        )
+        .await;
+    assert_eq!(
+        after["devices"],
+        json!([]),
+        "the listed device is gone: {after}"
+    );
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_synapse/admin/v1/reset_password/{alice}"),
+            Some(&admin),
+            Some(&json!({ "new_password": "another-horse", "logout_devices": false })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_synapse/admin/v1/deactivate/{alice}"),
+            Some(&admin),
+            Some(&json!({ "erase": false })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (_, user) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v2/users/{alice}"),
+            Some(&admin),
+            None,
+        )
+        .await;
+    assert_eq!(user["deactivated"], true, "{user}");
 }

@@ -46,6 +46,73 @@ pub struct SlidingRequest {
     pub room_subscriptions: Map<String, Value>,
     /// Milliseconds to long-poll when nothing has changed.
     pub timeout: Option<u64>,
+    pub extensions: Extensions,
+}
+
+/// The extensions (MSC4186 §extensions): the parts of a client's world that
+/// are not a room's timeline, each switched on by name. Element X reads
+/// *all* of its E2EE and to-device traffic through these rather than
+/// through classic sync, so serving them on `/sync` v3 alone leaves the
+/// flagship client unable to decrypt anything.
+///
+/// Stateless like the rest of this endpoint: each request says which
+/// extensions it wants, and `to_device` carries its own `since`, because
+/// to-device messages are acknowledged by the token that delivered them
+/// rather than by `pos`. The MSC's per-extension `lists` and `rooms`
+/// scoping is not honoured: an enabled room extension applies to every room
+/// in the response, which is the superset a client asked for.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Extensions {
+    pub to_device: ToDeviceExtension,
+    pub e2ee: Toggle,
+    pub account_data: Toggle,
+    pub receipts: Toggle,
+    pub typing: Toggle,
+}
+
+/// One extension's switch. Absent is off.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Toggle {
+    pub enabled: Option<bool>,
+}
+
+impl Toggle {
+    #[must_use]
+    pub fn on(&self) -> bool {
+        self.enabled == Some(true)
+    }
+}
+
+/// The to-device extension: enabled, and the token of the last batch the
+/// client has, which is what acknowledges everything before it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ToDeviceExtension {
+    pub enabled: Option<bool>,
+    pub since: Option<String>,
+    pub limit: Option<usize>,
+}
+
+impl ToDeviceExtension {
+    #[must_use]
+    pub fn on(&self) -> bool {
+        self.enabled == Some(true)
+    }
+}
+
+impl Extensions {
+    /// Whether any extension is on, so a response can stay `{}` when none
+    /// is.
+    #[must_use]
+    pub fn any(&self) -> bool {
+        self.to_device.on()
+            || self.e2ee.on()
+            || self.account_data.on()
+            || self.receipts.on()
+            || self.typing.on()
+    }
 }
 
 impl SlidingRequest {
