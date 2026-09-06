@@ -52,6 +52,14 @@ down() {
 }
 
 up() {
+  # A port already bound is a server already running -- a previous sitting's,
+  # a probe's -- and the driver would measure it, not the cold one launched
+  # below. That happened once: a stale Dendrite from a probe answered a
+  # whole leg with M_USER_IN_USE. Refuse, and name what holds the port.
+  for port in 8099 8098 8097 8096 8095; do
+    holder=$(ss -ltnp 2>/dev/null | grep -E ":$port " | grep -o 'pid=[0-9]*' | head -1 || true)
+    [ -z "$holder" ] || { echo "port $port is already bound ($holder); stop it before a sitting" >&2; return 1; }
+  done
   rm -rf "$BENCH/spindle-data"
   cat > "$BENCH/spindle.toml" <<TOML
 [server]
