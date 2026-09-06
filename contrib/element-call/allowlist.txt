@@ -7,7 +7,15 @@
 # adding it is a reviewed promotion, never automatic, so a flaky spec cannot
 # teach everyone to ignore this gate.
 #
-# Empty until the first recorded run: nothing is claimed that has not been
-# seen to pass. The rig has been authored without a Docker host to run it
-# on (the sandbox this was written in has none); the first green run
-# promotes landing.spec.ts and the sign-up half of access.spec.ts.
+# Nothing is claimed that has not been seen to pass: every entry names the
+# run that recorded it.
+#
+# Recorded on the first run (workflow run 34014884679, element-call pin
+# a03f23e, chromium): four of four, including a two-party call with video
+# tiles on both sides -- LiveKit, lk-jwt-service and Spindle's transport
+# discovery composing, which is the composition #41 says no unit test
+# reaches.
+access.spec.ts :: As a guest, create a call, share link and other join
+access.spec.ts :: Sign up a new account, then login, then logout
+landing.spec.ts :: Landing page
+landing.spec.ts :: has title

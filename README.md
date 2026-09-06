@@ -108,11 +108,11 @@ impossible and the exception path is dead code.
 | **M0** Prove the core | **Done** | Fork resolution vs `ruma-state-res` as a differential oracle; HAMT benchmarks; torn-write and restart recovery |
 | **M1** Local homeserver | **Done** | Rooms, timelines, state, membership, moderation, relations, threads, redaction, receipts, typing, account data, push rules, aliases, filters, `/context` |
 | **M2** Modern clients | **Done** | Media + thumbnails, S3 backend, Simplified Sliding Sync, E2EE transport, device lists, key backup, cross-signing, URL previews |
-| **M3** Federation | Interoperating | Signed requests, join/invite/leave/knock handshakes, backfill, state reads, outbound queue with backoff — live Spindle↔Synapse rooms in both directions |
+| **M3** Federation | Interoperating | Signed requests, join/invite/leave/knock handshakes, backfill, state reads, outbound queue with backoff — live Spindle↔Synapse rooms in both directions; MSC4242 state-DAG rooms (Hydra phase 2) and E2EE keys, to-device and device lists across the seam to a Neutrino mesh node, measured by a loopback rig |
 | **M4** Ecosystem | Substantial | Appservices (transactions, MSC2409 to-device, MSC4190), MSC3861 delegated auth, the `/_synapse/mas/*` surface, and a built-in OIDC provider so Element X login needs one binary |
 | **M5** Lifecycle | Substantial | 18 admin endpoints (also at `/_synapse/admin/v1`), `/metrics` with the fork-case counter, backup/restore/verify-media, versioned migrations |
 | **M6** Differentiators | Not started | Hub mode, MLS |
-| **M7** MatrixRTC | Started | **MSC4140 delayed events** — the dead-man's switch that stops calls accumulating ghost participants. No other Rust homeserver has them |
+| **M7** MatrixRTC | Server side served | **MSC4140 delayed events** — the dead-man's switch that stops calls accumulating ghost participants, which no other Rust homeserver has — plus MSC4354 sticky events, MSC4143 transport discovery, a built-in LiveKit JWT service or the OpenID round trip for an external one, ringing and decline. Element Call's own Playwright suite runs with Spindle in Synapse's seat, and its first run put a two-party call with video through LiveKit; the call and crash scenarios of the gate are what remains |
 
 **183 routes** and a **311-test Complement ratchet** in CI, over a workspace of
 100+ test suites. The first two are gated — the [dashboard](docs/dashboard.md)
