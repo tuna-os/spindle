@@ -119,6 +119,14 @@ jobs:
       - name: Check the example config documents every setting
         run: python3 scripts/config-drift.py
 
+      # A standing answer to "what is implemented and untested". It lists
+      # every route the router serves that no test, evidence document or
+      # interop script names. It reports rather than gates: the two routes
+      # it flags today are covered under another spelling or by a
+      # two-instance harness the grep cannot see.
+      - name: List routes nothing exercises
+        run: python3 scripts/untested-routes.py
+
       # Both Rust homeservers in this space run this. It costs seconds and
       # this repository is unusually prose-heavy: the SPEC, the ADRs and the
       # benchmark write-ups are the artefact as much as the code is.

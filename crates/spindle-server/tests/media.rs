@@ -337,6 +337,20 @@ async fn the_upload_limit_is_advertised_and_enforced() {
     let limit = body["m.upload.size"].as_u64().unwrap();
     assert_eq!(limit, 50 * 1024 * 1024);
 
+    // The pre-v1.11 spelling of the same endpoint is still served, and a
+    // client on the old path must read the same number.
+    let (status, body) = harness
+        .call(
+            Request::builder()
+                .uri("/_matrix/media/v3/config")
+                .header("authorization", format!("Bearer {alice}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["m.upload.size"].as_u64().unwrap(), limit);
+
     // A file comfortably over axum's own 2 MiB default but well under the
     // advertised limit must succeed. Without an explicit body limit on the
     // route the extractor rejects it first, and the server ends up
