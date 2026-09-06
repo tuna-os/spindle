@@ -172,6 +172,16 @@ pub struct Rooms {
     /// Continuwuity across two sittings. A sort key is one i64; it lives
     /// in memory and is refreshed by the append that changes it.
     last_activity: Mutex<HashMap<String, i64>>,
+    /// `(room, user)` -> the stream position allocated when that user last
+    /// sent a receipt in that room. A receipt is not an event and writes
+    /// no stream row, so nothing about the room moves when one lands --
+    /// and yet the reader's own unread counts just changed, and a sliding
+    /// sync that stays silent about an "unchanged" room sends them the old
+    /// numbers until something else happens there. matrix-rust-sdk's
+    /// notification-count test waited four seconds for the new count and
+    /// gave up; it was waiting on the next message. Positions on the same
+    /// counter events use, so `since` orders receipts and events together.
+    receipt_marks: Mutex<HashMap<(String, String), u64>>,
     /// The rendered `/state` body per room, keyed by the state root it was
     /// rendered from.
     ///
@@ -421,6 +431,7 @@ impl Rooms {
             unread_index: Mutex::new(HashMap::new()),
             highlights: Mutex::new(HashMap::new()),
             last_activity: Mutex::new(HashMap::new()),
+            receipt_marks: Mutex::new(HashMap::new()),
             state_render: Mutex::new(HashMap::new()),
             member_ids: Mutex::new(HashMap::new()),
             destinations: Mutex::new(HashMap::new()),
@@ -2893,6 +2904,42 @@ impl Rooms {
 
     pub fn stream_position(&self) -> u64 {
         self.stream.position()
+    }
+
+    /// Note that `user_id` sent a receipt in `room_id`: a position on the
+    /// stream counter, and a wake for whoever is long-polling, so the
+    /// reader's own next sync answers now and carries the counts the
+    /// receipt changed.
+    pub fn mark_receipt(&self, room_id: &str, user_id: &str) {
+        let position = self.allocate_stream_id();
+        self.receipt_marks
+            .lock()
+            .unwrap()
+            .insert((room_id.to_owned(), user_id.to_owned()), position);
+        self.wake_sync_waiters();
+    }
+
+    /// Of `rooms`, the ones `user_id` sent a receipt in at a position in
+    /// `(since, until]`: rooms an incremental sync must speak about even
+    /// though no event landed there, because the reader's own unread
+    /// counts moved.
+    pub fn rooms_read_since<'a>(
+        &self,
+        user_id: &str,
+        rooms: impl IntoIterator<Item = &'a str>,
+        since: u64,
+        until: u64,
+    ) -> HashSet<String> {
+        let marks = self.receipt_marks.lock().unwrap();
+        rooms
+            .into_iter()
+            .filter(|room_id| {
+                marks
+                    .get(&((*room_id).to_owned(), user_id.to_owned()))
+                    .is_some_and(|position| *position > since && *position <= until)
+            })
+            .map(str::to_owned)
+            .collect()
     }
 
     /// Wait until an event lands, or the deadline passes.

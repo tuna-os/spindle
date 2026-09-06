@@ -493,3 +493,97 @@ async fn second_device(server: &Harness, username: &str) -> String {
     assert_eq!(status, StatusCode::OK, "{body}");
     body["access_token"].as_str().unwrap().to_owned()
 }
+
+/// A read receipt is not an event, but it changes the reader's own unread
+/// counts, so the reader's next incremental sliding sync must speak about
+/// the room again and carry the new count. It did not: the room was
+/// "unchanged" and stayed silent until something else happened there,
+/// which is what matrix-rust-sdk's `test_room_notification_count` waited
+/// four seconds for.
+#[tokio::test]
+async fn a_receipt_makes_the_next_sliding_sync_recount_the_room() {
+    let server = Harness::new();
+    let alice = server.register("alice").await;
+    let bob = server.register("bob").await;
+    let (status, body) = server
+        .post(
+            "/_matrix/client/v3/createRoom",
+            &alice,
+            &json!({ "preset": "public_chat" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = server
+        .post(
+            &format!("/_matrix/client/v3/rooms/{room}/join"),
+            &bob,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let request = json!({ "lists": { "all": { "ranges": [[0, 9]], "timeline_limit": 5 } } });
+    let sliding = |token: String, pos: Option<String>| {
+        let request = request.clone();
+        let server = &server;
+        async move {
+            let path = match pos {
+                Some(pos) => format!(
+                    "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync?pos={pos}&timeout=0"
+                ),
+                None => "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync".to_owned(),
+            };
+            let (status, body) = server.post(&path, &token, &request).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body
+        }
+    };
+
+    // Alice is caught up, then Bob speaks: one unread for Alice.
+    let body = sliding(alice.clone(), None).await;
+    let pos = body["pos"].as_str().unwrap().to_owned();
+    let (status, body) = server
+        .put(
+            &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/rc-1"),
+            &bob,
+            &json!({ "msgtype": "m.text", "body": "hello" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let event_id = body["event_id"].as_str().unwrap().to_owned();
+    let body = sliding(alice.clone(), Some(pos)).await;
+    assert_eq!(
+        body["rooms"][&room]["notification_count"],
+        json!(1),
+        "{body}"
+    );
+    let pos = body["pos"].as_str().unwrap().to_owned();
+
+    // Nothing has happened since: the room stays silent.
+    let body = sliding(alice.clone(), Some(pos.clone())).await;
+    assert!(body["rooms"][&room].is_null(), "{body}");
+
+    // Alice reads. That is not an event, and it is still a change to her
+    // room: the next incremental response names it, count at zero.
+    let (status, body) = server
+        .post(
+            &format!("/_matrix/client/v3/rooms/{room}/receipt/m.read/{event_id}"),
+            &alice,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let body = sliding(alice.clone(), Some(pos)).await;
+    assert_eq!(
+        body["rooms"][&room]["notification_count"],
+        json!(0),
+        "{body}"
+    );
+
+    // Bob, who did not read anything, is told nothing about it.
+    let bob_body = sliding(bob.clone(), None).await;
+    let bob_pos = bob_body["pos"].as_str().unwrap().to_owned();
+    let bob_body = sliding(bob.clone(), Some(bob_pos)).await;
+    assert!(bob_body["rooms"][&room].is_null(), "{bob_body}");
+}
