@@ -38,3 +38,8 @@ tests::timeline::test_pinned_events_are_decrypted_after_recovering_with_event_no
 tests::timeline::test_send_message_updates
 tests::timeline::test_thread_focused_timeline
 tests::timeline::test_toggling_reaction
+
+# Run 34034370986 (main at 3901c4a, after #405): 23 passed, 26 failed,
+# 5 ignored; the 21 above held and these two joined.
+tests::invitations::test_invitation_details
+tests::room_privacy::test_publishing_room_alias
