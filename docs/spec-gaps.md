@@ -10,7 +10,7 @@ and the diff is the work the release brought.
 
 ## Client-Server API
 
-110 of 166 operations served.
+122 of 166 operations served.
 
 ### Not served, in the spec since before v1.1
 
@@ -27,15 +27,11 @@ and the diff is the work the release brought.
 - `POST /_matrix/client/v3/account/3pid/unbind` — `administrative_contact.yaml`
 - `POST /_matrix/client/v3/account/password/email/requestToken` — `password_management.yaml`
 - `POST /_matrix/client/v3/account/password/msisdn/requestToken` — `password_management.yaml`
-- `GET /_matrix/client/v3/admin/whois/{userId}` — `admin.yaml`
 - `PUT /_matrix/client/v3/directory/list/appservice/{networkId}/{roomId}` — `appservice_room_directory.yaml`
 - `GET /_matrix/client/v3/events` *(deprecated)* — `old_sync.yaml`
 - `GET /_matrix/client/v3/events ` — `peeking_events.yaml`
 - `GET /_matrix/client/v3/events/{eventId}` *(deprecated)* — `old_sync.yaml`
 - `GET /_matrix/client/v3/initialSync` *(deprecated)* — `old_sync.yaml`
-- `POST /_matrix/client/v3/logout/all` — `logout.yaml`
-- `GET /_matrix/client/v3/profile/{userId}/{keyName}` — `profile.yaml`
-- `PUT /_matrix/client/v3/profile/{userId}/{keyName}` — `profile.yaml`
 - `GET /_matrix/client/v3/pushrules/global/` — `pushrules.yaml`
 - `DELETE /_matrix/client/v3/pushrules/global/{kind}/{ruleId}` — `pushrules.yaml`
 - `GET /_matrix/client/v3/pushrules/global/{kind}/{ruleId}` — `pushrules.yaml`
@@ -73,29 +69,9 @@ and the diff is the work the release brought.
 - `POST /_matrix/media/v1/create` — `content-repo.yaml`
 - `PUT /_matrix/media/v3/upload/{serverName}/{mediaId}` — `content-repo.yaml`
 
-### Not served, added in v1.10
-
-- `GET /.well-known/matrix/support` — `support.yaml`
-
-### Not served, added in v1.13
-
-- `POST /_matrix/client/v3/rooms/{roomId}/report` — `report_content.yaml`
-
-### Not served, added in v1.14
-
-- `POST /_matrix/client/v3/users/{userId}/report` — `report_content.yaml`
-
-### Not served, added in v1.16
-
-- `DELETE /_matrix/client/v3/profile/{userId}/{keyName}` — `profile.yaml`
-
 ### Not served, added in v1.18
 
 - `GET /.well-known/matrix/policy_server` — `policy_server.yaml`
-- `GET /_matrix/client/v1/admin/lock/{userId}` — `admin.yaml`
-- `PUT /_matrix/client/v1/admin/lock/{userId}` — `admin.yaml`
-- `GET /_matrix/client/v1/admin/suspend/{userId}` — `admin.yaml`
-- `PUT /_matrix/client/v1/admin/suspend/{userId}` — `admin.yaml`
 
 ### Served, but deprecated upstream
 

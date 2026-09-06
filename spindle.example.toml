@@ -23,6 +23,15 @@ bind = "127.0.0.1:8008"
 # not be the hostname.
 # public_base_url = "https://matrix.example.org"
 
+# Who to contact about this server, served at /.well-known/matrix/support
+# (spec v1.10). Unset, the endpoint answers 404 rather than an empty list.
+# [server.support]
+# support_page = "https://example.org/matrix-help"
+# contacts = [
+#   { matrix_id = "@admin:example.org", email_address = "admin@example.org", role = "m.role.admin" },
+#   { email_address = "security@example.org", role = "m.role.security" },
+# ]
+
 [storage]
 path = "./data"
 

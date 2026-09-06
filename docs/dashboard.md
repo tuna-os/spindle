@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**196 routes implemented; 0 known gaps in scope.**
+**204 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -205,7 +205,7 @@ neither implemented nor counted.
 - `PUT /_matrix/client/v3/rooms/{room_id}/typing/{user_id}`
 - `POST /_matrix/client/v3/search`
 
-### Rooms & membership — 24 implemented, 0 planned
+### Rooms & membership — 25 implemented, 0 planned
 
 - `GET /_matrix/client/unstable/im.nheko.summary/rooms/{room_id_or_alias}/summary`
 - `GET /_matrix/client/v1/room_summary/{room_id_or_alias}`
@@ -224,6 +224,7 @@ neither implemented nor counted.
 - `POST /_matrix/client/v3/rooms/{room_id}/kick`
 - `POST /_matrix/client/v3/rooms/{room_id}/leave`
 - `GET /_matrix/client/v3/rooms/{room_id}/members`
+- `POST /_matrix/client/v3/rooms/{room_id}/report`
 - `POST /_matrix/client/v3/rooms/{room_id}/report/{event_id}`
 - `GET /_matrix/client/v3/rooms/{room_id}/state`
 - `GET/PUT /_matrix/client/v3/rooms/{room_id}/state/{event_type}`
@@ -232,14 +233,15 @@ neither implemented nor counted.
 - `POST /_matrix/client/v3/rooms/{room_id}/unban`
 - `POST /_matrix/client/v3/rooms/{room_id}/upgrade`
 
-### Profiles & presence — 4 implemented, 0 planned
+### Profiles & presence — 5 implemented, 0 planned
 
 - `GET/PUT /_matrix/client/v3/presence/{user_id}/status`
 - `GET /_matrix/client/v3/profile/{user_id}`
 - `GET/PUT /_matrix/client/v3/profile/{user_id}/avatar_url`
 - `GET/PUT /_matrix/client/v3/profile/{user_id}/displayname`
+- `GET/PUT/DELETE /_matrix/client/v3/profile/{user_id}/{key}`
 
-### Accounts, devices & auth — 11 implemented, 0 planned
+### Accounts, devices & auth — 12 implemented, 0 planned
 
 - `POST /_matrix/client/v3/account/deactivate`
 - `POST /_matrix/client/v3/account/password`
@@ -249,24 +251,30 @@ neither implemented nor counted.
 - `GET/PUT/DELETE /_matrix/client/v3/devices/{device_id}`
 - `GET/POST /_matrix/client/v3/login`
 - `POST /_matrix/client/v3/logout`
+- `POST /_matrix/client/v3/logout/all`
 - `POST /_matrix/client/v3/refresh`
 - `POST /_matrix/client/v3/register`
 - `GET /_matrix/client/v3/register/available`
 
-### Server, discovery & operations — 16 implemented, 0 planned
+### Server, discovery & operations — 21 implemented, 0 planned
 
 - `GET /.well-known/matrix/client`
 - `GET /.well-known/matrix/server`
+- `GET /.well-known/matrix/support`
 - `GET/PUT/DELETE /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device`
 - `POST /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device/{device_id}/events`
+- `GET/PUT /_matrix/client/v1/admin/lock/{user_id}`
+- `GET/PUT /_matrix/client/v1/admin/suspend/{user_id}`
 - `GET /_matrix/client/v1/rooms/{room_id}/hierarchy`
 - `GET /_matrix/client/v1/rooms/{room_id}/threads`
 - `GET /_matrix/client/v1/rooms/{room_id}/timestamp_to_event`
+- `GET /_matrix/client/v3/admin/whois/{user_id}`
 - `GET /_matrix/client/v3/capabilities`
 - `GET/POST /_matrix/client/v3/publicRooms`
 - `GET /_matrix/client/v3/pushers`
 - `POST /_matrix/client/v3/pushers/set`
 - `POST /_matrix/client/v3/user_directory/search`
+- `POST /_matrix/client/v3/users/{user_id}/report`
 - `GET /_matrix/client/versions`
 - `GET /_matrix/key/v2/server`
 - `GET /health`

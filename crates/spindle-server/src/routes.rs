@@ -88,6 +88,7 @@ pub const MOUNTED: &[&str] = &[
 pub fn router(state: AppState) -> Router {
     let routes = Router::new()
         .merge(account_routes())
+        .merge(report_and_hold_routes())
         .merge(push_routes())
         .merge(appservice_routes())
         .merge(crate::dehydrated::routes())
@@ -445,6 +446,35 @@ fn device_routes() -> Router<AppState> {
         )
 }
 
+/// Reports, generic profile fields, `whois`, and the v1.18 holds: the
+/// first wave filled in from `docs/spec-gaps.md`.
+fn report_and_hold_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/report",
+            post(report_room),
+        )
+        .route(
+            "/_matrix/client/v3/users/{user_id}/report",
+            post(report_user),
+        )
+        .route(
+            "/_matrix/client/v3/profile/{user_id}/{key}",
+            get(get_profile_field)
+                .put(put_profile_field)
+                .delete(delete_profile_field),
+        )
+        .route("/_matrix/client/v3/admin/whois/{user_id}", get(admin_whois))
+        .route(
+            "/_matrix/client/v1/admin/lock/{user_id}",
+            get(admin_lock_get).put(admin_lock_put),
+        )
+        .route(
+            "/_matrix/client/v1/admin/suspend/{user_id}",
+            get(admin_suspend_get).put(admin_suspend_put),
+        )
+}
+
 fn account_routes() -> Router<AppState> {
     Router::new()
         .route("/_matrix/client/v3/register", post(register))
@@ -454,6 +484,7 @@ fn account_routes() -> Router<AppState> {
             get(register_available),
         )
         .route("/_matrix/client/v3/logout", post(logout))
+        .route("/_matrix/client/v3/logout/all", post(logout_all))
         .route("/_matrix/client/v3/refresh", post(refresh))
         .route("/_matrix/client/v3/account/whoami", get(whoami))
         .route("/_matrix/client/v3/keys/upload", post(upload_keys))
@@ -1225,6 +1256,7 @@ fn discovery_routes() -> Router<AppState> {
             get(federation_media_download),
         )
         .route("/.well-known/matrix/client", get(well_known_client))
+        .route("/.well-known/matrix/support", get(well_known_support))
         .route("/_matrix/client/v1/auth_metadata", get(auth_metadata))
         // The unstable alias is load-bearing: Element Web's js-sdk asks
         // here first, and a deployment serving only the stable path
@@ -1794,6 +1826,293 @@ async fn whoami(Authenticated(identity): Authenticated) -> Json<Value> {
         "user_id": identity.user_id,
         "device_id": identity.device_id,
     }))
+}
+
+/// `POST /_matrix/client/v3/logout/all`
+///
+/// Every session of the account, this one included: the answer to a lost
+/// phone, which is why it is its own endpoint rather than a loop over
+/// `/logout` from a device that may not be the one in hand.
+async fn logout_all(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+) -> Result<Json<Value>, MatrixError> {
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    accounts
+        .logout_everywhere(&localpart_of(&identity.user_id))
+        .map_err(|error| internal(&error))?;
+    Ok(Json(json!({})))
+}
+
+/// `GET /.well-known/matrix/support` (spec v1.10)
+///
+/// Who to contact about this server. Unconfigured, it is a 404 rather
+/// than an empty list: the spec reads an empty answer as "nobody", and
+/// "not published" is the truer thing to say.
+async fn well_known_support(State(state): State<AppState>) -> Result<Json<Value>, MatrixError> {
+    let Some(support) = &state.config.server.support else {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "this server publishes no support contacts",
+        ));
+    };
+    let contacts: Vec<Value> = support
+        .contacts
+        .iter()
+        .map(|contact| {
+            let mut entry = serde_json::Map::new();
+            if let Some(matrix_id) = &contact.matrix_id {
+                entry.insert("matrix_id".to_owned(), json!(matrix_id));
+            }
+            if let Some(email) = &contact.email_address {
+                entry.insert("email_address".to_owned(), json!(email));
+            }
+            entry.insert("role".to_owned(), json!(contact.role));
+            Value::Object(entry)
+        })
+        .collect();
+    let mut body = serde_json::Map::new();
+    body.insert("contacts".to_owned(), Value::Array(contacts));
+    if let Some(page) = &support.support_page {
+        body.insert("support_page".to_owned(), json!(page));
+    }
+    Ok(Json(Value::Object(body)))
+}
+
+#[derive(Debug, Deserialize)]
+struct ReasonOnly {
+    reason: Option<String>,
+}
+
+/// `POST /_matrix/client/v3/rooms/{roomId}/report` (spec v1.13)
+///
+/// A report about a room rather than an event in it. The room must be one
+/// this server holds; a report about nothing is a 404, the same answer an
+/// event report gives.
+async fn report_room(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    Json(request): Json<ReasonOnly>,
+) -> Result<Json<Value>, MatrixError> {
+    if state.rooms.summary(&room_id).is_err() {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "no such room",
+        ));
+    }
+    let report_id = crate::admin::file_report(
+        &state,
+        &identity.user_id,
+        Some(&room_id),
+        None,
+        None,
+        request.reason.as_deref(),
+        None,
+    )?;
+    crate::admin::audit(
+        &state,
+        &identity.user_id,
+        "report",
+        &room_id,
+        &json!({ "room_id": room_id, "reason": request.reason, "report_id": report_id }),
+    )?;
+    Ok(Json(json!({})))
+}
+
+/// `POST /_matrix/client/v3/users/{userId}/report` (spec v1.14)
+///
+/// A report about a user. Only a local user can be reported here: a
+/// report about somebody else's user belongs to their server, and this
+/// one has nothing to act on. An unknown local user is a 404.
+async fn report_user(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+    Json(request): Json<ReasonOnly>,
+) -> Result<Json<Value>, MatrixError> {
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let local = user_id.ends_with(&format!(":{}", state.config.server.name))
+        && accounts
+            .account(&localpart_of(&user_id))
+            .map_err(|error| internal(&error))?
+            .is_some();
+    if !local {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "no such user here",
+        ));
+    }
+    let report_id = crate::admin::file_report(
+        &state,
+        &identity.user_id,
+        None,
+        None,
+        Some(&user_id),
+        request.reason.as_deref(),
+        None,
+    )?;
+    crate::admin::audit(
+        &state,
+        &identity.user_id,
+        "report",
+        &user_id,
+        &json!({ "user_id": user_id, "reason": request.reason, "report_id": report_id }),
+    )?;
+    Ok(Json(json!({})))
+}
+
+/// `GET /_matrix/client/v3/admin/whois/{userId}`
+///
+/// The user's devices. The spec's shape carries the sessions and
+/// connections behind each device; this server keeps no connection log,
+/// so each device is listed with one session and no connections, which
+/// is the shape with nothing invented in it. The user themself or a
+/// server admin may ask.
+async fn admin_whois(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    if identity.user_id != user_id
+        && !crate::admin::is_server_admin(&state, &identity.user_id)
+            .map_err(|error| internal(&error))?
+    {
+        return Err(MatrixError::forbidden(
+            "only the user or a server admin may ask",
+        ));
+    }
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let localpart = localpart_of(&user_id);
+    if accounts
+        .account(&localpart)
+        .map_err(|error| internal(&error))?
+        .is_none()
+    {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "no such user here",
+        ));
+    }
+    let mut devices = serde_json::Map::new();
+    for device in accounts
+        .devices_of(&localpart)
+        .map_err(|error| internal(&error))?
+    {
+        devices.insert(
+            device.device_id,
+            json!({ "sessions": [{ "connections": [] }] }),
+        );
+    }
+    Ok(Json(json!({ "user_id": user_id, "devices": devices })))
+}
+
+/// The two v1.18 administrative holds share one shape: a flag on the
+/// account, read and written by a server admin, audited, and refused for
+/// a user this server does not hold.
+fn admin_hold(
+    state: &AppState,
+    actor: &crate::accounts::Identity,
+    user_id: &str,
+    hold: &'static str,
+    set: Option<bool>,
+) -> Result<Json<Value>, MatrixError> {
+    if !crate::admin::is_server_admin(state, &actor.user_id).map_err(|error| internal(&error))? {
+        return Err(MatrixError::forbidden("not a server admin"));
+    }
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let localpart = localpart_of(user_id);
+    let Some(account) = accounts
+        .account(&localpart)
+        .map_err(|error| internal(&error))?
+    else {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "no such user here",
+        ));
+    };
+    let Some(wanted) = set else {
+        let current = if hold == "locked" {
+            account.locked
+        } else {
+            account.suspended
+        };
+        return Ok(Json(json!({ hold: current })));
+    };
+    let written = if hold == "locked" {
+        accounts.set_locked(&localpart, wanted)
+    } else {
+        accounts.set_suspended(&localpart, wanted)
+    }
+    .map_err(|error| internal(&error))?;
+    debug_assert!(written);
+    crate::admin::audit(
+        state,
+        &actor.user_id,
+        hold,
+        user_id,
+        &json!({ hold: wanted }),
+    )?;
+    Ok(Json(json!({ hold: wanted })))
+}
+
+#[derive(Debug, Deserialize)]
+struct LockRequest {
+    locked: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SuspendRequest {
+    suspended: bool,
+}
+
+/// `GET /_matrix/client/v1/admin/lock/{userId}` (spec v1.18)
+async fn admin_lock_get(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    admin_hold(&state, &identity, &user_id, "locked", None)
+}
+
+/// `PUT /_matrix/client/v1/admin/lock/{userId}` (spec v1.18)
+async fn admin_lock_put(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+    Json(request): Json<LockRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    admin_hold(&state, &identity, &user_id, "locked", Some(request.locked))
+}
+
+/// `GET /_matrix/client/v1/admin/suspend/{userId}` (spec v1.18)
+async fn admin_suspend_get(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    admin_hold(&state, &identity, &user_id, "suspended", None)
+}
+
+/// `PUT /_matrix/client/v1/admin/suspend/{userId}` (spec v1.18)
+async fn admin_suspend_put(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+    Json(request): Json<SuspendRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    admin_hold(
+        &state,
+        &identity,
+        &user_id,
+        "suspended",
+        Some(request.suspended),
+    )
 }
 
 /// MSC2659 (spec v1.7): an appservice asks to be pinged back, to prove the
@@ -2728,6 +3047,105 @@ struct DisplaynameRequest {
 #[derive(Debug, Deserialize)]
 struct AvatarRequest {
     avatar_url: Option<String>,
+}
+
+/// `GET /_matrix/client/v3/profile/{userId}/{keyName}` (spec v1.16)
+///
+/// One field of a profile, `displayname` and `avatar_url` included; the
+/// literal routes for those two still answer first. A field that is not
+/// set is a 404, which is the spec's answer and the one a client can act
+/// on.
+async fn get_profile_field(
+    State(state): State<AppState>,
+    axum::extract::Path((user_id, key)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    let profile = profile_of(&state, &user_id).await?;
+    match profile.get(&key).filter(|value| !value.is_null()) {
+        Some(value) => Ok(Json(json!({ key: value }))),
+        None => Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            format!("{user_id} has no {key}"),
+        )),
+    }
+}
+
+/// The user's own profile, or a server admin acting for them.
+fn may_edit_profile(state: &AppState, actor: &str, user_id: &str) -> Result<(), MatrixError> {
+    if actor == user_id
+        || crate::admin::is_server_admin(state, actor).map_err(|error| internal(&error))?
+    {
+        Ok(())
+    } else {
+        Err(MatrixError::forbidden("a profile belongs to its user"))
+    }
+}
+
+fn field_refusal(refusal: crate::profiles::FieldRefusal) -> MatrixError {
+    match refusal {
+        crate::profiles::FieldRefusal::KeyTooLarge => MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_KEY_TOO_LARGE",
+            format!(
+                "a profile key is at most {} bytes",
+                crate::profiles::MAX_KEY_BYTES
+            ),
+        ),
+        crate::profiles::FieldRefusal::ProfileTooLarge => MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_PROFILE_TOO_LARGE",
+            format!(
+                "a profile is at most {} bytes",
+                crate::profiles::MAX_PROFILE_BYTES
+            ),
+        ),
+        crate::profiles::FieldRefusal::NotAString => {
+            MatrixError::bad_json("displayname and avatar_url are strings")
+        }
+    }
+}
+
+/// `PUT /_matrix/client/v3/profile/{userId}/{keyName}` (spec v1.16)
+///
+/// The body names the key again, as the spec has it; a body that names
+/// a different key is a request that does not agree with itself.
+async fn put_profile_field(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((user_id, key)): axum::extract::Path<(String, String)>,
+    Json(mut request): Json<serde_json::Map<String, Value>>,
+) -> Result<Json<Value>, MatrixError> {
+    may_edit_profile(&state, &identity.user_id, &user_id)?;
+    let Some(value) = request.remove(&key) else {
+        return Err(MatrixError::bad_json(format!("the body must carry {key}")));
+    };
+    state
+        .profiles
+        .set_field(&user_id, &key, Some(value))
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+        .map_err(field_refusal)?;
+    if key == "displayname" || key == "avatar_url" {
+        propagate_profile(&state, &user_id)?;
+    }
+    Ok(Json(json!({})))
+}
+
+/// `DELETE /_matrix/client/v3/profile/{userId}/{keyName}` (spec v1.16)
+async fn delete_profile_field(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((user_id, key)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    may_edit_profile(&state, &identity.user_id, &user_id)?;
+    state
+        .profiles
+        .set_field(&user_id, &key, None)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+        .map_err(field_refusal)?;
+    if key == "displayname" || key == "avatar_url" {
+        propagate_profile(&state, &user_id)?;
+    }
+    Ok(Json(json!({})))
 }
 
 /// Store one profile field and copy it into every joined room's member
