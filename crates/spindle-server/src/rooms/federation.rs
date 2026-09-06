@@ -13,16 +13,16 @@
 //! reading the parent's private fields and helpers, so this is a file split
 //! of that block (#311) and not a new boundary yet.
 
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
-use ruma::RoomVersionId;
 use serde_json::Value;
 use spindle_core::{AppendError, EventId, EventInput, LogEntry, Pdu, RoomLog, StateKey};
 use spindle_store::RoomStore;
 
 use super::{
-    INVITE_STR, IdentifiedEvent, JOIN_STR, PersistInput, ROOM_VERSION, RoomError, Rooms,
-    auth_events_for, event_body_key,
+    INVITE_STR, IdentifiedEvent, JOIN_STR, PersistInput, RoomError, Rooms, auth_events_for,
+    event_body_key, version_in,
 };
 
 impl Rooms {
@@ -161,7 +161,7 @@ impl Rooms {
                 .map(|id| id.as_str().to_owned())
                 .collect();
             let depth = head.depth.saturating_add(1);
-            Ok(serde_json::json!({
+            let mut template = serde_json::json!({
                 "type": "m.room.member",
                 "sender": user_id,
                 "state_key": user_id,
@@ -171,10 +171,9 @@ impl Rooms {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
                     .unwrap_or(0),
-                "depth": depth,
-                "prev_events": prev,
-                "auth_events": auth,
-            }))
+            });
+            rooms.link_template(log, room_id, &mut template, &prev, &auth, depth)?;
+            Ok(template)
         })
     }
 
@@ -229,7 +228,7 @@ impl Rooms {
                 .map(|id| id.as_str().to_owned())
                 .collect();
             let depth = head.depth.saturating_add(1);
-            Ok(serde_json::json!({
+            let mut template = serde_json::json!({
                 "type": "m.room.member",
                 "sender": user_id,
                 "state_key": user_id,
@@ -239,10 +238,9 @@ impl Rooms {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
                     .unwrap_or(0),
-                "depth": depth,
-                "prev_events": prev,
-                "auth_events": auth,
-            }))
+            });
+            rooms.link_template(log, room_id, &mut template, &prev, &auth, depth)?;
+            Ok(template)
         })
     }
 
@@ -297,7 +295,7 @@ impl Rooms {
                 .map(|id| id.as_str().to_owned())
                 .collect();
             let depth = head.depth.saturating_add(1);
-            Ok(serde_json::json!({
+            let mut template = serde_json::json!({
                 "type": "m.room.member",
                 "sender": user_id,
                 "state_key": user_id,
@@ -307,10 +305,9 @@ impl Rooms {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
                     .unwrap_or(0),
-                "depth": depth,
-                "prev_events": prev,
-                "auth_events": auth,
-            }))
+            });
+            rooms.link_template(log, room_id, &mut template, &prev, &auth, depth)?;
+            Ok(template)
         })
     }
 
@@ -375,7 +372,11 @@ impl Rooms {
         latest: &[String],
         limit: usize,
         min_depth: u64,
+        state_dag: bool,
     ) -> Result<Vec<Value>, RoomError> {
+        if state_dag {
+            return self.missing_state_events(room_id, earliest, latest);
+        }
         self.with_room(room_id, |rooms, log| {
             let floor = earliest
                 .iter()
@@ -414,6 +415,133 @@ impl Rooms {
             newest_first.reverse();
             Ok(newest_first)
         })
+    }
+
+    /// MSC4242's `/get_missing_events` with `state_dag: true`: the state
+    /// DAG walked back from `latest` along `prev_state_events`, stopping at
+    /// `earliest`, in the order the MSC fixes -- fewest hops first, then
+    /// lexicographic -- and to completion rather than to a limit, because
+    /// the asking server needs a path to the create event or nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`RoomError::UnknownRoom`] for a room this server has no log for.
+    fn missing_state_events(
+        &self,
+        room_id: &str,
+        earliest: &[String],
+        latest: &[String],
+    ) -> Result<Vec<Value>, RoomError> {
+        // Bounded all the same: a state DAG with more events than this is
+        // not a conference room, and the walk is a stored read per event.
+        const CAP: usize = 5_000;
+        self.with_room(room_id, |rooms, log| {
+            let stop: std::collections::HashSet<&str> =
+                earliest.iter().map(String::as_str).collect();
+            let mut seen: std::collections::HashSet<String> = HashSet::new();
+            let mut frontier: Vec<String> = latest
+                .iter()
+                .filter(|id| log.get(&EventId::new(id.as_str())).is_some())
+                .cloned()
+                .collect();
+            frontier.sort();
+            frontier.dedup();
+            // `latest` are what the peer holds; it wants their ancestry.
+            let mut found: Vec<Value> = Vec::new();
+            let mut next: Vec<String> = Vec::new();
+            for id in &frontier {
+                seen.insert(id.clone());
+            }
+            while !frontier.is_empty() && found.len() < CAP {
+                for id in &frontier {
+                    let event = rooms.read_event(room_id, &EventId::new(id.as_str()))?;
+                    for parent in event["prev_state_events"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                    {
+                        if stop.contains(parent) || !seen.insert(parent.to_owned()) {
+                            continue;
+                        }
+                        if log.get(&EventId::new(parent)).is_some() {
+                            next.push(parent.to_owned());
+                        }
+                    }
+                }
+                next.sort();
+                for id in &next {
+                    found.push(rooms.read_event(room_id, &EventId::new(id.as_str()))?);
+                }
+                frontier = std::mem::take(&mut next);
+            }
+            Ok(found)
+        })
+    }
+
+    /// The `send_join` response of a state-DAG room (MSC4242): the whole
+    /// state DAG -- every accepted state event, which in a room this
+    /// server serializes is every state entry of the log -- and the tail
+    /// of the timeline, so the joiner has context and the join's
+    /// `prev_events` resolve.
+    ///
+    /// # Errors
+    ///
+    /// [`RoomError::UnknownRoom`] for a room this server has no log for.
+    pub fn state_dag_response(
+        &self,
+        room_id: &str,
+        join_id: &str,
+    ) -> Result<(Vec<Value>, Vec<Value>), RoomError> {
+        const TIMELINE: usize = 20;
+        self.with_room_read(room_id, |rooms, log| {
+            let mut state_dag = Vec::new();
+            for entry in log.entries().filter(|entry| entry.state_key.is_some()) {
+                if entry.event_id.as_str() == join_id {
+                    continue;
+                }
+                state_dag.push(rooms.read_event(room_id, &entry.event_id)?);
+            }
+            let mut timeline = Vec::new();
+            for entry in log
+                .entries()
+                .rev()
+                .filter(|entry| entry.event_id.as_str() != join_id)
+                .take(TIMELINE)
+            {
+                timeline.push(rooms.read_event(room_id, &entry.event_id)?);
+            }
+            Ok((state_dag, timeline))
+        })
+    }
+
+    /// Give a membership template its links: `prev_events` always, and
+    /// then either the stock `auth_events` and `depth`, or -- in a
+    /// state-DAG room (MSC4242) -- `prev_state_events`, the state DAG's
+    /// forward extremities.
+    fn link_template(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        template: &mut Value,
+        prev: &[String],
+        auth: &[String],
+        depth: u64,
+    ) -> Result<(), RoomError> {
+        let Some(object) = template.as_object_mut() else {
+            return Err(RoomError::Build("a template is an object".to_owned()));
+        };
+        object.insert("prev_events".to_owned(), serde_json::json!(prev));
+        if spindle_core::is_state_dag(&self.version_in_log(log, room_id)?) {
+            object.insert(
+                "prev_state_events".to_owned(),
+                serde_json::json!(self.state_dag_heads(log, room_id)?),
+            );
+        } else {
+            object.insert("auth_events".to_owned(), serde_json::json!(auth));
+            object.insert("depth".to_owned(), serde_json::json!(depth));
+        }
+        Ok(())
     }
 
     /// The room's state *before* `event_id`, with the auth chain, for
@@ -633,8 +761,17 @@ impl Rooms {
             )));
         }
 
-        let version = RoomVersionId::try_from(ROOM_VERSION)
-            .map_err(|error| RoomError::Append(error.to_string()))?;
+        // The room's version is the create event's to state, and it
+        // decides how every other event here is named. The old code hashed
+        // under this build's default, which was right only by the accident
+        // of v11 and v12 sharing a redaction.
+        let create = state
+            .iter()
+            .chain(auth_chain)
+            .find(|event| event["type"] == "m.room.create" && event["state_key"] == "")
+            .ok_or_else(|| RoomError::Append("the response has no create event".to_owned()))?;
+        let version = version_in(&create["content"])?;
+        let state_dag = spindle_core::is_state_dag(&version);
         let identify = |event: &Value| -> Result<(String, Value), RoomError> {
             let ruma::CanonicalJsonValue::Object(canonical) =
                 ruma::CanonicalJsonValue::try_from(event.clone())
@@ -660,18 +797,36 @@ impl Rooms {
             events.insert(id, body);
         }
         if events.contains_key(join_id) {
-            return Err(RoomError::Append(
-                "the join must not be part of the state before it".to_owned(),
-            ));
+            // A state-DAG resident answers with the DAG *after* the join,
+            // in which the join is a head; a stock resident answers with
+            // the state before it. The join is seeded last either way.
+            if state_dag {
+                events.remove(join_id);
+            } else {
+                return Err(RoomError::Append(
+                    "the join must not be part of the state before it".to_owned(),
+                ));
+            }
         }
         let mut ordered: Vec<(String, Value)> = events.into_iter().collect();
-        ordered.sort_by_key(|(id, event)| {
-            (
-                event["depth"].as_u64().unwrap_or(0),
-                event["origin_server_ts"].as_u64().unwrap_or(0),
-                id.clone(),
-            )
-        });
+        if state_dag {
+            // MSC4242: the state DAG orders itself. Parents before children
+            // along `prev_state_events`, ties by timestamp; the timeline
+            // events, which carry no state, follow by timestamp. An event
+            // for another room is a peer's mistake and is left out.
+            ordered.retain(|(_, event)| {
+                event["type"] == "m.room.create" || event["room_id"].as_str() == Some(room_id)
+            });
+            ordered = order_state_dag(ordered);
+        } else {
+            ordered.sort_by_key(|(id, event)| {
+                (
+                    event["depth"].as_u64().unwrap_or(0),
+                    event["origin_server_ts"].as_u64().unwrap_or(0),
+                    id.clone(),
+                )
+            });
+        }
 
         let (computed_join_id, join_body) = identify(join)?;
         if computed_join_id != join_id {
@@ -875,4 +1030,74 @@ impl Rooms {
             rooms.ingest(log, room_id, event_id, json, true)
         })
     }
+}
+
+/// Order a state-DAG room's events for seeding: state events in a
+/// topological order of `prev_state_events` (ties by timestamp, then ID),
+/// then the rest by timestamp. A state event whose parent is not in the
+/// set is placed as if it had none: the resident vouched for the set, and
+/// a hole in it is theirs.
+fn order_state_dag(events: Vec<(String, Value)>) -> Vec<(String, Value)> {
+    use std::collections::{BTreeSet, HashMap};
+    let (state, timeline): (Vec<_>, Vec<_>) = events
+        .into_iter()
+        .partition(|(_, event)| event.get("state_key").is_some());
+    let present: std::collections::HashSet<String> =
+        state.iter().map(|(id, _)| id.clone()).collect();
+    let mut parents: HashMap<String, Vec<String>> = HashMap::new();
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    let mut by_id: HashMap<String, Value> = HashMap::new();
+    for (id, event) in state {
+        let mine: Vec<String> = event["prev_state_events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|parent| present.contains(*parent))
+            .map(str::to_owned)
+            .collect();
+        for parent in &mine {
+            children.entry(parent.clone()).or_default().push(id.clone());
+        }
+        parents.insert(id.clone(), mine);
+        by_id.insert(id, event);
+    }
+    let stamps: HashMap<String, u64> = by_id
+        .iter()
+        .map(|(id, event)| (id.clone(), event["origin_server_ts"].as_u64().unwrap_or(0)))
+        .collect();
+    let sort_key = |id: &str| (stamps.get(id).copied().unwrap_or(0), id.to_owned());
+    let mut ready: BTreeSet<(u64, String)> = parents
+        .iter()
+        .filter(|(_, mine)| mine.is_empty())
+        .map(|(id, _)| sort_key(id))
+        .collect();
+    let mut remaining: HashMap<String, usize> = parents
+        .iter()
+        .map(|(id, mine)| (id.clone(), mine.len()))
+        .collect();
+    let mut ordered = Vec::with_capacity(by_id.len());
+    while let Some((_, id)) = ready.pop_first() {
+        for child in children.get(&id).into_iter().flatten() {
+            if let Some(left) = remaining.get_mut(child) {
+                *left -= 1;
+                if *left == 0 {
+                    ready.insert(sort_key(child));
+                }
+            }
+        }
+        if let Some(event) = by_id.remove(&id) {
+            ordered.push((id, event));
+        }
+    }
+    // Anything left is in a cycle, which a hash-named DAG cannot have; keep
+    // it anyway rather than lose state, in a fixed order.
+    let mut leftover: Vec<(String, Value)> = by_id.into_iter().collect();
+    leftover.sort_by_key(|(id, _)| id.clone());
+    ordered.extend(leftover);
+    let mut timeline = timeline;
+    timeline
+        .sort_by_key(|(id, event)| (event["origin_server_ts"].as_u64().unwrap_or(0), id.clone()));
+    ordered.extend(timeline);
+    ordered
 }

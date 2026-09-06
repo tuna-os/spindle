@@ -1,12 +1,12 @@
-use ruma::{
-    CanonicalJsonObject, CanonicalJsonValue, RoomVersionId,
-    signatures::{KeyPair, hash_and_sign_event, reference_hash},
-};
+use ruma::{CanonicalJsonObject, CanonicalJsonValue, RoomVersionId, signatures::KeyPair};
 
 use crate::EventId;
+use crate::version::{self, is_state_dag};
 
 const MAX_PREV_EVENTS: usize = 20;
 const MAX_AUTH_EVENTS: usize = 10;
+/// MSC4242: "Servers MUST limit the number of `prev_state_events` to 20."
+const MAX_PREV_STATE_EVENTS: usize = 20;
 const MAX_DEPTH: i64 = (1_i64 << 53) - 1;
 
 /// A canonical, room-version-tagged Matrix persistent data unit.
@@ -33,14 +33,10 @@ impl Pdu {
         server_name: &str,
         key_pair: &K,
     ) -> Result<Self, PduError> {
-        validate(&canonical)?;
-        let rules = room_version
-            .rules()
-            .ok_or_else(|| PduError::UnsupportedRoomVersion(room_version.to_string()))?;
-        hash_and_sign_event(server_name, key_pair, &mut canonical, &rules.redaction)
-            .map_err(|error| PduError::Signing(error.to_string()))?;
-        let hash = reference_hash(&canonical, &rules)
-            .map_err(|error| PduError::Signing(error.to_string()))?;
+        validate(&canonical, &room_version)?;
+        version::hash_and_sign(server_name, key_pair, &mut canonical, &room_version)
+            .map_err(PduError::from)?;
+        let hash = version::reference_hash(&canonical, &room_version).map_err(PduError::from)?;
 
         Ok(Self {
             room_version,
@@ -66,12 +62,8 @@ impl Pdu {
         room_version: RoomVersionId,
         canonical: CanonicalJsonObject,
     ) -> Result<Self, PduError> {
-        validate(&canonical)?;
-        let rules = room_version
-            .rules()
-            .ok_or_else(|| PduError::UnsupportedRoomVersion(room_version.to_string()))?;
-        let hash = reference_hash(&canonical, &rules)
-            .map_err(|error| PduError::Signing(error.to_string()))?;
+        validate(&canonical, &room_version)?;
+        let hash = version::reference_hash(&canonical, &room_version).map_err(PduError::from)?;
         Ok(Self {
             room_version,
             event_id: EventId::new(format!("${hash}")),
@@ -95,16 +87,36 @@ impl Pdu {
     }
 }
 
-fn validate(event: &CanonicalJsonObject) -> Result<(), PduError> {
-    required_string(event, "type")?;
+fn validate(event: &CanonicalJsonObject, room_version: &RoomVersionId) -> Result<(), PduError> {
+    let event_type = required_string(event, "type")?;
     required_string(event, "sender")?;
     required_integer(event, "origin_server_ts")?;
     required_object(event, "content")?;
+    bounded_event_ids(event, "prev_events", MAX_PREV_EVENTS)?;
+    if is_state_dag(room_version) {
+        // MSC4242: `auth_events` is calculated by every server and must not
+        // be on the wire; `prev_state_events` is on every event but the
+        // create event, which has nothing before it. `depth` is not part of
+        // the shape (Neutrino omits it) and is bounded if it is there.
+        if event.contains_key("auth_events") {
+            return Err(PduError::InvalidField("auth_events"));
+        }
+        match event.get("prev_state_events") {
+            None if event_type == "m.room.create" => {}
+            _ => bounded_event_ids(event, "prev_state_events", MAX_PREV_STATE_EVENTS)?,
+        }
+        if event.contains_key("depth") {
+            let depth = required_integer(event, "depth")?;
+            if !(0..=MAX_DEPTH).contains(&depth) {
+                return Err(PduError::InvalidDepth(depth));
+            }
+        }
+        return Ok(());
+    }
     let depth = required_integer(event, "depth")?;
     if !(0..=MAX_DEPTH).contains(&depth) {
         return Err(PduError::InvalidDepth(depth));
     }
-    bounded_event_ids(event, "prev_events", MAX_PREV_EVENTS)?;
     bounded_event_ids(event, "auth_events", MAX_AUTH_EVENTS)?;
     Ok(())
 }
@@ -172,4 +184,15 @@ pub enum PduError {
     },
     UnsupportedRoomVersion(String),
     Signing(String),
+}
+
+impl From<crate::version::VersionError> for PduError {
+    fn from(error: crate::version::VersionError) -> Self {
+        match error {
+            crate::version::VersionError::Unsupported(version) => {
+                Self::UnsupportedRoomVersion(version)
+            }
+            other => Self::Signing(other.to_string()),
+        }
+    }
 }

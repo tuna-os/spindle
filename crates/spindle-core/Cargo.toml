@@ -16,6 +16,7 @@ publish = false
 blake3.workspace = true
 ruma.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 blake3.workspace = true
