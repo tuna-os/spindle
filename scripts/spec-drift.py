@@ -91,6 +91,27 @@ def served() -> set[tuple[str, str]]:
     return out
 
 
+def covers(router_shape: str, spec_shape: str) -> bool:
+    """Whether a router route answers a spec operation.
+
+    Segment by segment: a placeholder on either side matches the other's
+    segment, a literal must match a literal. The router serves
+    `/pushrules/{scope}/...` where the spec writes `/pushrules/global/...`,
+    and `/query/profile` where the spec writes `/query/{queryType}`; both
+    are served, and a comparison of literal strings called both missing.
+    """
+    ours = router_shape.split("/")
+    theirs = spec_shape.split("/")
+    if len(ours) != len(theirs):
+        return False
+    return all(a == "{}" or b == "{}" or a == b for a, b in zip(ours, theirs, strict=True))
+
+
+def is_served(routes: set[tuple[str, str]], method: str, template: str) -> bool:
+    wanted = shape(template)
+    return any(m == method and covers(path, wanted) for m, path in routes)
+
+
 def version_key(version: str) -> tuple[int, int]:
     match = re.match(r"(\d+)\.(\d+)", version)
     return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
@@ -116,10 +137,10 @@ def report(spec_root: pathlib.Path) -> str:
     ]
     for label, api_dir in APIS:
         operations = spec_operations(spec_root, api_dir)
-        missing = [op for op in operations if (op["method"], shape(op["template"])) not in routes]
+        missing = [op for op in operations if not is_served(routes, op["method"], op["template"])]
         present = len(operations) - len(missing)
         deprecated_served = [
-            op for op in operations if op["deprecated"] and (op["method"], shape(op["template"])) in routes
+            op for op in operations if op["deprecated"] and is_served(routes, op["method"], op["template"])
         ]
         lines += [f"## {label} API", "", f"{present} of {len(operations)} operations served.", ""]
         by_version: dict[str, list[dict]] = {}
@@ -151,7 +172,9 @@ def report(spec_root: pathlib.Path) -> str:
     for _, api_dir in APIS:
         for op in spec_operations(spec_root, api_dir):
             spec_shapes.add(shape(op["template"]))
-    extra = sorted(s for s in served_shapes if s not in spec_shapes)
+    extra = sorted(
+        s for s in served_shapes if not any(covers(s, spec_shape) for spec_shape in spec_shapes)
+    )
     lines += [
         "## Served beyond the spec at this pin",
         "",

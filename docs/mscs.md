@@ -22,20 +22,20 @@ what became of each proposal.
 | [MSC3083](https://github.com/matrix-org/matrix-spec-proposals/pull/3083) | Restricted room joins | v1.2 | — | `restricted_join.rs` |  |
 | [MSC3202](https://github.com/matrix-org/matrix-spec-proposals/pull/3202) | Appservice E2EE: device masquerading and OTK counts | — | — | `appservice_transactions.rs`, `appservice_key_proxy.rs` |  |
 | [MSC3266](https://github.com/matrix-org/matrix-spec-proposals/pull/3266) | Room summary API | v1.15 | `im.nheko.summary` | `room_summary.rs` |  |
-| [MSC3757](https://github.com/matrix-org/matrix-spec-proposals/pull/3757) | Restricting state keys to a user's own ID | — | — | `rtc_membership.rs` | What lets m.rtc.member state keys carry the sender. |
+| [MSC3757](https://github.com/matrix-org/matrix-spec-proposals/pull/3757) | Restricting state keys to a user's own ID | — | — | `rtc_membership.rs` | What lets m.rtc.member state keys carry the sender. Closed unmerged upstream; MatrixRTC clients send the underscore-prefixed keys regardless, so the rule stays served. |
 | [MSC3787](https://github.com/matrix-org/matrix-spec-proposals/pull/3787) | knock_restricted join rule | v1.3 | — | `federation_knock.rs` |  |
 | [MSC3814](https://github.com/matrix-org/matrix-spec-proposals/pull/3814) | Dehydrated devices | — | `org.matrix.msc3814` | `dehydrated_devices.rs` |  |
 | [MSC3820](https://github.com/matrix-org/matrix-spec-proposals/pull/3820) | Room version 11 | v1.8 | — | `redaction.rs` | With its parts: MSC2174 (redacts in content), MSC2175, MSC2176, MSC3821, MSC3989. |
 | [MSC3856](https://github.com/matrix-org/matrix-spec-proposals/pull/3856) | Threads list API | v1.4 | — | `threads.rs` |  |
-| [MSC3861](https://github.com/matrix-org/matrix-spec-proposals/pull/3861) | Delegated authentication (OIDC) | — | — | `delegated_auth.rs`, `delegated-auth.md` | Both ways: the built-in provider, or a real MAS through the /_synapse/mas/* surface. |
+| [MSC3861](https://github.com/matrix-org/matrix-spec-proposals/pull/3861) | Delegated authentication (OIDC) | v1.15 | — | `delegated_auth.rs`, `delegated-auth.md` | Both ways: the built-in provider, or a real MAS through the /_synapse/mas/* surface. |
 | [MSC3916](https://github.com/matrix-org/matrix-spec-proposals/pull/3916) | Authenticated media | v1.11 | — | `federation_media.rs`, `media.rs` |  |
 | [MSC3983](https://github.com/matrix-org/matrix-spec-proposals/pull/3983) | Appservices claim one-time keys | — | — | `appservice_key_proxy.rs` |  |
 | [MSC3984](https://github.com/matrix-org/matrix-spec-proposals/pull/3984) | Appservices answer key queries | — | — | `appservice_key_proxy.rs` |  |
 | [MSC4075](https://github.com/matrix-org/matrix-spec-proposals/pull/4075) | MatrixRTC ringing (m.rtc.notification) | — | — | `push_delivery.rs`, `rate-limits.md` | Rings are pushed and budgeted per sender (rings_per_minute). |
 | [MSC4140](https://github.com/matrix-org/matrix-spec-proposals/pull/4140) | Delayed events | — | `org.matrix.msc4140` | `delayed_events.rs`, `rtc_membership.rs` | All four endpoints; the dead-man's switch MatrixRTC members rely on. |
 | [MSC4143](https://github.com/matrix-org/matrix-spec-proposals/pull/4143) | MatrixRTC transport discovery (rtc/transports) | — | `org.matrix.msc4143` | `rtc_transports.rs`, `matrix-rtc.md` | Served under the unstable and the v1 path; answers an empty list when no backend is configured. Absorbed MSC4158. |
-| [MSC4186](https://github.com/matrix-org/matrix-spec-proposals/pull/4186) | Simplified sliding sync | — | — | `sliding_sync.rs` | Lists, room subscriptions, required_state, timeline, extensions, invites in the list, heroes and bump_stamp. What Element X syncs with. |
-| [MSC4190](https://github.com/matrix-org/matrix-spec-proposals/pull/4190) | Appservice device management | — | — | `appservice_devices.rs`, `appservice_transactions.rs` |  |
+| [MSC4186](https://github.com/matrix-org/matrix-spec-proposals/pull/4186) | Simplified sliding sync | merged, unreleased | — | `sliding_sync.rs` | Lists, room subscriptions, required_state, timeline, extensions, invites in the list, heroes and bump_stamp. What Element X syncs with. |
+| [MSC4190](https://github.com/matrix-org/matrix-spec-proposals/pull/4190) | Appservice device management | merged, unreleased | — | `appservice_devices.rs`, `appservice_transactions.rs` |  |
 | [MSC4195](https://github.com/matrix-org/matrix-spec-proposals/pull/4195) | LiveKit as a MatrixRTC transport | — | — | `livekit_jwt.rs`, `matrix-rtc.md` | The built-in JWT service, or the OpenID round trip for an external one. |
 | [MSC4196](https://github.com/matrix-org/matrix-spec-proposals/pull/4196) | Push rule defaults | — | — | `push_rules.rs` |  |
 | [MSC4222](https://github.com/matrix-org/matrix-spec-proposals/pull/4222) | use_state_after in sync | v1.16 | `org.matrix.msc4222.use_state_after` | `state_after.rs`, `sync.rs` |  |

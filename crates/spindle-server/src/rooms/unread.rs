@@ -141,6 +141,7 @@ impl Rooms {
             }
             .encode(),
         )?;
+        self.mark_receipt(room_id, user_id);
         Ok(())
     }
 

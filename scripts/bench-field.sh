@@ -76,7 +76,9 @@ if [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c "import synapse,sys; sys.e
 else
   echo "--- synapse $SYNAPSE_VERSION"
   python3 -m venv "$VENV"
-  "$VENV/bin/pip" install --quiet "matrix-synapse==$SYNAPSE_VERSION"
+  # psycopg2 beside it, so the same venv runs Synapse on Postgres when a
+  # sitting has one (bench-servers.sh, BENCH_PG_URL).
+  "$VENV/bin/pip" install --quiet "matrix-synapse==$SYNAPSE_VERSION" "psycopg2-binary==2.9.10"
   "$VENV/bin/python" -c "import synapse; print('synapse', synapse.__version__)"
 fi
 

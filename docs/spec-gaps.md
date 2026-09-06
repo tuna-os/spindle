@@ -10,7 +10,7 @@ and the diff is the work the release brought.
 
 ## Client-Server API
 
-122 of 166 operations served.
+129 of 166 operations served.
 
 ### Not served, in the spec since before v1.1
 
@@ -33,13 +33,6 @@ and the diff is the work the release brought.
 - `GET /_matrix/client/v3/events/{eventId}` *(deprecated)* — `old_sync.yaml`
 - `GET /_matrix/client/v3/initialSync` *(deprecated)* — `old_sync.yaml`
 - `GET /_matrix/client/v3/pushrules/global/` — `pushrules.yaml`
-- `DELETE /_matrix/client/v3/pushrules/global/{kind}/{ruleId}` — `pushrules.yaml`
-- `GET /_matrix/client/v3/pushrules/global/{kind}/{ruleId}` — `pushrules.yaml`
-- `PUT /_matrix/client/v3/pushrules/global/{kind}/{ruleId}` — `pushrules.yaml`
-- `GET /_matrix/client/v3/pushrules/global/{kind}/{ruleId}/actions` — `pushrules.yaml`
-- `PUT /_matrix/client/v3/pushrules/global/{kind}/{ruleId}/actions` — `pushrules.yaml`
-- `GET /_matrix/client/v3/pushrules/global/{kind}/{ruleId}/enabled` — `pushrules.yaml`
-- `PUT /_matrix/client/v3/pushrules/global/{kind}/{ruleId}/enabled` — `pushrules.yaml`
 - `POST /_matrix/client/v3/register/email/requestToken` — `registration.yaml`
 - `POST /_matrix/client/v3/register/msisdn/requestToken` — `registration.yaml`
 - `GET /_matrix/client/v3/rooms/{roomId}/initialSync` — `room_initial_sync.yaml`
@@ -79,7 +72,7 @@ and the diff is the work the release brought.
 
 ## Server-Server API
 
-23 of 36 operations served.
+24 of 36 operations served.
 
 ### Not served, in the spec since before v1.1
 
@@ -89,7 +82,6 @@ and the diff is the work the release brought.
 - `PUT /_matrix/federation/v1/invite/{roomId}/{eventId}` — `invites-v1.yaml`
 - `GET /_matrix/federation/v1/publicRooms` — `public_rooms.yaml`
 - `POST /_matrix/federation/v1/publicRooms` — `public_rooms.yaml`
-- `GET /_matrix/federation/v1/query/{queryType}` — `query.yaml`
 - `POST /_matrix/key/v2/query` — `keys_query.yaml`
 - `GET /_matrix/key/v2/query/{serverName}` — `keys_query.yaml`
 - `POST /_matrix/policy/v1/sign` — `room_policy.yaml`
@@ -108,7 +100,7 @@ and the diff is the work the release brought.
 
 ## Served beyond the spec at this pin
 
-84 routes the pinned spec does not define: MSC surfaces under
+79 routes the pinned spec does not define: MSC surfaces under
 `unstable/`, the admin and MAS-compatibility APIs, and stable spellings
 newer than the pin. Each MSC route must be accounted for in
 `contrib/msc/ledger.toml`; `scripts/msc-ledger.py --check` enforces that.
@@ -123,11 +115,6 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_matrix/client/unstable/org.matrix.msc4143/rtc/transports`
 - `/_matrix/client/unstable/org.matrix.simplified_msc3575/sync`
 - `/_matrix/client/v1/rtc/transports`
-- `/_matrix/client/v3/profile/{}/avatar_url`
-- `/_matrix/client/v3/profile/{}/displayname`
-- `/_matrix/client/v3/pushrules/{}/{}/{}`
-- `/_matrix/client/v3/pushrules/{}/{}/{}/actions`
-- `/_matrix/client/v3/pushrules/{}/{}/{}/enabled`
 - `/_matrix/client/v3/rooms/{}/state/{}`
 - `/_matrix/federation/v1/send_join/{}/{}`
 - `/_matrix/federation/v1/send_leave/{}/{}`

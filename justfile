@@ -48,6 +48,19 @@ bench-field:
 bench-build:
     cargo build --release -p spindle-server --bin spindle
 
+# A Postgres for Synapse, in a container on loopback, and the variable the
+# sitting reads to use it: `export BENCH_PG_URL=...` as this prints, then
+# `just bench-sitting`. Without it Synapse runs on SQLite and the sidecar
+# says so. `just bench-pg-down` removes the container.
+bench-pg:
+    docker run -d --name spindle-bench-pg -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench \
+      -p 127.0.0.1:5433:5432 postgres:16-alpine >/dev/null
+    @for _ in $(seq 1 30); do docker exec spindle-bench-pg pg_isready -U bench -q && break; sleep 1; done
+    @echo 'export BENCH_PG_URL=postgres://bench:bench@127.0.0.1:5433/postgres'
+
+bench-pg-down:
+    docker rm -f spindle-bench-pg >/dev/null 2>&1 || true
+
 # Bring every server up on loopback, cold; `just bench-down` stops them.
 bench-up:
     BENCH_BIN="{{bench_bin}}" SYNAPSE_VENV="{{synapse_venv}}" scripts/bench-servers.sh up

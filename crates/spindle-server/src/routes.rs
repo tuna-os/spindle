@@ -2732,7 +2732,7 @@ pub(crate) fn record_invite(
         .unwrap_or_default();
     state
         .rooms
-        .record_pending_invite(target, room_id, origin, &invite_state)
+        .record_pending_invite(target, room_id, origin, event_id, &invite_state)
         .map_err(room_error)?;
     state.rooms.wake_sync_waiters();
     Ok(())
@@ -6214,12 +6214,22 @@ async fn sliding_sync(
     // asking the server's whole stream instead would price a client's
     // sliding sync at everyone else's traffic.
     let changed: Option<std::collections::HashSet<String>> = match since {
-        Some(since) => Some(
-            state
+        Some(since) => {
+            let mut changed = state
                 .rooms
                 .changed_rooms(visible.iter().copied(), since, position)
-                .map_err(room_error)?,
-        ),
+                .map_err(room_error)?;
+            // A room the reader just read is one whose counts moved for
+            // them, event or no event; silence about it would hand back the
+            // unread numbers the receipt has just made wrong.
+            changed.extend(state.rooms.rooms_read_since(
+                &identity.user_id,
+                visible.iter().copied(),
+                since,
+                position,
+            ));
+            Some(changed)
+        }
         None => None,
     };
 

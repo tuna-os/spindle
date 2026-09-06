@@ -167,13 +167,19 @@ just bench-render                # the site from the committed results
 - **`scripts/bench-field.sh`** holds the pins: Continuwuity 26.8.1 as its
   static release binary, Tuwunel 1.9.0 built from source at its tag (its
   release assets are gated; it needs `liburing-dev` for RocksDB), Dendrite
-  0.15.2 built from source, Synapse 1.160.0 in a virtualenv. Bumping a pin
+  0.15.2 built from source, Synapse 1.160.0 in a virtualenv with psycopg2
+  beside it. Bumping a pin
   is a reviewed change, because it changes what every later cell is
   compared against. A competitor whose binary is absent is left out of the
   sitting and named, never carried forward.
 - **`scripts/bench-servers.sh`** brings every server up cold on loopback
   with every rate limit it exposes lifted, each configured the way its own
-  documentation suggests for a single node. Dendrite runs with SQLite per
+  documentation suggests for a single node. Synapse runs on Postgres when
+  `BENCH_PG_URL` names one -- the shared-runner sittings start a container
+  for it, and `just bench-pg` does locally -- and on SQLite otherwise; the
+  sidecar records which, since its own docs call SQLite a development
+  database and a comparison against it is a floor, not a measurement. The
+  milestone sittings up to m7 ran it on SQLite. Dendrite runs with SQLite per
   component (its global database block is Postgres-only), the NATS bus
   in-process, federation off, and open registration — which it refuses
   without a flag whose name says what it thinks of the idea; fair, this is
