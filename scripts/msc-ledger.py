@@ -30,6 +30,7 @@ import os
 import pathlib
 import re
 import sys
+import time
 import tomllib
 import urllib.error
 import urllib.request
@@ -167,7 +168,7 @@ def render(entries: list[dict]) -> str:
         lines += [f"## {titles[status]}", "", "| MSC | Title | Stable in | Flags | Evidence | Notes |", "|---|---|---|---|---|---|"]
         for e in group:
             link = f"[MSC{e['number']}](https://github.com/{PROPOSALS}/pull/{e['number']})"
-            stable = f"v{e['stable']}" if e.get("stable") else "—"
+            stable = f"v{e['stable']}" if e.get("stable") else ("merged, unreleased" if e.get("merged") else "—")
             flags = ", ".join(f"`{f}`" for f in e.get("unstable", [])) or "—"
             evidence = ", ".join(f"`{pathlib.Path(rel).name}`" for rel in e.get("evidence", [])) or "—"
             notes = e.get("notes", "").replace("|", "\\|")
@@ -177,16 +178,24 @@ def render(entries: list[dict]) -> str:
 
 
 def github(path: str) -> dict | None:
+    """One GET against the API, with the pause and the one retry GitHub's
+    secondary rate limit asks of a burst of forty calls in a row."""
     request = urllib.request.Request(f"https://api.github.com/{path}", headers={"Accept": "application/vnd.github+json"})
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if token:
         request.add_header("Authorization", f"Bearer {token}")
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as error:
-        print(f"msc-ledger: GET {path}: HTTP {error.code}", file=sys.stderr)
-        return None
+    for attempt in (1, 2):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                time.sleep(0.5)
+                return json.load(response)
+        except urllib.error.HTTPError as error:
+            if error.code in (403, 429) and attempt == 1:
+                time.sleep(10)
+                continue
+            print(f"msc-ledger: GET {path}: HTTP {error.code}", file=sys.stderr)
+            return None
+    return None
 
 
 def upstream(entries: list[dict]) -> int:
@@ -210,7 +219,7 @@ def upstream(entries: list[dict]) -> int:
             state = "open"
         print(f"| MSC{number} | {entry['status']} | {state} | {', '.join(labels)} |")
         spec_merged = "spec-pr-merged" in labels or state == "merged"
-        if spec_merged and not entry.get("stable") and entry["status"] in BUILT:
+        if spec_merged and not entry.get("stable") and not entry.get("merged") and entry["status"] in BUILT:
             findings.append(f"MSC{number} ({entry['title']}) has landed upstream and the ledger has no `stable` version: adopt the stable spelling and record the version")
         if state == "closed" and entry["status"] == "planned":
             findings.append(f"MSC{number} ({entry['title']}) was closed unmerged upstream and is still `planned` here")

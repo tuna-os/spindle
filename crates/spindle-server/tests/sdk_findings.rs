@@ -494,6 +494,161 @@ async fn second_device(server: &Harness, username: &str) -> String {
     body["access_token"].as_str().unwrap().to_owned()
 }
 
+/// A world-readable room's roster is readable by anyone, the way its
+/// state is. matrix-rust-sdk's `RoomPreview::from_state_events` reads
+/// `/state` and `/joined_members` together for a room the user is not in
+/// (`test_room_preview`), and a 403 on the second failed the preview. A
+/// room with the default `shared` visibility still refuses a stranger.
+#[tokio::test]
+async fn a_world_readable_rooms_roster_is_readable_by_a_stranger() {
+    let server = Harness::new();
+    let alice = server.register("alice").await;
+    let bob = server.register("bob").await;
+    let mut rooms = Vec::new();
+    for visibility in ["world_readable", "shared"] {
+        let (status, body) = server
+            .post(
+                "/_matrix/client/v3/createRoom",
+                &alice,
+                &json!({
+                    "initial_state": [{
+                        "type": "m.room.history_visibility",
+                        "state_key": "",
+                        "content": { "history_visibility": visibility },
+                    }],
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        rooms.push(body["room_id"].as_str().unwrap().to_owned());
+    }
+
+    let (status, body) = server
+        .get(
+            &format!("/_matrix/client/v3/rooms/{}/joined_members", rooms[0]),
+            &bob,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["joined"]["@alice:example.org"].is_object(), "{body}");
+
+    let (status, body) = server
+        .get(
+            &format!("/_matrix/client/v3/rooms/{}/joined_members", rooms[1]),
+            &bob,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// `/context`'s limit is split the way Synapse splits it: the floor
+/// before the event, the rest after. matrix-rust-sdk's permalink timeline
+/// asks for one context event and lays out two items; a symmetric split
+/// gave it three (`test_permalink_timelines_redecrypt`).
+#[tokio::test]
+async fn the_context_window_puts_the_odd_event_after() {
+    let server = Harness::new();
+    let alice = server.register("alice").await;
+    let (status, body) = server
+        .post("/_matrix/client/v3/createRoom", &alice, &json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    let mut ids = Vec::new();
+    for n in 0..5 {
+        let (status, body) = server
+            .put(
+                &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/ctx-{n}"),
+                &alice,
+                &json!({ "msgtype": "m.text", "body": n.to_string() }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        ids.push(body["event_id"].as_str().unwrap().to_owned());
+    }
+    let count = |events: &Value| events.as_array().map_or(0, Vec::len);
+    for (limit, before, after) in [(1, 0, 1), (2, 1, 1), (3, 1, 2), (0, 0, 0)] {
+        let (status, body) = server
+            .get(
+                &format!(
+                    "/_matrix/client/v3/rooms/{room}/context/{}?limit={limit}",
+                    ids[2]
+                ),
+                &alice,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            (count(&body["events_before"]), count(&body["events_after"])),
+            (before, after),
+            "limit={limit}: {body}"
+        );
+    }
+}
+
+/// `["m.room.member", "$LAZY"]` in sliding sync's `required_state` is
+/// the members who sent something in the timeline window, and nobody
+/// else. matrix-rust-sdk's notification client asks for exactly this to
+/// name the sender (`test_notification`); with the key unknown it got no
+/// member events and no sender name.
+#[tokio::test]
+async fn lazy_members_are_the_senders_in_the_window() {
+    let server = Harness::new();
+    let alice = server.register("alice").await;
+    let bob = server.register("bob").await;
+    let carol = server.register("carol").await;
+    let (status, body) = server
+        .post(
+            "/_matrix/client/v3/createRoom",
+            &alice,
+            &json!({ "preset": "public_chat" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    for token in [&bob, &carol] {
+        let (status, body) = server
+            .post(
+                &format!("/_matrix/client/v3/rooms/{room}/join"),
+                token,
+                &json!({}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, body) = server
+        .put(
+            &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/lazy-1"),
+            &alice,
+            &json!({ "msgtype": "m.text", "body": "hello" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A window of one holds Alice's message alone, so the lazy members
+    // are Alice alone: not Bob asking, not Carol who said nothing.
+    let (status, body) = server
+        .post(
+            "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync",
+            &bob,
+            &json!({ "lists": { "all": {
+                "ranges": [[0, 9]],
+                "timeline_limit": 1,
+                "required_state": [["m.room.member", "$LAZY"], ["m.room.name", ""]],
+            } } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let members: Vec<&str> = body["rooms"][&room]["required_state"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["type"] == "m.room.member")
+        .map(|event| event["state_key"].as_str().unwrap())
+        .collect();
+    assert_eq!(members, vec!["@alice:example.org"], "{body}");
+}
+
 /// A read receipt is not an event, but it changes the reader's own unread
 /// counts, so the reader's next incremental sliding sync must speak about
 /// the room again and carry the new count. It did not: the room was

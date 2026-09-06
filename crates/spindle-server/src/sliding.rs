@@ -151,9 +151,11 @@ impl SlidingRequest {
 ///
 /// `["*", "*"]` is everything; `["m.room.member", "*"]` is every member;
 /// `["m.room.member", "$ME"]` is the asking user's own membership, which is
-/// how Element X asks for exactly the memberships it can render. An empty
-/// list is *nothing*, not everything — a client that wants no state says so
-/// by saying nothing, and the timeline is unaffected either way.
+/// how Element X asks for exactly the memberships it can render. `$LAZY`
+/// (the senders in the timeline window) is expanded to concrete keys by
+/// the caller before this is asked. An empty list is *nothing*, not
+/// everything — a client that wants no state says so by saying nothing,
+/// and the timeline is unaffected either way.
 #[must_use]
 pub fn wants_state(
     required: &[(String, String)],
