@@ -2914,7 +2914,7 @@ impl Rooms {
         let position = self.allocate_stream_id();
         self.receipt_marks
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert((room_id.to_owned(), user_id.to_owned()), position);
         self.wake_sync_waiters();
     }
@@ -2930,7 +2930,10 @@ impl Rooms {
         since: u64,
         until: u64,
     ) -> HashSet<String> {
-        let marks = self.receipt_marks.lock().unwrap();
+        let marks = self
+            .receipt_marks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         rooms
             .into_iter()
             .filter(|room_id| {
