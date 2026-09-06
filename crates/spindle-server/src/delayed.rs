@@ -56,6 +56,11 @@ pub struct DelayedEvent {
     pub delay_ms: u64,
     /// Unix milliseconds at which this becomes due.
     pub fire_at_ms: u64,
+    /// MSC4354: how long the event is sticky for once it fires, when the
+    /// client asked for both -- a `MatrixRTC` membership scheduled to expire
+    /// is the case. Absent on rows written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticky_ms: Option<u64>,
 }
 
 /// A delayed event that has finished: sent, or refused when it came due.
@@ -261,6 +266,7 @@ impl Delayed {
     /// # Errors
     ///
     /// Returns [`DelayError::TooLong`] past the cap, or a store error.
+    #[allow(clippy::too_many_arguments, reason = "one call per request field")]
     pub fn schedule(
         &self,
         room_id: &str,
@@ -269,6 +275,7 @@ impl Delayed {
         state_key: Option<&str>,
         content: &Value,
         delay_ms: u64,
+        sticky_ms: Option<u64>,
     ) -> Result<String, DelayError> {
         if delay_ms > self.max_delay_ms {
             return Err(DelayError::TooLong {
@@ -294,6 +301,7 @@ impl Delayed {
             content: content.clone(),
             delay_ms,
             fire_at_ms: Self::now_ms().saturating_add(delay_ms),
+            sticky_ms,
         };
         self.write(&event)?;
         Ok(delay_id)
@@ -698,20 +706,22 @@ pub async fn fire_loop(
                 continue;
             }
             let sent = match &event.state_key {
-                Some(state_key) => rooms.set_state(
+                Some(state_key) => rooms.set_state_sticky(
                     &event.room_id,
                     &event.sender,
                     key.pair(),
                     &event.event_type,
                     state_key,
                     &event.content,
+                    event.sticky_ms,
                 ),
-                None => rooms.send(
+                None => rooms.send_sticky(
                     &event.room_id,
                     &event.sender,
                     key.pair(),
                     &event.event_type,
                     &event.content,
+                    event.sticky_ms,
                 ),
             };
             // MSC4309: whatever happened, the client that scheduled this is
@@ -771,6 +781,7 @@ mod restart_hot_path_tests {
                 None,
                 &serde_json::json!({ "body": "hi" }),
                 delay_ms,
+                None,
             )
             .unwrap()
     }
@@ -962,6 +973,7 @@ mod restart_hot_path_tests {
                     None,
                     &serde_json::json!({ "body": "hi" }),
                     60 * 60 * 1000,
+                    None,
                 )
                 .unwrap();
         }

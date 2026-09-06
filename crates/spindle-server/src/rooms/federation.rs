@@ -882,10 +882,21 @@ impl Rooms {
                 &event_body_key(room_id, id),
                 &serde_json::to_vec(event)?,
             )?;
-            let extra = vec![(
+            let mut extra = vec![(
                 spindle_core::keys::event_room(id),
                 room_id.as_bytes().to_vec(),
             )];
+            // MSC4354: a seeded sticky event is owed to this server's
+            // syncing clients like any other, at a position every token
+            // issued before the join precedes.
+            if event.get(super::STICKY_KEY).is_some() {
+                extra.extend(super::sticky_index_row(
+                    room_id,
+                    id,
+                    event,
+                    self.allocate_stream_id(),
+                ));
+            }
             room_store.journal_entry_with(&entry, &log, &extra)?;
         }
 

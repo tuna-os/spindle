@@ -360,6 +360,11 @@ pub enum Keyspace {
     /// than a scan of every token ever minted; the token carries its own
     /// expiry so a lookup can still address one row directly.
     OpenIdToken = 0x33,
+    /// MSC4354 sticky events, per room, ordered by expiry:
+    /// `room_prefix ++ expires_ms (u64 BE) ++ event_id`, valued with the
+    /// stream id the event was persisted under, so `/sync` can tell which
+    /// sticky events are news to a client since its token.
+    Sticky = 0x34,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -893,6 +898,32 @@ pub fn event_room(event_id: &str) -> Vec<u8> {
     let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::EventRoom as u8];
     key.extend_from_slice(event_id.as_bytes());
     key
+}
+
+/// The sticky-event row for `event_id` in `room_id`, expiring at
+/// `expires_ms`. Sorted by expiry within the room, so what has lapsed is a
+/// bounded prefix of the room's rows.
+#[must_use]
+pub fn sticky(room_id: &str, expires_ms: u64, event_id: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::Sticky, room_id);
+    key.extend_from_slice(&expires_ms.to_be_bytes());
+    key.extend_from_slice(event_id.as_bytes());
+    key
+}
+
+/// The prefix every sticky-event row of one room shares.
+#[must_use]
+pub fn sticky_prefix(room_id: &str) -> Vec<u8> {
+    room_prefix(Keyspace::Sticky, room_id)
+}
+
+/// The `(expires_ms, event_id)` a [`sticky`] key under `room_id` encodes.
+#[must_use]
+pub fn sticky_parts(key: &[u8], room_id: &str) -> Option<(u64, String)> {
+    let rest = key.get(sticky_prefix(room_id).len()..)?;
+    let expires = u64::from_be_bytes(rest.get(..8)?.try_into().ok()?);
+    let event_id = String::from_utf8(rest.get(8..)?.to_vec()).ok()?;
+    Some((expires, event_id))
 }
 
 /// `(destination, seq)` key for [`Keyspace::FederationOutbox`].
