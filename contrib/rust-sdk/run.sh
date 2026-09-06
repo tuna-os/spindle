@@ -13,7 +13,10 @@
 #   RUST_SDK_SRC   a checkout of matrix-org/matrix-rust-sdk (cloned at the
 #                  pin below when unset)
 #   SPINDLE_BIN    the server (default target/release/spindle)
-#   RUST_SDK_TESTS a filter passed to `cargo test` (default: everything)
+#   RUST_SDK_TESTS a filter on test names (default: everything)
+#   RUST_SDK_TEST_TIMEOUT
+#                  seconds one test may take before it is killed and
+#                  recorded as failed (default 180)
 #   RUST_SDK_TOOLCHAIN
 #                  a rustup toolchain for the suite's build, when the
 #                  SDK's floor is above this repository's pin (0.18 wants
@@ -66,14 +69,44 @@ for _ in $(seq 1 50); do curl -sf "$S/_matrix/client/versions" >/dev/null && bre
 curl -sf "$S/_matrix/client/versions" >/dev/null || { echo "Spindle did not start" >&2; exit 1; }
 
 # --- the suite ----------------------------------------------------------------
-# Every test runs whatever the others did (--no-fail-fast), one at a time
-# (they share a homeserver and register fixed names), and the log is the
-# record the checker reads. cargo's own exit status is not the verdict:
-# the allowlist is.
-echo "--- running the suite against $S"
+# Every test runs whatever the others did, one at a time (they share a
+# homeserver and register fixed names), and the log is the record the
+# checker reads. cargo's own exit status is not the verdict: the allowlist
+# is.
+#
+# One process per test, each under a timeout, and the test binary run
+# directly rather than through `cargo test`. The first dispatch of this
+# suite hung: a test that waits on a sync long-poll for an event the server
+# will never send has no timeout of its own, and under one `cargo test`
+# invocation it held the whole suite until the job's 75-minute limit took
+# every later test's verdict with it. `timeout` around cargo would not do
+# either -- cargo does not forward the signal, so the test binary would
+# outlive it and keep talking to the server the next test is using. The
+# binary is killed directly, and the timed-out test is written to the log
+# in cargo's own line shape, so the checker reads it as the failure it is.
+echo "--- building the suite"
+cargo_test=(cargo ${RUST_SDK_TOOLCHAIN:+"+$RUST_SDK_TOOLCHAIN"} test --manifest-path "$RUST_SDK_SRC/Cargo.toml" -p matrix-sdk-integration-testing --lib)
+suite_bin=$("${cargo_test[@]}" --no-run --message-format=json 2>/dev/null \
+  | python3 -c 'import json,sys
+for line in sys.stdin:
+    try: m = json.loads(line)
+    except ValueError: continue
+    if m.get("executable") and m.get("target", {}).get("name") == "matrix-sdk-integration-testing":
+        print(m["executable"])')
+[ -x "$suite_bin" ] || { echo "the suite binary was not built" >&2; exit 1; }
+
+mapfile -t tests < <("$suite_bin" --list --format terse ${RUST_SDK_TESTS:-} | sed -n 's/^\(.*\): test$/\1/p')
+echo "--- running ${#tests[@]} tests against $S, ${RUST_SDK_TEST_TIMEOUT:-180}s each"
+: > "$RESULTS"
 set +e
-HOMESERVER_URL="$S" HOMESERVER_DOMAIN="$SERVER_NAME" \
-  cargo ${RUST_SDK_TOOLCHAIN:+"+$RUST_SDK_TOOLCHAIN"} test --manifest-path "$RUST_SDK_SRC/Cargo.toml" -p matrix-sdk-integration-testing \
-  --no-fail-fast -- --test-threads 1 ${RUST_SDK_TESTS:-} 2>&1 | tee "$RESULTS"
+for name in "${tests[@]}"; do
+  HOMESERVER_URL="$S" HOMESERVER_DOMAIN="$SERVER_NAME" \
+    timeout --kill-after=10 "${RUST_SDK_TEST_TIMEOUT:-180}" \
+    "$suite_bin" --exact "$name" --test-threads 1 2>&1 | tee -a "$RESULTS"
+  status=${PIPESTATUS[0]}
+  if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+    echo "test $name ... FAILED, timed out after ${RUST_SDK_TEST_TIMEOUT:-180}s" | tee -a "$RESULTS"
+  fi
+done
 set -e
 python3 "$root/scripts/rust-sdk-check.py" "$RESULTS"
