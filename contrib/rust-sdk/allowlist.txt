@@ -43,3 +43,17 @@ tests::timeline::test_toggling_reaction
 # 5 ignored; the 21 above held and these two joined.
 tests::invitations::test_invitation_details
 tests::room_privacy::test_publishing_room_alias
+
+# Run 34037549881 (matrix-sdk-0.18.0 at 1c44fb66, Spindle at 207e6fc):
+# 29 passed, 21 failed, 5 ignored. #416 (members?at=) settles the missing
+# member keys; #411 lists invites in sliding sync, which the delayed
+# invite test waited on; #406 strips a removed alias from the room, so
+# the directory search no longer finds it. The latest-event and the
+# notification-client tests had been failing on timing and held on this
+# run and the one after it.
+tests::e2ee::test_encryption_missing_member_keys
+tests::e2ee::test_mutual_sas_verification_with_notification_client_ignores_verification_events
+tests::room::test_latest_event_few_rooms
+tests::room_privacy::test_removing_published_room_alias
+tests::sliding_sync::room::test_delayed_invite_response_and_sent_message_decryption
+tests::timeline::test_room_keys_received_on_notification_client_trigger_redecryption
