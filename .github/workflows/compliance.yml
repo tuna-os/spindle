@@ -12,6 +12,14 @@ on:
   schedule:
     - cron: '23 3 * * *'
   workflow_dispatch:
+    inputs:
+      element_call_specs:
+        description: >-
+          Element Call spec files for the element-call-e2e job, space
+          separated and relative to upstream's playwright/ directory.
+          Empty runs the default subset in contrib/element-call/run.sh.
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -491,6 +499,7 @@ jobs:
         env:
           SPINDLE_IMAGE: complement-spindle:latest
           ELEMENT_CALL_SRC: tmp/element-call
+          ELEMENT_CALL_SPECS: ${{ inputs.element_call_specs }}
         run: contrib/element-call/run.sh tmp/element-call-results/results.json
       - name: Keep the report and the server logs
         if: always()
