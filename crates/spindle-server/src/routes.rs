@@ -2413,7 +2413,7 @@ pub(crate) fn record_invite(
         .unwrap_or_default();
     state
         .rooms
-        .record_pending_invite(target, room_id, origin, &invite_state)
+        .record_pending_invite(target, room_id, origin, event_id, &invite_state)
         .map_err(room_error)?;
     state.rooms.wake_sync_waiters();
     Ok(())
