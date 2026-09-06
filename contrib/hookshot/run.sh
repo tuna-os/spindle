@@ -13,7 +13,7 @@
 #   OUT_DIR          where logs go (default tmp/hookshot)
 #
 # Needs docker (the bridge runs as a container on the host network),
-# curl, python3, openssl. Ports 8008, 9993 and 9000 on loopback.
+# curl, python3, openssl. Ports 8008, 9993 and 9723 on loopback.
 #
 # What it proves, in order, and fails on:
 #   1. the registration loads and the bridge's transaction endpoint answers
@@ -87,12 +87,12 @@ bridge:
 passFile: /data/passkey.pem
 generic:
   enabled: true
-  urlPrefix: http://127.0.0.1:9000/webhook/
+  urlPrefix: http://127.0.0.1:9723/webhook/
   userIdPrefix: _webhook_
   allowJsTransformationFunctions: false
   waitForComplete: true
 listeners:
-  - port: 9000
+  - port: 9723
     bindAddress: 127.0.0.1
     resources:
       - webhooks
@@ -131,17 +131,23 @@ curl -sf "$S/_matrix/client/versions" >/dev/null || { echo "Spindle did not star
 # --- the bridge -------------------------------------------------------------------
 step "the bridge starts against the registration"
 container="$(docker run -d --network host -v "$rig/hookshot:/data" "$HOOKSHOT_IMAGE")"
+# Ready means the bridge's own appservice port answers: it opens once the
+# registration is read and the homeserver connection is up. The webhook
+# listener is probed too, since that is the feature under test. Neither
+# probe may be fatal on its own (a `$(...)` assignment is, under set -e),
+# and the loop must not trust a port something else on the host answers.
+bridge_up() {
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' -X PUT "http://127.0.0.1:9993/_matrix/app/v1/transactions/probe" \
+    -H "authorization: Bearer $HS_TOKEN" -H 'content-type: application/json' -d '{"events":[]}' || true)"
+  [[ $code == 2* ]] && curl -s -o /dev/null "http://127.0.0.1:9723/" 2>/dev/null
+}
 for _ in $(seq 1 120); do
-  # The appservice port answers once the bridge has read its registration
-  # and connected to the homeserver; the webhook listener once generic
-  # webhooks are up.
-  curl -s -o /dev/null "http://127.0.0.1:9000/" && break
+  bridge_up && break
   sleep 1
 done
-curl -s -o /dev/null "http://127.0.0.1:9000/" || { echo "the bridge's webhook listener never answered" >&2; docker logs "$container" | tail -40 >&2; exit 1; }
-CODE="$(curl -s -o /dev/null -w '%{http_code}' -X PUT "http://127.0.0.1:9993/_matrix/app/v1/transactions/probe" \
-  -H "authorization: Bearer $HS_TOKEN" -H 'content-type: application/json' -d '{"events":[]}')"
-echo "the bridge's transaction endpoint answers $CODE to an empty transaction"
+bridge_up || { echo "the bridge never came up" >&2; docker logs "$container" | tail -40 >&2; exit 1; }
+echo "the bridge's transaction endpoint answers, and its webhook listener is up"
 
 # --- a user, a room, the bot ----------------------------------------------------
 step "alice invites the bot and it joins"
@@ -202,7 +208,7 @@ echo "the bot handed over $URL"
 
 # --- the outside world knocks -------------------------------------------------
 step "a webhook fires into the room"
-CODE="$(curl -s -o "$rig/hook.out" -w '%{http_code}' -X POST "$URL" -H 'content-type: application/json' -d '{"text":"hello from the outside"}')"
+CODE="$(curl -s -o "$rig/hook.out" -w '%{http_code}' -X POST "$URL" -H 'content-type: application/json' -d '{"text":"hello from the outside"}' || true)"
 echo "POST $URL -> $CODE $(head -c 120 "$rig/hook.out")"
 landed=""
 for _ in $(seq 1 60); do
@@ -227,10 +233,10 @@ esac
 # --- the bridge restarts, and remembers ----------------------------------------
 step "the bridge restarts and the same URL still routes"
 docker restart "$container" >/dev/null
-for _ in $(seq 1 120); do curl -s -o /dev/null "http://127.0.0.1:9000/" && break; sleep 1; done
+for _ in $(seq 1 120); do bridge_up && break; sleep 1; done
 CODE=""
 for _ in $(seq 1 30); do
-  CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL" -H 'content-type: application/json' -d '{"text":"still here after a restart"}')"
+  CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL" -H 'content-type: application/json' -d '{"text":"still here after a restart"}' || true)"
   [[ $CODE == 2* ]] && break
   sleep 1
 done
