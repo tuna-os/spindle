@@ -52,6 +52,7 @@ fn a_call_of(delayed: &Delayed, participants: usize, delay_ms: u64) -> Vec<(Stri
                     Some(&sender),
                     &serde_json::json!({ "memberships": [] }),
                     delay_ms,
+                    None,
                 )
                 .expect("the delay is scheduled");
             (id, sender)

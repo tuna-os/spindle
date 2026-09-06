@@ -1298,6 +1298,15 @@ pub(crate) async fn send_join_common(
     }
 
     state.rooms.wake_sync_waiters();
+    // MSC4354: a server that has just joined is owed every unexpired
+    // sticky event of the room. Pushed through the outbox as the MSC
+    // says, for a peer that backfills what it does not know; and carried
+    // in the join response too, for a Spindle, which seeds the join
+    // response and backfills nothing.
+    if let Err(error) = state.rooms.push_sticky_to(&room_id, &origin) {
+        tracing::debug!(%error, "cannot push sticky events to {origin}");
+    }
+    let sticky = state.rooms.sticky_pdus(&room_id).map_err(room_error)?;
     // MSC4242: a state-DAG room answers with the state DAG and the tail
     // of the timeline, and never with `state`/`auth_chain`.
     let version = state.rooms.room_version(&room_id).map_err(room_error)?;
@@ -1311,6 +1320,7 @@ pub(crate) async fn send_join_common(
             "event": join,
             "state_dag": state_dag,
             "timeline": timeline,
+            "msc4354_sticky": sticky,
         }));
     }
 
@@ -1328,6 +1338,7 @@ pub(crate) async fn send_join_common(
         "event": join,
         "state": bodies(state_pairs),
         "auth_chain": bodies(auth_pairs),
+        "msc4354_sticky": sticky,
     }))
 }
 
