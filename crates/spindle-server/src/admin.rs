@@ -235,6 +235,30 @@ pub(crate) fn file_event_report(
     reason: Option<&str>,
     score: Option<i64>,
 ) -> Result<u64, MatrixError> {
+    file_report(
+        state,
+        reporter,
+        Some(room_id),
+        Some(event_id),
+        sender,
+        reason,
+        score,
+    )
+}
+
+/// File a report about an event, a room (spec v1.13) or a user (spec
+/// v1.14): the same queue, with the parts the report is about filled in.
+/// `sender` is the reported user: an event's sender, or the user
+/// reported directly.
+pub(crate) fn file_report(
+    state: &AppState,
+    reporter: &str,
+    room_id: Option<&str>,
+    event_id: Option<&str>,
+    sender: Option<&str>,
+    reason: Option<&str>,
+    score: Option<i64>,
+) -> Result<u64, MatrixError> {
     let seq = state.rooms.allocate_stream_id();
     let record = json!({
         "id": seq,

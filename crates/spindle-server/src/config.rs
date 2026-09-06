@@ -445,6 +445,33 @@ pub struct ServerConfig {
     /// server name need not be the hostname.
     #[serde(default)]
     pub public_base_url: Option<String>,
+    /// Who to contact about this server (spec v1.10), served at
+    /// `/.well-known/matrix/support`. Absent means the endpoint answers
+    /// 404, which is what the spec says an unconfigured server does.
+    #[serde(default)]
+    pub support: Option<SupportConfig>,
+}
+
+/// `/.well-known/matrix/support`: the people and the page behind a server.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupportConfig {
+    #[serde(default)]
+    pub contacts: Vec<SupportContact>,
+    #[serde(default)]
+    pub support_page: Option<String>,
+}
+
+/// One support contact: a role, and a Matrix ID or an email or both.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupportContact {
+    #[serde(default)]
+    pub matrix_id: Option<String>,
+    #[serde(default)]
+    pub email_address: Option<String>,
+    /// `m.role.admin`, `m.role.security`, or a namespaced role of your own.
+    pub role: String,
 }
 
 /// Whether the rate limiter is in force.

@@ -30,6 +30,10 @@ const TOKEN_BYTES: usize = 32;
 
 /// A registered local user.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "admin, deactivated, locked and suspended are independent flags"
+)]
 pub struct Account {
     pub localpart: String,
     /// Argon2id PHC string, salt included.
@@ -46,6 +50,15 @@ pub struct Account {
     /// subcommand against the store.
     #[serde(default)]
     pub admin: bool,
+    /// Locked by an administrator (spec v1.18): every request answers
+    /// `M_USER_LOCKED` with `soft_logout`, and the sessions survive the
+    /// lock so that lifting it needs no re-login.
+    #[serde(default)]
+    pub locked: bool,
+    /// Suspended by an administrator (spec v1.18): the account may read
+    /// and log out, and nothing else; a write answers `M_USER_SUSPENDED`.
+    #[serde(default)]
+    pub suspended: bool,
 }
 
 /// One logged-in device.
@@ -151,6 +164,8 @@ impl<'a, S: Store> Accounts<'a, S> {
             password_hash,
             deactivated: false,
             admin: false,
+            locked: false,
+            suspended: false,
         };
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
@@ -396,6 +411,38 @@ impl<'a, S: Store> Accounts<'a, S> {
             return Ok(false);
         };
         account.admin = admin;
+        self.store
+            .put(&account_key(localpart), &encode(&account)?)?;
+        Ok(true)
+    }
+
+    /// Lock or unlock an account (spec v1.18). `false` for an account
+    /// that does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or decoding error.
+    pub fn set_locked(&self, localpart: &str, locked: bool) -> Result<bool, AccountError> {
+        let Some(mut account) = self.account(localpart)? else {
+            return Ok(false);
+        };
+        account.locked = locked;
+        self.store
+            .put(&account_key(localpart), &encode(&account)?)?;
+        Ok(true)
+    }
+
+    /// Suspend or reinstate an account (spec v1.18). `false` for an
+    /// account that does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or decoding error.
+    pub fn set_suspended(&self, localpart: &str, suspended: bool) -> Result<bool, AccountError> {
+        let Some(mut account) = self.account(localpart)? else {
+            return Ok(false);
+        };
+        account.suspended = suspended;
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
         Ok(true)

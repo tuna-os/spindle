@@ -196,6 +196,15 @@ const TABLE: &[Route] = &[
     },
     Route {
         method: "POST",
+        path: "/_matrix/client/v3/rooms/{room_id}/report",
+        reach: Reach::Exempt(
+            "spec v1.13: the caller is not required to be joined to report a room, and the \
+             answer carries nothing of the room; a stranger learns only that it exists, which \
+             the spec allows a server to disclose",
+        ),
+    },
+    Route {
+        method: "POST",
         path: "/_matrix/client/v3/rooms/{room_id}/read_markers",
         reach: Reach::Refused,
     },
@@ -455,7 +464,7 @@ fn body_for(route: &Route, event: &str) -> Option<Value> {
         json!({ "m.fully_read": event })
     } else if path.ends_with("/upgrade") {
         json!({ "new_version": "11" })
-    } else if path.contains("/report/") {
+    } else if path.contains("/report/") || path.ends_with("/report") {
         json!({ "reason": "from outside" })
     } else if path.contains("/directory/list/room/") {
         json!({ "visibility": "public" })
