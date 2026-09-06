@@ -674,6 +674,57 @@ jobs:
       - name: Run the harness against a fresh build
         run: evidence/mautrix-echo/run.sh
 
+  # A peer-to-peer call with no SFU anywhere: Element Call's frozen
+  # full-mesh branch, built at its last commit and pointed at a Spindle,
+  # two browsers meeting in a call over a host-to-host candidate pair
+  # (docs/p2p-calls.md). Nightly and on demand, because building the
+  # branch is a yarn install and a vite build of a 2023 tree.
+  # matrix-rust-sdk's own integration suite, nightly: the library under
+  # Element X, driving Spindle the way the flagship client does, with the
+  # allowlist in contrib/rust-sdk as the ratchet. Not on pull requests:
+  # the suite's build is a workspace of its own.
+  rust-sdk-suite:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            . -> target
+            tmp/matrix-rust-sdk -> target
+      - name: Check out matrix-rust-sdk at the pin
+        run: |
+          rev=$(sed -n 's/^RUST_SDK_REV=\([0-9a-f]*\).*/\1/p' contrib/rust-sdk/run.sh)
+          mkdir -p tmp/matrix-rust-sdk
+          git -C tmp/matrix-rust-sdk init -q
+          git -C tmp/matrix-rust-sdk fetch -q --depth 1 https://github.com/matrix-org/matrix-rust-sdk.git "$rev"
+          git -C tmp/matrix-rust-sdk checkout -q FETCH_HEAD
+      - name: Build the server
+        run: cargo build --release -p spindle-server --bin spindle
+      # The SDK's floor is above this repository's pin; a second toolchain
+      # for its build alone, named to the rig rather than changing the pin.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.93.0
+      - name: Run the suite against Spindle
+        env:
+          RUST_SDK_SRC: tmp/matrix-rust-sdk
+          RUST_SDK_TOOLCHAIN: 1.93.0
+          SPINDLE_BIN: target/release/spindle
+        run: contrib/rust-sdk/run.sh tmp/rust-sdk/results.log
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rust-sdk-suite
+          path: tmp/rust-sdk/
+          if-no-files-found: ignore
+
   full-mesh-e2e:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
