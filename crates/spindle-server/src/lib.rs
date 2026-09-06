@@ -15,6 +15,7 @@ pub mod authorize;
 pub mod backups;
 pub mod blobs;
 pub mod config;
+pub mod dehydrated;
 pub mod delayed;
 pub mod delegated;
 pub mod devices;

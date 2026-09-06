@@ -97,7 +97,39 @@ pub fn routes() -> Router<AppState> {
             )
             .route(&format!("{prefix}/audit"), get(audit_log))
     };
-    group("/_spindle/admin/v1").merge(group("/_synapse/admin/v1"))
+    group("/_spindle/admin/v1")
+        .merge(group("/_synapse/admin/v1"))
+        .merge(synapse_spellings())
+}
+
+/// The paths Synapse spells differently, so that the tooling written
+/// against it -- synadm, the admin panels -- drives this server without
+/// a patch. Same handlers; only the URL differs. Synapse's v2 user
+/// endpoints are its current ones (v1's were retired), its `deactivate`,
+/// `reset_password` and `purge_history` put the verb first and the target
+/// second, and `delete_devices` takes a list where this API takes one
+/// device per DELETE.
+fn synapse_spellings() -> Router<AppState> {
+    Router::new()
+        .route("/_synapse/admin/v2/users", get(list_users))
+        .route(
+            "/_synapse/admin/v2/users/{user_id}",
+            get(get_user).put(put_user),
+        )
+        .route("/_synapse/admin/v2/users/{user_id}/devices", get(devices))
+        .route(
+            "/_synapse/admin/v2/users/{user_id}/delete_devices",
+            post(delete_devices),
+        )
+        .route("/_synapse/admin/v1/deactivate/{user_id}", post(deactivate))
+        .route(
+            "/_synapse/admin/v1/reset_password/{user_id}",
+            post(reset_password),
+        )
+        .route(
+            "/_synapse/admin/v1/purge_history/{room_id}",
+            post(purge_history),
+        )
 }
 
 /// The caller, proven to be a server admin.
@@ -531,6 +563,39 @@ async fn delete_device(
         &user_id,
         &json!({ "device_id": device_id }),
     )?;
+    Ok(Json(json!({})))
+}
+
+#[derive(Deserialize)]
+struct DeleteDevices {
+    #[serde(default)]
+    devices: Vec<String>,
+}
+
+/// `POST /_synapse/admin/v2/users/{userId}/delete_devices`, Synapse's
+/// list form of the DELETE above: one audit record per device, as if each
+/// had been deleted on its own, so the log reads the same either way.
+async fn delete_devices(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path(user_id): Path<String>,
+    Json(request): Json<DeleteDevices>,
+) -> Result<Json<Value>, MatrixError> {
+    let (localpart, _) = target_account(&state, &user_id)?;
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    for device_id in &request.devices {
+        crate::mas::remove_device(&state, &accounts, &localpart, device_id)?;
+        audit(
+            &state,
+            &actor.identity().user_id,
+            "delete_device",
+            &user_id,
+            &json!({ "device_id": device_id }),
+        )?;
+    }
+    if !request.devices.is_empty() {
+        crate::mas::device_list_changed(&state, &accounts.user_id(&localpart));
+    }
     Ok(Json(json!({})))
 }
 

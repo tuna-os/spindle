@@ -106,6 +106,38 @@ impl Instance {
 /// New endpoints must be added here — the refusal test walks this list.
 fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
     let mut routes = Vec::new();
+    // The paths Synapse spells differently, served for its tooling.
+    routes.extend([
+        (reqwest::Method::GET, "/_synapse/admin/v2/users".to_owned()),
+        (
+            reqwest::Method::GET,
+            format!("/_synapse/admin/v2/users/{user}"),
+        ),
+        (
+            reqwest::Method::PUT,
+            format!("/_synapse/admin/v2/users/{user}"),
+        ),
+        (
+            reqwest::Method::GET,
+            format!("/_synapse/admin/v2/users/{user}/devices"),
+        ),
+        (
+            reqwest::Method::POST,
+            format!("/_synapse/admin/v2/users/{user}/delete_devices"),
+        ),
+        (
+            reqwest::Method::POST,
+            format!("/_synapse/admin/v1/deactivate/{user}"),
+        ),
+        (
+            reqwest::Method::POST,
+            format!("/_synapse/admin/v1/reset_password/{user}"),
+        ),
+        (
+            reqwest::Method::POST,
+            "/_synapse/admin/v1/purge_history/!r:x".to_owned(),
+        ),
+    ]);
     for prefix in ["/_spindle/admin/v1", "/_synapse/admin/v1"] {
         routes.extend([
             (reqwest::Method::GET, format!("{prefix}/server_version")),
@@ -1519,4 +1551,99 @@ async fn one_event_report_carries_the_event_it_is_about() {
         assert_eq!(status, 404, "{path}: {body}");
         assert_eq!(body["errcode"], "M_NOT_FOUND", "{path}: {body}");
     }
+}
+
+/// synadm and the admin panels speak Synapse's spellings: v2 for users,
+/// the verb before the target for `deactivate` and `reset_password`, and a
+/// list form of device deletion. Same handlers behind them.
+#[tokio::test]
+async fn synapse_spellings_reach_the_same_handlers() {
+    let server = Instance::start().await;
+    let admin = server.register("admin").await;
+    server.promote("admin");
+    server.register("alice").await;
+    let alice = server.user("alice");
+
+    let (status, v2) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v2/users",
+            Some(&admin),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{v2}");
+    let (_, v1) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/users",
+            Some(&admin),
+            None,
+        )
+        .await;
+    assert_eq!(v2["users"], v1["users"], "v2 lists what v1 lists");
+
+    let (status, devices) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v2/users/{alice}/devices"),
+            Some(&admin),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{devices}");
+    let device_id = devices["devices"][0]["device_id"]
+        .as_str()
+        .expect("alice's session is a device")
+        .to_owned();
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_synapse/admin/v2/users/{alice}/delete_devices"),
+            Some(&admin),
+            Some(&json!({ "devices": [device_id] })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (_, after) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v1/users/{alice}/devices"),
+            Some(&admin),
+            None,
+        )
+        .await;
+    assert_eq!(
+        after["devices"],
+        json!([]),
+        "the listed device is gone: {after}"
+    );
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_synapse/admin/v1/reset_password/{alice}"),
+            Some(&admin),
+            Some(&json!({ "new_password": "another-horse", "logout_devices": false })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_synapse/admin/v1/deactivate/{alice}"),
+            Some(&admin),
+            Some(&json!({ "erase": false })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (_, user) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v2/users/{alice}"),
+            Some(&admin),
+            None,
+        )
+        .await;
+    assert_eq!(user["deactivated"], true, "{user}");
 }

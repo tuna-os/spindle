@@ -372,6 +372,11 @@ pub enum Keyspace {
     /// moderation queue an admin walks by id is a different thing from a
     /// log of what admins did. The sequence number is the report's id.
     EventReport = 0x35,
+    /// MSC3814: the one dehydrated device a user may park, keyed by user:
+    /// which device it is and the encrypted `device_data` that rehydrates
+    /// it. The device's keys and queue live in the device keyspaces like
+    /// any other device's.
+    DehydratedDevice = 0x36,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
