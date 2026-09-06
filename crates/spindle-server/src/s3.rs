@@ -6,7 +6,7 @@
 //! published test vectors; the signer below is checked against them, which
 //! is a stronger statement than "the SDK probably does it right".
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;

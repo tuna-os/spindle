@@ -15,7 +15,8 @@
 //! password is recovered from a stolen hash.
 
 use argon2::Argon2;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt, SaltString};
+use argon2::password_hash::phc::{PasswordHash, Salt};
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use serde::{Deserialize, Serialize};
 use spindle_core::keys::{Keyspace, room_prefix};
 use spindle_store::{Store, StoreError};
@@ -139,9 +140,9 @@ impl<'a, S: Store> Accounts<'a, S> {
             return Err(AccountError::UserInUse);
         }
 
-        let salt = salt()?;
+        let salt = salt();
         let password_hash = Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
+            .hash_password_with_salt(password.as_bytes(), &salt)
             .map_err(|error| AccountError::Hashing(error.to_string()))?
             .to_string();
 
@@ -409,9 +410,9 @@ impl<'a, S: Store> Accounts<'a, S> {
         let Some(mut account) = self.account(localpart)? else {
             return Ok(false);
         };
-        let salt = salt()?;
+        let salt = salt();
         account.password_hash = Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
+            .hash_password_with_salt(password.as_bytes(), &salt)
             .map_err(|error| AccountError::Hashing(error.to_string()))?
             .to_string();
         self.store
@@ -527,10 +528,10 @@ fn token_key(keyspace: Keyspace, token: &str) -> Vec<u8> {
 /// difference is that the entropy now comes from the one source this
 /// module already uses for tokens, rather than from a second RNG that
 /// happened to be reachable.
-fn salt() -> Result<SaltString, AccountError> {
+fn salt() -> [u8; Salt::RECOMMENDED_LENGTH] {
     let mut bytes = [0_u8; Salt::RECOMMENDED_LENGTH];
     crate::secrets::fill(&mut bytes);
-    SaltString::encode_b64(&bytes).map_err(|error| AccountError::Hashing(error.to_string()))
+    bytes
 }
 
 /// A password for an account nobody logs into with one: appservice
