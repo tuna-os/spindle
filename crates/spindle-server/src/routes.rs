@@ -3421,16 +3421,59 @@ async fn create_alias(
 }
 
 /// `DELETE /_matrix/client/v3/directory/room/{room_alias}`
+///
+/// Claiming an alias writes no room state -- the room's own opinion about
+/// what it is called is the room's to give. Removing one is different: a
+/// canonical alias that names an alias the directory no longer resolves
+/// is a broken name the server left behind, and the public directory
+/// still matches searches against it. So, as Synapse does, the alias is
+/// taken out of `m.room.canonical_alias` on the remover's behalf, best
+/// effort: a remover the room does not let edit that event keeps the
+/// stale name, which is the room's decision rather than an error here.
 async fn delete_alias(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
     axum::extract::Path(room_alias): axum::extract::Path<String>,
 ) -> Result<Json<Value>, MatrixError> {
-    state
+    let room_id = state
         .directory
         .delete(&room_alias, &identity.user_id)
         .map_err(|error| directory_error(&error))?;
+    if let Ok(event) = state
+        .rooms
+        .state_event_full(&room_id, "m.room.canonical_alias", "")
+        && let Some(without) = without_alias(&event["content"], &room_alias)
+    {
+        let _ = state.rooms.set_state(
+            &room_id,
+            &identity.user_id,
+            state.key.pair(),
+            "m.room.canonical_alias",
+            "",
+            &without,
+        );
+    }
     Ok(Json(json!({})))
+}
+
+/// `content` with `alias` gone from `alias` and `alt_aliases`, or `None` if
+/// it named it nowhere and there is nothing to write.
+fn without_alias(content: &Value, alias: &str) -> Option<Value> {
+    let names_it = content["alias"] == json!(alias)
+        || content["alt_aliases"]
+            .as_array()
+            .is_some_and(|alts| alts.iter().any(|alt| alt == alias));
+    if !names_it {
+        return None;
+    }
+    let mut without = content.clone();
+    if without["alias"] == json!(alias) {
+        without.as_object_mut()?.remove("alias");
+    }
+    if let Some(alts) = without["alt_aliases"].as_array_mut() {
+        alts.retain(|alt| alt != alias);
+    }
+    Some(without)
 }
 
 /// `GET /_matrix/client/v3/rooms/{room_id}/aliases`

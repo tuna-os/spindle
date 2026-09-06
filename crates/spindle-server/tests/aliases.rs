@@ -625,3 +625,101 @@ async fn an_alias_is_not_room_state() {
         "the server does not write the room's opinion for it: {after}"
     );
 }
+
+#[tokio::test]
+async fn removing_an_alias_takes_it_out_of_the_canonical_alias() {
+    // matrix-rust-sdk's `test_removing_published_room_alias`: a room
+    // published under an alias, the alias removed, and a directory search
+    // by that alias expected to find nothing. The directory row went, but
+    // `m.room.canonical_alias` still named the alias and the search
+    // matches on it. Synapse amends the event on removal; so does this.
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.create_room(&alice).await;
+    harness.claim("#lobby:example.org", &room, &alice).await;
+    harness.claim("#foyer:example.org", &room, &alice).await;
+
+    let (status, body) = harness
+        .request(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.canonical_alias/"),
+            Some(&alice),
+            &json!({ "alias": "#lobby:example.org", "alt_aliases": ["#foyer:example.org"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness
+        .request(
+            "PUT",
+            &format!("/_matrix/client/v3/directory/list/room/{room}"),
+            Some(&alice),
+            &json!({ "visibility": "public" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let search = |term: &str| json!({ "filter": { "generic_search_term": term } });
+    let (status, found) = harness
+        .request(
+            "POST",
+            "/_matrix/client/v3/publicRooms",
+            Some(&alice),
+            &search("#lobby"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    assert_eq!(found["chunk"].as_array().map(Vec::len), Some(1), "{found}");
+
+    let (status, body) = harness
+        .request(
+            "DELETE",
+            &format!(
+                "/_matrix/client/v3/directory/room/{}",
+                encoded("#lobby:example.org")
+            ),
+            Some(&alice),
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, canonical) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.canonical_alias/"),
+            Some(&alice),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{canonical}");
+    assert!(
+        canonical.get("alias").is_none(),
+        "the removed alias is gone: {canonical}"
+    );
+    assert_eq!(
+        canonical["alt_aliases"],
+        json!(["#foyer:example.org"]),
+        "the other alias stays: {canonical}"
+    );
+
+    let (_, found) = harness
+        .request(
+            "POST",
+            "/_matrix/client/v3/publicRooms",
+            Some(&alice),
+            &search("#lobby"),
+        )
+        .await;
+    assert_eq!(found["chunk"].as_array().map(Vec::len), Some(0), "{found}");
+    let (_, found) = harness
+        .request(
+            "POST",
+            "/_matrix/client/v3/publicRooms",
+            Some(&alice),
+            &search("#foyer"),
+        )
+        .await;
+    assert_eq!(
+        found["chunk"].as_array().map(Vec::len),
+        Some(0),
+        "an alt alias is not searched: {found}"
+    );
+}
