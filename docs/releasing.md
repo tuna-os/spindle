@@ -21,11 +21,34 @@ git push origin v0.0.1
   `.sha256` beside it;
 - builds the runtime image (the `Dockerfile` at the root) for `amd64` and
   `arm64` and publishes a manifest at `ghcr.io/tuna-os/spindle:<tag>`;
-- creates the GitHub release with the tarballs, the checksums and notes
-  that say what the tag is, marked a prerelease for every `v0.*` tag.
+- writes an SBOM for each tarball (SPDX, from `Cargo.lock`, so it names
+  every crate the build pinned) and attests it to the tarball;
+- signs a provenance attestation for each tarball and each image, through
+  Sigstore, tied to the workflow's own identity; the image attestations
+  are pushed to the registry beside the images;
+- creates the GitHub release with the tarballs, the checksums, the SBOMs
+  and notes that say what the tag is, marked a prerelease for every
+  `v0.*` tag.
 
 Nothing is published under `latest`. A tag names a build; the next tag
 names the next one.
+
+## Checking a build is what it says
+
+A file name proves nothing. The attestation does: it says which workflow,
+on which commit, produced the artifact with this digest, and Sigstore's
+log says when.
+
+```sh
+gh attestation verify spindle-v0.0.1-x86_64-unknown-linux-gnu.tar.gz --repo tuna-os/spindle
+gh attestation verify oci://ghcr.io/tuna-os/spindle:v0.0.1 --repo tuna-os/spindle
+```
+
+`--repo` is the trust root: the check passes only for attestations signed
+by a workflow in this repository. The SBOM beside each tarball is an
+SPDX document; `gh attestation verify --predicate-type
+https://spdx.dev/Document` checks that it, too, was attested to the same
+tarball by the same workflow.
 
 ## What a tag gives the rest of the project
 
