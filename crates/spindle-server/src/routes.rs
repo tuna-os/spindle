@@ -1586,9 +1586,12 @@ async fn registration_token_validity(
     {
         return Err(MatrixError::limit_exceeded(retry.as_millis()));
     }
+    let token = query
+        .token
+        .ok_or_else(|| MatrixError::missing_param("token is required"))?;
     let valid =
         crate::registration_tokens::RegistrationTokens::new(std::sync::Arc::clone(&state.store))
-            .is_valid(&query.token)
+            .is_valid(&token)
             .map_err(|error| MatrixError::internal(&error.to_string()))?;
     Ok(Json(json!({ "valid": valid })))
 }
