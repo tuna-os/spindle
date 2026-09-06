@@ -543,9 +543,15 @@ jobs:
           git -C tmp/matrix-rust-sdk checkout -q FETCH_HEAD
       - name: Build the server
         run: cargo build --release -p spindle-server --bin spindle
+      # The SDK's floor is above this repository's pin; a second toolchain
+      # for its build alone, named to the rig rather than changing the pin.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.93.0
       - name: Run the suite against Spindle
         env:
           RUST_SDK_SRC: tmp/matrix-rust-sdk
+          RUST_SDK_TOOLCHAIN: 1.93.0
           SPINDLE_BIN: target/release/spindle
         run: contrib/rust-sdk/run.sh tmp/rust-sdk/results.log
       - name: Keep the log

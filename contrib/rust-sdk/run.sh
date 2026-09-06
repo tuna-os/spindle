@@ -14,6 +14,10 @@
 #                  pin below when unset)
 #   SPINDLE_BIN    the server (default target/release/spindle)
 #   RUST_SDK_TESTS a filter passed to `cargo test` (default: everything)
+#   RUST_SDK_TOOLCHAIN
+#                  a rustup toolchain for the suite's build, when the
+#                  SDK's floor is above this repository's pin (0.18 wants
+#                  1.93); `cargo +<toolchain>` outranks rust-toolchain.toml
 #
 # Needs a Rust toolchain, git, curl. Port 8228 on loopback.
 set -euo pipefail
@@ -69,7 +73,7 @@ curl -sf "$S/_matrix/client/versions" >/dev/null || { echo "Spindle did not star
 echo "--- running the suite against $S"
 set +e
 HOMESERVER_URL="$S" HOMESERVER_DOMAIN="$SERVER_NAME" \
-  cargo test --manifest-path "$RUST_SDK_SRC/Cargo.toml" -p matrix-sdk-integration-testing \
+  cargo ${RUST_SDK_TOOLCHAIN:+"+$RUST_SDK_TOOLCHAIN"} test --manifest-path "$RUST_SDK_SRC/Cargo.toml" -p matrix-sdk-integration-testing \
   --no-fail-fast -- --test-threads 1 ${RUST_SDK_TESTS:-} 2>&1 | tee "$RESULTS"
 set -e
 python3 "$root/scripts/rust-sdk-check.py" "$RESULTS"
