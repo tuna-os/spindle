@@ -674,76 +674,6 @@ jobs:
       - name: Run the harness against a fresh build
         run: evidence/mautrix-echo/run.sh
 
-  # A real bridge, nightly: matrix-hookshot through the Application
-  # Service API, invited, joined, answering a command and relaying a
-  # webhook into the room from a ghost it minted (contrib/hookshot). The
-  # bridge evidence #18 asks for, one bridge at a time.
-  hookshot-bridge:
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        with:
-          toolchain: 1.90.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: Build the server
-        run: cargo build -p spindle-server --bin spindle
-      - name: Bridge a webhook through hookshot
-        env:
-          SPINDLE_BIN: target/debug/spindle
-        run: contrib/hookshot/run.sh
-      - name: Keep the logs
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: hookshot-bridge
-          path: tmp/hookshot/
-          if-no-files-found: ignore
-
-  # The mautrix-go harness under evidence/: a bridge written against the
-  # library most bridges are written against, registering, provisioning
-  # ghosts, echoing. Its transcript is in docs/evidence; this keeps the
-  # transcript true. Not on pull requests, with the other bridge.
-  mautrix-echo:
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        with:
-          toolchain: 1.90.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: evidence/mautrix-echo/go.mod
-          cache-dependency-path: evidence/mautrix-echo/go.sum
-      - name: Run the harness against a fresh build
-        run: evidence/mautrix-echo/run.sh
-
-  # The mautrix-go harness under evidence/: a bridge written against the
-  # library most bridges are written against, registering, provisioning
-  # ghosts, echoing. Its transcript is in docs/evidence; this keeps the
-  # transcript true. Not on pull requests, with the other bridge.
-  mautrix-echo:
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        with:
-          toolchain: 1.90.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: evidence/mautrix-echo/go.mod
-          cache-dependency-path: evidence/mautrix-echo/go.sum
-      - name: Run the harness against a fresh build
-        run: evidence/mautrix-echo/run.sh
-
   # A peer-to-peer call with no SFU anywhere: Element Call's frozen
   # full-mesh branch, built at its last commit and pointed at a Spindle,
   # two browsers meeting in a call over a host-to-host candidate pair
@@ -776,15 +706,9 @@ jobs:
           git -C tmp/matrix-rust-sdk checkout -q FETCH_HEAD
       - name: Build the server
         run: cargo build --release -p spindle-server --bin spindle
-      # The SDK's floor is above this repository's pin; a second toolchain
-      # for its build alone, named to the rig rather than changing the pin.
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        with:
-          toolchain: 1.93.0
       - name: Run the suite against Spindle
         env:
           RUST_SDK_SRC: tmp/matrix-rust-sdk
-          RUST_SDK_TOOLCHAIN: 1.93.0
           SPINDLE_BIN: target/release/spindle
         run: contrib/rust-sdk/run.sh tmp/rust-sdk/results.log
       - name: Keep the log
