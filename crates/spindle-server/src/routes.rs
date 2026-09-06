@@ -174,7 +174,24 @@ async fn observe(
         .map_or_else(|| "unmatched".to_owned(), |path| path.as_str().to_owned());
     let method = request.method().to_string();
     let started = std::time::Instant::now();
-    let response = next.run(request).await;
+    // One span per request, named by the matched route rather than the
+    // path for the same reason the metric is: the template is bounded, the
+    // path is whatever was asked. The fields are OpenTelemetry's HTTP
+    // semantic conventions, so an exported trace reads like every other
+    // service's. Free when no exporter is configured: the log subscriber
+    // shows it only at a level operators do not run at.
+    let span = tracing::info_span!(
+        "request",
+        otel.name = %format!("{method} {route}"),
+        http.request.method = %method,
+        http.route = %route,
+        http.response.status_code = tracing::field::Empty,
+    );
+    let response = {
+        use tracing::Instrument as _;
+        next.run(request).instrument(span.clone()).await
+    };
+    span.record("http.response.status_code", response.status().as_u16());
     state.metrics.observe_request(
         &route,
         &method,

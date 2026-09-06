@@ -621,6 +621,28 @@ pub struct LoggingConfig {
     /// `tracing-subscriber` filter directive, e.g. `spindle=debug,warn`.
     #[serde(default)]
     pub filter: Option<String>,
+    /// Where spans go, beside the log. Absent means nowhere, which is the
+    /// default and the only shape `docs/telemetry-guidelines.md` allows
+    /// without an operator's say-so: no exporter is wired unless named.
+    #[serde(default)]
+    pub traces: Option<TraceExporter>,
+}
+
+/// A span exporter an operator may switch on.
+///
+/// One variant, and an enum rather than a bool so the next exporter is a
+/// variant and not a second flag. The destination is deliberately not a
+/// setting here: OTLP's own `OTEL_EXPORTER_OTLP_ENDPOINT` (and its
+/// `_HEADERS`, `_TIMEOUT` siblings) are read by the SDK, so a collector
+/// address never lives in this file and the same config runs against any
+/// backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TraceExporter {
+    /// OpenTelemetry protocol over HTTP with protobuf bodies, to the
+    /// endpoint the standard environment names (`http://localhost:4318`
+    /// when it names none).
+    Otlp,
 }
 
 fn default_bind() -> String {

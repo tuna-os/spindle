@@ -305,3 +305,8 @@ registrations = []
 [logging]
 # A `tracing-subscriber` filter directive.
 # filter = "spindle=debug,warn"
+# Export spans as traces. Off unless named; the only value is "otlp", which
+# sends OTLP/HTTP to the endpoint OTEL_EXPORTER_OTLP_ENDPOINT names (its
+# default is http://localhost:4318). No collector address lives in this
+# file: docs/telemetry-guidelines.md.
+# traces = "otlp"
