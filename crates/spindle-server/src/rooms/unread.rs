@@ -368,6 +368,53 @@ impl Rooms {
     }
 }
 
+impl Rooms {
+    /// Every receipt in a room, as `(user_id, receipt_type, event_id, ts)`.
+    ///
+    /// What an `m.receipt` ephemeral event is built from. The private
+    /// kind (`m.read.private`) is the reader's own business: the caller
+    /// keeps those for their owner and hands the rest to everyone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the records cannot be read.
+    pub fn room_receipts(
+        &self,
+        room_id: &str,
+    ) -> Result<Vec<(String, String, String, u64)>, RoomError> {
+        let prefix =
+            spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::Receipt, room_id);
+        let mut receipts = Vec::new();
+        for (key, value) in spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)? {
+            let rest = &key[prefix.len()..];
+            // The key's tail is what `receipt_key` wrote: a length-prefixed
+            // user, then the type.
+            let Some((len, rest)) = rest.split_first_chunk::<2>() else {
+                continue;
+            };
+            let len = usize::from(u16::from_be_bytes(*len));
+            if rest.len() < len {
+                continue;
+            }
+            let (user, receipt_type) = rest.split_at(len);
+            let (Ok(user), Ok(receipt_type)) =
+                (std::str::from_utf8(user), std::str::from_utf8(receipt_type))
+            else {
+                continue;
+            };
+            if let Some(record) = ReceiptRecord::decode(&value) {
+                receipts.push((
+                    user.to_owned(),
+                    receipt_type.to_owned(),
+                    record.event_id,
+                    record.ts,
+                ));
+            }
+        }
+        Ok(receipts)
+    }
+}
+
 /// Receipts live per room, per user, per type.
 fn receipt_key(room_id: &str, user_id: &str, receipt_type: &str) -> Vec<u8> {
     let mut key = spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::Receipt, room_id);

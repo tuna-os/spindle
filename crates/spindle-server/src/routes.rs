@@ -5605,19 +5605,9 @@ async fn sliding_sync(
         .decoded_subscriptions()
         .map_err(MatrixError::bad_json)?;
 
-    let mut position = state.rooms.stream_position();
-    // Long-poll before answering, not after assembling: an incremental request
-    // with nothing new blocks here, and answers fresh when something lands.
-    if let Some(since) = since {
-        let timeout_ms = request.timeout.or(query.timeout).unwrap_or(0).min(60_000);
-        if position <= since && timeout_ms > 0 {
-            state
-                .rooms
-                .wait_for_event(std::time::Duration::from_millis(timeout_ms))
-                .await;
-            position = state.rooms.stream_position();
-        }
-    }
+    let timeout_ms = request.timeout.or(query.timeout).unwrap_or(0).min(60_000);
+    let position =
+        sliding_long_poll(&state, since, timeout_ms, request.extensions.typing.on()).await;
 
     // The sorted room list: every joined room, newest activity first. The
     // sort is recomputed per request because it is what the ranges index
@@ -5694,6 +5684,9 @@ async fn sliding_sync(
         entry.1 = entry.1.max(subscription.timeline_limit);
     }
 
+    // The rooms in view, whether or not they changed: the room extensions
+    // below answer for all of them.
+    let in_view: Vec<String> = wanted.keys().cloned().collect();
     for (room_id, (required_state, timeline_limit)) in wanted {
         // Incrementally, silence about an unchanged room *is* the answer.
         if let Some(changed) = &changed
@@ -5712,12 +5705,228 @@ async fn sliding_sync(
         rooms_out.insert(room_id, entry);
     }
 
+    let extensions = sliding_extensions(
+        &state,
+        &identity,
+        &request.extensions,
+        since,
+        position,
+        &in_view,
+    )?;
+
     Ok(Json(json!({
         "pos": crate::tokens::Sync(position).to_string(),
         "lists": lists_out,
         "rooms": rooms_out,
-        "extensions": {},
+        "extensions": extensions,
     })))
+}
+
+/// Long-poll before answering, not after assembling: an incremental request
+/// with nothing new blocks here, and answers fresh when something lands.
+/// Typing is not an event and has no stream position, so with the typing
+/// extension on a change in who is typing ends the wait too, as it does for
+/// classic sync. Returns the stream position to answer at.
+async fn sliding_long_poll(
+    state: &AppState,
+    since: Option<u64>,
+    timeout_ms: u64,
+    typing_wakes: bool,
+) -> u64 {
+    let position = state.rooms.stream_position();
+    let Some(since) = since else {
+        return position;
+    };
+    if position > since || timeout_ms == 0 {
+        return position;
+    }
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    if typing_wakes {
+        tokio::select! {
+            () = state.rooms.wait_for_event(timeout) => {}
+            () = state.typing.wait(timeout) => {}
+        }
+    } else {
+        state.rooms.wait_for_event(timeout).await;
+    }
+    state.rooms.stream_position()
+}
+
+/// The `extensions` object of a sliding-sync response.
+///
+/// The room extensions (account data, receipts, typing) answer for every
+/// room in view, changed or not. Stateless as this endpoint is, there is no
+/// record of what a client was last told, and a receipt or a typing change
+/// bumps no stream position; repeating a window's worth is the answer that
+/// cannot silently drop one, the same trade classic sync makes for room
+/// account data.
+fn sliding_extensions(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    extensions: &crate::sliding::Extensions,
+    since: Option<u64>,
+    position: u64,
+    in_view: &[String],
+) -> Result<Value, MatrixError> {
+    let mut out = serde_json::Map::new();
+    if !extensions.any() {
+        return Ok(Value::Object(out));
+    }
+
+    if extensions.to_device.on() {
+        out.insert(
+            "to_device".to_owned(),
+            to_device_extension(state, identity, &extensions.to_device, position)?,
+        );
+    }
+    if extensions.e2ee.on() {
+        out.insert(
+            "e2ee".to_owned(),
+            e2ee_extension(state, identity, since, position)?,
+        );
+    }
+    if extensions.account_data.on() {
+        out.insert(
+            "account_data".to_owned(),
+            account_data_extension(state, identity, in_view)?,
+        );
+    }
+    if extensions.receipts.on() {
+        out.insert(
+            "receipts".to_owned(),
+            receipts_extension(state, identity, in_view)?,
+        );
+    }
+    if extensions.typing.on() {
+        let mut rooms = serde_json::Map::new();
+        for room_id in in_view {
+            if let Some(event) = state.typing.event(room_id) {
+                rooms.insert(room_id.clone(), event);
+            }
+        }
+        out.insert("typing".to_owned(), json!({ "rooms": rooms }));
+    }
+
+    Ok(Value::Object(out))
+}
+
+/// The to-device extension: what is pending for this device, acknowledged
+/// by the extension's own token rather than by `pos`. A client that restarts
+/// its sliding sync from nothing must not lose the to-device messages it has
+/// already decrypted, and one that lost its E2EE state must be able to ask
+/// for them again.
+fn to_device_extension(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    extension: &crate::sliding::ToDeviceExtension,
+    position: u64,
+) -> Result<Value, MatrixError> {
+    let acknowledged = match extension.since.as_deref() {
+        Some(token) => Some(
+            token
+                .parse::<crate::tokens::Sync>()
+                .map_err(|error| MatrixError::bad_json(error.to_string()))?
+                .0,
+        ),
+        None => None,
+    };
+    let mut events = state
+        .devices
+        .take_pending(&identity.user_id, &identity.device_id, acknowledged)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    if let Some(limit) = extension.limit {
+        events.truncate(limit.max(1));
+    }
+    Ok(json!({
+        "next_batch": crate::tokens::Sync(position).to_string(),
+        "events": events,
+    }))
+}
+
+/// The E2EE extension: the same three things classic sync carries at the
+/// top level, for the same reasons.
+fn e2ee_extension(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    since: Option<u64>,
+    position: u64,
+) -> Result<Value, MatrixError> {
+    let changed = match since {
+        Some(since) => visible_device_changes(state, identity, since, position)?,
+        None => Vec::new(),
+    };
+    let key_counts = state
+        .devices
+        .one_time_key_counts(&identity.user_id, &identity.device_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    let unused_fallback = state
+        .devices
+        .unused_fallback_algorithms(&identity.user_id, &identity.device_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    Ok(json!({
+        "device_lists": { "changed": changed, "left": [] },
+        "device_one_time_keys_count": key_counts,
+        "device_unused_fallback_key_types": unused_fallback,
+    }))
+}
+
+/// The account-data extension: the global events, and each room in view
+/// that has any.
+fn account_data_extension(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    in_view: &[String],
+) -> Result<Value, MatrixError> {
+    let global = sync_account_data(state, identity, None)?;
+    let mut rooms = serde_json::Map::new();
+    for room_id in in_view {
+        let data = state
+            .account_data
+            .all(&identity.user_id, room_id)
+            .map_err(|error| account_data_error(&error))?;
+        if !data.is_empty() {
+            rooms.insert(room_id.clone(), Value::Array(data));
+        }
+    }
+    Ok(json!({ "global": global, "rooms": rooms }))
+}
+
+/// The receipts extension: one `m.receipt` event per room in view that has
+/// any, keyed by event then by type then by reader, as the spec shapes it.
+/// A private receipt is shown to its owner and nobody else.
+fn receipts_extension(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    in_view: &[String],
+) -> Result<Value, MatrixError> {
+    let mut rooms = serde_json::Map::new();
+    for room_id in in_view {
+        let mut content: serde_json::Map<String, Value> = serde_json::Map::new();
+        for (user, receipt_type, event_id, ts) in
+            state.rooms.room_receipts(room_id).map_err(room_error)?
+        {
+            if receipt_type == "m.read.private" && user != identity.user_id {
+                continue;
+            }
+            content
+                .entry(event_id)
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .expect("inserted as an object")
+                .entry(receipt_type)
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .expect("inserted as an object")
+                .insert(user, json!({ "ts": ts }));
+        }
+        if !content.is_empty() {
+            rooms.insert(
+                room_id.clone(),
+                json!({ "type": "m.receipt", "content": content }),
+            );
+        }
+    }
+    Ok(json!({ "rooms": rooms }))
 }
 
 /// One room's sliding-sync entry.
