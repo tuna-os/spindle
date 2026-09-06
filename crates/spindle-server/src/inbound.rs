@@ -163,10 +163,22 @@ fn room_version_of(state: &AppState, pdu: &Value) -> ruma::RoomVersionId {
     if pdu["type"] == json!("m.room.create") {
         return crate::rooms::version_in(&pdu["content"]).unwrap_or_else(|_| fallback());
     }
-    pdu["room_id"]
+    if let Some(version) = pdu["room_id"]
         .as_str()
         .and_then(|room_id| state.rooms.room_version(room_id).ok())
-        .unwrap_or_else(fallback)
+    {
+        return version;
+    }
+    // A room this server does not hold: read the version off the event's
+    // shape, so that the one thing such an event can still say -- an
+    // invite of ours ended -- is not refused as malformed under the wrong
+    // version's rules. State parents and no `auth_events` is MSC4242's
+    // shape and nobody else's.
+    if pdu.get("prev_state_events").is_some() && pdu.get("auth_events").is_none() {
+        return ruma::RoomVersionId::try_from(spindle_core::STATE_DAG_V12)
+            .unwrap_or_else(|_| fallback());
+    }
+    fallback()
 }
 
 /// Judge and apply each PDU of one transaction, keyed by the event ID this
