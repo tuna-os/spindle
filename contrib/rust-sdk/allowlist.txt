@@ -8,4 +8,33 @@
 # automatic, so a flaky test cannot teach everyone to ignore this gate.
 #
 # Nothing is claimed that has not been seen to pass: every entry names the
-# run that recorded it. Empty until the first run reports.
+# run that recorded it.
+
+# Run 34031964690 (matrix-sdk-0.18.0 at 1c44fb66, Spindle at 2dcedeb):
+# 21 passed, 28 failed, 5 ignored. The first run past registration, once
+# #396 let the SDK's session-less m.login.dummy through. The 28 failures
+# are 11 shared-history (MSC4268) tests, interactive verification (SAS,
+# QR, secret gossip), room previews and notification counts through
+# sliding sync, alias publishing, /context, and four timeline redecryption
+# tests -- each a real gap or a real defect, none promoted.
+tests::auth::register_login_is_one_device
+tests::e2ee::test_backup_enable_new_user
+tests::e2ee::test_cross_signing_bootstrap
+tests::e2ee::test_failed_members_response
+tests::e2ee::test_importing_secrets_bundle_verifies_the_device
+tests::e2ee::test_recovery_disabling_deletes_secret_storage_secrets
+tests::repeated_join::test_repeated_join_leave
+tests::room::test_room_account_data
+tests::room_directory_search::test_room_directory_search_filter
+tests::sliding_sync::room::test_joined_user_can_create_push_context_with_room_list_service
+tests::sliding_sync::room::test_left_room
+tests::sliding_sync::room::test_room_avatar_group_conversation
+tests::sliding_sync::room::test_room_preview_with_room_directory_search_and_room_alias_only
+tests::sliding_sync::room::test_room_preview_with_room_directory_search_and_room_alias_only_in_several_homeservers
+tests::timeline::test_enabling_backups_retries_decryption
+tests::timeline::test_local_echo_to_send_event_has_encryption_info
+tests::timeline::test_pinned_events_are_decrypted_after_recovering_with_event_in_timeline
+tests::timeline::test_pinned_events_are_decrypted_after_recovering_with_event_not_in_timeline
+tests::timeline::test_send_message_updates
+tests::timeline::test_thread_focused_timeline
+tests::timeline::test_toggling_reaction
