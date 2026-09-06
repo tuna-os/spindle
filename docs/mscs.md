@@ -14,8 +14,10 @@ what became of each proposal.
 |---|---|---|---|---|---|
 | [MSC1227](https://github.com/matrix-org/matrix-spec-proposals/pull/1227) | Lazy-loading room members | v1.1 | — | `lazy_members.rs` |  |
 | [MSC2174](https://github.com/matrix-org/matrix-spec-proposals/pull/2174) | Move the redacts key into content | v1.8 | — | `redaction.rs` |  |
+| [MSC2246](https://github.com/matrix-org/matrix-spec-proposals/pull/2246) | Asynchronous media uploads | v1.7 | — | `spec_wave2.rs` | POST /media/v1/create mints the mxc:// URI; PUT /media/v3/upload/{server}/{id} fills it once; a reader in between gets 504 M_NOT_YET_UPLOADED. Reservations lapse after 24 hours, twenty live per user. |
 | [MSC2409](https://github.com/matrix-org/matrix-spec-proposals/pull/2409) | Appservices receive to-device messages and ephemeral events | v1.13 | — | `appservice_transactions.rs` |  |
 | [MSC2659](https://github.com/matrix-org/matrix-spec-proposals/pull/2659) | Appservice ping | v1.7 | — | `appservice_ping.rs` |  |
+| [MSC2666](https://github.com/matrix-org/matrix-spec-proposals/pull/2666) | Mutual rooms | — | — | `spec_wave2.rs` | GET /_matrix/client/v1/mutual_rooms, one page: the rooms both users are joined to. |
 | [MSC2675](https://github.com/matrix-org/matrix-spec-proposals/pull/2675) | Serverside aggregations of relations | v1.3 | — | `aggregation.rs` |  |
 | [MSC2965](https://github.com/matrix-org/matrix-spec-proposals/pull/2965) | OAuth 2.0 server metadata discovery | v1.15 | — | `delegated_auth.rs` | Served at /v1/auth_metadata and the unstable path js-sdk asks first. |
 | [MSC2967](https://github.com/matrix-org/matrix-spec-proposals/pull/2967) | OAuth 2.0 API scopes | v1.15 | — | `delegated_auth.rs` | The v1.15 scope spelling and the draft one older clients still send. |
@@ -31,7 +33,8 @@ what became of each proposal.
 | [MSC3856](https://github.com/matrix-org/matrix-spec-proposals/pull/3856) | Threads list API | v1.4 | — | `threads.rs` |  |
 | [MSC3861](https://github.com/matrix-org/matrix-spec-proposals/pull/3861) | Delegated authentication (OIDC) | v1.15 | — | `delegated_auth.rs`, `delegated-auth.md` | Both ways: the built-in provider, or a real MAS through the /_synapse/mas/* surface. |
 | [MSC3881](https://github.com/matrix-org/matrix-spec-proposals/pull/3881) | Remotely toggling push notifications for another client | — | `org.matrix.msc3881` | `pushers.rs` | Pushers carry `enabled` and `device_id` under the unstable and the plain names; a disabled pusher stays registered and receives nothing. |
-| [MSC3916](https://github.com/matrix-org/matrix-spec-proposals/pull/3916) | Authenticated media | v1.11 | — | `federation_media.rs`, `media.rs` |  |
+| [MSC3882](https://github.com/matrix-org/matrix-spec-proposals/pull/3882) | Login tokens for a second client | v1.7 | — | `spec_wave2.rs` | POST /login/get_token behind the password UIA stage, m.login.token on /login, the m.get_login_token capability and the get_login_token flow flag. Tokens are single use and live two minutes. |
+| [MSC3916](https://github.com/matrix-org/matrix-spec-proposals/pull/3916) | Authenticated media | v1.11 | — | `federation_media.rs`, `media.rs`, `spec_wave2.rs` |  |
 | [MSC3983](https://github.com/matrix-org/matrix-spec-proposals/pull/3983) | Appservices claim one-time keys | — | — | `appservice_key_proxy.rs` |  |
 | [MSC3984](https://github.com/matrix-org/matrix-spec-proposals/pull/3984) | Appservices answer key queries | — | — | `appservice_key_proxy.rs` |  |
 | [MSC4075](https://github.com/matrix-org/matrix-spec-proposals/pull/4075) | MatrixRTC ringing (m.rtc.notification) | — | — | `push_delivery.rs`, `rate-limits.md` | Rings are pushed and budgeted per sender (rings_per_minute). |

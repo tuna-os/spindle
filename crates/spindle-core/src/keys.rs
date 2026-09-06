@@ -382,6 +382,13 @@ pub enum Keyspace {
     /// device that sent it with the `unsigned.transaction_id` the spec
     /// promises that device, and no other.
     TransactionEcho = 0x37,
+    /// An `mxc://` URI minted ahead of its bytes (`POST /media/v1/create`,
+    /// spec v1.7): who reserved it and when the reservation lapses. The
+    /// row is deleted when the upload lands under [`Keyspace::Media`].
+    MediaReservation = 0x38,
+    /// A single-use login token (`POST /login/get_token`, spec v1.7): the
+    /// user it logs in and when it stops working. Deleted on use.
+    LoginToken = 0x39,
     /// A registration token (`m.login.registration_token`, spec v1.2):
     /// how many uses it allows, how many it has had, and when it lapses.
     /// Keyed by the token itself. 0x38 and 0x39 are taken by the media
@@ -847,6 +854,22 @@ pub fn media(media_id: &str) -> Vec<u8> {
     key.push(Keyspace::Media as u8);
     key.extend_from_slice(&len.to_be_bytes());
     key.extend_from_slice(id);
+    key
+}
+
+/// The reservation row for a media ID minted before its bytes arrived.
+#[must_use]
+pub fn media_reservation(media_id: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::MediaReservation as u8];
+    key.extend_from_slice(media_id.as_bytes());
+    key
+}
+
+/// The row for one single-use login token.
+#[must_use]
+pub fn login_token(token: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::LoginToken as u8];
+    key.extend_from_slice(token.as_bytes());
     key
 }
 

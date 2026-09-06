@@ -231,7 +231,31 @@ number = 3916
 title = "Authenticated media"
 status = "served"
 stable = "1.11"
-evidence = ["crates/spindle-server/tests/federation_media.rs", "crates/spindle-server/tests/media.rs"]
+evidence = ["crates/spindle-server/tests/federation_media.rs", "crates/spindle-server/tests/media.rs", "crates/spindle-server/tests/spec_wave2.rs"]
+
+[[msc]]
+number = 2246
+title = "Asynchronous media uploads"
+status = "served"
+stable = "1.7"
+evidence = ["crates/spindle-server/tests/spec_wave2.rs"]
+notes = "POST /media/v1/create mints the mxc:// URI; PUT /media/v3/upload/{server}/{id} fills it once; a reader in between gets 504 M_NOT_YET_UPLOADED. Reservations lapse after 24 hours, twenty live per user."
+
+[[msc]]
+number = 3882
+title = "Login tokens for a second client"
+status = "served"
+stable = "1.7"
+evidence = ["crates/spindle-server/tests/spec_wave2.rs"]
+notes = "POST /login/get_token behind the password UIA stage, m.login.token on /login, the m.get_login_token capability and the get_login_token flow flag. Tokens are single use and live two minutes."
+
+[[msc]]
+number = 2666
+title = "Mutual rooms"
+status = "served"
+stable = ""
+evidence = ["crates/spindle-server/tests/spec_wave2.rs"]
+notes = "GET /_matrix/client/v1/mutual_rooms, one page: the rooms both users are joined to."
 
 [[msc]]
 number = 3083

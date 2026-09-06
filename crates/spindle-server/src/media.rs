@@ -24,6 +24,27 @@ use spindle_store::{FjallStore, ReadView, Store, StoreError};
 /// so a client can refuse a file before spending a minute sending it.
 pub const MAX_UPLOAD: usize = 50 * 1024 * 1024;
 
+/// How long a minted-but-empty media ID stays claimable: the spec's
+/// recommended 24 hours, for uploaders on a poor connection.
+pub const RESERVATION_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Live reservations one user may hold at once.
+pub const MAX_PENDING_UPLOADS: usize = 20;
+
+/// A media ID minted ahead of its bytes.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Reservation {
+    pub user_id: String,
+    pub expires_at: u64,
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 /// Content types safe to render inline in a browser.
 ///
 /// Everything else is served as an attachment. The list is deliberately short
@@ -198,6 +219,110 @@ impl Media {
         Ok(media_id)
     }
 
+    /// Mint a media ID ahead of its bytes (`POST /_matrix/media/v1/create`,
+    /// spec v1.7). Returns the ID and the moment the reservation lapses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError::TooManyPending`] when the user already holds
+    /// [`MAX_PENDING_UPLOADS`] live reservations, or [`MediaError`] if the
+    /// row cannot be written.
+    pub fn reserve(&self, user_id: &str) -> Result<(String, u64), MediaError> {
+        let now = now_millis();
+        let mut pending = 0;
+        for (key, value) in
+            ReadView::scan_prefix(self.store.as_ref(), &keys::media_reservation(""))?
+        {
+            let reservation: Reservation = serde_json::from_slice(&value)?;
+            if reservation.expires_at <= now {
+                // Lapsed: cleared on sight rather than by a sweeper.
+                Store::delete(self.store.as_ref(), &key)?;
+            } else if reservation.user_id == user_id {
+                pending += 1;
+            }
+        }
+        if pending >= MAX_PENDING_UPLOADS {
+            return Err(MediaError::TooManyPending(MAX_PENDING_UPLOADS));
+        }
+        let media_id = random_media_id();
+        let expires_at = now.saturating_add(RESERVATION_TTL_MS);
+        let reservation = Reservation {
+            user_id: user_id.to_owned(),
+            expires_at,
+        };
+        Store::put(
+            self.store.as_ref(),
+            &keys::media_reservation(&media_id),
+            &serde_json::to_vec(&reservation)?,
+        )?;
+        Ok((media_id, expires_at))
+    }
+
+    /// Whether `media_id` is reserved and waiting for its bytes. A lapsed
+    /// reservation reads as none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the row cannot be read.
+    pub fn reservation(&self, media_id: &str) -> Result<Option<Reservation>, MediaError> {
+        let Some(bytes) = ReadView::get(self.store.as_ref(), &keys::media_reservation(media_id))?
+        else {
+            return Ok(None);
+        };
+        let reservation: Reservation = serde_json::from_slice(&bytes)?;
+        Ok((reservation.expires_at > now_millis()).then_some(reservation))
+    }
+
+    /// Fill a reserved media ID (`PUT /_matrix/media/v3/upload/{server}/{id}`).
+    ///
+    /// # Errors
+    ///
+    /// [`MediaError::AlreadyUploaded`] when the ID already has bytes,
+    /// [`MediaError::Unknown`] when no live reservation stands,
+    /// [`MediaError::NotReserver`] when someone else reserved it,
+    /// [`MediaError::TooLarge`] past [`MAX_UPLOAD`], or [`MediaError`] if
+    /// the blob or its record cannot be written.
+    pub async fn put_reserved(
+        &self,
+        media_id: &str,
+        bytes: &[u8],
+        content_type: &str,
+        filename: Option<&str>,
+        uploaded_by: &str,
+    ) -> Result<(), MediaError> {
+        if self.record(media_id)?.is_some() {
+            return Err(MediaError::AlreadyUploaded(media_id.to_owned()));
+        }
+        let Some(reservation) = self.reservation(media_id)? else {
+            return Err(MediaError::Unknown(media_id.to_owned()));
+        };
+        if reservation.user_id != uploaded_by {
+            return Err(MediaError::NotReserver(media_id.to_owned()));
+        }
+        if bytes.len() > MAX_UPLOAD {
+            return Err(MediaError::TooLarge {
+                size: bytes.len(),
+                limit: MAX_UPLOAD,
+            });
+        }
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        self.blobs.put(&hash, bytes).await?;
+        let record = MediaRecord {
+            hash,
+            content_type: content_type.to_owned(),
+            filename: filename.map(str::to_owned),
+            size: bytes.len(),
+            uploaded_by: uploaded_by.to_owned(),
+        };
+        Store::put(
+            self.store.as_ref(),
+            &keys::media(media_id),
+            &serde_json::to_vec(&record)?,
+        )?;
+        Store::delete(self.store.as_ref(), &keys::media_reservation(media_id))?;
+        Ok(())
+    }
+
     /// The internal ID a remote server's media is cached under.
     ///
     /// Local IDs are 32 hex characters, so the `/` makes collision with a
@@ -304,6 +429,19 @@ impl Media {
         Ok(Some(serde_json::from_slice(&bytes)?))
     }
 
+    /// The record, or the reason there is none: a live reservation is
+    /// [`MediaError::NotYetUploaded`], which the spec answers with 504 so
+    /// a client can retry once the uploader finishes.
+    fn record_or_pending(&self, media_id: &str) -> Result<MediaRecord, MediaError> {
+        if let Some(record) = self.record(media_id)? {
+            return Ok(record);
+        }
+        if self.reservation(media_id)?.is_some() {
+            return Err(MediaError::NotYetUploaded(media_id.to_owned()));
+        }
+        Err(MediaError::Unknown(media_id.to_owned()))
+    }
+
     /// The bytes of `media_id`.
     ///
     /// # Errors
@@ -313,9 +451,7 @@ impl Media {
     /// which means the store and the filesystem disagree, and is worth saying
     /// rather than reporting as "no such file".
     pub async fn bytes(&self, media_id: &str) -> Result<(MediaRecord, Vec<u8>), MediaError> {
-        let record = self
-            .record(media_id)?
-            .ok_or_else(|| MediaError::Unknown(media_id.to_owned()))?;
+        let record = self.record_or_pending(media_id)?;
         let bytes = self
             .blobs
             .get(&record.hash)
@@ -357,9 +493,7 @@ impl Media {
         height: u32,
         crop: bool,
     ) -> Result<(String, Vec<u8>), MediaError> {
-        let record = self
-            .record(media_id)?
-            .ok_or_else(|| MediaError::Unknown(media_id.to_owned()))?;
+        let record = self.record_or_pending(media_id)?;
         if !record.content_type.starts_with("image/") || record.content_type == "image/svg+xml" {
             return Err(MediaError::Unsupported(record.content_type));
         }
@@ -456,6 +590,14 @@ fn random_media_id() -> String {
 #[derive(Debug)]
 pub enum MediaError {
     Unknown(String),
+    /// Reserved by `POST /media/v1/create` and not filled yet.
+    NotYetUploaded(String),
+    /// A reserved ID that already has its bytes.
+    AlreadyUploaded(String),
+    /// A reserved ID someone else minted.
+    NotReserver(String),
+    /// The user holds too many live reservations.
+    TooManyPending(usize),
     /// The record exists and the blob does not: the store and the filesystem
     /// disagree, which is a different fault from a missing upload.
     Missing {
@@ -503,6 +645,12 @@ impl std::fmt::Display for MediaError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unknown(id) => write!(formatter, "no media with ID {id}"),
+            Self::NotYetUploaded(id) => write!(formatter, "{id} is reserved but not uploaded"),
+            Self::AlreadyUploaded(id) => write!(formatter, "{id} already has its content"),
+            Self::NotReserver(id) => write!(formatter, "{id} was reserved by someone else"),
+            Self::TooManyPending(limit) => {
+                write!(formatter, "at most {limit} uploads may be pending at once")
+            }
             Self::Missing { media_id, hash } => write!(
                 formatter,
                 "{media_id} is recorded but its blob {hash} is not on disk"

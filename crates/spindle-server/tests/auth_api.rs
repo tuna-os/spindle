@@ -413,7 +413,7 @@ async fn a_token_in_the_query_string_is_not_accepted() {
 }
 
 #[tokio::test]
-async fn login_flows_advertise_only_password() {
+async fn login_flows_advertise_password_and_the_token_flow() {
     let harness = Harness::new();
     let (status, body) = harness
         .send(
@@ -425,8 +425,14 @@ async fn login_flows_advertise_only_password() {
         .await;
     assert_eq!(status, StatusCode::OK);
     let flows = body["flows"].as_array().unwrap();
-    assert_eq!(flows.len(), 1, "only what is implemented: {body}");
-    assert_eq!(flows[0]["type"], "m.login.password");
+    let kinds: Vec<&str> = flows
+        .iter()
+        .filter_map(|flow| flow["type"].as_str())
+        .collect();
+    // Only what is implemented: no SSO, and the token flow only because
+    // `POST /login/get_token` mints tokens for it.
+    assert_eq!(kinds, vec!["m.login.password", "m.login.token"], "{body}");
+    assert_eq!(flows[1]["get_login_token"], true, "{body}");
 }
 
 /// Restart preserves accounts and devices — an exit criterion of #11.
