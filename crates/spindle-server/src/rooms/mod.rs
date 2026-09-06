@@ -29,6 +29,11 @@ use spindle_store::{Durability, FjallStore, RoomStore, StoreError};
 /// Native rooms are v11 (SPEC §11.6).
 pub const ROOM_VERSION: &str = "11";
 
+/// MSC4354's top-level event key, under its unstable name.
+pub const STICKY_KEY: &str = "msc4354_sticky";
+/// MSC4354: a sticky duration is capped at one hour.
+pub const MAX_STICKY_MS: u64 = 3_600_000;
+
 /// The membership index stores the membership verbatim, not a flag. `join` and
 /// `leave` are two of six states, and a boolean would have to be recomputed
 /// from the room the moment invites or knocks matter.
@@ -536,8 +541,29 @@ impl Rooms {
         event_type: &str,
         content: &Value,
     ) -> Result<String, RoomError> {
+        self.send_sticky(room_id, sender, key, event_type, content, None)
+    }
+
+    /// [`Self::send`], with MSC4354 stickiness when `sticky_ms` is given:
+    /// the event carries `msc4354_sticky.duration_ms` (capped at an hour)
+    /// and is delivered to every joined client's `/sync` until it lapses.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::send`].
+    pub fn send_sticky(
+        &self,
+        room_id: &str,
+        sender: &str,
+        key: &Ed25519KeyPair,
+        event_type: &str,
+        content: &Value,
+        sticky_ms: Option<u64>,
+    ) -> Result<String, RoomError> {
         self.with_room(room_id, |rooms, log| {
-            rooms.append(log, room_id, sender, key, event_type, None, content)
+            rooms.append_with(
+                log, room_id, sender, key, event_type, None, content, sticky_ms,
+            )
         })
     }
 
@@ -682,6 +708,7 @@ impl Rooms {
                 "m.room.member",
                 Some(target),
                 &content,
+                None,
             )
         })
     }
@@ -1541,9 +1568,29 @@ impl Rooms {
         state_key: &str,
         content: &Value,
     ) -> Result<String, RoomError> {
+        self.set_state_sticky(room_id, sender, key, event_type, state_key, content, None)
+    }
+
+    /// [`Self::set_state`], with MSC4354 stickiness when `sticky_ms` is
+    /// given. See [`Self::send_sticky`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_state`].
+    #[allow(clippy::too_many_arguments, reason = "an event is what it is")]
+    pub fn set_state_sticky(
+        &self,
+        room_id: &str,
+        sender: &str,
+        key: &Ed25519KeyPair,
+        event_type: &str,
+        state_key: &str,
+        content: &Value,
+        sticky_ms: Option<u64>,
+    ) -> Result<String, RoomError> {
         let content = &sanitized_member_content(event_type, content);
         self.with_room(room_id, |rooms, log| {
-            rooms.append(
+            rooms.append_with(
                 log,
                 room_id,
                 sender,
@@ -1551,8 +1598,107 @@ impl Rooms {
                 event_type,
                 Some(state_key),
                 content,
+                sticky_ms,
             )
         })
+    }
+
+    /// The room's unexpired MSC4354 sticky events, each with the
+    /// milliseconds it has left, in expiry order. With `after`, only those
+    /// persisted after that stream position -- what a client with a sync
+    /// token has not been sent yet; without it, every one, which is what a
+    /// client joining the room or syncing from nothing is owed. Rows that
+    /// have lapsed are removed on the way past.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the index or an event body cannot be read.
+    pub fn sticky_events(
+        &self,
+        room_id: &str,
+        after: Option<u64>,
+    ) -> Result<Vec<(String, Value, u64)>, RoomError> {
+        let now = now_ms();
+        let mut out = Vec::new();
+        for (key, value) in spindle_store::ReadView::scan_prefix(
+            self.store.as_ref(),
+            &spindle_core::keys::sticky_prefix(room_id),
+        )? {
+            let Some((expires, event_id)) = spindle_core::keys::sticky_parts(&key, room_id) else {
+                continue;
+            };
+            if expires <= now {
+                let _ = spindle_store::Store::delete(self.store.as_ref(), &key);
+                continue;
+            }
+            let stream_id = value
+                .as_slice()
+                .try_into()
+                .map(u64::from_be_bytes)
+                .unwrap_or(0);
+            if after.is_some_and(|after| stream_id <= after) {
+                continue;
+            }
+            let event = self.event(room_id, &event_id)?;
+            out.push((event_id, event, expires - now));
+        }
+        Ok(out)
+    }
+
+    /// MSC4354: every unexpired sticky event of `room_id` as PDUs, for
+    /// the `send_join` response. A joining server seeds them with the
+    /// state, which is the one way an event older than what it knows can
+    /// reach it without a backfill: the join response is the only place
+    /// history arrives with no predecessor check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the index or an event body cannot be read.
+    pub fn sticky_pdus(&self, room_id: &str) -> Result<Vec<Value>, RoomError> {
+        Ok(self
+            .sticky_events(room_id, None)?
+            .into_iter()
+            .map(|(_, mut event, _)| {
+                if let Some(object) = event.as_object_mut() {
+                    object.remove("event_id");
+                }
+                event
+            })
+            .collect())
+    }
+
+    /// MSC4354: send every unexpired sticky event this server's users
+    /// authored in `room_id` to `destination`, which has just joined and
+    /// would otherwise learn of them only if they fell inside the join
+    /// response. Rides the outbox like any fan-out; the peer's transaction
+    /// handling makes a repeat a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the index cannot be read or the outbox
+    /// written.
+    pub fn push_sticky_to(&self, room_id: &str, destination: &str) -> Result<(), RoomError> {
+        for (_, event, _) in self.sticky_events(room_id, None)? {
+            let local = event["sender"]
+                .as_str()
+                .and_then(|sender| sender.split_once(':'))
+                .is_some_and(|(_, domain)| domain == self.server_name);
+            if !local {
+                continue;
+            }
+            // The stored body, without the client-facing `event_id`.
+            let mut pdu = event;
+            if let Some(object) = pdu.as_object_mut() {
+                object.remove("event_id");
+            }
+            let seq = self.allocate_stream_id();
+            spindle_store::Store::put(
+                self.store.as_ref(),
+                &spindle_core::keys::federation_outbox(destination, seq),
+                pdu.to_string().as_bytes(),
+            )?;
+        }
+        Ok(())
     }
 
     /// One event by ID.
@@ -3628,6 +3774,7 @@ impl Rooms {
         event_type: &str,
         state_key: Option<&str>,
         content: &Value,
+        sticky_ms: Option<u64>,
     ) -> Result<(String, Value), RoomError> {
         // Before `prev` is read, so the event names only tips that fold.
         self.set_aside_contested(log, room_id)?;
@@ -3673,7 +3820,7 @@ impl Rooms {
         } else {
             None
         };
-        let canonical = build_canonical(
+        let mut canonical = build_canonical(
             names_room_id.then_some(room_id),
             sender,
             event_type,
@@ -3684,6 +3831,20 @@ impl Rooms {
             depth,
             state_parents.as_deref(),
         )?;
+        // MSC4354: the stickiness rides the event as a top-level key. It is
+        // outside the redacted form, so it is covered by neither the event
+        // ID nor the signature -- a redacted sticky event is an ordinary
+        // event, as the MSC intends.
+        if let Some(sticky_ms) = sticky_ms {
+            let mut sticky = CanonicalJsonObject::new();
+            sticky.insert(
+                "duration_ms".to_owned(),
+                CanonicalJsonValue::Integer(
+                    sticky_ms.min(MAX_STICKY_MS).try_into().unwrap_or_default(),
+                ),
+            );
+            canonical.insert(STICKY_KEY.to_owned(), CanonicalJsonValue::Object(sticky));
+        }
         let pdu = Pdu::sign(version, canonical, &self.server_name, key)
             .map_err(|error| RoomError::Build(format!("{error:?}")))?;
 
@@ -3742,8 +3903,26 @@ impl Rooms {
         state_key: Option<&str>,
         content: &Value,
     ) -> Result<String, RoomError> {
-        let (event_id, json) =
-            self.build_event(log, room_id, sender, key, event_type, state_key, content)?;
+        self.append_with(
+            log, room_id, sender, key, event_type, state_key, content, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "an event is what it is")]
+    fn append_with(
+        &self,
+        log: &mut RoomLog,
+        room_id: &str,
+        sender: &str,
+        key: &Ed25519KeyPair,
+        event_type: &str,
+        state_key: Option<&str>,
+        content: &Value,
+        sticky_ms: Option<u64>,
+    ) -> Result<String, RoomError> {
+        let (event_id, json) = self.build_event(
+            log, room_id, sender, key, event_type, state_key, content, sticky_ms,
+        )?;
         self.commit_event(
             log, room_id, sender, event_type, state_key, content, &event_id, &json,
         )
@@ -4147,6 +4326,12 @@ impl Rooms {
             }
             .encode(),
         ));
+
+        // MSC4354: a sticky event is indexed by when it stops being one,
+        // from the earlier of when it says it was made and when it got
+        // here, so a peer cannot stretch stickiness with a timestamp from
+        // the future. Local and federated alike, in the entry's own batch.
+        extra.extend(sticky_index_row(room_id, event_id, input.json, stream_id));
         // The same fact keyed the other way round, in the same batch. Two
         // rows that must always agree are written by one commit or by
         // neither: an index row without its forward row would answer a sync
@@ -4759,6 +4944,31 @@ fn canonical_to_json(object: &CanonicalJsonObject) -> Value {
         );
     }
     Value::Object(out)
+}
+
+/// MSC4354: the index row for `event` if it is sticky and has not
+/// lapsed -- keyed by when it stops being sticky, from the earlier of
+/// when it says it was made and now, so a peer cannot stretch stickiness
+/// with a timestamp from the future; valued by the stream position a
+/// `/sync` compares its token against. `None` for anything else.
+pub(super) fn sticky_index_row(
+    room_id: &str,
+    event_id: &str,
+    event: &Value,
+    stream_id: u64,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let duration = event[STICKY_KEY]["duration_ms"].as_u64()?;
+    let now = now_ms();
+    let start = event["origin_server_ts"]
+        .as_u64()
+        .map_or(now, |ts| ts.min(now));
+    let expires = start.saturating_add(duration.min(MAX_STICKY_MS));
+    (expires > now).then(|| {
+        (
+            spindle_core::keys::sticky(room_id, expires, event_id),
+            stream_id.to_be_bytes().to_vec(),
+        )
+    })
 }
 
 fn now_ms() -> u64 {

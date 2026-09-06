@@ -161,6 +161,10 @@ pub const UNSTABLE_FEATURES: &[(&str, bool)] = &[
     // implemented the MSC, which is a different and untrue thing -- and
     // would leave the client with no way to distinguish the two.
     ("org.matrix.msc4143", true),
+    // MSC4354's sticky events: the `sticky_duration_ms` query parameter
+    // on a send, the key on the event, and the section on `/sync`. What
+    // MatrixRTC 2.0 makes `m.rtc.member`.
+    ("org.matrix.msc4354", true),
 ];
 
 #[must_use]
