@@ -147,8 +147,8 @@ mod unread;
 pub use admin::AdminTimelineEntry;
 pub use read::{ReadScope, RoomReader};
 
-use unread::{HighlightTally, UnreadIndex};
-pub use unread::{Receipt, Unread, Unscored};
+pub use unread::{Receipt, Scored, Unread, Unscored};
+use unread::{ScoreTally, UnreadIndex};
 
 pub struct Rooms {
     store: Arc<FjallStore>,
@@ -161,7 +161,7 @@ pub struct Rooms {
     /// only `unread_index`; the build and append paths already hold `open`.
     unread_index: Mutex<HashMap<String, UnreadIndex>>,
     /// Per `(room, reader)`; taken on its own, never under `open`.
-    highlights: Mutex<HashMap<(String, String), HighlightTally>>,
+    highlights: Mutex<HashMap<(String, String), ScoreTally>>,
     /// Head-event timestamp per room, kept warm on append.
     ///
     /// The sliding-sync room list sorts by recency, so every request reads

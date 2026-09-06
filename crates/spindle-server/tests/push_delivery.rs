@@ -639,3 +639,43 @@ async fn the_ring_budget_refuses_the_ring_over_it_and_nothing_else() {
     // not have. So four.
     gateway.wait_for(4).await;
 }
+
+/// MSC3881: a pusher switched off stays registered and receives nothing.
+#[tokio::test]
+async fn a_disabled_pusher_receives_nothing() {
+    let (gateway, url) = Gateway::serve().await;
+    let hs = Instance::start().await;
+    let (alice, bob, _, room) = alice_and_bob(&hs, &gateway, &url).await;
+    let (status, body) = hs
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/pushers/set",
+            &bob,
+            Some(&json!({
+                "kind": "http",
+                "app_id": "org.example.app",
+                "pushkey": "bobkey",
+                "app_display_name": "App",
+                "device_display_name": "Phone",
+                "lang": "en",
+                "data": { "url": url },
+                "org.matrix.msc3881.enabled": false,
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    hs.say(&alice, &room, "nobody is listening").await;
+    gateway.settle(1).await;
+
+    // Switched back on, the next message arrives.
+    let (status, body) = hs.set_pusher(&bob, "bobkey", json!({ "url": url })).await;
+    assert_eq!(status, 200, "{body}");
+    hs.say(&alice, &room, "and now they are").await;
+    let deliveries = gateway.wait_for(2).await;
+    assert_eq!(
+        deliveries[1]["notification"]["content"]["body"],
+        "and now they are"
+    );
+    gateway.settle(2).await;
+}
