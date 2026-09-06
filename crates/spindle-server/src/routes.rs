@@ -5019,10 +5019,16 @@ async fn query_keys(
                 .map_err(|error| MatrixError::internal(&error.to_string()))
         };
         if let Some(key) = fetch("master")? {
-            master_keys.insert(user_id.clone(), key);
+            master_keys.insert(
+                user_id.clone(),
+                signatures_visible_to(key, user_id, &identity.user_id),
+            );
         }
         if let Some(key) = fetch("self_signing")? {
-            self_signing_keys.insert(user_id.clone(), key);
+            self_signing_keys.insert(
+                user_id.clone(),
+                signatures_visible_to(key, user_id, &identity.user_id),
+            );
         }
         if user_id == &identity.user_id
             && let Some(key) = fetch("user_signing")?
@@ -5200,10 +5206,11 @@ async fn upload_cross_signing(
 /// `POST /_matrix/client/v3/keys/signatures/upload`
 async fn upload_signatures(
     State(state): State<AppState>,
-    Authenticated(_identity): Authenticated,
+    Authenticated(identity): Authenticated,
     Json(request): Json<serde_json::Map<String, Value>>,
 ) -> Result<Json<Value>, MatrixError> {
     let mut failures = serde_json::Map::new();
+    let mut signed_users = std::collections::BTreeSet::new();
     for (user_id, targets) in &request {
         let Some(targets) = targets.as_object() else {
             continue;
@@ -5213,6 +5220,9 @@ async fn upload_signatures(
                 .devices
                 .add_signatures(user_id, target, signed)
                 .map_err(|error| MatrixError::internal(&error.to_string()))?;
+            if added {
+                signed_users.insert(user_id.clone());
+            }
             if !added {
                 // The spec's failure shape: per-target errors, not a failed
                 // request — the other signatures in the batch still landed.
@@ -5228,7 +5238,36 @@ async fn upload_signatures(
             }
         }
     }
+    // A new signature is a device-list change for the user whose key
+    // carries it. Without this the signer's own client never hears that
+    // its signature landed: it re-queries a user's keys only when a sync
+    // names them in `device_lists.changed`, and until it does the identity
+    // it just verified stays unverified in its own store.
+    for user_id in &signed_users {
+        let seq = state.rooms.allocate_stream_id();
+        state
+            .devices
+            .mark_device_list_changed(user_id, seq)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        if user_id == &identity.user_id {
+            crate::e2ee_federation::announce_signing_keys(&state, user_id);
+        }
+    }
+    if !signed_users.is_empty() {
+        state.rooms.wake_sync_waiters();
+    }
     Ok(Json(json!({ "failures": failures })))
+}
+
+/// A key as `viewer` may see it: signatures by anyone other than the
+/// key's owner or the viewer are dropped. A user-signing signature is the
+/// signer's private opinion of who they have verified; the spec has the
+/// server return it to the signer alone.
+fn signatures_visible_to(mut key: Value, owner: &str, viewer: &str) -> Value {
+    if let Some(signatures) = key["signatures"].as_object_mut() {
+        signatures.retain(|signer, _| signer == owner || signer == viewer);
+    }
+    key
 }
 
 /// The API's version is a string; storage counts. Anything non-numeric can
