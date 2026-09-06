@@ -63,7 +63,7 @@ mesh's.
 
 `scripts/neutrino-interop.sh` starts `neutrino-lan` (the LAN build of the
 fork: iroh, mDNS, no BLE) and a Spindle that lists the node in `peers`,
-then runs nine probes. Against the unpatched fork and a Spindle without
+then runs the probes below. Against the unpatched fork and a Spindle without
 MSC4242, the picture was: the key document served, Spindle's invite refused
 for the room version, the node's invite failing after sixty seconds because
 the request went to `http://127.0.0.1~:8008` through the egress and the
@@ -94,6 +94,45 @@ from the `send_join` response, and that copy is lost, harmlessly, because
 the node already holds the event. And a state-DAG resident answers
 `send_join` with the DAG *after* the join, in which the join is a head;
 Spindle's seeding accepts that shape and seeds the join last.
+
+## Calls across the seam
+
+A call in a session room is MatrixRTC: transport discovery (MSC4143),
+delayed events (MSC4140) for the dead-man's switch, and sticky events
+(MSC4354) for a membership that lapses instead of lasting forever. Spindle
+serves all three (docs/matrix-rtc.md). The rig probes what the mesh node
+does with them, in the room the mesh user joined, with `m.rtc.member`
+granted to every member the way Element X grants it on every room it
+creates:
+
+| probe | outcome | detail |
+|---|---|---|
+| mesh node advertises msc4140 / msc4143 / msc4354 | none | `unstable_features` names only msc4222 and simplified sliding sync |
+| mesh node serves `/rtc/transports` (MSC4143) | 404 | a client on the mesh finds no SFU through the node |
+| mesh node honours a delayed send (MSC4140) | sent now | HTTP 200 and the delay parameter ignored: the event goes out at once |
+| alice's sticky `m.rtc.member` reaches the node | sticky-kept | the `msc4354_sticky` key on the PDU survives the crossing and the node's store |
+| the node's `/sync` has an `msc4354_sticky` section | no | a client on the node sees the membership in the timeline only; a later mesh joiner is not handed it |
+| the mesh user's `m.rtc.member` state reaches Spindle | arrived | MatrixRTC 1.0 membership as room state; without the power-level override the node refuses it by auth rules, correctly |
+| alice's delayed event fires and reaches the node | delivered | MSC4140 on Spindle; the node needs nothing to receive the result |
+
+What that means for the venue. A participant whose homeserver is a
+Spindle -- the gateway, or a hub -- has the whole mechanism: their
+membership expires when their phone dies, and their sticky membership
+reaches every server in the room, mesh nodes included, as an ordinary PDU.
+A participant whose homeserver is their own mesh node has none of it yet,
+and the delayed-event row is the one that bites: the node answers 200 to a
+delayed leave and sends it immediately, so a client that trusts the
+answer removes itself from the call the moment it joins. Element Call
+checks `unstable_features` before relying on the server and would not
+schedule the leave against this node at all -- which leaves the ghost the
+mechanism exists to prevent, when a mesh participant's phone dies. Until
+the fork carries MSC4140 (a delay parameter, a timer, a restart endpoint;
+Spindle's `delayed.rs` is the shape) and MSC4143 (a static transport list
+pointing at the venue's SFU), a call at the venue is hosted with the
+participants on Spindles, and a mesh node is a spectator to its
+membership. MSC4354 is the smaller gap: the node already keeps the key on
+the PDU, so what is missing is the index and the `/sync` section, and
+`msc4354` on the versions list.
 
 ## Encryption: session rooms in the clear, everything else encrypted
 
