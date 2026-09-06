@@ -27,6 +27,7 @@ pub mod keys;
 mod log;
 mod pdu;
 mod state;
+pub mod version;
 
 pub use log::{
     AppendError, ChainHash, DEFAULT_RESIDENT_WINDOW, EventId, EventInput, ForkWindow,
@@ -37,3 +38,4 @@ pub use pdu::{Pdu, PduError};
 pub use state::{
     CONTENT_DIGEST_VERSION, EventType, RehydrateError, StateKey, StateRoot, StateSnapshot,
 };
+pub use version::{STATE_DAG_V12, VersionError, is_state_dag, rules_of};

@@ -85,7 +85,7 @@ pub const SPEC_VERSIONS: &[SpecVersion] = &[
 /// The work is real and tracked separately. This list moves when
 /// Complement's knock and restricted-join tests pass at the versions they
 /// ask for, and not before.
-pub const ROOM_VERSIONS: &[&str] = &["11", "12"];
+pub const ROOM_VERSIONS: &[&str] = &["11", "12", spindle_core::STATE_DAG_V12];
 
 /// The default room version.
 pub const DEFAULT_ROOM_VERSION: Option<&str> = Some("11");
@@ -200,9 +200,8 @@ mod room_version_surface_tests {
         for name in ROOM_VERSIONS {
             let version = ruma::RoomVersionId::try_from(*name)
                 .unwrap_or_else(|error| panic!("v{name} is not a room version: {error}"));
-            let rules = version
-                .rules()
-                .unwrap_or_else(|| panic!("ruma has no rules for advertised v{name}"));
+            let rules = spindle_core::rules_of(&version)
+                .unwrap_or_else(|| panic!("no rules for advertised v{name}"));
             assert_eq!(
                 rules.event_id_format,
                 ruma::room_version_rules::EventIdFormatVersion::V3,
@@ -213,13 +212,16 @@ mod room_version_surface_tests {
         }
     }
 
-    /// Nothing advertised is a version `ruma` calls unstable.
-    ///
-    /// Advertising an unstable version invites clients into rooms whose rules
-    /// may still change under them.
+    /// Nothing advertised is a version `ruma` calls unstable, except the
+    /// one this server advertises *as* unstable: MSC4242's state-DAG
+    /// version, which `/capabilities` marks so, and which exists here to
+    /// federate with a mesh that creates rooms under it.
     #[test]
     fn nothing_advertised_is_unstable() {
         for name in ROOM_VERSIONS {
+            if *name == spindle_core::STATE_DAG_V12 {
+                continue;
+            }
             let rules = ruma::RoomVersionId::try_from(*name)
                 .unwrap()
                 .rules()

@@ -15,7 +15,7 @@
 //! room is loaded once and kept, which is the shape SPEC §15's per-room executor
 //! takes.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::authorize::StoredEvent;
@@ -23,7 +23,7 @@ use ruma::room_version_rules::RoomVersionRules;
 use ruma::signatures::Ed25519KeyPair;
 use ruma::{CanonicalJsonObject, CanonicalJsonValue, RoomVersionId};
 use serde_json::{Map, Value};
-use spindle_core::{EventId, EventInput, LogEntry, Pdu, RoomLog, StateKey};
+use spindle_core::{EventId, EventInput, LogEntry, Pdu, RoomLog, StateKey, is_state_dag};
 use spindle_store::{Durability, FjallStore, RoomStore, StoreError};
 
 /// Native rooms are v11 (SPEC §11.6).
@@ -191,6 +191,15 @@ pub struct Rooms {
     /// moves.
     destinations: Mutex<HashMap<String, Destinations>>,
     room_versions: Mutex<HashMap<String, RoomVersionId>>,
+    /// The forward extremities of each state-DAG room's state DAG
+    /// (MSC4242): the accepted state events no later accepted state event
+    /// names in its `prev_state_events`. What every event this server
+    /// authors in such a room names as its state parents.
+    ///
+    /// Filled from the log on first use and kept current by the append
+    /// paths while warm; a room not in the map is recomputed on demand.
+    /// Rooms of stock versions never appear here.
+    state_heads: Mutex<HashMap<String, BTreeSet<String>>>,
     /// The server-global order `/sync` needs (SPEC §10.2). The linear index
     /// orders events within one room; nothing orders them across rooms, so
     /// this is the one counter that exists purely because a per-room order is
@@ -341,6 +350,7 @@ impl Rooms {
             member_ids: Mutex::new(HashMap::new()),
             destinations: Mutex::new(HashMap::new()),
             room_versions: Mutex::new(HashMap::new()),
+            state_heads: Mutex::new(HashMap::new()),
             // Resumed, not reset. A counter that restarted at zero would
             // re-issue stream ids already on disk, overwriting the entries
             // they point at -- the same shape of bug as a room registry that
@@ -402,7 +412,7 @@ impl Rooms {
         // dropped. Before v12 it is required.
         let privileges_creators = RoomVersionId::try_from(version)
             .ok()
-            .and_then(|id| id.rules())
+            .and_then(|id| spindle_core::rules_of(&id))
             .is_some_and(|rules| rules.authorization.explicitly_privilege_room_creators);
         let trusted = preset == Some("trusted_private_chat");
         // `trusted_private_chat` gives every invitee the creator's own
@@ -1331,6 +1341,7 @@ impl Rooms {
             Some(""),
             content,
         )?;
+        let version = version_in(content)?;
         let canonical = build_canonical(
             room_id,
             creator,
@@ -1340,8 +1351,8 @@ impl Rooms {
             &[],
             &auth,
             0,
+            is_state_dag(&version).then_some(&[][..]),
         )?;
-        let version = version_in(content)?;
         let pdu = Pdu::sign(version, canonical, &self.server_name, key)
             .map_err(|error| RoomError::Build(format!("{error:?}")))?;
         Ok((
@@ -1650,8 +1661,8 @@ impl Rooms {
         // the versions differ most visibly -- which keys survive a redaction
         // changed in v11 -- so applying ours to someone else's room would
         // strip fields the room's own version keeps.
-        let rules = self.rules(room_id)?.redaction;
-        let redacted = ruma::canonical_json::redact(object, &rules, None)
+        let version = self.room_version(room_id)?;
+        let redacted = spindle_core::version::redact(&object, &version)
             .map_err(|error| RoomError::Build(format!("cannot redact: {error}")))?;
 
         let mut json = canonical_to_json(&redacted);
@@ -3641,16 +3652,6 @@ impl Rooms {
         // hash cannot name the ID, so it is built without one. `create`
         // has already derived the same ID from the same bytes.
         let names_room_id = !(event_type == "m.room.create" && derives_room_id(content));
-        let canonical = build_canonical(
-            names_room_id.then_some(room_id),
-            sender,
-            event_type,
-            state_key,
-            content,
-            &prev,
-            &auth,
-            depth,
-        )?;
         // Sign under the room's own version, not this build's default.
         // Event IDs are version-dependent, so signing a v12 room's event
         // under v11 rules mints an ID the rest of that room will not
@@ -3664,6 +3665,25 @@ impl Rooms {
         } else {
             self.version_in_log(log, room_id)?
         };
+        // MSC4242: the state parents are the state DAG's forward
+        // extremities, which in a room this server serializes is the
+        // latest accepted state event -- or several, after a fork.
+        let state_parents = if is_state_dag(&version) {
+            Some(self.state_dag_heads(log, room_id)?)
+        } else {
+            None
+        };
+        let canonical = build_canonical(
+            names_room_id.then_some(room_id),
+            sender,
+            event_type,
+            state_key,
+            content,
+            &prev,
+            &auth,
+            depth,
+            state_parents.as_deref(),
+        )?;
         let pdu = Pdu::sign(version, canonical, &self.server_name, key)
             .map_err(|error| RoomError::Build(format!("{error:?}")))?;
 
@@ -3958,6 +3978,7 @@ impl Rooms {
         if log.get(&EventId::new(event_id)).is_some() {
             return Ok(());
         }
+        self.check_state_parents(log, room_id, json)?;
         self.authorize(log, room_id, event_id, json)?;
 
         let event_type = json["type"].as_str().unwrap_or_default().to_owned();
@@ -4041,6 +4062,24 @@ impl Rooms {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(index) = cache.get_mut(room_id) {
                 index.push(entry.li.get(), input.sender);
+            }
+        }
+
+        // A state event in a state-DAG room moves the DAG's heads: it is
+        // one, and whatever it named no longer is. Only while warm, like
+        // the unread index; a cold room recomputes from the log.
+        if input.state_key.is_some()
+            && let Some(parents) = input.json["prev_state_events"].as_array()
+        {
+            let mut heads = self
+                .state_heads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(heads) = heads.get_mut(room_id) {
+                for parent in parents.iter().filter_map(Value::as_str) {
+                    heads.remove(parent);
+                }
+                heads.insert(event_id.to_owned());
             }
         }
 
@@ -4267,6 +4306,85 @@ impl Rooms {
         .map_err(RoomError::Forbidden)
     }
 
+    /// The state DAG's forward extremities in a state-DAG room (MSC4242):
+    /// what an event authored now names in `prev_state_events`.
+    ///
+    /// Cached per room while warm; otherwise one pass over the log's state
+    /// entries, reading each body for the parents it names. The result is
+    /// sorted, so two servers holding the same log name the same parents.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if a state event's body cannot be read.
+    fn state_dag_heads(&self, log: &RoomLog, room_id: &str) -> Result<Vec<String>, RoomError> {
+        if let Some(heads) = self
+            .state_heads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(room_id)
+        {
+            return Ok(heads.iter().cloned().collect());
+        }
+        let mut heads: BTreeSet<String> = BTreeSet::new();
+        let mut named: HashSet<String> = HashSet::new();
+        for entry in log.entries().filter(|entry| entry.state_key.is_some()) {
+            let event = self.read_event(room_id, &entry.event_id)?;
+            if let Some(parents) = event["prev_state_events"].as_array() {
+                named.extend(parents.iter().filter_map(Value::as_str).map(str::to_owned));
+            }
+            heads.insert(entry.event_id.as_str().to_owned());
+        }
+        heads.retain(|id| !named.contains(id));
+        let result: Vec<String> = heads.iter().cloned().collect();
+        self.state_heads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(room_id.to_owned(), heads);
+        Ok(result)
+    }
+
+    /// MSC4242's receipt checks on `prev_state_events`: in a state-DAG
+    /// room every parent must be a state event this server holds in this
+    /// room. One it does not hold is a gap, refused the way an unknown
+    /// `prev_events` parent is; one that is not a state event is a
+    /// malformed event, refused outright.
+    fn check_state_parents(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        json: &Value,
+    ) -> Result<(), RoomError> {
+        if json["type"] == "m.room.create" || !is_state_dag(&self.version_in_log(log, room_id)?) {
+            return Ok(());
+        }
+        let Some(parents) = json["prev_state_events"].as_array() else {
+            return Err(RoomError::Append(
+                "a state-DAG event names no prev_state_events".to_owned(),
+            ));
+        };
+        for parent in parents {
+            let Some(parent) = parent.as_str() else {
+                return Err(RoomError::Append(
+                    "prev_state_events holds a non-string".to_owned(),
+                ));
+            };
+            match log.get(&EventId::new(parent)) {
+                Some(entry) if entry.state_key.is_some() => {}
+                Some(_) => {
+                    return Err(RoomError::Append(format!(
+                        "prev_state_events names {parent}, which is not a state event"
+                    )));
+                }
+                None => {
+                    return Err(RoomError::Append(format!(
+                        "prev_state_events names {parent}, which this server does not hold"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn read_event(&self, room_id: &str, event_id: &EventId) -> Result<Value, RoomError> {
         let raw = spindle_store::ReadView::get(
             self.store.as_ref(),
@@ -4348,11 +4466,11 @@ fn stamp(mut json: Value, event_id: &str) -> Value {
 fn derives_room_id(create_content: &Value) -> bool {
     version_in(create_content)
         .ok()
-        .and_then(|version| version.rules())
+        .and_then(|version| spindle_core::rules_of(&version))
         .is_some_and(|rules| rules.authorization.room_create_event_id_as_room_id)
 }
 
-fn version_in(content: &Value) -> Result<RoomVersionId, RoomError> {
+pub(crate) fn version_in(content: &Value) -> Result<RoomVersionId, RoomError> {
     let named = content
         .get("room_version")
         .and_then(Value::as_str)
@@ -4367,8 +4485,7 @@ fn version_in(content: &Value) -> Result<RoomVersionId, RoomError> {
 /// an unknown version's events through a known version's rules is how a
 /// server accepts something it should have rejected.
 fn rules_of(version: &RoomVersionId) -> Result<RoomVersionRules, RoomError> {
-    version
-        .rules()
+    spindle_core::rules_of(version)
         .ok_or_else(|| RoomError::Build(format!("no rules for room version {version}")))
 }
 
@@ -4556,6 +4673,7 @@ fn build_canonical(
     prev_events: &[String],
     auth_events: &[String],
     depth: u64,
+    prev_state_events: Option<&[String]>,
 ) -> Result<CanonicalJsonObject, RoomError> {
     let mut object = CanonicalJsonObject::new();
     // MSC4291: a v12 create event carries no `room_id`, because the room's
@@ -4592,19 +4710,35 @@ fn build_canonical(
                 .collect(),
         ),
     );
-    object.insert(
-        "auth_events".to_owned(),
-        CanonicalJsonValue::Array(
-            auth_events
-                .iter()
-                .map(|id| CanonicalJsonValue::String(id.clone()))
-                .collect(),
-        ),
-    );
-    object.insert(
-        "depth".to_owned(),
-        CanonicalJsonValue::Integer(depth.try_into().unwrap_or_default()),
-    );
+    // MSC4242: a state-DAG event names its state parents and carries no
+    // `auth_events` -- every server calculates those -- and no `depth`,
+    // which the state DAG makes redundant (and which Neutrino omits).
+    // Everything else keeps the stock shape.
+    if let Some(prev_state_events) = prev_state_events {
+        object.insert(
+            "prev_state_events".to_owned(),
+            CanonicalJsonValue::Array(
+                prev_state_events
+                    .iter()
+                    .map(|id| CanonicalJsonValue::String(id.clone()))
+                    .collect(),
+            ),
+        );
+    } else {
+        object.insert(
+            "auth_events".to_owned(),
+            CanonicalJsonValue::Array(
+                auth_events
+                    .iter()
+                    .map(|id| CanonicalJsonValue::String(id.clone()))
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "depth".to_owned(),
+            CanonicalJsonValue::Integer(depth.try_into().unwrap_or_default()),
+        );
+    }
     object.insert(
         "origin_server_ts".to_owned(),
         CanonicalJsonValue::Integer(now_ms().try_into().unwrap_or_default()),

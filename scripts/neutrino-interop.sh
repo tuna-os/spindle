@@ -67,13 +67,14 @@ row "mesh node key document at its loopback URL" "$(echo "$KEYS" | grep -q verif
 TOK="$(curl -s -X POST "$S/_matrix/client/v3/register" -H 'content-type: application/json' \
   -d '{"username":"alice","password":"hunter2","auth":{"type":"m.login.dummy","session":"s"}}' | json access_token)"
 ROOM="$(curl -s -X POST "$S/_matrix/client/v3/createRoom" -H "authorization: Bearer $TOK" \
-  -H 'content-type: application/json' -d '{"name":"Interop","room_version":"12"}' | json room_id)"
+  -H 'content-type: application/json' -d '{"name":"Interop","room_version":"org.matrix.msc4242.12","preset":"public_chat"}' | json room_id)"
 
-# 1. Spindle invites the mesh user into a v12 room.
+# 1. Spindle invites the mesh user into a state-DAG room (MSC4242, the
+# version the mesh creates rooms under and Spindle now speaks).
 OUT="$(curl -s -X POST "$S/_matrix/client/v3/rooms/$ROOM/invite" -H "authorization: Bearer $TOK" \
   -H 'content-type: application/json' -d "{\"user_id\":\"@n:$NODE\"}")"
-row "Spindle invites @n:<node> into a v12 room" "$(echo "$OUT" | grep -q errcode && echo refused || echo accepted)" \
-  "$(echo "$OUT" | grep -o 'M_INCOMPATIBLE_ROOM_VERSION[^}]*' | head -c 120)"
+row "Spindle invites @n:<node> into a state-DAG room" "$(echo "$OUT" | grep -q errcode && echo refused || echo accepted)" \
+  "$(echo "$OUT" | head -c 120)"
 
 # 2. The mesh node invites the Spindle user.
 NROOM="$(curl -s -X POST "$N/_matrix/client/v3/createRoom" -H 'content-type: application/json' -d '{"name":"Mesh"}' | json room_id)"
@@ -88,6 +89,43 @@ PEER="$(grep -o 'peer returned non-2xx.*' "$RIG/neutrino.log" | head -1 | sed 's
 UNROUTED="$(grep -o 'error sending request for url ([^)]*' "$RIG/neutrino.log" | head -1 | head -c 90 || true)"
 row "mesh node invites @alice:<spindle>" "$(echo "$OUT" | grep -q errcode && echo refused || echo accepted)" \
   "after $(( $(date +%s) - START )) s; ${PEER:-$UNROUTED}"
+
+# 2b. The mesh user joins Spindle's room through the node: make_join and
+# send_join against Spindle, the state DAG seeded on the node.
+START=$(date +%s)
+OUT="$(curl -s -X POST "$N/_matrix/client/v3/join/$ROOM?server_name=127.0.0.1:8008" -H 'content-type: application/json' -d '{}')"
+JOINED="$(curl -s "$S/_matrix/client/v3/rooms/$ROOM/joined_members" -H "authorization: Bearer $TOK" | grep -c "@n:$NODE" || true)"
+row "mesh user joins Spindle's state-DAG room via make_join/send_join" \
+  "$([ "$JOINED" = "1" ] && echo joined || echo failed)" "after $(( $(date +%s) - START )) s; $(echo "$OUT" | head -c 90)"
+
+# 2c. Messages cross the seam in both directions.
+curl -s -X PUT "$S/_matrix/client/v3/rooms/$ROOM/send/m.room.message/t1" -H "authorization: Bearer $TOK" \
+  -H 'content-type: application/json' -d '{"msgtype":"m.text","body":"hello from spindle"}' >/dev/null
+curl -s -X PUT "$N/_matrix/client/v3/rooms/$ROOM/send/m.room.message/t2" \
+  -H 'content-type: application/json' -d '{"msgtype":"m.text","body":"hello from the mesh"}' >/dev/null
+for _ in $(seq 1 40); do
+  A="$(curl -s "$N/_matrix/client/v3/rooms/$ROOM/messages?dir=b&limit=20" | grep -c 'hello from spindle' || true)"
+  B="$(curl -s "$S/_matrix/client/v3/rooms/$ROOM/messages?dir=b&limit=20" -H "authorization: Bearer $TOK" | grep -c 'hello from the mesh' || true)"
+  [ "$A" != "0" ] && [ "$B" != "0" ] && break
+  sleep 0.25
+done
+row "messages cross Spindle -> mesh and mesh -> Spindle" \
+  "$([ "$A" != "0" ] && [ "$B" != "0" ] && echo both || echo "spindle->mesh=$A mesh->spindle=$B")" "in the room the mesh user joined"
+
+# 2d. Alice accepts the mesh node's invite: Spindle joins the mesh room,
+# seeded from the node's state DAG, and a message crosses back.
+START=$(date +%s)
+OUT="$(curl -s -X POST "$S/_matrix/client/v3/join/$NROOM?server_name=$NODE" -H "authorization: Bearer $TOK" \
+  -H 'content-type: application/json' -d '{}')"
+curl -s -X PUT "$S/_matrix/client/v3/rooms/$NROOM/send/m.room.message/t3" -H "authorization: Bearer $TOK" \
+  -H 'content-type: application/json' -d '{"msgtype":"m.text","body":"alice on the mesh room"}' >/dev/null
+for _ in $(seq 1 40); do
+  C="$(curl -s "$N/_matrix/client/v3/rooms/$NROOM/messages?dir=b&limit=20" | grep -c 'alice on the mesh room' || true)"
+  [ "$C" != "0" ] && break
+  sleep 0.25
+done
+row "Spindle joins the mesh node's room and a message reaches the node" \
+  "$([ "$C" != "0" ] && echo joined || echo failed)" "after $(( $(date +%s) - START )) s; $(echo "$OUT" | head -c 90)"
 
 # 3. An alias on the mesh node, resolved by Spindle over federation.
 AROOM="$(curl -s -X POST "$N/_matrix/client/v3/createRoom" -H 'content-type: application/json' -d '{"name":"Aliased"}' | json room_id)"

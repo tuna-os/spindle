@@ -127,26 +127,46 @@ mesh's question, and the harder one; the Companion project's
    the patch signs, verified with the same resolver; it is the next patch,
    and it can be gated by `trusted_network` like event verification is.
 
-3. **Meet on a room version.** This is the cost that dominates and the one
-   the RFC has to decide. Two ways:
-   - *Neutrino speaks v12.* Its wire layer is structural for MSC4242
-     (`validate.rs` refuses `auth_events` and requires
-     `prev_state_events`; `RoomVersions` holds at most two versions), and
-     its state resolution is v12's algorithm run over MSC4242 inputs. Adding
-     v12 means a version-dispatched validator, an `auth_events` path in
-     event building, and state resolution over a DAG on the phone. Weeks,
-     and it lands on the phone's battery.
-   - *Spindle speaks MSC4242.* Spindle keeps a linear log per room and
-     already resolves nothing; an MSC4242 room is a DAG of state events
-     where every event names its state ancestors. Spindle would accept the
-     version, validate the MSC4242 shape, and treat `prev_state_events`
-     as the fork signal it already classifies (docs/divergence.md).
-     Smaller than the phone-side change, and the phones stay as they are.
-     It is an experimental version, so it belongs behind a config flag and
-     on the `spindle-hub-p2p` branch, not in the default set.
-   The recommendation is the second, because the mesh is the constrained
-   side and because the RFC's "hub" intuition is right: the server with
-   the uplink should absorb the complexity.
+3. **Meet on a room version: MSC4242, done on this branch.** The
+   mesh's version is not a fork of v12 that Neutrino chose; it is where
+   Matrix itself is going. Project Hydra, the matrix.org programme to make
+   federation's state handling reliable, landed its phase 1 in room
+   version 12 (creator power, hash-derived room IDs, state resolution
+   2.1) and has published its phase 2 MSCs: MSC4242 State DAGs, MSC4428
+   stable member identifiers, MSC4430 member keys. MSC4242 is the one
+   that changes the wire: every event names its *state* parents
+   (`prev_state_events`, at most twenty), `auth_events` leaves the wire
+   because every server calculates them from the state DAG, current
+   state is the resolution of the state DAG's forward extremities, and
+   `send_join` answers with the whole state DAG and a slice of timeline
+   instead of `state` and `auth_chain`. It has no number yet -- the
+   proposal carries "unassigned room version", and the expectation is
+   v13 -- so it federates as `org.matrix.msc4242.12`, and Neutrino's
+   README says outright that it implements only the newest versions,
+   Hydra phase 2 and, in future, 3, to test them in the harshest place.
+
+   Spindle now speaks that version. It is the smaller change on this
+   side, and the right one: a server whose state is a linear log has one
+   state-DAG head almost all of the time, so "the resolution of the
+   forward extremities" is a lookup, and the DAG's discipline -- every
+   state event names the state it was written against -- is what the
+   log already records. What the branch adds: the version itself, with
+   v12's rules and a redaction that keeps `prev_state_events` under the
+   reference hash and the signature (docs of `spindle-core::version`);
+   events built with state parents and no `auth_events`; the state DAG's
+   heads tracked per room; receipt checks on the parents; the
+   `send_join` shape both ways; `get_missing_events` with `state_dag`;
+   and `/capabilities` advertising it as unstable. When the number is
+   assigned, the string changes and nothing else does.
+
+   What it does not do yet is resolve a state-DAG fork: two accepted
+   state events neither of which names the other. Today that is the
+   fork the log already classifies (docs/divergence.md), and the
+   contested key is set aside rather than resolved, exactly as for a
+   stock room. Neutrino runs state resolution 2.1 over the same inputs,
+   so on a fork the two can disagree until the resolver is wired in --
+   the same gap #16 names, now with a version whose whole point is that
+   the resolver's inputs are trustworthy.
 
 4. **The MSC3995 hub protocol.** SPEC.md §12 is the design; nothing
    implements it, on either side. Not on the path to the venue.

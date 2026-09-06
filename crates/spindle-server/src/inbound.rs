@@ -96,26 +96,24 @@ pub(crate) fn receive_one_pdu(
         );
     }
 
-    let pdu_parsed = match spindle_core::Pdu::from_remote(
-        ruma::RoomVersionId::try_from(crate::rooms::ROOM_VERSION)
-            .expect("the supported room version parses"),
-        canonical.clone(),
-    ) {
+    // The event is named and verified under the room's version: the create
+    // event states it, every other event is in a room this server holds.
+    // A room it does not hold is judged under the default, which is the
+    // pre-existing behaviour and only reaches `receive`'s unknown-room
+    // answer anyway.
+    let version = room_version_of(state, pdu);
+    let pdu_parsed = match spindle_core::Pdu::from_remote(version.clone(), canonical.clone()) {
         Ok(parsed) => parsed,
         Err(error) => return ("$malformed".to_owned(), Err(format!("{error:?}"))),
     };
     let event_id = pdu_parsed.event_id().as_str().to_owned();
 
     if let Some(keys) = keys {
-        let rules = ruma::RoomVersionId::try_from(crate::rooms::ROOM_VERSION)
-            .expect("the supported room version parses")
-            .rules()
-            .expect("the supported room version has rules");
         // Which of the peer's keys may answer for this event depends on
         // when the peer says it signed it: a key retired at `expired_ts`
         // verifies nothing claimed after that moment (#296).
         let key_map = keys.map_for(pdu["origin_server_ts"].as_u64());
-        match ruma::signatures::verify_event(&key_map, &canonical, &rules) {
+        match spindle_core::version::verify(&key_map, &canonical, &version) {
             Ok(ruma::signatures::Verified::All) => {}
             // The signature holds but the content hash does not: someone
             // altered the body after signing. The spec's answer is redact,
@@ -124,11 +122,10 @@ pub(crate) fn receive_one_pdu(
             // agree on), only its content is not, so the room keeps the
             // event and loses the tampering.
             Ok(ruma::signatures::Verified::Signatures) => {
-                let redacted =
-                    match ruma::canonical_json::redact(canonical.clone(), &rules.redaction, None) {
-                        Ok(redacted) => redacted,
-                        Err(error) => return (event_id, Err(format!("redaction: {error}"))),
-                    };
+                let redacted = match spindle_core::version::redact(&canonical, &version) {
+                    Ok(redacted) => redacted,
+                    Err(error) => return (event_id, Err(format!("redaction: {error}"))),
+                };
                 let json = serde_json::to_value(&redacted).unwrap_or(Value::Null);
                 return match receive(
                     pdu["room_id"].as_str().unwrap_or_default(),
@@ -150,6 +147,26 @@ pub(crate) fn receive_one_pdu(
         Ok(()) => (event_id, Ok(())),
         Err(error) => (event_id, Err(error.to_string())),
     }
+}
+
+/// The version a received PDU is to be read under.
+///
+/// A create event carries it; any other event belongs to a room, and the
+/// room's create event has it. A room this server does not hold has no
+/// answer, and the default stands in -- the event is refused a few lines
+/// later for the room being unknown, so the choice decides nothing.
+fn room_version_of(state: &AppState, pdu: &Value) -> ruma::RoomVersionId {
+    let fallback = || {
+        ruma::RoomVersionId::try_from(crate::rooms::ROOM_VERSION)
+            .expect("the supported room version parses")
+    };
+    if pdu["type"] == json!("m.room.create") {
+        return crate::rooms::version_in(&pdu["content"]).unwrap_or_else(|_| fallback());
+    }
+    pdu["room_id"]
+        .as_str()
+        .and_then(|room_id| state.rooms.room_version(room_id).ok())
+        .unwrap_or_else(fallback)
 }
 
 /// Judge and apply each PDU of one transaction, keyed by the event ID this
@@ -271,17 +288,14 @@ pub(crate) fn sign_membership_template(
             ruma::CanonicalJsonValue::Integer(ruma::Int::try_from(now).unwrap_or_default()),
         );
     }
-    let rules = version
-        .rules()
-        .ok_or_else(|| "the room version rules are unavailable".to_owned())?;
-    ruma::signatures::hash_and_sign_event(
+    spindle_core::version::hash_and_sign(
         &state.config.server.name,
         state.key.pair(),
         &mut canonical,
-        &rules.redaction,
+        version,
     )
     .map_err(|error| format!("the template cannot be signed: {error}"))?;
-    let hash = ruma::signatures::reference_hash(&canonical, &rules)
+    let hash = spindle_core::version::reference_hash(&canonical, version)
         .map_err(|error| format!("the signed event cannot be hashed: {error}"))?;
     let event = serde_json::to_value(&canonical)
         .map_err(|error| format!("the signed event cannot be serialized: {error}"))?;
@@ -311,14 +325,11 @@ pub(crate) fn countersign(
             "the event does not canonicalize".to_owned(),
         ));
     };
-    let rules = version
-        .rules()
-        .ok_or_else(|| MatrixError::internal("the room version rules are unavailable"))?;
-    ruma::signatures::hash_and_sign_event(
+    spindle_core::version::hash_and_sign(
         &state.config.server.name,
         state.key.pair(),
         &mut canonical,
-        &rules.redaction,
+        version,
     )
     .map_err(|error| MatrixError::internal(&format!("the event cannot be co-signed: {error}")))?;
     serde_json::to_value(&canonical).map_err(|error| MatrixError::internal(&error.to_string()))
@@ -677,6 +688,12 @@ pub(crate) async fn missing_events(
         .unwrap_or(10)
         .clamp(1, 100);
     let min_depth = body["min_depth"].as_u64().unwrap_or(0);
+    // MSC4242: walk the state DAG instead of the room DAG. The stable
+    // name and the unstable-prefixed one both count.
+    let state_dag = body["state_dag"].as_bool().unwrap_or(false)
+        || body["org.matrix.msc4242.state_dag"]
+            .as_bool()
+            .unwrap_or(false);
     let events = state
         .rooms
         .missing_events(
@@ -685,6 +702,7 @@ pub(crate) async fn missing_events(
             &ids("latest_events"),
             limit,
             min_depth,
+            state_dag,
         )
         .map_err(room_error)?;
     Ok(Json(json!({ "events": events })))
@@ -1030,24 +1048,24 @@ pub(crate) async fn invite(
             "the invite event does not canonicalize".to_owned(),
         ));
     };
-    let rules = ruma::RoomVersionId::try_from(crate::rooms::ROOM_VERSION)
-        .ok()
-        .and_then(|version| version.rules())
-        .ok_or_else(|| MatrixError::internal("the room version rules are unavailable"))?;
+    // Under the version the inviter named -- checked above to be one this
+    // server speaks -- because the hash is version-dependent.
+    let version = ruma::RoomVersionId::try_from(offered)
+        .map_err(|error| MatrixError::bad_json(format!("room_version: {error}")))?;
     // The path names the event the inviter computed; disagreement means the
     // two servers are not looking at the same event.
-    let hash = ruma::signatures::reference_hash(&canonical, &rules)
+    let hash = spindle_core::version::reference_hash(&canonical, &version)
         .map_err(|error| MatrixError::bad_json(format!("the invite cannot be hashed: {error}")))?;
     if format!("${hash}") != event_id {
         return Err(MatrixError::bad_json(format!(
             "the event hashes to ${hash}, not {event_id}"
         )));
     }
-    if ruma::signatures::hash_and_sign_event(
+    if spindle_core::version::hash_and_sign(
         &state.config.server.name,
         state.key.pair(),
         &mut canonical,
-        &rules.redaction,
+        &version,
     )
     .is_err()
     {
@@ -1264,6 +1282,23 @@ pub(crate) async fn send_join_common(
         return Err(MatrixError::forbidden(&reason));
     }
 
+    state.rooms.wake_sync_waiters();
+    // MSC4242: a state-DAG room answers with the state DAG and the tail
+    // of the timeline, and never with `state`/`auth_chain`.
+    let version = state.rooms.room_version(&room_id).map_err(room_error)?;
+    if spindle_core::is_state_dag(&version) {
+        let (state_dag, timeline) = state
+            .rooms
+            .state_dag_response(&room_id, &event_id)
+            .map_err(room_error)?;
+        return Ok(json!({
+            "origin": state.config.server.name,
+            "event": join,
+            "state_dag": state_dag,
+            "timeline": timeline,
+        }));
+    }
+
     // The state *before* the join, with its auth chain: everything the new
     // server needs to participate from this event onward.
     let (state_pairs, auth_pairs) = state
@@ -1273,7 +1308,6 @@ pub(crate) async fn send_join_common(
     let bodies = |events: Vec<crate::rooms::IdentifiedEvent>| -> Vec<Value> {
         events.into_iter().map(|(_, event)| event).collect()
     };
-    state.rooms.wake_sync_waiters();
     Ok(json!({
         "origin": state.config.server.name,
         "event": join,

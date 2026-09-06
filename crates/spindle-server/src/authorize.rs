@@ -112,7 +112,13 @@ impl StoredEvent {
                 .map_err(|error| format!("content: {error}"))?,
             state_key: json["state_key"].as_str().map(ToOwned::to_owned),
             prev_events: ids("prev_events")?,
-            auth_events: ids("auth_events")?,
+            // MSC4242 takes `auth_events` off the wire: a state-DAG event
+            // has none, and the rules run here read state, not the list.
+            auth_events: if json.get("auth_events").is_some() {
+                ids("auth_events")?
+            } else {
+                Vec::new()
+            },
         })
     }
 }
