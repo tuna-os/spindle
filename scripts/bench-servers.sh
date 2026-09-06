@@ -1,21 +1,32 @@
 #!/usr/bin/env bash
 #
-# Bring up all four servers of a four-way sitting on loopback, cold, with
-# every rate limit the competitors expose lifted, and leave them running
-# for `bench-rounds.sh`. `down` stops them.
+# Bring up every server of a sitting on loopback, cold, with every rate limit
+# the competitors expose lifted, and leave them running for
+# `bench-rounds.sh`. `down` stops them.
 #
-#   BENCH_BIN=/path/with/continuwuity/and/tuwunel SYNAPSE_VENV=/path/to/venv \
-#     scripts/bench-four-way.sh up
-#   scripts/bench-rounds.sh --group m7-progress --rounds 3 \
+#   BENCH_BIN=/path/with/the/competitor/binaries SYNAPSE_VENV=/path/to/venv \
+#     scripts/bench-servers.sh up
+#   scripts/bench-rounds.sh --group m7-progress-2 --rounds 3 \
 #       --server spindle=http://127.0.0.1:8099 --server synapse=http://127.0.0.1:8098 \
 #       --server continuwuity=http://127.0.0.1:8097 --server tuwunel=http://127.0.0.1:8096 \
+#       --server dendrite=http://127.0.0.1:8095 \
 #       --registration-token continuwuity=benchtoken --registration-token tuwunel=benchtoken
-#   scripts/bench-four-way.sh down
+#   scripts/bench-servers.sh down
 #
 # Committed because the M7 sitting lost most of an evening to details that
 # had all been solved once before and written down nowhere: see the notes
 # inline. Expects `target/release/spindle` to exist; the competitors are
-# whatever binaries `BENCH_BIN` holds, named `continuwuity` and `tuwunel`.
+# whatever binaries `BENCH_BIN` holds, named `continuwuity`, `tuwunel` and
+# `dendrite` (with Dendrite's `generate-keys` beside it). A competitor whose
+# binary is absent is skipped and named, so a sitting can be three servers
+# or five and the page says which.
+#
+# The five, and why each is in the field: Synapse is the reference
+# implementation and the one most deployments run; Continuwuity and Tuwunel
+# are the conduwuit lineage, Rust on RocksDB, and the performance bar;
+# Dendrite is Element's second-generation Go server, a different design
+# again (a NATS event bus between components) and the other server an
+# operator picks when Synapse is too heavy. Spindle is the subject.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 BENCH=${BENCH_DIR:-tmp/bench}
@@ -41,6 +52,14 @@ down() {
 }
 
 up() {
+  # A port already bound is a server already running -- a previous sitting's,
+  # a probe's -- and the driver would measure it, not the cold one launched
+  # below. That happened once: a stale Dendrite from a probe answered a
+  # whole leg with M_USER_IN_USE. Refuse, and name what holds the port.
+  for port in 8099 8098 8097 8096 8095; do
+    holder=$(ss -ltnp 2>/dev/null | grep -E ":$port " | grep -o 'pid=[0-9]*' | head -1 || true)
+    [ -z "$holder" ] || { echo "port $port is already bound ($holder); stop it before a sitting" >&2; return 1; }
+  done
   rm -rf "$BENCH/spindle-data"
   cat > "$BENCH/spindle.toml" <<TOML
 [server]
@@ -103,6 +122,10 @@ YAML
 
   for pair in continuwuity:8097 tuwunel:8096; do
     name=${pair%%:*}; port=${pair#*:}
+    if [ ! -x "$BIN/$name" ]; then
+      echo "no $BIN/$name: the sitting runs without $name" >&2
+      continue
+    fi
     rm -rf "$BENCH/$name-data"; mkdir -p "$BENCH/$name-data"
     cat > "$BENCH/$name.toml" <<TOML
 [global]
@@ -119,11 +142,75 @@ TOML
     echo $! > "$BENCH/$name.pid"
   done
 
-  wait_up 8099; wait_up 8098; wait_up 8097; wait_up 8096
+  # Dendrite: Element's Go server. SQLite per component (its global database
+  # block is Postgres-only), the NATS bus in-process, federation off, its
+  # rate limiter off, and open registration -- which it refuses without a
+  # flag whose name says what it thinks of the idea. Fair: this is a
+  # loopback benchmark, not a deployment.
+  if [ -x "$BIN/dendrite" ]; then
+    rm -rf "$BENCH/dendrite"; mkdir -p "$BENCH/dendrite"
+    ( cd "$BENCH/dendrite" && "$BIN/generate-keys" --private-key matrix_key.pem >/dev/null 2>&1 )
+    {
+      cat <<'YAML'
+version: 2
+global:
+  server_name: bench.local
+  private_key: matrix_key.pem
+  key_validity_period: 168h0m0s
+  cache:
+    max_size_estimated: 1gb
+    max_age: 1h
+  disable_federation: true
+  presence:
+    enable_inbound: false
+    enable_outbound: false
+  report_stats:
+    enabled: false
+  jetstream:
+    addresses: []
+    storage_path: ./jetstream
+    topic_prefix: Dendrite
+    in_memory: false
+  metrics:
+    enabled: false
+client_api:
+  registration_disabled: false
+  guests_disabled: true
+  registration_shared_secret: ""
+  enable_registration_captcha: false
+  rate_limiting:
+    enabled: false
+user_api:
+  bcrypt_cost: 4
+  account_database:
+    connection_string: file:userapi.db
+logging:
+  - type: std
+    level: warn
+YAML
+      for pair in app_service_api:appservice key_server:keyserver mscs:mscs relay_api:relayapi \
+                  room_server:roomserver sync_api:syncapi; do
+        printf '%s:\n  database:\n    connection_string: file:%s.db\n' "${pair%%:*}" "${pair#*:}"
+      done
+      printf 'federation_api:\n  send_max_retries: 1\n  disable_tls_validation: true\n  database:\n    connection_string: file:federationapi.db\n'
+      printf 'media_api:\n  base_path: ./media_store\n  max_file_size_bytes: 10485760\n  dynamic_thumbnails: false\n  database:\n    connection_string: file:mediaapi.db\n' 
+    } > "$BENCH/dendrite/dendrite.yaml"
+    ( cd "$BENCH/dendrite" && setsid "$BIN/dendrite" -config dendrite.yaml \
+        -http-bind-address 127.0.0.1:8095 -really-enable-open-registration \
+        > ../dendrite-run.log 2>&1 < /dev/null & echo $! > ../dendrite.pid )
+  else
+    echo "no $BIN/dendrite: the sitting runs without Dendrite" >&2
+  fi
+
+  wait_up 8099; wait_up 8098
+  [ -x "$BIN/continuwuity" ] && wait_up 8097
+  [ -x "$BIN/tuwunel" ] && wait_up 8096
+  [ -x "$BIN/dendrite" ] && wait_up 8095
 
   # Continuwuity's release build refuses the configured registration token
   # until a first account has been created with the one-time token it
   # prints at startup, so create that account here and out of the way.
+  [ -x "$BIN/continuwuity" ] || { echo "all up"; return 0; }
   for _ in $(seq 1 30); do
     once=$(sed 's/\x1b\[[0-9;]*m//g' "$BENCH/continuwuity-run.log" \
       | sed -n 's/.*using the registration token \([A-Za-z0-9]*\) .*/\1/p' | tail -1)
@@ -135,7 +222,7 @@ TOML
     -H 'content-type: application/json' \
     -d "{\"username\":\"bootstrap\",\"password\":\"bootstrap-$RANDOM$RANDOM\",\"auth\":{\"type\":\"m.login.registration_token\",\"token\":\"$once\"}}" \
     | grep -q '"user_id"' || { echo "continuwuity first-user bootstrap failed" >&2; return 1; }
-  echo "all four up"
+  echo "all up"
 }
 
 case ${1:-up} in up) up ;; down) down ;; *) echo "up|down" >&2; exit 2 ;; esac

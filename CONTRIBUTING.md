@@ -16,6 +16,12 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 ```
 
+`just lint` and `just test` run the same commands, and `just --list` names
+the rest: the generated pages (`just docs`) and the competitive benchmark
+sitting from a bare checkout (`just bench <group>`, or its three steps
+`bench-field`, `bench-build`, `bench-sitting`; docs/benchmarks.md says what
+each does and what the field is pinned to).
+
 Those three are the pull-request gate, with a few checks that keep
 generated and hand-copied things honest:
 

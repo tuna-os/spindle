@@ -24,12 +24,6 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 
-# How `register` satisfies user-interactive auth. Overridden by
-# --registration-token, because the servers this driver must treat equally do
-# not agree: Synapse and Spindle take m.login.dummy on an open server, while
-# continuwuity refuses open registration outright and gates on a token. The
-# driver adapting is what keeps the workload identical past the front door.
-REGISTRATION_AUTH: dict = {"type": "m.login.dummy"}
 import json
 import pathlib
 import statistics
@@ -37,6 +31,13 @@ import sys
 import time
 import urllib.error
 import urllib.request
+
+# How `register` satisfies user-interactive auth. Overridden by
+# --registration-token, because the servers this driver must treat equally do
+# not agree: Synapse and Spindle take m.login.dummy on an open server, while
+# continuwuity refuses open registration outright and gates on a token. The
+# driver adapting is what keeps the workload identical past the front door.
+REGISTRATION_AUTH: dict = {"type": "m.login.dummy"}
 
 TIMEOUT_SECONDS = 30
 

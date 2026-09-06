@@ -40,6 +40,7 @@ stale on a runner change. Wall times do.
 | The same vs **Continuwuity** (conduwuit lineage) | Done, below (#42) |
 | The same vs **Tuwunel** | Done from M2 close-out on, below |
 | All four at three rounds a side, under the separation rule (#171) | Done, below — the first sitting the page judges by its own repeatability |
+| The same vs **Dendrite** (Element's Go server), five in the field | Done from the second M7 sitting on, below |
 
 Everything here is **algorithmic**, measured inside the library. None of it is a
 server throughput figure and none of it should be quoted as one. Server-to-
@@ -80,7 +81,7 @@ So a sitting is now several rounds, and the tooling enforces the shape:
   caller already brought up, **five rounds by default** and three at minimum,
   reversing the order each round so a drift in the machine becomes spread
   the page can see rather than bias baked into whichever server ran last. It
-  refuses to start above load 0.6. `scripts/bench-four-way.sh` is the launch
+  refuses to start above load 0.6. `scripts/bench-servers.sh` is the launch
   recipe for the four servers; `scripts/compare-against.sh` owns Spindle and
   Synapse itself and runs the same rounds for a two-way check.
 - **Every round is kept.** One file per server per round,
@@ -107,6 +108,55 @@ So a sitting is now several rounds, and the tooling enforces the shape:
 `scripts/compare-benchmarks.py` prints a fresh sitting from the terminal
 with the same arithmetic — each side a glob over its round files — so a
 sitting reads the same on the console as it will on the page.
+
+### One command, here and in CI
+
+A sitting used to be an evening of remembering how each competitor is
+fetched, configured and launched. It is now three recipes in the
+`justfile`, and the same three steps in a workflow:
+
+```bash
+just bench-field                 # fetch or build every competitor at its pin, once
+just bench-build                 # Spindle, release
+just bench-sitting m7-progress-2 # up, three rounds, down, and the sidecar
+just bench-render                # the site from the committed results
+```
+
+- **`scripts/bench-field.sh`** holds the pins: Continuwuity 26.8.1 as its
+  static release binary, Tuwunel 1.9.0 built from source at its tag (its
+  release assets are gated; it needs `liburing-dev` for RocksDB), Dendrite
+  0.15.2 built from source, Synapse 1.160.0 in a virtualenv. Bumping a pin
+  is a reviewed change, because it changes what every later cell is
+  compared against. A competitor whose binary is absent is left out of the
+  sitting and named, never carried forward.
+- **`scripts/bench-servers.sh`** brings every server up cold on loopback
+  with every rate limit it exposes lifted, each configured the way its own
+  documentation suggests for a single node. Dendrite runs with SQLite per
+  component (its global database block is Postgres-only), the NATS bus
+  in-process, federation off, and open registration — which it refuses
+  without a flag whose name says what it thinks of the idea; fair, this is
+  a loopback benchmark and not a deployment.
+- **`scripts/bench-sitting.sh`** is the order they go in, and writes
+  `docs/benchmarks/data/<group>.sitting.json` beside the round files: the
+  host's CPU, cores and kernel, the versions measured, the Spindle commit,
+  and which servers were absent. The page renders it as the sitting's
+  provenance.
+- **The `bench-sitting` workflow** runs the same thing weekly on a
+  GitHub-hosted runner and files the result as a pull request under a
+  `ci-<date>` group. A shared runner is a slower, noisier host than the
+  developer machine the milestone sittings come from, so the page keeps the
+  two apart — its own section, the same charts and rules — and a person
+  reads the sidecar before the numbers join the record. That is what keeps
+  the page current between milestones without letting a runner's noise
+  overwrite a milestone's number.
+
+On the page itself, every rival is a toggle. Synapse's column is often ten
+times the Rust servers' and flattens their lines to the axis, so a reader
+can take it out of the frame — or click *Rust servers only*, or switch to a
+log scale — and the charts rescale and the tables drop the column. Hiding
+a server changes the drawing, never the data: the committed files, the
+tallies and every ratio are computed before the page knows what was
+chosen.
 
 ## Client-server API vs Synapse, at M1
 
@@ -1021,7 +1071,7 @@ cold databases, every rate limit the competitors expose lifted. Three
 rounds, order reversed on the even round, load 0.37 at the first leg and
 0.45 after the last. Sizes 200/800/3,200, means over 25 samples per cell
 per round, twelve raw files committed as `m7-progress.<server>.r<N>.json`.
-`scripts/bench-four-way.sh` is the launch recipe, committed this time so
+`scripts/bench-servers.sh` is the launch recipe, committed this time so
 the next sitting starts from it rather than from memory.
 
 **The scoreboard: 81 comparable cells, 75 separated in Spindle's favour,
@@ -1077,7 +1127,7 @@ they make it visible, which is the whole point.
 `bench-rounds.sh` exited before its first leg whenever a sitting mixed
 token-gated servers with open ones — a `set -e` interaction in
 `token_for` that no two-way sitting had exercised — and is fixed here.
-Everything else was launch recipe, now in `bench-four-way.sh`: Synapse's
+Everything else was launch recipe, now in `bench-servers.sh`: Synapse's
 generated config ends without a newline, so an appended override was
 glued onto its last comment and registration stayed off; its
 `rc_joins_per_room` and `rc_invites` limits are separate from `rc_joins`

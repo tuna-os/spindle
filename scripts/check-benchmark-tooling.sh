@@ -276,8 +276,11 @@ assert rows["clears"][0][0] == "win", (
 )
 assert "1 round(s) per server" in text, "the sitting was not labelled unresolved"
 # No range was measured, so none may be drawn: a band of one round would be
-# a precision the sitting never had.
-assert 'class="band"' not in text, "a single-round sitting was given a spread"
+# a precision the sitting never had. The page's script carries the band
+# markup as text for the client-side redraw, so the assertion is over the
+# markup outside <script>, which is what was drawn.
+markup = re.sub(r"<script>.*?</script>", "", text, flags=re.S)
+assert 'class="band"' not in markup, "a single-round sitting was given a spread"
 print("comparisons: a single round colours only what clears the host's own variance")
 PY
 

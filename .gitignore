@@ -9,3 +9,6 @@
 
 # Python bytecode from the helper scripts.
 __pycache__/
+homeserver.db
+homeserver.log
+tmp/
