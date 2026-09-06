@@ -72,6 +72,7 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/v3/rooms/{room_id}/event/{event_id}",
     "/_matrix/client/v3/rooms/{room_id}/context/{event_id}",
     "/_matrix/key/v2/server",
+    "/_matrix/client/v1/register/m.login.registration_token/validity",
     "/.well-known/matrix/client",
     "/.well-known/matrix/server",
     "/health",
@@ -452,6 +453,10 @@ fn account_routes() -> Router<AppState> {
         .route(
             "/_matrix/client/v3/register/available",
             get(register_available),
+        )
+        .route(
+            "/_matrix/client/v1/register/m.login.registration_token/validity",
+            get(registration_token_validity),
         )
         .route("/_matrix/client/v3/logout", post(logout))
         .route("/_matrix/client/v3/refresh", post(refresh))
@@ -1560,6 +1565,94 @@ async fn refresh(
     Ok(Json(session_body(&user_id, &session)))
 }
 
+#[derive(Debug, Deserialize)]
+struct TokenValidityQuery {
+    token: Option<String>,
+}
+
+/// `GET /_matrix/client/v1/register/m.login.registration_token/validity`
+/// (spec v1.2)
+///
+/// Whether a token would be accepted now. Rate-limited with registration
+/// itself: this is the endpoint a guesser would hammer.
+async fn registration_token_validity(
+    State(state): State<AppState>,
+    source: ClientAddr,
+    axum::extract::Query(query): axum::extract::Query<TokenValidityQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    if let Err(retry) = state
+        .limiter
+        .check(&format!("register:source:{source}"), REGISTER_PER_SOURCE)
+    {
+        return Err(MatrixError::limit_exceeded(retry.as_millis()));
+    }
+    let valid =
+        crate::registration_tokens::RegistrationTokens::new(std::sync::Arc::clone(&state.store))
+            .is_valid(&query.token)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    Ok(Json(json!({ "valid": valid })))
+}
+
+/// `Ok(token)` when the stage is complete, `Err(challenge)` to send back.
+type StageOutcome = Result<Option<String>, (StatusCode, Json<Value>)>;
+
+/// The one UIA stage registration asks for, and whether `auth` completes
+/// it. `Ok(Err(challenge))` is the 401 to send back; `Ok(Ok(token))` is
+/// the registration token to spend once the account exists, `None` on an
+/// open server.
+///
+/// With `[registration] require_token` on, the stage is
+/// `m.login.registration_token` (spec v1.2) and the token in the auth dict
+/// has to be one an admin minted and not yet spent; it is spent by the
+/// caller, once the account exists, so a flow that fails later costs
+/// nothing.
+fn registration_stage(state: &AppState, auth: Option<&Value>) -> Result<StageOutcome, MatrixError> {
+    let require_token = state.config.registration.require_token;
+    let uia_stage = if require_token {
+        "m.login.registration_token"
+    } else {
+        "m.login.dummy"
+    };
+    let challenge = |error: Option<(&str, &str)>| {
+        let mut body = json!({
+            "flows": [{ "stages": [uia_stage] }],
+            "params": {},
+            "session": "register",
+        });
+        if let Some((errcode, message)) = error {
+            body["errcode"] = json!(errcode);
+            body["error"] = json!(message);
+        }
+        (StatusCode::UNAUTHORIZED, Json(body))
+    };
+    let stage_completed = if require_token {
+        auth.is_some_and(|auth| auth["type"] == uia_stage && auth["token"].is_string())
+    } else {
+        auth.is_some_and(|auth| auth["session"].is_string() || auth["type"] == "m.login.dummy")
+    };
+    if !stage_completed {
+        return Ok(Err(challenge(None)));
+    }
+    if !require_token {
+        return Ok(Ok(None));
+    }
+    let token = auth
+        .and_then(|auth| auth["token"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let valid =
+        crate::registration_tokens::RegistrationTokens::new(std::sync::Arc::clone(&state.store))
+            .is_valid(&token)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    if !valid {
+        return Ok(Err(challenge(Some((
+            "M_UNAUTHORIZED",
+            "the registration token is not valid",
+        )))));
+    }
+    Ok(Ok(Some(token)))
+}
+
 /// `GET /_matrix/client/v3/register/available`
 ///
 /// The same verdicts registration itself would give, without spending a UIA
@@ -1663,20 +1756,10 @@ async fn register(
     // dummy stage carries no state a session would tie back to, and
     // Synapse accepts it. Its integration suite was refused here on every
     // test until this did.
-    let stage_completed = request
-        .auth
-        .as_ref()
-        .is_some_and(|auth| auth["session"].is_string() || auth["type"] == "m.login.dummy");
-    if !stage_completed {
-        return Ok((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "flows": [{ "stages": ["m.login.dummy"] }],
-                "params": {},
-                "session": "register",
-            })),
-        ));
-    }
+    let registration_token = match registration_stage(&state, request.auth.as_ref())? {
+        Ok(token) => token,
+        Err(challenge) => return Ok(challenge),
+    };
 
     let username = username.ok_or_else(|| MatrixError::bad_json("no username"))?;
     let username = username.as_str();
@@ -1694,6 +1777,11 @@ async fn register(
         })?;
 
     let user_id = accounts.user_id(username);
+    if let Some(token) = registration_token {
+        crate::registration_tokens::RegistrationTokens::new(std::sync::Arc::clone(&state.store))
+            .consume(&token)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    }
     if request.inhibit_login {
         return Ok((StatusCode::OK, Json(json!({ "user_id": user_id }))));
     }
