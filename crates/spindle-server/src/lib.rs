@@ -19,6 +19,7 @@ pub mod delayed;
 pub mod delegated;
 pub mod devices;
 pub mod directory;
+pub mod e2ee_federation;
 pub mod errors;
 pub mod federation;
 pub mod filters;

@@ -499,6 +499,9 @@ pub(crate) async fn send_transaction(
         .take(100)
     {
         if edu["edu_type"].as_str() != Some("m.typing") {
+            // Keys, to-device messages and device-list changes: the
+            // origin is the authority for all three, and each checks it.
+            crate::e2ee_federation::apply_edu(&state, &origin, edu).await;
             continue;
         }
         let content = &edu["content"];

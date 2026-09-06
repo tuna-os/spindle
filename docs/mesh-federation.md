@@ -25,9 +25,12 @@ federation, with every event signed and verified.
 
 The design decision the RFC makes -- plain federation, no portal bridge --
 is right for Spindle too: this server relays ciphertext and key material
-and never holds plaintext, and every endpoint that needs is served
-(client-server and federation E2EE, to-device delivery, device-list EDUs,
-authenticated media).
+and never holds plaintext. An earlier version of this page claimed that
+every endpoint encryption needs was already served across federation. It
+was not: until this branch Spindle answered `/keys/query` and
+`/keys/claim` for its own users only, served none of the federation key
+endpoints, and neither sent nor accepted to-device or device-list EDUs.
+The section on encryption below says what is served now.
 
 ## What is true today
 
@@ -91,6 +94,40 @@ from the `send_join` response, and that copy is lost, harmlessly, because
 the node already holds the event. And a state-DAG resident answers
 `send_join` with the DAG *after* the join, in which the join is a head;
 Spindle's seeding accepts that shape and seeds the join last.
+
+## Encryption: session rooms in the clear, everything else encrypted
+
+The policy is the app's: a session room, a hall room, the announcements
+room are created unencrypted, because a talk's back-channel is public by
+nature and a late joiner on a phone has to be able to read it without a
+key exchange over Bluetooth. A direct message or a group chat a person
+creates is encrypted by default, and stays encrypted across the seam.
+
+What that asks of the servers is not the encryption -- the clients do
+that -- but the plumbing that lets clients on both sides find each
+other's keys and pass key material around. Spindle now carries all of it
+over federation:
+
+| need | Spindle | Neutrino fork |
+|---|---|---|
+| a peer asks for our users' device keys | `POST /_matrix/federation/v1/user/keys/query` | served |
+| a peer claims our users' one-time keys | `POST /_matrix/federation/v1/user/keys/claim` | served |
+| a peer wants a user's whole device list | `GET /_matrix/federation/v1/user/devices/{user}` | served |
+| our client asks for a remote user's keys | `/keys/query` and `/keys/claim` ask that user's server, one request per server, and keep the answer as a copy | the same, via the fork's `keys_query` client |
+| a to-device message for a user elsewhere | one `m.direct_to_device` EDU per destination in the next transaction, named by the client's transaction so a retry does not deliver twice | the same |
+| a to-device message for a user here | delivered from the EDU to the device, or to every device for `*`, the sender checked against the origin | the same |
+| a device appears, changes or is deleted | `m.device_list_update` to every server sharing a room with the user, through the durable outbox; on receipt the keys are stored, or the list re-fetched if the update carried none | the same |
+| cross-signing keys uploaded | `m.signing_key_update` to the same servers | not sent; stored if received |
+
+The two-Spindle suite `tests/e2ee_federation.rs` pins the directory, the
+claim handed out once, to-device both ways including the `*` fan-out
+resolved on the recipient's server, and a device change arriving as
+`device_lists.changed` on the server sharing a room. The rig runs the
+same six probes against the Neutrino node.
+
+A note on what a gateway sees: ciphertext and keys, never plaintext.
+Which is the point of choosing federation over a bridge, and what makes
+a gateway a laptop anyone at the venue can run.
 
 ## The system
 
