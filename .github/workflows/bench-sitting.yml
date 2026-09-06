@@ -64,6 +64,20 @@ jobs:
         run: scripts/bench-field.sh
       - name: Spindle, release build
         run: cargo build --release -p spindle-server --bin spindle
+      # Synapse's documentation puts SQLite down as a development database
+      # and Postgres as the one to run; a comparison that used SQLite was a
+      # floor for Synapse, not a measurement of it. One container, on
+      # loopback, and the sitting script does the rest.
+      - name: Postgres, so Synapse is measured where its own docs put it
+        run: |
+          docker run -d --name bench-pg -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench \
+            -p 127.0.0.1:5433:5432 postgres:16-alpine
+          for _ in $(seq 1 30); do
+            docker exec bench-pg pg_isready -U bench -q && break
+            sleep 1
+          done
+          docker exec bench-pg pg_isready -U bench
+          echo "BENCH_PG_URL=postgres://bench:bench@127.0.0.1:5433/postgres" >> "$GITHUB_ENV"
       - name: The sitting
         env:
           BENCH_RUNNER: github-actions/ubuntu-24.04 (shared runner)
@@ -95,6 +109,14 @@ jobs:
           git commit -m "Benchmark sitting $GROUP on a shared runner" \
             -m "Filed by the bench-sitting workflow. The sidecar names the host, the load and the versions; the page renders it in its own shared-runner section, apart from the milestone sittings."
           git push -u origin "$branch"
-          gh pr create --title "Benchmark sitting $GROUP (shared runner)" \
+          # Opening the pull request needs "Allow GitHub Actions to create
+          # and approve pull requests" under Settings > Actions > General,
+          # which is off by default and was off for the first sitting that
+          # got this far (#414). The sitting has run and its results are
+          # pushed by now, so a refusal here is a notice, not a failed run:
+          # somebody opens the pull request from the branch by hand.
+          if ! gh pr create --title "Benchmark sitting $GROUP (shared runner)" \
             --body "The weekly competitive sitting on a GitHub-hosted runner, filed as its own \`ci-\` group. Read \`docs/benchmarks/data/$GROUP.sitting.json\` for the host and the versions before merging; the page keeps shared-runner sittings apart from milestone ones." \
-            --base main --head "$branch"
+            --base main --head "$branch"; then
+            echo "::warning title=Sitting pushed, pull request not opened::The results are on branch $branch. Open the pull request by hand at https://github.com/${{ github.repository }}/compare/main...$branch, or allow GitHub Actions to create pull requests under Settings > Actions > General so the next sitting files its own."
+          fi

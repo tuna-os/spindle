@@ -45,7 +45,9 @@ version_of() {
     # The server takes a config path and nothing else, so its version is the
     # tree it was built from: the crate version and the commit.
     spindle) echo "spindle $(grep -m1 '^version' crates/spindle-server/Cargo.toml | cut -d'"' -f2) @ $(git rev-parse --short=12 HEAD)" ;;
-    synapse) "$VENV/bin/python" -c 'import synapse; print("synapse", synapse.__version__)' ;;
+    # The database is part of the version: Synapse on SQLite and on
+    # Postgres are two different things to compare against.
+    synapse) echo "$("$VENV/bin/python" -c 'import synapse; print("synapse", synapse.__version__)') on $([ -n "${BENCH_PG_URL:-}" ] && echo postgres || echo sqlite)" ;;
     # Dendrite prints "0.15.2+e546df2" (tag plus commit) with no name.
     dendrite) echo "dendrite $("$BIN/dendrite" --version 2>/dev/null | head -1 || echo unknown)" ;;
     *) "$BIN/$1" --version 2>/dev/null | head -1 ;;

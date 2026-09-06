@@ -1,0 +1,177 @@
+{
+  "base_url": "http://127.0.0.1:8098",
+  "benchmarks": {
+    "context_deep/200": {
+      "lower_ns": 3373251.0,
+      "mean_ns": 3428013.0,
+      "samples": 25,
+      "upper_ns": 3550973.0
+    },
+    "context_deep/3200": {
+      "lower_ns": 3376407.0,
+      "mean_ns": 3440767.0,
+      "samples": 25,
+      "upper_ns": 3735218.0
+    },
+    "context_deep/800": {
+      "lower_ns": 3306335.0,
+      "mean_ns": 3366408.0,
+      "samples": 25,
+      "upper_ns": 3652912.0
+    },
+    "join/200": {
+      "lower_ns": 23745646.0,
+      "mean_ns": 25894002.0,
+      "samples": 25,
+      "upper_ns": 30058886.0
+    },
+    "join/3200": {
+      "lower_ns": 23063628.0,
+      "mean_ns": 27597303.0,
+      "samples": 25,
+      "upper_ns": 32097489.0
+    },
+    "join/800": {
+      "lower_ns": 23058394.0,
+      "mean_ns": 25398990.0,
+      "samples": 25,
+      "upper_ns": 30288141.0
+    },
+    "messages_page/200": {
+      "lower_ns": 4432344.0,
+      "mean_ns": 4709003.0,
+      "samples": 25,
+      "upper_ns": 4958821.0
+    },
+    "messages_page/3200": {
+      "lower_ns": 4564142.0,
+      "mean_ns": 4984589.0,
+      "samples": 25,
+      "upper_ns": 5427559.0
+    },
+    "messages_page/800": {
+      "lower_ns": 4312761.0,
+      "mean_ns": 4706288.0,
+      "samples": 25,
+      "upper_ns": 7902477.0
+    },
+    "send/200": {
+      "lower_ns": 14479308.0,
+      "mean_ns": 15882778.0,
+      "samples": 25,
+      "upper_ns": 17885631.0
+    },
+    "send/3200": {
+      "lower_ns": 14759394.0,
+      "mean_ns": 17056548.0,
+      "samples": 25,
+      "upper_ns": 19656078.0
+    },
+    "send/800": {
+      "lower_ns": 14900911.0,
+      "mean_ns": 15942813.0,
+      "samples": 25,
+      "upper_ns": 21373489.0
+    },
+    "sliding_window/200": {
+      "lower_ns": 4053426.0,
+      "mean_ns": 4128547.0,
+      "samples": 25,
+      "upper_ns": 4342968.0
+    },
+    "sliding_window/3200": {
+      "lower_ns": 5285117.0,
+      "mean_ns": 5378273.0,
+      "samples": 25,
+      "upper_ns": 5640644.0
+    },
+    "sliding_window/800": {
+      "lower_ns": 4383073.0,
+      "mean_ns": 4466008.0,
+      "samples": 25,
+      "upper_ns": 4898950.0
+    },
+    "state/200": {
+      "lower_ns": 1499930.0,
+      "mean_ns": 1538433.0,
+      "samples": 25,
+      "upper_ns": 1658799.0
+    },
+    "state/3200": {
+      "lower_ns": 1523183.0,
+      "mean_ns": 1559311.0,
+      "samples": 25,
+      "upper_ns": 1680229.0
+    },
+    "state/800": {
+      "lower_ns": 1446811.0,
+      "mean_ns": 1480364.0,
+      "samples": 25,
+      "upper_ns": 1631658.0
+    },
+    "sync_delta/200": {
+      "lower_ns": 5043371.0,
+      "mean_ns": 5548938.0,
+      "samples": 25,
+      "upper_ns": 5957504.0
+    },
+    "sync_delta/3200": {
+      "lower_ns": 5012467.0,
+      "mean_ns": 5712368.0,
+      "samples": 25,
+      "upper_ns": 6342580.0
+    },
+    "sync_delta/800": {
+      "lower_ns": 5097571.0,
+      "mean_ns": 5683990.0,
+      "samples": 25,
+      "upper_ns": 6437832.0
+    },
+    "sync_initial/200": {
+      "lower_ns": 2237402.0,
+      "mean_ns": 2277838.0,
+      "samples": 25,
+      "upper_ns": 3003749.0
+    },
+    "sync_initial/3200": {
+      "lower_ns": 2278872.0,
+      "mean_ns": 2376716.0,
+      "samples": 25,
+      "upper_ns": 2604931.0
+    },
+    "sync_initial/800": {
+      "lower_ns": 2240639.0,
+      "mean_ns": 2280012.0,
+      "samples": 25,
+      "upper_ns": 2449780.0
+    },
+    "sync_poll/200": {
+      "lower_ns": 2255387.0,
+      "mean_ns": 2310810.0,
+      "samples": 25,
+      "upper_ns": 2492381.0
+    },
+    "sync_poll/3200": {
+      "lower_ns": 2356909.0,
+      "mean_ns": 2401542.0,
+      "samples": 25,
+      "upper_ns": 2555781.0
+    },
+    "sync_poll/800": {
+      "lower_ns": 2304218.0,
+      "mean_ns": 2348801.0,
+      "samples": 25,
+      "upper_ns": 2524319.0
+    }
+  },
+  "clients": null,
+  "dimension": "events",
+  "round": 2,
+  "samples": 25,
+  "server": "synapse",
+  "sizes": [
+    200,
+    800,
+    3200
+  ]
+}
