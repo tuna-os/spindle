@@ -6689,7 +6689,7 @@ async fn rtc_transports_endpoint(
 /// throughout and `signing.rs` says why; this is not Matrix's encoding, it is
 /// coturn's, and coturn compares against the padded string.
 fn turn_credential(secret: &str, username: &str) -> String {
-    use hmac::Mac;
+    use hmac::{KeyInit, Mac};
     let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(secret.as_bytes())
         .expect("hmac accepts any key length");
     mac.update(username.as_bytes());

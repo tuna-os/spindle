@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use hmac::Mac as _;
+use hmac::{KeyInit as _, Mac as _};
 use serde_json::{Value, json};
 use spindle_store::FjallStore;
 use tempfile::TempDir;

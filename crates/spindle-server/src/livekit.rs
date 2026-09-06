@@ -44,7 +44,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
-use hmac::Mac as _;
+use hmac::{KeyInit as _, Mac as _};
 use serde::Deserialize;
 use serde_json::{Value, json};
 

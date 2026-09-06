@@ -280,3 +280,33 @@ fn refresh_tokens_are_not_stored_in_a_form_that_could_be_replayed() {
     );
     assert!(accounts.refresh(&refresh).is_ok(), "and it still works");
 }
+
+/// A hash written by an earlier build must keep verifying after a crate
+/// upgrade, or every user is locked out by a dependency bump nobody
+/// announced. The PHC string below was produced by `argon2` 0.5.3 for the
+/// password `correct horse`, and is planted straight into the store the way an
+/// old row would sit there.
+#[test]
+fn a_password_hash_written_by_an_older_argon2_still_verifies() {
+    use spindle_core::keys::{Keyspace, room_prefix};
+    use spindle_store::Store as _;
+
+    const LEGACY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c3BpbmRsZS1sZWdhY3kwMQ$VLrVX6o/hveBAvrredSvthJm6CRAr4A9nuYZ4aL0/uk";
+
+    let (_dir, store) = store();
+    let accounts = Accounts::new(&store, "example.org");
+
+    let row = serde_json::json!({
+        "localpart": "legacy",
+        "password_hash": LEGACY_HASH,
+    });
+    store
+        .put(
+            &room_prefix(Keyspace::Account, "legacy"),
+            &serde_json::to_vec(&row).unwrap(),
+        )
+        .unwrap();
+
+    assert!(accounts.verify_password("legacy", "correct horse").unwrap());
+    assert!(!accounts.verify_password("legacy", "wrong horse").unwrap());
+}
