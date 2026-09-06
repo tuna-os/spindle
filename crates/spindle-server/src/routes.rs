@@ -6233,7 +6233,10 @@ fn sliding_room_entry(
             .map_err(room_error)?
     };
     let timeline = crate::sliding::Timeline {
-        events,
+        events: events
+            .into_iter()
+            .map(|event| with_transaction_id(state, identity, event))
+            .collect(),
         limited,
         prev_batch: prev_batch.map(|li| crate::tokens::Pagination(li).to_string()),
     };
@@ -6660,6 +6663,21 @@ fn sync_leave(
     leave
 }
 
+/// A joined room's timeline events as this device may see them: the
+/// client's timeline filter applied, and its own transaction IDs on the
+/// events it sent.
+fn sync_timeline(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    room_filter: Option<&crate::filters::RoomFilter>,
+    events: Vec<Value>,
+) -> Vec<Value> {
+    crate::filters::Filter::apply(room_filter.and_then(|room| room.timeline.as_ref()), events)
+        .into_iter()
+        .map(|event| with_transaction_id(state, identity, event))
+        .collect()
+}
+
 /// A sync `timeline` block. `prev_batch` is where the window begins, as
 /// the token `/messages?dir=b` pages back from (#331); absent only for an
 /// empty window, since a client with no token cannot page back at all.
@@ -6741,10 +6759,7 @@ fn sync_join(
             .map_err(|error| account_data_error(&error))?;
         let typing = state.typing.event(&room.room_id);
         let room_filter = filter.map(|filter| &filter.room);
-        let events = crate::filters::Filter::apply(
-            room_filter.and_then(|room| room.timeline.as_ref()),
-            room.events,
-        );
+        let events = sync_timeline(state, identity, room_filter, room.events);
         let mut room_state = crate::filters::Filter::apply(
             room_filter.and_then(|room| room.state.as_ref()),
             room.state,
@@ -7474,7 +7489,7 @@ async fn room_threads(
 
     let chunk: Vec<Value> = roots
         .into_iter()
-        .map(|root| with_bundle(&state, &room_id, &identity.user_id, root))
+        .map(|root| as_seen_by(&state, &room_id, &identity, root))
         .collect();
 
     let mut body = serde_json::Map::new();
@@ -7661,12 +7676,7 @@ async fn room_event(
         .and_then(|reader| reader.event(&event_id))
         .map_err(room_error)?
         .ok_or_else(|| MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such event"))?;
-    Ok(Json(with_bundle(
-        &state,
-        &room_id,
-        &identity.user_id,
-        event,
-    )))
+    Ok(Json(as_seen_by(&state, &room_id, &identity, event)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -7698,9 +7708,17 @@ async fn room_context(
         .map_err(room_error)?;
 
     Ok(Json(json!({
-        "event": with_bundle(&state, &room_id, &identity.user_id, context.event),
-        "events_before": context.events_before,
-        "events_after": context.events_after,
+        "event": as_seen_by(&state, &room_id, &identity, context.event),
+        "events_before": context
+            .events_before
+            .into_iter()
+            .map(|event| with_transaction_id(&state, &identity, event))
+            .collect::<Vec<_>>(),
+        "events_after": context
+            .events_after
+            .into_iter()
+            .map(|event| with_transaction_id(&state, &identity, event))
+            .collect::<Vec<_>>(),
         "state": context.state,
         // The same `t`-tagged tokens `/messages` pages with, because they are
         // positions in the same index -- so a client can carry on paginating
@@ -7790,7 +7808,69 @@ fn with_transaction(
     let event_id = mint()?;
     spindle_store::Store::put(state.store.as_ref(), &key, event_id.as_bytes())
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    // The inverse row, so the event comes back to this device with the
+    // transaction ID it chose: that is how a client matches the remote
+    // echo to the local one it is still showing.
+    spindle_store::Store::put(
+        state.store.as_ref(),
+        &spindle_core::keys::transaction_echo(&identity.user_id, &event_id),
+        &spindle_core::keys::transaction_echo_value(&identity.device_id, txn_id),
+    )
+    .map_err(|error| MatrixError::internal(&error.to_string()))?;
     Ok(Json(json!({ "event_id": event_id })))
+}
+
+/// Stamp `unsigned.transaction_id` on an event the reading device sent.
+///
+/// The spec scopes it to the device: the same user on another device gets
+/// no `transaction_id`, since that device never chose one and a client
+/// that sees one it did not send would try to match a local echo it does
+/// not have.
+fn with_transaction_id(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    mut event: Value,
+) -> Value {
+    let Some(event_id) = event["event_id"].as_str() else {
+        return event;
+    };
+    if event["sender"].as_str() != Some(identity.user_id.as_str()) {
+        return event;
+    }
+    let key = spindle_core::keys::transaction_echo(&identity.user_id, event_id);
+    let Ok(Some(raw)) = spindle_store::ReadView::get(state.store.as_ref(), &key) else {
+        return event;
+    };
+    let Some((device_id, txn_id)) = spindle_core::keys::transaction_echo_parts(&raw) else {
+        return event;
+    };
+    if device_id != identity.device_id {
+        return event;
+    }
+    if let Some(unsigned) = event.as_object_mut().and_then(|object| {
+        object
+            .entry("unsigned")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+    }) {
+        unsigned.insert("transaction_id".to_owned(), Value::String(txn_id));
+    }
+    event
+}
+
+/// An event as the reading device sees it: its own transaction ID, and
+/// the relations bundled on it.
+fn as_seen_by(
+    state: &AppState,
+    room_id: &str,
+    identity: &crate::accounts::Identity,
+    event: Value,
+) -> Value {
+    with_transaction_id(
+        state,
+        identity,
+        with_bundle(state, room_id, &identity.user_id, event),
+    )
 }
 
 async fn send_event(
@@ -7909,7 +7989,7 @@ async fn room_messages(
             if let Some(object) = json.as_object_mut() {
                 object.insert("event_id".to_owned(), json!(event.event_id));
             }
-            with_bundle(&state, &room_id, &identity.user_id, json)
+            as_seen_by(&state, &room_id, &identity, json)
         })
         .collect();
 
@@ -8528,7 +8608,7 @@ async fn search(
                 object.insert("event_id".to_owned(), json!(hit.event.event_id));
                 object.insert("room_id".to_owned(), json!(hit.room_id));
             }
-            let event = with_bundle(&state, &hit.room_id, &identity.user_id, event);
+            let event = as_seen_by(&state, &hit.room_id, &identity, event);
             let mut result = json!({ "rank": 1.0, "result": event });
             if let Some(wanted) = &criteria.event_context
                 && let Some(scope) = scopes.get(&hit.room_id)

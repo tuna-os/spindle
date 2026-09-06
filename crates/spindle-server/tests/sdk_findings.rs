@@ -365,3 +365,131 @@ async fn a_room_created_with_an_alias_names_it_as_canonical() {
         "{canonical}"
     );
 }
+
+/// The device that sent an event reads it back with the transaction ID it
+/// chose, in `unsigned`, everywhere the event is served; nobody else does,
+/// the same user's other device included.
+///
+/// matrix-rust-sdk matches the remote echo to the local one it is still
+/// showing by this field. Without it the local echo is never replaced,
+/// and an edit aimed at it fails with `EventNotInTimeline`
+/// (`test_stale_local_echo_time_abort_edit`).
+#[tokio::test]
+async fn the_sending_device_reads_its_transaction_id_back_and_nobody_else_does() {
+    let server = Harness::new();
+    let alice = server.register("alice").await;
+    let bob = server.register("bob").await;
+    let (status, body) = server
+        .post(
+            "/_matrix/client/v3/createRoom",
+            &alice,
+            &json!({ "preset": "public_chat" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = server
+        .post(
+            &format!("/_matrix/client/v3/rooms/{room}/join"),
+            &bob,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let alice_phone = second_device(&server, "alice").await;
+
+    let (status, body) = server
+        .put(
+            &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/txn-hello"),
+            &alice,
+            &json!({ "msgtype": "m.text", "body": "hi!" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let event_id = body["event_id"].as_str().unwrap().to_owned();
+
+    let txn_in_sync = |sync: &Value| -> Value {
+        transaction_id_of(
+            &sync["rooms"]["join"][&room]["timeline"]["events"],
+            &event_id,
+        )
+    };
+    let sync = server.sync(&alice, "?timeout=0").await;
+    assert_eq!(txn_in_sync(&sync), json!("txn-hello"), "{sync}");
+    let sync = server.sync(&alice_phone, "?timeout=0").await;
+    assert!(txn_in_sync(&sync).is_null(), "{sync}");
+    let sync = server.sync(&bob, "?timeout=0").await;
+    assert!(txn_in_sync(&sync).is_null(), "{sync}");
+
+    // The same on the other reads a client replaces a local echo from.
+    let (status, body) = server
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=5"),
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        transaction_id_of(&body["chunk"], &event_id),
+        json!("txn-hello")
+    );
+
+    let (status, body) = server
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/event/{event_id}"),
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["unsigned"]["transaction_id"], json!("txn-hello"));
+
+    let (status, body) = server
+        .post(
+            "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync",
+            &alice,
+            &json!({ "lists": { "all": { "ranges": [[0, 9]], "timeline_limit": 5 } } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        transaction_id_of(&body["rooms"][&room]["timeline"], &event_id),
+        json!("txn-hello")
+    );
+}
+
+/// The `unsigned.transaction_id` on the event with `event_id` in a list
+/// of events, `Null` when there is none or the event is not there.
+fn transaction_id_of(events: &Value, event_id: &str) -> Value {
+    events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["event_id"] == event_id)
+        .map_or(Value::Null, |event| {
+            event["unsigned"]["transaction_id"].clone()
+        })
+}
+
+/// A second login for a registered user: another device, another token.
+async fn second_device(server: &Harness, username: &str) -> String {
+    let (status, body) = server
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/_matrix/client/v3/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "type": "m.login.password",
+                        "identifier": { "type": "m.id.user", "user": username },
+                        "password": "hunter2",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["access_token"].as_str().unwrap().to_owned()
+}
