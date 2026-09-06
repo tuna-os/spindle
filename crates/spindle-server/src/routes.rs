@@ -3861,12 +3861,11 @@ async fn leave_remote(state: &AppState, user_id: &str, room_id: &str, origin: Op
 struct MembersQuery {
     membership: Option<String>,
     not_membership: Option<String>,
-    /// A sync token. Accepted and not yet honoured: the roster returned is
-    /// the room's present (or, for a former member, the one at their
-    /// departure), which is what every client that sends `at` sends it
-    /// for -- the token it just synced to, where present and requested
-    /// coincide. Recorded here rather than silently dropped.
-    #[allow(dead_code)]
+    /// A sync token: the roster as it stood when that token was issued,
+    /// rather than the room's present. The two differ whenever someone
+    /// joined after the client's last sync, and an E2EE client that shares
+    /// a room key with the present roster then encrypts for a device its
+    /// sync never told it about.
     at: Option<String>,
 }
 
@@ -3883,11 +3882,31 @@ async fn room_members(
     axum::extract::Path(room_id): axum::extract::Path<String>,
     axum::extract::Query(query): axum::extract::Query<MembersQuery>,
 ) -> Result<Json<Value>, MatrixError> {
-    let events = state
+    let at = query
+        .at
+        .as_deref()
+        .map(|token| {
+            token
+                .parse::<crate::tokens::Sync>()
+                .map(|token| token.0)
+                .map_err(|error| {
+                    MatrixError::new(
+                        StatusCode::BAD_REQUEST,
+                        "M_INVALID_PARAM",
+                        error.to_string(),
+                    )
+                })
+        })
+        .transpose()?;
+    let reader = state
         .rooms
         .reader(&identity.user_id, &room_id)
-        .and_then(|reader| reader.members())
         .map_err(room_error)?;
+    let events = match at {
+        Some(position) => reader.members_at(position),
+        None => reader.members(),
+    }
+    .map_err(room_error)?;
     let chunk: Vec<Value> = events
         .into_iter()
         .filter(|event| {

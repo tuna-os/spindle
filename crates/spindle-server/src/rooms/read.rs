@@ -274,7 +274,37 @@ impl RoomReader<'_> {
     /// Returns [`RoomError`] if the room is unknown or its state cannot be
     /// read.
     pub fn members(&self) -> Result<Vec<Value>, RoomError> {
-        match self.scope.bound() {
+        self.members_bounded(self.scope.bound())
+    }
+
+    /// The room's `m.room.member` events as they stood when sync token
+    /// `position` was issued, as this caller may see them.
+    ///
+    /// The `at` of `GET /members`. A client sends the token it just
+    /// synced to and expects a roster that agrees with that sync: nobody
+    /// who joined after the token, everybody who was in before it. An
+    /// E2EE client shares a room key with exactly this roster, so a
+    /// roster newer than the token hands a key to a device the sync never
+    /// mentioned, and the sync it did mention it in cannot be decrypted.
+    /// A former member's own bound still applies on top: the token is not
+    /// a way past what they were entitled to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room is unknown or its state cannot be
+    /// read.
+    pub fn members_at(&self, position: u64) -> Result<Vec<Value>, RoomError> {
+        let Some(at) = self.rooms.li_at_stream(&self.room_id, position)? else {
+            // Nothing of the room's had entered the stream by that token:
+            // it had no members the client could have been told about.
+            return Ok(Vec::new());
+        };
+        let bound = self.scope.bound().map_or(at, |bound| bound.min(at));
+        self.members_bounded(Some(bound))
+    }
+
+    fn members_bounded(&self, bound: Option<i64>) -> Result<Vec<Value>, RoomError> {
+        match bound {
             None => self.rooms.state_where(&self.room_id, |key| {
                 key.event_type().as_str() == "m.room.member"
             }),

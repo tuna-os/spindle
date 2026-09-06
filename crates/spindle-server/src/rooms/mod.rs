@@ -3452,6 +3452,39 @@ impl Rooms {
         Ok(out)
     }
 
+    /// Where the room stood when the server handed out sync token
+    /// `position`: the room's own index of its newest event at or before
+    /// that stream position, or `None` if nothing of the room's had entered
+    /// the stream by then.
+    ///
+    /// A client that asks for the roster "as of" a token it synced to is
+    /// asking this question, and the answer has to come from the same
+    /// index the sync answered from ([`Self::room_slice`]) or the two
+    /// disagree at exactly the moment a member joins: the sync says the
+    /// event is after the token, the roster says they are in. The room's
+    /// rows are in stream order, so this is a scan to the token and one
+    /// step back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the index cannot be read.
+    pub fn li_at_stream(&self, room_id: &str, position: u64) -> Result<Option<i64>, RoomError> {
+        let rows = spindle_store::ReadView::scan_prefix(
+            self.store.as_ref(),
+            &spindle_core::keys::room_stream_prefix(room_id),
+        )?;
+        let mut last = None;
+        for (key, raw) in rows {
+            if spindle_core::keys::room_stream_from_key(&key).is_some_and(|id| id > position) {
+                break;
+            }
+            if let Ok(bytes) = <[u8; 8]>::try_from(raw.as_slice()) {
+                last = Some(i64::from_be_bytes(bytes));
+            }
+        }
+        Ok(last)
+    }
+
     /// The events a room contributed to a stream range, as bodies.
     ///
     /// Takes the room's own indices rather than finding them, so the caller
