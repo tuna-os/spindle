@@ -42,7 +42,9 @@ done
 
 version_of() {
   case $1 in
-    spindle) ./target/release/spindle --version 2>/dev/null | head -1 ;;
+    # The server takes a config path and nothing else, so its version is the
+    # tree it was built from: the crate version and the commit.
+    spindle) echo "spindle $(grep -m1 '^version' crates/spindle-server/Cargo.toml | cut -d'"' -f2) @ $(git rev-parse --short=12 HEAD)" ;;
     synapse) "$VENV/bin/python" -c 'import synapse; print("synapse", synapse.__version__)' ;;
     dendrite) echo "dendrite $(cat "$BIN/dendrite.tag" 2>/dev/null || echo unknown)" ;;
     *) "$BIN/$1" --version 2>/dev/null | head -1 ;;
