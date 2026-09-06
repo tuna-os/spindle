@@ -65,10 +65,11 @@ be made sound. We ask for a coordinated window of up to **90 days** from
 acknowledgement before details are published, shorter once the fix has
 landed.
 
-There are no tagged releases yet (#308), so "fixed in" names a commit on
-`main`, and `main` is the only supported line: a deployment tracking
-anything older is not supported. When releases exist, the advisory will
-name the fixed version as well.
+Releases are weekly `v0.0.x` prereleases cut from `main` (see
+`docs/releasing.md`), so an advisory names the commit that fixed the
+problem and the first tag carrying it. `main` is the only supported line:
+a deployment tracking anything older is not supported, and a prerelease
+tag is a name for a build rather than a line that receives fixes.
 
 ## Scope
 
