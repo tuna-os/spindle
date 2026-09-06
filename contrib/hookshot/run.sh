@@ -20,10 +20,14 @@
 #   2. the bot joins a room it is invited to (an inbound transaction
 #      carried the invite, the bridge acted on it through the client API
 #      with its as_token)
-#   3. `!hookshot webhook ci` gets an answer naming a URL
+#   3. `!hookshot webhook ci` gets an answer: the bot opens an admin room,
+#      invites alice into it, and hands over the webhook URL there (its
+#      real flow; the URL is a secret and the bridged room may be public)
 #   4. a POST to that URL lands in the room as a message from the
 #      webhook's ghost user, `@_webhook_ci:<server>`, a user the bridge
 #      minted in its exclusive namespace
+#   5. the bridge restarted comes back with the connection it stored as
+#      room state on the homeserver, and the same URL still routes
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -160,23 +164,41 @@ echo "@hookshot:$SERVER_NAME is joined"
 step "alice asks for a webhook"
 curl -s -X PUT "$S/_matrix/client/v3/rooms/$ROOM/send/m.room.message/cmd1" -H "authorization: Bearer $TOK" \
   -H 'content-type: application/json' -d '{"msgtype":"m.text","body":"!hookshot webhook ci"}' >/dev/null
-URL=""
-for _ in $(seq 1 60); do
-  MSGS="$(curl -s "$S/_matrix/client/v3/rooms/$ROOM/messages?dir=b&limit=20" -H "authorization: Bearer $TOK")"
-  URL="$(echo "$MSGS" | python3 -c '
+# The bot answers by opening an admin room and inviting alice into it;
+# the invite shows up in her sync. Join every room the bot invites her to
+# and look for the URL in all of them, the bridged room included.
+find_url() {
+  python3 -c '
 import sys, json, re
 d = json.load(sys.stdin)
 for e in d.get("chunk", []):
     if e.get("sender", "").startswith("@hookshot:") and e.get("type") == "m.room.message":
-        m = re.search(r"https?://[^\s\"<>]+/webhook/[A-Za-z0-9_-]+", e["content"].get("body", "") + " " + e["content"].get("formatted_body", ""))
+        c = e["content"]
+        m = re.search(r"https?://[^\s\"<>]+/webhook/[A-Za-z0-9_-]+", c.get("body", "") + " " + c.get("formatted_body", ""))
         if m:
             print(m.group(0)); break
-')"
-  [[ -n $URL ]] && break
+'
+}
+URL=""
+ADMIN_ROOMS=()
+for _ in $(seq 1 90); do
+  SYNC="$(curl -s "$S/_matrix/client/v3/sync?timeout=0" -H "authorization: Bearer $TOK")"
+  for invited in $(echo "$SYNC" | python3 -c 'import sys,json; print(" ".join(json.load(sys.stdin).get("rooms",{}).get("invite",{}).keys()))'); do
+    curl -s -X POST "$S/_matrix/client/v3/join/$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$invited")" \
+      -H "authorization: Bearer $TOK" -H 'content-type: application/json' -d '{}' >/dev/null
+    ADMIN_ROOMS+=("$invited")
+    echo "joined the room the bot opened: $invited"
+  done
+  for r in "$ROOM" "${ADMIN_ROOMS[@]:-}"; do
+    [[ -n $r ]] || continue
+    MSGS="$(curl -s "$S/_matrix/client/v3/rooms/$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$r")/messages?dir=b&limit=30" -H "authorization: Bearer $TOK")"
+    URL="$(echo "$MSGS" | find_url)"
+    [[ -n $URL ]] && break 2
+  done
   sleep 0.5
 done
-[[ -n $URL ]] || { echo "no webhook URL in the bot's answer; last messages: $(echo "$MSGS" | head -c 600)" >&2; docker logs "$container" | tail -40 >&2; exit 1; }
-echo "the bot answered with $URL"
+[[ -n $URL ]] || { echo "no webhook URL from the bot; last messages: $(echo "$MSGS" | head -c 600)" >&2; docker logs "$container" | tail -40 >&2; exit 1; }
+echo "the bot handed over $URL"
 
 # --- the outside world knocks -------------------------------------------------
 step "a webhook fires into the room"
@@ -199,6 +221,26 @@ done
 echo "the message arrived from $landed"
 case "$landed" in
   "@_webhook_"*":$SERVER_NAME") echo "a ghost in the bridge's exclusive namespace, minted by the bridge" ;;
-  *) echo "sent by $landed, not a namespace ghost" ;;
+  *) echo "sent by $landed, not a namespace ghost" >&2; exit 1 ;;
 esac
+
+# --- the bridge restarts, and remembers ----------------------------------------
+step "the bridge restarts and the same URL still routes"
+docker restart "$container" >/dev/null
+for _ in $(seq 1 120); do curl -s -o /dev/null "http://127.0.0.1:9000/" && break; sleep 1; done
+CODE=""
+for _ in $(seq 1 30); do
+  CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL" -H 'content-type: application/json' -d '{"text":"still here after a restart"}')"
+  [[ $CODE == 2* ]] && break
+  sleep 1
+done
+echo "POST after restart -> $CODE"
+again=""
+for _ in $(seq 1 60); do
+  MSGS="$(curl -s "$S/_matrix/client/v3/rooms/$ROOM/messages?dir=b&limit=20" -H "authorization: Bearer $TOK")"
+  echo "$MSGS" | grep -q "still here after a restart" && again=yes && break
+  sleep 0.5
+done
+[[ -n $again ]] || { echo "after the restart the webhook no longer reaches the room" >&2; docker logs "$container" | tail -60 >&2; exit 1; }
+echo "the connection survived the restart: it was stored as room state on the homeserver"
 echo "hookshot bridge: ok"
