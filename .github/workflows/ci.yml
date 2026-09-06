@@ -61,6 +61,23 @@ jobs:
       - name: Check the dashboard matches the router
         run: python3 scripts/coverage-dashboard.py --check
 
+      # The spec-gaps page is generated from the router and the pinned
+      # matrix-spec, so a route added or a pin bumped without regenerating
+      # it cannot merge. The OpenAPI step above already fetched the spec.
+      - name: Check the spec-gaps page matches the router and the pin
+        run: python3 scripts/spec-drift.py --check
+
+      # The MSC ledger is the one place that says what of the proposals is
+      # served. A flag advertised or an unstable route served without a
+      # served entry, or a served entry with no test naming the MSC, fails.
+      - name: Check the MSC ledger against /versions, the router and the tests
+        run: python3 scripts/msc-ledger.py --check
+
+      # The weekly upkeep report reads every hand-pinned upstream from the
+      # file that uses it; a renamed variable would drop one silently.
+      - name: Check every upstream pin can still be read
+        run: python3 scripts/upstream-pins.py --check
+
       # The Complement ratchet decides whether a conformance regression can
       # merge, and its output is what somebody reads when one does. Both are
       # worth a test: #228 is a case where the gate was right, and #231 one

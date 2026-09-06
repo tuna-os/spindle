@@ -1,4 +1,5 @@
-//! Redaction.
+//! Redaction, under room version 11's algorithm (MSC3820, with MSC2174's
+//! `redacts` in content).
 //!
 //! Two things this file is really about.
 //!
