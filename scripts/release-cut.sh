@@ -37,9 +37,16 @@ fi
 # finished without failing (a skipped nightly-only job is fine), and the
 # quality gate must be among the ones that passed: a commit with no checks
 # at all is one CI has not looked at, not one it approved.
+#
+# This workflow's own jobs are check runs on the same commit, and the one
+# running this script is "in progress" by definition (run 34053330372
+# declined its own release that way), so runs belonging to this workflow
+# run are left out of the verdict.
 if [ -n "${GH_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
+  own="/runs/${GITHUB_RUN_ID:-none}/"
   gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs?per_page=100" --paginate \
-    --jq '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv' > checks.tsv
+    --jq --arg own "$own" '.check_runs[] | select((.html_url // "") | contains($own) | not)
+      | [.name, .status, (.conclusion // "")] | @tsv' > checks.tsv
   if ! grep -Pq '^Rust quality gate\tcompleted\tsuccess$' checks.tsv; then
     echo "The Rust quality gate has not passed on ${sha}; not releasing it."
     cat checks.tsv
