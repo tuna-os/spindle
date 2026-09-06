@@ -166,8 +166,15 @@ TestProfileDisplayName/PUT_/profile/:user_id/displayname_sets_my_name
 TestPushRuleCacheHealth
 TestRedact
 TestRedact/Event_content_is_redacted
-TestRegistration
-TestRegistration/parallel
+# Demoted, deliberately, in #396: TestRegistration/parallel/
+# Registration_without_a_session_fails expects an auth dict naming the
+# dummy stage and no session to be refused with 401. matrix-rust-sdk, the
+# library under Element X, registers exactly that way, and Complement skips
+# this test on Synapse, Dendrite and Conduit because all three accept it.
+# Between a check the reference implementation itself fails and a client
+# that cannot register otherwise, the client wins; the two parents leave
+# with it because a parent fails when any child does, and every other
+# TestRegistration subtest stays protected on its own line.
 TestRegistration/parallel/GET_/register/available_returns_M_INVALID_USERNAME_for_invalid_user_name
 TestRegistration/parallel/GET_/register/available_returns_M_USER_IN_USE_for_registered_user_name
 TestRegistration/parallel/GET_/register/available_returns_available_for_unregistered_user_name
@@ -186,7 +193,6 @@ TestRegistration/parallel/POST_/register_rejects_usernames_with_special_characte
 TestRegistration/parallel/POST_/register_returns_the_same_device_id_as_that_in_the_request
 TestRegistration/parallel/POST_{}_returns_a_set_of_flows
 TestRegistration/parallel/Registration_accepts_non-ascii_passwords
-TestRegistration/parallel/Registration_without_a_session_fails
 TestRelations
 TestRemoteAliasRequestsUnderstandUnicode
 TestRemotePngThumbnail/test_/_matrix/client/v1/media_endpoint
@@ -335,3 +341,5 @@ TestKnockingInMSC3787Room/Knocking_on_a_room_with_a_join_rule_other_than_'knock'
 TestKnockingInMSC3787Room/Knocking_on_a_room_with_join_rule_'knock'_should_succeed#01
 TestKnockingInMSC3787Room/Users_in_the_room_see_a_user's_membership_update_when_they_knock
 TestKnockingInMSC3787Room/Users_in_the_room_see_a_user's_membership_update_when_they_knock#01
+TestRoomState/Parallel/GET_/rooms/:room_id/joined_members_is_forbidden_after_leaving_room
+TestSync/parallel/Newly_joined_room_has_correct_timeline_in_incremental_sync
