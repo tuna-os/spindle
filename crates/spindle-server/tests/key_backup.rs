@@ -658,3 +658,117 @@ async fn deletes_trim_exactly_the_named_scope() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["errcode"], json!("M_WRONG_ROOM_KEYS_VERSION"));
 }
+
+/// Signing another user's master key is a device-list change for that
+/// user, and the signature is the signer's alone to see.
+///
+/// matrix-rust-sdk marks an identity verified from the signatures it reads
+/// back on the master key, and it reads them back only when a sync names
+/// the user in `device_lists.changed`. A server that stored the signature
+/// and told nobody left the SDK's `test_mutual_sas_verification` with a
+/// completed SAS and an unverified identity.
+#[tokio::test]
+async fn signing_another_users_key_is_a_device_list_change_the_signer_alone_can_read() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let carol = harness.register("carol").await;
+
+    // Alice and Bob share a room, which is what makes Bob's device-list
+    // changes Alice's business.
+    let (status, body) = harness
+        .send(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            &alice.token,
+            &json!({ "preset": "public_chat" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room_id = body["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = harness
+        .send(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+            &bob.token,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = harness
+        .send(
+            "POST",
+            "/_matrix/client/v3/keys/device_signing/upload",
+            &bob.token,
+            &json!({ "master_key": {
+                "user_id": "@bob:example.org",
+                "usage": ["master"],
+                "keys": { "ed25519:bobmaster": "bm" },
+            } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Alice syncs past Bob's key upload; the token is her `since`.
+    let (status, sync) = harness
+        .get("/_matrix/client/v3/sync?timeout=0", &alice.token)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{sync}");
+    let since = sync["next_batch"].as_str().unwrap().to_owned();
+
+    // Alice signs Bob's master key with her user-signing key.
+    let (status, body) = harness
+        .send(
+            "POST",
+            "/_matrix/client/v3/keys/signatures/upload",
+            &alice.token,
+            &json!({ "@bob:example.org": { "bobmaster": {
+                "user_id": "@bob:example.org",
+                "usage": ["master"],
+                "keys": { "ed25519:bobmaster": "bm" },
+                "signatures": { "@alice:example.org": { "ed25519:aliceuser": "alice-says-so" } },
+            } } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["failures"].as_object().unwrap().is_empty(), "{body}");
+
+    // Her next sync names Bob as changed, so her client re-queries him.
+    let (status, sync) = harness
+        .get(
+            &format!("/_matrix/client/v3/sync?timeout=0&since={since}"),
+            &alice.token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{sync}");
+    let changed = sync["device_lists"]["changed"].as_array().unwrap();
+    assert!(changed.contains(&json!("@bob:example.org")), "{sync}");
+
+    let harness = &harness;
+    let master_key_as_seen_by = |token: String| async move {
+        let (status, queried) = harness
+            .send(
+                "POST",
+                "/_matrix/client/v3/keys/query",
+                &token,
+                &json!({ "device_keys": { "@bob:example.org": [] } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{queried}");
+        queried["master_keys"]["@bob:example.org"].clone()
+    };
+
+    // Alice reads her own signature back; Carol, and Bob himself, do not:
+    // whom Alice has verified is Alice's business.
+    let seen_by_alice = master_key_as_seen_by(alice.token.clone()).await;
+    assert_eq!(
+        seen_by_alice["signatures"]["@alice:example.org"]["ed25519:aliceuser"],
+        json!("alice-says-so")
+    );
+    for token in [carol.token.clone(), bob.token.clone()] {
+        let seen = master_key_as_seen_by(token).await;
+        assert_eq!(seen["keys"]["ed25519:bobmaster"], json!("bm"), "{seen}");
+        assert!(seen["signatures"]["@alice:example.org"].is_null(), "{seen}");
+    }
+}
