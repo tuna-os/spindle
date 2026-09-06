@@ -122,6 +122,36 @@ YAML
   sed -i '0,/port: 8008/s//port: 8098/' "$BENCH/synapse/homeserver.yaml"
   # no IPv6 loopback on this host: Synapse refuses to start if ::1 cannot bind
   sed -i '/^    - ::1$/d' "$BENCH/synapse/homeserver.yaml"
+  # Postgres when BENCH_PG_URL names one, SQLite otherwise. Synapse's own
+  # documentation says SQLite is for development and Postgres for anything
+  # measured, so a sitting that wants to be fair to it runs it there: the
+  # shared-runner sittings do (bench-sitting.yml starts a container), and
+  # `just bench-pg` does the same locally. The sidecar records which, and
+  # the page says which beside the number. The database is dropped and
+  # recreated so every sitting starts cold, the way every other server does.
+  if [ -n "${BENCH_PG_URL:-}" ]; then
+    psql "$BENCH_PG_URL" -v ON_ERROR_STOP=1 -q \
+      -c "DROP DATABASE IF EXISTS synapse_bench" \
+      -c "CREATE DATABASE synapse_bench ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0"
+    "$VENV/bin/python" - "$BENCH/synapse/homeserver.yaml" "$BENCH_PG_URL" <<'PY'
+import sys
+from urllib.parse import urlparse
+import yaml
+path, url = sys.argv[1:3]
+at = urlparse(url)
+with open(path) as handle:
+    config = yaml.safe_load(handle)
+config["database"] = {
+    "name": "psycopg2",
+    "args": {
+        "user": at.username, "password": at.password, "database": "synapse_bench",
+        "host": at.hostname, "port": at.port or 5432, "cp_min": 5, "cp_max": 10,
+    },
+}
+with open(path, "w") as handle:
+    yaml.safe_dump(config, handle)
+PY
+  fi
   setsid "$VENV/bin/python" -m synapse.app.homeserver \
     --config-path "$BENCH/synapse/homeserver.yaml" > "$BENCH/synapse-run.log" 2>&1 < /dev/null &
   echo $! > "$BENCH/synapse.pid"

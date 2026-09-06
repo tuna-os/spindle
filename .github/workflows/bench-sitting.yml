@@ -64,6 +64,20 @@ jobs:
         run: scripts/bench-field.sh
       - name: Spindle, release build
         run: cargo build --release -p spindle-server --bin spindle
+      # Synapse's documentation puts SQLite down as a development database
+      # and Postgres as the one to run; a comparison that used SQLite was a
+      # floor for Synapse, not a measurement of it. One container, on
+      # loopback, and the sitting script does the rest.
+      - name: Postgres, so Synapse is measured where its own docs put it
+        run: |
+          docker run -d --name bench-pg -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench \
+            -p 127.0.0.1:5433:5432 postgres:16-alpine
+          for _ in $(seq 1 30); do
+            docker exec bench-pg pg_isready -U bench -q && break
+            sleep 1
+          done
+          docker exec bench-pg pg_isready -U bench
+          echo "BENCH_PG_URL=postgres://bench:bench@127.0.0.1:5433/postgres" >> "$GITHUB_ENV"
       - name: The sitting
         env:
           BENCH_RUNNER: github-actions/ubuntu-24.04 (shared runner)
