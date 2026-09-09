@@ -10,7 +10,7 @@
 # startup contract (TLS on 8448 from a mounted CA, a health check), which
 # an operator's image should not carry.
 
-FROM rust:1.90-bookworm AS build
+FROM rust:1.98-bookworm AS build
 WORKDIR /src
 COPY . .
 RUN cargo build --release -p spindle-server --bin spindle --locked
