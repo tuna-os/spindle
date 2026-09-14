@@ -1,0 +1,21 @@
+{
+  "group": "ci-20260914",
+  "rounds": 3,
+  "started": "2026-09-14T09:22:21Z",
+  "finished": "2026-09-14T09:50:43Z",
+  "host": {
+    "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+    "cores": 4,
+    "kernel": "6.17.0-1022-azure",
+    "runner": "github-actions/ubuntu-24.04 (shared runner)"
+  },
+  "spindle_commit": "afd740b17c5e",
+  "versions": [
+    "spindle 0.1.0 afd740b @ afd740b17c5e",
+    "synapse 1.160.0 (b=main,afd740b) on postgres",
+    "continuwuity 26.8.1 (ab3c05d)",
+    "tuwunel 1.9.0",
+    "dendrite 0.15.2+e546df2"
+  ],
+  "absent": []
+}
