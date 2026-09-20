@@ -174,6 +174,21 @@ fn import_synapse_rehearsal(
             return ExitCode::FAILURE;
         }
     }
+    if let Ok(path) = std::env::var("SPINDLE_SYNAPSE_SIGNING_KEY_FILE") {
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) => {
+                eprintln!("spindle: cannot read Synapse signing key file {path}: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(error) =
+            spindle_server::signing::ServerKey::install_synapse(store.as_ref(), &source)
+        {
+            eprintln!("spindle: cannot install Synapse signing key: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
 
     let database_password = std::env::var("SPINDLE_SYNAPSE_PASSWORD").ok();
     let mut source = match spindle_server::import::synapse::postgres::Reader::connect_no_tls(
