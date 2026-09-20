@@ -225,6 +225,51 @@ fn rooms_are_listed() {
     );
 }
 
+/// A real Synapse room exported into the four tables this reader consumes.
+///
+/// This is deliberately opt-in: CI has no production database, while an
+/// operator rehearsing a migration needs to run the exact reader and replay
+/// against real rows rather than only the synthesized fixture below. The
+/// export contains event metadata and current state, not message bodies.
+#[test]
+fn an_exported_live_room_reads_replays_and_matches_synapse_state() {
+    let (Ok(database), Ok(room_id)) = (
+        std::env::var("SPINDLE_LIVE_SYNAPSE_DB"),
+        std::env::var("SPINDLE_LIVE_SYNAPSE_ROOM"),
+    ) else {
+        eprintln!("skipped: set SPINDLE_LIVE_SYNAPSE_DB and SPINDLE_LIVE_SYNAPSE_ROOM");
+        return;
+    };
+
+    let connection = Connection::open(database).expect("the exported database opens");
+    let source = read_room(&connection, &room_id).expect("the real room reads");
+    let expected = source
+        .events
+        .iter()
+        .filter(|event| !event.outlier && !event.rejected)
+        .count();
+    let outcome = replay(&source).expect("the real room replays");
+
+    assert_eq!(
+        outcome.imported, expected,
+        "the replay dropped accepted events"
+    );
+    assert!(
+        outcome.clean(),
+        "the replay diverged from Synapse state: {:?}",
+        outcome.divergence
+    );
+    assert!(
+        !outcome.seeded_from_source,
+        "the create-rooted rehearsal unexpectedly used source-seeded state"
+    );
+    eprintln!(
+        "rehearsed {} accepted events; excluded {}; state slots match",
+        outcome.imported,
+        outcome.excluded.len()
+    );
+}
+
 /// The whole path, against Synapse's own DDL: build the fixture, read it,
 /// replay it, and compare the result with what Synapse says the room is.
 ///
