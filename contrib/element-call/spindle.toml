@@ -21,6 +21,9 @@ filter = "info"
 [ratelimit]
 enabled = false
 
+[registration]
+shared_secret = "test_shared_secret_for_local_dev_only"
+
 [federation]
 # The other site is reached through nginx on the compose network, which is
 # RFC 1918 space the address guard refuses by default (#288).
