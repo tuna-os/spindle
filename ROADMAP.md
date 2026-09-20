@@ -1,6 +1,6 @@
 # Spindle Roadmap
 
-**Last updated**: 2026-09-02 | **Status**: Experiment under construction — not a deployment
+**Last updated**: 2026-09-20 | **Status**: Experiment under construction — not a deployment
 
 Part of the [TunaOS](https://tunaos.org) ecosystem. A Matrix homeserver that
 stores rooms as a linear log, so state resolution never runs on the hot path.
@@ -19,6 +19,7 @@ maturity contract** — what has to be demonstrated before Spindle stops being a
 experiment, and what is deliberately not being built yet.
 
 - Milestone status: [docs/dashboard.md](docs/dashboard.md) (generated, drift-gated)
+- GitHub work queues: [M0–M7 milestones](https://github.com/tuna-os/spindle/milestones?state=open)
 - Milestone scope and sequencing: [#4](https://github.com/tuna-os/spindle/issues/4)
 - The design the code is held against: [SPEC.md](SPEC.md)
 - What is inherited, what is ours, what is deferred: [docs/divergence.md](docs/divergence.md)
@@ -83,7 +84,7 @@ a roadmap item, not an afterthought — it is the org's only fresh Rust codebase
 with an embedded store, no database to provision, and `cargo test --workspace`
 as the whole gate.
 
-Near-term, tracked by [#306](https://github.com/tuna-os/spindle/issues/306):
+Completed under [#306](https://github.com/tuna-os/spindle/issues/306):
 
 - Repository topics and a homepage link, so the benchmark site is reachable from
   the repository header
