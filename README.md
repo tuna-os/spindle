@@ -197,6 +197,7 @@ The risks that would invalidate the headline claim are enumerated in
 | [docs/delegated-auth.md](docs/delegated-auth.md) | MSC3861, both ways — built-in provider or a real MAS |
 | [docs/metrics.md](docs/metrics.md) | What is exported, including the number the architecture is falsified by |
 | [docs/lifecycle.md](docs/lifecycle.md) | Backup, restore, migrations |
+| [docs/synapse-kubernetes-cutover.md](docs/synapse-kubernetes-cutover.md) | Reversible ESS/Kubernetes quiesce and the production cutover gates |
 | [docs/rate-limits.md](docs/rate-limits.md) | Every rate and cap, and the growth nothing bounds yet |
 | [docs/matrix-rtc.md](docs/matrix-rtc.md) | Calls end to end: the SFU, the JWT service built in or beside, and what a token cannot promise |
 | [docs/mesh-federation.md](docs/mesh-federation.md) | Federating with a Bluetooth mesh: the venue system, the loopback evidence, and the Neutrino gateway patch |
