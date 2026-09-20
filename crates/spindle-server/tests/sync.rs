@@ -647,3 +647,40 @@ async fn a_long_poll_returns_as_soon_as_something_happens() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(bodies(&body["rooms"]["join"][&room_id]), vec!["wake up"]);
 }
+
+#[tokio::test]
+async fn creating_a_room_wakes_an_existing_long_poll() {
+    let harness = Arc::new(Harness::new());
+    let token = harness.register("alice").await;
+    let since = harness.sync(&token, None).await["next_batch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let waiting = {
+        let harness = Arc::clone(&harness);
+        let token = token.clone();
+        let since = since.clone();
+        tokio::spawn(async move {
+            harness
+                .get(
+                    &format!("/_matrix/client/v3/sync?since={since}&timeout=30000"),
+                    &token,
+                )
+                .await
+        })
+    };
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let room_id = harness.create_room(&token).await;
+
+    let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("the long poll did not return when the room was created")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["rooms"]["join"][&room_id].is_object(),
+        "the created room was absent: {body}"
+    );
+}

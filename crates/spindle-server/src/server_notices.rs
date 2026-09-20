@@ -162,9 +162,11 @@ fn notices_room(
         tags["tags"] = json!({});
     }
     tags["tags"]["m.server_notice"] = json!({});
+    let position = state.rooms.allocate_stream_id();
     state
         .account_data
-        .put(user_id, &room_id, "m.tag", &tags)
+        .put(user_id, &room_id, "m.tag", &tags, position)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    state.rooms.wake_sync_waiters();
     Ok(room_id)
 }
