@@ -818,6 +818,7 @@ impl Rooms {
         event_id: &str,
         invite_state: &[Value],
     ) -> Result<(), RoomError> {
+        let stream_id = self.allocate_stream_id();
         spindle_store::Store::put(
             self.store.as_ref(),
             &spindle_core::keys::user_room(
@@ -829,6 +830,7 @@ impl Rooms {
                 "origin": origin,
                 "event_id": event_id,
                 "invite_state": invite_state,
+                "stream_id": stream_id,
             })
             .to_string()
             .as_bytes(),
@@ -2999,7 +3001,7 @@ impl Rooms {
     ) -> Result<SyncResult, RoomError> {
         let position = self.stream_position();
         let joined = self.joined(user_id)?;
-        let invited = self.invited(user_id)?;
+        let invited = self.invited_since(user_id, since, position)?;
         let knocked = self.knocked(user_id)?;
 
         // The range each room is asked about. `None` on an initial sync,
@@ -3128,6 +3130,48 @@ impl Rooms {
     /// Returns [`RoomError`] if the index cannot be read.
     pub fn invited(&self, user_id: &str) -> Result<Vec<String>, RoomError> {
         self.membership_rooms(user_id, INVITE)
+    }
+
+    /// Current invites which are news in this sync window.
+    ///
+    /// Membership is a standing index: reading every current invite on every
+    /// incremental sync makes the same response immediately readable forever,
+    /// with an unchanged token. Local invites can be positioned through the
+    /// room's reverse stream index. Out-of-band federated invites have no room
+    /// log, so their pending record carries the side-stream position allocated
+    /// when it was accepted.
+    fn invited_since(
+        &self,
+        user_id: &str,
+        since: Option<u64>,
+        until: u64,
+    ) -> Result<Vec<String>, RoomError> {
+        let invited = self.invited(user_id)?;
+        let Some(since) = since else {
+            return Ok(invited);
+        };
+        let mut changed = Vec::new();
+        for room_id in invited {
+            if let Some(pending) = self.pending_invite(user_id, &room_id)? {
+                if pending["stream_id"]
+                    .as_u64()
+                    .is_some_and(|position| position > since && position <= until)
+                {
+                    changed.push(room_id);
+                }
+                continue;
+            }
+            let Some((_, membership_li)) = self.membership_event(&room_id, user_id)? else {
+                continue;
+            };
+            if self
+                .room_slice(&room_id, since, until)?
+                .contains(&membership_li)
+            {
+                changed.push(room_id);
+            }
+        }
+        Ok(changed)
     }
 
     /// Rooms this user has knocked on and not yet been answered about.
@@ -4060,7 +4104,32 @@ impl Rooms {
             .map_err(|error| RoomError::Build(format!("{error:?}")))?;
 
         let event_id = pdu.event_id().as_str().to_owned();
-        let json = canonical_to_json(pdu.canonical());
+        let mut json = canonical_to_json(pdu.canonical());
+
+        // State replacement metadata is unsigned because it describes the
+        // local server's view of the state transition, rather than the event
+        // the sender signed. Clients still depend on it: in particular,
+        // matrix-js-sdk follows a join's previous membership event to retain
+        // an invite's `is_direct` hint after the invite is accepted.
+        //
+        // Keep `replaces_state` as well as the expanded content. Synapse
+        // persists the former and expands the latter while reading for a
+        // client; storing all three gives every client-facing read path the
+        // same complete event without making timeline reads reopen state.
+        if let Some(state_key) = state_key
+            && let Some(previous_id) = current_state_id(log, &StateKey::new(event_type, state_key))
+            && let Ok(previous) = self.read_event(room_id, &EventId::new(previous_id.as_str()))
+            && let Some(object) = json.as_object_mut()
+        {
+            object.insert(
+                "unsigned".to_owned(),
+                serde_json::json!({
+                    "replaces_state": previous_id,
+                    "prev_content": previous["content"],
+                    "prev_sender": previous["sender"],
+                }),
+            );
+        }
 
         // Authorized before it is appended, against the state the log already
         // holds materialized. Signing first costs a wasted signature on a
@@ -5429,6 +5498,40 @@ fn highest_stream_id(store: &FjallStore, from_stream: u64) -> u64 {
     .filter_map(|(_, value)| value.as_slice().try_into().map(u64::from_be_bytes).ok())
     .max()
     .unwrap_or(0);
+    // An out-of-band federated invite has no room event and therefore no
+    // `Stream` row, but its pending record carries the side-stream position
+    // that makes it a one-shot incremental-sync change. Resume above those
+    // positions too, or a restart can reuse one and make a later invite sit
+    // at or below a token the client already holds.
+    let from_pending_invites = spindle_store::ReadView::scan_prefix(
+        store,
+        &[
+            spindle_core::keys::KEY_SCHEMA_VERSION,
+            spindle_core::keys::Keyspace::PendingInvite as u8,
+        ],
+    )
+    .unwrap_or_default()
+    .iter()
+    .filter_map(|(_, value)| {
+        serde_json::from_slice::<Value>(value)
+            .ok()?
+            .get("stream_id")?
+            .as_u64()
+    })
+    .max()
+    .unwrap_or(0);
+    let from_account_data = spindle_store::ReadView::scan_prefix(
+        store,
+        &[
+            spindle_core::keys::KEY_SCHEMA_VERSION,
+            spindle_core::keys::Keyspace::AccountDataStream as u8,
+        ],
+    )
+    .unwrap_or_default()
+    .iter()
+    .filter_map(|(_, value)| value.as_slice().try_into().map(u64::from_be_bytes).ok())
+    .max()
+    .unwrap_or(0);
     // The federation outbox is the fourth drawer: its rows carry the
     // sequence in the key's last eight bytes and have no stream row, and a
     // counter resumed below one would eventually overwrite a pending
@@ -5447,6 +5550,8 @@ fn highest_stream_id(store: &FjallStore, from_stream: u64) -> u64 {
     from_stream
         .max(from_to_device)
         .max(from_device_lists)
+        .max(from_pending_invites)
+        .max(from_account_data)
         .max(from_outbox)
 }
 

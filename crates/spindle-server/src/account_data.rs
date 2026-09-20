@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use spindle_core::keys;
-use spindle_store::{FjallStore, ReadView, Store, StoreError};
+use spindle_store::{Durability, FjallStore, ReadView, Store, StoreError};
 
 /// Reads and writes one user's account data.
 pub struct AccountData {
@@ -40,11 +40,21 @@ impl AccountData {
         room_id: &str,
         event_type: &str,
         content: &Value,
+        position: u64,
     ) -> Result<(), AccountDataError> {
-        Store::put(
+        Store::commit(
             self.store.as_ref(),
-            &keys::account_data(user_id, room_id, event_type),
-            content.to_string().as_bytes(),
+            &[
+                (
+                    keys::account_data(user_id, room_id, event_type),
+                    content.to_string().into_bytes(),
+                ),
+                (
+                    keys::account_data_stream(user_id, room_id, event_type),
+                    position.to_be_bytes().to_vec(),
+                ),
+            ],
+            Durability::Group,
         )?;
         Ok(())
     }
@@ -111,6 +121,44 @@ impl AccountData {
             let content: Value = serde_json::from_slice(&bytes)
                 .map_err(|error| AccountDataError::Corrupt(format!("{event_type}: {error}")))?;
             out.push(serde_json::json!({ "type": event_type, "content": content }));
+        }
+        Ok(out)
+    }
+
+    /// Entries changed in `(since, until]`, or every entry for an initial
+    /// sync. Old stores have no marks for their existing rows; those rows are
+    /// correctly part of an initial sync and not new in an incremental one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountDataError`] if account data or its stream marks cannot
+    /// be read, or if stored account data is not JSON.
+    pub fn between(
+        &self,
+        user_id: &str,
+        room_id: &str,
+        since: Option<u64>,
+        until: u64,
+    ) -> Result<Vec<Value>, AccountDataError> {
+        let all = self.all(user_id, room_id)?;
+        let Some(since) = since else { return Ok(all) };
+        let mut out = Vec::new();
+        for event in all {
+            let Some(event_type) = event["type"].as_str() else {
+                continue;
+            };
+            let mark = ReadView::get(
+                self.store.as_ref(),
+                &keys::account_data_stream(user_id, room_id, event_type),
+            )?;
+            let changed = mark
+                .as_deref()
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u64::from_be_bytes)
+                .is_some_and(|position| position > since && position <= until);
+            if changed {
+                out.push(event);
+            }
         }
         Ok(out)
     }
