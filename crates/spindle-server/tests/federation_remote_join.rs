@@ -103,12 +103,20 @@ impl Instance {
     }
 
     async fn public_room(&self, token: &str) -> String {
+        self.public_room_at_version(token, None).await
+    }
+
+    async fn public_room_at_version(&self, token: &str, version: Option<&str>) -> String {
+        let mut create = json!({});
+        if let Some(version) = version {
+            create["room_version"] = json!(version);
+        }
         let (status, body) = self
             .request(
                 reqwest::Method::POST,
                 "/_matrix/client/v3/createRoom",
                 Some(token),
-                Some(&json!({})),
+                Some(&create),
             )
             .await;
         assert_eq!(status, 200, "{body}");
@@ -127,12 +135,25 @@ impl Instance {
 
     /// A room whose join rule admits members of `allowed`.
     async fn restricted_room(&self, token: &str, allowed: &str) -> String {
+        self.restricted_room_at_version(token, allowed, None).await
+    }
+
+    async fn restricted_room_at_version(
+        &self,
+        token: &str,
+        allowed: &str,
+        version: Option<&str>,
+    ) -> String {
+        let mut create = json!({});
+        if let Some(version) = version {
+            create["room_version"] = json!(version);
+        }
         let (status, body) = self
             .request(
                 reqwest::Method::POST,
                 "/_matrix/client/v3/createRoom",
                 Some(token),
-                Some(&json!({})),
+                Some(&create),
             )
             .await;
         assert_eq!(status, 200, "{body}");
@@ -194,6 +215,32 @@ impl Instance {
             .await;
         assert_eq!(status, 200, "{body}");
         body["event_id"].as_str().unwrap().to_owned()
+    }
+
+    async fn redact(&self, room: &str, token: &str, target: &str) -> String {
+        let (status, body) = self
+            .request(
+                reqwest::Method::PUT,
+                &format!("/_matrix/client/v3/rooms/{room}/redact/{target}/redact-{target}"),
+                Some(token),
+                Some(&json!({ "reason": "test" })),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        body["event_id"].as_str().unwrap().to_owned()
+    }
+
+    async fn event(&self, room: &str, token: &str, event_id: &str) -> Value {
+        let (status, body) = self
+            .request(
+                reqwest::Method::GET,
+                &format!("/_matrix/client/v3/rooms/{room}/event/{event_id}"),
+                Some(token),
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        body
     }
 
     async fn joined_members(&self, room: &str, token: &str) -> Value {
@@ -733,5 +780,100 @@ async fn a_room_at_a_version_this_server_creates_is_one_it_can_also_join() {
         })
         .await,
         "the joiner can write into the room it joined"
+    );
+}
+
+/// Version 10 is the dominant legacy version in the migration corpus. This
+/// exercises both sides of the join handshake at that actual version and
+/// then sends a federated event, rather than proving only that createRoom
+/// accepts the name.
+#[tokio::test]
+async fn a_v10_room_can_be_joined_and_used_across_two_servers() {
+    let remote = Instance::start().await;
+    let local = Instance::start().await;
+    let alice = remote.register("alice").await;
+    let bob = local.register("bob").await;
+
+    let room = remote.public_room_at_version(&alice, Some("10")).await;
+    remote.say(&room, &alice, "before the v10 join").await;
+
+    let (status, body) = local.join_via(&room, &bob, &remote.name).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, create) = local
+        .request(
+            reqwest::Method::GET,
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.create"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{create}");
+    assert_eq!(create["room_version"], "10", "{create}");
+
+    let target = local.say(&room, &bob, "after the v10 join").await;
+    assert!(
+        eventually(async || {
+            remote
+                .messages(&room, &alice)
+                .await
+                .contains(&"after the v10 join".to_owned())
+        })
+        .await,
+        "the resident server accepted the v10 event"
+    );
+
+    remote.redact(&room, &alice, &target).await;
+    assert!(
+        eventually(async || remote.event(&room, &alice, &target).await["content"] == json!({}))
+            .await,
+        "the resident applied its v10 redaction"
+    );
+    assert!(
+        eventually(async || local.event(&room, &bob, &target).await["content"] == json!({})).await,
+        "the joining server applied the federated v10 redaction"
+    );
+
+    remote.say(&room, &alice, "back across the v10 room").await;
+    assert!(
+        eventually(async || {
+            local
+                .messages(&room, &bob)
+                .await
+                .contains(&"back across the v10 room".to_owned())
+        })
+        .await,
+        "the joining server accepted the resident's v10 event"
+    );
+}
+
+/// Restricted joins were the path that previously exposed version
+/// substitution. Keep a two-server v10 regression alongside the general
+/// Complement-shaped sequence.
+#[tokio::test]
+async fn a_v10_restricted_room_admits_a_remote_member() {
+    let remote = Instance::start().await;
+    let local = Instance::start().await;
+    let alice = remote.register("alice").await;
+    let bob = local.register("bob").await;
+    let bob_id = format!("@bob:{}", local.name);
+
+    let space = remote.public_room_at_version(&alice, Some("10")).await;
+    assert_eq!(local.join_via(&space, &bob, &remote.name).await.0, 200);
+    let room = remote
+        .restricted_room_at_version(&alice, &space, Some("10"))
+        .await;
+
+    let (status, body) = local.join_via(&room, &bob, &remote.name).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        eventually(async || {
+            remote
+                .joined_members(&room, &alice)
+                .await
+                .get(&bob_id)
+                .is_some()
+        })
+        .await,
+        "the v10 resident records the restricted join"
     );
 }

@@ -68,24 +68,11 @@ pub const SPEC_VERSIONS: &[SpecVersion] = &[
 /// MustJoinRoom: send_join failed: {"errcode":"M_BAD_JSON", …}
 /// ```
 ///
-/// Restricted joins fail the same way at v8–v10:
-/// `TestRestrictedRooms*/Join_should_succeed_when_joined_to_allowed_room`.
-///
-/// So `ruma`'s per-version rules are necessary and not sufficient. The
-/// federation join path carries v11-shaped assumptions that held only
-/// because every room was quietly v11 — which is exactly what made those
-/// thirty allowlisted tests pass on a substitution. Creating a room at a
-/// version is not the same as *joining* one over federation at it, and
-/// only the second is what advertising promises.
-///
-/// Advertising v4–v10 before that path is fixed would move the
-/// substitution's dishonesty rather than remove it: clients would be told
-/// the version is available and then fail to federate into it.
-///
-/// The work is real and tracked separately. This list moves when
-/// Complement's knock and restricted-join tests pass at the versions they
-/// ask for, and not before.
-pub const ROOM_VERSIONS: &[&str] = &["11", "12", spindle_core::STATE_DAG_V12];
+/// A version is listed only after its client and federation paths are tested
+/// without substituting this build's default. Version 10 is the first legacy
+/// version restored for Synapse migration: it is the dominant version in the
+/// production-shaped migration corpus tracked by #456.
+pub const ROOM_VERSIONS: &[&str] = &["10", "11", "12", spindle_core::STATE_DAG_V12];
 
 /// The default room version.
 pub const DEFAULT_ROOM_VERSION: Option<&str> = Some("11");

@@ -4166,6 +4166,21 @@ impl Rooms {
             depth,
             state_parents.as_deref(),
         )?;
+        // Before room v11 a redaction names its target in the top-level
+        // `redacts` field. From v11 MSC2174 moved it into content. Keep the
+        // route and public API version-neutral, then put the field where this
+        // room's own rules require it before hashing and signing.
+        if event_type == "m.room.redaction"
+            && !rules_of(&version)?.redaction.content_field_redacts
+            && let Some(redacts) = canonical
+                .get_mut("content")
+                .and_then(|content| match content {
+                    CanonicalJsonValue::Object(content) => content.remove("redacts"),
+                    _ => None,
+                })
+        {
+            canonical.insert("redacts".to_owned(), redacts);
+        }
         // MSC4354: the stickiness rides the event as a top-level key. It is
         // outside the redacted form, so it is covered by neither the event
         // ID nor the signature -- a redacted sticky event is an ordinary
@@ -4523,6 +4538,23 @@ impl Rooms {
         let event_type = json["type"].as_str().unwrap_or_default().to_owned();
         let state_key = json["state_key"].as_str().map(str::to_owned);
         let sender = json["sender"].as_str().unwrap_or_default().to_owned();
+        let redaction_target = if event_type == "m.room.redaction" {
+            let version = self.version_in_log(log, room_id)?;
+            let rules = rules_of(&version)?;
+            let target = if rules.redaction.content_field_redacts {
+                json["content"]["redacts"].as_str()
+            } else {
+                json["redacts"].as_str()
+            }
+            .ok_or_else(|| {
+                RoomError::Build(format!(
+                    "a room v{version} redaction has no target in the version's required field"
+                ))
+            })?;
+            Some(target.to_owned())
+        } else {
+            None
+        };
         let prev: Vec<EventId> = json["prev_events"]
             .as_array()
             .map(|ids| {
@@ -4574,6 +4606,17 @@ impl Rooms {
                 json,
             },
         )?;
+        // A federated redaction has the same effect as one authored here.
+        // The target's location changed in v11, so it was resolved above
+        // under this room's rules rather than by looking in both places and
+        // accepting an ambiguous event. A target that has not arrived yet is
+        // left untouched; normal transaction order and the predecessor edge
+        // make the already-present case the common one.
+        if let Some(target) = redaction_target
+            && log.get(&EventId::new(target.as_str())).is_some()
+        {
+            self.apply_redaction(room_id, &target, event_id)?;
+        }
         if fan_out {
             self.enqueue_outbound(log, room_id, json)?;
         }
@@ -5853,7 +5896,15 @@ mod room_version_tests {
     fn creating_a_room_at_an_unadvertised_version_is_refused() {
         let (_dir, _store, rooms) = rooms();
         let key = key();
-        for unsupported in ["1", "9", "10"] {
+        let unsupported: Vec<_> = ["1", "5", "6", "9", "10"]
+            .into_iter()
+            .filter(|version| !crate::surface::supports_room_version(version))
+            .collect();
+        assert!(
+            !unsupported.is_empty(),
+            "the legacy-version refusal fixture needs a newer candidate"
+        );
+        for unsupported in unsupported {
             let result = rooms.create(
                 "@alice:example.org",
                 &key,
