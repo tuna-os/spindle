@@ -1,0 +1,89 @@
+# matrix-rust-sdk integration tests Spindle must pass -- the ratchet over
+# upstream's own suite, enforced by scripts/rust-sdk-check.py the way
+# contrib/element-call/allowlist.txt is by element-call-check.py.
+#
+# One entry per line: the test's path as `cargo test` prints it
+# (`module::submodule::test_name`). A test that passes and is not here is
+# printed as a candidate; adding it is a reviewed promotion, never
+# automatic, so a flaky test cannot teach everyone to ignore this gate.
+#
+# Nothing is claimed that has not been seen to pass: every entry names the
+# run that recorded it.
+
+# Run 34031964690 (matrix-sdk-0.18.0 at 1c44fb66, Spindle at 2dcedeb):
+# 21 passed, 28 failed, 5 ignored. The first run past registration, once
+# #396 let the SDK's session-less m.login.dummy through. The 28 failures
+# are 11 shared-history (MSC4268) tests, interactive verification (SAS,
+# QR, secret gossip), room previews and notification counts through
+# sliding sync, alias publishing, /context, and four timeline redecryption
+# tests -- each a real gap or a real defect, none promoted.
+tests::auth::register_login_is_one_device
+tests::e2ee::test_backup_enable_new_user
+tests::e2ee::test_cross_signing_bootstrap
+tests::e2ee::test_failed_members_response
+tests::e2ee::test_importing_secrets_bundle_verifies_the_device
+tests::e2ee::test_recovery_disabling_deletes_secret_storage_secrets
+tests::repeated_join::test_repeated_join_leave
+tests::room::test_room_account_data
+tests::room_directory_search::test_room_directory_search_filter
+tests::sliding_sync::room::test_joined_user_can_create_push_context_with_room_list_service
+tests::sliding_sync::room::test_left_room
+tests::sliding_sync::room::test_room_avatar_group_conversation
+tests::sliding_sync::room::test_room_preview_with_room_directory_search_and_room_alias_only
+tests::sliding_sync::room::test_room_preview_with_room_directory_search_and_room_alias_only_in_several_homeservers
+tests::timeline::test_enabling_backups_retries_decryption
+tests::timeline::test_local_echo_to_send_event_has_encryption_info
+tests::timeline::test_pinned_events_are_decrypted_after_recovering_with_event_in_timeline
+tests::timeline::test_pinned_events_are_decrypted_after_recovering_with_event_not_in_timeline
+tests::timeline::test_send_message_updates
+tests::timeline::test_thread_focused_timeline
+tests::timeline::test_toggling_reaction
+
+# Run 34034370986 (main at 3901c4a, after #405): 23 passed, 26 failed,
+# 5 ignored; the 21 above held and these two joined.
+tests::invitations::test_invitation_details
+tests::room_privacy::test_publishing_room_alias
+
+# Run 34037549881 (matrix-sdk-0.18.0 at 1c44fb66, Spindle at 207e6fc):
+# 29 passed, 21 failed, 5 ignored. #416 (members?at=) settles the missing
+# member keys; #411 lists invites in sliding sync, which the delayed
+# invite test waited on; #406 strips a removed alias from the room, so
+# the directory search no longer finds it. The latest-event and the
+# notification-client tests had been failing on timing and held on this
+# run and the one after it.
+tests::e2ee::test_encryption_missing_member_keys
+tests::e2ee::test_mutual_sas_verification_with_notification_client_ignores_verification_events
+tests::room_privacy::test_removing_published_room_alias
+tests::sliding_sync::room::test_delayed_invite_response_and_sent_message_decryption
+tests::timeline::test_room_keys_received_on_notification_client_trigger_redecryption
+
+# Run 34038593414 (matrix-sdk-0.18.0 at 1c44fb66, Spindle at ea7213c):
+# 33 passed, 17 failed, 5 ignored. #417 (a signature upload is a
+# device-list change, user-signing signatures returned to the signer
+# alone) settles the interactive verification group: SAS, QR code and the
+# secret gossip that follows. #418 (the sending device reads its
+# transaction ID back) settles the stale-local-echo edit. The first
+# shared-history test to pass is the pin-violation one, which needs no
+# key forwarding.
+#
+# Withdrawn: test_latest_event_few_rooms, promoted on the run before this
+# one and failing on this one with the same five-second wait on the
+# latest-event observer. Two runs disagreeing is the definition of a
+# test that cannot be protected yet; it goes back in when the cause is
+# found, not when it next happens to pass.
+tests::e2ee::shared_history::test_history_share_on_invite_pin_violation
+tests::e2ee::test_mutual_qrcode_verification
+tests::e2ee::test_mutual_sas_verification
+tests::e2ee::test_secret_gossip_after_interactive_verification
+tests::timeline::test_stale_local_echo_time_abort_edit
+
+# Run 34043758918 (matrix-sdk-0.18.0 at 1c44fb66, Spindle at 4497773):
+# 36 passed, 14 failed, 5 ignored. #425 (a world-readable roster, the
+# `/context` split, `$LAZY` members) settles the room preview, the
+# notification client's sender lookup and the permalink timeline's
+# redecryption. #429 (a receipt is a change to the reader's room) was
+# meant for test_room_notification_count as well, which still waits out
+# its observer; it stays a candidate until a second run agrees.
+tests::sliding_sync::notification_client::test_notification
+tests::sliding_sync::room::test_room_preview
+tests::timeline::test_permalink_timelines_redecrypt

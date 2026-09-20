@@ -594,21 +594,34 @@ impl Rooms {
 
         // The auth chain is every event the state transitively cites: a
         // walk over stored bodies, deduplicated, no network.
-        let mut seen = std::collections::BTreeSet::new();
-        let mut frontier: Vec<String> = pdus
+        let frontier: Vec<String> = pdus
             .iter()
-            .flat_map(|(_, event)| {
-                event["auth_events"]
-                    .as_array()
-                    .map(|ids| {
-                        ids.iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-            })
+            .flat_map(|(_, event)| cited_auth_events(event))
             .collect();
+        let auth_chain = self.auth_chain_from(room_id, frontier);
+        Ok((pdus, auth_chain))
+    }
+
+    /// The auth chain of one event (`GET /event_auth/{roomId}/{eventId}`):
+    /// every event it cites, and every event those cite, to the create.
+    ///
+    /// # Errors
+    ///
+    /// [`RoomError::UnknownRoom`] for a room this server is not in, and
+    /// the event lookup's error when the room has no such event.
+    pub fn auth_chain(&self, room_id: &str, event_id: &str) -> Result<Vec<Value>, RoomError> {
+        let event = self.event(room_id, event_id)?;
+        Ok(self
+            .auth_chain_from(room_id, cited_auth_events(&event))
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect())
+    }
+
+    /// Walk `auth_events` from `frontier` to the create event, each event
+    /// once, from stored bodies alone.
+    fn auth_chain_from(&self, room_id: &str, mut frontier: Vec<String>) -> Vec<IdentifiedEvent> {
+        let mut seen = std::collections::BTreeSet::new();
         let mut auth_chain = Vec::new();
         while let Some(id) = frontier.pop() {
             if !seen.insert(id.clone()) {
@@ -617,12 +630,10 @@ impl Rooms {
             let Ok(event) = self.event(room_id, &id) else {
                 continue;
             };
-            if let Some(ids) = event["auth_events"].as_array() {
-                frontier.extend(ids.iter().filter_map(Value::as_str).map(str::to_owned));
-            }
+            frontier.extend(cited_auth_events(&event));
             auth_chain.push((id, event));
         }
-        Ok((pdus, auth_chain))
+        auth_chain
     }
 
     /// Every remote domain with a live member in the room — the EDU
@@ -703,15 +714,44 @@ impl Rooms {
             }
             Err(error) => return Err(error),
         };
-        let mut stripped = Vec::with_capacity(ids.len());
+        let mut stripped = Vec::with_capacity(ids.len() + 1);
+        let mut inviter: Option<String> = None;
         for (event_type, state_key, id) in ids {
             let event = self.read_event(room_id, &EventId::new(id.as_str()))?;
+            if event_type == "m.room.member" && state_key == user_id {
+                inviter = event["sender"].as_str().map(str::to_owned);
+            }
             stripped.push(serde_json::json!({
                 "type": event_type,
                 "state_key": state_key,
                 "sender": event["sender"],
                 "content": event["content"],
             }));
+        }
+        // The inviter's own membership rides along, as Synapse's does: an
+        // invite is rendered as "<name> invited you", and the name lives in
+        // the inviter's member event. Without it a client has a sender it
+        // cannot show -- matrix-rust-sdk's `invite_details` has no inviter,
+        // and Element X renders the invite from a bare user ID.
+        if let Some(inviter) = inviter.filter(|inviter| inviter != user_id) {
+            let key = spindle_core::StateKey::new("m.room.member", inviter.as_str());
+            let id = self.with_room_read(room_id, |_, log| {
+                let Some(head) = log.entries().next_back() else {
+                    return Ok(None);
+                };
+                Ok(log
+                    .state_after(head.li)
+                    .and_then(|state| state.get(&key).map(str::to_owned)))
+            })?;
+            if let Some(id) = id {
+                let event = self.read_event(room_id, &EventId::new(id.as_str()))?;
+                stripped.push(serde_json::json!({
+                    "type": "m.room.member",
+                    "state_key": inviter,
+                    "sender": event["sender"],
+                    "content": event["content"],
+                }));
+            }
         }
         Ok(stripped)
     }
@@ -984,10 +1024,40 @@ impl Rooms {
             && let Some(target) = json["state_key"].as_str()
             && target.split_once(':').map(|(_, domain)| domain) == Some(self.server_name.as_str())
         {
-            self.clear_pending_invite(target, room_id)?;
+            if self.leave_ends_pending_invite(target, room_id, json)? {
+                self.clear_pending_invite(target, room_id)?;
+            }
             return Ok(());
         }
         received
+    }
+
+    /// Whether a leave or ban that arrived for a room this server does
+    /// not hold is about the invite standing for the user, rather than an
+    /// earlier one. The resident server fans a rejection out to the
+    /// invitee's domain after the rejecting server has already answered
+    /// its user, so a fresh invite can be recorded before the old leave
+    /// lands; that leave names the old invite among its auth and prev
+    /// events and must not take the new one with it. A record written
+    /// before the invite's id was kept yields to any leave, as before.
+    fn leave_ends_pending_invite(
+        &self,
+        user_id: &str,
+        room_id: &str,
+        leave: &Value,
+    ) -> Result<bool, RoomError> {
+        let Some(pending) = self.pending_invite(user_id, room_id)? else {
+            return Ok(false);
+        };
+        let Some(invite_id) = pending["event_id"].as_str() else {
+            return Ok(true);
+        };
+        let names_invite = |key: &str| {
+            leave[key]
+                .as_array()
+                .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(invite_id)))
+        };
+        Ok(names_invite("auth_events") || names_invite("prev_events"))
     }
 
     /// Accept a membership event another server's user made *through*
@@ -1111,4 +1181,17 @@ fn order_state_dag(events: Vec<(String, Value)>) -> Vec<(String, Value)> {
         .sort_by_key(|(id, event)| (event["origin_server_ts"].as_u64().unwrap_or(0), id.clone()));
     ordered.extend(timeline);
     ordered
+}
+
+/// The event ids an event's `auth_events` names.
+fn cited_auth_events(event: &Value) -> Vec<String> {
+    event["auth_events"]
+        .as_array()
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }

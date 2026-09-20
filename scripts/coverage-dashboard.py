@@ -43,7 +43,9 @@ MILESTONES = [
      "(room upgrade, spaces, search, OpenAPI validation, Element Web rig). "
      "Benchmarked vs Synapse and Continuwuity — see docs/benchmarks.md."),
     ("M2", "Modern encrypted clients", "**Done**",
-     "Media + thumbnails (#99, #104), Simplified Sliding Sync (#105), E2EE "
+     "Media + thumbnails (#99, #104), Simplified Sliding Sync (#105) with the "
+     "to-device, E2EE, account-data, receipts and typing extensions Element X "
+     "reads everything but timelines through, E2EE "
      "transport (#106), fallback keys + device lists (#107), key backup + "
      "cross-signing (#108), URL previews (#109), S3 media backend (#110). "
      "Close-out benchmark: four-way vs Synapse, Continuwuity and Tuwunel "

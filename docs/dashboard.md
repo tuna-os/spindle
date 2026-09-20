@@ -17,7 +17,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 |---|---|---|---|
 | M0 | Prove the core | **Done** | Fork resolution vs ruma-state-res and HAMT-vs-im benchmarks published on the [benchmark site](https://tuna-os.github.io/spindle/); durability and recovery covered by restart and torn-write tests. |
 | M1 | Usable local homeserver | **Done** | Full local CS-API surface with classic `/sync`; leftovers tracked on #7 (room upgrade, spaces, search, OpenAPI validation, Element Web rig). Benchmarked vs Synapse and Continuwuity — see docs/benchmarks.md. |
-| M2 | Modern encrypted clients | **Done** | Media + thumbnails (#99, #104), Simplified Sliding Sync (#105), E2EE transport (#106), fallback keys + device lists (#107), key backup + cross-signing (#108), URL previews (#109), S3 media backend (#110). Close-out benchmark: four-way vs Synapse, Continuwuity and Tuwunel (built from source) — 60 of 63 cells won; the one real loss became #113's unread-index fix (11.79 ms → 1.00 ms); the three residual cells are within measured noise. See docs/benchmarks.md and the comparisons page. Element X client-gate work continues as #112. |
+| M2 | Modern encrypted clients | **Done** | Media + thumbnails (#99, #104), Simplified Sliding Sync (#105) with the to-device, E2EE, account-data, receipts and typing extensions Element X reads everything but timelines through, E2EE transport (#106), fallback keys + device lists (#107), key backup + cross-signing (#108), URL previews (#109), S3 media backend (#110). Close-out benchmark: four-way vs Synapse, Continuwuity and Tuwunel (built from source) — 60 of 63 cells won; the one real loss became #113's unread-index fix (11.79 ms → 1.00 ms); the three residual cells are within measured noise. See docs/benchmarks.md and the comparisons page. Element X client-gate work continues as #112. |
 | M3 | Ordinary Matrix federation | In progress | Started with #14's identity layer: X-Matrix request signing and verification against fetched-and-cached peer keys (self-signature, name binding, capped validity all enforced; every failure a uniform 401), /version, and the first authenticated query. Inbound /send receives foreign PDUs through the same authorization predicate local events pass, with per-origin transaction replay and spec-correct redact-on-hash-mismatch; the outbound queue delivers local events to every live-member server with ack-before-delete, deterministic transaction IDs and per-destination backoff — #14 is functionally complete. #15 under way: state reads (/state, /state_ids, /event) serve peers from the materialized log, and the make_join/send_join handshake admits remote users — template previews the real authorization, the sent join faces the same judgement chain as any PDU, and the response carries the state before the join with its transitive auth chain. Backfill and get_missing_events serve history as bounded range reads on the linear log, and 8448 serves TLS. Remote joins work in both roles: the server walks make_join/send_join as the joining side and seeds the room from the response — proven by a two-instance Spindle-to-Spindle test with messages flowing both ways. #16's fork rig exists: `federation_fork.rs` injects stale, disjoint, contested (power levels, membership) and partition-and-heal forks over real federation and asserts the case counters and that the client's `/state`, federation's `/state` and `/state_ids` agree — which caught `/state_ids` answering with one branch's state after a merge. Complement runs heterogeneously against Synapse nightly, in both directions, as the report-only `compliance-interop` board. Still open on #16: the resolver for case 3, and fork metrics from a real deployment. |
 | M4 | Ecosystem integration | In progress | Both halves are built and under test, which is why this no longer reads *not started*. #18: appservice registration, authentication and namespaces, transactions with per-appservice queues, MSC2409 to-device delivery with restart redelivery, MSC4190 deviceless clients, ping (MSC2659), queries and the key proxy — six test files. #17: MSC3861 delegated authentication with introspection and gating, the `/_synapse/mas/*` homeserver-connection surface MAS drives, and a built-in OIDC provider (#159) for deployments that do not want a separate MAS. 17 of the router's endpoints come from `mas.rs` and `oidc.rs`. #17 and #18 stay open for the remaining bridge evidence. |
 | M5 | Production lifecycle | In progress | #83's admin API is served: 20 endpoints under `/_spindle/admin/v1`, each also mounted at `/_synapse/admin/v1` for existing tooling — users, rooms, state-at, purge_history, room deletion, make_room_admin, event reports and the audit log. #166's observability landed too: a `/metrics` exposition on its own listener with the fork-case counter, append and HTTP histograms. #21 has its counting performance gate (`read_budget.rs`, #177), which asserts flat-in-membership rather than timing on CI. #20 is three-quarters done and split: `spindle backup`, `restore` and `verify-media` are served, and #230 added versioned schema migrations whose guarantees — chaining, the no-path refusal, dry runs writing nothing, and the marker never landing ahead of the data — are proven against synthetic tables; the real migration table is deliberately empty because no schema change has yet needed a data rewrite, and `docs/lifecycle.md` says so rather than implying otherwise. The Synapse importer moved to #240 and is parked behind the API surface and MatrixRTC: its fixture (#234, #237), ordering and divergence check (#235) and SQLite reader (#239) are on main, and the exit criterion has been executed end to end once. `backups.rs` is M2's E2EE key backup and not this. #42's parity gate vs Synapse and Tuwunel remains part of the definition of done. |
@@ -26,16 +26,19 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**187 routes implemented; 0 known gaps in scope.**
+**224 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
 
-### Admin & moderation — 40 implemented, 0 planned
+### Admin & moderation — 55 implemented, 0 planned
 
 - `GET /_spindle/admin/v1/audit`
 - `GET /_spindle/admin/v1/event_reports`
 - `GET /_spindle/admin/v1/event_reports/{report_id}`
+- `GET /_spindle/admin/v1/registration_tokens`
+- `POST /_spindle/admin/v1/registration_tokens/new`
+- `GET/PUT/DELETE /_spindle/admin/v1/registration_tokens/{token}`
 - `GET /_spindle/admin/v1/rooms`
 - `GET/DELETE /_spindle/admin/v1/rooms/{room_id}`
 - `POST /_spindle/admin/v1/rooms/{room_id}/make_room_admin`
@@ -44,6 +47,7 @@ neither implemented nor counted.
 - `GET /_spindle/admin/v1/rooms/{room_id}/state`
 - `GET /_spindle/admin/v1/rooms/{room_id}/state_at`
 - `GET /_spindle/admin/v1/rooms/{room_id}/timeline`
+- `POST /_spindle/admin/v1/send_server_notice`
 - `GET /_spindle/admin/v1/server_version`
 - `GET /_spindle/admin/v1/users`
 - `GET/PUT /_spindle/admin/v1/users/{user_id}`
@@ -54,8 +58,14 @@ neither implemented nor counted.
 - `POST /_spindle/admin/v1/users/{user_id}/reset_password`
 - `GET /_spindle/admin/v1/whois/{user_id}`
 - `GET /_synapse/admin/v1/audit`
+- `POST /_synapse/admin/v1/deactivate/{user_id}`
 - `GET /_synapse/admin/v1/event_reports`
 - `GET /_synapse/admin/v1/event_reports/{report_id}`
+- `POST /_synapse/admin/v1/purge_history/{room_id}`
+- `GET /_synapse/admin/v1/registration_tokens`
+- `POST /_synapse/admin/v1/registration_tokens/new`
+- `GET/PUT/DELETE /_synapse/admin/v1/registration_tokens/{token}`
+- `POST /_synapse/admin/v1/reset_password/{user_id}`
 - `GET /_synapse/admin/v1/rooms`
 - `GET/DELETE /_synapse/admin/v1/rooms/{room_id}`
 - `POST /_synapse/admin/v1/rooms/{room_id}/make_room_admin`
@@ -64,6 +74,7 @@ neither implemented nor counted.
 - `GET /_synapse/admin/v1/rooms/{room_id}/state`
 - `GET /_synapse/admin/v1/rooms/{room_id}/state_at`
 - `GET /_synapse/admin/v1/rooms/{room_id}/timeline`
+- `POST /_synapse/admin/v1/send_server_notice`
 - `GET /_synapse/admin/v1/server_version`
 - `GET /_synapse/admin/v1/users`
 - `GET/PUT /_synapse/admin/v1/users/{user_id}`
@@ -73,6 +84,10 @@ neither implemented nor counted.
 - `GET /_synapse/admin/v1/users/{user_id}/joined_rooms`
 - `POST /_synapse/admin/v1/users/{user_id}/reset_password`
 - `GET /_synapse/admin/v1/whois/{user_id}`
+- `GET /_synapse/admin/v2/users`
+- `GET/PUT /_synapse/admin/v2/users/{user_id}`
+- `POST /_synapse/admin/v2/users/{user_id}/delete_devices`
+- `GET /_synapse/admin/v2/users/{user_id}/devices`
 
 ### Delegated auth & OIDC — 19 implemented, 0 planned
 
@@ -119,15 +134,19 @@ neither implemented nor counted.
 - `POST/GET /_matrix/client/v3/room_keys/version`
 - `GET/PUT/DELETE /_matrix/client/v3/room_keys/version/{version}`
 
-### Federation — 22 implemented, 0 planned
+### Federation — 27 implemented, 0 planned
 
 - `GET /_matrix/federation/v1/backfill/{room_id}`
 - `GET /_matrix/federation/v1/event/{event_id}`
+- `GET /_matrix/federation/v1/event_auth/{room_id}/{event_id}`
 - `POST /_matrix/federation/v1/get_missing_events/{room_id}`
+- `GET /_matrix/federation/v1/hierarchy/{room_id}`
 - `GET /_matrix/federation/v1/make_join/{room_id}/{user_id}`
 - `GET /_matrix/federation/v1/make_knock/{room_id}/{user_id}`
 - `GET /_matrix/federation/v1/make_leave/{room_id}/{user_id}`
 - `GET /_matrix/federation/v1/media/download/{media_id}`
+- `GET /_matrix/federation/v1/media/thumbnail/{media_id}`
+- `GET/POST /_matrix/federation/v1/publicRooms`
 - `GET /_matrix/federation/v1/query/directory`
 - `GET /_matrix/federation/v1/query/profile`
 - `PUT /_matrix/federation/v1/send/{txn_id}`
@@ -136,6 +155,7 @@ neither implemented nor counted.
 - `PUT /_matrix/federation/v1/send_leave/{room_id}/{event_id}`
 - `GET /_matrix/federation/v1/state/{room_id}`
 - `GET /_matrix/federation/v1/state_ids/{room_id}`
+- `GET /_matrix/federation/v1/timestamp_to_event/{room_id}`
 - `GET /_matrix/federation/v1/user/devices/{user_id}`
 - `POST /_matrix/federation/v1/user/keys/claim`
 - `POST /_matrix/federation/v1/user/keys/query`
@@ -172,7 +192,7 @@ neither implemented nor counted.
 - `GET /_matrix/client/v3/user/{user_id}/rooms/{room_id}/tags`
 - `PUT/DELETE /_matrix/client/v3/user/{user_id}/rooms/{room_id}/tags/{tag}`
 
-### Media — 7 implemented, 0 planned
+### Media — 8 implemented, 0 planned
 
 - `GET /_matrix/client/v1/media/config`
 - `GET /_matrix/client/v1/media/download/{server_name}/{media_id}`
@@ -181,6 +201,7 @@ neither implemented nor counted.
 - `GET /_matrix/client/v1/media/thumbnail/{server_name}/{media_id}`
 - `GET /_matrix/media/v3/config`
 - `POST /_matrix/media/v3/upload`
+- `PUT /_matrix/media/v3/upload/{server_name}/{media_id}`
 
 ### Timeline, messaging & search — 13 implemented, 0 planned
 
@@ -198,7 +219,7 @@ neither implemented nor counted.
 - `PUT /_matrix/client/v3/rooms/{room_id}/typing/{user_id}`
 - `POST /_matrix/client/v3/search`
 
-### Rooms & membership — 24 implemented, 0 planned
+### Rooms & membership — 25 implemented, 0 planned
 
 - `GET /_matrix/client/unstable/im.nheko.summary/rooms/{room_id_or_alias}/summary`
 - `GET /_matrix/client/v1/room_summary/{room_id_or_alias}`
@@ -217,6 +238,7 @@ neither implemented nor counted.
 - `POST /_matrix/client/v3/rooms/{room_id}/kick`
 - `POST /_matrix/client/v3/rooms/{room_id}/leave`
 - `GET /_matrix/client/v3/rooms/{room_id}/members`
+- `POST /_matrix/client/v3/rooms/{room_id}/report`
 - `POST /_matrix/client/v3/rooms/{room_id}/report/{event_id}`
 - `GET /_matrix/client/v3/rooms/{room_id}/state`
 - `GET/PUT /_matrix/client/v3/rooms/{room_id}/state/{event_type}`
@@ -225,14 +247,15 @@ neither implemented nor counted.
 - `POST /_matrix/client/v3/rooms/{room_id}/unban`
 - `POST /_matrix/client/v3/rooms/{room_id}/upgrade`
 
-### Profiles & presence — 4 implemented, 0 planned
+### Profiles & presence — 5 implemented, 0 planned
 
 - `GET/PUT /_matrix/client/v3/presence/{user_id}/status`
 - `GET /_matrix/client/v3/profile/{user_id}`
 - `GET/PUT /_matrix/client/v3/profile/{user_id}/avatar_url`
 - `GET/PUT /_matrix/client/v3/profile/{user_id}/displayname`
+- `GET/PUT/DELETE /_matrix/client/v3/profile/{user_id}/{key}`
 
-### Accounts, devices & auth — 11 implemented, 0 planned
+### Accounts, devices & auth — 12 implemented, 0 planned
 
 - `POST /_matrix/client/v3/account/deactivate`
 - `POST /_matrix/client/v3/account/password`
@@ -242,24 +265,38 @@ neither implemented nor counted.
 - `GET/PUT/DELETE /_matrix/client/v3/devices/{device_id}`
 - `GET/POST /_matrix/client/v3/login`
 - `POST /_matrix/client/v3/logout`
+- `POST /_matrix/client/v3/logout/all`
 - `POST /_matrix/client/v3/refresh`
 - `POST /_matrix/client/v3/register`
 - `GET /_matrix/client/v3/register/available`
 
-### Server, discovery & operations — 14 implemented, 0 planned
+### Server, discovery & operations — 27 implemented, 0 planned
 
 - `GET /.well-known/matrix/client`
 - `GET /.well-known/matrix/server`
+- `GET /.well-known/matrix/support`
+- `GET/PUT/DELETE /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device`
+- `POST /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device/{device_id}/events`
+- `GET/PUT /_matrix/client/v1/admin/lock/{user_id}`
+- `GET/PUT /_matrix/client/v1/admin/suspend/{user_id}`
+- `POST /_matrix/client/v1/login/get_token`
+- `GET /_matrix/client/v1/mutual_rooms`
+- `GET /_matrix/client/v1/register/m.login.registration_token/validity`
 - `GET /_matrix/client/v1/rooms/{room_id}/hierarchy`
 - `GET /_matrix/client/v1/rooms/{room_id}/threads`
 - `GET /_matrix/client/v1/rooms/{room_id}/timestamp_to_event`
+- `GET /_matrix/client/v3/admin/whois/{user_id}`
 - `GET /_matrix/client/v3/capabilities`
 - `GET/POST /_matrix/client/v3/publicRooms`
 - `GET /_matrix/client/v3/pushers`
 - `POST /_matrix/client/v3/pushers/set`
 - `POST /_matrix/client/v3/user_directory/search`
+- `POST /_matrix/client/v3/users/{user_id}/report`
 - `GET /_matrix/client/versions`
+- `POST /_matrix/key/v2/query`
+- `GET /_matrix/key/v2/query/{server_name}`
 - `GET /_matrix/key/v2/server`
+- `POST /_matrix/media/v1/create`
 - `GET /health`
 - `GET /ready`
 

@@ -1,5 +1,5 @@
-//! The built-in `LiveKit` JWT service (#38): who gets a token, for what,
-//! and for how long.
+//! The built-in `LiveKit` JWT service (#38, MSC4195): who gets a token,
+//! for what, and for how long.
 //!
 //! A token here is a credential for a server this one never talks to. The
 //! SFU checks the signature and the grants and asks nobody, so everything

@@ -193,8 +193,9 @@ async fn registration_without_auth_returns_the_uia_flows() {
 async fn username_verdicts_outrank_the_uia_dance() {
     // A client should hear M_USER_IN_USE or M_INVALID_USERNAME on its first
     // request — not complete an auth flow to learn its username was never
-    // going to work. And an auth dict naming no session has not completed
-    // anything: it gets the challenge again, not an account.
+    // going to work. And an auth dict naming neither a session nor the
+    // dummy stage has not completed anything: it gets the challenge again,
+    // not an account.
     let harness = Harness::new();
     harness.register("alice", "hunter2").await;
 
@@ -222,12 +223,34 @@ async fn username_verdicts_outrank_the_uia_dance() {
             &json!({
                 "username": "bob",
                 "password": "hunter2",
-                "auth": { "type": "m.login.dummy" },
+                "auth": { "type": "m.login.password" },
             }),
         )
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
     assert!(body["session"].is_string(), "{body}");
+}
+
+/// The dummy stage completes without a session: `session` is optional in
+/// the auth dict, the stage carries no state a session would tie back to,
+/// and matrix-rust-sdk (so Element X) registers exactly this way. Its
+/// integration suite was refused on every test until this passed.
+#[tokio::test]
+async fn the_dummy_stage_completes_without_a_session() {
+    let harness = Harness::new();
+    let (status, body) = harness
+        .post(
+            "/_matrix/client/v3/register",
+            &json!({
+                "username": "bob",
+                "password": "hunter2",
+                "auth": { "type": "m.login.dummy" },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["user_id"], "@bob:example.org");
+    assert!(body["access_token"].is_string(), "{body}");
 }
 
 #[tokio::test]
@@ -390,7 +413,7 @@ async fn a_token_in_the_query_string_is_not_accepted() {
 }
 
 #[tokio::test]
-async fn login_flows_advertise_only_password() {
+async fn login_flows_advertise_password_and_the_token_flow() {
     let harness = Harness::new();
     let (status, body) = harness
         .send(
@@ -402,8 +425,14 @@ async fn login_flows_advertise_only_password() {
         .await;
     assert_eq!(status, StatusCode::OK);
     let flows = body["flows"].as_array().unwrap();
-    assert_eq!(flows.len(), 1, "only what is implemented: {body}");
-    assert_eq!(flows[0]["type"], "m.login.password");
+    let kinds: Vec<&str> = flows
+        .iter()
+        .filter_map(|flow| flow["type"].as_str())
+        .collect();
+    // Only what is implemented: no SSO, and the token flow only because
+    // `POST /login/get_token` mints tokens for it.
+    assert_eq!(kinds, vec!["m.login.password", "m.login.token"], "{body}");
+    assert_eq!(flows[1]["get_login_token"], true, "{body}");
 }
 
 /// Restart preserves accounts and devices — an exit criterion of #11.

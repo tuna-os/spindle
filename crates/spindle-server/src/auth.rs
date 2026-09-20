@@ -26,7 +26,10 @@ impl FromRequestParts<AppState> for Authenticated {
         let token = bearer(parts).ok_or_else(MatrixError::missing_token)?;
         let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
         match accounts.identify(&token) {
-            Ok(Some(identity)) => Ok(Self(identity)),
+            Ok(Some(identity)) => {
+                refuse_if_locked_or_suspended(parts, &accounts, &identity)?;
+                Ok(Self(identity))
+            }
             // Not a local session: an appservice's skeleton key, or —
             // under MSC3861 delegation — a token only the provider can
             // vouch for. The order is cheapest-check-first.
@@ -171,4 +174,43 @@ fn bearer(parts: &Parts) -> Option<String> {
         .strip_prefix("Bearer ")
         .map(|token| token.trim().to_owned())
         .filter(|token| !token.is_empty())
+}
+
+/// The two administrative holds of spec v1.18, checked on every local
+/// session. A locked account is refused everything, with `soft_logout` so
+/// the client keeps its session for when the lock lifts. A suspended
+/// account keeps reading -- `/sync`, `/messages`, its own profile -- and
+/// may log out, and every other write is refused: the spec's shape, so a
+/// suspended user can still see what is said about them and leave.
+fn refuse_if_locked_or_suspended(
+    parts: &Parts,
+    accounts: &Accounts<'_, spindle_store::FjallStore>,
+    identity: &crate::accounts::Identity,
+) -> Result<(), MatrixError> {
+    let localpart = identity
+        .user_id
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(localpart, _)| localpart)
+        .unwrap_or_default();
+    let Some(account) = accounts
+        .account(localpart)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+    else {
+        return Ok(());
+    };
+    if account.locked {
+        return Err(MatrixError::user_locked());
+    }
+    if account.suspended
+        && parts.method != axum::http::Method::GET
+        && !parts.uri.path().starts_with("/_matrix/client/v3/logout")
+    {
+        return Err(MatrixError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            "M_USER_SUSPENDED",
+            "this account is suspended",
+        ));
+    }
+    Ok(())
 }

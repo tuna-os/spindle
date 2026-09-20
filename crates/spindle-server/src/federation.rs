@@ -409,6 +409,24 @@ impl Federation {
         PeerKeys::from_document(origin, &cached["document"])
     }
 
+    /// The origin's key document as it published it, from cache or
+    /// fetched: what a notary hands on (`/_matrix/key/v2/query`), still
+    /// carrying the origin's own signature so the asker can check it too.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] if the document cannot be fetched or is
+    /// not credible.
+    pub async fn peer_key_document(&self, origin: &str) -> Result<Value, FederationError> {
+        let _ = self.server_key(origin, "ed25519:_warm").await;
+        let bytes = ReadView::get(self.store.as_ref(), &server_keys_row(origin))
+            .map_err(|error| FederationError::Storage(error.to_string()))?
+            .ok_or_else(|| FederationError::Refused(format!("no keys for {origin}")))?;
+        let cached: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| FederationError::Storage(error.to_string()))?;
+        Ok(cached["document"].clone())
+    }
+
     /// The origin's public key (unpadded base64), from cache or fetched.
     async fn server_key(&self, origin: &str, key_id: &str) -> Result<String, FederationError> {
         let cache_key = server_keys_row(origin);

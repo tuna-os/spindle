@@ -1,0 +1,23 @@
+mesh node key document at its loopback URL|served
+Spindle invites @n:<node> into a state-DAG room|accepted
+mesh node invites @alice:<spindle>|accepted
+mesh user joins Spindle's state-DAG room via make_join/send_join|joined
+messages cross Spindle -> mesh and mesh -> Spindle|both
+mesh node finds alice's device keys via Spindle's user/keys/query|found
+mesh node claims one of alice's one-time keys|claimed
+Spindle finds the mesh user's device keys via the node's user/keys/query|found
+the mesh user's new device reaches alice as device_lists.changed|announced
+a to-device message from alice reaches the mesh user's device|delivered
+a to-device message from the mesh user reaches alice's device|delivered
+mesh node advertises msc4140 / msc4143 / msc4354|some
+mesh node serves /rtc/transports (MSC4143)|200
+mesh node honours a delayed send (MSC4140)|held
+alice's sticky m.rtc.member reaches the node|sticky-kept
+the node's /sync has an msc4354_sticky section|no
+the mesh user's m.rtc.member state reaches Spindle|arrived
+alice's delayed event fires and reaches the node|delivered
+the mesh user's delayed event fires on the node and reaches Spindle|delivered
+Spindle joins the mesh node's room and a message reaches the node|joined
+Spindle resolves #mesh-session-1:<node> over federation|resolved
+mesh node answers federation query with no X-Matrix header|200
+Spindle key document over plain http|200

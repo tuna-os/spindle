@@ -18,7 +18,7 @@ use argon2::Argon2;
 use argon2::password_hash::phc::{PasswordHash, Salt};
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use serde::{Deserialize, Serialize};
-use spindle_core::keys::{Keyspace, room_prefix};
+use spindle_core::keys::{self, Keyspace, room_prefix};
 use spindle_store::{Store, StoreError};
 
 /// How many bytes of entropy an access token carries.
@@ -30,6 +30,10 @@ const TOKEN_BYTES: usize = 32;
 
 /// A registered local user.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "admin, deactivated, locked and suspended are independent flags"
+)]
 pub struct Account {
     pub localpart: String,
     /// Argon2id PHC string, salt included.
@@ -46,6 +50,15 @@ pub struct Account {
     /// subcommand against the store.
     #[serde(default)]
     pub admin: bool,
+    /// Locked by an administrator (spec v1.18): every request answers
+    /// `M_USER_LOCKED` with `soft_logout`, and the sessions survive the
+    /// lock so that lifting it needs no re-login.
+    #[serde(default)]
+    pub locked: bool,
+    /// Suspended by an administrator (spec v1.18): the account may read
+    /// and log out, and nothing else; a write answers `M_USER_SUSPENDED`.
+    #[serde(default)]
+    pub suspended: bool,
 }
 
 /// One logged-in device.
@@ -86,6 +99,17 @@ pub struct Session {
 /// that does not expire -- which is why `expires_in_ms` is absent there rather
 /// than merely large.
 const ACCESS_TOKEN_LIFETIME_MS: u64 = 60 * 60 * 1000;
+
+/// How long a `get_token` login token stays redeemable: the spec's two
+/// minutes, enough to hand it to the other client and no more.
+pub const LOGIN_TOKEN_TTL_MS: u64 = 2 * 60 * 1000;
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
 
 /// The identity behind an authenticated request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -151,6 +175,8 @@ impl<'a, S: Store> Accounts<'a, S> {
             password_hash,
             deactivated: false,
             admin: false,
+            locked: false,
+            suspended: false,
         };
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
@@ -203,6 +229,46 @@ impl<'a, S: Store> Accounts<'a, S> {
         // A deactivated account keeps its hash (the row is the localpart
         // reservation) but no longer authenticates.
         Ok(matches && account.is_some_and(|account| !account.deactivated))
+    }
+
+    /// Mint a single-use login token for `localpart` (`POST
+    /// /login/get_token`, spec v1.7), good for [`LOGIN_TOKEN_TTL_MS`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountError`] if the row cannot be written.
+    pub fn issue_login_token(&self, localpart: &str) -> Result<(String, u64), AccountError> {
+        let token = format!("spt_{}", random_id(""));
+        let expires_at = now_millis().saturating_add(LOGIN_TOKEN_TTL_MS);
+        let row = serde_json::json!({ "localpart": localpart, "expires_at": expires_at });
+        self.store
+            .put(&keys::login_token(&token), row.to_string().as_bytes())?;
+        Ok((token, LOGIN_TOKEN_TTL_MS))
+    }
+
+    /// Spend a login token: the localpart it logs in, once. A token that
+    /// is unknown, already spent or lapsed is [`AccountError::UnknownToken`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountError`] if the store cannot be read or written.
+    pub fn redeem_login_token(&self, token: &str) -> Result<String, AccountError> {
+        let key = keys::login_token(token);
+        let Some(bytes) = self.store.get(&key)? else {
+            return Err(AccountError::UnknownToken);
+        };
+        // Spent on sight, whether or not it is still good: a lapsed token
+        // is not one to leave lying around.
+        self.store.delete(&key)?;
+        let row: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| AccountError::Codec(error.to_string()))?;
+        let live = row["expires_at"]
+            .as_u64()
+            .is_some_and(|until| until > now_millis());
+        match row["localpart"].as_str() {
+            Some(localpart) if live => Ok(localpart.to_owned()),
+            _ => Err(AccountError::UnknownToken),
+        }
     }
 
     /// Create a device and an access token for it.
@@ -396,6 +462,38 @@ impl<'a, S: Store> Accounts<'a, S> {
             return Ok(false);
         };
         account.admin = admin;
+        self.store
+            .put(&account_key(localpart), &encode(&account)?)?;
+        Ok(true)
+    }
+
+    /// Lock or unlock an account (spec v1.18). `false` for an account
+    /// that does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or decoding error.
+    pub fn set_locked(&self, localpart: &str, locked: bool) -> Result<bool, AccountError> {
+        let Some(mut account) = self.account(localpart)? else {
+            return Ok(false);
+        };
+        account.locked = locked;
+        self.store
+            .put(&account_key(localpart), &encode(&account)?)?;
+        Ok(true)
+    }
+
+    /// Suspend or reinstate an account (spec v1.18). `false` for an
+    /// account that does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or decoding error.
+    pub fn set_suspended(&self, localpart: &str, suspended: bool) -> Result<bool, AccountError> {
+        let Some(mut account) = self.account(localpart)? else {
+            return Ok(false);
+        };
+        account.suspended = suspended;
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
         Ok(true)

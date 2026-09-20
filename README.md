@@ -3,15 +3,16 @@
 **A Matrix homeserver that stores rooms as a linear log, so state resolution
 never runs on the hot path.**
 
-[**Benchmarks vs Synapse, Continuwuity and Tuwunel**](https://tuna-os.github.io/spindle/comparisons.html)
+[**Benchmarks vs Synapse, Dendrite, Continuwuity and Tuwunel**](https://tuna-os.github.io/spindle/comparisons.html)
 · [micro-benchmarks](https://tuna-os.github.io/spindle/)
 · [spec coverage dashboard](https://tuna-os.github.io/spindle/dashboard.html)
 · [SPEC.md](SPEC.md)
 
 > **Status: an experiment under construction, not a deployment.** The
 > client-server surface is broad and tested, federation interoperates with real
-> Synapse, and nothing here has ever run in production. There is no release, no
-> upgrade path promise, and the storage format has already broken once —
+> Synapse, and nothing here has ever run in production. Releases are weekly
+> `v0.0.x` prereleases that name a build and promise nothing else: no
+> upgrade path, and the storage format has already broken once —
 > deliberately, with the [test that caught it](crates/spindle-store/tests/backend_compatibility.rs)
 > kept and inverted rather than deleted.
 
@@ -114,7 +115,7 @@ impossible and the exception path is dead code.
 | **M6** Differentiators | Not started | Hub mode, MLS |
 | **M7** MatrixRTC | Server side served | **MSC4140 delayed events** — the dead-man's switch that stops calls accumulating ghost participants, which no other Rust homeserver has — plus MSC4354 sticky events, MSC4143 transport discovery, a built-in LiveKit JWT service or the OpenID round trip for an external one, ringing and decline. Element Call's own Playwright suite runs with Spindle in Synapse's seat: thirteen specs pass, among them a two-party call with video through LiveKit and MatrixRTC 2.0 sticky-event membership with a rejoin after an improper leave. Ringing, churn, a restart mid-call and the federated call are what remains of the gate |
 
-**187 routes** and a **311-test Complement ratchet** in CI, over a workspace of
+**224 routes** and a **310-test Complement ratchet** in CI, over a workspace of
 100+ test suites. The first two are gated — the [dashboard](docs/dashboard.md)
 is parsed from the router and CI fails on drift, and the ratchet is a file every
 entry of which must pass — so what they say matches `main` rather than matching
@@ -202,6 +203,9 @@ The risks that would invalidate the headline claim are enumerated in
 | [docs/venue-playbook.md](docs/venue-playbook.md) | Setting up the mesh and the conference Spindle, the test ladder, and the go/no-go list for 3,000 attendees |
 | [docs/venue-gateway.md](docs/venue-gateway.md) | The venue gateway: the Neutrino node with the uplink, how to build, run, pair, and troubleshoot it |
 | [docs/dashboard.md](docs/dashboard.md) | Generated endpoint and milestone coverage |
+| [docs/mscs.md](docs/mscs.md) | Every MSC served, partly served, planned or declined — generated from the ledger CI holds to the code |
+| [docs/spec-gaps.md](docs/spec-gaps.md) | What the pinned Matrix spec defines that the router does not serve, by the version that added it |
+| [docs/maintenance.md](docs/maintenance.md) | Keeping up: the gates, the ratchets, the weekly upkeep report, and how a spec release or an MSC is absorbed |
 
 ---
 

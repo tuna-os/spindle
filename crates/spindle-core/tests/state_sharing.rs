@@ -166,3 +166,69 @@ fn state_roots_are_the_bytes_they_have_always_been() {
         "a state key that overflows the hashing buffer changed its digest"
     );
 }
+
+/// Length-framed key/value pairs: the fewest bytes any snapshot without
+/// stable node addresses can be written in. Charging the alternative no
+/// format overhead at all is what makes the comparison below fair to it.
+fn serialised_len(state: &StateSnapshot) -> usize {
+    let mut bytes = 0;
+    state.for_each(|key, event_id| {
+        bytes += 4 + key.event_type().as_str().len() + 4 + key.state_key().len();
+        bytes += 4 + event_id.len();
+    });
+    bytes
+}
+
+#[test]
+fn one_update_writes_a_path_of_bytes_not_a_state() {
+    // #80: the node count above is the mechanism; the bytes are what the
+    // mechanism buys. A persistent map with no node addresses -- `im`, or a
+    // state snapshot serialised whole -- has to write everything reachable
+    // from the root on every change, so its cost per state event is the
+    // state. Content addressing writes the copied path and stops at the
+    // first node the previous snapshot already held, so the cost is the
+    // path, and it must stay flat while the state grows a hundredfold.
+    let mut rows = Vec::new();
+
+    for size in [100_usize, 1_000, 10_000] {
+        let before = seeded(size);
+        let after = before.apply(StateKey::new("m.room.topic", ""), "$topic");
+
+        let delta: usize = after
+            .delta_nodes(Some(&before))
+            .iter()
+            .map(|(_, node)| node.len())
+            .sum();
+        let whole = serialised_len(&after);
+        rows.push((size, delta, whole));
+
+        // Every node on the path is a leaf of at most a few entries or a
+        // branch of child hashes: a few hundred bytes each, a handful deep.
+        assert!(
+            delta <= 4 * 1024,
+            "one update in a {size}-entry state wrote {delta} bytes of nodes"
+        );
+        assert!(
+            whole >= size * 40,
+            "the serialised alternative should cost at least the entries: {whole} bytes at {size}"
+        );
+    }
+
+    let (_, small, _) = rows[0];
+    let (_, large, whole_large) = rows[2];
+    // Flat: the 10,000-entry case may cost a deeper path, not a larger one.
+    assert!(
+        large <= small * 4,
+        "delta bytes grew from {small} at 100 entries to {large} at 10,000 -- the path is no longer a path"
+    );
+    // And the trade at scale, so the table this test prints is the claim:
+    // the alternative writes the room, we write the path.
+    assert!(
+        whole_large / large >= 50,
+        "at 10,000 entries the whole-state write ({whole_large} bytes) should dwarf the delta ({large} bytes)"
+    );
+
+    for (size, delta, whole) in rows {
+        eprintln!("{size:>6} entries: delta {delta:>6} bytes, whole state {whole:>8} bytes");
+    }
+}

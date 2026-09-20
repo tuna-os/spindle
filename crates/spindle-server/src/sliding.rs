@@ -46,6 +46,73 @@ pub struct SlidingRequest {
     pub room_subscriptions: Map<String, Value>,
     /// Milliseconds to long-poll when nothing has changed.
     pub timeout: Option<u64>,
+    pub extensions: Extensions,
+}
+
+/// The extensions (MSC4186 §extensions): the parts of a client's world that
+/// are not a room's timeline, each switched on by name. Element X reads
+/// *all* of its E2EE and to-device traffic through these rather than
+/// through classic sync, so serving them on `/sync` v3 alone leaves the
+/// flagship client unable to decrypt anything.
+///
+/// Stateless like the rest of this endpoint: each request says which
+/// extensions it wants, and `to_device` carries its own `since`, because
+/// to-device messages are acknowledged by the token that delivered them
+/// rather than by `pos`. The MSC's per-extension `lists` and `rooms`
+/// scoping is not honoured: an enabled room extension applies to every room
+/// in the response, which is the superset a client asked for.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Extensions {
+    pub to_device: ToDeviceExtension,
+    pub e2ee: Toggle,
+    pub account_data: Toggle,
+    pub receipts: Toggle,
+    pub typing: Toggle,
+}
+
+/// One extension's switch. Absent is off.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Toggle {
+    pub enabled: Option<bool>,
+}
+
+impl Toggle {
+    #[must_use]
+    pub fn on(&self) -> bool {
+        self.enabled == Some(true)
+    }
+}
+
+/// The to-device extension: enabled, and the token of the last batch the
+/// client has, which is what acknowledges everything before it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ToDeviceExtension {
+    pub enabled: Option<bool>,
+    pub since: Option<String>,
+    pub limit: Option<usize>,
+}
+
+impl ToDeviceExtension {
+    #[must_use]
+    pub fn on(&self) -> bool {
+        self.enabled == Some(true)
+    }
+}
+
+impl Extensions {
+    /// Whether any extension is on, so a response can stay `{}` when none
+    /// is.
+    #[must_use]
+    pub fn any(&self) -> bool {
+        self.to_device.on()
+            || self.e2ee.on()
+            || self.account_data.on()
+            || self.receipts.on()
+            || self.typing.on()
+    }
 }
 
 impl SlidingRequest {
@@ -84,9 +151,11 @@ impl SlidingRequest {
 ///
 /// `["*", "*"]` is everything; `["m.room.member", "*"]` is every member;
 /// `["m.room.member", "$ME"]` is the asking user's own membership, which is
-/// how Element X asks for exactly the memberships it can render. An empty
-/// list is *nothing*, not everything — a client that wants no state says so
-/// by saying nothing, and the timeline is unaffected either way.
+/// how Element X asks for exactly the memberships it can render. `$LAZY`
+/// (the senders in the timeline window) is expanded to concrete keys by
+/// the caller before this is asked. An empty list is *nothing*, not
+/// everything — a client that wants no state says so by saying nothing,
+/// and the timeline is unaffected either way.
 #[must_use]
 pub fn wants_state(
     required: &[(String, String)],
@@ -103,6 +172,29 @@ pub fn wants_state(
         };
         type_matches && (key == "*" || key == state_key)
     })
+}
+
+/// MSC4186 `heroes`: up to five members other than `viewer`, each as
+/// `{user_id, name?, avatar?}` from their own member event. Six candidates
+/// come in so that leaving the viewer out still leaves five.
+#[must_use]
+pub fn heroes(candidates: &[crate::rooms::Hero], viewer: &str) -> Vec<Value> {
+    candidates
+        .iter()
+        .filter(|hero| hero.user_id != viewer)
+        .take(5)
+        .map(|hero| {
+            let mut entry = Map::new();
+            entry.insert("user_id".to_owned(), json!(hero.user_id));
+            if let Some(name) = &hero.displayname {
+                entry.insert("name".to_owned(), json!(name));
+            }
+            if let Some(avatar) = &hero.avatar_url {
+                entry.insert("avatar".to_owned(), json!(avatar));
+            }
+            Value::Object(entry)
+        })
+        .collect()
 }
 
 /// Clip `ranges` to a list of `len` rooms, yielding the indices in view.
@@ -144,27 +236,48 @@ pub struct Timeline {
     pub prev_batch: Option<String>,
 }
 
+/// What a room-list row is drawn from when the room has no name: the
+/// members' own names and avatars, the room's avatar, and who is invited.
+/// MSC4186 sends these beside the counts so a client need not ask for every
+/// member's state to label a direct chat.
+pub struct Summary {
+    pub name: Option<String>,
+    pub avatar: Option<String>,
+    pub joined_count: usize,
+    pub invited_count: usize,
+    /// Up to five members other than the viewer, joined first.
+    pub heroes: Vec<Value>,
+    /// The room's recency, comparable across rooms: the timestamp of its
+    /// newest event. A client sorts its list by this without a timeline.
+    pub bump_stamp: i64,
+}
+
 /// The `rooms` entry for one room, from the pieces the caller fetched.
 #[must_use]
 pub fn room_entry(
-    name: Option<String>,
+    summary: Summary,
     required_state: Vec<Value>,
     timeline: Timeline,
-    joined_count: usize,
     unread: Counts,
     initial: bool,
 ) -> Value {
     let mut entry = Map::new();
-    if let Some(name) = name {
+    if let Some(name) = summary.name {
         entry.insert("name".to_owned(), json!(name));
     }
+    if let Some(avatar) = summary.avatar {
+        entry.insert("avatar".to_owned(), json!(avatar));
+    }
+    entry.insert("heroes".to_owned(), Value::Array(summary.heroes));
+    entry.insert("invited_count".to_owned(), json!(summary.invited_count));
+    entry.insert("bump_stamp".to_owned(), json!(summary.bump_stamp));
     entry.insert("required_state".to_owned(), Value::Array(required_state));
     entry.insert("timeline".to_owned(), Value::Array(timeline.events));
     entry.insert("limited".to_owned(), json!(timeline.limited));
     if let Some(prev_batch) = timeline.prev_batch {
         entry.insert("prev_batch".to_owned(), json!(prev_batch));
     }
-    entry.insert("joined_count".to_owned(), json!(joined_count));
+    entry.insert("joined_count".to_owned(), json!(summary.joined_count));
     entry.insert(
         "notification_count".to_owned(),
         json!(unread.notification_count),

@@ -424,12 +424,7 @@ impl Pass<'_> {
             if reader == sender {
                 continue;
             }
-            let http_pushers: Vec<Value> = self
-                .pushers_for(&reader)
-                .iter()
-                .filter(|pusher| pusher["kind"] == "http" && pusher["data"]["url"].is_string())
-                .cloned()
-                .collect();
+            let http_pushers = self.live_http_pushers(&reader);
             if http_pushers.is_empty() {
                 continue;
             }
@@ -527,6 +522,21 @@ impl Pass<'_> {
             self.facts.insert(room_id.to_owned(), facts);
         }
         self.facts.get(room_id)
+    }
+
+    /// The reader's http pushers that receive anything: MSC3881 lets
+    /// another client switch one off, and one switched off stays
+    /// registered and gets nothing.
+    fn live_http_pushers(&mut self, user_id: &str) -> Vec<Value> {
+        self.pushers_for(user_id)
+            .iter()
+            .filter(|pusher| {
+                pusher["kind"] == "http"
+                    && pusher["data"]["url"].is_string()
+                    && pusher["enabled"] != false
+            })
+            .cloned()
+            .collect()
     }
 
     fn pushers_for(&mut self, user_id: &str) -> &Vec<Value> {

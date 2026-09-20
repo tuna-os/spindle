@@ -38,6 +38,58 @@ USES = re.compile(
 SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
+KEY = re.compile(r"^(?P<indent>\s*)(?P<dash>-\s+)?(?P<key>[A-Za-z0-9_.-]+):(?:\s|$)")
+
+
+def duplicate_keys(text: str) -> list[tuple[int, str]]:
+    """Every mapping key that repeats among its siblings, with its line.
+
+    GitHub refuses a workflow whose jobs (or steps' keys, or anything else)
+    repeat, while PyYAML keeps the last copy without a word -- so a file
+    can pass every local check and fail to parse the moment it is pushed,
+    which is exactly what a merge-conflict resolution once did to the
+    compliance workflow. This walks the indentation, the way YAML's block
+    structure is defined, and skips block scalars (`run: |` bodies), whose
+    lines are text and not keys. It is a scan, not a parser: it knows only
+    enough to catch the case that bit us.
+    """
+    found: list[tuple[int, str]] = []
+    # (indent, keys seen at that indent) for each open mapping.
+    stack: list[tuple[int, set[str]]] = []
+    scalar_indent: int | None = None
+    for number, raw in enumerate(text.splitlines(), 1):
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        if scalar_indent is not None:
+            if indent > scalar_indent:
+                continue
+            scalar_indent = None
+        match = KEY.match(raw)
+        if not match:
+            continue
+        # A `- key:` item opens a fresh mapping for the item; its own keys
+        # sit at the indent of the key, not of the dash.
+        if match["dash"]:
+            indent += len(match["dash"])
+            while stack and stack[-1][0] >= indent:
+                stack.pop()
+            stack.append((indent, set()))
+        while stack and stack[-1][0] > indent:
+            stack.pop()
+        if not stack or stack[-1][0] < indent:
+            stack.append((indent, set()))
+        seen = stack[-1][1]
+        key = match["key"]
+        if key in seen:
+            found.append((number, key))
+        seen.add(key)
+        rest = raw[match.end() :].strip()
+        if rest in ("|", ">", "|-", ">-", "|+", ">+"):
+            scalar_indent = indent
+    return found
+
+
 def main() -> int:
     root = pathlib.Path(__file__).resolve().parent.parent
     workflows = sorted((root / ".github" / "workflows").glob("*.yml"))
@@ -48,6 +100,11 @@ def main() -> int:
     problems: list[str] = []
     pinned = 0
     for path in workflows:
+        for number, key in duplicate_keys(path.read_text()):
+            problems.append(
+                f"{path.relative_to(root)}:{number}: `{key}` is defined twice "
+                "in the same mapping; GitHub refuses the whole workflow"
+            )
         for number, line in enumerate(path.read_text().splitlines(), 1):
             match = USES.match(line)
             if not match:

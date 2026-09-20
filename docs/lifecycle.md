@@ -107,11 +107,47 @@ past it. So a failed step leaves the marker where it was: the store still
 describes itself as the version it can still be read as, and you can fix the
 cause and run `migrate` again rather than reaching for the backup.
 
+### Format versions
+
+"The storage format" is four formats stacked, each with its own number, and
+a bug report or a migration step has to say which one it means:
+
+| layer | named by | now | what a bump means |
+|---|---|---|---|
+| **key schema** | `KEY_SCHEMA_VERSION` in `spindle-core` | 1 | the byte layout of keys: a keyspace discriminant reused or reordered, or a key's fields moved. *Adding* a keyspace is not a bump: every existing key keeps its bytes and its meaning. |
+| **record schema** | `RECORD_VERSION` in `spindle-store` | 1 | the encoding of the values under those keys (log entries and bodies), which carry their version as their first byte. |
+| **content digest** | `CONTENT_DIGEST_VERSION` in `spindle-core` | 2 | how content addresses are *derived*: a domain tag, a length width or a field order in the hashing. Keys and records are untouched by such a change, which is why it has its own number (#78): a store under the old derivation would open and misread every node address. |
+| **engine format** | the major version of `fjall` in `Cargo.toml` | 3 | the on-disk layout of the store itself: journal, segments, the engine's own `version` file. Spindle does not choose it and cannot rewrite it. |
+
+The first three are what the schema marker records and what `migrate` moves
+between; all three are pinned by
+`crates/spindle-store/tests/format_compatibility.rs`, whose fixtures are bytes
+written under the versions they name, so a bump fails a test until fixtures
+for the new version *and* a decision about data written under the old one
+exist. The fourth is what the marker cannot describe, because the marker is
+stored inside it.
+
+The transitions so far, numbered so they can be referred to:
+
+| # | layer | from | to | where | how a store crosses it |
+|---|---|---|---|---|---|
+| 1 | engine format | fjall 2 | fjall 3 | #193 | it does not. fjall 3 refuses a v2 directory with `InvalidVersion(Some(V2))` and has no in-process upgrade. Restore from a backup taken under fjall 3, or start a fresh store. |
+| 2 | content digest | 1 | 2 | #330 | it does not, yet. The store is refused as `content_digest 1` (a store from before the marker existed counts as 1 if it holds any row), and no migration step re-derives the addresses. Start a fresh store. |
+
+Both were accepted deliberately, because no Spindle had data to lose. They
+are kept on the books rather than forgotten because each is an example of
+what the machinery below does *not* do: transition 1 is the case it cannot
+help with, and `crates/spindle-store/tests/backend_compatibility.rs` holds
+fixtures written under fjall 2 to prove the refusal is clean and explains
+itself; transition 2 is a step the table could hold and does not, because
+nobody has needed it. Key and record schemas have never moved.
+
 ### The current state of the table
 
-**No schema change has yet needed a data rewrite**, so the migration table is
-empty and `spindle migrate` reports "already at this binary's schema" on every
-store in existence.
+**No schema change has yet been given a data rewrite** (transition 2 above
+was refused rather than migrated), so the migration table is empty and
+`spindle migrate` reports "already at this binary's schema" on every store in
+existence.
 
 That is worth saying rather than implying otherwise. What exists today is the
 machinery and its guarantees, proven by `crates/spindle-store/tests/schema_migration.rs`

@@ -106,7 +106,36 @@ pub enum StateBlock {
 }
 
 /// A room's joined user IDs, with the state root they were read from.
-type MemberIds = ([u8; 32], Arc<Vec<String>>);
+type MemberIds = ([u8; 32], Arc<Roster>);
+
+/// Who is in a room and who is asked in, read once per state root.
+///
+/// One pass over the member bodies serves three askers: the joined IDs
+/// (sliding sync's `joined_count`, the appservice fan-out, push), the
+/// invited IDs (`invited_count`), and the first few members with the name
+/// and avatar their member event carries, which is what MSC4186's
+/// `heroes` are made of. Reading the bodies again per asker was the cost
+/// the cache exists to avoid, so the second and third answers ride the
+/// first read.
+#[derive(Debug, Default)]
+pub struct Roster {
+    pub joined: Arc<Vec<String>>,
+    pub invited: Arc<Vec<String>>,
+    /// Up to six members, joined first then invited, in state order: one
+    /// more than the five heroes a room shows, so the viewer can be left
+    /// out and five remain.
+    pub heroes: Vec<Hero>,
+}
+
+/// One member as a room-list row shows them: the name and avatar from
+/// their own member event, not their global profile, because that is what
+/// they chose to be called in this room.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hero {
+    pub user_id: String,
+    pub displayname: Option<String>,
+    pub avatar_url: Option<String>,
+}
 /// Remote domains to fan out to, and the state root they were read from.
 type Destinations = ([u8; 32], Arc<Vec<String>>);
 
@@ -118,8 +147,8 @@ mod unread;
 pub use admin::AdminTimelineEntry;
 pub use read::{ReadScope, RoomReader};
 
-use unread::{HighlightTally, UnreadIndex};
-pub use unread::{Receipt, Unread, Unscored};
+pub use unread::{Receipt, Scored, Unread, Unscored};
+use unread::{ScoreTally, UnreadIndex};
 
 pub struct Rooms {
     store: Arc<FjallStore>,
@@ -132,7 +161,7 @@ pub struct Rooms {
     /// only `unread_index`; the build and append paths already hold `open`.
     unread_index: Mutex<HashMap<String, UnreadIndex>>,
     /// Per `(room, reader)`; taken on its own, never under `open`.
-    highlights: Mutex<HashMap<(String, String), HighlightTally>>,
+    highlights: Mutex<HashMap<(String, String), ScoreTally>>,
     /// Head-event timestamp per room, kept warm on append.
     ///
     /// The sliding-sync room list sorts by recency, so every request reads
@@ -143,6 +172,16 @@ pub struct Rooms {
     /// Continuwuity across two sittings. A sort key is one i64; it lives
     /// in memory and is refreshed by the append that changes it.
     last_activity: Mutex<HashMap<String, i64>>,
+    /// `(room, user)` -> the stream position allocated when that user last
+    /// sent a receipt in that room. A receipt is not an event and writes
+    /// no stream row, so nothing about the room moves when one lands --
+    /// and yet the reader's own unread counts just changed, and a sliding
+    /// sync that stays silent about an "unchanged" room sends them the old
+    /// numbers until something else happens there. matrix-rust-sdk's
+    /// notification-count test waited four seconds for the new count and
+    /// gave up; it was waiting on the next message. Positions on the same
+    /// counter events use, so `since` orders receipts and events together.
+    receipt_marks: Mutex<HashMap<(String, String), u64>>,
     /// The rendered `/state` body per room, keyed by the state root it was
     /// rendered from.
     ///
@@ -245,6 +284,47 @@ pub struct SyncResult {
     /// Rooms knocked on and not yet answered — see [`Rooms::knocked`].
     pub knocked: Vec<String>,
     pub left: Vec<SyncRoom>,
+}
+
+impl SyncResult {
+    /// Nothing in *any* section, which is the only state a long-poll may
+    /// wait in.
+    ///
+    /// The wait once looked at the joined rooms alone, so a client whose
+    /// only news was a fresh invite (or a knock answered, or a room left)
+    /// entered it with the invite already in hand and did not return until
+    /// the next unrelated event or the timeout. matrix-rust-sdk's suite
+    /// found it: an invitee polling at 30 s never saw the room inside the
+    /// 8 s its test allowed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rooms.is_empty()
+            && self.invited.is_empty()
+            && self.knocked.is_empty()
+            && self.left.is_empty()
+    }
+}
+
+/// The state a window changed, as MSC4222's `state_after` wants it: the
+/// last event in the window for each `(type, state_key)` it touched. The
+/// window runs to the head, so the last event for a key *is* the state
+/// after the window for that key, and every key the window did not touch
+/// is unchanged and stays out.
+fn state_changed_in(events: &[Value]) -> Vec<Value> {
+    let mut latest: Vec<((String, String), Value)> = Vec::new();
+    for event in events {
+        let (Some(event_type), Some(state_key)) =
+            (event["type"].as_str(), event["state_key"].as_str())
+        else {
+            continue;
+        };
+        let key = (event_type.to_owned(), state_key.to_owned());
+        match latest.iter_mut().find(|(seen, _)| *seen == key) {
+            Some((_, slot)) => *slot = event.clone(),
+            None => latest.push((key, event.clone())),
+        }
+    }
+    latest.into_iter().map(|(_, event)| event).collect()
 }
 
 /// One room's share of a sync response.
@@ -351,6 +431,7 @@ impl Rooms {
             unread_index: Mutex::new(HashMap::new()),
             highlights: Mutex::new(HashMap::new()),
             last_activity: Mutex::new(HashMap::new()),
+            receipt_marks: Mutex::new(HashMap::new()),
             state_render: Mutex::new(HashMap::new()),
             member_ids: Mutex::new(HashMap::new()),
             destinations: Mutex::new(HashMap::new()),
@@ -693,11 +774,15 @@ impl Rooms {
         sender: &str,
         target: &str,
         reason: Option<&str>,
+        is_direct: bool,
         key: &Ed25519KeyPair,
     ) -> Result<(String, Value), RoomError> {
         let mut content = serde_json::json!({ "membership": INVITE_STR });
         if let Some(reason) = reason {
             content["reason"] = Value::String(reason.to_owned());
+        }
+        if is_direct {
+            content["is_direct"] = Value::Bool(true);
         }
         self.with_room(room_id, |rooms, log| {
             rooms.build_event(
@@ -730,6 +815,7 @@ impl Rooms {
         user_id: &str,
         room_id: &str,
         origin: &str,
+        event_id: &str,
         invite_state: &[Value],
     ) -> Result<(), RoomError> {
         spindle_store::Store::put(
@@ -739,9 +825,13 @@ impl Rooms {
                 user_id,
                 room_id,
             ),
-            serde_json::json!({ "origin": origin, "invite_state": invite_state })
-                .to_string()
-                .as_bytes(),
+            serde_json::json!({
+                "origin": origin,
+                "event_id": event_id,
+                "invite_state": invite_state,
+            })
+            .to_string()
+            .as_bytes(),
         )?;
         spindle_store::Store::put(
             self.store.as_ref(),
@@ -1510,6 +1600,16 @@ impl Rooms {
     ///
     /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
     pub fn joined_member_ids(&self, room_id: &str) -> Result<Arc<Vec<String>>, RoomError> {
+        Ok(Arc::clone(&self.roster(room_id)?.joined))
+    }
+
+    /// Who is joined, who is invited, and the first few of them with a
+    /// name and an avatar -- see [`Roster`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
+    pub fn roster(&self, room_id: &str) -> Result<Arc<Roster>, RoomError> {
         let (root, members) = self.with_room_read(room_id, |_, log| {
             let root = log
                 .entries()
@@ -1525,33 +1625,59 @@ impl Rooms {
             Ok((root, members))
         })?;
         let Some(root) = root else {
-            return Ok(Arc::new(Vec::new()));
+            return Ok(Arc::new(Roster::default()));
         };
-        if let Some((cached_root, ids)) = self
+        if let Some((cached_root, roster)) = self
             .member_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(room_id)
             && *cached_root == root
         {
-            return Ok(Arc::clone(ids));
+            return Ok(Arc::clone(roster));
         }
-        let mut ids = Vec::new();
+        let mut joined = Vec::new();
+        let mut invited = Vec::new();
+        let mut invited_heroes = Vec::new();
+        let mut heroes = Vec::new();
         for (user_id, event_id) in members {
             // `read_event`, not `event`: the room's existence is already
             // established above, and `event` re-proves it under the room
             // lock once per member.
             let event = self.read_event(room_id, &EventId::new(event_id.as_str()))?;
-            if event["content"]["membership"].as_str() == Some(JOIN_STR) {
-                ids.push(user_id);
+            let hero = || Hero {
+                user_id: user_id.clone(),
+                displayname: event["content"]["displayname"].as_str().map(str::to_owned),
+                avatar_url: event["content"]["avatar_url"].as_str().map(str::to_owned),
+            };
+            match event["content"]["membership"].as_str() {
+                Some(JOIN_STR) => {
+                    if heroes.len() < 6 {
+                        heroes.push(hero());
+                    }
+                    joined.push(user_id);
+                }
+                Some(INVITE_STR) => {
+                    if invited_heroes.len() < 6 {
+                        invited_heroes.push(hero());
+                    }
+                    invited.push(user_id);
+                }
+                _ => {}
             }
         }
-        let ids = Arc::new(ids);
+        heroes.extend(invited_heroes);
+        heroes.truncate(6);
+        let roster = Arc::new(Roster {
+            joined: Arc::new(joined),
+            invited: Arc::new(invited),
+            heroes,
+        });
         self.member_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(room_id.to_owned(), (root, Arc::clone(&ids)));
-        Ok(ids)
+            .insert(room_id.to_owned(), (root, Arc::clone(&roster)));
+        Ok(roster)
     }
 
     /// Set a state event.
@@ -2033,9 +2159,10 @@ impl Rooms {
         &self,
         room_id: &str,
         event_id: &str,
-        limit: usize,
+        before: usize,
+        after: usize,
     ) -> Result<Context, RoomError> {
-        self.context_within(room_id, event_id, limit, None)
+        self.context_within(room_id, event_id, before, after, None)
     }
 
     /// [`Self::context`], seeing nothing above `bound`.
@@ -2051,10 +2178,11 @@ impl Rooms {
         &self,
         room_id: &str,
         event_id: &str,
-        limit: usize,
+        before: usize,
+        after: usize,
         bound: Option<i64>,
     ) -> Result<Context, RoomError> {
-        self.context_visible(room_id, event_id, limit, &|li| {
+        self.context_visible(room_id, event_id, before, after, &|li| {
             bound.is_none_or(|bound| li <= bound)
         })
     }
@@ -2071,7 +2199,8 @@ impl Rooms {
         &self,
         room_id: &str,
         event_id: &str,
-        limit: usize,
+        before_limit: usize,
+        after_limit: usize,
         visible: &(dyn Fn(i64) -> bool + Sync),
     ) -> Result<Context, RoomError> {
         let found = self.with_room_read(room_id, |_, log| {
@@ -2084,19 +2213,19 @@ impl Rooms {
             }
             let state_root = entry.state_root;
 
-            // Symmetric, and each side stops at the end of the log rather than
-            // running off it.
+            // Each side has its own limit and stops at the end of the log
+            // rather than running off it.
             let before: Vec<String> = log
                 .entries()
                 .rev()
                 .filter(|entry| entry.li.get() < target && visible(entry.li.get()))
-                .take(limit)
+                .take(before_limit)
                 .map(|entry| entry.event_id.as_str().to_owned())
                 .collect();
             let after: Vec<String> = log
                 .entries()
                 .filter(|entry| entry.li.get() > target && visible(entry.li.get()))
-                .take(limit)
+                .take(after_limit)
                 .map(|entry| entry.event_id.as_str().to_owned())
                 .collect();
 
@@ -2785,6 +2914,45 @@ impl Rooms {
         self.stream.position()
     }
 
+    /// Note that `user_id` sent a receipt in `room_id`: a position on the
+    /// stream counter, and a wake for whoever is long-polling, so the
+    /// reader's own next sync answers now and carries the counts the
+    /// receipt changed.
+    pub fn mark_receipt(&self, room_id: &str, user_id: &str) {
+        let position = self.allocate_stream_id();
+        self.receipt_marks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((room_id.to_owned(), user_id.to_owned()), position);
+        self.wake_sync_waiters();
+    }
+
+    /// Of `rooms`, the ones `user_id` sent a receipt in at a position in
+    /// `(since, until]`: rooms an incremental sync must speak about even
+    /// though no event landed there, because the reader's own unread
+    /// counts moved.
+    pub fn rooms_read_since<'a>(
+        &self,
+        user_id: &str,
+        rooms: impl IntoIterator<Item = &'a str>,
+        since: u64,
+        until: u64,
+    ) -> HashSet<String> {
+        let marks = self
+            .receipt_marks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        rooms
+            .into_iter()
+            .filter(|room_id| {
+                marks
+                    .get(&((*room_id).to_owned(), user_id.to_owned()))
+                    .is_some_and(|position| *position > since && *position <= until)
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// Wait until an event lands, or the deadline passes.
     ///
     /// SPEC §10.3 wants `/sync` to be push rather than poll, and this is the
@@ -2889,6 +3057,14 @@ impl Rooms {
             // initial sync, or on the sync that joins it. Otherwise the
             // state events are in the timeline already, and sending them
             // twice would make a client apply each one twice.
+            //
+            // Except under MSC4222. `state_after` tells the client *not* to
+            // fold the timeline's state events into its state -- the block
+            // is the whole answer -- so an incremental sync must carry
+            // every key that changed in the window, or the change is lost.
+            // It was: this branch sent an empty block, and matrix-rust-sdk,
+            // which always asks for `state_after`, never saw a room name,
+            // topic, alias or power level change after its first sync.
             let (state, cached_state) = if fresh {
                 self.initial_state(
                     &room_id,
@@ -2898,6 +3074,8 @@ impl Rooms {
                     prev_batch,
                     state_after,
                 )?
+            } else if state_after {
+                (state_changed_in(&events), false)
             } else {
                 (Vec::new(), false)
             };
@@ -3330,6 +3508,39 @@ impl Rooms {
             }
         }
         Ok(out)
+    }
+
+    /// Where the room stood when the server handed out sync token
+    /// `position`: the room's own index of its newest event at or before
+    /// that stream position, or `None` if nothing of the room's had entered
+    /// the stream by then.
+    ///
+    /// A client that asks for the roster "as of" a token it synced to is
+    /// asking this question, and the answer has to come from the same
+    /// index the sync answered from ([`Self::room_slice`]) or the two
+    /// disagree at exactly the moment a member joins: the sync says the
+    /// event is after the token, the roster says they are in. The room's
+    /// rows are in stream order, so this is a scan to the token and one
+    /// step back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the index cannot be read.
+    pub fn li_at_stream(&self, room_id: &str, position: u64) -> Result<Option<i64>, RoomError> {
+        let rows = spindle_store::ReadView::scan_prefix(
+            self.store.as_ref(),
+            &spindle_core::keys::room_stream_prefix(room_id),
+        )?;
+        let mut last = None;
+        for (key, raw) in rows {
+            if spindle_core::keys::room_stream_from_key(&key).is_some_and(|id| id > position) {
+                break;
+            }
+            if let Ok(bytes) = <[u8; 8]>::try_from(raw.as_slice()) {
+                last = Some(i64::from_be_bytes(bytes));
+            }
+        }
+        Ok(last)
     }
 
     /// The events a room contributed to a stream range, as bodies.
@@ -4274,21 +4485,27 @@ impl Rooms {
                 input.json["origin_server_ts"].as_i64().unwrap_or(0),
             );
 
-        // The signed JSON is stored beside the log entry. The log holds
-        // ordering and state; the event body is what a client actually reads
-        // back, and reconstructing it from the log would mean re-signing, which
-        // would produce a different event ID.
+        // The signed JSON is stored beside the log entry, in the entry's own
+        // batch. The log holds ordering and state; the event body is what a
+        // client actually reads back, and reconstructing it from the log
+        // would mean re-signing, which would produce a different event ID.
+        //
+        // In the batch, not a `put` before it (#84 §4). Written separately,
+        // the body survived a crash only because fjall keeps one journal
+        // that the entry's sync happened to flush -- an ordering nothing
+        // stated and nothing tested, whose failure would surface as
+        // `MissingBody` on a read far from the cause. One batch has no
+        // ordering to get wrong: the body lands if and only if the entry
+        // does. `an_append_writes_nothing_outside_its_batch` holds it.
         let room_store = RoomStore::new(self.store.as_ref(), room_id);
-        spindle_store::Store::put(
-            self.store.as_ref(),
-            &event_body_key(room_id, event_id),
-            &serde_json::to_vec(input.json)?,
-        )?;
+        let mut extra = vec![(
+            event_body_key(room_id, event_id),
+            serde_json::to_vec(input.json)?,
+        )];
         // A relation is indexed in the entry's own batch too, and for the same
         // reason: an index entry written separately can outlive a commit that
         // failed, leaving `/relations` pointing at an event the room does not
         // have.
-        let mut extra = Vec::new();
         if let Some((rel_type, target)) = relates_to(input.content) {
             // The type goes in the value, not the key -- see `keys::relation`.
             let mut value = Vec::with_capacity(2 + rel_type.len() + event_id.len());

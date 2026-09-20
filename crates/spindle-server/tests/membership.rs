@@ -309,3 +309,66 @@ async fn joining_by_id_through_the_alias_endpoint_works() {
     assert_eq!(body["room_id"], room_id);
     assert_eq!(harness.joined(&bob).await, vec![room_id]);
 }
+
+/// `GET /members?at=` answers with the roster as it stood at that sync
+/// token, not the present one. The difference is exactly the join the
+/// client has not seen yet, and an E2EE client that gets the present
+/// roster shares a room key with a device its sync never mentioned
+/// (matrix-rust-sdk's `test_encryption_missing_member_keys`).
+#[tokio::test]
+async fn members_at_a_token_stops_where_that_sync_stopped() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness.create_room(&alice).await;
+    let room_path = |tail: &str| format!("/_matrix/client/v3/rooms/{room}/{tail}");
+
+    // Alice syncs while alone in the room; that token is her `at`.
+    let (status, sync) = harness
+        .get("/_matrix/client/v3/sync?timeout=0", &alice)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{sync}");
+    let token = sync["next_batch"].as_str().unwrap().to_owned();
+
+    let (status, body) = harness
+        .post(
+            &room_path("invite"),
+            &alice,
+            &json!({ "user_id": "@bob:example.org" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness.post(&room_path("join"), &bob, &json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let names = |body: &Value| -> Vec<String> {
+        body["chunk"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["state_key"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // The present roster has both; the roster at the token has Alice alone.
+    let (status, body) = harness.get(&room_path("members"), &alice).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(names(&body), vec!["@alice:example.org", "@bob:example.org"]);
+
+    let (status, body) = harness
+        .get(&room_path(&format!("members?at={token}")), &alice)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(names(&body), vec!["@alice:example.org"]);
+
+    // A token from before the room existed names an empty roster, and a
+    // token this server never issued is refused rather than ignored.
+    let (status, body) = harness.get(&room_path("members?at=s0"), &alice).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(names(&body).is_empty(), "{body}");
+    let (status, body) = harness
+        .get(&room_path("members?at=not-a-token"), &alice)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_INVALID_PARAM");
+}
