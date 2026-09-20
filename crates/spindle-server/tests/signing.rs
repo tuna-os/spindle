@@ -72,6 +72,54 @@ fn separate_servers_get_separate_keys() {
     assert_ne!(first.public_key_base64(), second.public_key_base64());
 }
 
+/// A cutover keeps the source key ID and seed, so remote homeservers can
+/// verify both imported history and events Spindle signs after the switch.
+#[test]
+fn a_synapse_signing_seed_is_installed_once_and_survives_restart() {
+    let dir = TempDir::new().unwrap();
+    let store = FjallStore::open(dir.path()).unwrap();
+    let source = "ed25519 a_test nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A\n";
+    let key = ServerKey::install_synapse(&store, source).unwrap();
+    assert_eq!(key.key_id(), "ed25519:a_test");
+    assert_eq!(
+        key.public_key_base64(),
+        "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo"
+    );
+
+    let restarted = ServerKey::load_or_create(&store).unwrap();
+    assert_eq!(restarted.key_id(), key.key_id());
+    assert_eq!(restarted.public_key_base64(), key.public_key_base64());
+    assert!(matches!(
+        ServerKey::install_synapse(&store, source),
+        Err(spindle_server::signing::SigningError::AlreadyExists)
+    ));
+}
+
+#[test]
+fn malformed_synapse_signing_keys_are_refused_without_installing_anything() {
+    for source in [
+        "rsa a_test AAAA",
+        "ed25519 bad-version AAAA",
+        "ed25519 a_test not-base64!",
+        "ed25519 a_test AAAA",
+        "ed25519 a_test AAAA extra",
+    ] {
+        let dir = TempDir::new().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        assert!(
+            ServerKey::install_synapse(&store, source).is_err(),
+            "{source}"
+        );
+        assert!(
+            store
+                .scan_prefix(&[spindle_core::keys::KEY_SCHEMA_VERSION, 0x0a])
+                .unwrap()
+                .is_empty(),
+            "a refused key left private material behind"
+        );
+    }
+}
+
 /// The load-bearing one. A private key in a published response is a total
 /// compromise that still returns 200, so nothing about the response looks
 /// wrong.

@@ -1,5 +1,5 @@
-//! Redaction, under room version 11's algorithm (MSC3820, with MSC2174's
-//! `redacts` in content).
+//! Redaction under the room's own algorithm, including the v1–v10 top-level
+//! target and v11's MSC2174 `content.redacts` target.
 //!
 //! Two things this file is really about.
 //!
@@ -112,8 +112,16 @@ impl Harness {
     }
 
     async fn room(&self, token: &str) -> String {
+        self.room_at_version(token, None).await
+    }
+
+    async fn room_at_version(&self, token: &str, version: Option<&str>) -> String {
+        let mut request = json!({});
+        if let Some(version) = version {
+            request["room_version"] = json!(version);
+        }
         let (_, created) = self
-            .post("/_matrix/client/v3/createRoom", token, &json!({}))
+            .post("/_matrix/client/v3/createRoom", token, &request)
             .await;
         created["room_id"].as_str().unwrap().to_owned()
     }
@@ -338,6 +346,37 @@ async fn the_redaction_names_its_target_where_room_v11_puts_it() {
         event["redacts"].is_null(),
         "the v1-v10 top-level `redacts` is set on a v11 event: {event}"
     );
+}
+
+/// Version 10 predates MSC2174: putting the target in content would produce
+/// a signed event that v10 peers cannot apply.
+#[tokio::test]
+async fn a_v10_redaction_names_its_target_at_the_top_level() {
+    let harness = Harness::new();
+    let token = harness.register("alice").await;
+    let room = harness.room_at_version(&token, Some("10")).await;
+    let target = harness.say(&room, &token, "doomed", "t1").await;
+
+    let (status, body) = harness
+        .put(
+            &format!("/_matrix/client/v3/rooms/{room}/redact/{target}/r1"),
+            &token,
+            &json!({ "reason": "off topic" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let redaction = body["event_id"].as_str().unwrap();
+    let (status, event) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/event/{redaction}"),
+            &token,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{event}");
+    assert_eq!(event["redacts"], target, "{event}");
+    assert_eq!(event["content"]["reason"], "off topic", "{event}");
+    assert!(event["content"]["redacts"].is_null(), "{event}");
 }
 
 /// State survives redaction as state: the entry still points at the event, and

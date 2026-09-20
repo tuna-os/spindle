@@ -34,29 +34,49 @@ use rusqlite::{Connection, OptionalExtension};
 
 use super::{SourceEvent, SourceRoom, StateMap};
 
+pub mod postgres;
+pub mod recovery;
+
 /// Why a room could not be read.
 #[derive(Debug)]
 pub enum ReadError {
     Sqlite(rusqlite::Error),
+    Postgres(::postgres::Error),
+    Json(serde_json::Error),
     /// The database has no such room.
     UnknownRoom(String),
     /// The room's history starts at a backfill horizon.
     ///
     /// Reconstructing the state there means resolving a Synapse *state group*,
     /// which is a delta against a parent group threaded through
-    /// `state_group_edges` -- a walk this reader does not do yet. Refused
+    /// `state_group_edges`. The native PostgreSQL reader does that walk; the
+    /// deliberately small SQLite fixture reader refuses these rooms. Refused
     /// loudly, because the alternative is an import that starts from empty
     /// state and calls a room with different contents a success.
     NeedsStateGroups {
         room_id: String,
         root: String,
     },
+    /// Synapse has no state-group mapping for the retained-history root.
+    MissingStateGroup {
+        room_id: String,
+        root: String,
+    },
+    /// The source state-group chain loops instead of reaching a full state.
+    StateGroupCycle {
+        room_id: String,
+        state_group: i64,
+    },
+    /// A caller supplied something other than PostgreSQL's snapshot token.
+    InvalidSnapshotId(String),
 }
 
 impl std::fmt::Display for ReadError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Sqlite(error) => write!(formatter, "reading Synapse: {error}"),
+            Self::Postgres(error) => write!(formatter, "reading Synapse PostgreSQL: {error}"),
+            Self::Json(error) => write!(formatter, "parsing Synapse JSON: {error}"),
             Self::UnknownRoom(room) => write!(formatter, "no room {room} in this database"),
             Self::NeedsStateGroups { room_id, root } => write!(
                 formatter,
@@ -64,6 +84,23 @@ impl std::fmt::Display for ReadError {
                  state has to come from Synapse's state groups, which this reader does \
                  not resolve yet (they are deltas chained through state_group_edges)"
             ),
+            Self::MissingStateGroup { room_id, root } => write!(
+                formatter,
+                "{room_id}: Synapse has no state group for retained-history root {root}"
+            ),
+            Self::StateGroupCycle {
+                room_id,
+                state_group,
+            } => write!(
+                formatter,
+                "{room_id}: Synapse state-group chain cycles at {state_group}"
+            ),
+            Self::InvalidSnapshotId(snapshot) => {
+                write!(
+                    formatter,
+                    "invalid PostgreSQL snapshot identifier {snapshot:?}"
+                )
+            }
         }
     }
 }
@@ -74,6 +111,40 @@ impl From<rusqlite::Error> for ReadError {
     fn from(error: rusqlite::Error) -> Self {
         Self::Sqlite(error)
     }
+}
+
+impl From<::postgres::Error> for ReadError {
+    fn from(error: ::postgres::Error) -> Self {
+        Self::Postgres(error)
+    }
+}
+
+impl From<serde_json::Error> for ReadError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
+
+fn is_create_rooted(room: &SourceRoom) -> bool {
+    room.events
+        .iter()
+        .any(|event| event.event_type == "m.room.create" && !event.outlier && !event.rejected)
+}
+
+fn require_create_root(room: SourceRoom) -> Result<SourceRoom, ReadError> {
+    if is_create_rooted(&room) {
+        return Ok(room);
+    }
+
+    let earliest = room
+        .events
+        .iter()
+        .find(|event| !event.outlier && !event.rejected)
+        .map_or_else(|| "nothing".to_owned(), |event| event.event_id.clone());
+    Err(ReadError::NeedsStateGroups {
+        room_id: room.room_id,
+        root: earliest,
+    })
 }
 
 /// Every room the database holds, in a stable order.
@@ -175,21 +246,5 @@ pub fn read_room(connection: &Connection, room_id: &str) -> Result<SourceRoom, R
     // Refuse a horizon start here rather than handing `plan` a room it will
     // refuse anyway: this reader knows *why* the state is missing, and can
     // name the tables that would supply it.
-    if !room
-        .events
-        .iter()
-        .any(|event| event.event_type == "m.room.create" && !event.outlier && !event.rejected)
-    {
-        let earliest = room
-            .events
-            .iter()
-            .find(|event| !event.outlier && !event.rejected)
-            .map_or_else(|| "nothing".to_owned(), |event| event.event_id.clone());
-        return Err(ReadError::NeedsStateGroups {
-            room_id: room_id.to_owned(),
-            root: earliest,
-        });
-    }
-
-    Ok(room)
+    require_create_root(room)
 }
