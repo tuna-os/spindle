@@ -19,6 +19,9 @@ pub struct MatrixError {
     pub error: String,
     /// Present only on `M_LIMIT_EXCEEDED`, where the spec defines it.
     pub retry_after_ms: Option<u64>,
+    /// `M_USER_LOCKED` carries `soft_logout: true`: the session is kept,
+    /// the client is to stop using it until the lock lifts.
+    pub soft_logout: bool,
 }
 
 impl MatrixError {
@@ -29,6 +32,20 @@ impl MatrixError {
             errcode,
             error: error.into(),
             retry_after_ms: None,
+            soft_logout: false,
+        }
+    }
+
+    /// The account is locked by an administrator (spec v1.18). The token
+    /// stays valid, which is what `soft_logout` tells the client.
+    #[must_use]
+    pub fn user_locked() -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            errcode: "M_USER_LOCKED",
+            error: "this account is locked".to_owned(),
+            retry_after_ms: None,
+            soft_logout: true,
         }
     }
 
@@ -85,6 +102,7 @@ impl MatrixError {
             errcode: "M_LIMIT_EXCEEDED",
             error: format!("too many requests; retry in {retry_after_ms}ms"),
             retry_after_ms: Some(retry_after_ms),
+            soft_logout: false,
         }
     }
 
@@ -127,6 +145,9 @@ impl IntoResponse for MatrixError {
         body.insert("error".to_owned(), json!(self.error));
         if let Some(retry) = self.retry_after_ms {
             body.insert("retry_after_ms".to_owned(), json!(retry));
+        }
+        if self.soft_logout {
+            body.insert("soft_logout".to_owned(), json!(true));
         }
         (self.status, Json(serde_json::Value::Object(body))).into_response()
     }

@@ -88,6 +88,30 @@ impl Harness {
         .await
     }
 
+    async fn put(&self, path: &str, token: &str, payload: &Value) -> (StatusCode, Value) {
+        self.call(
+            Request::builder()
+                .method("PUT")
+                .uri(path)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+    }
+
+    async fn say(&self, room_id: &str, token: &str, text: &str, txn: &str) {
+        let (status, body) = self
+            .put(
+                &format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{txn}"),
+                token,
+                &json!({ "msgtype": "m.text", "body": text }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
     async fn get(&self, path: &str, token: &str) -> (StatusCode, Value) {
         self.call(
             Request::builder()
@@ -250,46 +274,74 @@ async fn the_block_holds_the_state_at_the_end_of_the_timeline() {
 }
 
 #[tokio::test]
-async fn an_incremental_sync_carries_an_empty_state_after() {
-    // Correct here, and worth stating why: this server's incremental timeline
-    // is never gapped -- it returns everything since the token -- so every
-    // state change is already in the timeline and there is nothing left for
-    // `state_after` to add. MSC4222 exists for the gapped case, which this
-    // server does not produce.
+async fn an_incremental_sync_carries_the_keys_the_window_changed() {
+    // MSC4222 tells a client not to fold the timeline's state events into
+    // its state: `state_after` is the whole answer. So an incremental sync
+    // must name every key that changed in the window, or the change is
+    // lost -- which is what happened, and why matrix-rust-sdk (which always
+    // asks for `state_after`) never saw a canonical alias land.
+    //
+    // A test here used to assert the block was *empty* on an incremental
+    // sync, reasoning that this server's timeline is never gapped so every
+    // change is already in it. The timeline is indeed complete; the
+    // reasoning missed that under the MSC the client is told not to read
+    // state from it. The reversal is recorded rather than deleted.
     let harness = Harness::new();
     let alice = harness.register("alice").await;
     let room = harness.create_room(&alice).await;
 
-    let since = harness.sync(&alice, "?use_state_after=true").await["next_batch"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let sync = harness.sync(&alice, "?use_state_after=true").await;
+    let since = sync["next_batch"].as_str().unwrap().to_owned();
 
-    harness
-        .request(
-            "PUT",
-            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.topic"),
-            &alice,
-            &json!({ "topic": "changed after the token" }),
-        )
-        .await;
+    // Two topics in one window: only the last one is the state after it.
+    for topic in ["first", "second"] {
+        let (status, body) = harness
+            .put(
+                &format!("/_matrix/client/v3/rooms/{room}/state/m.room.topic/"),
+                &alice,
+                &json!({ "topic": topic }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    harness.say(&room, &alice, "not state", "t1").await;
 
     let sync = harness
         .sync(&alice, &format!("?since={since}&use_state_after=true"))
         .await;
-    let after = &sync["rooms"]["join"][&room]["state_after"]["events"];
+    let block = &sync["rooms"]["join"][&room]["state_after"];
+    let topics: Vec<&str> = block["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("state_after on an incremental sync: {sync}"))
+        .iter()
+        .filter(|event| event["type"] == "m.room.topic")
+        .filter_map(|event| event["content"]["topic"].as_str())
+        .collect();
     assert_eq!(
-        after.as_array().map(Vec::len),
-        Some(0),
-        "nothing to add: the change is in the timeline: {sync}"
+        topics,
+        vec!["second"],
+        "the last value of a changed key, once: {sync}"
+    );
+    assert!(
+        block["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| event.get("state_key").is_some()),
+        "only state events, never the message: {sync}"
+    );
+    assert!(
+        sync["rooms"]["join"][&room]["state"].is_null(),
+        "never both blocks: {sync}"
     );
 
-    let timeline = sync["rooms"]["join"][&room]["timeline"]["events"]
-        .as_array()
-        .unwrap();
+    // Without the flag the incremental sync still carries no state block:
+    // that client folds the timeline itself, and a block would double it.
+    let sync = harness.sync(&alice, &format!("?since={since}")).await;
     assert!(
-        timeline.iter().any(|event| event["type"] == "m.room.topic"
-            && event["content"]["topic"] == "changed after the token"),
-        "and it really is in the timeline: {timeline:?}"
+        sync["rooms"]["join"][&room]["state"]["events"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "{sync}"
     );
 }

@@ -1,4 +1,4 @@
-//! `/threads`: the room's thread roots, most recently active first.
+//! `/threads` (MSC3856): the room's thread roots, most recently active first.
 //!
 //! The endpoint's ordering is by *latest reply*, not by when the root was
 //! sent, so a thread started first can be listed last and usually is. That

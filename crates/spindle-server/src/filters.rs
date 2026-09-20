@@ -105,6 +105,11 @@ pub struct EventFilter {
     /// put it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lazy_load_members: Option<bool>,
+    /// MSC3773 (spec v1.4): count the main timeline and each thread
+    /// separately in `unread_notifications` and
+    /// `unread_thread_notifications`. Meaningful on the `timeline` filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_thread_notifications: Option<bool>,
 }
 
 impl EventFilter {

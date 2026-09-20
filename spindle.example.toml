@@ -23,6 +23,15 @@ bind = "127.0.0.1:8008"
 # not be the hostname.
 # public_base_url = "https://matrix.example.org"
 
+# Who to contact about this server, served at /.well-known/matrix/support
+# (spec v1.10). Unset, the endpoint answers 404 rather than an empty list.
+# [server.support]
+# support_page = "https://example.org/matrix-help"
+# contacts = [
+#   { matrix_id = "@admin:example.org", email_address = "admin@example.org", role = "m.role.admin" },
+#   { email_address = "security@example.org", role = "m.role.security" },
+# ]
+
 [storage]
 path = "./data"
 
@@ -67,6 +76,18 @@ enabled = true
 # tests, which serve fixtures on 127.0.0.1, and for the rare deployment that
 # genuinely wants previews of an internal wiki and says so range by range.
 allow_private = []
+
+# Who may register. Open by default; with `require_token = true` a new
+# account needs a token an admin minted at `/_spindle/admin/v1/registration_tokens`.
+# [registration]
+# require_token = false
+
+# Notices from the operator to a user (`POST /_spindle/admin/v1/send_server_notice`).
+# Absent, the endpoint refuses and says so. The account is created on first use.
+# [server_notices]
+# localpart = "server"
+# display_name = "Server Notices"
+# room_name = "Server Notices"
 
 [push]
 # Deliver notifications to the push gateways clients register (`POST
@@ -305,3 +326,8 @@ registrations = []
 [logging]
 # A `tracing-subscriber` filter directive.
 # filter = "spindle=debug,warn"
+# Export spans as traces. Off unless named; the only value is "otlp", which
+# sends OTLP/HTTP to the endpoint OTEL_EXPORTER_OTLP_ENDPOINT names (its
+# default is http://localhost:4318). No collector address lives in this
+# file: docs/telemetry-guidelines.md.
+# traces = "otlp"

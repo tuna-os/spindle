@@ -384,3 +384,25 @@ fn no_rtc_section_means_no_transports() {
     let config = parse("[server]\nname = \"example.org\"\n").expect("no section is fine");
     assert!(config.rtc.foci.is_empty());
 }
+
+#[test]
+fn traces_are_off_unless_an_exporter_is_named() {
+    // docs/telemetry-guidelines.md: no exporter is wired by default, and the
+    // only way to wire one is to name it. A misspelling is a refusal, not a
+    // silent default to nothing.
+    use spindle_server::config::TraceExporter;
+    let off = spindle_server::Config::parse("[server]\nname = \"example.org\"\n").unwrap();
+    assert_eq!(off.logging.traces, None);
+
+    let on = spindle_server::Config::parse(
+        "[server]\nname = \"example.org\"\n[logging]\ntraces = \"otlp\"\n",
+    )
+    .unwrap();
+    assert_eq!(on.logging.traces, Some(TraceExporter::Otlp));
+
+    let error = spindle_server::Config::parse(
+        "[server]\nname = \"example.org\"\n[logging]\ntraces = \"jaeger\"\n",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("jaeger"), "{error}");
+}

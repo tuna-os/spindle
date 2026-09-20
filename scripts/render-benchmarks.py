@@ -48,6 +48,27 @@ COMPARISONS = [
         "state_lookup/hashmap/{}",
         ["1000", "50000"],
     ),
+    # The other side of the two trades above (#80): what content addressing
+    # buys. Neither `im` nor a HashMap can do these at all, so the comparison
+    # is against the cheapest thing a structure without node addresses can do.
+    (
+        "Persisting one state change: content-addressed delta vs serialising an im map",
+        "state_persist/hamt_delta/{}",
+        "state_persist/im_serialise/{}",
+        ["100", "1000", "10000"],
+    ),
+    (
+        "State at a past point, inside the resident window: snapshot vs a 100-hop delta replay",
+        "state_history_at/resident/{}",
+        "state_history_at/delta_replay_100/{}",
+        ["100", "1000", "10000"],
+    ),
+    (
+        "State at a past point, outside the window: rehydrate from the node store vs a 100-hop delta replay",
+        "state_history_at/rehydrate/{}",
+        "state_history_at/delta_replay_100/{}",
+        ["100", "1000", "10000"],
+    ),
 ]
 
 

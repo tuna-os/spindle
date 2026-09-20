@@ -1,4 +1,6 @@
-//! The rules deciding what a client is notified about.
+//! The rules deciding what a client is notified about. The defaults are
+//! the spec's own (MSC4196 is what keeps them the spec's business), so a
+//! client that has never touched its rules gets the same answer everywhere.
 //!
 //! Push rules are both account data and an endpoint, which is the thing most
 //! worth testing: `/sync` and `/pushrules/` read one stored value, so a client
@@ -112,7 +114,7 @@ impl Harness {
             .unwrap()
             .iter()
             .find(|event| event["type"] == "m.push_rules")
-            .unwrap_or_else(|| panic!("no m.push_rules in {body}"))["content"]
+            .unwrap_or_else(|| panic!("no m.push_rules in {body}"))["content"]["global"]
             .clone()
     }
 }

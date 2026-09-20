@@ -1,6 +1,7 @@
 //! MSC3861: authentication delegated to an OIDC provider — a real
 //! Spindle instance over TCP against a mock Matrix Authentication
-//! Service.
+//! Service, with the MSC2967 API scopes and the MSC2965 metadata
+//! discovery a client needs to find it.
 //!
 //! What the suite pins: `/auth_metadata` relays the provider's own
 //! discovery document (and 404s `M_UNRECOGNIZED` when nothing is

@@ -777,10 +777,12 @@ trigger `/get_missing_events` — the classic amplification vector.
    immediately.
 4. Backfills asynchronously into negative `li` per §6.5.
 
-Faster room joins (MSC3706 partial state / MSC3902) are supported on the receive
-side: the room is usable with partial state, marked `partial_state`, and the
-remaining state is resynced in the background. Membership-dependent operations
-block only until the relevant slice of state has arrived.
+Faster room joins (MSC3706 partial state / MSC3902) are designed for on the
+receive side, and not yet built: the room would be usable with partial state,
+marked `partial_state`, with the remaining state resynced in the background and
+membership-dependent operations blocking only until the relevant slice of state
+has arrived. Nothing handles `members_omitted` today; `docs/mscs.md` records
+MSC3706 as planned, and this paragraph is the design it will be built to.
 
 ### 11.6 Room versions
 

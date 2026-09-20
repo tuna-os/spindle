@@ -8,6 +8,8 @@ use spindle_server::Config;
 use spindle_store::FjallStore;
 use tokio::net::TcpListener;
 use tokio::signal;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -159,10 +161,10 @@ async fn serve() -> ExitCode {
         .filter
         .clone()
         .unwrap_or_else(|| "info".to_owned());
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
+    let tracer_provider = match init_logging(&config, filter) {
+        Ok(provider) => provider,
+        Err(code) => return code,
+    };
 
     // Listened for from here, before the store is opened or anything is
     // bound: a signal that arrives during startup is then kept and
@@ -265,6 +267,7 @@ async fn serve() -> ExitCode {
         }
     }
     close_store(store).await;
+    flush_traces(tracer_provider);
     match served {
         Ok(()) => {
             tracing::info!("shut down cleanly");
@@ -274,6 +277,56 @@ async fn serve() -> ExitCode {
             tracing::error!("server stopped: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Install the log subscriber, and the trace exporter beside it when the
+/// config names one.
+///
+/// The exporter is built before the subscriber so a bad OTLP environment
+/// is reported and fails the start, rather than being discovered as a
+/// silent absence of traces. Nothing is wired unless the config names it:
+/// `docs/telemetry-guidelines.md`. The provider comes back to the caller,
+/// who shuts it down last so the shutdown itself is traced.
+fn init_logging(
+    config: &Config,
+    filter: String,
+) -> Result<Option<opentelemetry_sdk::trace::SdkTracerProvider>, ExitCode> {
+    let tracer_provider = match config.logging.traces {
+        Some(spindle_server::config::TraceExporter::Otlp) => {
+            match spindle_server::telemetry::otlp_provider() {
+                Ok(provider) => Some(provider),
+                Err(error) => {
+                    eprintln!("spindle: cannot set up the OTLP trace exporter: {error}");
+                    return Err(ExitCode::FAILURE);
+                }
+            }
+        }
+        None => None,
+    };
+    let traces = tracer_provider.as_ref().map(|provider| {
+        use opentelemetry::trace::TracerProvider as _;
+        tracing_opentelemetry::layer().with_tracer(provider.tracer("spindle"))
+    });
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new(filter))
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(traces)
+        .init();
+    if tracer_provider.is_some() {
+        tracing::info!("exporting traces over OTLP");
+    }
+    Ok(tracer_provider)
+}
+
+/// Last, so the shutdown is traced too: flush what is queued and stop the
+/// export thread. The error is logged and not returned -- a collector that
+/// went away must not turn a clean stop into a failed one.
+fn flush_traces(provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>) {
+    if let Some(provider) = provider
+        && let Err(error) = provider.shutdown()
+    {
+        tracing::warn!("trace exporter did not flush: {error}");
     }
 }
 

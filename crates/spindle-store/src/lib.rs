@@ -476,6 +476,13 @@ pub struct FjallStore {
     reads: AtomicU64,
     scanned: AtomicU64,
     written: AtomicU64,
+    /// Rows written *outside* a batch -- by [`Store::put`] or
+    /// [`Store::delete`] -- since open.
+    ///
+    /// A row written this way is not atomic with anything. That is fine
+    /// for a setting or a key; it is the defect for anything an event
+    /// needs, which is why the append path is held to writing none (#84).
+    unbatched: AtomicU64,
     /// Batches journalled but not necessarily synced, ever, since open.
     ///
     /// Exists so a caller can ask "did anything get written while I held
@@ -541,6 +548,18 @@ impl FjallStore {
     #[must_use]
     pub fn written(&self) -> u64 {
         self.written.load(Ordering::Relaxed)
+    }
+
+    /// Rows written outside any batch since this store was opened.
+    ///
+    /// The append path's own gate: an event's body, its stream row, its
+    /// indexes and its state nodes must land in the entry's batch or not
+    /// at all, and a test holds that by asserting this counter does not
+    /// move across an append (#84 §4). A row that slips out of the batch
+    /// is a row a crash can separate from the entry it belongs to.
+    #[must_use]
+    pub fn unbatched(&self) -> u64 {
+        self.unbatched.load(Ordering::Relaxed)
     }
 
     /// Open or create a store at `path`.
@@ -615,6 +634,7 @@ impl FjallStore {
             reads: AtomicU64::new(0),
             scanned: AtomicU64::new(0),
             written: AtomicU64::new(0),
+            unbatched: AtomicU64::new(0),
             journalled: AtomicU64::new(0),
             group: GroupCommit::default(),
             db,
@@ -884,6 +904,7 @@ impl Store for FjallStore {
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         self.partition.insert(key, value)?;
         self.written.fetch_add(1, Ordering::Relaxed);
+        self.unbatched.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -899,6 +920,7 @@ impl Store for FjallStore {
     fn delete(&self, key: &[u8]) -> Result<(), StoreError> {
         self.partition.remove(key)?;
         self.written.fetch_add(1, Ordering::Relaxed);
+        self.unbatched.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 

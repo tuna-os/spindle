@@ -39,6 +39,49 @@ pub struct Config {
     pub rtc: RtcConfig,
     #[serde(default)]
     pub push: PushConfig,
+    #[serde(default)]
+    pub registration: RegistrationConfig,
+    /// Absent means this server sends no notices and the admin endpoint
+    /// says so.
+    #[serde(default)]
+    pub server_notices: Option<ServerNoticesConfig>,
+}
+
+/// Who may register.
+///
+/// Registration is open unless a token is required: an operator who
+/// wants a closed server hands out tokens from the admin API
+/// (`/registration_tokens`), each good for so many uses until a time.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistrationConfig {
+    /// Require an `m.login.registration_token` stage at registration.
+    #[serde(default)]
+    pub require_token: bool,
+}
+
+/// The account this server speaks through when an admin sends a notice
+/// (`POST /send_server_notice`), and the room it opens with each user.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerNoticesConfig {
+    /// The localpart of the notices account, created on first use.
+    #[serde(default = "default_notices_localpart")]
+    pub localpart: String,
+    /// The account's display name, as members of the notices room see it.
+    #[serde(default = "default_notices_name")]
+    pub display_name: String,
+    /// The name each notices room is created with.
+    #[serde(default = "default_notices_name")]
+    pub room_name: String,
+}
+
+fn default_notices_localpart() -> String {
+    "server".to_owned()
+}
+
+fn default_notices_name() -> String {
+    "Server Notices".to_owned()
 }
 
 /// Push notification delivery.
@@ -402,6 +445,33 @@ pub struct ServerConfig {
     /// server name need not be the hostname.
     #[serde(default)]
     pub public_base_url: Option<String>,
+    /// Who to contact about this server (spec v1.10), served at
+    /// `/.well-known/matrix/support`. Absent means the endpoint answers
+    /// 404, which is what the spec says an unconfigured server does.
+    #[serde(default)]
+    pub support: Option<SupportConfig>,
+}
+
+/// `/.well-known/matrix/support`: the people and the page behind a server.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupportConfig {
+    #[serde(default)]
+    pub contacts: Vec<SupportContact>,
+    #[serde(default)]
+    pub support_page: Option<String>,
+}
+
+/// One support contact: a role, and a Matrix ID or an email or both.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupportContact {
+    #[serde(default)]
+    pub matrix_id: Option<String>,
+    #[serde(default)]
+    pub email_address: Option<String>,
+    /// `m.role.admin`, `m.role.security`, or a namespaced role of your own.
+    pub role: String,
 }
 
 /// Whether the rate limiter is in force.
@@ -621,6 +691,28 @@ pub struct LoggingConfig {
     /// `tracing-subscriber` filter directive, e.g. `spindle=debug,warn`.
     #[serde(default)]
     pub filter: Option<String>,
+    /// Where spans go, beside the log. Absent means nowhere, which is the
+    /// default and the only shape `docs/telemetry-guidelines.md` allows
+    /// without an operator's say-so: no exporter is wired unless named.
+    #[serde(default)]
+    pub traces: Option<TraceExporter>,
+}
+
+/// A span exporter an operator may switch on.
+///
+/// One variant, and an enum rather than a bool so the next exporter is a
+/// variant and not a second flag. The destination is deliberately not a
+/// setting here: OTLP's own `OTEL_EXPORTER_OTLP_ENDPOINT` (and its
+/// `_HEADERS`, `_TIMEOUT` siblings) are read by the SDK, so a collector
+/// address never lives in this file and the same config runs against any
+/// backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TraceExporter {
+    /// OpenTelemetry protocol over HTTP with protobuf bodies, to the
+    /// endpoint the standard environment names (`http://localhost:4318`
+    /// when it names none).
+    Otlp,
 }
 
 fn default_bind() -> String {

@@ -218,3 +218,49 @@ async fn one_account_never_sees_anothers_pushers() {
         .await;
     assert_eq!(harness.list(&alice).await.len(), 1);
 }
+
+/// MSC3881: a pusher says which device owns it and whether it is on, so
+/// another client of the same user can switch it off. Both spellings are
+/// served until the stable one is in a spec this server claims.
+#[tokio::test]
+async fn a_pusher_names_its_device_and_can_be_switched_off_from_anywhere() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let (status, whoami) = harness
+        .get("/_matrix/client/v3/account/whoami", &alice)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{whoami}");
+    let device_id = whoami["device_id"].as_str().unwrap().to_owned();
+
+    let (status, body) = harness.set(&alice, &http_pusher("KEY1")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let pushers = harness.list(&alice).await;
+    assert_eq!(pushers[0]["enabled"], true, "{pushers:?}");
+    assert_eq!(pushers[0]["org.matrix.msc3881.enabled"], true);
+    assert_eq!(pushers[0]["device_id"], device_id);
+    assert_eq!(pushers[0]["org.matrix.msc3881.device_id"], device_id);
+
+    let mut off = http_pusher("KEY1");
+    off["org.matrix.msc3881.enabled"] = json!(false);
+    let (status, body) = harness.set(&alice, &off).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let pushers = harness.list(&alice).await;
+    assert_eq!(pushers[0]["enabled"], false, "{pushers:?}");
+
+    let (status, versions) = harness.get("/_matrix/client/versions", &alice).await;
+    assert_eq!(status, StatusCode::OK, "{versions}");
+    assert_eq!(versions["unstable_features"]["org.matrix.msc3881"], true);
+}
+
+impl Harness {
+    async fn get(&self, path: &str, token: &str) -> (StatusCode, Value) {
+        self.call(
+            Request::builder()
+                .uri(path)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    }
+}

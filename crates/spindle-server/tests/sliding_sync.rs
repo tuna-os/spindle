@@ -555,3 +555,441 @@ async fn a_bump_after_a_sync_still_reorders_the_window() {
          recency was already read once: {after}"
     );
 }
+
+// --- extensions ------------------------------------------------------------
+//
+// Element X reads its to-device traffic, key counts, account data, receipts
+// and typing through the sliding-sync extensions and nothing else; a server
+// that serves them only on classic sync leaves the flagship client unable
+// to decrypt a single message.
+
+fn with_extensions(extensions: Value) -> Value {
+    let mut request = window();
+    request["extensions"] = extensions;
+    request
+}
+
+#[tokio::test]
+async fn extensions_are_absent_unless_asked_for() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    harness.named_room(&alice, "Quiet").await;
+    let response = harness.sliding(&alice, None, &window()).await;
+    assert_eq!(response["extensions"], json!({}), "{response}");
+}
+
+#[tokio::test]
+async fn the_to_device_extension_delivers_and_its_token_acknowledges() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let (status, whoami) = harness
+        .request("GET", "/_matrix/client/v3/account/whoami", &bob, &json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{whoami}");
+    let bob_device = whoami["device_id"].as_str().unwrap().to_owned();
+
+    let (status, body) = harness
+        .request(
+            "PUT",
+            "/_matrix/client/v3/sendToDevice/m.room_key_request/txn1",
+            &alice,
+            &json!({ "messages": { "@bob:example.org": { bob_device: { "action": "request" } } } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let enabled = with_extensions(json!({ "to_device": { "enabled": true } }));
+    let response = harness.sliding(&bob, None, &enabled).await;
+    let events = response["extensions"]["to_device"]["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a to_device section: {response}"));
+    assert_eq!(events.len(), 1, "{response}");
+    assert_eq!(events[0]["type"], "m.room_key_request");
+    assert_eq!(events[0]["sender"], "@alice:example.org");
+    let next_batch = response["extensions"]["to_device"]["next_batch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Not acknowledged yet: a request without the token gets it again, which
+    // is what lets a client that lost its state recover.
+    let again = harness.sliding(&bob, None, &enabled).await;
+    assert_eq!(
+        again["extensions"]["to_device"]["events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "{again}"
+    );
+
+    // Acknowledged by the token: gone.
+    let acknowledged =
+        with_extensions(json!({ "to_device": { "enabled": true, "since": next_batch } }));
+    let after = harness.sliding(&bob, None, &acknowledged).await;
+    assert_eq!(
+        after["extensions"]["to_device"]["events"],
+        json!([]),
+        "{after}"
+    );
+}
+
+#[tokio::test]
+async fn the_e2ee_extension_reports_key_counts_and_changed_devices() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness.named_room(&alice, "Shared").await;
+    harness.invite(&room, &alice, "bob").await;
+    harness.join(&room, &bob).await;
+
+    let (status, body) = harness
+        .request(
+            "POST",
+            "/_matrix/client/v3/keys/upload",
+            &bob,
+            &json!({
+                "one_time_keys": {
+                    "signed_curve25519:AAAAAQ": { "key": "one" },
+                    "signed_curve25519:AAAAAg": { "key": "two" },
+                },
+                "fallback_keys": { "signed_curve25519:FB": { "key": "fallback" } },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let enabled = with_extensions(json!({ "e2ee": { "enabled": true } }));
+    let response = harness.sliding(&bob, None, &enabled).await;
+    let e2ee = &response["extensions"]["e2ee"];
+    assert_eq!(
+        e2ee["device_one_time_keys_count"]["signed_curve25519"], 2,
+        "{response}"
+    );
+    assert_eq!(
+        e2ee["device_unused_fallback_key_types"],
+        json!(["signed_curve25519"]),
+        "{response}"
+    );
+    assert_eq!(e2ee["device_lists"]["changed"], json!([]), "{response}");
+    let pos = response["pos"].as_str().unwrap().to_owned();
+
+    // Alice, who shares a room with bob, announces a device: bob's next
+    // incremental response names her.
+    let (status, whoami) = harness
+        .request(
+            "GET",
+            "/_matrix/client/v3/account/whoami",
+            &alice,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{whoami}");
+    let (status, body) = harness
+        .request(
+            "POST",
+            "/_matrix/client/v3/keys/upload",
+            &alice,
+            &json!({ "device_keys": { "user_id": "@alice:example.org", "device_id": whoami["device_id"] } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response = harness.sliding(&bob, Some(&pos), &enabled).await;
+    assert_eq!(
+        response["extensions"]["e2ee"]["device_lists"]["changed"],
+        json!(["@alice:example.org"]),
+        "{response}"
+    );
+}
+
+#[tokio::test]
+async fn the_account_data_extension_carries_global_and_room_data() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.named_room(&alice, "Tagged").await;
+    let (status, body) = harness
+        .request(
+            "PUT",
+            "/_matrix/client/v3/user/@alice:example.org/account_data/io.example.global",
+            &alice,
+            &json!({ "colour": "teal" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness
+        .request(
+            "PUT",
+            &format!("/_matrix/client/v3/user/@alice:example.org/rooms/{room}/account_data/m.tag"),
+            &alice,
+            &json!({ "tags": { "m.favourite": {} } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let enabled = with_extensions(json!({ "account_data": { "enabled": true } }));
+    let response = harness.sliding(&alice, None, &enabled).await;
+    let global = response["extensions"]["account_data"]["global"]
+        .as_array()
+        .unwrap_or_else(|| panic!("global account data: {response}"));
+    assert!(
+        global
+            .iter()
+            .any(|event| event["type"] == "io.example.global"
+                && event["content"]["colour"] == "teal"),
+        "{response}"
+    );
+    assert!(
+        global.iter().any(|event| event["type"] == "m.push_rules"),
+        "the default push rules ride along, as on classic sync: {response}"
+    );
+    let room_data = &response["extensions"]["account_data"]["rooms"][&room];
+    assert_eq!(room_data[0]["type"], "m.tag", "{response}");
+}
+
+#[tokio::test]
+async fn the_receipts_extension_carries_read_receipts_and_keeps_private_ones_private() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness.named_room(&alice, "Read").await;
+    harness.invite(&room, &alice, "bob").await;
+    harness.join(&room, &bob).await;
+    let (status, sent) = harness
+        .request(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/m1"),
+            &alice,
+            &json!({ "msgtype": "m.text", "body": "read me" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    let event_id = sent["event_id"].as_str().unwrap().to_owned();
+    for (token, kind) in [(&bob, "m.read"), (&bob, "m.read.private")] {
+        let (status, body) = harness
+            .request(
+                "POST",
+                &format!("/_matrix/client/v3/rooms/{room}/receipt/{kind}/{event_id}"),
+                token,
+                &json!({}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    let enabled = with_extensions(json!({ "receipts": { "enabled": true } }));
+    let seen_by_alice = harness.sliding(&alice, None, &enabled).await;
+    let receipt = &seen_by_alice["extensions"]["receipts"]["rooms"][&room];
+    assert_eq!(receipt["type"], "m.receipt", "{seen_by_alice}");
+    assert!(
+        receipt["content"][&event_id]["m.read"]["@bob:example.org"]["ts"].is_u64(),
+        "{seen_by_alice}"
+    );
+    assert!(
+        receipt["content"][&event_id]["m.read.private"].is_null(),
+        "bob's private receipt is not alice's to see: {seen_by_alice}"
+    );
+
+    let seen_by_bob = harness.sliding(&bob, None, &enabled).await;
+    assert!(
+        seen_by_bob["extensions"]["receipts"]["rooms"][&room]["content"][&event_id]["m.read.private"]
+            ["@bob:example.org"]["ts"]
+            .is_u64(),
+        "{seen_by_bob}"
+    );
+}
+
+#[tokio::test]
+async fn the_typing_extension_says_who_is_typing() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness.named_room(&alice, "Typing").await;
+    harness.invite(&room, &alice, "bob").await;
+    harness.join(&room, &bob).await;
+    let (status, body) = harness
+        .request(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/typing/@alice:example.org"),
+            &alice,
+            &json!({ "typing": true, "timeout": 30_000 }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let enabled = with_extensions(json!({ "typing": { "enabled": true } }));
+    let response = harness.sliding(&bob, None, &enabled).await;
+    let typing = &response["extensions"]["typing"]["rooms"][&room];
+    assert_eq!(typing["type"], "m.typing", "{response}");
+    assert_eq!(
+        typing["content"]["user_ids"],
+        json!(["@alice:example.org"]),
+        "{response}"
+    );
+
+    // Off again: the room drops out of the section.
+    let (status, body) = harness
+        .request(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/typing/@alice:example.org"),
+            &alice,
+            &json!({ "typing": false }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response = harness.sliding(&bob, None, &enabled).await;
+    assert!(
+        response["extensions"]["typing"]["rooms"][&room].is_null(),
+        "{response}"
+    );
+}
+
+#[tokio::test]
+async fn a_room_entry_carries_what_a_row_is_drawn_from() {
+    // MSC4186 sends, beside the counts, what a room-list row needs when the
+    // room has no name: the members' own names and avatars (`heroes`), the
+    // room avatar, who is invited, and a recency stamp comparable across
+    // rooms. Without them a client asks for every member's state to label
+    // a direct chat, and sorts its list by a timeline it did not want.
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let carol = harness.register("carol").await;
+    let (status, body) = harness
+        .request(
+            "PUT",
+            "/_matrix/client/v3/profile/@bob:example.org/displayname",
+            &bob,
+            &json!({ "displayname": "Bob" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness
+        .request("POST", "/_matrix/client/v3/createRoom", &alice, &json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    harness.invite(&room, &alice, "bob").await;
+    harness.join(&room, &bob).await;
+    harness.invite(&room, &alice, "carol").await;
+    let (status, body) = harness
+        .request(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.avatar/"),
+            &alice,
+            &json!({ "url": "mxc://example.org/room" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let response = harness.sliding(&alice, None, &window()).await;
+    let entry = &response["rooms"][&room];
+    assert_eq!(entry["joined_count"], json!(2), "{entry}");
+    assert_eq!(entry["invited_count"], json!(1), "{entry}");
+    assert_eq!(entry["avatar"], json!("mxc://example.org/room"), "{entry}");
+    // Heroes leave the viewer out and come joined first, then invited,
+    // with the name the member event carries.
+    let heroes = entry["heroes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{entry}"));
+    let ids: Vec<&str> = heroes
+        .iter()
+        .filter_map(|hero| hero["user_id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["@bob:example.org", "@carol:example.org"],
+        "{entry}"
+    );
+    assert_eq!(heroes[0]["name"], json!("Bob"), "{entry}");
+    assert!(
+        heroes[1].get("name").is_none(),
+        "carol never set one: {entry}"
+    );
+
+    // The bump stamp is the newest event's timestamp, so it moves when the
+    // room does and orders rooms without a timeline in the response.
+    let before = entry["bump_stamp"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("{entry}"));
+    let newest = entry["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["origin_server_ts"].as_i64())
+        .max()
+        .unwrap();
+    assert_eq!(before, newest, "{entry}");
+    drop(carol);
+}
+
+#[tokio::test]
+async fn an_invite_is_a_room_in_the_list() {
+    // MSC4186 has no invite section: an invited room is in the list like any
+    // other, with the stripped state the invite is rendered from and no
+    // timeline. Without it a sliding-sync client -- Element X -- never sees
+    // an invite at all (matrix-rust-sdk's
+    // `test_delayed_invite_response_and_sent_message_decryption` waited on
+    // one for three seconds and gave up).
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+
+    // Bob is up to date, then the invite lands: the incremental response
+    // names the room, and it is an invite entry.
+    let before = harness.sliding(&bob, None, &window()).await;
+    assert_eq!(before["lists"]["main"]["count"], json!(0), "{before}");
+    let pos = before["pos"].as_str().unwrap().to_owned();
+    let room = harness.named_room(&alice, "the reading circle").await;
+    harness.invite(&room, &alice, "bob").await;
+
+    let response = harness.sliding(&bob, Some(&pos), &window()).await;
+    assert_eq!(response["lists"]["main"]["count"], json!(1), "{response}");
+    let entry = &response["rooms"][&room];
+    assert_eq!(entry["initial"], json!(true), "{response}");
+    assert_eq!(entry["name"], json!("the reading circle"), "{entry}");
+    let stripped = entry["invite_state"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{entry}"));
+    assert!(
+        stripped.iter().any(|event| event["type"] == "m.room.member"
+            && event["state_key"] == "@bob:example.org"
+            && event["content"]["membership"] == "invite"),
+        "the invite itself is in the stripped state: {entry}"
+    );
+    assert!(
+        stripped.iter().all(|event| event.get("event_id").is_none()),
+        "stripped events carry no event IDs: {entry}"
+    );
+    assert!(
+        entry.get("timeline").is_none(),
+        "an invitee gets no timeline: {entry}"
+    );
+    assert!(entry.get("joined_count").is_none(), "nor counts: {entry}");
+    let ids: Vec<&str> = entry["heroes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|hero| hero["user_id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["@alice:example.org"],
+        "the inviter is the hero: {entry}"
+    );
+
+    // On an initial request the invite is there too, sorted with the rest.
+    let initial = harness.sliding(&bob, None, &window()).await;
+    assert_eq!(initial["lists"]["main"]["count"], json!(1), "{initial}");
+    assert!(
+        initial["rooms"][&room]["invite_state"].is_array(),
+        "{initial}"
+    );
+
+    // Once Bob joins, the same room is an ordinary entry.
+    harness.join(&room, &bob).await;
+    let joined = harness.sliding(&bob, None, &window()).await;
+    let entry = &joined["rooms"][&room];
+    assert!(entry.get("invite_state").is_none(), "{entry}");
+    assert_eq!(entry["joined_count"], json!(2), "{entry}");
+}

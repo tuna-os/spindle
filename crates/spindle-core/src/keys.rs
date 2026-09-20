@@ -372,6 +372,31 @@ pub enum Keyspace {
     /// moderation queue an admin walks by id is a different thing from a
     /// log of what admins did. The sequence number is the report's id.
     EventReport = 0x35,
+    /// MSC3814: the one dehydrated device a user may park, keyed by user:
+    /// which device it is and the encrypted `device_data` that rehydrates
+    /// it. The device's keys and queue live in the device keyspaces like
+    /// any other device's.
+    DehydratedDevice = 0x36,
+    /// `(user_id, event_id)` -> `(device_id, txn_id)`: the inverse of
+    /// [`Keyspace::Transaction`], so an event can be handed back to the
+    /// device that sent it with the `unsigned.transaction_id` the spec
+    /// promises that device, and no other.
+    TransactionEcho = 0x37,
+    /// An `mxc://` URI minted ahead of its bytes (`POST /media/v1/create`,
+    /// spec v1.7): who reserved it and when the reservation lapses. The
+    /// row is deleted when the upload lands under [`Keyspace::Media`].
+    MediaReservation = 0x38,
+    /// A single-use login token (`POST /login/get_token`, spec v1.7): the
+    /// user it logs in and when it stops working. Deleted on use.
+    LoginToken = 0x39,
+    /// A registration token (`m.login.registration_token`, spec v1.2):
+    /// how many uses it allows, how many it has had, and when it lapses.
+    /// Keyed by the token itself. 0x38 and 0x39 are taken by the media
+    /// reservation and login-token rows.
+    RegistrationToken = 0x3a,
+    /// `user_id` -> the room this server sends its notices to that user
+    /// in, so a second notice lands in the same room as the first.
+    ServerNoticeRoom = 0x3b,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -832,6 +857,44 @@ pub fn media(media_id: &str) -> Vec<u8> {
     key
 }
 
+/// The reservation row for a media ID minted before its bytes arrived.
+#[must_use]
+pub fn media_reservation(media_id: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::MediaReservation as u8];
+    key.extend_from_slice(media_id.as_bytes());
+    key
+}
+
+/// The row for one single-use login token.
+#[must_use]
+pub fn login_token(token: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::LoginToken as u8];
+    key.extend_from_slice(token.as_bytes());
+    key
+}
+
+/// One registration token's row.
+#[must_use]
+pub fn registration_token(token: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::RegistrationToken as u8];
+    key.extend_from_slice(token.as_bytes());
+    key
+}
+
+/// Every registration token.
+#[must_use]
+pub fn registration_tokens_prefix() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::RegistrationToken as u8]
+}
+
+/// The server-notices room of one user.
+#[must_use]
+pub fn server_notice_room(user_id: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::ServerNoticeRoom as u8];
+    key.extend_from_slice(user_id.as_bytes());
+    key
+}
+
 /// Every [`Keyspace::Media`] key, for a scan over all uploaded files.
 #[must_use]
 pub fn media_all() -> Vec<u8> {
@@ -844,6 +907,36 @@ pub fn media_id(key: &[u8]) -> Option<String> {
     let rest = key.strip_prefix(media_all().as_slice())?;
     let len = usize::from(u16::from_be_bytes(rest.get(..2)?.try_into().ok()?));
     String::from_utf8(rest.get(2..2 + len)?.to_vec()).ok()
+}
+
+/// The echo row for one event: which user's event, so the sender's own
+/// reads can look it up by the ID alone.
+#[must_use]
+pub fn transaction_echo(user_id: &str, event_id: &str) -> Vec<u8> {
+    let mut key = user_prefix(Keyspace::TransactionEcho, user_id);
+    key.extend_from_slice(event_id.as_bytes());
+    key
+}
+
+/// The value of a [`transaction_echo`] row: the device, length-prefixed,
+/// then the transaction ID it chose.
+#[must_use]
+pub fn transaction_echo_value(device_id: &str, txn_id: &str) -> Vec<u8> {
+    let (len, device) = framed(device_id.as_bytes());
+    let mut value = Vec::with_capacity(2 + device.len() + txn_id.len());
+    value.extend_from_slice(&len.to_be_bytes());
+    value.extend_from_slice(device);
+    value.extend_from_slice(txn_id.as_bytes());
+    value
+}
+
+/// Read a [`transaction_echo_value`] back: `(device_id, txn_id)`.
+#[must_use]
+pub fn transaction_echo_parts(value: &[u8]) -> Option<(String, String)> {
+    let len = usize::from(u16::from_be_bytes(value.get(..2)?.try_into().ok()?));
+    let device = String::from_utf8(value.get(2..2 + len)?.to_vec()).ok()?;
+    let txn = String::from_utf8(value.get(2 + len..)?.to_vec()).ok()?;
+    Some((device, txn))
 }
 
 /// One transaction's key: who sent it, from which device, under what name.

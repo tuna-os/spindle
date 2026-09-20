@@ -72,6 +72,18 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/v3/rooms/{room_id}/event/{event_id}",
     "/_matrix/client/v3/rooms/{room_id}/context/{event_id}",
     "/_matrix/key/v2/server",
+    "/_matrix/key/v2/query",
+    "/_matrix/key/v2/query/{server_name}",
+    "/_matrix/media/v1/create",
+    "/_matrix/media/v3/upload/{server_name}/{media_id}",
+    "/_matrix/client/v1/login/get_token",
+    "/_matrix/client/v1/mutual_rooms",
+    "/_matrix/federation/v1/media/thumbnail/{media_id}",
+    "/_matrix/federation/v1/event_auth/{room_id}/{event_id}",
+    "/_matrix/federation/v1/publicRooms",
+    "/_matrix/federation/v1/hierarchy/{room_id}",
+    "/_matrix/federation/v1/timestamp_to_event/{room_id}",
+    "/_matrix/client/v1/register/m.login.registration_token/validity",
     "/.well-known/matrix/client",
     "/.well-known/matrix/server",
     "/health",
@@ -88,14 +100,17 @@ pub const MOUNTED: &[&str] = &[
 pub fn router(state: AppState) -> Router {
     let routes = Router::new()
         .merge(account_routes())
+        .merge(report_and_hold_routes())
         .merge(push_routes())
         .merge(appservice_routes())
+        .merge(crate::dehydrated::routes())
         .merge(device_routes())
         .merge(profile_routes())
         .merge(room_routes())
         .merge(timeline_routes())
         .merge(media_routes())
         .merge(discovery_routes())
+        .merge(federation_read_routes())
         .merge(crate::mas::routes())
         .merge(crate::admin::routes())
         .merge(crate::oidc::routes())
@@ -173,7 +188,24 @@ async fn observe(
         .map_or_else(|| "unmatched".to_owned(), |path| path.as_str().to_owned());
     let method = request.method().to_string();
     let started = std::time::Instant::now();
-    let response = next.run(request).await;
+    // One span per request, named by the matched route rather than the
+    // path for the same reason the metric is: the template is bounded, the
+    // path is whatever was asked. The fields are OpenTelemetry's HTTP
+    // semantic conventions, so an exported trace reads like every other
+    // service's. Free when no exporter is configured: the log subscriber
+    // shows it only at a level operators do not run at.
+    let span = tracing::info_span!(
+        "request",
+        otel.name = %format!("{method} {route}"),
+        http.request.method = %method,
+        http.route = %route,
+        http.response.status_code = tracing::field::Empty,
+    );
+    let response = {
+        use tracing::Instrument as _;
+        next.run(request).instrument(span.clone()).await
+    };
+    span.record("http.response.status_code", response.status().as_u16());
     state.metrics.observe_request(
         &route,
         &method,
@@ -427,6 +459,35 @@ fn device_routes() -> Router<AppState> {
         )
 }
 
+/// Reports, generic profile fields, `whois`, and the v1.18 holds: the
+/// first wave filled in from `docs/spec-gaps.md`.
+fn report_and_hold_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/report",
+            post(report_room),
+        )
+        .route(
+            "/_matrix/client/v3/users/{user_id}/report",
+            post(report_user),
+        )
+        .route(
+            "/_matrix/client/v3/profile/{user_id}/{key}",
+            get(get_profile_field)
+                .put(put_profile_field)
+                .delete(delete_profile_field),
+        )
+        .route("/_matrix/client/v3/admin/whois/{user_id}", get(admin_whois))
+        .route(
+            "/_matrix/client/v1/admin/lock/{user_id}",
+            get(admin_lock_get).put(admin_lock_put),
+        )
+        .route(
+            "/_matrix/client/v1/admin/suspend/{user_id}",
+            get(admin_suspend_get).put(admin_suspend_put),
+        )
+}
+
 fn account_routes() -> Router<AppState> {
     Router::new()
         .route("/_matrix/client/v3/register", post(register))
@@ -435,7 +496,14 @@ fn account_routes() -> Router<AppState> {
             "/_matrix/client/v3/register/available",
             get(register_available),
         )
+        .route(
+            "/_matrix/client/v1/register/m.login.registration_token/validity",
+            get(registration_token_validity),
+        )
         .route("/_matrix/client/v3/logout", post(logout))
+        .route("/_matrix/client/v3/logout/all", post(logout_all))
+        .route("/_matrix/client/v1/login/get_token", post(login_get_token))
+        .route("/_matrix/client/v1/mutual_rooms", get(mutual_rooms))
         .route("/_matrix/client/v3/refresh", post(refresh))
         .route("/_matrix/client/v3/account/whoami", get(whoami))
         .route("/_matrix/client/v3/keys/upload", post(upload_keys))
@@ -766,6 +834,13 @@ fn media_routes() -> Router<AppState> {
                     crate::media::MAX_UPLOAD + 1,
                 )),
         )
+        .route("/_matrix/media/v1/create", post(create_media))
+        .route(
+            "/_matrix/media/v3/upload/{server_name}/{media_id}",
+            axum::routing::put(upload_reserved_media).layer(axum::extract::DefaultBodyLimit::max(
+                crate::media::MAX_UPLOAD + 1,
+            )),
+        )
         .route("/_matrix/media/v3/config", get(media_config))
         .route("/_matrix/client/v1/media/config", get(media_config))
         .route("/_matrix/client/v1/media/preview_url", get(preview_url))
@@ -1010,7 +1085,64 @@ async fn federation_media_download(
         .bytes(&media_id)
         .await
         .map_err(|error| media_error(&error))?;
+    multipart_media(
+        &record.content_type,
+        Some(&record.content_disposition()),
+        &bytes,
+    )
+}
 
+/// `GET /_matrix/federation/v1/media/thumbnail/{mediaId}` (spec v1.11)
+///
+/// The authenticated-media twin of the client thumbnail, in the same
+/// `multipart/mixed` framing as the federation download.
+async fn federation_media_thumbnail(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(media_id): axum::extract::Path<String>,
+    // Every field optional so a missing one is refused after the
+    // signature check, in the spec's JSON shape, not by the extractor.
+    axum::extract::Query(query): axum::extract::Query<FederationThumbnailQuery>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<axum::response::Response, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    federation_origin(&state, &headers, "GET", &uri, None).await?;
+    let (Some(width), Some(height)) = (query.width, query.height) else {
+        return Err(MatrixError::missing_param("width and height are required"));
+    };
+    if width == 0 || height == 0 {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            "width and height must be positive",
+        ));
+    }
+    let crop = query.method.as_deref() == Some("crop");
+    let (content_type, bytes) = state
+        .media
+        .thumbnail(&media_id, width, height, crop)
+        .await
+        .map_err(|error| media_error(&error))?;
+    multipart_media(&content_type, None, &bytes)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FederationThumbnailQuery {
+    width: Option<u32>,
+    height: Option<u32>,
+    method: Option<String>,
+}
+
+/// The `multipart/mixed` body authenticated federation media travels in:
+/// an empty JSON metadata part, then the bytes.
+fn multipart_media(
+    content_type: &str,
+    disposition: Option<&str>,
+    bytes: &[u8],
+) -> Result<axum::response::Response, MatrixError> {
     // The boundary need only be absent from the payload's *framing*, and a
     // random 32-hex string followed by the exact dash-CRLF framing has no
     // way to occur inside the file; fixed randomness per response keeps
@@ -1028,15 +1160,12 @@ async fn federation_media_download(
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
     body.extend_from_slice(b"content-type: application/json\r\n\r\n{}\r\n");
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(format!("content-type: {}\r\n", record.content_type).as_bytes());
-    body.extend_from_slice(
-        format!(
-            "content-disposition: {}\r\n\r\n",
-            record.content_disposition()
-        )
-        .as_bytes(),
-    );
-    body.extend_from_slice(&bytes);
+    body.extend_from_slice(format!("content-type: {content_type}\r\n").as_bytes());
+    if let Some(disposition) = disposition {
+        body.extend_from_slice(format!("content-disposition: {disposition}\r\n").as_bytes());
+    }
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(bytes);
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
     axum::response::Response::builder()
@@ -1099,6 +1228,24 @@ fn media_error(error: &crate::media::MediaError) -> MatrixError {
         Error::Unknown(_) | Error::Missing { .. } => {
             MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", error.to_string())
         }
+        // 504, as the spec has it: the bytes are on their way from another
+        // client, and the asker should try again rather than give up.
+        Error::NotYetUploaded(_) => MatrixError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "M_NOT_YET_UPLOADED",
+            error.to_string(),
+        ),
+        Error::AlreadyUploaded(_) => MatrixError::new(
+            StatusCode::CONFLICT,
+            "M_CANNOT_OVERWRITE_MEDIA",
+            error.to_string(),
+        ),
+        Error::NotReserver(_) => MatrixError::forbidden(error.to_string()),
+        Error::TooManyPending(_) => MatrixError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "M_LIMIT_EXCEEDED",
+            error.to_string(),
+        ),
         Error::TooLarge { .. } => MatrixError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             "M_TOO_LARGE",
@@ -1116,6 +1263,34 @@ fn media_error(error: &crate::media::MediaError) -> MatrixError {
 }
 
 /// What a client or a peer reads before it knows anything else.
+/// The read-side federation surface added with the second spec-gap wave,
+/// and the key notary.
+fn federation_read_routes() -> Router<AppState> {
+    Router::new()
+        .route("/_matrix/key/v2/query", post(key_query_batch))
+        .route("/_matrix/key/v2/query/{server_name}", get(key_query_one))
+        .route(
+            "/_matrix/federation/v1/media/thumbnail/{media_id}",
+            get(federation_media_thumbnail),
+        )
+        .route(
+            "/_matrix/federation/v1/event_auth/{room_id}/{event_id}",
+            get(federation_event_auth),
+        )
+        .route(
+            "/_matrix/federation/v1/publicRooms",
+            get(federation_public_rooms).post(federation_public_rooms_filtered),
+        )
+        .route(
+            "/_matrix/federation/v1/hierarchy/{room_id}",
+            get(federation_hierarchy),
+        )
+        .route(
+            "/_matrix/federation/v1/timestamp_to_event/{room_id}",
+            get(federation_timestamp_to_event),
+        )
+}
+
 fn discovery_routes() -> Router<AppState> {
     Router::new()
         .route("/_matrix/client/versions", get(versions))
@@ -1207,6 +1382,7 @@ fn discovery_routes() -> Router<AppState> {
             get(federation_media_download),
         )
         .route("/.well-known/matrix/client", get(well_known_client))
+        .route("/.well-known/matrix/support", get(well_known_support))
         .route("/_matrix/client/v1/auth_metadata", get(auth_metadata))
         // The unstable alias is load-bearing: Element Web's js-sdk asks
         // here first, and a deployment serving only the stable path
@@ -1257,6 +1433,7 @@ async fn capabilities() -> Json<Value> {
             json!({ "default": default, "available": Value::Object(available) }),
         );
     }
+    capabilities.insert("m.get_login_token".to_owned(), json!({ "enabled": true }));
     Json(json!({ "capabilities": Value::Object(capabilities) }))
 }
 
@@ -1396,6 +1573,8 @@ struct LoginRequest {
     /// The deprecated top-level form, still sent by older clients.
     user: Option<String>,
     password: Option<String>,
+    /// `m.login.token`: a token from `POST /login/get_token`.
+    token: Option<String>,
     device_id: Option<String>,
     initial_device_display_name: Option<String>,
     #[serde(default)]
@@ -1445,14 +1624,79 @@ fn session_body(user_id: &str, session: &crate::accounts::Session) -> Value {
 
 /// `GET /_matrix/client/v3/login`
 ///
-/// Only password login. SSO and token login are advertised by servers that
-/// implement them; listing a flow we cannot complete would send a client down
-/// a path that dead-ends.
+/// Password login, and token login for the tokens `POST /login/get_token`
+/// mints (spec v1.7), which is what `get_login_token: true` tells an
+/// unauthenticated client. SSO is advertised by servers that implement it;
+/// listing a flow we cannot complete would send a client down a path that
+/// dead-ends.
 async fn login_flows(State(state): State<AppState>) -> Result<Json<Value>, MatrixError> {
     if state.delegated.is_some() {
         return Err(delegated_refusal());
     }
-    Ok(Json(json!({ "flows": [{ "type": "m.login.password" }] })))
+    Ok(Json(json!({ "flows": [
+        { "type": "m.login.password" },
+        { "type": "m.login.token", "get_login_token": true },
+    ] })))
+}
+
+/// The `m.login.token` half of `POST /login`: one token, one session.
+fn login_with_token(state: &AppState, request: LoginRequest) -> Result<Json<Value>, MatrixError> {
+    let token = request
+        .token
+        .as_deref()
+        .ok_or_else(|| MatrixError::bad_json("no token"))?;
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let localpart = accounts
+        .redeem_login_token(token)
+        .map_err(|error| match error {
+            AccountError::UnknownToken => MatrixError::forbidden("the login token is not valid"),
+            other => internal(&other),
+        })?;
+    let session = accounts
+        .create_session(
+            &localpart,
+            request.device_id,
+            request.initial_device_display_name,
+            request.refresh_token,
+        )
+        .map_err(|error| internal(&error))?;
+    Ok(Json(session_body(&accounts.user_id(&localpart), &session)))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GetLoginTokenRequest {
+    auth: Option<Value>,
+}
+
+/// `POST /_matrix/client/v1/login/get_token` (spec v1.7)
+///
+/// Behind the password stage of UIA, as the spec asks: the token logs a
+/// second client in as this user, so minting one is as strong as a login.
+async fn login_get_token(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<Value>), MatrixError> {
+    let request: GetLoginTokenRequest = optional_body(&body)?;
+    let localpart = localpart_of(&identity.user_id);
+    if let Some(challenge) = password_uia(
+        &state,
+        &localpart,
+        &headers,
+        request.auth.as_ref(),
+        "get_login_token",
+    )? {
+        return Ok((StatusCode::UNAUTHORIZED, challenge));
+    }
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let (login_token, expires_in_ms) = accounts
+        .issue_login_token(&localpart)
+        .map_err(|error| internal(&error))?;
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "login_token": login_token, "expires_in_ms": expires_in_ms })),
+    ))
 }
 
 /// `POST /_matrix/client/v3/login`
@@ -1463,6 +1707,9 @@ async fn login(
 ) -> Result<Json<Value>, MatrixError> {
     if state.delegated.is_some() {
         return Err(delegated_refusal());
+    }
+    if request.kind == "m.login.token" {
+        return login_with_token(&state, request);
     }
     if request.kind != "m.login.password" {
         return Err(MatrixError::new(
@@ -1540,6 +1787,97 @@ async fn refresh(
         })?;
     let user_id = accounts.user_id(&session.device.localpart);
     Ok(Json(session_body(&user_id, &session)))
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenValidityQuery {
+    token: Option<String>,
+}
+
+/// `GET /_matrix/client/v1/register/m.login.registration_token/validity`
+/// (spec v1.2)
+///
+/// Whether a token would be accepted now. Rate-limited with registration
+/// itself: this is the endpoint a guesser would hammer.
+async fn registration_token_validity(
+    State(state): State<AppState>,
+    source: ClientAddr,
+    axum::extract::Query(query): axum::extract::Query<TokenValidityQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    if let Err(retry) = state
+        .limiter
+        .check(&format!("register:source:{source}"), REGISTER_PER_SOURCE)
+    {
+        return Err(MatrixError::limit_exceeded(retry.as_millis()));
+    }
+    let token = query
+        .token
+        .ok_or_else(|| MatrixError::missing_param("token is required"))?;
+    let valid =
+        crate::registration_tokens::RegistrationTokens::new(std::sync::Arc::clone(&state.store))
+            .is_valid(&token)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    Ok(Json(json!({ "valid": valid })))
+}
+
+/// `Ok(token)` when the stage is complete, `Err(challenge)` to send back.
+type StageOutcome = Result<Option<String>, (StatusCode, Json<Value>)>;
+
+/// The one UIA stage registration asks for, and whether `auth` completes
+/// it. `Ok(Err(challenge))` is the 401 to send back; `Ok(Ok(token))` is
+/// the registration token to spend once the account exists, `None` on an
+/// open server.
+///
+/// With `[registration] require_token` on, the stage is
+/// `m.login.registration_token` (spec v1.2) and the token in the auth dict
+/// has to be one an admin minted and not yet spent; it is spent by the
+/// caller, once the account exists, so a flow that fails later costs
+/// nothing.
+fn registration_stage(state: &AppState, auth: Option<&Value>) -> Result<StageOutcome, MatrixError> {
+    let require_token = state.config.registration.require_token;
+    let uia_stage = if require_token {
+        "m.login.registration_token"
+    } else {
+        "m.login.dummy"
+    };
+    let challenge = |error: Option<(&str, &str)>| {
+        let mut body = json!({
+            "flows": [{ "stages": [uia_stage] }],
+            "params": {},
+            "session": "register",
+        });
+        if let Some((errcode, message)) = error {
+            body["errcode"] = json!(errcode);
+            body["error"] = json!(message);
+        }
+        (StatusCode::UNAUTHORIZED, Json(body))
+    };
+    let stage_completed = if require_token {
+        auth.is_some_and(|auth| auth["type"] == uia_stage && auth["token"].is_string())
+    } else {
+        auth.is_some_and(|auth| auth["session"].is_string() || auth["type"] == "m.login.dummy")
+    };
+    if !stage_completed {
+        return Ok(Err(challenge(None)));
+    }
+    if !require_token {
+        return Ok(Ok(None));
+    }
+    let token = auth
+        .and_then(|auth| auth["token"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let valid =
+        crate::registration_tokens::RegistrationTokens::new(std::sync::Arc::clone(&state.store))
+            .is_valid(&token)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    if !valid {
+        return Ok(Err(challenge(Some((
+            "M_UNAUTHORIZED",
+            "the registration token is not valid",
+        )))));
+    }
+    Ok(Ok(Some(token)))
 }
 
 /// `GET /_matrix/client/v3/register/available`
@@ -1638,23 +1976,17 @@ async fn register(
     // SPEC (client-server §UIA) has clients read `flows`/`params`/`session`
     // at the top level, and a challenge folded into an `error` string is
     // invisible to every generic UIA implementation. Complement's
-    // RegisterUser is what caught this. An auth dict that names no session
-    // gets the same challenge — the session is how a completed stage is
-    // tied back to the flow it completed.
-    let session_named = request
-        .auth
-        .as_ref()
-        .is_some_and(|auth| auth["session"].is_string());
-    if !session_named {
-        return Ok((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "flows": [{ "stages": ["m.login.dummy"] }],
-                "params": {},
-                "session": "register",
-            })),
-        ));
-    }
+    // RegisterUser is what caught this. An auth dict that names a session
+    // completes the stage; so does one that names the dummy stage and no
+    // session at all, which is how matrix-rust-sdk (and so Element X)
+    // registers: the spec makes `session` optional in the auth dict, the
+    // dummy stage carries no state a session would tie back to, and
+    // Synapse accepts it. Its integration suite was refused here on every
+    // test until this did.
+    let registration_token = match registration_stage(&state, request.auth.as_ref())? {
+        Ok(token) => token,
+        Err(challenge) => return Ok(challenge),
+    };
 
     let username = username.ok_or_else(|| MatrixError::bad_json("no username"))?;
     let username = username.as_str();
@@ -1672,6 +2004,11 @@ async fn register(
         })?;
 
     let user_id = accounts.user_id(username);
+    if let Some(token) = registration_token {
+        crate::registration_tokens::RegistrationTokens::new(std::sync::Arc::clone(&state.store))
+            .consume(&token)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    }
     if request.inhibit_login {
         return Ok((StatusCode::OK, Json(json!({ "user_id": user_id }))));
     }
@@ -1772,6 +2109,302 @@ async fn whoami(Authenticated(identity): Authenticated) -> Json<Value> {
         "user_id": identity.user_id,
         "device_id": identity.device_id,
     }))
+}
+
+/// `POST /_matrix/client/v3/logout/all`
+///
+/// Every session of the account, this one included: the answer to a lost
+/// phone, which is why it is its own endpoint rather than a loop over
+/// `/logout` from a device that may not be the one in hand.
+async fn logout_all(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+) -> Result<Json<Value>, MatrixError> {
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    accounts
+        .logout_everywhere(&localpart_of(&identity.user_id))
+        .map_err(|error| internal(&error))?;
+    Ok(Json(json!({})))
+}
+
+/// `GET /.well-known/matrix/support` (spec v1.10)
+///
+/// Who to contact about this server. Unconfigured, it is a 404 rather
+/// than an empty list: the spec reads an empty answer as "nobody", and
+/// "not published" is the truer thing to say.
+async fn well_known_support(State(state): State<AppState>) -> Result<Json<Value>, MatrixError> {
+    let Some(support) = &state.config.server.support else {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "this server publishes no support contacts",
+        ));
+    };
+    let contacts: Vec<Value> = support
+        .contacts
+        .iter()
+        .map(|contact| {
+            let mut entry = serde_json::Map::new();
+            if let Some(matrix_id) = &contact.matrix_id {
+                entry.insert("matrix_id".to_owned(), json!(matrix_id));
+            }
+            if let Some(email) = &contact.email_address {
+                entry.insert("email_address".to_owned(), json!(email));
+            }
+            entry.insert("role".to_owned(), json!(contact.role));
+            Value::Object(entry)
+        })
+        .collect();
+    let mut body = serde_json::Map::new();
+    body.insert("contacts".to_owned(), Value::Array(contacts));
+    if let Some(page) = &support.support_page {
+        body.insert("support_page".to_owned(), json!(page));
+    }
+    Ok(Json(Value::Object(body)))
+}
+
+#[derive(Debug, Deserialize)]
+struct ReasonOnly {
+    reason: Option<String>,
+}
+
+/// `POST /_matrix/client/v3/rooms/{roomId}/report` (spec v1.13)
+///
+/// A report about a room rather than an event in it. The room must be one
+/// this server holds; a report about nothing is a 404, the same answer an
+/// event report gives.
+async fn report_room(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    Json(request): Json<ReasonOnly>,
+) -> Result<Json<Value>, MatrixError> {
+    // Deliberately open to strangers. A report is how somebody *outside*
+    // a room tells the admins about it (spec v1.13 says a reporter need
+    // not be joined), so the caller's own view of the room is not the
+    // gate here. What is checked is that the room exists at all: a
+    // member already knows that, and a stranger learns nothing more from
+    // the 404 than they would from a join attempt.
+    if may_read_room(&state, &identity.user_id, &room_id).is_err() {
+        // A stranger: still allowed to report, but only a room that exists.
+        if state.rooms.summary(&room_id).is_err() {
+            return Err(MatrixError::new(
+                StatusCode::NOT_FOUND,
+                "M_NOT_FOUND",
+                "no such room",
+            ));
+        }
+    }
+    let report_id = crate::admin::file_report(
+        &state,
+        &identity.user_id,
+        Some(&room_id),
+        None,
+        None,
+        request.reason.as_deref(),
+        None,
+    )?;
+    crate::admin::audit(
+        &state,
+        &identity.user_id,
+        "report",
+        &room_id,
+        &json!({ "room_id": room_id, "reason": request.reason, "report_id": report_id }),
+    )?;
+    Ok(Json(json!({})))
+}
+
+/// `POST /_matrix/client/v3/users/{userId}/report` (spec v1.14)
+///
+/// A report about a user. Only a local user can be reported here: a
+/// report about somebody else's user belongs to their server, and this
+/// one has nothing to act on. An unknown local user is a 404.
+async fn report_user(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+    Json(request): Json<ReasonOnly>,
+) -> Result<Json<Value>, MatrixError> {
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let local = user_id.ends_with(&format!(":{}", state.config.server.name))
+        && accounts
+            .account(&localpart_of(&user_id))
+            .map_err(|error| internal(&error))?
+            .is_some();
+    if !local {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "no such user here",
+        ));
+    }
+    let report_id = crate::admin::file_report(
+        &state,
+        &identity.user_id,
+        None,
+        None,
+        Some(&user_id),
+        request.reason.as_deref(),
+        None,
+    )?;
+    crate::admin::audit(
+        &state,
+        &identity.user_id,
+        "report",
+        &user_id,
+        &json!({ "user_id": user_id, "reason": request.reason, "report_id": report_id }),
+    )?;
+    Ok(Json(json!({})))
+}
+
+/// `GET /_matrix/client/v3/admin/whois/{userId}`
+///
+/// The user's devices. The spec's shape carries the sessions and
+/// connections behind each device; this server keeps no connection log,
+/// so each device is listed with one session and no connections, which
+/// is the shape with nothing invented in it. The user themself or a
+/// server admin may ask.
+async fn admin_whois(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    if identity.user_id != user_id
+        && !crate::admin::is_server_admin(&state, &identity.user_id)
+            .map_err(|error| internal(&error))?
+    {
+        return Err(MatrixError::forbidden(
+            "only the user or a server admin may ask",
+        ));
+    }
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let localpart = localpart_of(&user_id);
+    if accounts
+        .account(&localpart)
+        .map_err(|error| internal(&error))?
+        .is_none()
+    {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "no such user here",
+        ));
+    }
+    let mut devices = serde_json::Map::new();
+    for device in accounts
+        .devices_of(&localpart)
+        .map_err(|error| internal(&error))?
+    {
+        devices.insert(
+            device.device_id,
+            json!({ "sessions": [{ "connections": [] }] }),
+        );
+    }
+    Ok(Json(json!({ "user_id": user_id, "devices": devices })))
+}
+
+/// The two v1.18 administrative holds share one shape: a flag on the
+/// account, read and written by a server admin, audited, and refused for
+/// a user this server does not hold.
+fn admin_hold(
+    state: &AppState,
+    actor: &crate::accounts::Identity,
+    user_id: &str,
+    hold: &'static str,
+    set: Option<bool>,
+) -> Result<Json<Value>, MatrixError> {
+    if !crate::admin::is_server_admin(state, &actor.user_id).map_err(|error| internal(&error))? {
+        return Err(MatrixError::forbidden("not a server admin"));
+    }
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let localpart = localpart_of(user_id);
+    let Some(account) = accounts
+        .account(&localpart)
+        .map_err(|error| internal(&error))?
+    else {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "no such user here",
+        ));
+    };
+    let Some(wanted) = set else {
+        let current = if hold == "locked" {
+            account.locked
+        } else {
+            account.suspended
+        };
+        return Ok(Json(json!({ hold: current })));
+    };
+    let written = if hold == "locked" {
+        accounts.set_locked(&localpart, wanted)
+    } else {
+        accounts.set_suspended(&localpart, wanted)
+    }
+    .map_err(|error| internal(&error))?;
+    debug_assert!(written);
+    crate::admin::audit(
+        state,
+        &actor.user_id,
+        hold,
+        user_id,
+        &json!({ hold: wanted }),
+    )?;
+    Ok(Json(json!({ hold: wanted })))
+}
+
+#[derive(Debug, Deserialize)]
+struct LockRequest {
+    locked: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SuspendRequest {
+    suspended: bool,
+}
+
+/// `GET /_matrix/client/v1/admin/lock/{userId}` (spec v1.18)
+async fn admin_lock_get(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    admin_hold(&state, &identity, &user_id, "locked", None)
+}
+
+/// `PUT /_matrix/client/v1/admin/lock/{userId}` (spec v1.18)
+async fn admin_lock_put(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+    Json(request): Json<LockRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    admin_hold(&state, &identity, &user_id, "locked", Some(request.locked))
+}
+
+/// `GET /_matrix/client/v1/admin/suspend/{userId}` (spec v1.18)
+async fn admin_suspend_get(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    admin_hold(&state, &identity, &user_id, "suspended", None)
+}
+
+/// `PUT /_matrix/client/v1/admin/suspend/{userId}` (spec v1.18)
+async fn admin_suspend_put(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+    Json(request): Json<SuspendRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    admin_hold(
+        &state,
+        &identity,
+        &user_id,
+        "suspended",
+        Some(request.suspended),
+    )
 }
 
 /// MSC2659 (spec v1.7): an appservice asks to be pinged back, to prove the
@@ -2391,7 +3024,7 @@ pub(crate) fn record_invite(
         .unwrap_or_default();
     state
         .rooms
-        .record_pending_invite(target, room_id, origin, &invite_state)
+        .record_pending_invite(target, room_id, origin, event_id, &invite_state)
         .map_err(room_error)?;
     state.rooms.wake_sync_waiters();
     Ok(())
@@ -2407,6 +3040,11 @@ pub(crate) fn record_invite(
 /// trusting a key we may have had to rotate, and the cost of it being wrong is
 /// borne by whoever has to explain why signatures stopped verifying.
 async fn server_keys(State(state): State<AppState>) -> Json<Value> {
+    Json(own_key_document(&state))
+}
+
+/// This server's signed key document, as `/_matrix/key/v2/server` serves it.
+fn own_key_document(state: &AppState) -> Value {
     let valid_until = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_millis().saturating_add(24 * 60 * 60 * 1000))
@@ -2429,7 +3067,12 @@ async fn server_keys(State(state): State<AppState>) -> Json<Value> {
     // the network path. Our own verifier refuses unsigned documents, so an
     // unsigned one here would mean no other Spindle could ever trust us —
     // which is exactly how the first server-to-server test found this.
-    let signed = ruma::CanonicalJsonValue::try_from(document.clone())
+    sign_with_own_key(state, document)
+}
+
+/// Add this server's signature to a JSON object, keeping any it carries.
+fn sign_with_own_key(state: &AppState, document: Value) -> Value {
+    ruma::CanonicalJsonValue::try_from(document.clone())
         .ok()
         .and_then(|canonical| match canonical {
             ruma::CanonicalJsonValue::Object(mut object) => {
@@ -2443,8 +3086,65 @@ async fn server_keys(State(state): State<AppState>) -> Json<Value> {
             }
             _ => None,
         })
-        .unwrap_or(document);
-    Json(signed)
+        .unwrap_or(document)
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyQueryParams {
+    /// Accepted and not acted on: a document is served as cached, and a
+    /// document that lapsed is refetched by the cache itself.
+    #[allow(dead_code)]
+    minimum_valid_until_ts: Option<u64>,
+}
+
+/// `GET /_matrix/key/v2/query/{serverName}`
+///
+/// The notary form: another server's key document, from this server's
+/// cache (fetched if unseen), with this server's signature added so the
+/// asker can hold us to what we handed on. Our own name answers with our
+/// own document. A server whose keys cannot be had is simply absent.
+async fn key_query_one(
+    State(state): State<AppState>,
+    axum::extract::Path(server_name): axum::extract::Path<String>,
+    axum::extract::Query(_query): axum::extract::Query<KeyQueryParams>,
+) -> Json<Value> {
+    let server_keys = notary_documents(&state, &[server_name]).await;
+    Json(json!({ "server_keys": server_keys }))
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyQueryBatch {
+    #[serde(default)]
+    server_keys: BTreeMap<String, Value>,
+}
+
+/// `POST /_matrix/key/v2/query`
+async fn key_query_batch(
+    State(state): State<AppState>,
+    Json(request): Json<KeyQueryBatch>,
+) -> Json<Value> {
+    let names: Vec<String> = request.server_keys.into_keys().collect();
+    let server_keys = notary_documents(&state, &names).await;
+    Json(json!({ "server_keys": server_keys }))
+}
+
+async fn notary_documents(state: &AppState, names: &[String]) -> Vec<Value> {
+    let mut documents = Vec::new();
+    for name in names {
+        let document = if *name == state.config.server.name {
+            own_key_document(state)
+        } else {
+            match state.federation.peer_key_document(name).await {
+                Ok(document) => sign_with_own_key(state, document),
+                Err(error) => {
+                    tracing::debug!(server = %name, "notary: no key document: {error}");
+                    continue;
+                }
+            }
+        };
+        documents.push(document);
+    }
+    documents
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2454,6 +3154,12 @@ struct CreateRoomRequest {
     preset: Option<String>,
     #[serde(default)]
     invite: Vec<String>,
+    /// The invites carry `is_direct: true`, which is how the invitee's
+    /// client knows to file the room under direct chats (and, by the
+    /// spec, to write its own `m.direct`). Not a room property here: the
+    /// server keeps no notion of a DM beyond what the member events say.
+    #[serde(default)]
+    is_direct: bool,
     #[serde(default)]
     initial_state: Vec<InitialStateEvent>,
     room_alias_name: Option<String>,
@@ -2538,7 +3244,15 @@ async fn create_room(
     // Invites after the room stands, refused invites failing the create the
     // way the spec asks (the room still exists; the error names why).
     for target in &request.invite {
-        invite_user(&state, &identity.user_id, &room_id, target, None).await?;
+        invite_user(
+            &state,
+            &identity.user_id,
+            &room_id,
+            target,
+            None,
+            request.is_direct,
+        )
+        .await?;
     }
     if request.visibility.as_deref() == Some("public") {
         // The creator is joined by construction, so `may_advertise` would pass;
@@ -2554,6 +3268,27 @@ async fn create_room(
             .directory
             .create(&alias, &room_id, &identity.user_id)
             .map_err(|error| directory_error(&error))?;
+        // The spec has the server write `m.room.canonical_alias` for a
+        // room created with an alias, unless the client set one itself in
+        // `initial_state`. Claiming an alias later through the directory
+        // writes nothing (`aliases.rs`); this is the one place the server
+        // speaks for the room, and only because the spec says it does.
+        let client_set_one = initial_state
+            .iter()
+            .any(|(event_type, _, _)| event_type == "m.room.canonical_alias");
+        if !client_set_one {
+            state
+                .rooms
+                .set_state(
+                    &room_id,
+                    &identity.user_id,
+                    state.key.pair(),
+                    "m.room.canonical_alias",
+                    "",
+                    &json!({ "alias": alias }),
+                )
+                .map_err(room_error)?;
+        }
     }
     Ok(Json(json!({ "room_id": room_id })))
 }
@@ -2673,6 +3408,105 @@ struct AvatarRequest {
     avatar_url: Option<String>,
 }
 
+/// `GET /_matrix/client/v3/profile/{userId}/{keyName}` (spec v1.16)
+///
+/// One field of a profile, `displayname` and `avatar_url` included; the
+/// literal routes for those two still answer first. A field that is not
+/// set is a 404, which is the spec's answer and the one a client can act
+/// on.
+async fn get_profile_field(
+    State(state): State<AppState>,
+    axum::extract::Path((user_id, key)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    let profile = profile_of(&state, &user_id).await?;
+    match profile.get(&key).filter(|value| !value.is_null()) {
+        Some(value) => Ok(Json(json!({ key: value }))),
+        None => Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            format!("{user_id} has no {key}"),
+        )),
+    }
+}
+
+/// The user's own profile, or a server admin acting for them.
+fn may_edit_profile(state: &AppState, actor: &str, user_id: &str) -> Result<(), MatrixError> {
+    if actor == user_id
+        || crate::admin::is_server_admin(state, actor).map_err(|error| internal(&error))?
+    {
+        Ok(())
+    } else {
+        Err(MatrixError::forbidden("a profile belongs to its user"))
+    }
+}
+
+fn field_refusal(refusal: crate::profiles::FieldRefusal) -> MatrixError {
+    match refusal {
+        crate::profiles::FieldRefusal::KeyTooLarge => MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_KEY_TOO_LARGE",
+            format!(
+                "a profile key is at most {} bytes",
+                crate::profiles::MAX_KEY_BYTES
+            ),
+        ),
+        crate::profiles::FieldRefusal::ProfileTooLarge => MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_PROFILE_TOO_LARGE",
+            format!(
+                "a profile is at most {} bytes",
+                crate::profiles::MAX_PROFILE_BYTES
+            ),
+        ),
+        crate::profiles::FieldRefusal::NotAString => {
+            MatrixError::bad_json("displayname and avatar_url are strings")
+        }
+    }
+}
+
+/// `PUT /_matrix/client/v3/profile/{userId}/{keyName}` (spec v1.16)
+///
+/// The body names the key again, as the spec has it; a body that names
+/// a different key is a request that does not agree with itself.
+async fn put_profile_field(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((user_id, key)): axum::extract::Path<(String, String)>,
+    Json(mut request): Json<serde_json::Map<String, Value>>,
+) -> Result<Json<Value>, MatrixError> {
+    may_edit_profile(&state, &identity.user_id, &user_id)?;
+    let Some(value) = request.remove(&key) else {
+        return Err(MatrixError::bad_json(format!("the body must carry {key}")));
+    };
+    state
+        .profiles
+        .set_field(&user_id, &key, Some(value))
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+        .map_err(field_refusal)?;
+    if key == "displayname" || key == "avatar_url" {
+        propagate_profile(&state, &user_id)?;
+    }
+    Ok(Json(json!({})))
+}
+
+/// `DELETE /_matrix/client/v3/profile/{userId}/{keyName}` (spec v1.16)
+async fn delete_profile_field(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((user_id, key)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    may_edit_profile(&state, &identity.user_id, &user_id)?;
+    state
+        .profiles
+        .set_field(&user_id, &key, None)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+        .map_err(field_refusal)?;
+    if key == "displayname" || key == "avatar_url" {
+        propagate_profile(&state, &user_id)?;
+    }
+    Ok(Json(json!({})))
+}
+
 /// Store one profile field and copy it into every joined room's member
 /// event — the propagation the spec asks for, and the step that carries a
 /// renamed user across federation, because member events fan out and
@@ -2777,6 +3611,7 @@ async fn invite_to_room(
         &room_id,
         &request.user_id,
         request.reason.as_deref(),
+        false,
     )
     .await?;
     Ok(Json(json!({})))
@@ -2797,6 +3632,7 @@ async fn invite_user(
     room_id: &str,
     target: &str,
     reason: Option<&str>,
+    is_direct: bool,
 ) -> Result<(), MatrixError> {
     let Some((_, domain)) = target.split_once(':') else {
         return Err(MatrixError::bad_json(format!("{target} is not a user ID")));
@@ -2811,6 +3647,10 @@ async fn invite_user(
             .appservices
             .query_user(target, &state.config.server.name)
             .await;
+        let mut extra = member_profile(state, target);
+        if is_direct {
+            extra.insert("is_direct".to_owned(), json!(true));
+        }
         state
             .rooms
             .set_membership_with(
@@ -2819,7 +3659,7 @@ async fn invite_user(
                 target,
                 "invite",
                 reason,
-                &member_profile(state, target),
+                &extra,
                 state.key.pair(),
             )
             .map_err(room_error)?;
@@ -2828,7 +3668,7 @@ async fn invite_user(
 
     let (event_id, event) = state
         .rooms
-        .build_invite_event(room_id, sender, target, reason, state.key.pair())
+        .build_invite_event(room_id, sender, target, reason, is_direct, state.key.pair())
         .map_err(room_error)?;
     // The stripped state the invited user renders the invite from — plus
     // the invite itself, which is not yet state anywhere and is exactly the
@@ -3416,16 +4256,59 @@ async fn create_alias(
 }
 
 /// `DELETE /_matrix/client/v3/directory/room/{room_alias}`
+///
+/// Claiming an alias writes no room state -- the room's own opinion about
+/// what it is called is the room's to give. Removing one is different: a
+/// canonical alias that names an alias the directory no longer resolves
+/// is a broken name the server left behind, and the public directory
+/// still matches searches against it. So, as Synapse does, the alias is
+/// taken out of `m.room.canonical_alias` on the remover's behalf, best
+/// effort: a remover the room does not let edit that event keeps the
+/// stale name, which is the room's decision rather than an error here.
 async fn delete_alias(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
     axum::extract::Path(room_alias): axum::extract::Path<String>,
 ) -> Result<Json<Value>, MatrixError> {
-    state
+    let room_id = state
         .directory
         .delete(&room_alias, &identity.user_id)
         .map_err(|error| directory_error(&error))?;
+    if let Ok(event) = state
+        .rooms
+        .state_event_full(&room_id, "m.room.canonical_alias", "")
+        && let Some(without) = without_alias(&event["content"], &room_alias)
+    {
+        let _ = state.rooms.set_state(
+            &room_id,
+            &identity.user_id,
+            state.key.pair(),
+            "m.room.canonical_alias",
+            "",
+            &without,
+        );
+    }
     Ok(Json(json!({})))
+}
+
+/// `content` with `alias` gone from `alias` and `alt_aliases`, or `None` if
+/// it named it nowhere and there is nothing to write.
+fn without_alias(content: &Value, alias: &str) -> Option<Value> {
+    let names_it = content["alias"] == json!(alias)
+        || content["alt_aliases"]
+            .as_array()
+            .is_some_and(|alts| alts.iter().any(|alt| alt == alias));
+    if !names_it {
+        return None;
+    }
+    let mut without = content.clone();
+    if without["alias"] == json!(alias) {
+        without.as_object_mut()?.remove("alias");
+    }
+    if let Some(alts) = without["alt_aliases"].as_array_mut() {
+        alts.retain(|alt| alt != alias);
+    }
+    Some(without)
 }
 
 /// `GET /_matrix/client/v3/rooms/{room_id}/aliases`
@@ -3755,12 +4638,11 @@ async fn leave_remote(state: &AppState, user_id: &str, room_id: &str, origin: Op
 struct MembersQuery {
     membership: Option<String>,
     not_membership: Option<String>,
-    /// A sync token. Accepted and not yet honoured: the roster returned is
-    /// the room's present (or, for a former member, the one at their
-    /// departure), which is what every client that sends `at` sends it
-    /// for -- the token it just synced to, where present and requested
-    /// coincide. Recorded here rather than silently dropped.
-    #[allow(dead_code)]
+    /// A sync token: the roster as it stood when that token was issued,
+    /// rather than the room's present. The two differ whenever someone
+    /// joined after the client's last sync, and an E2EE client that shares
+    /// a room key with the present roster then encrypts for a device its
+    /// sync never told it about.
     at: Option<String>,
 }
 
@@ -3777,11 +4659,31 @@ async fn room_members(
     axum::extract::Path(room_id): axum::extract::Path<String>,
     axum::extract::Query(query): axum::extract::Query<MembersQuery>,
 ) -> Result<Json<Value>, MatrixError> {
-    let events = state
+    let at = query
+        .at
+        .as_deref()
+        .map(|token| {
+            token
+                .parse::<crate::tokens::Sync>()
+                .map(|token| token.0)
+                .map_err(|error| {
+                    MatrixError::new(
+                        StatusCode::BAD_REQUEST,
+                        "M_INVALID_PARAM",
+                        error.to_string(),
+                    )
+                })
+        })
+        .transpose()?;
+    let reader = state
         .rooms
         .reader(&identity.user_id, &room_id)
-        .and_then(|reader| reader.members())
         .map_err(room_error)?;
+    let events = match at {
+        Some(position) => reader.members_at(position),
+        None => reader.members(),
+    }
+    .map_err(room_error)?;
     let chunk: Vec<Value> = events
         .into_iter()
         .filter(|event| {
@@ -3801,22 +4703,22 @@ async fn room_members(
 
 /// `GET /_matrix/client/v3/rooms/{room_id}/joined_members`
 ///
-/// Restricted to members: the response is the room's roster, and handing it to
-/// a non-member would leak who is in a room they cannot see. `joined()` is a
-/// prefix scan over the caller's own rooms, so the check costs a scan of what
-/// the caller is in rather than a walk of the room.
+/// Restricted to those who may read the room: its members, and anybody
+/// at all when the room is world-readable. The roster is the room's
+/// state, and the spec lets a world-readable room's state be read by
+/// anyone; a preview of such a room (matrix-rust-sdk's `RoomPreview`)
+/// reads `/state` and this together, and a 403 here made the whole
+/// preview fail. Handing the roster to a non-member of any other room
+/// would leak who is in a room they cannot see, which `may_read` refuses.
 async fn room_joined_members(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
     axum::extract::Path(room_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, MatrixError> {
-    let joined = state.rooms.joined(&identity.user_id).map_err(room_error)?;
-    if !joined.iter().any(|room| room == &room_id) {
-        return Err(MatrixError::forbidden(format!(
-            "{} is not in {room_id}",
-            identity.user_id
-        )));
-    }
+    state
+        .rooms
+        .may_read(&identity.user_id, &room_id)
+        .map_err(room_error)?;
     let members = state.rooms.joined_members(&room_id).map_err(room_error)?;
     Ok(Json(json!({ "joined": members })))
 }
@@ -4131,6 +5033,9 @@ struct SetPusherRequest {
     #[serde(default)]
     #[allow(dead_code)]
     append: bool,
+    /// MSC3881: whether this pusher receives anything. Absent is on.
+    #[serde(default, alias = "org.matrix.msc3881.enabled")]
+    enabled: Option<bool>,
 }
 
 /// `POST /_matrix/client/v3/pushers/set`
@@ -4199,6 +5104,13 @@ async fn set_pusher(
                 "profile_tag": request.profile_tag,
                 "lang": request.lang,
                 "data": request.data,
+                // MSC3881, under both spellings until the stable one is
+                // in a spec this server claims: the device that owns the
+                // pusher, so another client can name it, and the switch.
+                "enabled": request.enabled.unwrap_or(true),
+                "org.matrix.msc3881.enabled": request.enabled.unwrap_or(true),
+                "device_id": identity.device_id,
+                "org.matrix.msc3881.device_id": identity.device_id,
             }),
         )
         .map_err(internal)?;
@@ -4225,57 +5137,147 @@ fn save_ruleset(state: &AppState, user_id: &str, ruleset: &Value) -> Result<(), 
         .put(user_id, "", crate::push_rules::TYPE, ruleset)
         .map_err(|error| account_data_error(&error))?;
     // What was scored under the old rules says nothing under the new.
-    state.rooms.forget_highlights(user_id);
+    state.rooms.forget_scores(user_id);
     Ok(())
 }
 
-/// `unread_notifications.highlight_count`: the reader's unread events in
-/// `room_id` that their push rules highlight.
+/// A room's badge for one reader: the unread events their push rules
+/// notify for and the highlights among them, in total and split by
+/// thread (MSC3773).
+pub(crate) struct Badge {
+    /// Everything after the unthreaded receipt, threads included.
+    pub notification_count: usize,
+    pub highlight_count: usize,
+    /// The main timeline alone, after the later of the unthreaded and
+    /// the `main` receipt.
+    pub main: (usize, usize),
+    /// Each thread root to its counts after the later of the unthreaded
+    /// and that thread's receipt; threads with nothing unread are absent.
+    pub threads: BTreeMap<String, (usize, usize)>,
+}
+
+impl Badge {
+    const NONE: Self = Self {
+        notification_count: 0,
+        highlight_count: 0,
+        main: (0, 0),
+        threads: BTreeMap::new(),
+    };
+}
+
+/// The reader's badge in `room_id`.
 ///
-/// Scored through the reader's tally ([`crate::rooms::Rooms::unscored_highlights`]):
-/// only the bodies after the position last scored are put to the rules, and
-/// the ruleset, profile and room context are read only when there is
-/// something to score. Nothing unread means nothing highlighted, before any
-/// of that.
-fn highlight_count(
+/// Scored through the reader's tally ([`crate::rooms::Rooms::unscored`]):
+/// only the bodies after the position last scored are put to the rules,
+/// and the ruleset, profile and room context are read only when there is
+/// something to score. Nothing unread (by the arithmetic count, which
+/// never reads a body) means nothing to score, before any of that.
+fn badge(
     state: &AppState,
     identity: &crate::accounts::Identity,
     room_id: &str,
     unread: &crate::rooms::Unread,
-) -> Result<usize, MatrixError> {
+) -> Result<Badge, MatrixError> {
     let Some(boundary) = unread.boundary else {
-        return Ok(0);
+        return Ok(Badge::NONE);
     };
     if unread.notification_count == 0 {
-        return Ok(0);
+        return Ok(Badge::NONE);
     }
     let pending = state
         .rooms
-        .unscored_highlights(room_id, &identity.user_id, boundary)
+        .unscored(room_id, &identity.user_id, boundary)
         .map_err(room_error)?;
-    if pending.events.is_empty() {
-        return Ok(pending.count);
+    let mut scored = pending.scored;
+    if !pending.events.is_empty() {
+        let ruleset = ruleset_of(state, &identity.user_id)?;
+        let profile = state
+            .profiles
+            .get(&identity.user_id)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        let room = RoomRuleContext::of(state, room_id)?;
+        let context = room.for_reader(&identity.user_id, profile.displayname.as_deref(), room_id);
+        for (li, event) in &pending.events {
+            let actions = crate::push_rules::evaluate(&ruleset, event, &context);
+            let relation = &event["content"]["m.relates_to"];
+            let thread = (relation["rel_type"] == "m.thread")
+                .then(|| relation["event_id"].as_str().map(str::to_owned))
+                .flatten();
+            scored.push(crate::rooms::Scored {
+                li: *li,
+                notifies: actions.is_some(),
+                highlights: actions
+                    .as_deref()
+                    .is_some_and(crate::push_rules::is_highlight),
+                thread,
+            });
+        }
+        state.rooms.record_scores(
+            room_id,
+            &identity.user_id,
+            boundary,
+            pending.upto,
+            scored.clone(),
+        );
     }
-    let ruleset = ruleset_of(state, &identity.user_id)?;
-    let profile = state
-        .profiles
-        .get(&identity.user_id)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    let room = RoomRuleContext::of(state, room_id)?;
-    let context = room.for_reader(&identity.user_id, profile.displayname.as_deref(), room_id);
-    let count = pending.count
-        + pending
-            .events
-            .iter()
-            .filter(|event| {
-                crate::push_rules::evaluate(&ruleset, event, &context)
-                    .is_some_and(|actions| crate::push_rules::is_highlight(&actions))
-            })
-            .count();
-    state
+    let floors = state
         .rooms
-        .record_highlights(room_id, &identity.user_id, boundary, pending.upto, count);
-    Ok(count)
+        .thread_receipts(room_id, &identity.user_id)
+        .map_err(room_error)?;
+    let main_floor = floors.get("main").copied().unwrap_or(i64::MIN);
+    let mut counts = Badge::NONE;
+    for event in &scored {
+        if !event.notifies {
+            continue;
+        }
+        let highlight = usize::from(event.highlights);
+        counts.notification_count += 1;
+        counts.highlight_count += highlight;
+        match &event.thread {
+            None if event.li > main_floor => {
+                counts.main.0 += 1;
+                counts.main.1 += highlight;
+            }
+            Some(root) if event.li > floors.get(root).copied().unwrap_or(i64::MIN) => {
+                let thread = counts.threads.entry(root.clone()).or_insert((0, 0));
+                thread.0 += 1;
+                thread.1 += highlight;
+            }
+            _ => {}
+        }
+    }
+    Ok(counts)
+}
+
+/// The `unread_notifications` section of a room in `/sync`, and, when
+/// the timeline filter asks (MSC3773), `unread_thread_notifications`:
+/// then the badge is the main timeline alone and each thread has its
+/// own; without it, one badge covers everything.
+fn badge_sections(
+    badge: &Badge,
+    by_thread: bool,
+) -> Result<Vec<(&'static str, Box<RawValue>)>, MatrixError> {
+    let counts = |notifications: usize, highlights: usize| json!({ "notification_count": notifications, "highlight_count": highlights });
+    if !by_thread {
+        return Ok(vec![(
+            "unread_notifications",
+            raw(&counts(badge.notification_count, badge.highlight_count))?,
+        )]);
+    }
+    let threads: serde_json::Map<String, Value> = badge
+        .threads
+        .iter()
+        .map(|(root, (notifications, highlights))| {
+            (root.clone(), counts(*notifications, *highlights))
+        })
+        .collect();
+    Ok(vec![
+        (
+            "unread_notifications",
+            raw(&counts(badge.main.0, badge.main.1))?,
+        ),
+        ("unread_thread_notifications", raw(&Value::Object(threads))?),
+    ])
 }
 
 /// Reject a scope the spec does not define.
@@ -4894,10 +5896,16 @@ async fn query_keys(
                 .map_err(|error| MatrixError::internal(&error.to_string()))
         };
         if let Some(key) = fetch("master")? {
-            master_keys.insert(user_id.clone(), key);
+            master_keys.insert(
+                user_id.clone(),
+                signatures_visible_to(key, user_id, &identity.user_id),
+            );
         }
         if let Some(key) = fetch("self_signing")? {
-            self_signing_keys.insert(user_id.clone(), key);
+            self_signing_keys.insert(
+                user_id.clone(),
+                signatures_visible_to(key, user_id, &identity.user_id),
+            );
         }
         if user_id == &identity.user_id
             && let Some(key) = fetch("user_signing")?
@@ -5075,10 +6083,11 @@ async fn upload_cross_signing(
 /// `POST /_matrix/client/v3/keys/signatures/upload`
 async fn upload_signatures(
     State(state): State<AppState>,
-    Authenticated(_identity): Authenticated,
+    Authenticated(identity): Authenticated,
     Json(request): Json<serde_json::Map<String, Value>>,
 ) -> Result<Json<Value>, MatrixError> {
     let mut failures = serde_json::Map::new();
+    let mut signed_users = std::collections::BTreeSet::new();
     for (user_id, targets) in &request {
         let Some(targets) = targets.as_object() else {
             continue;
@@ -5088,6 +6097,9 @@ async fn upload_signatures(
                 .devices
                 .add_signatures(user_id, target, signed)
                 .map_err(|error| MatrixError::internal(&error.to_string()))?;
+            if added {
+                signed_users.insert(user_id.clone());
+            }
             if !added {
                 // The spec's failure shape: per-target errors, not a failed
                 // request — the other signatures in the batch still landed.
@@ -5103,7 +6115,36 @@ async fn upload_signatures(
             }
         }
     }
+    // A new signature is a device-list change for the user whose key
+    // carries it. Without this the signer's own client never hears that
+    // its signature landed: it re-queries a user's keys only when a sync
+    // names them in `device_lists.changed`, and until it does the identity
+    // it just verified stays unverified in its own store.
+    for user_id in &signed_users {
+        let seq = state.rooms.allocate_stream_id();
+        state
+            .devices
+            .mark_device_list_changed(user_id, seq)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        if user_id == &identity.user_id {
+            crate::e2ee_federation::announce_signing_keys(&state, user_id);
+        }
+    }
+    if !signed_users.is_empty() {
+        state.rooms.wake_sync_waiters();
+    }
     Ok(Json(json!({ "failures": failures })))
+}
+
+/// A key as `viewer` may see it: signatures by anyone other than the
+/// key's owner or the viewer are dropped. A user-signing signature is the
+/// signer's private opinion of who they have verified; the spec has the
+/// server return it to the signer alone.
+fn signatures_visible_to(mut key: Value, owner: &str, viewer: &str) -> Value {
+    if let Some(signatures) = key["signatures"].as_object_mut() {
+        signatures.retain(|signer, _| signer == owner || signer == viewer);
+    }
+    key
 }
 
 /// The API's version is a string; storage counts. Anything non-numeric can
@@ -5605,31 +6646,15 @@ async fn sliding_sync(
         .decoded_subscriptions()
         .map_err(MatrixError::bad_json)?;
 
-    let mut position = state.rooms.stream_position();
-    // Long-poll before answering, not after assembling: an incremental request
-    // with nothing new blocks here, and answers fresh when something lands.
-    if let Some(since) = since {
-        let timeout_ms = request.timeout.or(query.timeout).unwrap_or(0).min(60_000);
-        if position <= since && timeout_ms > 0 {
-            state
-                .rooms
-                .wait_for_event(std::time::Duration::from_millis(timeout_ms))
-                .await;
-            position = state.rooms.stream_position();
-        }
-    }
+    let timeout_ms = request.timeout.or(query.timeout).unwrap_or(0).min(60_000);
+    let position =
+        sliding_long_poll(&state, since, timeout_ms, request.extensions.typing.on()).await;
 
     // The sorted room list: every joined room, newest activity first. The
     // sort is recomputed per request because it is what the ranges index
     // into, and a stale order would make the client's window show the wrong
     // rooms — the exact bug sliding sync exists to avoid.
-    let joined = state.rooms.joined(&identity.user_id).map_err(room_error)?;
-    let mut ordered: Vec<(String, i64)> = Vec::with_capacity(joined.len());
-    for room_id in joined {
-        let activity = state.rooms.last_activity(&room_id).map_err(room_error)?;
-        ordered.push((room_id, activity));
-    }
-    ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let (ordered, invited) = sliding_room_order(&state, &identity)?;
 
     // Every room this request may be answered with. A list window can only
     // produce rooms out of `ordered`, which came from the caller's own
@@ -5648,12 +6673,22 @@ async fn sliding_sync(
     // asking the server's whole stream instead would price a client's
     // sliding sync at everyone else's traffic.
     let changed: Option<std::collections::HashSet<String>> = match since {
-        Some(since) => Some(
-            state
+        Some(since) => {
+            let mut changed = state
                 .rooms
                 .changed_rooms(visible.iter().copied(), since, position)
-                .map_err(room_error)?,
-        ),
+                .map_err(room_error)?;
+            // A room the reader just read is one whose counts moved for
+            // them, event or no event; silence about it would hand back the
+            // unread numbers the receipt has just made wrong.
+            changed.extend(state.rooms.rooms_read_since(
+                &identity.user_id,
+                visible.iter().copied(),
+                since,
+                position,
+            ));
+            Some(changed)
+        }
         None => None,
     };
 
@@ -5694,6 +6729,9 @@ async fn sliding_sync(
         entry.1 = entry.1.max(subscription.timeline_limit);
     }
 
+    // The rooms in view, whether or not they changed: the room extensions
+    // below answer for all of them.
+    let in_view: Vec<String> = wanted.keys().cloned().collect();
     for (room_id, (required_state, timeline_limit)) in wanted {
         // Incrementally, silence about an unchanged room *is* the answer.
         if let Some(changed) = &changed
@@ -5701,26 +6739,387 @@ async fn sliding_sync(
         {
             continue;
         }
-        let entry = sliding_room_entry(
-            &state,
-            &identity,
-            &room_id,
-            &required_state,
-            timeline_limit,
-            since.is_none(),
-        )?;
+        let entry = if invited.contains(&room_id) {
+            sliding_invite_entry(&state, &identity, &room_id)?
+        } else {
+            sliding_room_entry(
+                &state,
+                &identity,
+                &room_id,
+                &required_state,
+                timeline_limit,
+                since.is_none(),
+            )?
+        };
         rooms_out.insert(room_id, entry);
     }
+
+    let extensions = sliding_extensions(
+        &state,
+        &identity,
+        &request.extensions,
+        since,
+        position,
+        &in_view,
+    )?;
 
     Ok(Json(json!({
         "pos": crate::tokens::Sync(position).to_string(),
         "lists": lists_out,
         "rooms": rooms_out,
-        "extensions": {},
+        "extensions": extensions,
     })))
 }
 
+/// Long-poll before answering, not after assembling: an incremental request
+/// with nothing new blocks here, and answers fresh when something lands.
+/// Typing is not an event and has no stream position, so with the typing
+/// extension on a change in who is typing ends the wait too, as it does for
+/// classic sync. Returns the stream position to answer at.
+async fn sliding_long_poll(
+    state: &AppState,
+    since: Option<u64>,
+    timeout_ms: u64,
+    typing_wakes: bool,
+) -> u64 {
+    let position = state.rooms.stream_position();
+    let Some(since) = since else {
+        return position;
+    };
+    if position > since || timeout_ms == 0 {
+        return position;
+    }
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    if typing_wakes {
+        tokio::select! {
+            () = state.rooms.wait_for_event(timeout) => {}
+            () = state.typing.wait(timeout) => {}
+        }
+    } else {
+        state.rooms.wait_for_event(timeout).await;
+    }
+    state.rooms.stream_position()
+}
+
+/// The `extensions` object of a sliding-sync response.
+///
+/// The room extensions (account data, receipts, typing) answer for every
+/// room in view, changed or not. Stateless as this endpoint is, there is no
+/// record of what a client was last told, and a receipt or a typing change
+/// bumps no stream position; repeating a window's worth is the answer that
+/// cannot silently drop one, the same trade classic sync makes for room
+/// account data.
+fn sliding_extensions(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    extensions: &crate::sliding::Extensions,
+    since: Option<u64>,
+    position: u64,
+    in_view: &[String],
+) -> Result<Value, MatrixError> {
+    let mut out = serde_json::Map::new();
+    if !extensions.any() {
+        return Ok(Value::Object(out));
+    }
+
+    if extensions.to_device.on() {
+        out.insert(
+            "to_device".to_owned(),
+            to_device_extension(state, identity, &extensions.to_device, position)?,
+        );
+    }
+    if extensions.e2ee.on() {
+        out.insert(
+            "e2ee".to_owned(),
+            e2ee_extension(state, identity, since, position)?,
+        );
+    }
+    if extensions.account_data.on() {
+        out.insert(
+            "account_data".to_owned(),
+            account_data_extension(state, identity, in_view)?,
+        );
+    }
+    if extensions.receipts.on() {
+        out.insert(
+            "receipts".to_owned(),
+            receipts_extension(state, identity, in_view)?,
+        );
+    }
+    if extensions.typing.on() {
+        let mut rooms = serde_json::Map::new();
+        for room_id in in_view {
+            if let Some(event) = state.typing.event(room_id) {
+                rooms.insert(room_id.clone(), event);
+            }
+        }
+        out.insert("typing".to_owned(), json!({ "rooms": rooms }));
+    }
+
+    Ok(Value::Object(out))
+}
+
+/// The to-device extension: what is pending for this device, acknowledged
+/// by the extension's own token rather than by `pos`. A client that restarts
+/// its sliding sync from nothing must not lose the to-device messages it has
+/// already decrypted, and one that lost its E2EE state must be able to ask
+/// for them again.
+fn to_device_extension(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    extension: &crate::sliding::ToDeviceExtension,
+    position: u64,
+) -> Result<Value, MatrixError> {
+    let acknowledged = match extension.since.as_deref() {
+        Some(token) => Some(
+            token
+                .parse::<crate::tokens::Sync>()
+                .map_err(|error| MatrixError::bad_json(error.to_string()))?
+                .0,
+        ),
+        None => None,
+    };
+    let mut events = state
+        .devices
+        .take_pending(&identity.user_id, &identity.device_id, acknowledged)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    if let Some(limit) = extension.limit {
+        events.truncate(limit.max(1));
+    }
+    Ok(json!({
+        "next_batch": crate::tokens::Sync(position).to_string(),
+        "events": events,
+    }))
+}
+
+/// The E2EE extension: the same three things classic sync carries at the
+/// top level, for the same reasons.
+fn e2ee_extension(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    since: Option<u64>,
+    position: u64,
+) -> Result<Value, MatrixError> {
+    let changed = match since {
+        Some(since) => visible_device_changes(state, identity, since, position)?,
+        None => Vec::new(),
+    };
+    let key_counts = state
+        .devices
+        .one_time_key_counts(&identity.user_id, &identity.device_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    let unused_fallback = state
+        .devices
+        .unused_fallback_algorithms(&identity.user_id, &identity.device_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    Ok(json!({
+        "device_lists": { "changed": changed, "left": [] },
+        "device_one_time_keys_count": key_counts,
+        "device_unused_fallback_key_types": unused_fallback,
+    }))
+}
+
+/// The account-data extension: the global events, and each room in view
+/// that has any.
+fn account_data_extension(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    in_view: &[String],
+) -> Result<Value, MatrixError> {
+    let global = sync_account_data(state, identity, None)?;
+    let mut rooms = serde_json::Map::new();
+    for room_id in in_view {
+        let data = state
+            .account_data
+            .all(&identity.user_id, room_id)
+            .map_err(|error| account_data_error(&error))?;
+        if !data.is_empty() {
+            rooms.insert(room_id.clone(), Value::Array(data));
+        }
+    }
+    Ok(json!({ "global": global, "rooms": rooms }))
+}
+
+/// The receipts extension: one `m.receipt` event per room in view that has
+/// any, keyed by event then by type then by reader, as the spec shapes it.
+/// A private receipt is shown to its owner and nobody else.
+fn receipts_extension(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    in_view: &[String],
+) -> Result<Value, MatrixError> {
+    let mut rooms = serde_json::Map::new();
+    for room_id in in_view {
+        let mut content: serde_json::Map<String, Value> = serde_json::Map::new();
+        for (user, receipt_type, event_id, ts, thread) in
+            state.rooms.room_receipts(room_id).map_err(room_error)?
+        {
+            if receipt_type == "m.read.private" && user != identity.user_id {
+                continue;
+            }
+            let mut data = json!({ "ts": ts });
+            if let Some(thread) = thread {
+                data["thread_id"] = json!(thread);
+            }
+            content
+                .entry(event_id)
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .expect("inserted as an object")
+                .entry(receipt_type)
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .expect("inserted as an object")
+                .insert(user, data);
+        }
+        if !content.is_empty() {
+            rooms.insert(
+                room_id.clone(),
+                json!({ "type": "m.receipt", "content": content }),
+            );
+        }
+    }
+    Ok(json!({ "rooms": rooms }))
+}
+
 /// One room's sliding-sync entry.
+/// `(rooms newest first with their recency, the invited ones among them)`.
+type SlidingRoomOrder = (Vec<(String, i64)>, std::collections::HashSet<String>);
+
+/// The sorted room list: every joined room and every invite, newest
+/// activity first. Recomputed per request because it is what the ranges
+/// index into, and a stale order would make the client's window show the
+/// wrong rooms -- the exact bug sliding sync exists to avoid. The invited
+/// set comes back too: those entries render differently.
+fn sliding_room_order(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+) -> Result<SlidingRoomOrder, MatrixError> {
+    let joined = state.rooms.joined(&identity.user_id).map_err(room_error)?;
+    // Invites are rooms in the list too (MSC4186), or a client has no way
+    // to show one: there is no separate section, the way classic sync has.
+    // The entry differs -- stripped state, no timeline -- so which rooms
+    // are invites is remembered for the render below.
+    let invited: std::collections::HashSet<String> = state
+        .rooms
+        .invited(&identity.user_id)
+        .map_err(room_error)?
+        .into_iter()
+        .collect();
+    let mut ordered: Vec<(String, i64)> = Vec::with_capacity(joined.len() + invited.len());
+    for room_id in joined {
+        let activity = state.rooms.last_activity(&room_id).map_err(room_error)?;
+        ordered.push((room_id, activity));
+    }
+    for room_id in &invited {
+        // A room this server holds has a newest event to date the invite
+        // by. One it does not (a federated invite, no log here) is dated
+        // now: the invite is the newest thing the invitee knows of it.
+        let activity = state
+            .rooms
+            .last_activity(room_id)
+            .unwrap_or_else(|_| now_ms());
+        ordered.push((room_id.clone(), activity));
+    }
+    ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Ok((ordered, invited))
+}
+
+/// Milliseconds since the epoch, for dating what has no event to date it.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since_epoch| {
+            i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+/// The `rooms` entry for a room the asker is invited to: the stripped state
+/// an invite is rendered from, and nothing an invitee is not yet entitled
+/// to -- no timeline, no counts. Always `initial`, since there is nothing
+/// incremental about an invite; and the name and heroes come from the
+/// stripped events themselves, which is all the client would have had.
+fn sliding_invite_entry(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    room_id: &str,
+) -> Result<Value, MatrixError> {
+    let events = state
+        .rooms
+        .stripped_state(room_id, &identity.user_id)
+        .map_err(room_error)?;
+    let mut entry = serde_json::Map::new();
+    if let Some(name) = events
+        .iter()
+        .find(|event| event["type"] == "m.room.name")
+        .and_then(|event| event["content"]["name"].as_str())
+    {
+        entry.insert("name".to_owned(), json!(name));
+    }
+    let heroes: Vec<Value> = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "m.room.member"
+                && event["state_key"] != json!(identity.user_id)
+                && event["content"]["membership"] == "join"
+        })
+        .take(5)
+        .map(|event| {
+            let mut hero = serde_json::Map::new();
+            hero.insert("user_id".to_owned(), event["state_key"].clone());
+            if let Some(name) = event["content"]["displayname"].as_str() {
+                hero.insert("name".to_owned(), json!(name));
+            }
+            if let Some(avatar) = event["content"]["avatar_url"].as_str() {
+                hero.insert("avatar".to_owned(), json!(avatar));
+            }
+            Value::Object(hero)
+        })
+        .collect();
+    entry.insert("heroes".to_owned(), Value::Array(heroes));
+    entry.insert("invite_state".to_owned(), Value::Array(events));
+    entry.insert(
+        "bump_stamp".to_owned(),
+        json!(
+            state
+                .rooms
+                .last_activity(room_id)
+                .unwrap_or_else(|_| now_ms())
+        ),
+    );
+    entry.insert("initial".to_owned(), json!(true));
+    Ok(Value::Object(entry))
+}
+
+/// `required_state` with `$LAZY` (MSC4186's lazy-loaded members) made
+/// concrete: the member events of whoever sent something in `window`,
+/// which is what a client needs to render that timeline -- the sender
+/// names and avatars -- and nothing more. Expanded before either state
+/// path runs so neither need know about it. A window with no senders
+/// wants no members.
+fn lazy_members_expanded(
+    required_state: &[(String, String)],
+    window: &[Value],
+) -> Vec<(String, String)> {
+    let senders: std::collections::BTreeSet<&str> = window
+        .iter()
+        .filter_map(|event| event["sender"].as_str())
+        .collect();
+    required_state
+        .iter()
+        .flat_map(|(event_type, state_key)| {
+            if state_key == "$LAZY" {
+                senders
+                    .iter()
+                    .map(|sender| (event_type.clone(), (*sender).to_owned()))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![(event_type.clone(), state_key.clone())]
+            }
+        })
+        .collect()
+}
+
 fn sliding_room_entry(
     state: &AppState,
     identity: &crate::accounts::Identity,
@@ -5734,6 +7133,23 @@ fn sliding_room_entry(
         .state_event_unscoped(room_id, "m.room.name", "")
         .ok()
         .and_then(|content| content["name"].as_str().map(str::to_owned));
+    let (events, limited, prev_batch) = if timeline_limit == 0 {
+        (Vec::new(), false, None)
+    } else {
+        state
+            .rooms
+            .timeline_tail_public(room_id, timeline_limit.min(50))
+            .map_err(room_error)?
+    };
+    let timeline = crate::sliding::Timeline {
+        events: events
+            .into_iter()
+            .map(|event| with_transaction_id(state, identity, event))
+            .collect(),
+        limited,
+        prev_batch: prev_batch.map(|li| crate::tokens::Pagination(li).to_string()),
+    };
+    let required_state = lazy_members_expanded(required_state, &timeline.events);
     // A wildcard has to be answered by looking at everything; a list of
     // named keys does not. Element X asks for a handful of concrete keys
     // and gets sent the whole room state to filter down — a stored-body
@@ -5776,7 +7192,7 @@ fn sliding_room_entry(
                 let event_type = event["type"].as_str().unwrap_or_default();
                 let state_key = event["state_key"].as_str().unwrap_or_default();
                 crate::sliding::wants_state(
-                    required_state,
+                    &required_state,
                     &identity.user_id,
                     event_type,
                     state_key,
@@ -5784,36 +7200,32 @@ fn sliding_room_entry(
             })
             .collect()
     };
-    let (events, limited, prev_batch) = if timeline_limit == 0 {
-        (Vec::new(), false, None)
-    } else {
-        state
-            .rooms
-            .timeline_tail_public(room_id, timeline_limit.min(50))
-            .map_err(room_error)?
-    };
-    let timeline = crate::sliding::Timeline {
-        events,
-        limited,
-        prev_batch: prev_batch.map(|li| crate::tokens::Pagination(li).to_string()),
-    };
-    let joined_count = state
+    let roster = state.rooms.roster(room_id).map_err(room_error)?;
+    let avatar = state
         .rooms
-        .joined_member_count(room_id)
-        .map_err(room_error)?;
+        .state_event_unscoped(room_id, "m.room.avatar", "")
+        .ok()
+        .and_then(|content| content["url"].as_str().map(str::to_owned));
+    let bump_stamp = state.rooms.last_activity(room_id).map_err(room_error)?;
     let unread = state
         .rooms
         .unread(room_id, &identity.user_id)
         .map_err(room_error)?;
-    let highlight_count = highlight_count(state, identity, room_id, &unread)?;
+    let badge = badge(state, identity, room_id, &unread)?;
     Ok(crate::sliding::room_entry(
-        name,
+        crate::sliding::Summary {
+            name,
+            avatar,
+            joined_count: roster.joined.len(),
+            invited_count: roster.invited.len(),
+            heroes: crate::sliding::heroes(&roster.heroes, &identity.user_id),
+            bump_stamp,
+        },
         state_events,
         timeline,
-        joined_count,
         crate::sliding::Counts {
-            notification_count: unread.notification_count,
-            highlight_count,
+            notification_count: badge.notification_count,
+            highlight_count: badge.highlight_count,
         },
         initial,
     ))
@@ -5976,7 +7388,7 @@ async fn sync(
     // staring at nothing for the whole timeout.
     if let Some(since) = since {
         let timeout = std::time::Duration::from_millis(query.timeout.unwrap_or(0).min(60_000));
-        if result.rooms.is_empty() && !timeout.is_zero() {
+        if result.is_empty() && !timeout.is_zero() {
             // Either an appended event or a change in who is typing ends the
             // wait. Typing is not an event and has no stream position, so it
             // cannot be discovered by re-reading the log -- without this arm a
@@ -6091,6 +7503,18 @@ fn sync_account_data(
         .account_data
         .all(&identity.user_id, "")
         .map_err(|error| account_data_error(&error))?;
+    // The ruleset is stored bare -- `/pushrules/` edits it a rule at a
+    // time and wraps it in `global` on the way out -- but the account-data
+    // event's content is `{"global": ruleset}` by the spec, and a client
+    // that finds the kinds at the top level refuses the whole event:
+    // matrix-rust-sdk logged "missing field `global`" and carried on with
+    // no push rules at all, which is every notification count wrong.
+    for event in &mut global {
+        if event["type"] == crate::push_rules::TYPE {
+            let ruleset = event["content"].take();
+            event["content"] = json!({ "global": ruleset });
+        }
+    }
     // A user who has never edited a rule still has a ruleset, and a client
     // reads it from here rather than from `/pushrules/`. Injected rather than
     // written at registration for the reason `ruleset_of` gives: only an edit
@@ -6102,7 +7526,7 @@ fn sync_account_data(
     {
         global.push(json!({
             "type": crate::push_rules::TYPE,
-            "content": crate::push_rules::defaults(&identity.user_id),
+            "content": { "global": crate::push_rules::defaults(&identity.user_id) },
         }));
     }
     Ok(crate::filters::Filter::apply(
@@ -6199,6 +7623,21 @@ fn sync_leave(
     leave
 }
 
+/// A joined room's timeline events as this device may see them: the
+/// client's timeline filter applied, and its own transaction IDs on the
+/// events it sent.
+fn sync_timeline(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    room_filter: Option<&crate::filters::RoomFilter>,
+    events: Vec<Value>,
+) -> Vec<Value> {
+    crate::filters::Filter::apply(room_filter.and_then(|room| room.timeline.as_ref()), events)
+        .into_iter()
+        .map(|event| with_transaction_id(state, identity, event))
+        .collect()
+}
+
 /// A sync `timeline` block. `prev_batch` is where the window begins, as
 /// the token `/messages?dir=b` pages back from (#331); absent only for an
 /// empty window, since a client with no token cannot page back at all.
@@ -6267,7 +7706,7 @@ fn sync_join(
             .rooms
             .unread(&room.room_id, &identity.user_id)
             .map_err(room_error)?;
-        let highlight_count = highlight_count(state, identity, &room.room_id, &unread)?;
+        let badge = badge(state, identity, &room.room_id, &unread)?;
         // Sent in full on every sync, incremental ones included, rather than
         // only when it changed. Account data has no stream position of its
         // own -- the sync token counts room events, and a `PUT` to
@@ -6280,10 +7719,7 @@ fn sync_join(
             .map_err(|error| account_data_error(&error))?;
         let typing = state.typing.event(&room.room_id);
         let room_filter = filter.map(|filter| &filter.room);
-        let events = crate::filters::Filter::apply(
-            room_filter.and_then(|room| room.timeline.as_ref()),
-            room.events,
-        );
+        let events = sync_timeline(state, identity, room_filter, room.events);
         let mut room_state = crate::filters::Filter::apply(
             room_filter.and_then(|room| room.state.as_ref()),
             room.state,
@@ -6358,13 +7794,13 @@ fn sync_join(
                 ),
             }))?,
         );
-        entry.insert(
-            "unread_notifications",
-            raw(&json!({
-                "notification_count": unread.notification_count,
-                "highlight_count": highlight_count,
-            }))?,
-        );
+        let by_thread = room_filter
+            .and_then(|room| room.timeline.as_ref())
+            .and_then(|timeline| timeline.unread_thread_notifications)
+            .unwrap_or(false);
+        for (key, value) in badge_sections(&badge, by_thread)? {
+            entry.insert(key, value);
+        }
         join.insert(room.room_id, raw(&entry)?);
     }
 
@@ -6388,6 +7824,10 @@ fn sync_join(
 }
 
 /// `POST /_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}`
+///
+/// The body may name a thread (MSC3771, spec v1.4): `main` for the main
+/// timeline or a thread root's event ID. A receipt with no thread is
+/// unthreaded and covers everything.
 async fn set_receipt(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
@@ -6396,12 +7836,25 @@ async fn set_receipt(
         String,
         String,
     )>,
+    body: axum::body::Bytes,
 ) -> Result<Json<Value>, MatrixError> {
+    let request: ReceiptRequest = optional_body(&body)?;
     state
         .rooms
-        .set_receipt(&room_id, &identity.user_id, &receipt_type, &event_id)
+        .set_receipt(
+            &room_id,
+            &identity.user_id,
+            &receipt_type,
+            &event_id,
+            request.thread_id.as_deref(),
+        )
         .map_err(room_error)?;
     Ok(Json(json!({})))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ReceiptRequest {
+    thread_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6431,7 +7884,7 @@ async fn read_markers(
         if let Some(event_id) = event_id {
             state
                 .rooms
-                .set_receipt(&room_id, &identity.user_id, receipt_type, event_id)
+                .set_receipt(&room_id, &identity.user_id, receipt_type, event_id, None)
                 .map_err(room_error)?;
         }
     }
@@ -6610,6 +8063,15 @@ async fn room_timestamp_to_event(
     axum::extract::Query(query): axum::extract::Query<TimestampToEventQuery>,
 ) -> Result<Json<Value>, MatrixError> {
     may_read_room(&state, &identity.user_id, &room_id)?;
+    timestamp_lookup(&state, &room_id, &query)
+}
+
+/// The lookup behind both spellings of `timestamp_to_event`.
+fn timestamp_lookup(
+    state: &AppState,
+    room_id: &str,
+    query: &TimestampToEventQuery,
+) -> Result<Json<Value>, MatrixError> {
     let ts = query
         .ts
         .ok_or_else(|| MatrixError::missing_param("ts is required"))?;
@@ -6625,12 +8087,28 @@ async fn room_timestamp_to_event(
     };
     let (event_id, origin_server_ts) = state
         .rooms
-        .event_at_timestamp(&room_id, ts, direction)
+        .event_at_timestamp(room_id, ts, direction)
         .map_err(room_error)?;
     Ok(Json(json!({
         "event_id": event_id,
         "origin_server_ts": origin_server_ts,
     })))
+}
+
+/// `GET /_matrix/federation/v1/timestamp_to_event/{roomId}` (spec v1.6)
+async fn federation_timestamp_to_event(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<TimestampToEventQuery>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    crate::inbound::federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
+    timestamp_lookup(&state, &room_id, &query)
 }
 
 /// MSC4140's delay, spelled as the unstable query parameter.
@@ -7013,7 +8491,7 @@ async fn room_threads(
 
     let chunk: Vec<Value> = roots
         .into_iter()
-        .map(|root| with_bundle(&state, &room_id, &identity.user_id, root))
+        .map(|root| as_seen_by(&state, &room_id, &identity, root))
         .collect();
 
     let mut body = serde_json::Map::new();
@@ -7200,12 +8678,7 @@ async fn room_event(
         .and_then(|reader| reader.event(&event_id))
         .map_err(room_error)?
         .ok_or_else(|| MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such event"))?;
-    Ok(Json(with_bundle(
-        &state,
-        &room_id,
-        &identity.user_id,
-        event,
-    )))
+    Ok(Json(as_seen_by(&state, &room_id, &identity, event)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -7223,20 +8696,34 @@ async fn room_context(
     axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
     axum::extract::Query(query): axum::extract::Query<ContextQuery>,
 ) -> Result<Json<Value>, MatrixError> {
-    // The spec's limit is the total window, so each side gets half.
-    let limit = query.limit.unwrap_or(10).clamp(1, 100);
-    let each_side = limit.div_ceil(2);
+    // The spec's limit is the total window. It is split the way Synapse
+    // splits it -- the floor before, the rest after -- because that is the
+    // split clients have learned: matrix-rust-sdk's permalink timeline asks
+    // for one context event and lays out a window of two, and an extra
+    // neighbour on the earlier side shifted every item it then indexed.
+    // Zero is a real ask, the event alone with tokens to page out from.
+    let limit = query.limit.unwrap_or(10).min(100);
+    let before = limit / 2;
+    let after = limit - before;
 
     let context = state
         .rooms
         .reader(&identity.user_id, &room_id)
-        .and_then(|reader| reader.context(&event_id, each_side))
+        .and_then(|reader| reader.context(&event_id, before, after))
         .map_err(room_error)?;
 
     Ok(Json(json!({
-        "event": with_bundle(&state, &room_id, &identity.user_id, context.event),
-        "events_before": context.events_before,
-        "events_after": context.events_after,
+        "event": as_seen_by(&state, &room_id, &identity, context.event),
+        "events_before": context
+            .events_before
+            .into_iter()
+            .map(|event| with_transaction_id(&state, &identity, event))
+            .collect::<Vec<_>>(),
+        "events_after": context
+            .events_after
+            .into_iter()
+            .map(|event| with_transaction_id(&state, &identity, event))
+            .collect::<Vec<_>>(),
         "state": context.state,
         // The same `t`-tagged tokens `/messages` pages with, because they are
         // positions in the same index -- so a client can carry on paginating
@@ -7326,7 +8813,69 @@ fn with_transaction(
     let event_id = mint()?;
     spindle_store::Store::put(state.store.as_ref(), &key, event_id.as_bytes())
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    // The inverse row, so the event comes back to this device with the
+    // transaction ID it chose: that is how a client matches the remote
+    // echo to the local one it is still showing.
+    spindle_store::Store::put(
+        state.store.as_ref(),
+        &spindle_core::keys::transaction_echo(&identity.user_id, &event_id),
+        &spindle_core::keys::transaction_echo_value(&identity.device_id, txn_id),
+    )
+    .map_err(|error| MatrixError::internal(&error.to_string()))?;
     Ok(Json(json!({ "event_id": event_id })))
+}
+
+/// Stamp `unsigned.transaction_id` on an event the reading device sent.
+///
+/// The spec scopes it to the device: the same user on another device gets
+/// no `transaction_id`, since that device never chose one and a client
+/// that sees one it did not send would try to match a local echo it does
+/// not have.
+fn with_transaction_id(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    mut event: Value,
+) -> Value {
+    let Some(event_id) = event["event_id"].as_str() else {
+        return event;
+    };
+    if event["sender"].as_str() != Some(identity.user_id.as_str()) {
+        return event;
+    }
+    let key = spindle_core::keys::transaction_echo(&identity.user_id, event_id);
+    let Ok(Some(raw)) = spindle_store::ReadView::get(state.store.as_ref(), &key) else {
+        return event;
+    };
+    let Some((device_id, txn_id)) = spindle_core::keys::transaction_echo_parts(&raw) else {
+        return event;
+    };
+    if device_id != identity.device_id {
+        return event;
+    }
+    if let Some(unsigned) = event.as_object_mut().and_then(|object| {
+        object
+            .entry("unsigned")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+    }) {
+        unsigned.insert("transaction_id".to_owned(), Value::String(txn_id));
+    }
+    event
+}
+
+/// An event as the reading device sees it: its own transaction ID, and
+/// the relations bundled on it.
+fn as_seen_by(
+    state: &AppState,
+    room_id: &str,
+    identity: &crate::accounts::Identity,
+    event: Value,
+) -> Value {
+    with_transaction_id(
+        state,
+        identity,
+        with_bundle(state, room_id, &identity.user_id, event),
+    )
 }
 
 async fn send_event(
@@ -7445,7 +8994,7 @@ async fn room_messages(
             if let Some(object) = json.as_object_mut() {
                 object.insert("event_id".to_owned(), json!(event.event_id));
             }
-            with_bundle(&state, &room_id, &identity.user_id, json)
+            as_seen_by(&state, &room_id, &identity, json)
         })
         .collect();
 
@@ -8064,7 +9613,7 @@ async fn search(
                 object.insert("event_id".to_owned(), json!(hit.event.event_id));
                 object.insert("room_id".to_owned(), json!(hit.room_id));
             }
-            let event = with_bundle(&state, &hit.room_id, &identity.user_id, event);
+            let event = as_seen_by(&state, &hit.room_id, &identity, event);
             let mut result = json!({ "rank": 1.0, "result": event });
             if let Some(wanted) = &criteria.event_context
                 && let Some(scope) = scopes.get(&hit.room_id)
@@ -8392,16 +9941,12 @@ fn search_context(
     let Ok(context) = state
         .rooms
         .reader_with(&hit.room_id, scope.clone())
-        .context(&hit.event.event_id, before_limit.max(after_limit))
+        .context(&hit.event.event_id, before_limit, after_limit)
     else {
         return Value::Null;
     };
-    let events_before: Vec<Value> = context
-        .events_before
-        .into_iter()
-        .take(before_limit)
-        .collect();
-    let events_after: Vec<Value> = context.events_after.into_iter().take(after_limit).collect();
+    let events_before = context.events_before;
+    let events_after = context.events_after;
     let mut out = json!({
         "events_before": events_before,
         "events_after": events_after,
@@ -9049,4 +10594,229 @@ async fn room_hierarchy(
         body.insert("next_batch".to_owned(), json!((offset + limit).to_string()));
     }
     Ok(Json(Value::Object(body)))
+}
+
+/// `POST /_matrix/media/v1/create` (spec v1.7)
+///
+/// An `mxc://` URI ahead of its bytes, so a client can put the URI in an
+/// event while the upload is still going.
+async fn create_media(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+) -> Result<Json<Value>, MatrixError> {
+    let (media_id, unused_expires_at) = state
+        .media
+        .reserve(&identity.user_id)
+        .map_err(|error| media_error(&error))?;
+    Ok(Json(json!({
+        "content_uri": state.media.mxc(&media_id),
+        "unused_expires_at": unused_expires_at,
+    })))
+}
+
+/// `PUT /_matrix/media/v3/upload/{serverName}/{mediaId}` (spec v1.7)
+async fn upload_reserved_media(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<UploadQuery>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, MatrixError> {
+    if !state.media.is_ours(&server_name) {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            format!("{server_name} is not this server"),
+        ));
+    }
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+    state
+        .media
+        .put_reserved(
+            &media_id,
+            &body,
+            &content_type,
+            query.filename.as_deref(),
+            &identity.user_id,
+        )
+        .await
+        .map_err(|error| media_error(&error))?;
+    Ok(Json(json!({})))
+}
+
+#[derive(Debug, Deserialize)]
+struct MutualRoomsQuery {
+    user_id: String,
+    /// Accepted for the shape of the spec: every answer fits one page.
+    #[allow(dead_code)]
+    from: Option<String>,
+}
+
+/// `GET /_matrix/client/v1/mutual_rooms?user_id=` (MSC2666)
+///
+/// The rooms both the caller and `user_id` are joined to. Nothing the
+/// caller could not learn from their own rooms' member lists, one query
+/// instead of many.
+async fn mutual_rooms(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Query(query): axum::extract::Query<MutualRoomsQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    if query.user_id == identity.user_id {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            "mutual rooms are with someone else",
+        ));
+    }
+    let mine = state.rooms.joined(&identity.user_id).map_err(room_error)?;
+    let joined: Vec<String> = mine
+        .into_iter()
+        .filter(|room_id| {
+            state
+                .rooms
+                .is_joined(&query.user_id, room_id)
+                .unwrap_or(false)
+        })
+        .collect();
+    Ok(Json(json!({ "joined": joined, "count": joined.len() })))
+}
+
+/// `GET /_matrix/federation/v1/event_auth/{roomId}/{eventId}`
+async fn federation_event_auth(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    crate::inbound::federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
+    let auth_chain = state
+        .rooms
+        .auth_chain(&room_id, &event_id)
+        .map_err(room_error)?;
+    Ok(Json(json!({ "auth_chain": auth_chain })))
+}
+
+/// `GET /_matrix/federation/v1/publicRooms`
+///
+/// This server's published directory, for a peer that asks. The same
+/// page a client gets, since the directory is public by definition.
+async fn federation_public_rooms(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<PublicRoomsQuery>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    federation_origin(&state, &headers, "GET", &uri, None).await?;
+    directory_page(&state, query.limit, query.since.as_deref(), None, &[])
+}
+
+/// `POST /_matrix/federation/v1/publicRooms`
+async fn federation_public_rooms_filtered(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let bytes = axum::body::to_bytes(request.into_body(), 64 * 1024)
+        .await
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    let body: Value =
+        serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    federation_origin(&state, &headers, "POST", &uri, Some(&body)).await?;
+    let filter: PublicRoomsRequest =
+        serde_json::from_value(body).map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    directory_page(
+        &state,
+        filter.limit,
+        filter.since.as_deref(),
+        filter.filter.generic_search_term.as_deref(),
+        &filter.filter.room_types,
+    )
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FederationHierarchyQuery {
+    #[serde(default)]
+    suggested_only: bool,
+}
+
+/// `GET /_matrix/federation/v1/hierarchy/{roomId}` (spec v1.2)
+///
+/// One level of a space for a peer walking it: the space and its direct
+/// children, each as a room summary with its own `m.space.child` state.
+/// A child the requesting server may not see (not public, not knockable,
+/// not world-readable, and no member of theirs in it) is named in
+/// `inaccessible_children` rather than described.
+async fn federation_hierarchy(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<FederationHierarchyQuery>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let origin = federation_origin(&state, &headers, "GET", &uri, None).await?;
+    let visible = |room: &str| -> Option<crate::rooms::RoomSummary> {
+        let summary = state.rooms.summary(room).ok()?;
+        if state.rooms.server_in_room(room, &origin).unwrap_or(false) {
+            return Some(summary);
+        }
+        let open = summary.world_readable
+            || matches!(summary.join_rule.as_deref(), Some("public" | "knock"));
+        open.then_some(summary)
+    };
+    let Some(root) = visible(&room_id) else {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "the room is not known here, or not visible to the requesting server",
+        ));
+    };
+    let with_children = |summary: &crate::rooms::RoomSummary| -> Value {
+        let mut entry = match chunk_of(summary) {
+            Value::Object(entry) => entry,
+            _ => serde_json::Map::new(),
+        };
+        let children = space_children(&state, &summary.room_id, query.suggested_only);
+        entry.insert("children_state".to_owned(), Value::Array(children));
+        entry.insert("allowed_room_ids".to_owned(), json!([]));
+        Value::Object(entry)
+    };
+    let parent = with_children(&root);
+    let mut children = Vec::new();
+    let mut inaccessible = Vec::new();
+    for child in space_children(&state, &room_id, query.suggested_only) {
+        let Some(child_id) = child["state_key"].as_str() else {
+            continue;
+        };
+        match visible(child_id) {
+            Some(summary) => children.push(with_children(&summary)),
+            None => inaccessible.push(json!(child_id)),
+        }
+    }
+    Ok(Json(json!({
+        "room": parent,
+        "children": children,
+        "inaccessible_children": inaccessible,
+    })))
 }
