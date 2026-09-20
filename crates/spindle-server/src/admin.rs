@@ -24,8 +24,10 @@ use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha1::Sha1;
 use spindle_core::keys;
 use spindle_store::Store;
 
@@ -129,6 +131,10 @@ pub fn routes() -> Router<AppState> {
 /// device per DELETE.
 fn synapse_spellings() -> Router<AppState> {
     Router::new()
+        .route(
+            "/_synapse/admin/v1/register",
+            get(shared_secret_nonce).post(shared_secret_register),
+        )
         .route("/_synapse/admin/v2/users", get(list_users))
         .route(
             "/_synapse/admin/v2/users/{user_id}",
@@ -148,6 +154,114 @@ fn synapse_spellings() -> Router<AppState> {
             "/_synapse/admin/v1/purge_history/{room_id}",
             post(purge_history),
         )
+}
+
+/// `GET /_synapse/admin/v1/register` — one short-lived registration nonce.
+async fn shared_secret_nonce(State(state): State<AppState>) -> Result<Json<Value>, MatrixError> {
+    shared_registration_secret(&state)?;
+    Ok(Json(json!({ "nonce": state.registration_nonces.issue() })))
+}
+
+#[derive(Deserialize)]
+struct SharedSecretRegistration {
+    nonce: String,
+    username: String,
+    password: String,
+    #[serde(default)]
+    displayname: Option<String>,
+    #[serde(default)]
+    admin: bool,
+    mac: String,
+}
+
+/// `POST /_synapse/admin/v1/register` — Synapse's shared-secret fixture API.
+async fn shared_secret_register(
+    State(state): State<AppState>,
+    Json(request): Json<SharedSecretRegistration>,
+) -> Result<Json<Value>, MatrixError> {
+    let secret = shared_registration_secret(&state)?;
+    // Spent before the MAC is judged. A failed guess does not leave a live
+    // challenge to brute-force, and two concurrent requests cannot both win.
+    if !state.registration_nonces.consume(&request.nonce) {
+        return Err(MatrixError::forbidden(
+            "the registration nonce is not valid",
+        ));
+    }
+    let supplied = decode_hex(&request.mac)
+        .ok_or_else(|| MatrixError::forbidden("the registration MAC is not valid"))?;
+    let mut expected = Hmac::<Sha1>::new_from_slice(secret.as_bytes())
+        .map_err(|_| MatrixError::internal("the registration secret is not valid"))?;
+    for (index, part) in [
+        request.nonce.as_str(),
+        request.username.as_str(),
+        request.password.as_str(),
+        if request.admin { "admin" } else { "notadmin" },
+    ]
+    .iter()
+    .enumerate()
+    {
+        if index > 0 {
+            expected.update(&[0]);
+        }
+        expected.update(part.as_bytes());
+    }
+    expected
+        .verify_slice(&supplied)
+        .map_err(|_| MatrixError::forbidden("the registration MAC is not valid"))?;
+
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    accounts
+        .register(&request.username, &request.password)
+        .map_err(|error| match error {
+            crate::accounts::AccountError::UserInUse => MatrixError::user_in_use(),
+            crate::accounts::AccountError::InvalidUsername => MatrixError::invalid_username(),
+            other => MatrixError::internal(&other.to_string()),
+        })?;
+    if request.admin {
+        accounts
+            .set_admin(&request.username, true)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    }
+    let user_id = accounts.user_id(&request.username);
+    if let Some(displayname) = request.displayname {
+        state
+            .profiles
+            .set(&user_id, Some(Some(displayname)), None)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    }
+    let session = accounts
+        .create_session(&request.username, None, None, false)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    Ok(Json(json!({
+        "access_token": session.access_token,
+        "user_id": user_id,
+        "home_server": state.config.server.name,
+        "device_id": session.device.device_id,
+    })))
+}
+
+fn shared_registration_secret(state: &AppState) -> Result<&str, MatrixError> {
+    state
+        .config
+        .registration
+        .shared_secret
+        .as_deref()
+        .ok_or_else(|| MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "not found"))
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16)?;
+            let low = (pair[1] as char).to_digit(16)?;
+            u8::try_from((high << 4) | low).ok()
+        })
+        .collect()
 }
 
 /// The caller, proven to be a server admin.

@@ -26,12 +26,12 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**224 routes implemented; 0 known gaps in scope.**
+**225 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
 
-### Admin & moderation — 55 implemented, 0 planned
+### Admin & moderation — 56 implemented, 0 planned
 
 - `GET /_spindle/admin/v1/audit`
 - `GET /_spindle/admin/v1/event_reports`
@@ -62,6 +62,7 @@ neither implemented nor counted.
 - `GET /_synapse/admin/v1/event_reports`
 - `GET /_synapse/admin/v1/event_reports/{report_id}`
 - `POST /_synapse/admin/v1/purge_history/{room_id}`
+- `GET/POST /_synapse/admin/v1/register`
 - `GET /_synapse/admin/v1/registration_tokens`
 - `POST /_synapse/admin/v1/registration_tokens/new`
 - `GET/PUT/DELETE /_synapse/admin/v1/registration_tokens/{token}`
