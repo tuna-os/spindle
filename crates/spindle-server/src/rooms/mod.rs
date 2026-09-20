@@ -23,6 +23,8 @@ use ruma::room_version_rules::RoomVersionRules;
 use ruma::signatures::Ed25519KeyPair;
 use ruma::{CanonicalJsonObject, CanonicalJsonValue, RoomVersionId};
 use serde_json::{Map, Value};
+#[cfg(feature = "synapse-import")]
+use spindle_core::StateSnapshot;
 use spindle_core::{EventId, EventInput, LogEntry, Pdu, RoomLog, StateKey, is_state_dag};
 use spindle_store::{Durability, FjallStore, RoomStore, StoreError};
 
@@ -448,6 +450,84 @@ impl Rooms {
             )),
             appended: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Persist one fully validated Synapse replay into a disposable store.
+    ///
+    /// Validation and state comparison happen in `import::persist_rehearsal`
+    /// before this method writes anything. This method deliberately skips
+    /// authorization and federation fan-out: Synapse already accepted these
+    /// signed historical events, and replaying a migration must not resend
+    /// them to remote homeservers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the target room is not empty, an event body is
+    /// missing, replay append fails, or storage cannot be written.
+    #[cfg(feature = "synapse-import")]
+    pub(crate) fn persist_synapse_plan(
+        &self,
+        plan: &crate::import::Plan,
+        state_after_root: Option<&crate::import::StateMap>,
+        bodies: &std::collections::BTreeMap<String, Value>,
+    ) -> Result<(), RoomError> {
+        if RoomStore::new(self.store.as_ref(), &plan.room_id)
+            .load()?
+            .is_some()
+        {
+            return Err(RoomError::Append(
+                "the rehearsal target room is not empty".to_owned(),
+            ));
+        }
+
+        let mut log = RoomLog::new();
+        for step in &plan.steps {
+            let event_id = step.input.event_id.as_str();
+            let body = bodies
+                .get(event_id)
+                .ok_or_else(|| RoomError::MissingBody(event_id.to_owned()))?;
+            let entry = if step.seed {
+                let state = state_after_root.map_or_else(
+                    || {
+                        step.input
+                            .state_key
+                            .clone()
+                            .map_or_else(StateSnapshot::new, |key| {
+                                StateSnapshot::new().apply(key, event_id.to_owned())
+                            })
+                    },
+                    crate::import::snapshot_from,
+                );
+                log.append_seeded(step.input.clone(), state, step.depth)
+            } else {
+                log.append_remote(step.input.clone())
+            }
+            .map_err(|error| RoomError::Append(format!("{event_id}: {error:?}")))?
+            .clone();
+
+            let event_type = body["type"].as_str().unwrap_or_default();
+            let state_key = body.get("state_key").and_then(Value::as_str);
+            let sender = body["sender"].as_str().unwrap_or_default();
+            self.persist_entry(
+                &mut log,
+                &plan.room_id,
+                &entry,
+                event_id,
+                &PersistInput {
+                    event_type,
+                    state_key,
+                    sender,
+                    content: &body["content"],
+                    json: body,
+                },
+            )?;
+        }
+        spindle_store::Store::sync(self.store.as_ref(), Durability::Group)?;
+        self.open
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(plan.room_id.clone(), Arc::new(RwLock::new(log)));
+        Ok(())
     }
 
     /// Create a room and return its ID.

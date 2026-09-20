@@ -46,6 +46,7 @@ tracing-subscriber.workspace = true
 tower.workspace = true
 
 rusqlite = { workspace = true, optional = true }
+postgres = { workspace = true, optional = true }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace"] }
 tracing-opentelemetry = "0.32"
 opentelemetry = "0.31"
@@ -54,7 +55,7 @@ opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "trace"] }
 [features]
 # Off by default: the reader is a one-shot migration path, and neither the
 # server binary nor the hot CI gate should pay a C compile for it.
-synapse-import = ["dep:rusqlite"]
+synapse-import = ["dep:postgres", "dep:rusqlite"]
 
 [dev-dependencies]
 # `state-res` so the tests can judge our events with the same implementation a

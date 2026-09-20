@@ -30,7 +30,7 @@
 //! copies of this logic. The reader that fills a `SourceRoom` from Synapse's
 //! own tables lands separately.
 
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 
 /// Reading a `SourceRoom` out of a Synapse database.
 ///
@@ -345,8 +345,19 @@ fn prune_frayed<'a>(
 ) -> Vec<&'a SourceEvent> {
     let mut origins: Vec<&'a SourceEvent> = Vec::new();
     let mut dropped: HashSet<&'a str> = HashSet::new();
+    let mut children: HashMap<&'a str, Vec<&'a str>> = HashMap::new();
 
     for event in included.values() {
+        for parent in event
+            .prev_events
+            .iter()
+            .filter(|parent| included.contains_key(parent.as_str()))
+        {
+            children
+                .entry(parent)
+                .or_default()
+                .push(event.event_id.as_str());
+        }
         let known = event
             .prev_events
             .iter()
@@ -373,24 +384,23 @@ fn prune_frayed<'a>(
         return origins;
     }
 
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for event in included.values() {
-            if dropped.contains(event.event_id.as_str()) {
-                continue;
-            }
-            if let Some(behind) = event
-                .prev_events
-                .iter()
-                .find(|parent| dropped.contains(parent.as_str()))
-            {
-                dropped.insert(event.event_id.as_str());
+    // Walk the reverse edges once. The previous whole-map fixed-point scan was
+    // correct but quadratic for a long history behind one frayed event -- a
+    // very ordinary shape in a large federated room with a retention gap.
+    let mut first_dropped: Vec<&str> = dropped.iter().copied().collect();
+    first_dropped.sort_unstable();
+    for descendants in children.values_mut() {
+        descendants.sort_unstable();
+    }
+    let mut pending: VecDeque<&str> = first_dropped.into();
+    while let Some(behind) = pending.pop_front() {
+        for event_id in children.get(behind).into_iter().flatten().copied() {
+            if dropped.insert(event_id) {
                 excluded.push(Excluded::Orphaned {
-                    event_id: event.event_id.clone(),
-                    behind: behind.clone(),
+                    event_id: event_id.to_owned(),
+                    behind: behind.to_owned(),
                 });
-                changed = true;
+                pending.push_back(event_id);
             }
         }
     }
@@ -555,7 +565,7 @@ pub fn plan(room: &SourceRoom) -> Result<Plan, PlanError> {
     })
 }
 
-fn snapshot_from(map: &StateMap) -> StateSnapshot {
+pub(crate) fn snapshot_from(map: &StateMap) -> StateSnapshot {
     let mut snapshot = StateSnapshot::new();
     for ((event_type, state_key), event_id) in map {
         snapshot = snapshot.apply(
@@ -564,6 +574,104 @@ fn snapshot_from(map: &StateMap) -> StateSnapshot {
         );
     }
     snapshot
+}
+
+/// Why a validated rehearsal could not be persisted.
+#[cfg(feature = "synapse-import")]
+#[derive(Debug)]
+pub enum PersistError {
+    Replay(ImportError),
+    Divergent { room_id: String, slots: usize },
+    MissingBody(String),
+    BodyMismatch(String),
+    Room(crate::rooms::RoomError),
+}
+
+#[cfg(feature = "synapse-import")]
+impl std::fmt::Display for PersistError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Replay(error) => write!(formatter, "{error}"),
+            Self::Divergent { room_id, slots } => {
+                write!(formatter, "{room_id}: {slots} state slots diverge")
+            }
+            Self::MissingBody(event_id) => write!(formatter, "missing JSON body for {event_id}"),
+            Self::BodyMismatch(event_id) => {
+                write!(
+                    formatter,
+                    "Synapse metadata and JSON disagree for {event_id}"
+                )
+            }
+            Self::Room(error) => write!(formatter, "persisting rehearsal: {error}"),
+        }
+    }
+}
+
+#[cfg(feature = "synapse-import")]
+impl std::error::Error for PersistError {}
+
+/// Validate every source row, then persist one room into an isolated store.
+///
+/// This is intentionally a rehearsal path, not yet the production cutover
+/// writer: storage failures can leave a prefix behind until resumable room
+/// checkpoints land. Call it only with an empty disposable store.
+///
+/// # Errors
+///
+/// Returns [`PersistError`] if replay diverges, source JSON disagrees with
+/// normalized metadata, or the target store cannot persist the validated log.
+#[cfg(feature = "synapse-import")]
+pub fn persist_rehearsal(
+    rooms: &crate::rooms::Rooms,
+    source: &SourceRoom,
+    bodies: &BTreeMap<String, serde_json::Value>,
+) -> Result<Outcome, PersistError> {
+    let outcome = replay(source).map_err(PersistError::Replay)?;
+    if !outcome.clean() {
+        return Err(PersistError::Divergent {
+            room_id: source.room_id.clone(),
+            slots: outcome.divergence.len(),
+        });
+    }
+    let plan = plan(source).map_err(|error| PersistError::Replay(error.into()))?;
+    let events: HashMap<&str, &SourceEvent> = source
+        .events
+        .iter()
+        .map(|event| (event.event_id.as_str(), event))
+        .collect();
+    for step in &plan.steps {
+        let event_id = step.input.event_id.as_str();
+        let body = bodies
+            .get(event_id)
+            .ok_or_else(|| PersistError::MissingBody(event_id.to_owned()))?;
+        let Some(event) = events.get(event_id) else {
+            return Err(PersistError::BodyMismatch(event_id.to_owned()));
+        };
+        let body_state_key = body.get("state_key").and_then(serde_json::Value::as_str);
+        let body_parents: Vec<&str> = body
+            .get("prev_events")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        if body.get("type").and_then(serde_json::Value::as_str) != Some(event.event_type.as_str())
+            || body_state_key != event.state_key.as_deref()
+            || body_parents
+                != event
+                    .prev_events
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+        {
+            return Err(PersistError::BodyMismatch(event_id.to_owned()));
+        }
+    }
+
+    rooms
+        .persist_synapse_plan(&plan, source.state_after_root.as_ref(), bodies)
+        .map_err(PersistError::Room)?;
+    Ok(outcome)
 }
 
 /// Compare the state Spindle folded forward with the state Synapse reports.

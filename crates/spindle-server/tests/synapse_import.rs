@@ -255,6 +255,28 @@ fn a_frayed_event_and_everything_behind_it_are_named() {
     );
 }
 
+/// A production-sized tail behind a retention gap is walked once, not by
+/// rescanning the entire room for every newly orphaned event.
+#[test]
+fn a_long_frayed_tail_is_pruned_as_one_linear_walk() {
+    let mut events = vec![
+        create("$create"),
+        message("$merge", &["$create", "$missing"]),
+    ];
+    let mut parent = "$merge".to_owned();
+    for index in 0..4_096 {
+        let event_id = format!("$after-{index}");
+        events.push(message(&event_id, &[&parent]));
+        parent = event_id;
+    }
+    let source = room(events, current_state(&[("m.room.create", "", "$create")]));
+
+    let outcome = replay(&source).expect("the retained root still imports");
+
+    assert_eq!(outcome.imported, 1);
+    assert_eq!(outcome.excluded.len(), 4_097);
+}
+
 /// Two disconnected starting points are refused, not half-imported.
 ///
 /// Only one event can seed a log, so the second would name parents the log

@@ -59,6 +59,34 @@ impl Backups {
         Ok(version)
     }
 
+    /// Restore a version under its original number and change token.
+    ///
+    /// Migration writes session rows first and this metadata last, so a
+    /// partially copied version is never advertised as complete. Repeating
+    /// the operation is idempotent and deliberately overwrites only this
+    /// user's named version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the version metadata cannot be written.
+    pub fn restore_version(
+        &self,
+        user_id: &str,
+        version: u64,
+        algorithm: &str,
+        auth_data: &Value,
+        etag: u64,
+        deleted: bool,
+    ) -> Result<(), StoreError> {
+        Store::put(
+            self.store.as_ref(),
+            &keys::key_backup_version(user_id, version),
+            record(algorithm, auth_data, etag, deleted)
+                .to_string()
+                .as_bytes(),
+        )
+    }
+
     /// The latest live (non-deleted) version, if any.
     ///
     /// # Errors
