@@ -24,10 +24,10 @@ SRC=${BENCH_SRC:-tmp/bench-src}
 mkdir -p "$BIN" "$SRC"
 BIN="$(cd "$BIN" && pwd)"; SRC="$(cd "$SRC" && pwd)"
 
-CONTINUWUITY_VERSION=26.8.1
-TUWUNEL_TAG=v1.9.0
+CONTINUWUITY_VERSION=26.9.0
+TUWUNEL_TAG=v1.9.2
 DENDRITE_TAG=v0.15.2
-SYNAPSE_VERSION=1.160.0
+SYNAPSE_VERSION=1.161.0
 
 have() { [ -x "$BIN/$1" ] && "$BIN/$1" --version 2>/dev/null | grep -q "$2"; }
 
