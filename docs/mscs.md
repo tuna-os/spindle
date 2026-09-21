@@ -17,7 +17,7 @@ what became of each proposal.
 | [MSC2246](https://github.com/matrix-org/matrix-spec-proposals/pull/2246) | Asynchronous media uploads | v1.7 | — | `spec_wave2.rs` | POST /media/v1/create mints the mxc:// URI; PUT /media/v3/upload/{server}/{id} fills it once; a reader in between gets 504 M_NOT_YET_UPLOADED. Reservations lapse after 24 hours, twenty live per user. |
 | [MSC2409](https://github.com/matrix-org/matrix-spec-proposals/pull/2409) | Appservices receive to-device messages and ephemeral events | v1.13 | — | `appservice_transactions.rs` |  |
 | [MSC2659](https://github.com/matrix-org/matrix-spec-proposals/pull/2659) | Appservice ping | v1.7 | — | `appservice_ping.rs` |  |
-| [MSC2666](https://github.com/matrix-org/matrix-spec-proposals/pull/2666) | Mutual rooms | — | — | `spec_wave2.rs` | GET /_matrix/client/v1/mutual_rooms, one page: the rooms both users are joined to. |
+| [MSC2666](https://github.com/matrix-org/matrix-spec-proposals/pull/2666) | Mutual rooms | v1.19 | — | `spec_wave2.rs` | GET /_matrix/client/v1/mutual_rooms, one page: the rooms both users are joined to. |
 | [MSC2675](https://github.com/matrix-org/matrix-spec-proposals/pull/2675) | Serverside aggregations of relations | v1.3 | — | `aggregation.rs` |  |
 | [MSC2965](https://github.com/matrix-org/matrix-spec-proposals/pull/2965) | OAuth 2.0 server metadata discovery | v1.15 | — | `delegated_auth.rs` | Served at /v1/auth_metadata and the unstable path js-sdk asks first. |
 | [MSC2967](https://github.com/matrix-org/matrix-spec-proposals/pull/2967) | OAuth 2.0 API scopes | v1.15 | — | `delegated_auth.rs` | The v1.15 scope spelling and the draft one older clients still send. |
@@ -38,7 +38,7 @@ what became of each proposal.
 | [MSC3983](https://github.com/matrix-org/matrix-spec-proposals/pull/3983) | Appservices claim one-time keys | — | — | `appservice_key_proxy.rs` |  |
 | [MSC3984](https://github.com/matrix-org/matrix-spec-proposals/pull/3984) | Appservices answer key queries | — | — | `appservice_key_proxy.rs` |  |
 | [MSC4075](https://github.com/matrix-org/matrix-spec-proposals/pull/4075) | MatrixRTC ringing (m.rtc.notification) | — | — | `push_delivery.rs`, `rate-limits.md` | Rings are pushed and budgeted per sender (rings_per_minute). |
-| [MSC4140](https://github.com/matrix-org/matrix-spec-proposals/pull/4140) | Delayed events | — | `org.matrix.msc4140` | `delayed_events.rs`, `rtc_membership.rs` | All four endpoints; the dead-man's switch MatrixRTC members rely on. |
+| [MSC4140](https://github.com/matrix-org/matrix-spec-proposals/pull/4140) | Delayed events | merged, unreleased | `org.matrix.msc4140` | `delayed_events.rs`, `rtc_membership.rs` | All four endpoints; the dead-man's switch MatrixRTC members rely on. |
 | [MSC4143](https://github.com/matrix-org/matrix-spec-proposals/pull/4143) | MatrixRTC transport discovery (rtc/transports) | — | `org.matrix.msc4143` | `rtc_transports.rs`, `matrix-rtc.md` | Served under the unstable and the v1 path; answers an empty list when no backend is configured. Absorbed MSC4158. |
 | [MSC4186](https://github.com/matrix-org/matrix-spec-proposals/pull/4186) | Simplified sliding sync | merged, unreleased | — | `sliding_sync.rs` | Lists, room subscriptions, required_state, timeline, extensions, invites in the list, heroes and bump_stamp. What Element X syncs with. |
 | [MSC4190](https://github.com/matrix-org/matrix-spec-proposals/pull/4190) | Appservice device management | merged, unreleased | — | `appservice_devices.rs`, `appservice_transactions.rs` |  |
