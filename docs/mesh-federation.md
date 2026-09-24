@@ -1,7 +1,7 @@
 # Federating with a Bluetooth mesh: the Spindle–Neutrino system
 
 The IndiaFOSS Companion project runs Matrix rooms on phones with no
-internet: Neutrino (Element's P2P homeserver, in hanthor's fork) over iroh
+internet: Neutrino (Element's P2P homeserver, in external upstream fork `hanthor/neutrino`) over iroh
 over Bluetooth LE, one homeserver per phone, federating phone to phone.
 Their RFC asks whether those rooms can reach the rest of Matrix through a
 Spindle hosted for the conference, so that people at home and people at
