@@ -43,7 +43,7 @@ where the crowd is; treat it as the same role on different hardware.
 
 ## Build
 
-The fork needs `contrib/neutrino/0001-gateway-federation.patch`, which
+The external fork (`https://github.com/hanthor/neutrino`) needs `contrib/neutrino/0001-gateway-federation.patch`, which
 is what lets a node dial the Spindle by name and sign its requests.
 Without it every request from the gateway to the Spindle dies inside the
 node's own egress after sixty seconds.
