@@ -10377,8 +10377,12 @@ async fn upgrade_room(
             ),
         ));
     }
-    may_read_room(&state, &identity.user_id, &room_id)?;
-    let old_state = state.rooms.state(&room_id).map_err(room_error)?;
+    let old_state = state
+        .rooms
+        .reader(&identity.user_id, &room_id)
+        .map_err(room_error)?
+        .state()
+        .map_err(room_error)?;
 
     // Whether this user may end the room, asked of the old room before
     // anything is built. The tombstone is a real state event and faces the
@@ -10476,7 +10480,7 @@ async fn upgrade_room(
 /// with no explicit order still has to paginate stably -- the same argument
 /// the room directory makes.
 fn space_children(state: &AppState, room_id: &str, suggested_only: bool) -> Vec<Value> {
-    let Ok(events) = state.rooms.state(room_id) else {
+    let Ok(events) = state.rooms.state_unscoped(room_id) else {
         return Vec::new();
     };
     let mut children: Vec<Value> = events
