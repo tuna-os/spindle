@@ -87,6 +87,7 @@ notes = "The built-in JWT service, or the OpenID round trip for an external one.
 number = 4140
 title = "Delayed events"
 status = "served"
+merged = true
 unstable = ["org.matrix.msc4140"]
 evidence = ["crates/spindle-server/tests/delayed_events.rs", "crates/spindle-server/tests/rtc_membership.rs"]
 notes = "All four endpoints; the dead-man's switch MatrixRTC members rely on."
@@ -253,7 +254,7 @@ notes = "POST /login/get_token behind the password UIA stage, m.login.token on /
 number = 2666
 title = "Mutual rooms"
 status = "served"
-stable = ""
+stable = "1.19"
 evidence = ["crates/spindle-server/tests/spec_wave2.rs"]
 notes = "GET /_matrix/client/v1/mutual_rooms, one page: the rooms both users are joined to."
 
