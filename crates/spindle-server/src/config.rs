@@ -58,6 +58,14 @@ pub struct RegistrationConfig {
     /// Require an `m.login.registration_token` stage at registration.
     #[serde(default)]
     pub require_token: bool,
+    /// Enable Synapse's shared-secret admin registration compatibility API.
+    ///
+    /// Absent by default: this secret can create administrator accounts, so
+    /// deployments that do not need the compatibility endpoint should not
+    /// have one. Element Call's upstream browser rig uses this API to create
+    /// its short-lived fixtures.
+    #[serde(default)]
+    pub shared_secret: Option<String>,
 }
 
 /// The account this server speaks through when an admin sends a notice

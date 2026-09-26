@@ -417,6 +417,52 @@ async fn sync_carries_global_and_per_room_account_data_in_their_own_blocks() {
 }
 
 #[tokio::test]
+async fn incremental_sync_carries_each_global_account_data_change_once() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let initial = harness.sync(&alice).await;
+    let since = initial["next_batch"].as_str().unwrap();
+
+    harness
+        .put(
+            "/_matrix/client/v3/user/@alice:example.org/account_data/io.example.setting",
+            &alice,
+            &json!({ "enabled": true }),
+        )
+        .await;
+    let started = std::time::Instant::now();
+    let (_, changed) = harness
+        .get(
+            &format!("/_matrix/client/v3/sync?since={since}&timeout=5000"),
+            &alice,
+        )
+        .await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "a pending account-data change waited out the long poll"
+    );
+    assert_eq!(
+        from_events(&changed["account_data"]["events"], "io.example.setting"),
+        Some(json!({ "enabled": true }))
+    );
+
+    let acknowledged = changed["next_batch"].as_str().unwrap();
+    let (_, unchanged) = harness
+        .get(
+            &format!("/_matrix/client/v3/sync?since={acknowledged}&timeout=10"),
+            &alice,
+        )
+        .await;
+    assert!(
+        unchanged["account_data"]["events"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "an acknowledged account-data value was repeated: {unchanged}"
+    );
+}
+
+#[tokio::test]
 async fn one_rooms_account_data_does_not_appear_under_another() {
     let harness = Harness::new();
     let alice = harness.register("alice").await;

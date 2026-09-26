@@ -397,6 +397,10 @@ pub enum Keyspace {
     /// `user_id` -> the room this server sends its notices to that user
     /// in, so a second notice lands in the same room as the first.
     ServerNoticeRoom = 0x3b,
+    /// `(user_id, room_id, event_type)` -> the global stream position of the
+    /// latest account-data write. Kept beside [`Self::AccountData`] rather
+    /// than inside its value so existing stored JSON remains its own format.
+    AccountDataStream = 0x3c,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -781,6 +785,25 @@ pub fn room_from_user_room(user_id: &str, key: &[u8]) -> Option<String> {
 pub fn account_data(user_id: &str, room_id: &str, event_type: &str) -> Vec<u8> {
     let mut key = account_data_prefix(user_id, room_id);
     key.extend_from_slice(event_type.as_bytes());
+    key
+}
+
+/// The latest global stream position for one account-data entry.
+#[must_use]
+pub fn account_data_stream(user_id: &str, room_id: &str, event_type: &str) -> Vec<u8> {
+    let mut key = account_data_stream_prefix(user_id, room_id);
+    key.extend_from_slice(event_type.as_bytes());
+    key
+}
+
+/// The prefix for one user's account-data stream marks in one room.
+#[must_use]
+pub fn account_data_stream_prefix(user_id: &str, room_id: &str) -> Vec<u8> {
+    let room = room_id.as_bytes();
+    let (len, room) = framed(room);
+    let mut key = user_prefix(Keyspace::AccountDataStream, user_id);
+    key.extend_from_slice(&len.to_be_bytes());
+    key.extend_from_slice(room);
     key
 }
 

@@ -3290,6 +3290,13 @@ async fn create_room(
                 .map_err(room_error)?;
         }
     }
+    // A client's sync loop may already be long-polling while createRoom is
+    // assembling the room. The room only becomes visible after `create`
+    // installs its completed log, so wake once the whole operation (including
+    // invites and aliases) is observable. Without this, Element Web leaves a
+    // freshly-created DM on "We're creating a room" until its 30-second poll
+    // happens to expire.
+    state.rooms.wake_sync_waiters();
     Ok(Json(json!({ "room_id": room_id })))
 }
 
@@ -4974,10 +4981,12 @@ fn write_account_data(
     {
         return Err(limit_exceeded("account data entries", cap));
     }
+    let position = state.rooms.allocate_stream_id();
     state
         .account_data
-        .put(user_id, room_id, event_type, content)
+        .put(user_id, room_id, event_type, content, position)
         .map_err(|error| account_data_error(&error))?;
+    state.rooms.wake_sync_waiters();
     Ok(Json(json!({})))
 }
 
@@ -5132,10 +5141,12 @@ fn ruleset_of(state: &AppState, user_id: &str) -> Result<Value, MatrixError> {
 }
 
 fn save_ruleset(state: &AppState, user_id: &str, ruleset: &Value) -> Result<(), MatrixError> {
+    let position = state.rooms.allocate_stream_id();
     state
         .account_data
-        .put(user_id, "", crate::push_rules::TYPE, ruleset)
+        .put(user_id, "", crate::push_rules::TYPE, ruleset, position)
         .map_err(|error| account_data_error(&error))?;
+    state.rooms.wake_sync_waiters();
     // What was scored under the old rules says nothing under the new.
     state.rooms.forget_scores(user_id);
     Ok(())
@@ -5704,10 +5715,12 @@ async fn set_tag(
     // keeps there. Stored as given: the server has no opinion about tag
     // content for the same reason it has none about account data generally.
     tags["tags"][&tag] = content;
+    let position = state.rooms.allocate_stream_id();
     state
         .account_data
-        .put(&user_id, &room_id, "m.tag", &tags)
+        .put(&user_id, &room_id, "m.tag", &tags, position)
         .map_err(|error| account_data_error(&error))?;
+    state.rooms.wake_sync_waiters();
     Ok(Json(json!({})))
 }
 
@@ -5736,10 +5749,12 @@ async fn delete_tag(
             format!("{room_id} is not tagged {tag}"),
         ));
     }
+    let position = state.rooms.allocate_stream_id();
     state
         .account_data
-        .put(&user_id, &room_id, "m.tag", &tags)
+        .put(&user_id, &room_id, "m.tag", &tags, position)
         .map_err(|error| account_data_error(&error))?;
+    state.rooms.wake_sync_waiters();
     Ok(Json(json!({})))
 }
 
@@ -6926,7 +6941,7 @@ fn account_data_extension(
     identity: &crate::accounts::Identity,
     in_view: &[String],
 ) -> Result<Value, MatrixError> {
-    let global = sync_account_data(state, identity, None)?;
+    let global = sync_account_data(state, identity, None, None, state.rooms.stream_position())?;
     let mut rooms = serde_json::Map::new();
     for room_id in in_view {
         let data = state
@@ -7388,7 +7403,11 @@ async fn sync(
     // staring at nothing for the whole timeout.
     if let Some(since) = since {
         let timeout = std::time::Duration::from_millis(query.timeout.unwrap_or(0).min(60_000));
-        if result.is_empty() && !timeout.is_zero() {
+        // A side stream (account data, to-device messages, receipts) can
+        // advance the shared token without putting a room in this result.
+        // That is already news: waiting merely because the room sections are
+        // empty misses a wake that landed just before this request subscribed.
+        if result.is_empty() && result.next_batch == since && !timeout.is_zero() {
             // Either an appended event or a change in who is typing ends the
             // wait. Typing is not an event and has no stream position, so it
             // cannot be discovered by re-reading the log -- without this arm a
@@ -7418,7 +7437,7 @@ async fn sync(
     let (to_device, device_changes, key_counts, unused_fallback) =
         sync_device_sections(&state, &identity, since, result.next_batch)?;
 
-    let global = sync_account_data(&state, &identity, filter.as_ref())?;
+    let global = sync_account_data(&state, &identity, filter.as_ref(), since, result.next_batch)?;
 
     // Assembled from pre-serialized parts rather than as one `Value`, so the
     // joined rooms' state blocks -- which `sync_join` may have taken straight
@@ -7498,10 +7517,12 @@ fn sync_account_data(
     state: &AppState,
     identity: &crate::accounts::Identity,
     filter: Option<&crate::filters::Filter>,
+    since: Option<u64>,
+    until: u64,
 ) -> Result<Vec<Value>, MatrixError> {
     let mut global = state
         .account_data
-        .all(&identity.user_id, "")
+        .between(&identity.user_id, "", since, until)
         .map_err(|error| account_data_error(&error))?;
     // The ruleset is stored bare -- `/pushrules/` edits it a rule at a
     // time and wraps it in `global` on the way out -- but the account-data
@@ -7520,9 +7541,10 @@ fn sync_account_data(
     // written at registration for the reason `ruleset_of` gives: only an edit
     // freezes a ruleset, so an unedited one keeps tracking the defaults as the
     // spec adds rules.
-    if !global
-        .iter()
-        .any(|event| event["type"] == crate::push_rules::TYPE)
+    if since.is_none()
+        && !global
+            .iter()
+            .any(|event| event["type"] == crate::push_rules::TYPE)
     {
         global.push(json!({
             "type": crate::push_rules::TYPE,
