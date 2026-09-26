@@ -56,7 +56,11 @@ to belong to something.
 | Storage format identity | A storage-format version distinct from the binary version, with the already-broken transition recorded as a numbered format change in [docs/lifecycle.md](docs/lifecycle.md) |
 | Benchmark provenance | Every published comparison names the Spindle build it measured, as it already names Synapse 1.159.0 |
 
-Tracked by [#308](https://github.com/tuna-os/spindle/issues/308).
+Tracked by [#308](https://github.com/tuna-os/spindle/issues/308), now closed.
+A tag (`v0.0.1`, `v0.0.2`) exists. The workflow for releases cuts a new one
+every week. [docs/lifecycle.md](docs/lifecycle.md#format-versions) names
+the identity of the storage format. Every benchmark that gets published
+already names the build that it measured.
 
 ### `v0.1.0` — the first release an outsider could reason about
 
@@ -66,7 +70,7 @@ commit, and the candidate's evidence links belong in the release notes.
 | Gate | Required evidence |
 |---|---|
 | Authorization surface | [#268](https://github.com/tuna-os/spindle/issues/268)'s systematic audit closed — the route table walked by a stranger for every room-scoped route, not "however much someone happened to look" |
-| Vulnerability intake | Private vulnerability reporting enabled on this repository and a `SECURITY.md` naming the server-software classes: authorization bypass, federation forgery, cross-account disclosure, unauthenticated resource exhaustion ([#307](https://github.com/tuna-os/spindle/issues/307)) |
+| Vulnerability intake | Private vulnerability reporting enabled on this repository and a `SECURITY.md` naming the server-software classes: authorization bypass, federation forgery, cross-account disclosure, unauthenticated resource exhaustion — done ([#307](https://github.com/tuna-os/spindle/issues/307)) |
 | The load-bearing claim | The SPEC §9.3 equivalence theorem's differential oracle against `ruma-state-res` passing on a schedule, not only on demand. A counterexample is a release blocker |
 | Federation under adversity | [#16](https://github.com/tuna-os/spindle/issues/16)'s fork-proof rig green, and [#225](https://github.com/tuna-os/spindle/issues/225) — a federated fork wedging a room permanently — fixed with a regression test |
 | Lifecycle round trip | `backup` → `restore` → `verify-media` demonstrated across a version boundary, with at least one real migration in the migration table rather than synthetic fixtures |
