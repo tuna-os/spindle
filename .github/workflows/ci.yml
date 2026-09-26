@@ -24,7 +24,7 @@ jobs:
       # building on 1.89. It could not have built on 1.85: `rust-version`
       # in Cargo.toml is 1.89, and cargo refuses outright below it. Left
       # unset so there is one place the version is declared.
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: 1.90.0
           components: clippy,rustfmt
@@ -148,7 +148,7 @@ jobs:
       # this repository is unusually prose-heavy: the SPEC, the ADRs and the
       # benchmark write-ups are the artefact as much as the code is.
       - name: Check spelling
-        uses: crate-ci/typos@d43b6c087ac471e2ea7b8af622ff15f05c0c365b # v1
+        uses: crate-ci/typos@512fc24f32f44ab01972217aaaf3dc86ec234d53 # v1
 
       # A tag is a pointer somebody else can move, and every action here runs
       # before our code does, in a job holding a token. This ran
