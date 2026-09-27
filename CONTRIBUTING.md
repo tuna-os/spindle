@@ -83,3 +83,10 @@ whole suite on main. A red check is yours to read before a reviewer does.
 ## Security
 
 Not an issue. `SECURITY.md` has the route.
+
+<!-- hive-contribute-plea: donated-compute appeal, keep in sync across repos -->
+## Contribute compute — no code needed
+
+No time to write code? You can still push this project's backlog forward. This repository is worked by a TunaOS AI-agent hive: lend the hive your AI subscription or API tokens and your machine runs contributor tasks from this project's backlog.
+
+- 🪸 [Contribute compute to the reef hive](https://reef.tunaos.org/contribute)
