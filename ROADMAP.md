@@ -39,24 +39,22 @@ experiment, and what is deliberately not being built yet.
 
 ## Release maturity
 
-Spindle has **no tagged release**. That is the correct standing for the current
-stage and the README says so plainly. What has been missing is a stated
-condition under which it changes — so this section is that condition, and the
-absence of a release is a decision with an exit rather than a default.
+### `v0.0.x` — an addressable prerelease, reached
 
-### `v0.0.x` — an addressable prerelease
-
-The near-term step is not a stability promise. It is a *name*, so that a
+The near-term step was never a stability promise. It is a *name*, so that a
 benchmark result, a security fix, and a storage-format change can each be said
-to belong to something.
+to belong to something — and Spindle has one now: `v0.0.1` and `v0.0.2` are
+tagged and released, each with a signed provenance attestation and an SBOM.
 
-| Gate | Required evidence |
+| Gate | Evidence |
 |---|---|
-| Addressability | `v0.0.x` tags cut from `main` weekly by the release workflow when CI is green, with release notes stating what they are not: no upgrade path, no support window, storage format unstable |
-| Storage format identity | A storage-format version distinct from the binary version, with the already-broken transition recorded as a numbered format change in [docs/lifecycle.md](docs/lifecycle.md) |
-| Benchmark provenance | Every published comparison names the Spindle build it measured, as it already names Synapse 1.159.0 |
+| Addressability | `v0.0.x` tags cut from `main` weekly by the release workflow when CI is green; the `v0.0.2` release notes state what the tag is not: no upgrade path, no support window, storage format unstable |
+| Storage format identity | Four numbered format layers (key schema, record schema, content digest, engine format), pinned by `crates/spindle-store/tests/format_compatibility.rs` and documented in [docs/lifecycle.md](docs/lifecycle.md) |
+| Benchmark provenance | Published comparisons name the Spindle commit measured, as they already name Synapse 1.159.0 |
 
-Tracked by [#308](https://github.com/tuna-os/spindle/issues/308).
+Tracked by (closed) [#308](https://github.com/tuna-os/spindle/issues/308). What
+has to stay true going forward is the *condition* the closed issue established:
+no release should claim more than a name for a build.
 
 ### `v0.1.0` — the first release an outsider could reason about
 

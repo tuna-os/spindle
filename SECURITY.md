@@ -11,18 +11,17 @@ homeserver produces that an installer or an image does not.
 
 **Do not open a public issue for a vulnerability.**
 
-1. Open **Security → Report a vulnerability** on this repository and
-   describe the affected route or component, a minimal reproduction, the
-   impact, and a suggested fix if you have one.
-2. If that button is not there, private reporting has not been enabled
-   on this repository yet (it is an organisation-level setting, tracked in
-   #307). Open an ordinary issue titled `security contact request` with
-   **no details in it**. A maintainer will open a private advisory and add
-   you to it, and the conversation continues there.
+Open **Security → Report a vulnerability** on this repository and describe
+the affected route or component, a minimal reproduction, the impact, and a
+suggested fix if you have one. Private vulnerability reporting is enabled on
+this repository.
 
-The organisation's fallback (a draft advisory in `tuna-os/tunaos`) needs
-write access to that repository, so it is not a route for an outside
-reporter; the request issue above is.
+If that button is ever not there (the setting is org-level and could be
+turned off), open an ordinary issue titled `security contact request` with
+**no details in it**. A maintainer will open a private advisory and add you
+to it, and the conversation continues there. The organisation's fallback (a
+draft advisory in `tuna-os/tunaos`) needs write access to that repository,
+so it is not a route for an outside reporter; the request issue above is.
 
 ## What to report
 
