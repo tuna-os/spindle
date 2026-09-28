@@ -277,8 +277,6 @@ fn profile_routes() -> Router<AppState> {
 
 // Presence endpoints are now in crate::presence_routes
 
-
-
 /// `POST /_matrix/client/v3/rooms/{room_id}/report/{event_id}`
 ///
 /// A user tells the server's operators that an event is a problem. The

@@ -10,11 +10,11 @@ use axum::{
     extract::State,
     routing::{get, put},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::AppState;
 use crate::auth::Authenticated;
 use crate::errors::MatrixError;
-use crate::AppState;
 
 /// `PUT /_matrix/client/v3/presence/{user_id}/status`
 ///
@@ -100,11 +100,7 @@ pub fn routes() -> Router<AppState> {
 /// Check if two users share a room.
 ///
 /// Used to determine if one user can view another's presence.
-fn shares_a_room(
-    state: &AppState,
-    asker: &str,
-    about: &str,
-) -> Result<bool, MatrixError> {
+fn shares_a_room(state: &AppState, asker: &str, about: &str) -> Result<bool, MatrixError> {
     let rooms = state
         .rooms
         .joined(asker)
