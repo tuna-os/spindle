@@ -34,6 +34,7 @@ pub mod netguard;
 pub mod oidc;
 pub mod openid;
 pub mod presence;
+pub mod presence_routes;
 pub mod previews;
 pub mod profiles;
 pub mod push;
