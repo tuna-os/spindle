@@ -24,6 +24,12 @@ ignore = [
     # Revisit if this ever becomes a real dependency, or if the advisory is
     # reclassified as a soundness or security problem.
     { id = "RUSTSEC-2026-0247", reason = "bitmaps: dev-only, via imbl, one benchmark; unmaintained rather than vulnerable" },
+    # `imbl-sized-chunks` 0.1.3 contains a double-free / use-after-free
+    # reachable from safe Rust when an element's Drop panics. This affects
+    # only dev/benchmark code via imbl (a dev-only dependency of spindle-core).
+    # The fix (imbl-sized-chunks 0.2.0+, available in imbl 7.0.2+) is pending
+    # merge on arch/room-reader-state. Ignore until the upgrade lands on main.
+    { id = "RUSTSEC-2026-0292", reason = "imbl-sized-chunks 0.1.3: dev-only via imbl; fix in imbl 7.0.2 pending merge" },
 ]
 
 [licenses]
