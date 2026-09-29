@@ -24,6 +24,11 @@ ignore = [
     # Revisit if this ever becomes a real dependency, or if the advisory is
     # reclassified as a soundness or security problem.
     { id = "RUSTSEC-2026-0247", reason = "bitmaps: dev-only, via imbl, one benchmark; unmaintained rather than vulnerable" },
+    # `imbl-sized-chunks` is a transitive dependency of `imbl` (dev-only benchmark
+    # dependency of spindle-core). `imbl` 7.0.1 pins `imbl-sized-chunks = "0.1.3"`.
+    # It is never in a shipped binary. Revisit when imbl releases a version bumping
+    # imbl-sized-chunks to >=0.2.0.
+    { id = "RUSTSEC-2026-0292", reason = "imbl-sized-chunks: dev-only, via imbl, benchmarks only; upstream imbl 7.0.1 pins 0.1.3" },
 ]
 
 [licenses]
