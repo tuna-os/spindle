@@ -54,6 +54,9 @@ allow = [
     # larger work under other terms, so it does not reach Spindle's own code.
     # LICENSING.md makes this argument at length.
     "MPL-2.0",
+    # CDLA-Permissive-2.0, via webpki-root-certs (Mozilla CA bundle data).
+    # Permissive: attribution only, no copyleft reach into Spindle's code.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 
