@@ -89,15 +89,18 @@ async fn get_presence(
 /// is likely to be quick to answer: one person in one room, the other in a
 /// thousand.
 fn shares_a_room(state: &AppState, asker: &str, about: &str) -> Result<bool, MatrixError> {
-    let rooms = state
+    let asker_rooms = state
         .rooms
         .joined(asker)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    for room in rooms {
+        .map_err(|e| MatrixError::internal(&e.to_string()))?;
+    if asker_rooms.is_empty() {
+        return Ok(false);
+    }
+    for room in asker_rooms {
         if state
             .rooms
             .is_joined(about, &room)
-            .map_err(|error| MatrixError::internal(&error.to_string()))?
+            .map_err(|e| MatrixError::internal(&e.to_string()))?
         {
             return Ok(true);
         }
