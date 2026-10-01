@@ -100,9 +100,13 @@ jobs:
         # gives: one fewer third party running before our code in a job
         # holding a token. Pinned, because a rule engine that changes how it
         # parses Rust changes what this gate catches.
+        # In its own venv: installed into the runner's system Python, pip
+        # cannot resolve semgrep's mcp dependency against what the image
+        # already ships, and the step fails before the rule runs.
         run: |
-          pip install --quiet semgrep==1.175.0
-          python3 scripts/authorization-rule.py
+          python3 -m venv "$RUNNER_TEMP/semgrep"
+          "$RUNNER_TEMP/semgrep/bin/pip" install --quiet semgrep==1.175.0
+          PATH="$RUNNER_TEMP/semgrep/bin:$PATH" python3 scripts/authorization-rule.py
       - name: Audit the dependency graph
         # Installed rather than run through an action: every action here is
         # SHA-pinned and Dependabot-tracked (#182), and adding one more
