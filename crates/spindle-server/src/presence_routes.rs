@@ -12,7 +12,6 @@ use serde_json::{Value, json};
 use crate::AppState;
 use crate::auth::Authenticated;
 use crate::errors::MatrixError;
-use crate::rooms::ReadScope;
 
 #[derive(Deserialize)]
 struct PresenceRequest {
@@ -89,19 +88,21 @@ async fn get_presence(
 /// the answer is symmetric and the caller is the one whose membership this
 /// is likely to be quick to answer: one person in one room, the other in a
 /// thousand.
-fn shares_a_room(state: &AppState, a: &str, b: &str) -> Result<bool, MatrixError> {
-    let a_rooms = state
+fn shares_a_room(state: &AppState, asker: &str, about: &str) -> Result<bool, MatrixError> {
+    let rooms = state
         .rooms
-        .joined_rooms(a, ReadScope::Joined)
-        .map_err(|e| MatrixError::internal(&e.to_string()))?;
-    if a_rooms.is_empty() {
-        return Ok(false);
+        .joined(asker)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    for room in rooms {
+        if state
+            .rooms
+            .is_joined(about, &room)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?
+        {
+            return Ok(true);
+        }
     }
-    let b_rooms = state
-        .rooms
-        .joined_rooms(b, ReadScope::Joined)
-        .map_err(|e| MatrixError::internal(&e.to_string()))?;
-    Ok(a_rooms.iter().any(|room| b_rooms.contains(room)))
+    Ok(false)
 }
 
 pub fn routes() -> Router<AppState> {
