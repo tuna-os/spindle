@@ -4,7 +4,7 @@
 //! A user can see their own presence or that of other users they share a room with.
 
 use axum::extract::{Path, State};
-use axum::routing::{get, put};
+use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -86,21 +86,17 @@ async fn get_presence(
 ///
 /// Asked of the *smaller* side's room list first -- the caller's -- because
 /// the answer is symmetric and the caller is the one whose membership this
-/// is likely to be quick to answer: one person in one room, the other in a
-/// thousand.
+/// server is certain to hold.
 fn shares_a_room(state: &AppState, asker: &str, about: &str) -> Result<bool, MatrixError> {
-    let asker_rooms = state
+    let rooms = state
         .rooms
         .joined(asker)
-        .map_err(|e| MatrixError::internal(&e.to_string()))?;
-    if asker_rooms.is_empty() {
-        return Ok(false);
-    }
-    for room in asker_rooms {
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    for room in rooms {
         if state
             .rooms
             .is_joined(about, &room)
-            .map_err(|e| MatrixError::internal(&e.to_string()))?
+            .map_err(|error| MatrixError::internal(&error.to_string()))?
         {
             return Ok(true);
         }
@@ -108,6 +104,7 @@ fn shares_a_room(state: &AppState, asker: &str, about: &str) -> Result<bool, Mat
     Ok(false)
 }
 
+/// The presence routes, merged into the main router.
 pub fn routes() -> Router<AppState> {
     Router::new().route(
         "/_matrix/client/v3/presence/{user_id}/status",
