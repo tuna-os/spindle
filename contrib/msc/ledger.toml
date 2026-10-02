@@ -30,7 +30,7 @@ number = 3995
 title = "Linearized Matrix"
 status = "design"
 evidence = ["SPEC.md", "docs/divergence.md"]
-notes = "The design basis: an append-only per-room log with materialized state and no state resolution on the hot path. Hub mode is opt-in per room."
+notes = "The design basis: an append-only per-room log with materialized state and no state resolution on the hot path. Hub mode is opt-in per room. The MSC is a WIP that has not changed since 2023, and its IETF draft has expired. SPEC.md section 12.0 records where Spindle follows each text."
 
 [[msc]]
 number = 4242
