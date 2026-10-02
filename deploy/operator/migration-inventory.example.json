@@ -1,0 +1,17 @@
+{
+  "rooms": [
+    {
+      "version": "10",
+      "disposition": "retain"
+    },
+    {
+      "version": "10",
+      "disposition": "retain"
+    },
+    {
+      "version": "9",
+      "disposition": "exclude",
+      "approval": "approval-example-9"
+    }
+  ]
+}
