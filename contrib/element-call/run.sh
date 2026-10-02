@@ -29,7 +29,7 @@
 # Restricted-SFU stays out: it changes which SFU a user may reach rather than exercising homeserver behaviour.
 set -euo pipefail
 
-ELEMENT_CALL_REV=a03f23e7206fa7d45911ec3da6af988452804614
+ELEMENT_CALL_REV=9f7c35cd8f84b12f9395e6aac56fd396a3921482
 DEFAULT_SPECS="landing.spec.ts access.spec.ts create-call.spec.ts spa-call-sticky.spec.ts reconnect.spec.ts sfu-reconnect-bug.spec.ts errors.spec.ts widget/voice-call-dm.spec.ts"
 
 results="${1:-tmp/element-call-results.json}"

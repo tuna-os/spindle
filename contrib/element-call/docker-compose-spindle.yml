@@ -13,7 +13,9 @@
 # binary, with the entrypoint swapped for one that trusts upstream's dev CA
 # instead of Complement's. nginx proxies /_matrix on 80, 443 and 8448 to
 # homeserver:8008 and homeserver-1:18008, so neither Spindle terminates TLS
-# and neither needs a federation listener of its own.
+# and neither needs a federation listener of its own. Each Spindle loads
+# the appservice registration upstream gives its Synapse, so the
+# lk-jwt-service beside it authenticates the same way.
 services:
   synapse:
     image: ${SPINDLE_IMAGE:-complement-spindle:latest}
@@ -24,6 +26,7 @@ services:
     volumes:
       - ${SPINDLE_CONTRIB:-.}/entrypoint.sh:/usr/local/bin/spindle-element-call-entrypoint.sh:ro,Z
       - ${SPINDLE_CONTRIB:-.}/spindle.toml:/cfg/spindle.toml:ro,Z
+      - ./backend/app-service.yaml:/cfg/app-service.yaml:ro,Z
       - ./backend/dev_tls_local-ca.crt:/cfg/dev-ca.crt:ro,Z
   synapse-1:
     image: ${SPINDLE_IMAGE:-complement-spindle:latest}
@@ -34,4 +37,5 @@ services:
     volumes:
       - ${SPINDLE_CONTRIB:-.}/entrypoint.sh:/usr/local/bin/spindle-element-call-entrypoint.sh:ro,Z
       - ${SPINDLE_CONTRIB:-.}/spindle-othersite.toml:/cfg/spindle.toml:ro,Z
+      - ./backend/app-service-othersite.yaml:/cfg/app-service.yaml:ro,Z
       - ./backend/dev_tls_local-ca.crt:/cfg/dev-ca.crt:ro,Z
