@@ -1,13 +1,13 @@
 # Evidence: Element Web logs in through the built-in OIDC provider — no MAS
 
 The claim under test (#159): with `[auth] builtin_oidc = true`, one
-Spindle process is homeserver and OIDC provider at once, and an
-unmodified MSC3861-native client completes modern login against it with
-**no Matrix Authentication Service deployed anywhere**. This is the same
-Element Web release tarball and the same Playwright script skeleton as
-the delegated-auth run in
-[m4-delegated-auth.md](m4-delegated-auth.md) — the only change is that
-the provider pages the browser lands on are Spindle's own.
+Spindle process is homeserver and OIDC provider at once. An unmodified
+client, native to MSC3861, completes a modern login against it with
+**no Matrix Authentication Service on any host**. It uses the same release
+tarball of Element Web and the same Playwright script skeleton as the
+delegated-auth run in [m4-delegated-auth.md](m4-delegated-auth.md). The
+only change is that the provider pages where the browser lands are
+Spindle's own.
 
 ## Setup
 
@@ -23,12 +23,12 @@ the provider pages the browser lands on are Spindle's own.
   builtin_oidc = true
   ```
 
-- Element Web **v1.12.26** (release tarball, static files), config
-  pointing `m.homeserver` at Spindle with
+- Element Web **v1.12.26** (release tarball, static files), with a config
+  that points `m.homeserver` at Spindle with
   `"feature_oidc_native_flow": true`.
-- `alice` registered through the ordinary password path beforehand.
-- Nothing listening on 8080 (where MAS lived in the delegated-auth
-  run) — the script asserts this before it opens the browser.
+- `alice` registered beforehand through the ordinary password path.
+- Nothing listens on 8080 (where MAS lived in the delegated-auth
+  run). The script asserts this before it opens the browser.
 
 ## Transcript
 
@@ -64,28 +64,27 @@ Every step of the modern flow is visible in that URL bar and traffic
 log, all of it served by the one process:
 
 - **Discovery** (MSC2965): Element fetched `auth_metadata` and accepted
-  the document — its `isValidAuthMetadata` requires `issuer`,
+  the document. Its `isValidAuthMetadata` needs `issuer`,
   `authorization_endpoint`, `token_endpoint`, `revocation_endpoint`,
   `registration_endpoint`, both `query` **and** `fragment` response
   modes, both grant types, and `S256`.
 - **Dynamic registration** (RFC 7591): `POST /oauth2/registration`
   minted `oc_04831ab54d0430e3129d45eef19d44ec`.
 - **Authorization** with mandatory PKCE `S256` and the **stable**
-  MSC2967 scope spelling `urn:matrix:client:api:*` +
-  `urn:matrix:client:device:U1ButcRtL4` — the spelling current
-  matrix-js-sdk generates, which the provider accepts alongside the
-  legacy `urn:matrix:org.matrix.msc2967.client:*` form older bundles
-  send.
+  MSC2967 scope form `urn:matrix:client:api:*` +
+  `urn:matrix:client:device:U1ButcRtL4`. Current matrix-js-sdk generates
+  this form. The provider also accepts the legacy
+  `urn:matrix:org.matrix.msc2967.client:*` form that older bundles send.
 - **Fragment response mode**: the code went back in the URL fragment,
   exactly as the SPA asked.
-- **Token exchange** at `POST /oauth2/token`, and the token Element
-  received is a native Spindle session: the app shell rendered
-  ("Welcome @alice:127.0.0.1:8008") and sync ran against the ordinary
+- **Token exchange** at `POST /oauth2/token`. The token that Element
+  received is a native Spindle session. The app shell rendered
+  ("Welcome @alice:127.0.0.1:8008"). Sync ran against the ordinary
   client API with no introspection hop anywhere.
 
-The homeserver-side proof that the session is real: alice's device list
-afterwards contains `U1ButcRtL4` — the device ID Element chose and named
-in its scope — alongside her password-login devices:
+Element chose the device ID `U1ButcRtL4` and named it in its scope. The
+homeserver-side proof that the session is real: afterwards, alice's
+device list contains `U1ButcRtL4`, next to her password-login devices:
 
 ```
 GET /_matrix/client/v3/devices
@@ -99,5 +98,5 @@ GET /_matrix/client/v3/devices
 The built-in provider is the floor for a single-node deployment:
 password-backed code flow, refresh, revocation. Upstream identity
 providers, SSO, email verification and the account-management UI remain
-what `[auth.delegated]` and a real MAS are for, and the two are
-mutually exclusive by config validation.
+what `[auth.delegated]` and a real MAS are for. Config validation makes
+the two mutually exclusive.

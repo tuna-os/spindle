@@ -5,11 +5,11 @@ one kind of mesh node the conference Spindle federates with, and the one
 kind of mesh node that dials a hostname. Everything else about it is an
 ordinary node: it holds rooms, signs its events with its node key, and
 gossips with the phones around it. It carries no bridge logic, because
-there is nothing to bridge -- both sides speak Matrix federation, in the
-same room version (docs/mesh-federation.md).
+there is nothing to bridge. Both sides use the Matrix federation protocol,
+in the same room version (docs/mesh-federation.md).
 
 This page is the operator's: what to run, on what, with which flags, and
-how to know it is working. The design is in docs/mesh-federation.md and
+how to know that it works. The design is in docs/mesh-federation.md and
 the test ladder in docs/venue-playbook.md.
 
 ## What it is for
@@ -19,7 +19,7 @@ Three to five of them, one per hall, so that:
 - the Spindle has a handful of peers it can wait hours for, instead of
   three thousand phones it cannot;
 - a phone with only the mesh reaches the Spindle's rooms through the
-  copy the nearest gateway carries, and the Spindle hears the phone's
+  copy that the nearest gateway carries. The Spindle hears the phone's
   events the same way;
 - the deterministic aliases (`#session-<id>:conf.example`) resolve for a
   phone that cannot see the Spindle, because the gateway holds the room.
@@ -28,18 +28,19 @@ Three to five of them, one per hall, so that:
 
 A laptop or a small computer per hall, on mains power, with:
 
-- **a wired uplink** to the venue router, so the Spindle can reach it and
-  it can reach the Spindle whatever the Wi-Fi is doing;
-- **an address on the venue LAN** the phones can reach. Client isolation
-  on the venue Wi-Fi blocks phone-to-phone unicast; it does not block a
-  phone reaching a wired host, which is what makes the gateway the answer
+- **a wired uplink** to the venue router. Then the Spindle and the
+  gateway can reach each other whatever the Wi-Fi does;
+- **an address on the venue LAN** the phones can reach. On the venue
+  Wi-Fi, client isolation blocks the unicast from one phone to another. It does not
+  block a phone that reaches a wired host. Thus the gateway is the answer
   to isolation as well as to fan-out (companion issue #163).
 
-The LAN build (`neutrino-lan`) has no Bluetooth. A laptop gateway serves
-phones that are on the venue Wi-Fi, and the BLE mesh reaches it through
-any phone that has both radios. A gateway that phones must reach over
-Bluetooth alone is a phone-class device running the BLE build, placed
-where the crowd is; treat it as the same role on different hardware.
+The LAN build (`neutrino-lan`) has no Bluetooth. A gateway on a laptop
+serves phones that are on the venue Wi-Fi. The BLE mesh reaches it
+through any phone that has both radios. Phones may have to reach a
+gateway over Bluetooth alone. That gateway is a phone-class device that
+runs the BLE build, placed where the crowd is. Treat it as the same role
+on different hardware.
 
 ## Build
 
@@ -76,7 +77,7 @@ neutrino-lan --bind 10.20.0.11:8008 \
 ```
 
 The first line it prints is its server name: the node id, 64 hex
-characters, which is also its signing key. Every flag matters:
+characters, which is also the key it signs with. Every flag matters:
 
 | flag | what it does | what goes wrong without it |
 |---|---|---|
@@ -87,8 +88,8 @@ characters, which is also its signing key. Every flag matters:
 | `--peer <id>@<ip:port>` | Seeds another gateway so the gateways find each other without waiting for mDNS. | They still find each other by mDNS on one LAN; across VLANs they do not. |
 | `--server-name` | Overrides the derived name. **Do not set it** on a gateway: the name has to be the node id for phones to verify its events without a fetch. | |
 
-Run it under systemd as a user unit with lingering, the way the
-companion project's test gateway runs, so it survives logout and reboot:
+Run it under systemd as a user unit with linger enabled, the way the
+companion project's test gateway runs. Then it survives logout and reboot:
 
 ```ini
 # ~/.config/systemd/user/indiafoss-gateway.service
@@ -111,9 +112,9 @@ loginctl enable-linger "$USER"
 journalctl --user -u indiafoss-gateway -f
 ```
 
-Restarts are safe. The store is crash-safe and the outbox is what a
-restart redelivers from; a gateway that comes back on the same storage
-directory picks up where it stopped.
+Restarts are safe. The store is crash-safe, and a restart redelivers
+from the outbox. A gateway that comes back on the same storage directory
+continues from where it stopped.
 
 ## Pair it with the Spindle
 
@@ -126,11 +127,12 @@ peers = { "<gateway node id>" = { url = "http://10.20.0.11:8008", max_backoff_ms
 allow_internal = ["10.20.0.0/16"]
 ```
 
-The Spindle fetches the gateway's key document from that URL, verifies
-every event and every request the gateway sends against it, and retries
-a dark gateway on a schedule that reaches an hour and never drops a row.
+The Spindle fetches the gateway's key document from that URL. It
+verifies every event and every request the gateway sends against that
+document. It retries a dark gateway on a schedule that reaches an hour,
+and it never drops a row.
 
-Check the pairing from the Spindle's host:
+From the Spindle's host, make sure that the pair works:
 
 ```sh
 curl -s http://10.20.0.11:8008/_matrix/key/v2/server | jq .server_name
@@ -138,8 +140,8 @@ curl -s http://10.20.0.11:8008/_matrix/key/v2/server | jq .server_name
 ```
 
 Then have a Spindle account invite the gateway's user into a session
-room; the invite is accepted within a second when the gateway can reach
-the Spindle's name, and refused with a transport error if it cannot.
+room. If the gateway can reach the Spindle's name, it accepts the invite
+within a second. If it cannot, the invite fails with a transport error.
 
 ## Join the rooms
 
@@ -155,19 +157,19 @@ done
 ```
 
 Each join is a `make_join`/`send_join` handshake against the Spindle,
-and the gateway is seeded from the room's state DAG. A phone then
+and the gateway gets its seed from the room's state DAG. A phone then
 resolves the alias at the gateway and joins there.
 
 ## Security posture
 
-- Every event the gateway sends is signed with its node key, and the
-  Spindle verifies it. Every request it sends is signed too (the patch),
-  and the Spindle verifies that.
+- The gateway signs every event it sends with its node key, and the
+  Spindle verifies it. The gateway signs every request it sends too (the
+  patch), and the Spindle verifies that.
 - The gateway does **not** yet verify the signatures on requests it
   receives; it trusts the `X-Matrix` origin. On a venue LAN the operator
   runs, that is acceptable. It is why the `--bind` port faces the venue
-  network only: never expose it to the internet. Fixing this is the next
-  patch to the fork.
+  network only: never expose it to the internet. The next patch to the
+  fork fixes this.
 - The gateway's client API accepts open registration and has no
   authentication in the LAN build. Same rule: LAN only.
 - A gateway relays ciphertext and keys for encrypted rooms and never sees
@@ -187,9 +189,15 @@ resolves the alias at the gateway and joins there.
 ## Test it
 
 `scripts/neutrino-interop.sh` runs one gateway-shaped node and one
-Spindle on loopback and prints fifteen probes; it is the fastest way to
-know a build of the patch still works. Against a real gateway, run the
-same probes by hand in this order: key document, invite in each
-direction, the gateway's user joining a Spindle room, a message each
-way, a key query each way, a to-device message each way. The playbook's
-rung 1 is this list.
+Spindle on loopback, and prints fifteen probes. It is the fastest way to
+know that a build of the patch still works. Against a real gateway, run
+the same probes by hand in this order:
+
+1. key document;
+2. invite in each direction;
+3. the gateway's user joins a Spindle room;
+4. a message each way;
+5. a key query each way;
+6. a to-device message each way.
+
+The playbook's rung 1 is this list.

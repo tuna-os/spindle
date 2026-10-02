@@ -4,9 +4,9 @@
 
 Read against [matrix-spec](https://github.com/matrix-org/matrix-spec) at `0dfc6917367e`, the pin
 `scripts/openapi-check.py` validates responses against. An operation is
-*served* when the router registers its method and path; the placeholders
-are compared by position, not by name. Bumping the pin rewrites this file,
-and the diff is the work the release brought.
+*served* when the router registers its method and path; the check compares
+the placeholders by position, not by name. A bump of the pin rewrites this
+file, and the diff is the work the release brought.
 
 ## Client-Server API
 
@@ -14,7 +14,7 @@ and the diff is the work the release brought.
 
 ### Not served, in the spec since before v1.1
 
-8 of these are deprecated upstream and can stay unserved.
+Upstream deprecates 8 of these, so they can stay unserved.
 
 - `GET /_matrix/client/v3/account/3pid` — `administrative_contact.yaml`
 - `POST /_matrix/client/v3/account/3pid` *(deprecated)* — `administrative_contact.yaml`
@@ -74,8 +74,8 @@ and the diff is the work the release brought.
 
 88 routes the pinned spec does not define: MSC surfaces under
 `unstable/`, the admin and MAS-compatibility APIs, and stable spellings
-newer than the pin. Each MSC route must be accounted for in
-`contrib/msc/ledger.toml`; `scripts/msc-ledger.py --check` enforces that.
+newer than the pin. `contrib/msc/ledger.toml` must account for each MSC
+route; `scripts/msc-ledger.py --check` enforces that.
 
 - `/.well-known/openid-configuration`
 - `/_matrix/client/unstable/im.nheko.summary/rooms/{}/summary`
