@@ -67,7 +67,7 @@ what became of each proposal.
 
 | MSC | Title | Stable in | Flags | Evidence | Notes |
 |---|---|---|---|---|---|
-| [MSC3995](https://github.com/matrix-org/matrix-spec-proposals/pull/3995) | Linearized Matrix | — | — | `SPEC.md`, `divergence.md` | The design basis: an append-only per-room log with materialized state and no state resolution on the hot path. Hub mode is opt-in per room. |
+| [MSC3995](https://github.com/matrix-org/matrix-spec-proposals/pull/3995) | Linearized Matrix | — | — | `SPEC.md`, `divergence.md` | The design basis: an append-only per-room log with materialized state and no state resolution on the hot path. Hub mode is opt-in per room. The MSC is a WIP that has not changed since 2023, and its IETF draft has expired. SPEC.md section 12.0 records where Spindle follows each text. |
 
 ## Superseded
 
