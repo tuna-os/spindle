@@ -246,6 +246,8 @@ fn shared_registration_secret(state: &AppState) -> Result<&str, MatrixError> {
         .registration
         .shared_secret
         .as_deref()
+        // An empty secret is one anybody knows; treat it as no secret.
+        .filter(|secret| !secret.is_empty())
         .ok_or_else(|| MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "not found"))
 }
 
