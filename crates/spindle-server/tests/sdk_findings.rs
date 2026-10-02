@@ -148,6 +148,20 @@ async fn an_invite_already_pending_does_not_wait_out_the_long_poll() {
         waited < std::time::Duration::from_secs(2),
         "a poll with an invite to report returned only after {waited:?}"
     );
+
+    let acknowledged = sync["next_batch"].as_str().unwrap();
+    let started = std::time::Instant::now();
+    let repeated = server
+        .sync(&bob, &format!("?since={acknowledged}&timeout=100"))
+        .await;
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(50),
+        "an acknowledged invite made the next long poll return immediately: {repeated}"
+    );
+    assert!(
+        repeated["rooms"]["invite"].as_object().unwrap().is_empty(),
+        "an acknowledged invite was delivered again: {repeated}"
+    );
 }
 
 #[tokio::test]
@@ -274,6 +288,7 @@ async fn a_direct_room_s_invites_say_so() {
     let room = body["room_id"].as_str().unwrap().to_owned();
 
     let sync = server.sync(&bob, "").await;
+    let invite_token = sync["next_batch"].as_str().unwrap().to_owned();
     let events = sync["rooms"]["invite"][&room]["invite_state"]["events"]
         .as_array()
         .unwrap_or_else(|| panic!("{sync}"));
@@ -282,6 +297,41 @@ async fn a_direct_room_s_invites_say_so() {
         .find(|event| event["type"] == "m.room.member" && event["state_key"] == "@bob:example.org")
         .unwrap_or_else(|| panic!("{sync}"));
     assert_eq!(own["content"]["is_direct"], json!(true), "{own}");
+
+    let (status, body) = server
+        .post(
+            &format!("/_matrix/client/v3/rooms/{room}/join"),
+            &bob,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let joined = server.sync(&bob, &format!("?since={invite_token}")).await;
+    let own_join = joined["rooms"]["join"][&room]["timeline"]["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{joined}"))
+        .iter()
+        .find(|event| {
+            event["type"] == "m.room.member"
+                && event["state_key"] == "@bob:example.org"
+                && event["content"]["membership"] == "join"
+        })
+        .unwrap_or_else(|| panic!("{joined}"));
+    assert_eq!(
+        own_join["unsigned"]["prev_content"]["membership"],
+        json!("invite"),
+        "{own_join}"
+    );
+    assert_eq!(
+        own_join["unsigned"]["prev_content"]["is_direct"],
+        json!(true),
+        "{own_join}"
+    );
+    assert_eq!(
+        own_join["unsigned"]["prev_sender"],
+        json!("@alice:example.org"),
+        "{own_join}"
+    );
 
     // And a plain invite says nothing, so a client does not file a group
     // room as a DM.

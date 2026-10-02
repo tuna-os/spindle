@@ -81,6 +81,9 @@ allow_private = []
 # account needs a token an admin minted at `/_spindle/admin/v1/registration_tokens`.
 # [registration]
 # require_token = false
+# Synapse-compatible `/_synapse/admin/v1/register`. Leave unset unless an
+# integration explicitly needs it: this secret can create administrator users.
+# shared_secret = "replace-with-a-long-random-secret"
 
 # Notices from the operator to a user (`POST /_spindle/admin/v1/send_server_notice`).
 # Absent, the endpoint refuses and says so. The account is created on first use.

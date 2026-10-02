@@ -47,6 +47,7 @@ pub mod routes;
 pub mod s3;
 pub mod secrets;
 pub mod server_notices;
+pub mod shared_secret_registration;
 pub mod signing;
 pub mod sliding;
 pub mod stream;
@@ -96,6 +97,9 @@ pub struct AppState {
     /// The push gateway client, and the judgement on which gateways it
     /// reaches; `set_pusher` asks it before storing a URL.
     pub push: Arc<push::Gateway>,
+    /// Single-use challenges for Synapse-compatible shared-secret account
+    /// creation. Process-local because a restart invalidates them.
+    pub registration_nonces: Arc<shared_secret_registration::RegistrationNonces>,
 }
 
 /// Why the application cannot be built. Both are startup-fatal on purpose:
@@ -258,6 +262,7 @@ pub fn app_with_metrics(
             delayed_caps.max_per_room,
         )),
         push,
+        registration_nonces: Arc::new(shared_secret_registration::RegistrationNonces::new()),
         metrics,
     };
     spawn_delivery_loops(&state);
