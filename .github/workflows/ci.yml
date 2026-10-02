@@ -38,6 +38,13 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-features
 
+      # #21's disk-full drill. The two tests fill a real filesystem, so they
+      # are ignored by the step above and run here against a 64 MiB tmpfs
+      # the script mounts. The runner has the sudo a contributor's machine
+      # may not, and the debug build is already warm, so it costs seconds.
+      - name: Disk-full drill
+        run: scripts/disk-full-drill.sh
+
       # Every response the scripted client gets back from a live server,
       # validated against the matrix-spec OpenAPI at a pinned revision (#25).
       # The test step above has already built the binary it runs. The spec

@@ -1455,12 +1455,22 @@ async fn health() -> StatusCode {
 
 /// Readiness: the process can serve.
 ///
-/// Currently the same answer as liveness, which is honest only because nothing
-/// is initialised asynchronously yet. When storage opens here, this has to stop
-/// reporting ready before it is — a readiness probe that lies is worse than no
-/// readiness probe, because it takes traffic on the strength of the lie.
-async fn ready() -> StatusCode {
-    StatusCode::OK
+/// Storage opens before the router exists, so the one way to stop being able
+/// to serve is to lose it: once the engine refuses a write (a full disk, a
+/// failing one) it refuses every write after it, and a server that answers
+/// `/sync` but fails every `/send` with a 500 is not one to route clients to.
+/// A readiness probe that lies is worse than no readiness probe, because it
+/// takes traffic on the strength of the lie.
+///
+/// Liveness stays up on purpose. The process is fine and its disk is not;
+/// restarting it onto the same full disk only adds a crash loop to the page.
+/// The remedy is in `docs/lifecycle.md`, under "A full disk".
+async fn ready(State(state): State<AppState>) -> StatusCode {
+    if state.store.accepts_writes() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 /// The identifier half of a login request.
