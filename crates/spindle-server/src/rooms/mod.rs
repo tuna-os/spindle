@@ -272,8 +272,24 @@ pub struct Context {
     pub events_before: Vec<Value>,
     pub events_after: Vec<Value>,
     pub state: Vec<Value>,
+    /// Where a backward page carries on from: below the oldest event of
+    /// the window.
     pub start: i64,
+    /// Where a forward page carries on from: above the newest event of
+    /// the window.
     pub end: i64,
+}
+
+/// Which way a `/messages` page walks the log from its token.
+///
+/// A token is a boundary between two positions, the one just below `t`.
+/// Backward takes what is under it and forward what is over it, so the
+/// `end` of either page is where the next page in the same direction
+/// starts, and the two directions agree on what one token means.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Direction {
+    Backward,
+    Forward,
 }
 
 /// What one `/sync` call found.
@@ -2237,10 +2253,15 @@ impl Rooms {
                 log.get(&EventId::new(id.as_str()))
                     .map_or(target, |entry| entry.li.get())
             });
+            // `end` is one past the newest, because a forward page takes
+            // what is at or above its token: the window's last event is
+            // already in hand, and a token sitting on it would hand it back
+            // a second time. `start` needs no such step, because a backward
+            // page takes only what is below its token.
             let end = after.last().map_or(target, |id| {
                 log.get(&EventId::new(id.as_str()))
                     .map_or(target, |entry| entry.li.get())
-            });
+            }) + 1;
             Ok(Some((before, after, start, end, state_root)))
         })?;
 
@@ -2590,7 +2611,7 @@ impl Rooms {
         limit: usize,
         bound: Option<i64>,
     ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
-        self.messages_visible(room_id, from, limit, &|li| {
+        self.messages_visible(room_id, from, Direction::Backward, limit, &|li| {
             bound.is_none_or(|bound| li <= bound)
         })
     }
@@ -2604,6 +2625,14 @@ impl Rooms {
     /// at, so a page walks on past a gap to the next stretch the caller
     /// may see; the `next` token is the position after the last one taken.
     ///
+    /// Backward pages walk down from `from` (the head without one) and
+    /// forward pages up from it (the room's first event without one).
+    /// A forward page that reaches the newest event still names a `next`,
+    /// one past it, because the room's live end is not its last end: more
+    /// can land, and a client following the room forward carries on from
+    /// there. Only an empty forward page names none. That is Synapse's
+    /// answer, and matrix-rust-sdk's `/context` test pages forward on it.
+    ///
     /// # Errors
     ///
     /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
@@ -2611,6 +2640,7 @@ impl Rooms {
         &self,
         room_id: &str,
         from: Option<i64>,
+        direction: Direction,
         limit: usize,
         visible: &(dyn Fn(i64) -> bool + Sync),
     ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
@@ -2621,21 +2651,32 @@ impl Rooms {
         // benchmark caught it: `/messages` grew 2.47x between a 10-event room
         // and a 500-event one, and `/sync` 4.79x, while `send` stayed flat.
         let wanted = self.with_room_read(room_id, |_, log| {
-            let mut wanted = Vec::new();
+            let mut wanted: Vec<(i64, String)> = Vec::new();
             let mut next = None;
-            for entry in log.entries().rev() {
+            let entries: Box<dyn Iterator<Item = _>> = match direction {
+                Direction::Backward => Box::new(log.entries().rev()),
+                Direction::Forward => Box::new(log.entries()),
+            };
+            for entry in entries {
                 let li = entry.li.get();
-                if from.is_some_and(|from| li >= from) {
-                    continue;
-                }
-                if !visible(li) {
+                let outside = match direction {
+                    Direction::Backward => from.is_some_and(|from| li >= from),
+                    Direction::Forward => from.is_some_and(|from| li < from),
+                };
+                if outside || !visible(li) {
                     continue;
                 }
                 if wanted.len() == limit {
-                    next = Some(li + 1);
+                    next = Some(match direction {
+                        Direction::Backward => li + 1,
+                        Direction::Forward => li,
+                    });
                     break;
                 }
                 wanted.push((li, entry.event_id.as_str().to_owned()));
+            }
+            if direction == Direction::Forward && next.is_none() {
+                next = wanted.last().map(|(li, _)| li + 1);
             }
             Ok((wanted, next))
         })?;
