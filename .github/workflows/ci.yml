@@ -125,6 +125,12 @@ jobs:
       - name: Check the Synapse fixture builder
         run: python3 scripts/synapse-fixture-test.py
 
+      # The #42 parity gate decides which benchmark cells count as a loss
+      # against which competitor; its judgement runs against synthetic
+      # sittings and the committed milestone one.
+      - name: Check the parity gate
+        run: python3 scripts/parity-gate-test.py
+
       # The alert rules and the dashboard under deploy/ rot silently: a
       # renamed metric leaves a rule that never fires and a panel that
       # draws nothing. This holds every metric they name to metrics.rs and

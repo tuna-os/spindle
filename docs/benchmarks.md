@@ -42,6 +42,7 @@ stale on a runner change. Wall times do.
 | The same vs **Tuwunel** | Done from M2 close-out on, below |
 | All four at three rounds a side, under the separation rule (#171) | Done, below — the first sitting the page judges by its own repeatability |
 | The same vs **Dendrite** (Element's Go server), five in the field | Done from the second M7 sitting on, below |
+| The three parity lines of #42, pass or fail per sitting | Done, below; two federated workloads are not measured |
 
 Everything here is **algorithmic**, measured inside the library. None of it is a
 server throughput figure and none of it should be quoted as one. Server-to-
@@ -162,6 +163,7 @@ just bench-field                 # fetch or build every competitor at its pin, o
 just bench-build                 # Spindle, release
 just bench-sitting m7-progress-2 # up, three rounds, down, and the sidecar
 just bench-render                # the site from the committed results
+just bench-gate m7-progress-2    # the three parity lines of #42, on that sitting
 ```
 
 - **`scripts/bench-field.sh`** holds the pins: Continuwuity 26.8.1 as its
@@ -205,6 +207,31 @@ log scale — and the charts rescale and the tables drop the column. Hiding
 a server changes the drawing, never the data: the committed files, the
 tallies and every ratio are computed before the page knows what was
 chosen.
+
+### The parity gate
+
+#42 sets three lines for the comparison:
+
+1. Spindle is never slower than Synapse.
+2. Spindle stays within 1.2× of Tuwunel on general workloads.
+3. Spindle is much faster on the workloads that the design targets.
+
+`scripts/parity-gate.py` reads the results of one group and gives each line a status.
+It uses the separation rule from `sitting.py` at each room size. A cell that
+the rounds do not separate is noise, not a loss. For line 3, "much faster"
+means a separated win of 1.38× or more against each rival. 1.38× is the
+repeatability that this host showed for one round.
+
+Line 3 does not pass while a target workload has no measurement. The gate
+lists these workloads in each report:
+
+- the 10,000-member federated join,
+- the catch-up after a partition,
+- concurrent send against a rival other than Synapse.
+
+The first two need a fork workload, and the client-server driver cannot
+make one. A failed line gives a non-zero exit. The weekly workflow puts the
+report in the body of its pull request.
 
 ## Client-server API vs Synapse, at M1
 
