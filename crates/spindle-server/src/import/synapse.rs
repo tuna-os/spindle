@@ -27,12 +27,20 @@
 //! why `scripts/synapse-fixture.py --populate` deliberately writes a legacy
 //! `is_state` edge: a reader that gets (2) wrong fails against the fixture
 //! instead of against somebody's deployment.
+//!
+//! A fourth shape matters only for a room whose history starts at a backfill
+//! horizon -- one Synapse joined over federation, with nothing before the
+//! join. The state at that root is a Synapse *state group*, and a state group
+//! is usually not a state: it is a delta against a parent group, threaded
+//! through `state_group_edges`. Reading only the root's own group gives the
+//! slots that changed at the root and silently loses every other one. See
+//! [`state_after`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use rusqlite::{Connection, OptionalExtension};
 
-use super::{SourceEvent, SourceRoom, StateMap};
+use super::{PlanError, SourceEvent, SourceRoom, StateMap, plan};
 
 /// Why a room could not be read.
 #[derive(Debug)]
@@ -40,16 +48,31 @@ pub enum ReadError {
     Sqlite(rusqlite::Error),
     /// The database has no such room.
     UnknownRoom(String),
-    /// The room's history starts at a backfill horizon.
+    /// The room's history starts at a backfill horizon, and Synapse records no
+    /// state group for the event it starts at.
     ///
-    /// Reconstructing the state there means resolving a Synapse *state group*,
-    /// which is a delta against a parent group threaded through
-    /// `state_group_edges` -- a walk this reader does not do yet. Refused
-    /// loudly, because the alternative is an import that starts from empty
-    /// state and calls a room with different contents a success.
-    NeedsStateGroups {
+    /// Refused loudly, because the alternative is an import that starts from
+    /// empty state and calls a room with different contents a success.
+    MissingStateGroup {
         room_id: String,
         root: String,
+    },
+    /// The `state_group_edges` chain returns to a group it already passed
+    /// through, so it never reaches a full state.
+    StateGroupCycle {
+        room_id: String,
+        state_group: i64,
+    },
+    /// A state group names more than one parent.
+    ///
+    /// Synapse writes one parent per group and reads back whichever row comes
+    /// first. Two rows means the database is not in a shape this reader
+    /// understands, and choosing one would be a guess about which state the
+    /// room is in.
+    AmbiguousStateGroup {
+        room_id: String,
+        state_group: i64,
+        parents: Vec<i64>,
     },
 }
 
@@ -58,11 +81,29 @@ impl std::fmt::Display for ReadError {
         match self {
             Self::Sqlite(error) => write!(formatter, "reading Synapse: {error}"),
             Self::UnknownRoom(room) => write!(formatter, "no room {room} in this database"),
-            Self::NeedsStateGroups { room_id, root } => write!(
+            Self::MissingStateGroup { room_id, root } => write!(
                 formatter,
-                "{room_id} has no m.room.create -- its history starts at {root}, so its \
-                 state has to come from Synapse's state groups, which this reader does \
-                 not resolve yet (they are deltas chained through state_group_edges)"
+                "{room_id} has no m.room.create -- its history starts at {root}, and \
+                 event_to_state_groups has no state group for {root}, so there is no \
+                 state to start the import from"
+            ),
+            Self::StateGroupCycle {
+                room_id,
+                state_group,
+            } => write!(
+                formatter,
+                "{room_id}: the state_group_edges chain returns to state group \
+                 {state_group} instead of reaching a full state"
+            ),
+            Self::AmbiguousStateGroup {
+                room_id,
+                state_group,
+                parents,
+            } => write!(
+                formatter,
+                "{room_id}: state group {state_group} has {} parents in \
+                 state_group_edges ({parents:?}); Synapse writes one",
+                parents.len()
             ),
         }
     }
@@ -92,7 +133,7 @@ pub fn rooms(connection: &Connection) -> Result<Vec<String>, ReadError> {
 /// # Errors
 ///
 /// Returns [`ReadError`] when the room is absent, a query fails, or the room's
-/// history begins somewhere that needs state groups to reconstruct.
+/// history starts at a backfill horizon whose state groups cannot be resolved.
 pub fn read_room(connection: &Connection, room_id: &str) -> Result<SourceRoom, ReadError> {
     let known: Option<String> = connection
         .query_row(
@@ -165,31 +206,96 @@ pub fn read_room(connection: &Connection, room_id: &str) -> Result<SourceRoom, R
         current_state.insert((event_type, state_key), event_id);
     }
 
-    let room = SourceRoom {
+    let mut room = SourceRoom {
         room_id: room_id.to_owned(),
         events,
         current_state,
         state_after_root: None,
     };
 
-    // Refuse a horizon start here rather than handing `plan` a room it will
-    // refuse anyway: this reader knows *why* the state is missing, and can
-    // name the tables that would supply it.
-    if !room
-        .events
-        .iter()
-        .any(|event| event.event_type == "m.room.create" && !event.outlier && !event.rejected)
-    {
-        let earliest = room
-            .events
-            .iter()
-            .find(|event| !event.outlier && !event.rejected)
-            .map_or_else(|| "nothing".to_owned(), |event| event.event_id.clone());
-        return Err(ReadError::NeedsStateGroups {
-            room_id: room_id.to_owned(),
-            root: earliest,
-        });
+    // A horizon start needs the state at its root. `plan` is asked where the
+    // root is rather than this reader guessing: it is the one that decides
+    // which events are in the import, and so which event the log is seeded
+    // with. Any other refusal is left for `plan` to report to the caller,
+    // because supplying state would not fix it.
+    if let Err(PlanError::NoRootState { root, .. }) = plan(&room) {
+        room.state_after_root = Some(state_after(connection, room_id, &root)?);
     }
 
     Ok(room)
+}
+
+/// The room's state after `event_id`, from Synapse's state groups.
+///
+/// `event_to_state_groups` maps an event to the group holding the state after
+/// it. That group is usually a delta: `state_groups_state` holds only the slots
+/// that changed relative to the parent named in `state_group_edges`, and so on
+/// back to a group with no parent, which holds a full state. The walk goes
+/// newest to oldest, so the first value seen for a slot is the one that wins
+/// and an older group fills only the slots no newer group mentions. That is
+/// the order Synapse's own `SQLite` path walks the chain in.
+///
+/// # Errors
+///
+/// Returns [`ReadError`] when the event has no state group, the chain loops or
+/// forks, or a query fails.
+pub fn state_after(
+    connection: &Connection,
+    room_id: &str,
+    event_id: &str,
+) -> Result<StateMap, ReadError> {
+    let Some(mut group) = connection
+        .query_row(
+            "SELECT state_group FROM event_to_state_groups WHERE event_id = ?",
+            [event_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    else {
+        return Err(ReadError::MissingStateGroup {
+            room_id: room_id.to_owned(),
+            root: event_id.to_owned(),
+        });
+    };
+
+    let mut slots = connection.prepare(
+        "SELECT type, state_key, event_id FROM state_groups_state WHERE state_group = ?",
+    )?;
+    let mut parent = connection
+        .prepare("SELECT prev_state_group FROM state_group_edges WHERE state_group = ?")?;
+    let mut state = StateMap::new();
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(group) {
+            return Err(ReadError::StateGroupCycle {
+                room_id: room_id.to_owned(),
+                state_group: group,
+            });
+        }
+        for row in slots.query_map([group], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (event_type, state_key, event_id) = row?;
+            state.entry((event_type, state_key)).or_insert(event_id);
+        }
+
+        let parents = parent
+            .query_map([group], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        match parents.as_slice() {
+            [] => return Ok(state),
+            [next] => group = *next,
+            _ => {
+                return Err(ReadError::AmbiguousStateGroup {
+                    room_id: room_id.to_owned(),
+                    state_group: group,
+                    parents,
+                });
+            }
+        }
+    }
 }

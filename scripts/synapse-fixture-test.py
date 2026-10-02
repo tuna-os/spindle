@@ -197,8 +197,11 @@ def minimal_room(**broken: bool) -> sqlite3.Connection:
     database.executescript(
         """
         CREATE TABLE event_edges (event_id TEXT, prev_event_id TEXT, is_state BOOL);
-        CREATE TABLE events (event_id TEXT, outlier BOOL, rejection_reason TEXT);
+        CREATE TABLE events (event_id TEXT, room_id TEXT, type TEXT, outlier BOOL,
+                             rejection_reason TEXT);
         CREATE TABLE current_state_events (event_id TEXT, room_id TEXT, type TEXT, state_key TEXT);
+        CREATE TABLE event_to_state_groups (event_id TEXT, state_group BIGINT);
+        CREATE TABLE state_group_edges (state_group BIGINT, prev_state_group BIGINT);
         """
     )
     child, parent = module.LEGACY_STATE_EDGE
@@ -214,13 +217,32 @@ def minimal_room(**broken: bool) -> sqlite3.Connection:
         (child, parent, 0 if broken.get("legacy_edge") else 1),
     )
     database.execute(
-        "INSERT INTO events VALUES (?, ?, NULL)",
-        (module.OUTLIER[0], 0 if broken.get("outlier") else 1),
+        "INSERT INTO events VALUES (?, ?, ?, ?, NULL)",
+        (module.OUTLIER[0], module.ROOM_ID, module.OUTLIER[1], 0 if broken.get("outlier") else 1),
     )
     database.execute(
-        "INSERT INTO events VALUES (?, 0, ?)",
-        (module.REJECTED[0], None if broken.get("rejection") else module.REJECTION_REASON),
+        "INSERT INTO events VALUES (?, ?, ?, 0, ?)",
+        (
+            module.REJECTED[0],
+            module.ROOM_ID,
+            module.REJECTED[1],
+            None if broken.get("rejection") else module.REJECTION_REASON,
+        ),
     )
+    # The horizon room: its create event only as an outlier, unless the
+    # mutation puts one in the timeline.
+    database.execute(
+        "INSERT INTO events VALUES (?, ?, 'm.room.create', ?, NULL)",
+        (
+            module.HORIZON_OUTLIERS[0][0],
+            module.HORIZON_ROOM_ID,
+            0 if broken.get("horizon_create") else 1,
+        ),
+    )
+    root = module.HORIZON_TIMELINE[0][0]
+    database.execute("INSERT INTO event_to_state_groups VALUES (?, 103)", (root,))
+    if not broken.get("flat_group"):
+        database.execute("INSERT INTO state_group_edges VALUES (103, 102)")
     for (event_type, state_key), event_id in module.CURRENT_STATE.items():
         if broken.get("state") and event_type == "m.room.topic":
             continue
@@ -266,6 +288,21 @@ def test_current_state_drift_is_caught():
     module = load_module()
     problems = module.verify_populated(minimal_room(state=True))
     assert any("current_state_events" in problem for problem in problems), problems
+
+
+def test_a_horizon_root_without_a_delta_chain_is_caught():
+    """The horizon room exists to make a reader walk `state_group_edges`. A
+    root group with no parent is a full state, and a reader that never walks
+    the chain would pass against it."""
+    module = load_module()
+    problems = module.verify_populated(minimal_room(flat_group=True))
+    assert any("delta chain" in problem for problem in problems), problems
+
+
+def test_a_horizon_room_with_a_timeline_create_is_caught():
+    module = load_module()
+    problems = module.verify_populated(minimal_room(horizon_create=True))
+    assert any("not a horizon" in problem for problem in problems), problems
 
 
 def test_populate_against_a_real_checkout(skipped: list[str]):
