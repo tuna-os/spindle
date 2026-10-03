@@ -41,7 +41,8 @@ import_job() {
   for a in "$@"; do args+="        - \"$a\""$'\n'; done
   k delete job "$name" --ignore-not-found --wait >/dev/null
   render "$here/import-job.yaml" | sed -e "s|__NAME__|$name|g" -e "s|__DB__|$db|g" -e "s|__PG_IP__|$ip|g" \
-    | awk -v args="$args" '{ if ($0 ~ /__ARGS__/) printf "%s", args; else print }' | k apply -f - >/dev/null
+    | awk -v args="$args" '{ if ($0 == "__ARGS__") printf "%s", args; else print }' >"${TMPDIR:-/tmp}/$name.yaml"
+  k apply -f "${TMPDIR:-/tmp}/$name.yaml" >/dev/null
   wait_job "$name"
 }
 

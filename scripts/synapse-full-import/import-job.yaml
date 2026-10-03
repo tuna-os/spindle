@@ -1,5 +1,5 @@
-# One `spindle import-synapse` run on the fi-dark-spindle volume. Rendered by
-# run.sh: __NAME__, __DB__, __PG_IP__, __IMAGE__, __NODE__ and __ARGS__.
+# One `spindle import-synapse` run on the fi-dark-spindle volume.
+# run.sh fills in the name, database, address, image, node and arguments.
 apiVersion: batch/v1
 kind: Job
 metadata:
