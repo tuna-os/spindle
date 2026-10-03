@@ -21,8 +21,8 @@ use spindle_core::{AppendError, EventId, EventInput, LogEntry, Pdu, RoomLog, Sta
 use spindle_store::RoomStore;
 
 use super::{
-    INVITE_STR, IdentifiedEvent, JOIN_STR, PersistInput, RoomError, Rooms, auth_events_for,
-    event_body_key, version_in,
+    INVITE_STR, IdentifiedEvent, PersistInput, RoomError, Rooms, auth_events_for, event_body_key,
+    version_in,
 };
 
 impl Rooms {
@@ -36,42 +36,9 @@ impl Rooms {
     ///
     /// Returns [`RoomError`] if the room or its indexes cannot be read.
     pub fn server_in_room(&self, room_id: &str, domain: &str) -> Result<bool, RoomError> {
-        let members = self.with_room_read(room_id, |_, log| {
-            let Some(state) = log
-                .entries()
-                .next_back()
-                .map(|entry| entry.li)
-                .and_then(|li| log.state_after(li))
-            else {
-                return Ok(Vec::new());
-            };
-            let mut members = Vec::new();
-            state.for_each(|state_key, _| {
-                if state_key.event_type().as_str() == "m.room.member"
-                    && state_key
-                        .state_key()
-                        .split_once(':')
-                        .is_some_and(|(_, d)| d == domain)
-                {
-                    members.push(state_key.state_key().to_owned());
-                }
-            });
-            Ok(members)
-        })?;
-        for user_id in members {
-            let membership = spindle_store::ReadView::get(
-                self.store.as_ref(),
-                &spindle_core::keys::user_room(
-                    spindle_core::keys::Keyspace::Membership,
-                    &user_id,
-                    room_id,
-                ),
-            )?;
-            if membership.as_deref() == Some(JOIN_STR.as_bytes()) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        self.with_room_read(room_id, |rooms, log| {
+            rooms.domain_has_joined_member(log, room_id, domain)
+        })
     }
 
     /// A join-event template for a remote user, for `make_join`.

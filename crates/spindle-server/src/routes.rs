@@ -4287,11 +4287,11 @@ async fn join(
         state.key.pair(),
     ) {
         Ok(_) => Ok(Json(json!({ "room_id": room_id }))),
-        // A room this server has never held may still be joinable: through
-        // the servers the client named, or the one in the room ID itself.
-        Err(crate::rooms::RoomError::UnknownRoom(_)) => {
-            join_remote(state, user_id, room_id, servers).await
-        }
+        // A room this server has never held, or whose last local member has
+        // left, needs a resident's current state for the join decision.
+        Err(
+            crate::rooms::RoomError::UnknownRoom(_) | crate::rooms::RoomError::NonResidentRoom(_),
+        ) => join_remote(state, user_id, room_id, servers).await,
         Err(error) => Err(room_error(error)),
     }
 }
@@ -4334,6 +4334,13 @@ async fn join_remote(
     // `knock_remote`, which has the same loop for the same reason.
     let mut answered: Option<MatrixError> = None;
     for server in &candidates {
+        // The resident must observe everything this server already authored
+        // before it judges the next membership. In particular, an undelivered
+        // leave makes a restricted rejoin look like a harmless join -> join.
+        if let Err(error) = state.federation.flush_outbox(server).await {
+            last_refusal = format!("could not bring {server} current before make_join: {error}");
+            continue;
+        }
         let (template, version) = match state
             .federation
             .remote_make_join(server, room_id, user_id)
@@ -8673,6 +8680,11 @@ pub(crate) fn room_error(error: crate::rooms::RoomError) -> MatrixError {
         crate::rooms::RoomError::UnknownRoom(_) => {
             MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such room")
         }
+        crate::rooms::RoomError::NonResidentRoom(_) => MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "this server is not resident in the room",
+        ),
         crate::rooms::RoomError::UnknownState(what) => {
             MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", format!("no {what}"))
         }

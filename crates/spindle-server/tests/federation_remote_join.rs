@@ -25,6 +25,14 @@ struct Instance {
 
 impl Instance {
     async fn start() -> Instance {
+        Self::start_with_delivery(true).await
+    }
+
+    async fn start_without_delivery() -> Instance {
+        Self::start_with_delivery(false).await
+    }
+
+    async fn start_with_delivery(delivery: bool) -> Instance {
         static TRACING: std::sync::Once = std::sync::Once::new();
         TRACING.call_once(|| {
             let _ = tracing_subscriber::fmt()
@@ -40,7 +48,17 @@ impl Instance {
              [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\nretry_base_ms = 50\n",
         ))
         .unwrap();
-        let app = spindle_server::app(config, store).expect("the app builds");
+        // `app` deliberately starts no delivery loops when built outside a
+        // runtime. That gives ordering tests a queue only the request under
+        // test can flush, rather than a race against the background drain.
+        let app = if delivery {
+            spindle_server::app(config, store).expect("the app builds")
+        } else {
+            std::thread::spawn(move || spindle_server::app(config, store))
+                .join()
+                .unwrap()
+                .expect("the app builds")
+        };
         tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -494,6 +512,86 @@ async fn a_restricted_room_admits_a_remote_member_of_a_room_it_allows() {
             "the {side} copy carries the authorising server's signature: {event}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_former_resident_does_not_authorize_a_join_from_stale_state() {
+    // Hold both ordinary federation queues: the former resident keeps the
+    // public rule while the actual resident still sees Bob joined. The next
+    // join must reject the first stale view and flush the leave before asking
+    // the second one to decide.
+    let remote = Instance::start_without_delivery().await;
+    let local = Instance::start_without_delivery().await;
+    let alice = remote.register("alice").await;
+    let bob = local.register("bob").await;
+    let bob_id = format!("@bob:{}", local.name);
+    let room = remote.public_room(&alice).await;
+
+    assert_eq!(local.join_via(&room, &bob, &remote.name).await.0, 200);
+    assert!(
+        eventually(async || {
+            remote
+                .joined_members(&room, &alice)
+                .await
+                .get(&bob_id)
+                .is_some()
+        })
+        .await,
+        "the resident sees the initial join"
+    );
+
+    let (status, body) = local
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/rooms/{room}/leave"),
+            Some(&bob),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "leave: {body}");
+    assert!(
+        remote
+            .joined_members(&room, &alice)
+            .await
+            .get(&bob_id)
+            .is_some(),
+        "the delayed outbox leaves the resident's membership stale"
+    );
+
+    // The local server is no longer in the room, so it does not receive this
+    // change and retains the old public rule.
+    let (status, body) = remote
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.join_rules"),
+            Some(&alice),
+            Some(&json!({ "join_rule": "invite" })),
+        )
+        .await;
+    assert_eq!(status, 200, "closing the room: {body}");
+    let (status, rules) = local
+        .request(
+            reqwest::Method::GET,
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.join_rules"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "reading retained state: {rules}");
+    assert_eq!(rules["join_rule"], "public", "the retained copy is stale");
+
+    // The stale public rule would admit Bob locally. A non-resident must ask
+    // the actual resident, whose current invite-only rule refuses him.
+    let (status, body) = local.join_via(&room, &bob, &remote.name).await;
+    assert_ne!(status, 200, "the stale copy admitted the join: {body}");
+    assert!(
+        remote
+            .joined_members(&room, &alice)
+            .await
+            .get(&bob_id)
+            .is_none(),
+        "the refusal writes no membership"
+    );
 }
 
 #[tokio::test]
