@@ -159,6 +159,11 @@ pub const UNSTABLE_FEATURES: &[(&str, bool)] = &[
     // unstable and the plain names), and a disabled pusher receives
     // nothing. A client checks here before showing the toggle.
     ("org.matrix.msc3881", true),
+    // MSC4186's simplified sliding sync, under the flag name it kept from
+    // MSC3575. Not decoration: matrix-sdk's `DiscoverNative` -- what
+    // Element X builds its client with at login -- reads exactly this flag,
+    // and without it refuses the server as having no sliding sync at all.
+    ("org.matrix.simplified_msc3575", true),
 ];
 
 #[must_use]

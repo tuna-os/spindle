@@ -161,6 +161,7 @@ number = 4186
 title = "Simplified sliding sync"
 status = "served"
 merged = true
+unstable = ["org.matrix.simplified_msc3575"]
 evidence = ["crates/spindle-server/tests/sliding_sync.rs"]
 notes = "Lists, room subscriptions, required_state, timeline, extensions, invites in the list, heroes and bump_stamp. What Element X syncs with."
 

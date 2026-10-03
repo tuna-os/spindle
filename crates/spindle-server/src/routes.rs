@@ -6583,6 +6583,56 @@ struct SlidingQuery {
     timeout: Option<u64>,
 }
 
+/// The stream position a sliding sync `pos` names.
+///
+/// A `pos` this server did not mint -- the one a client kept from the
+/// homeserver this one replaced -- is MSC4186's `M_UNKNOWN_POS`: the answer
+/// a client is built to handle, by dropping the position and starting the
+/// connection over. Anything else (a 400 `M_BAD_JSON`) is an error it
+/// retries with the same `pos`, forever.
+fn sliding_position(
+    identity: &crate::accounts::Identity,
+    pos: Option<&str>,
+) -> Result<Option<u64>, MatrixError> {
+    match crate::tokens::Sync::resume(pos)
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?
+    {
+        crate::tokens::Resume::Foreign => {
+            tracing::info!(
+                user_id = %identity.user_id,
+                "sliding sync pos from another server; answering M_UNKNOWN_POS"
+            );
+            Err(MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_UNKNOWN_POS",
+                "unknown position; start the connection over without `pos`",
+            ))
+        }
+        resume => Ok(resume.position()),
+    }
+}
+
+/// Where a `/sync` resumes from.
+///
+/// A token another homeserver minted (a client that synced against the
+/// server this one replaced) is answered as an initial sync: every room in
+/// full, timelines limited, so the client rebuilds rather than retrying a
+/// position that no longer exists. See `tokens::Resume`.
+fn sync_resume(
+    identity: &crate::accounts::Identity,
+    since: Option<&str>,
+) -> Result<crate::tokens::Resume, MatrixError> {
+    let resume = crate::tokens::Sync::resume(since)
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    if resume == crate::tokens::Resume::Foreign {
+        tracing::info!(
+            user_id = %identity.user_id,
+            "sync token from another server; answering as an initial sync"
+        );
+    }
+    Ok(resume)
+}
+
 /// `POST /_matrix/client/unstable/org.matrix.simplified_msc3575/sync`
 ///
 /// Stateless (`sliding.rs` explains why): `pos` is a stream position, and the
@@ -6595,15 +6645,7 @@ async fn sliding_sync(
     axum::extract::Query(query): axum::extract::Query<SlidingQuery>,
     Json(request): Json<crate::sliding::SlidingRequest>,
 ) -> Result<Json<Value>, MatrixError> {
-    let since = match query.pos.as_deref() {
-        Some(token) => Some(
-            token
-                .parse::<crate::tokens::Sync>()
-                .map_err(|error| MatrixError::bad_json(error.to_string()))?
-                .0,
-        ),
-        None => None,
-    };
+    let since = sliding_position(&identity, query.pos.as_deref())?;
     let lists = request.decoded_lists().map_err(MatrixError::bad_json)?;
     let subscriptions = request
         .decoded_subscriptions()
@@ -6833,15 +6875,11 @@ fn to_device_extension(
     extension: &crate::sliding::ToDeviceExtension,
     position: u64,
 ) -> Result<Value, MatrixError> {
-    let acknowledged = match extension.since.as_deref() {
-        Some(token) => Some(
-            token
-                .parse::<crate::tokens::Sync>()
-                .map_err(|error| MatrixError::bad_json(error.to_string()))?
-                .0,
-        ),
-        None => None,
-    };
+    // Another server's to-device token acknowledges nothing here: every
+    // pending message is delivered, which is the side to err on.
+    let acknowledged = crate::tokens::Sync::resume(extension.since.as_deref())
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?
+        .position();
     let mut events = state
         .devices
         .take_pending(&identity.user_id, &identity.device_id, acknowledged)
@@ -7231,6 +7269,28 @@ fn visible_device_changes(
     Ok(visible)
 }
 
+/// The asker and everyone joined to a room the asker is joined to: the
+/// widest device-list change set the asker may be told about, for a sync
+/// that resumes from another server's token (`tokens::Resume::Foreign`).
+fn everyone_sharing_a_room(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+) -> Result<Vec<String>, MatrixError> {
+    let mut everyone = std::collections::BTreeSet::new();
+    everyone.insert(identity.user_id.clone());
+    for room_id in state.rooms.joined(&identity.user_id).map_err(room_error)? {
+        everyone.extend(
+            state
+                .rooms
+                .joined_member_ids(&room_id)
+                .map_err(room_error)?
+                .iter()
+                .cloned(),
+        );
+    }
+    Ok(everyone.into_iter().collect())
+}
+
 /// The E2EE sections of a `/sync` response, fetched before assembly.
 ///
 /// To-device messages come first and destructively (`since` acknowledges the
@@ -7244,7 +7304,7 @@ fn visible_device_changes(
 fn sync_device_sections(
     state: &AppState,
     identity: &crate::accounts::Identity,
-    since: Option<u64>,
+    resume: crate::tokens::Resume,
     next_batch: u64,
 ) -> Result<
     (
@@ -7257,11 +7317,19 @@ fn sync_device_sections(
 > {
     let to_device = state
         .devices
-        .take_pending(&identity.user_id, &identity.device_id, since)
+        .take_pending(&identity.user_id, &identity.device_id, resume.position())
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    let device_changes = match since {
-        Some(since) => visible_device_changes(state, identity, since, next_batch)?,
-        None => Vec::new(),
+    let device_changes = match resume {
+        crate::tokens::Resume::From(since) => {
+            visible_device_changes(state, identity, since, next_batch)?
+        }
+        crate::tokens::Resume::Start => Vec::new(),
+        // The client believes this is an incremental sync, so it will not
+        // re-query keys the way a fresh login does. Device changes made on
+        // the old server between its last sync and the switch are in a
+        // stream this server never saw; naming everyone it shares a room
+        // with makes it re-query them, rather than encrypt to a stale list.
+        crate::tokens::Resume::Foreign => everyone_sharing_a_room(state, identity)?,
     };
     let key_counts = state
         .devices
@@ -7284,15 +7352,8 @@ async fn sync(
     Authenticated(identity): Authenticated,
     axum::extract::Query(query): axum::extract::Query<SyncQuery>,
 ) -> Result<axum::response::Response, MatrixError> {
-    let since = match query.since.as_deref() {
-        Some(token) => Some(
-            token
-                .parse::<crate::tokens::Sync>()
-                .map_err(|error| MatrixError::bad_json(error.to_string()))?
-                .0,
-        ),
-        None => None,
-    };
+    let resume = sync_resume(&identity, query.since.as_deref())?;
+    let since = resume.position();
     let filter = requested_filter(&state, &identity.user_id, query.filter.as_deref())?;
     // A filter's own timeline limit outranks the query parameter: the client
     // set both, and the filter is the more specific of the two.
@@ -7383,7 +7444,7 @@ async fn sync(
     let leave = sync_leave(result.left, filter.as_ref());
 
     let (to_device, device_changes, key_counts, unused_fallback) =
-        sync_device_sections(&state, &identity, since, result.next_batch)?;
+        sync_device_sections(&state, &identity, resume, result.next_batch)?;
 
     let global = sync_account_data(&state, &identity, filter.as_ref(), since, result.next_batch)?;
 
