@@ -52,7 +52,7 @@ The rig made test sessions only for rig users (`spindle-mig-*` and
 
 ## Results
 
-**The MAS gate driver passes 29 of 29 checks.**
+**All 29 checks of the MAS gate script pass.**
 
 - **Discovery.** Spindle serves the MAS metadata on `/v1/auth_metadata`
   and on the unstable MSC2965 path. Spindle answers legacy `/login` with
@@ -68,11 +68,11 @@ The rig made test sessions only for rig users (`spindle-mig-*` and
   - MAS sends the device and its display name to Spindle.
   - After the compat `/logout`, Spindle refuses the token within the
     120 s cache time. The MAS device sync then deletes the device.
-- **Provisioning** through the `/_synapse/mas/*` surface
+- **Account management** through the `/_synapse/mas/*` surface
   (`synapse_modern`):
   - To register a user, MAS first checks the localpart with Spindle.
     Then `provision_user` makes the account.
-  - Deactivation through the MAS admin API calls `delete_user`. Spindle
+  - For a deactivation in the MAS admin API, MAS calls `delete_user`. Spindle
     then shows the user as deactivated. Reactivation calls
     `reactivate_user`.
   - `sync_devices` sets the Spindle devices to the MAS set.
