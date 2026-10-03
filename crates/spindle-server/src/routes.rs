@@ -100,7 +100,8 @@ pub const MOUNTED: &[&str] = &[
 pub fn router(state: AppState) -> Router {
     let routes = Router::new()
         .merge(account_routes())
-        .merge(report_and_hold_routes())
+        .merge(crate::moderation_routes::routes())
+        .merge(profile_and_admin_routes())
         .merge(push_routes())
         .merge(appservice_routes())
         .merge(crate::dehydrated::routes())
@@ -275,69 +276,7 @@ fn profile_routes() -> Router<AppState> {
         )
 }
 
-/// `POST /_matrix/client/v3/rooms/{room_id}/report/{event_id}`
-///
-/// A user tells the server's operators that an event is a problem. The
-/// report is filed where the admin API's `/event_reports` reads it, by
-/// an id an operator can quote, and a line goes into the audit log too,
-/// which is the feed an operator already reads -- a report stored
-/// somewhere nobody looks is not a moderation feature, it is the
-/// appearance of one.
-///
-/// **404 covers both "no such event" and "you cannot see it", deliberately
-/// and per the spec.** Distinguishing them would turn this endpoint into an
-/// oracle for whether a given event ID exists in a room the caller is not
-/// in, which is exactly the thing a reporting endpoint must not become.
-async fn report_event(
-    State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
-    axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
-    Json(request): Json<ReportRequest>,
-) -> Result<Json<Value>, MatrixError> {
-    // The spec's range, and it is signed: a "score" here runs from -100
-    // (worst) to 0, so a positive number is a caller who has misread the
-    // API rather than one paying a compliment.
-    if let Some(score) = request.score
-        && !(-100..=0).contains(&score)
-    {
-        return Err(MatrixError::bad_json(format!(
-            "score must be between -100 and 0, not {score}"
-        )));
-    }
-    let not_found = || MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such event");
-    if may_read_room(&state, &identity.user_id, &room_id).is_err() {
-        return Err(not_found());
-    }
-    let event = state
-        .rooms
-        .event(&room_id, &event_id)
-        .map_err(|_| not_found())?;
 
-    let report_id = crate::admin::file_event_report(
-        &state,
-        &identity.user_id,
-        &room_id,
-        &event_id,
-        event["sender"].as_str(),
-        request.reason.as_deref(),
-        request.score,
-    )?;
-    crate::admin::audit(
-        &state,
-        &identity.user_id,
-        "report",
-        &event_id,
-        &json!({
-            "room_id": room_id,
-            "reason": request.reason,
-            "score": request.score,
-            "report_id": report_id,
-        }),
-    )?;
-    Ok(Json(json!({})))
-}
-
-#[derive(Debug, Deserialize)]
 struct ReportRequest {
     #[serde(default)]
     reason: Option<String>,
@@ -367,16 +306,9 @@ fn device_routes() -> Router<AppState> {
 
 /// Reports, generic profile fields, `whois`, and the v1.18 holds: the
 /// first wave filled in from `docs/spec-gaps.md`.
-fn report_and_hold_routes() -> Router<AppState> {
+/// Profile fields, whois, and the v1.18 holds.
+fn profile_and_admin_routes() -> Router<AppState> {
     Router::new()
-        .route(
-            "/_matrix/client/v3/rooms/{room_id}/report",
-            post(report_room),
-        )
-        .route(
-            "/_matrix/client/v3/users/{user_id}/report",
-            post(report_user),
-        )
         .route(
             "/_matrix/client/v3/profile/{user_id}/{key}",
             get(get_profile_field)
@@ -2120,48 +2052,6 @@ async fn report_room(
     Ok(Json(json!({})))
 }
 
-/// `POST /_matrix/client/v3/users/{userId}/report` (spec v1.14)
-///
-/// A report about a user. Only a local user can be reported here: a
-/// report about somebody else's user belongs to their server, and this
-/// one has nothing to act on. An unknown local user is a 404.
-async fn report_user(
-    State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
-    axum::extract::Path(user_id): axum::extract::Path<String>,
-    Json(request): Json<ReasonOnly>,
-) -> Result<Json<Value>, MatrixError> {
-    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
-    let local = user_id.ends_with(&format!(":{}", state.config.server.name))
-        && accounts
-            .account(&localpart_of(&user_id))
-            .map_err(|error| internal(&error))?
-            .is_some();
-    if !local {
-        return Err(MatrixError::new(
-            StatusCode::NOT_FOUND,
-            "M_NOT_FOUND",
-            "no such user here",
-        ));
-    }
-    let report_id = crate::admin::file_report(
-        &state,
-        &identity.user_id,
-        None,
-        None,
-        Some(&user_id),
-        request.reason.as_deref(),
-        None,
-    )?;
-    crate::admin::audit(
-        &state,
-        &identity.user_id,
-        "report",
-        &user_id,
-        &json!({ "user_id": user_id, "reason": request.reason, "report_id": report_id }),
-    )?;
-    Ok(Json(json!({})))
-}
 
 /// `GET /_matrix/client/v3/admin/whois/{userId}`
 ///
