@@ -199,6 +199,24 @@ impl Rooms {
         self.state_serialized(room_id)
     }
 
+    /// The room's current state, with no caller in mind.
+    ///
+    /// Same rule as [`Self::state_event_unscoped`]: for a caller whose
+    /// visibility into `room_id` was already decided by a gate other than
+    /// this module's -- the space hierarchy walk decides visibility per
+    /// room by its own rule (joined, world-readable, or public/knock) before
+    /// it ever reads a room's children, so asking [`Rooms::reader`] again
+    /// here would be a second, differently-shaped visibility answer for a
+    /// question already settled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room is unknown or an event body is
+    /// missing.
+    pub(crate) fn state_unscoped(&self, room_id: &str) -> Result<Vec<Value>, RoomError> {
+        self.state(room_id)
+    }
+
     /// A handle on the part of `room_id` that `user_id` may read.
     ///
     /// # Errors
@@ -243,6 +261,23 @@ impl RoomReader<'_> {
             Some(bound) => {
                 Ok(Value::Array(self.rooms.state_as_of(&self.room_id, bound)?).to_string())
             }
+        }
+    }
+
+    /// Every current state event of the room, as this caller may see it.
+    ///
+    /// For a caller with the whole room this is [`Rooms::state`] itself.
+    /// For a former member it is the state as of the position they were
+    /// removed at, the same bound every other read on this type applies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room is unknown or an event body is
+    /// missing.
+    pub fn state(&self) -> Result<Vec<Value>, RoomError> {
+        match self.scope.bound() {
+            None => self.rooms.state(&self.room_id),
+            Some(bound) => self.rooms.state_as_of(&self.room_id, bound),
         }
     }
 

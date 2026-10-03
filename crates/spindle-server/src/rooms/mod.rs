@@ -4006,7 +4006,7 @@ impl Rooms {
         // have journalled -- a partial append is exactly what must not be
         // left unsynced and then reported as an error.
         if self.store.journalled() != before {
-            spindle_store::Store::sync(self.store.as_ref(), Durability::Group)?;
+            self.store.as_ref().sync(Durability::Group)?;
         }
         done
     }
