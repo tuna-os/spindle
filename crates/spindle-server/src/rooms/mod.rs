@@ -601,10 +601,7 @@ impl Rooms {
                 } else if step.gap {
                     Some("a parent is outside the retained history".to_owned())
                 } else {
-                    match log
-                        .append_remote(step.input.clone())
-                        .map(|entry| entry.clone())
-                    {
+                    match log.append_remote(step.input.clone()).cloned() {
                         Ok(entry) => {
                             self.persist_synapse_entry(&mut log, room_id, &entry, event_id, &body)?;
                             appended += 1;
@@ -770,8 +767,9 @@ impl Rooms {
         room_id: &str,
         redactions: &[(String, String)],
     ) -> Result<usize, RoomError> {
-        let (present, members): (Vec<&(String, String)>, Vec<(String, String, i64)>) = self
-            .with_room_read(room_id, |_, log| {
+        type Members = Vec<(String, String, i64)>;
+        let (present, members): (Vec<&(String, String)>, Members) =
+            self.with_room_read(room_id, |_, log| {
                 let present = redactions
                     .iter()
                     .filter(|(target, _)| log.get(&EventId::new(target.as_str())).is_some())

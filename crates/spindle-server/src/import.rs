@@ -997,7 +997,9 @@ pub fn finish_room(
 #[cfg(feature = "synapse-import")]
 pub fn check_body(event: &SourceEvent, body: &serde_json::Value) -> Result<(), PersistError> {
     let body_state_key = body.get("state_key").and_then(serde_json::Value::as_str);
-    let body_parents: Vec<&str> = body
+    // Compared as sets: `event_edges` has no order column, so the rows come
+    // back in whatever order the database chooses.
+    let mut body_parents: Vec<&str> = body
         .get("prev_events")
         .and_then(serde_json::Value::as_array)
         .into_iter()
@@ -1009,14 +1011,12 @@ pub fn check_body(event: &SourceEvent, body: &serde_json::Value) -> Result<(), P
                 .or_else(|| parent.get(0).and_then(serde_json::Value::as_str))
         })
         .collect();
+    body_parents.sort_unstable();
+    let mut row_parents: Vec<&str> = event.prev_events.iter().map(String::as_str).collect();
+    row_parents.sort_unstable();
     if body.get("type").and_then(serde_json::Value::as_str) != Some(event.event_type.as_str())
         || body_state_key != event.state_key.as_deref()
-        || body_parents
-            != event
-                .prev_events
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
+        || body_parents != row_parents
     {
         return Err(PersistError::BodyMismatch(event.event_id.clone()));
     }

@@ -75,8 +75,14 @@ pub struct Options {
     /// A known login password for a localpart (the E2EE rig's users).
     /// Every other account gets an unguessable one: production logins go
     /// through the delegated identity provider.
-    pub password_for: Box<dyn Fn(&str) -> Option<String>>,
+    pub password_for: PasswordFor,
 }
+
+/// A known login password for a localpart, if there is one.
+pub type PasswordFor = Box<dyn Fn(&str) -> Option<String>>;
+
+/// One receipt row: type, user, event, thread.
+type ReceiptRow = (String, String, String, Option<String>);
 
 /// One data domain's counts.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -380,7 +386,7 @@ pub fn run(
 
     run.discover_users()?;
     let rooms = run.discover_rooms()?;
-    run.record_not_migrated()?;
+    run.record_not_migrated();
 
     run.phase("signing_key", Run::signing_key)?;
     run.phase("users", Run::import_users)?;
@@ -553,7 +559,7 @@ impl Run<'_, '_> {
     }
 
     /// Count what the import leaves behind, so the report can name it.
-    fn record_not_migrated(&mut self) -> Result<(), Error> {
+    fn record_not_migrated(&mut self) {
         let tables: [(&str, &str, &str); 15] = [
             (
                 "access_tokens",
@@ -643,7 +649,6 @@ impl Run<'_, '_> {
                 .not_migrated
                 .insert(table.to_owned(), format!("{count} rows: {reason}"));
         }
-        Ok(())
     }
 
     // ----- phases ----------------------------------------------------------
@@ -682,6 +687,15 @@ impl Run<'_, '_> {
         let accounts =
             crate::accounts::Accounts::new(self.target.store.as_ref(), &self.options.server_name);
         let mut imported = BTreeSet::new();
+        // One unguessable password, hashed once and then forgotten, for every
+        // account without a known password: sign-in goes through the
+        // delegated identity provider, and nobody holds the password.
+        let unguessable_hash = if self.options.dry_run {
+            String::new()
+        } else {
+            crate::accounts::hash_password(&crate::accounts::unguessable_password())
+                .map_err(write_error)?
+        };
         for row in rows {
             let user_id: String = row.get(0);
             if !self.user_in_scope(&user_id) {
@@ -718,9 +732,11 @@ impl Run<'_, '_> {
             let localpart = localpart(&user_id).to_owned();
             let exists = accounts.account(&localpart).map_err(write_error)?.is_some();
             if !exists {
-                let password = (self.options.password_for)(&localpart)
-                    .unwrap_or_else(crate::accounts::unguessable_password);
-                match accounts.register(&localpart, &password) {
+                let registered = match (self.options.password_for)(&localpart) {
+                    Some(password) => accounts.register(&localpart, &password),
+                    None => accounts.register_hashed(&localpart, &unguessable_hash),
+                };
+                match registered {
                     Ok(_) => {}
                     Err(crate::accounts::AccountError::InvalidUsername) => {
                         self.domain("users")
@@ -1602,8 +1618,7 @@ impl Run<'_, '_> {
              FROM receipts_linearized ORDER BY room_id, user_id, receipt_type",
             &[],
         )?;
-        let mut by_room: BTreeMap<String, Vec<(String, String, String, Option<String>)>> =
-            BTreeMap::new();
+        let mut by_room: BTreeMap<String, Vec<ReceiptRow>> = BTreeMap::new();
         for row in rows {
             let room_id: String = row.get(0);
             let user_id: String = row.get(2);
@@ -2169,6 +2184,9 @@ pub fn validate(
         );
     }
     let mut signature_check = Check::default();
+    // Synapse can hold more than one row for one (signer, key, target): a
+    // client that signed the same key again. Any of them held is a match.
+    let mut signatures: BTreeMap<(String, String, String, String), Vec<String>> = BTreeMap::new();
     for row in snapshot.query(
         "SELECT user_id, key_id, target_user_id, target_device_id, signature \
          FROM e2e_cross_signing_signatures \
@@ -2179,10 +2197,12 @@ pub fn validate(
         if !in_scope(&signer) {
             continue;
         }
-        let key_id: String = row.get(1);
-        let target_user: String = row.get(2);
-        let target: String = row.get(3);
-        let signature: String = row.get(4);
+        signatures
+            .entry((signer, row.get(1), row.get(2), row.get(3)))
+            .or_default()
+            .push(row.get(4));
+    }
+    for ((signer, key_id, target_user, target), values) in signatures {
         let mut held = devices
             .device_keys(&target_user, &target)
             .map_err(write_error)?;
@@ -2202,7 +2222,10 @@ pub fn validate(
         // A signature on a key Synapse no longer holds is skipped by the
         // import and reported there; it is not a mismatch here.
         if let Some(held) = held {
-            signature_check.expect(held["signatures"][&signer][&key_id] == signature, || {
+            let value = held["signatures"][&signer][&key_id]
+                .as_str()
+                .unwrap_or_default();
+            signature_check.expect(values.iter().any(|candidate| candidate == value), || {
                 format!("{signer} on {target_user} {target}: signature missing")
             });
         }

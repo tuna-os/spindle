@@ -34,6 +34,7 @@ fn source(id: &str, event_type: &str, state_key: Option<&str>, prev: &[&str]) ->
     }
 }
 
+#[allow(clippy::needless_pass_by_value, reason = "built inline at every call")]
 fn body(event: &SourceEvent, sender: &str, content: Value) -> Value {
     let mut json = json!({
         "room_id": ROOM,

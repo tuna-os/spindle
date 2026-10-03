@@ -183,6 +183,41 @@ impl<'a, S: Store> Accounts<'a, S> {
         Ok(account)
     }
 
+    /// Register a new account whose password hash the caller already holds.
+    ///
+    /// The Synapse importer creates over a thousand accounts that nobody
+    /// signs in to with a password (the delegated identity provider owns
+    /// sign-in). It hashes one unguessable password once and gives every
+    /// such account that hash, rather than paying an Argon2 hash, and its
+    /// 19 MiB working set, per account.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountError::UserInUse`] if the localpart is taken,
+    /// [`AccountError::InvalidUsername`] for a bad localpart, or a storage
+    /// error.
+    pub fn register_hashed(
+        &self,
+        localpart: &str,
+        password_hash: &str,
+    ) -> Result<Account, AccountError> {
+        validate_localpart(localpart)?;
+        if self.account(localpart)?.is_some() {
+            return Err(AccountError::UserInUse);
+        }
+        let account = Account {
+            localpart: localpart.to_owned(),
+            password_hash: password_hash.to_owned(),
+            deactivated: false,
+            admin: false,
+            locked: false,
+            suspended: false,
+        };
+        self.store
+            .put(&account_key(localpart), &encode(&account)?)?;
+        Ok(account)
+    }
+
     /// Flip an account's deactivation flag, leaving everything else.
     /// An unknown localpart is a no-op: deactivating a user who does
     /// not exist has nothing to do.
@@ -717,3 +752,16 @@ impl std::fmt::Display for AccountError {
 }
 
 impl std::error::Error for AccountError {}
+
+/// The Argon2id hash [`Accounts::register`] would store for `password`.
+///
+/// # Errors
+///
+/// Returns [`AccountError::Hashing`] if hashing fails.
+pub fn hash_password(password: &str) -> Result<String, AccountError> {
+    let salt = salt();
+    Ok(Argon2::default()
+        .hash_password_with_salt(password.as_bytes(), &salt)
+        .map_err(|error| AccountError::Hashing(error.to_string()))?
+        .to_string())
+}

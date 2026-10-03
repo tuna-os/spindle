@@ -179,7 +179,8 @@ fn rehearsal_password(localpart: &str) -> Result<String, String> {
 
 const IMPORT_USAGE: &str = "usage: spindle import-synapse <config> <postgres-config> \
     [--media <synapse media_store_path>] [--checkpoint <file>] [--dry-run] [--no-validate] \
-    [--rooms <id>,...] [--users <id>,...] [--exclude-rooms <file>] [--allow-nonempty]";
+    [--rooms <id>,...] [--users <id>,...] [--exclude-rooms <file>] [--allow-nonempty] \
+    [--validate-only]";
 
 /// The full Synapse import (#240, #563).
 ///
@@ -196,6 +197,7 @@ const IMPORT_USAGE: &str = "usage: spindle import-synapse <config> <postgres-con
 /// * `--exclude-rooms <file>`: one `<room_id> <reason>` per line.
 /// * `--allow-nonempty`: import into a store that already holds data and
 ///   has no checkpoint of this run, such as a second, supplementary source.
+/// * `--validate-only`: check a finished import against Synapse again.
 ///
 /// Environment: `SPINDLE_SYNAPSE_PASSWORD` (database password),
 /// `SPINDLE_SYNAPSE_SIGNING_KEY_FILE` (Synapse's signing key), and
@@ -214,6 +216,7 @@ fn import_synapse(arguments: &[String]) -> ExitCode {
     let mut checkpoint = None;
     let mut dry_run = false;
     let mut validate = true;
+    let mut validate_only = false;
     let mut allow_nonempty = false;
     let mut only_rooms = None;
     let mut only_users = None;
@@ -224,6 +227,7 @@ fn import_synapse(arguments: &[String]) -> ExitCode {
         match flag.as_str() {
             "--dry-run" => dry_run = true,
             "--no-validate" => validate = false,
+            "--validate-only" => validate_only = true,
             "--allow-nonempty" => allow_nonempty = true,
             "--media" => media_root = value().map(std::path::PathBuf::from),
             "--checkpoint" => checkpoint = value().map(std::path::PathBuf::from),
@@ -370,13 +374,22 @@ fn import_synapse(arguments: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut report = match full::run(
-        &options,
-        &mut snapshot,
-        &store,
-        spindle_server::blobs_for(&config),
-        previous,
-    ) {
+    let run = if validate_only {
+        previous.ok_or_else(|| {
+            full::Error::Checkpoint(
+                "--validate-only needs the checkpoint of a finished import".to_owned(),
+            )
+        })
+    } else {
+        full::run(
+            &options,
+            &mut snapshot,
+            &store,
+            spindle_server::blobs_for(&config),
+            previous,
+        )
+    };
+    let mut report = match run {
         Ok(report) => report,
         Err(error) => {
             eprintln!(
@@ -386,17 +399,18 @@ fn import_synapse(arguments: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if validate && !dry_run {
-        if let Err(error) = full::validate(
+    if validate
+        && !dry_run
+        && let Err(error) = full::validate(
             &options,
             &mut snapshot,
             &store,
             spindle_server::blobs_for(&config),
             &mut report,
-        ) {
-            eprintln!("spindle: validation stopped: {error}");
-            return ExitCode::FAILURE;
-        }
+        )
+    {
+        eprintln!("spindle: validation stopped: {error}");
+        return ExitCode::FAILURE;
     }
     println!(
         "import {}: rooms={} excluded_rooms={} events={} seconds={:.0} report={}",
