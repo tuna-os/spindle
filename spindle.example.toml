@@ -190,6 +190,10 @@ registrations = []
 # The token the provider presents when calling *us* — MAS's `matrix.secret`,
 # guarding the `/_synapse/mas/*` provisioning surface. Without it that
 # surface answers 404 and the provider cannot manage accounts here.
+# With client_id/client_secret left out, introspection presents this
+# secret as a bearer token instead, the way Synapse's
+# `matrix_authentication_service` section does — so a MAS set up for that
+# (no client of its own for the homeserver) needs no change.
 # homeserver_secret = "..."
 
 [turn]
