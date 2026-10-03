@@ -103,8 +103,9 @@ Recorded so that absence reads as a decision rather than an oversight:
 
 - **Horizontal scale-out** — deferred until after a single-node production gate
   ([#24](https://github.com/tuna-os/spindle/issues/24))
-- **MLS** — evaluated only after Megolm compatibility ships
-  ([#23](https://github.com/tuna-os/spindle/issues/23))
+- **MLS** — evaluated after Megolm compatibility shipped, and a no-go until a
+  stable MSC, a maintained client and hub mode exist
+  ([#23](https://github.com/tuna-os/spindle/issues/23), [docs/mls.md](docs/mls.md))
 - **Hub mode (MSC3995)** — the differentiator, behind a feature flag, after the
   ordinary-federation path is proven ([#22](https://github.com/tuna-os/spindle/issues/22))
 - **Synapse importer** — parked behind the API surface and MatrixRTC
