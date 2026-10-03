@@ -1,0 +1,43 @@
+# spindle-operator configuration (#457). docs/operator.md explains each part.
+#
+# The file holds no secret. Every credential is a reference -- `env:NAME`
+# or `file:/absolute/path` -- that the operator resolves only when it uses it.
+
+[operator]
+listen = "127.0.0.1:8090"
+# The origin browsers use. The OIDC redirect URI is
+# <public_url>/_spindle/operator/v1/session/callback.
+public_url = "https://operator.example.org"
+# The journal and evidence live here. Put it on a disk that neither
+# homeserver's shutdown takes with it.
+data_dir = "/var/lib/spindle-operator"
+# Thirty minutes; the operator refuses anything over eight hours.
+session_ttl_secs = 1800
+# Evidence content is deleted after a week; its hash stays in the audit trail.
+artifact_ttl_secs = 604800
+probe_timeout_secs = 5
+
+[oidc]
+issuer = "https://auth.example.org/"
+client_id = "spindle-operator"
+client_secret_ref = "file:/run/secrets/spindle-operator/oidc-client-secret"
+scopes = ["openid", "profile"]
+# The ID-token claim that `group:` entries below match against.
+roles_claim = "groups"
+
+[oidc.roles]
+viewer = ["group:matrix-viewers"]
+operator = ["group:matrix-operators"]
+# Approvers must be people other than the requester of what they approve;
+# give the role to a separate group, not to every operator.
+approver = ["group:matrix-approvers"]
+
+# An out-of-process driver. The operator runs the command once per call,
+# with the request on stdin and only PATH plus the secrets below in its
+# environment.
+[drivers.ess]
+command = ["/usr/bin/python3", "/opt/spindle/scripts/ess-kubernetes-driver.py", "operator-v1"]
+timeout_secs = 300
+
+[drivers.ess.secrets]
+KUBECONFIG_DATA = "file:/run/secrets/spindle-operator/kubeconfig"
