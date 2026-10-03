@@ -177,6 +177,7 @@ fn rehearsal_password(localpart: &str) -> Result<String, String> {
     Ok(password)
 }
 
+#[cfg(feature = "synapse-import")]
 const IMPORT_USAGE: &str = "usage: spindle import-synapse <config> <postgres-config> \
     [--media <synapse media_store_path>] [--checkpoint <file>] [--dry-run] [--no-validate] \
     [--rooms <id>,...] [--users <id>,...] [--exclude-rooms <file>] [--allow-nonempty] \

@@ -1,0 +1,73 @@
+# One `spindle import-synapse` run on the fi-dark-spindle volume. Rendered by
+# run.sh: __NAME__, __DB__, __PG_IP__, __IMAGE__, __NODE__ and __ARGS__.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: __NAME__
+  namespace: spindle-rehearsal
+  labels: {app: fi-import, part-of: spindle-full-import}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {app: fi-import, part-of: spindle-full-import}
+    spec:
+      restartPolicy: Never
+      nodeSelector: {kubernetes.io/hostname: __NODE__}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # No resolver: the database is the only name, through hostAliases.
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: [127.0.0.1]
+        options: [{name: ndots, value: "1"}, {name: attempts, value: "1"}, {name: timeout, value: "1"}]
+      hostAliases:
+      - {ip: "__PG_IP__", hostnames: [rehearsal-pg]}
+      securityContext:
+        runAsUser: 10092
+        runAsGroup: 10092
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: import
+        image: __IMAGE__
+        command:
+        - /usr/local/bin/spindle
+        - import-synapse
+        - /conf/spindle.toml
+        - "host=rehearsal-pg port=5432 user=postgres dbname=__DB__"
+__ARGS__
+        env:
+        - name: SPINDLE_SYNAPSE_PASSWORD
+          valueFrom: {secretKeyRef: {name: rehearsal-pg, key: POSTGRES_PASSWORD}}
+        - {name: SPINDLE_SYNAPSE_SIGNING_KEY_FILE, value: /secrets/signing/signing.key}
+        # Known passwords for the E2EE rig's users only; every other
+        # account gets an unguessable one.
+        - {name: SPINDLE_REHEARSAL_PASSWORD_DIR, value: /secrets/passwords}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: [ALL]}
+        resources:
+          requests: {cpu: 500m, memory: 1Gi}
+          limits: {cpu: "1", memory: 5Gi}
+        volumeMounts:
+        - {name: conf, mountPath: /conf, readOnly: true}
+        - {name: data, mountPath: /data}
+        - {name: signing, mountPath: /secrets/signing, readOnly: true}
+        - {name: passwords, mountPath: /secrets/passwords, readOnly: true}
+      volumes:
+      - name: conf
+        configMap: {name: fi-dark-spindle-config}
+      - name: data
+        persistentVolumeClaim: {claimName: fi-dark-spindle}
+      - name: signing
+        secret:
+          secretName: dark-synapse-secrets
+          items: [{key: signing.key, path: signing.key}]
+      - name: passwords
+        secret:
+          secretName: spindle-mig-rig
+          items:
+          - {key: password-a, path: spindle-mig-a}
+          - {key: password-b, path: spindle-mig-b}
+          - {key: password-c, path: spindle-mig-c}
