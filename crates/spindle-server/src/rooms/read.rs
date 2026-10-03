@@ -14,7 +14,7 @@
 
 use serde_json::Value;
 
-use super::{Context, RoomError, Rooms, TimelineEvent};
+use super::{Context, Direction, RoomError, Rooms, TimelineEvent};
 
 /// How much of a room a caller may read.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -317,8 +317,8 @@ impl RoomReader<'_> {
         }
     }
 
-    /// A page of the room's timeline, oldest position first, carrying only
-    /// what this caller may see.
+    /// A page of the room's timeline in `direction` from `from`, carrying
+    /// only what this caller may see.
     ///
     /// The visibility predicate is the reader's own scope. That is the
     /// point of the type: a caller cannot be paged a window computed
@@ -331,10 +331,13 @@ impl RoomReader<'_> {
     pub fn messages(
         &self,
         from: Option<i64>,
+        direction: Direction,
         limit: usize,
     ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
         self.rooms
-            .messages_visible(&self.room_id, from, limit, &|li| self.scope.admits(li))
+            .messages_visible(&self.room_id, from, direction, limit, &|li| {
+                self.scope.admits(li)
+            })
     }
 
     /// The window around one event, as this caller may see it.

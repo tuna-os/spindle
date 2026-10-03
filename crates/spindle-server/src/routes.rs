@@ -8884,6 +8884,7 @@ async fn send_event(
 #[derive(Debug, Deserialize)]
 struct MessagesQuery {
     from: Option<String>,
+    dir: Option<String>,
     limit: Option<usize>,
 }
 
@@ -8911,9 +8912,24 @@ async fn room_messages(
         ),
         None => None,
     };
+    // `dir=f` was read as `dir=b` until now, so matrix-rust-sdk's `/context`
+    // test, paging forward from a permalink, was handed the history behind it.
+    // The spec requires `dir`; a request without one is still read as
+    // backward, which is what every caller that left it out meant.
+    let direction = match query.dir.as_deref() {
+        Some("f") => crate::rooms::Direction::Forward,
+        Some("b") | None => crate::rooms::Direction::Backward,
+        Some(other) => {
+            return Err(MatrixError::bad_json(format!(
+                "dir must be 'f' or 'b', not {other:?}"
+            )));
+        }
+    };
     let limit = query.limit.unwrap_or(10).clamp(1, 100);
 
-    let (events, next) = reader.messages(from, limit).map_err(room_error)?;
+    let (events, next) = reader
+        .messages(from, direction, limit)
+        .map_err(room_error)?;
 
     let chunk: Vec<Value> = events
         .iter()
@@ -8930,14 +8946,21 @@ async fn room_messages(
     body.insert("chunk".to_owned(), Value::Array(chunk));
     // Where this chunk began. Without a `from` that is the room's head, which
     // is one past the newest event -- not the literal string "end", which is
-    // what this sent before and which no client could page from.
-    let start =
-        from.unwrap_or_else(|| events.first().map_or(0, |event| event.li.saturating_add(1)));
+    // what this sent before and which no client could page from. Forward,
+    // it is the room's beginning.
+    let start = from.unwrap_or_else(|| match direction {
+        crate::rooms::Direction::Backward => {
+            events.first().map_or(0, |event| event.li.saturating_add(1))
+        }
+        crate::rooms::Direction::Forward => 0,
+    });
     body.insert(
         "start".to_owned(),
         json!(crate::tokens::Pagination(start).to_string()),
     );
     // Absent when there is nothing more, which is how a client knows to stop.
+    // Forward, that is an empty page: the newest event is not the last one
+    // there will be (see `Rooms::messages_visible`).
     if let Some(next) = next {
         body.insert(
             "end".to_owned(),
