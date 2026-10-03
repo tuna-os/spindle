@@ -125,6 +125,12 @@ jobs:
       - name: Check the Synapse fixture builder
         run: python3 scripts/synapse-fixture-test.py
 
+      # Migration authority is a fail-closed state machine. Keep its evidence
+      # freshness, room-version, E2EE, federation and rollback boundaries
+      # executable without needing a live deployment.
+      - name: Check the migration workspace safety gates
+        run: python3 scripts/migration-workspace-test.py
+
       # The alert rules and the dashboard under deploy/ rot silently: a
       # renamed metric leaves a rule that never fires and a panel that
       # draws nothing. This holds every metric they name to metrics.rs and
