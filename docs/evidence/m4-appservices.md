@@ -1,12 +1,12 @@
 # M4 evidence: the mautrix appservice stack against Spindle
 
 The appservice milestone's exit criterion was never "the endpoints
-exist" — it was that the stack real bridges are built on actually works
-here. The harness in `evidence/mautrix-echo/` is that proof: it drives
-**mautrix-go's own `appservice` package** (the library every mautrix
-bridge — WhatsApp, Telegram, Signal, Discord — is built on, v0.30.0)
-against a freshly built Spindle, over real TCP, and asserts the whole
-loop.
+exist". It was that the stack real bridges build on works here. The
+harness in `evidence/mautrix-echo/` is that proof. It drives
+**mautrix-go's own `appservice` package** against a freshly built
+Spindle, over real TCP, and asserts the whole loop. That package
+(v0.30.0) is the library every mautrix bridge — WhatsApp, Telegram,
+Signal, Discord — is built on.
 
 ## What one passing run proves
 
@@ -25,19 +25,20 @@ Transcript from 2026-08-27, mautrix-go v0.30.0, Spindle at the commit
 that adds this file. Step by step, that is:
 
 1. **Registration works the way bridges register.** The bot intent
-   ensures its own account through `m.login.application_service` — the
-   UIA-free path — and the ghost provisions through the intent API with
-   a profile write under masquerade, exactly how every mautrix puppet
-   comes into being.
+   ensures its own account through `m.login.application_service`, the
+   UIA-free path. The ghost provisions through the intent API with a
+   profile write under masquerade. That is exactly how every mautrix
+   puppet comes into being.
 2. **The transaction push is real.** The human's message arrives at the
-   bridge as a pushed `PUT /_matrix/app/v1/transactions/{txnId}`, and it
-   is *mautrix* that verifies our `hs_token` before dispatching — a
-   wrong token would be rejected by the library, not by our own tests
-   grading their own homework.
+   bridge as a pushed `PUT /_matrix/app/v1/transactions/{txnId}`. It is
+   *mautrix* that verifies our `hs_token` before it dispatches the
+   transaction. So the library would reject a wrong token, not our own
+   tests that grade their own homework.
 3. **MSC2409 lands in a real consumer.** The human's typing arrives
-   through the `ephemeral` array and mautrix's own gate (`receive_ephemeral`
-   in its registration model) lets it through to the handler.
-4. **The loop closes.** The ghost answers through the intent API and the
+   through the `ephemeral` array. Then mautrix's own gate
+   (`receive_ephemeral` in its registration model) lets it through to the
+   handler.
+4. **The loop closes.** The ghost answers through the intent API. The
    human reads the reply back through the ordinary client API.
 
 ## What the harness deliberately does not cover

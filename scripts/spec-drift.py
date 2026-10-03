@@ -130,9 +130,9 @@ def report(spec_root: pathlib.Path) -> str:
         f"Read against [matrix-spec]({openapi.SPEC_URL}) at `{pin[:12]}`"
         + (", the pin" if pin == openapi.SPEC_PIN else f" (the pin is `{openapi.SPEC_PIN[:12]}`; this is a preview)"),
         "`scripts/openapi-check.py` validates responses against. An operation is",
-        "*served* when the router registers its method and path; the placeholders",
-        "are compared by position, not by name. Bumping the pin rewrites this file,",
-        "and the diff is the work the release brought.",
+        "*served* when the router registers its method and path; the check compares",
+        "the placeholders by position, not by name. A bump of the pin rewrites this",
+        "file, and the diff is the work the release brought.",
         "",
     ]
     for label, api_dir in APIS:
@@ -154,7 +154,7 @@ def report(spec_root: pathlib.Path) -> str:
                 heading = "### Not served, in the spec since before v1.1"
             lines += [heading, ""]
             if deprecated_count:
-                lines += [f"{deprecated_count} of these are deprecated upstream and can stay unserved.", ""]
+                lines += [f"Upstream deprecates {deprecated_count} of these, so they can stay unserved.", ""]
             for op in sorted(ops, key=lambda o: (o["template"], o["method"])):
                 mark = " *(deprecated)*" if op["deprecated"] else ""
                 lines.append(f"- `{op['method']} {op['template']}`{mark} — `{op['file']}`")
@@ -180,8 +180,8 @@ def report(spec_root: pathlib.Path) -> str:
         "",
         f"{len(extra)} routes the pinned spec does not define: MSC surfaces under",
         "`unstable/`, the admin and MAS-compatibility APIs, and stable spellings",
-        "newer than the pin. Each MSC route must be accounted for in",
-        "`contrib/msc/ledger.toml`; `scripts/msc-ledger.py --check` enforces that.",
+        "newer than the pin. `contrib/msc/ledger.toml` must account for each MSC",
+        "route; `scripts/msc-ledger.py --check` enforces that.",
         "",
     ]
     for path in extra:

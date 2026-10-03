@@ -9,12 +9,12 @@ never runs on the hot path.**
 · [SPEC.md](SPEC.md)
 
 > **Status: an experiment under construction, not a deployment.** The
-> client-server surface is broad and tested, federation interoperates with real
-> Synapse, and nothing here has ever run in production. Releases are weekly
-> `v0.0.x` prereleases that name a build and promise nothing else: no
-> upgrade path, and the storage format has already broken once —
-> deliberately, with the [test that caught it](crates/spindle-store/tests/backend_compatibility.rs)
-> kept and inverted rather than deleted.
+> client-server surface is broad and tested. Federation interoperates with
+> real Synapse, and nothing here has ever run in production. Releases are
+> weekly `v0.0.x` prereleases. Each one names a build and promises nothing
+> else: no upgrade path. The storage format has already broken once,
+> deliberately. We kept the [test that caught it](crates/spindle-store/tests/backend_compatibility.rs)
+> and inverted it; we did not delete it.
 
 ---
 
@@ -49,9 +49,9 @@ curl -XPOST localhost:8008/_matrix/client/v3/register \
 # → {"access_token":"syt_…","device_id":"DEV…","user_id":"@alice:localhost:8008"}
 ```
 
-Point Element, Element X, Cinny, Nheko or FluffyChat at `http://localhost:8008`
-and it works unmodified — Spindle serves ordinary room version 11 and 12 rooms,
-so there is no client capability to negotiate.
+Point Element, Element X, Cinny, Nheko or FluffyChat at http://localhost:8008,
+and it works unmodified. The rooms that Spindle serves are ordinary room version 11
+and 12 rooms, so clients have no capability to negotiate.
 
 [`spindle.example.toml`](spindle.example.toml) documents every setting, and a
 CI gate fails if a config field exists in the code and not in that file.
@@ -64,20 +64,20 @@ CI gate fails if a config field exists in the code and not in that file.
 
 ## The idea
 
-Matrix stores rooms as a replicated DAG, and everything expensive about running
-a homeserver — state groups, auth-chain differences, topological ordering,
-forward-extremity churn — exists to answer one question: *given concurrent
-branches, what is the room state?*
+Matrix stores rooms as a replicated DAG. Everything expensive about how a
+homeserver runs exists to answer one question: *given concurrent branches,
+what is the room state*? State groups, auth-chain differences, topological
+order and forward-extremity churn all exist for that question.
 
-**Almost no real traffic has concurrent branches.** A room owned by one server,
-or a room whose events all flow through one serializing node, has a DAG that is
-a **chain**: every event has exactly one `prev_event`, and there is never more
-than one forward extremity. On a chain, state resolution is the identity
+**Almost no real traffic has concurrent branches.** One server can own a room,
+or one node can serialize all of a room's events. In both cases the room's DAG
+is a **chain**: every event has exactly one `prev_event`, and there is never
+more than one forward extremity. On a chain, state resolution is the identity
 function.
 
 Spindle takes the Linearized Matrix idea (MSC3995 /
 `draft-ralston-mimi-linearized-matrix`) and applies it *inward*, as a storage
-and execution strategy, rather than only outward as a federation profile:
+and execution strategy, and not only outward as a federation profile:
 
 | | |
 |---|---|
@@ -92,7 +92,8 @@ In a non-federated room, state resolution never runs at all.
 
 Native Spindle rooms are ordinary room version 11 rooms. A chain is a valid DAG,
 so the performance properties come from the implementation, not a new wire
-format — no new room version, no client capability, no peer negotiation.
+format. There is no new room version, no client capability and no peer
+negotiation.
 Synapse, Dendrite and Conduit federate with it over the unmodified
 Server-Server API.
 
@@ -116,16 +117,16 @@ impossible and the exception path is dead code.
 | **M7** MatrixRTC | Server side served | **MSC4140 delayed events** — the dead-man's switch that stops calls accumulating ghost participants, which no other Rust homeserver has — plus MSC4354 sticky events, MSC4143 transport discovery, a built-in LiveKit JWT service or the OpenID round trip for an external one, ringing and decline. Element Call's own Playwright suite runs with Spindle in Synapse's seat: thirteen specs pass, among them a two-party call with video through LiveKit and MatrixRTC 2.0 sticky-event membership with a rejoin after an improper leave. Ringing, churn, a restart mid-call and the federated call are what remains of the gate |
 
 **225 routes** and a **310-test Complement ratchet** in CI, over a workspace of
-100+ test suites. The first two are gated — the [dashboard](docs/dashboard.md)
-is parsed from the router and CI fails on drift, and the ratchet is a file every
-entry of which must pass — so what they say matches `main` rather than matching
-when someone last edited this paragraph.
+100+ test suites. CI gates the first two. A script parses the
+[dashboard](docs/dashboard.md) from the router, and CI fails on drift. The
+ratchet is a file, and every entry in it must pass. So what they say matches
+`main`, not the code on the day someone last edited this paragraph.
 
 ### Throughput
 
-Same host, same driver, same sitting; Synapse 1.159.0 on both back ends,
-because for a *write throughput* comparison the database is not a detail —
-SQLite's single-writer lock is the property under test:
+Same host, same driver, same session. Synapse 1.159.0 ran on both back ends.
+For a *write throughput* comparison, the database is not a detail: SQLite's
+single-writer lock is the property under test.
 
 | clients | Spindle | Synapse (SQLite) | Synapse (Postgres) |
 |---|---|---|---|
@@ -139,50 +140,50 @@ Mean / p95 latency at eight clients: **4.7 / 10.1 ms** against Synapse's
 
 Per-process write throughput is **25–50× Synapse's**, and unlike a latency
 figure this one holds *under concurrency*. Both servers ran under the same
-four-core constraint, so the handicap is shared and the ratio is the result.
+four-core constraint, so both share the handicap and the ratio is the result.
 
 ---
 
 ## What this is honest about
 
-This section is longer than the marketing, on purpose.
+This section is longer than the sales pitch, on purpose.
 
 **The architectural win is a constant factor, not an asymptotic one.**
-Resolving a fork is 2.2–3.1× cheaper than `ruma-state-res` across the whole
-range out to a full `max_fork_window` — flat, not widening. And the current
-Rust homeservers already skip state resolution on a fork-free event, so "we
-skip it and they don't" was never true of them. What linear storage removes is
-the per-event *bookkeeping* the algorithm needs in order to exist — extremity
-sets, state-group delta stacks — not the algorithm.
+Fork resolution is 2.2–3.1× cheaper than `ruma-state-res` up to a full
+`max_fork_window`. The gap is flat across that range; it does not widen. Also, the current
+Rust homeservers do not run state resolution on a fork-free event either. So
+"we skip it and they don't" was never true of them. Linear storage removes the
+per-event *upkeep* that the algorithm needs to exist: extremity sets and
+state-group delta stacks. It does not remove the algorithm.
 
-**The load-bearing claim is the equivalence theorem** (SPEC §9.3): that
-window-bounded state resolution produces exactly what full state resolution
-would. It is tested as one, differentially against `ruma-state-res`, for every
-fork the fast path claims to handle. A counterexample is a release blocker.
+**The claim everything rests on is the equivalence theorem** (SPEC §9.3):
+state resolution inside a bounded window gives exactly what full state
+resolution would. The test suite checks it as a theorem, differentially against
+`ruma-state-res`, for every fork the fast path claims to handle. A counterexample is a release blocker.
 
-**Losses are published next to wins.** [docs/benchmarks.md](docs/benchmarks.md)
-carries the cells where Spindle lost, the investigations, and two claims that
-were **retracted after being published here** — a scaling curve that turned out
-to be the four-core test rig, and a 1.33× improvement measured against a
-baseline from the wrong branch.
+**We publish losses next to wins.** [docs/benchmarks.md](docs/benchmarks.md)
+carries the cells where Spindle lost, and the investigations. It also carries
+two claims that **we retracted after we published them here**. One was a scale
+curve that turned out to be the four-core test rig. The other was a 1.33×
+improvement, measured against a baseline from the wrong branch.
 
-**The benchmark host cannot resolve small differences.** Four cores, 10–14%
-run-to-run spread. So performance work is gated by *counting* — store reads,
-lock acquisitions, coalesced fsyncs — not by wall clocks. When a change shows
-in-process and not end-to-end, that is
-[recorded as a non-result](docs/benchmarks.md).
+**Small differences are below what the benchmark host can resolve.** Four
+cores, 10–14% run-to-run spread. So we gate performance work on *counts* —
+store reads, lock acquisitions, coalesced fsyncs — not on wall clocks. When a
+change shows in-process and not end-to-end, we
+[record that as a non-result](docs/benchmarks.md).
 
 **Federation numbers are still design targets.** Everything measured is one
 server. The architectural claim gets its real test as the federation rig grows.
 
-**Two authorization holes shipped and were found by reading, not by tests.**
-Nine read endpoints served any room's contents to any account
-(#257, #258). Both are fixed, with a route table walked by every test — and
-#268 exists because the finding rate was "however much someone happened to
-look".
+**Two holes in authorization shipped. People found them when they read the
+code; no test found them.** Nine read endpoints served any room's contents to
+any account (#257, #258). We fixed both and added a route table that every
+test walks. #268 exists because the discovery rate was "however much someone
+happened to look".
 
-The risks that would invalidate the headline claim are enumerated in
-[SPEC §21](SPEC.md).
+[SPEC §21](SPEC.md) lists the risks that would invalidate the headline
+claim.
 
 ---
 
@@ -224,17 +225,18 @@ so there is no database to provision.
 
 CI gates on all of the above plus the Complement ratchet, a config-drift check,
 a generated-dashboard drift check, and pinned-action and benchmark-tooling
-checks. CONTRIBUTING.md has the longer version, and docs/releasing.md what a
-tag does. New performance work is expected to arrive with a counting assertion
-rather than a timing one, for the reason given above.
+checks. [`CONTRIBUTING.md`](CONTRIBUTING.md) has the longer version, and
+[`docs/releasing.md`](docs/releasing.md) says what a tag does. We expect new
+performance work to arrive with an assertion that counts, not one that times,
+for the reason given above.
 
 ## License
 
 Dual-licensed under **[MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE)**, at
-your option; contributions are accepted under the same terms.
-[`LICENSING.md`](LICENSING.md) records what was checked before choosing, why
-not AGPL despite Synapse being AGPL, and why the copyright line reads as it
-does.
+your option. We accept contributions under the same terms.
+[`LICENSING.md`](LICENSING.md) records what we checked before we chose. It also
+says why not AGPL, even though Synapse is AGPL, and why the copyright line
+reads as it does.
 
 <!-- hive-contribute-plea: donated-compute appeal, keep in sync across repos -->
 ## Contribute compute — no code needed

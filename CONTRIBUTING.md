@@ -8,7 +8,7 @@ is how to work on it.
 ## Build and test
 
 `rust-toolchain.toml` pins the compiler and rustup fetches it on its own.
-Storage is embedded, so there is nothing to provision.
+Spindle embeds its storage, so there is nothing to provision.
 
 ```sh
 cargo test --workspace --all-features
@@ -16,11 +16,11 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 ```
 
-`just lint` and `just test` run the same commands, and `just --list` names
-the rest: the generated pages (`just docs`) and the competitive benchmark
-sitting from a bare checkout (`just bench <group>`, or its three steps
-`bench-field`, `bench-build`, `bench-sitting`; docs/benchmarks.md says what
-each does and what the field is pinned to).
+`just lint` and `just test` run the same commands. `just --list` names the
+rest: the generated pages (`just docs`) and a competitive benchmark run from a
+bare checkout. That run is `just bench <group>`, or its three steps
+`bench-field`, `bench-build`, `bench-sitting`. docs/benchmarks.md says what
+each step does and lists the pins for the field.
 
 Those three are the pull-request gate, with a few checks that keep
 generated and hand-copied things honest:
@@ -31,45 +31,47 @@ python3 scripts/readme-numbers.py --check       # the README's headline numbers 
 python3 scripts/actions-pinned.py               # every action is pinned to a commit
 ```
 
-The slower suites run on pushes to main and nightly, not on pull requests:
-the Complement ratchet (`scripts/complement.sh`, needs Docker), Element
-Web and Element Call end to end, the full-mesh peer-to-peer call, the
-Neutrino mesh seam, a real bridge through the appservice API, release-mode
-performance budgets, and weekly fuzzing and coverage. `.github/workflows/`
+The slower suites run on pushes to main and nightly, not on pull requests.
+They are the Complement ratchet (`scripts/complement.sh`, needs Docker), and
+Element Web and Element Call end to end. They also include the full-mesh
+peer-to-peer call, the Neutrino mesh seam and a real bridge through the
+appservice API. Release-mode performance budgets run there too, with weekly
+fuzz tests and coverage. `.github/workflows/`
 is the list; each job's comment says why it runs where it runs.
 
 ## What a change is expected to carry
 
 - **A test that would have failed before it.** For a bug, the test
-  reproduces the bug; for a feature, the test is the claim. Performance
-  work arrives with a counting assertion (allocations, bytes, comparisons)
-  rather than a timing, because timings do not fail deterministically.
-- **No stubs.** An endpoint that is routed works; one that is not answers
-  404. `tests/surface.rs` enforces that `/versions` advertises only what
+  reproduces the bug. For a feature, the test is the claim. Performance
+  work arrives with an assertion that counts something: allocations, bytes
+  or comparisons. It does not use a timing, because timings do not fail
+  deterministically.
+- **No stubs.** If the router serves an endpoint, the endpoint works.
+  Otherwise it answers 404. `tests/surface.rs` enforces that `/versions` advertises only what
   is built. A placeholder that returns `{}` is worse than a 404, because
   a client cannot tell it from success.
-- **Honest numbers.** The dashboard, the README's counts and the
-  Complement allowlist are generated or gated. A claim about performance
+- **Honest numbers.** A generator or a CI gate stands behind the
+  dashboard, the README's counts and the Complement allowlist. A claim about performance
   links the benchmark that made it; a retracted claim stays retracted in
   the text.
-- **Comments that say why.** The code says what; a comment earns its place
-  by recording the reason, the alternative that was rejected, or the
+- **Comments that say why.** The code says what. A comment earns its
+  place when it records the reason, the alternative we rejected, or the
   failure that motivated it.
 
 ## Adding an endpoint or an MSC
 
 Both have a generated page CI holds to the code. A new route must
 appear in `docs/dashboard.md` and leave `docs/spec-gaps.md` (run `just
-regen`); a new MSC surface needs an entry in `contrib/msc/ledger.toml`
-naming the test that proves it, and the flag it advertises. The whole
+regen`). A new MSC surface needs an entry in `contrib/msc/ledger.toml`.
+The entry names the test that proves it, and the flag it advertises. The whole
 procedure, with the spec-release and pin-bump cases, is in
 [docs/maintenance.md](docs/maintenance.md).
 
 ## Finding something to do
 
 Issues labelled `good first issue` are self-contained with a design in the
-issue; `help wanted` marks work that needs something this repository does
-not have (a client, a bridge, a second homeserver). The milestone table in
+issue. The `help wanted` label marks work that needs something this
+repository does not have (a client, a bridge, a second homeserver). The milestone table in
 the README is the roadmap in prose, and ROADMAP.md has the entry points
 for each track.
 
