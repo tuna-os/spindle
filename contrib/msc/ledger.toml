@@ -331,8 +331,9 @@ evidence = ["crates/spindle-server/tests/push_rules.rs"]
 number = 3706
 title = "Faster joins: partial state on send_join"
 status = "planned"
+stable = "1.6"
 evidence = ["SPEC.md"]
-notes = "SPEC.md says partial-state joins are accepted on the receive side; nothing in the code or the tests handles members_omitted, so this ledger does not repeat the claim. Not started."
+notes = "Merged upstream; spec v1.6 added omit_members, members_omitted and servers_in_room to send_join v2. The fields are optional, so Spindle conforms without them: as joiner it does not send omit_members, and as resident it ignores omit_members and returns the full state. Partial-state joins on the receive side are not started, and nothing in the code or the tests handles members_omitted."
 
 [[msc]]
 number = 4244
