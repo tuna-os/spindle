@@ -22,8 +22,9 @@ use spindle_store::RoomStore;
 
 use super::{
     INVITE_STR, IdentifiedEvent, JOIN_STR, PersistInput, RoomError, Rooms, auth_events_for,
-    event_body_key, version_in,
+    event_body_key, rules_of, version_in,
 };
+use crate::authorize::StoredEvent;
 
 impl Rooms {
     /// Whether `domain` has a joined member in the room right now.
@@ -983,6 +984,184 @@ impl Rooms {
 
         open.insert(room_id.to_owned(), Arc::new(RwLock::new(log)));
         Ok(())
+    }
+
+    /// Prepend a verified initial history page after a remote join.
+    ///
+    /// `state` is the resident's state immediately before the oldest event in
+    /// `history`. The complete page is authorized before anything is written;
+    /// commits then run newest-to-oldest because backfill indices descend.
+    /// Existing IDs are skipped, making a retry after a restart idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if an event belongs to another room, cannot be
+    /// named under this room version, has unavailable auth, or is unauthorized.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "validation precedes the commit boundary"
+    )]
+    pub fn backfill_remote(
+        &self,
+        room_id: &str,
+        state: &[Value],
+        auth_chain: &[Value],
+        history: &[Value],
+    ) -> Result<usize, RoomError> {
+        let open = self
+            .open
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let room = open
+            .get(room_id)
+            .cloned()
+            .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
+        let mut log = room
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let version = self.version_in_log(&log, room_id)?;
+
+        let identify = |event: &Value| -> Result<String, RoomError> {
+            if event["type"] != "m.room.create" && event["room_id"].as_str() != Some(room_id) {
+                return Err(RoomError::Append(
+                    "backfill response contains an event for another room".to_owned(),
+                ));
+            }
+            let ruma::CanonicalJsonValue::Object(canonical) =
+                ruma::CanonicalJsonValue::try_from(event.clone())
+                    .map_err(|error| RoomError::Append(error.to_string()))?
+            else {
+                return Err(RoomError::Append("event is not an object".to_owned()));
+            };
+            Pdu::from_remote(version.clone(), canonical)
+                .map(|pdu| pdu.event_id().as_str().to_owned())
+                .map_err(|error| RoomError::Append(format!("backfilled event: {error:?}")))
+        };
+
+        let mut bodies = std::collections::BTreeMap::<String, Value>::new();
+        for event in state.iter().chain(auth_chain).chain(history) {
+            let id = identify(event)?;
+            bodies.entry(id).or_insert_with(|| event.clone());
+        }
+        let mut ordered = history
+            .iter()
+            .map(|event| Ok((identify(event)?, event.clone())))
+            .collect::<Result<Vec<_>, RoomError>>()?;
+        ordered.sort_by_key(|(id, event)| {
+            (
+                event["depth"].as_u64().unwrap_or(0),
+                event["origin_server_ts"].as_u64().unwrap_or(0),
+                id.clone(),
+            )
+        });
+        ordered.dedup_by(|left, right| left.0 == right.0);
+
+        // `/state` is a set, not a timeline: applying its state keys directly
+        // constructs the exact snapshot before the page's oldest event.
+        let mut snapshot = spindle_core::StateSnapshot::new();
+        for event in state {
+            if let Some(state_key) = event["state_key"].as_str() {
+                let id = identify(event)?;
+                snapshot = snapshot.apply(
+                    StateKey::new(event["type"].as_str().unwrap_or_default(), state_key),
+                    id,
+                );
+            }
+        }
+
+        let rules = rules_of(&version)?;
+        let parse = |id: &str| -> Option<StoredEvent> {
+            let body = bodies
+                .get(id)
+                .cloned()
+                .or_else(|| self.read_event(room_id, &EventId::new(id)).ok())?;
+            StoredEvent::parse_in(id, room_id, &body).ok()
+        };
+        let mut states_after = std::collections::HashMap::new();
+        for (id, event) in &ordered {
+            let candidate = StoredEvent::parse_in(id, room_id, event).map_err(|error| {
+                RoomError::Build(format!("cannot authorize backfilled event {id}: {error}"))
+            })?;
+            crate::authorize::authorize_received(
+                &rules.authorization,
+                &candidate,
+                |wanted| parse(wanted.as_str()),
+                |event_type: &ruma::events::StateEventType, state_key: &str| {
+                    let wanted = snapshot.get(&StateKey::new(event_type.to_string(), state_key))?;
+                    parse(wanted)
+                },
+            )
+            .map_err(|error| {
+                RoomError::Forbidden(format!("backfilled event {id} was not authorized: {error}"))
+            })?;
+            if let Some(state_key) = event["state_key"].as_str() {
+                snapshot = snapshot.apply(
+                    StateKey::new(event["type"].as_str().unwrap_or_default(), state_key),
+                    id.as_str(),
+                );
+            }
+            states_after.insert(id.clone(), snapshot.clone());
+        }
+
+        let room_store = RoomStore::new(self.store.as_ref(), room_id);
+        let mut inserted = 0;
+        // Newest first assigns 0, -1, ... so the oldest event sorts first.
+        // Use our validated topological order rather than trusting wire order.
+        for (id, event) in ordered.iter().rev() {
+            let id = id.clone();
+            if log.get(&EventId::new(id.as_str())).is_some() {
+                continue;
+            }
+            let previous = event["prev_events"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(EventId::new)
+                .collect();
+            let mut input = EventInput::new(id.as_str(), previous);
+            if let Some(state_key) = event["state_key"].as_str() {
+                input = input.with_state_key(StateKey::new(
+                    event["type"].as_str().unwrap_or_default(),
+                    state_key,
+                ));
+            }
+            let event_state = states_after
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| RoomError::StateUnavailable(id.clone()))?;
+            let entry = log
+                .prepend_remote(input, event_state, event["depth"].as_u64().unwrap_or(0))
+                .map_err(|error| RoomError::Append(format!("{error:?}")))?
+                .clone();
+            let extra = vec![
+                (event_body_key(room_id, &id), serde_json::to_vec(event)?),
+                (
+                    spindle_core::keys::event_room(&id),
+                    room_id.as_bytes().to_vec(),
+                ),
+            ];
+            room_store.journal_entry_with(&entry, &log, &extra)?;
+            if event["type"] == "m.room.member"
+                && let (Some(user_id), Some(membership)) = (
+                    event["state_key"].as_str(),
+                    event["content"]["membership"].as_str(),
+                )
+            {
+                spindle_store::Store::put(
+                    self.store.as_ref(),
+                    &spindle_core::keys::member_history(user_id, room_id, entry.li.get()),
+                    membership.as_bytes(),
+                )?;
+            }
+            inserted += 1;
+        }
+        drop(log);
+        drop(open);
+        if inserted != 0 {
+            self.appended.notify_waiters();
+        }
+        Ok(inserted)
     }
 
     /// Accept one event another server created, after the caller verified

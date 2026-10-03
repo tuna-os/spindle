@@ -34,6 +34,13 @@ const MAX_KEY_VALIDITY: Duration = Duration::from_secs(7 * 24 * 3600);
 /// per minute, and a peer that was genuinely down retries within it.
 const NEGATIVE_CACHE: Duration = Duration::from_secs(60);
 
+/// A verified initial history page and the state immediately before it.
+pub struct RemoteBackfill {
+    pub history: Vec<Value>,
+    pub state: Vec<Value>,
+    pub auth_chain: Vec<Value>,
+}
+
 pub struct Federation {
     store: Arc<FjallStore>,
     server_name: String,
@@ -891,6 +898,133 @@ impl Federation {
             return Err(peer_refusal(destination, "send_join", status, body));
         }
         Ok(body)
+    }
+
+    /// Fetch and verify one bounded history page after a remote join.
+    ///
+    /// The state at the oldest event is fetched with the page. That gives the
+    /// room layer an exact authorization starting point instead of guessing
+    /// historical state from the (current) `send_join` response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] if either request fails or any returned
+    /// event has the wrong reference hash, content hash, or signature.
+    pub async fn remote_backfill(
+        &self,
+        destination: &str,
+        room_id: &str,
+        event_id: &str,
+        limit: usize,
+        version: &ruma::RoomVersionId,
+    ) -> Result<RemoteBackfill, FederationError> {
+        let room: String = form_urlencoded::byte_serialize(room_id.as_bytes()).collect();
+        let event: String = form_urlencoded::byte_serialize(event_id.as_bytes()).collect();
+        let uri = format!(
+            "/_matrix/federation/v1/backfill/{room}?v={event}&limit={}",
+            limit.clamp(1, 100)
+        );
+        let body = self
+            .signed_json(destination, &uri, None, "backfill")
+            .await?;
+        let pdus = body["pdus"]
+            .as_array()
+            .ok_or_else(|| FederationError::Refused("backfill response has no pdus".to_owned()))?;
+        let mut history = Vec::with_capacity(pdus.len());
+        for event in pdus {
+            history.push(self.verify_remote_event(event, version).await?);
+        }
+        let oldest_id = history
+            .last()
+            .map_or_else(|| event_id.to_owned(), |(_, id)| id.clone());
+        let oldest: String = form_urlencoded::byte_serialize(oldest_id.as_bytes()).collect();
+        let state_uri = format!("/_matrix/federation/v1/state/{room}?event_id={oldest}");
+        let state_body = self
+            .signed_json(destination, &state_uri, None, "state")
+            .await?;
+
+        let verify_array = |key: &str| -> Result<Vec<Value>, FederationError> {
+            state_body[key]
+                .as_array()
+                .ok_or_else(|| FederationError::Refused(format!("state response has no {key}")))
+                .cloned()
+        };
+        let state_unverified = verify_array("pdus")?;
+        let auth_unverified = verify_array("auth_chain")?;
+        let mut state = Vec::with_capacity(state_unverified.len());
+        for event in &state_unverified {
+            state.push(self.verify_remote_event(event, version).await?.0);
+        }
+        let mut auth_chain = Vec::with_capacity(auth_unverified.len());
+        for event in &auth_unverified {
+            auth_chain.push(self.verify_remote_event(event, version).await?.0);
+        }
+
+        Ok(RemoteBackfill {
+            history: history.into_iter().map(|(event, _)| event).collect(),
+            state,
+            auth_chain,
+        })
+    }
+
+    async fn verify_remote_event(
+        &self,
+        event: &Value,
+        version: &ruma::RoomVersionId,
+    ) -> Result<(Value, String), FederationError> {
+        let mut event = event.clone();
+        let advertised = event
+            .as_object_mut()
+            .and_then(|object| object.remove("event_id"))
+            .and_then(|id| id.as_str().map(str::to_owned));
+        let ruma::CanonicalJsonValue::Object(canonical) =
+            ruma::CanonicalJsonValue::try_from(event.clone()).map_err(|error| {
+                FederationError::Refused(format!("remote event is not canonical: {error}"))
+            })?
+        else {
+            return Err(FederationError::Refused(
+                "remote event is not an object".to_owned(),
+            ));
+        };
+        let parsed = spindle_core::Pdu::from_remote(version.clone(), canonical.clone())
+            .map_err(|error| FederationError::Refused(format!("remote event: {error:?}")))?;
+        let event_id = parsed.event_id().as_str().to_owned();
+        if advertised.as_deref().is_some_and(|id| id != event_id) {
+            return Err(FederationError::Refused(format!(
+                "remote event was advertised as {}, but hashes to {event_id}",
+                advertised.unwrap_or_default()
+            )));
+        }
+
+        let signers = event["signatures"]
+            .as_object()
+            .ok_or_else(|| FederationError::Refused("remote event has no signatures".to_owned()))?;
+        let mut key_map = ruma::signatures::PublicKeyMap::new();
+        for signer in signers.keys() {
+            if signer == &self.server_name {
+                key_map.entry(signer.clone()).or_default().insert(
+                    self.key.key_id(),
+                    ruma::serde::Base64::parse(self.key.public_key_base64()).map_err(|error| {
+                        FederationError::Refused(format!("local signing key: {error}"))
+                    })?,
+                );
+            } else {
+                key_map.extend(
+                    self.peer_keys(signer)
+                        .await?
+                        .map_for(event["origin_server_ts"].as_u64()),
+                );
+            }
+        }
+        match spindle_core::version::verify(&key_map, &canonical, version) {
+            Ok(ruma::signatures::Verified::All) => Ok((event, event_id)),
+            Ok(ruma::signatures::Verified::Signatures) => Err(FederationError::Refused(format!(
+                "remote event {event_id} has an invalid content hash"
+            ))),
+            Err(error) => Err(FederationError::Refused(format!(
+                "remote event {event_id} signature: {error}"
+            ))),
+        }
     }
 
     /// Ask the invited user's server to co-sign an invite — the client

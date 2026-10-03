@@ -4308,12 +4308,15 @@ fn invite_origin(state: &AppState, user_id: &str, room_id: &str) -> Option<Strin
 }
 
 /// Walk the `make_join`/`send_join` handshake as the joining server.
+#[allow(clippy::too_many_lines, reason = "one federation handshake")]
 async fn join_remote(
     state: &AppState,
     user_id: &str,
     room_id: &str,
     servers: &[String],
 ) -> Result<Json<Value>, MatrixError> {
+    const INITIAL_HISTORY_LIMIT: usize = 50;
+
     let candidates = join_candidates(
         &state.config.server.name,
         room_id,
@@ -4415,6 +4418,30 @@ async fn join_remote(
             .rooms
             .join_remote(room_id, &seed_state, &seed_rest, &join, &join_id)
             .map_err(room_error)?;
+
+        // `send_join` intentionally contains state and auth rather than the
+        // preceding timeline. A bounded backfill makes immediate client
+        // pagination useful; failure is non-fatal because the join itself is
+        // complete and a partial peer must not leave a corrupt room behind.
+        match state
+            .federation
+            .remote_backfill(server, room_id, &join_id, INITIAL_HISTORY_LIMIT, &version)
+            .await
+        {
+            Ok(page) => {
+                if let Err(error) = state.rooms.backfill_remote(
+                    room_id,
+                    &page.state,
+                    &page.auth_chain,
+                    &page.history,
+                ) {
+                    tracing::warn!(%error, %room_id, %server, "initial federation backfill refused");
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%error, %room_id, %server, "initial federation backfill unavailable");
+            }
+        }
         state.rooms.wake_sync_waiters();
         return Ok(Json(json!({ "room_id": room_id })));
     }

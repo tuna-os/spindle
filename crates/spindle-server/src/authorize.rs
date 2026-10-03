@@ -189,3 +189,23 @@ pub fn authorize(
 ) -> Result<(), String> {
     check_state_dependent_auth_rules(rules, candidate.clone(), by_state)
 }
+
+/// Run both receipt-time authorization checks for an event fetched from a peer.
+///
+/// Unlike a locally built event, a backfilled event brings its own
+/// `auth_events` list. Its shape must therefore be checked before the usual
+/// state-dependent predicate runs.
+///
+/// # Errors
+///
+/// Returns the first independent or state-dependent authorization rule that
+/// refuses the event.
+pub fn authorize_received(
+    rules: &AuthorizationRules,
+    candidate: &StoredEvent,
+    by_id: impl Fn(&ruma::EventId) -> Option<StoredEvent>,
+    by_state: impl Fn(&StateEventType, &str) -> Option<StoredEvent>,
+) -> Result<(), String> {
+    ruma::state_res::check_state_independent_auth_rules(rules, candidate.clone(), by_id)?;
+    check_state_dependent_auth_rules(rules, candidate.clone(), by_state)
+}
