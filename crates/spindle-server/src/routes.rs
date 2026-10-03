@@ -66,6 +66,7 @@ pub const MOUNTED: &[&str] = &[
     "/_spindle/rtc/livekit/sfu/get",
     "/_matrix/client/unstable/org.matrix.msc4140/delayed_events",
     "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}",
+    "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}",
     "/_matrix/client/v3/rooms/{room_id}/state",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}",
@@ -704,6 +705,13 @@ fn timeline_routes() -> Router<AppState> {
         .route(
             "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}",
             post(delayed_event_action),
+        )
+        // The current MSC4140 shape: the action in the path and no access
+        // token, so a delegate (lk-jwt-service) can keep a leave event
+        // pending, or send it, for a client that has gone away.
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}",
+            post(delayed_event_action_by_id),
         )
         .route("/_matrix/client/v3/rooms/{room_id}/state", get(room_state))
         // Two routes, because the spec has two forms and a router cannot
@@ -8187,47 +8195,86 @@ async fn delayed_event_action(
         .act(&delay_id, &identity.user_id, action)
         .map_err(delay_error)?;
     if let Some(event) = to_send {
-        let sent = match &event.state_key {
-            Some(state_key) => state.rooms.set_state(
-                &event.room_id,
-                &event.sender,
-                state.key.pair(),
-                &event.event_type,
-                state_key,
-                &event.content,
-            ),
-            None => state.rooms.send(
-                &event.room_id,
-                &event.sender,
-                state.key.pair(),
-                &event.event_type,
-                &event.content,
-            ),
-        };
-        // MSC4309, for the same reason the fire loop records its outcome:
-        // this device learns the result from the response, but the user's
-        // *other* devices are exactly as uninformed as if the delay had
-        // fired on its own. A failure to record must not fail the send that
-        // already happened, so it is logged rather than returned.
-        let record = crate::delayed::FinalisedDelay {
-            delay_id: event.delay_id.clone(),
-            room_id: event.room_id.clone(),
-            event_type: event.event_type.clone(),
-            state_key: event.state_key.clone(),
-            event_id: sent.as_ref().ok().cloned(),
-            error: sent.as_ref().err().map(ToString::to_string),
-        };
-        if let Err(error) =
-            state
-                .delayed
-                .finalise(&event.sender, state.rooms.stream_position(), &record)
-        {
-            tracing::warn!(
-                delay_id = %event.delay_id,
-                "a delayed event was sent but its outcome was not recorded: {error}"
-            );
-        }
-        sent.map_err(room_error)?;
+        send_delayed_now(&state, &event)?;
+    }
+    Ok(Json(json!({})))
+}
+
+/// Send a delayed event now, on its owner's behalf, and record the outcome
+/// for MSC4309 -- the `send` action, from either route.
+fn send_delayed_now(
+    state: &AppState,
+    event: &crate::delayed::DelayedEvent,
+) -> Result<(), MatrixError> {
+    let sent = match &event.state_key {
+        Some(state_key) => state.rooms.set_state(
+            &event.room_id,
+            &event.sender,
+            state.key.pair(),
+            &event.event_type,
+            state_key,
+            &event.content,
+        ),
+        None => state.rooms.send(
+            &event.room_id,
+            &event.sender,
+            state.key.pair(),
+            &event.event_type,
+            &event.content,
+        ),
+    };
+    // MSC4309, for the same reason the fire loop records its outcome:
+    // this device learns the result from the response, but the user's
+    // *other* devices are exactly as uninformed as if the delay had
+    // fired on its own. A failure to record must not fail the send that
+    // already happened, so it is logged rather than returned.
+    let record = crate::delayed::FinalisedDelay {
+        delay_id: event.delay_id.clone(),
+        room_id: event.room_id.clone(),
+        event_type: event.event_type.clone(),
+        state_key: event.state_key.clone(),
+        event_id: sent.as_ref().ok().cloned(),
+        error: sent.as_ref().err().map(ToString::to_string),
+    };
+    if let Err(error) =
+        state
+            .delayed
+            .finalise(&event.sender, state.rooms.stream_position(), &record)
+    {
+        tracing::warn!(
+            delay_id = %event.delay_id,
+            "a delayed event was sent but its outcome was not recorded: {error}"
+        );
+    }
+    sent.map_err(room_error)?;
+    Ok(())
+}
+
+/// `POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}`
+///
+/// No access token: the delay ID is the capability (see
+/// [`crate::delayed::Delayed::act_by_id`]). This is what
+/// lk-jwt-service calls to restart a delegated leave event while the
+/// participant is still connected to the SFU, and to send it when they are
+/// not; answering it 404 makes the service drop the delegation, and the
+/// leave fires while the caller is still in the call.
+async fn delayed_event_action_by_id(
+    State(state): State<AppState>,
+    axum::extract::Path((delay_id, action)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    let action = crate::delayed::Action::parse(&action).ok_or_else(|| {
+        MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_UNRECOGNIZED",
+            format!("no delayed-event action {action:?}"),
+        )
+    })?;
+    if let Some(event) = state
+        .delayed
+        .act_by_id(&delay_id, action)
+        .map_err(delay_error)?
+    {
+        send_delayed_now(&state, &event)?;
     }
     Ok(Json(json!({})))
 }

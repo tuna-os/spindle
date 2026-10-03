@@ -89,7 +89,7 @@ title = "Delayed events"
 status = "served"
 unstable = ["org.matrix.msc4140"]
 evidence = ["crates/spindle-server/tests/delayed_events.rs", "crates/spindle-server/tests/rtc_membership.rs"]
-notes = "All four endpoints; the dead-man's switch MatrixRTC members rely on."
+notes = "All four endpoints, plus the token-less `/delayed_events/{delay_id}/{action}` form lk-jwt-service uses for delegated leave events; the dead-man's switch MatrixRTC members rely on."
 
 [[msc]]
 number = 4309
