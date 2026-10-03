@@ -103,13 +103,14 @@ number = 4075
 title = "MatrixRTC ringing (m.rtc.notification)"
 status = "served"
 evidence = ["crates/spindle-server/tests/push_delivery.rs", "docs/rate-limits.md"]
-notes = "Rings are pushed and budgeted per sender (rings_per_minute)."
+notes = "Rings are pushed and budgeted per sender (rings_per_minute). Declines are part of this MSC now (m.rtc.decline), still sent as org.matrix.msc4310.rtc.decline, and push nobody."
 
 [[msc]]
 number = 4310
 title = "MatrixRTC ring decline"
-status = "served"
+status = "superseded"
 evidence = ["crates/spindle-server/tests/push_delivery.rs"]
+notes = "Absorbed into MSC4075 and closed upstream as obsolete. MSC4075 keeps org.matrix.msc4310.rtc.decline as the unstable event type, so the decline is still served, under MSC4075."
 
 [[msc]]
 number = 3757
