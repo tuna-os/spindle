@@ -1358,6 +1358,67 @@ async fn make_room_admin_authors_a_real_event() {
     assert_eq!(body["entries"][0]["detail"]["user_id"], alice.as_str());
 }
 
+/// Room versions before 10 allow power levels written as strings, and the
+/// rooms a migration brings over have them. Read as absent, every level fell
+/// back to `users_default`, and no local user had the power to author.
+#[tokio::test]
+async fn make_room_admin_reads_string_power_levels_in_a_v6_room() {
+    let server = Instance::start().await;
+    let admin_token = server.register("root").await;
+    server.promote("root");
+    let alice_token = server.register("alice").await;
+    let operator = server.user("root");
+    let alice = server.user("alice");
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/createRoom",
+            Some(&admin_token),
+            Some(&json!({ "preset": "public_chat", "room_version": "6" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/join/{room}"),
+            Some(&alice_token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    // A v6 power levels event may state every level as a string; the auth
+    // rules of the version accept it.
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.power_levels"),
+            Some(&admin_token),
+            Some(&json!({
+                "users": { operator.as_str(): "100" },
+                "users_default": "0",
+                "events": { "m.room.power_levels": "100" },
+                "state_default": "50",
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "a v6 room refused string power levels: {body}");
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_spindle/admin/v1/rooms/{room}/make_room_admin"),
+            Some(&admin_token),
+            Some(&json!({ "user_id": alice })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["power_level"], 100, "{body}");
+}
+
 #[tokio::test]
 async fn make_room_admin_says_so_when_nobody_local_can_author() {
     let server = Instance::start().await;

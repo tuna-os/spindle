@@ -52,27 +52,39 @@ pub const SPEC_VERSIONS: &[SpecVersion] = &[
 /// hands back events our machinery rightly refuses — which is how
 /// Complement's `TestJoinViaRoomIDAndServerName` found this.
 ///
-/// # Why not the older versions, when they appear to work
+/// # A version is listed only when it is served at that version
 ///
-/// They create. Driving `Rooms::create` at v6 through v12 with this list
-/// widened, every one creates, authorizes and accepts messages, and
-/// `ruma` reports `event_id_format = V3` for everything from v4 up — the
-/// same event IDs this server computes. On that evidence v4–v12 looks
-/// advertisable, and this list was briefly widened to say so.
+/// Creating a room at a version is not the same as *joining* one over
+/// federation at it, and only the second is what advertising promises. An
+/// earlier widening to v4–v10 was withdrawn because `send_join` refused a
+/// v7 join (`M_BAD_JSON`) while `/createRoom` quietly substituted v11 for
+/// every unlisted version, so knock and restricted-join tests passed on a
+/// room of the wrong version.
 ///
-/// **Complement says otherwise, and it is right.** With v7 actually
-/// served, `make_join` truthfully answers "7", the peer builds a
-/// v7-shaped join, and `send_join` rejects it:
+/// Versions 6 to 10 are listed because each is exercised at its own
+/// version: two-server joins and event exchange, redaction under the
+/// version's own algorithm, the v7 knock and v8/v9 restricted-join
+/// handshakes, and v1–v9 string power levels. The migration corpus tracked
+/// by #456 holds real v6, v9 and v10 rooms. The differences between them are
+/// ruma's per-version rules plus the three places this server makes a
+/// version-dependent choice of its own: the redaction target's location
+/// (top level before v11), the restricted-join nomination (v8+), and knock
+/// templates (v7+).
 ///
-/// ```text
-/// MustJoinRoom: send_join failed: {"errcode":"M_BAD_JSON", …}
-/// ```
-///
-/// A version is listed only after its client and federation paths are tested
-/// without substituting this build's default. Version 10 is the first legacy
-/// version restored for Synapse migration: it is the dominant version in the
-/// production-shaped migration corpus tracked by #456.
-pub const ROOM_VERSIONS: &[&str] = &["10", "11", "12", spindle_core::STATE_DAG_V12];
+/// Versions 1 to 5 are not listed: v1 and v2 name events by
+/// `$random:server` rather than by hash and link them by `[id, hash]`
+/// pairs, which this server does not yet build, and v3 to v5 are not yet
+/// exercised.
+pub const ROOM_VERSIONS: &[&str] = &[
+    "6",
+    "7",
+    "8",
+    "9",
+    "10",
+    "11",
+    "12",
+    spindle_core::STATE_DAG_V12,
+];
 
 /// The default room version.
 pub const DEFAULT_ROOM_VERSION: Option<&str> = Some("11");

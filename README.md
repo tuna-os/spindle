@@ -50,8 +50,8 @@ curl -XPOST localhost:8008/_matrix/client/v3/register \
 ```
 
 Point Element, Element X, Cinny, Nheko or FluffyChat at `http://localhost:8008`
-and it works unmodified — Spindle serves ordinary room version 11 and 12 rooms,
-so there is no client capability to negotiate.
+and it works unmodified — Spindle serves ordinary rooms of room versions 6 to
+12, so there is no client capability to negotiate.
 
 [`spindle.example.toml`](spindle.example.toml) documents every setting, and a
 CI gate fails if a config field exists in the code and not in that file.

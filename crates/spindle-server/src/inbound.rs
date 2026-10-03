@@ -750,24 +750,7 @@ pub(crate) async fn make_join(
     // room. For a room of any other version that answer is simply false.
     let version = state.rooms.room_version(&room_id).map_err(room_error)?;
     let version = version.as_str();
-
-    // The `ver` list is the peer telling us what *they* can speak. If this
-    // room's version is not in it, no template we produce will parse on
-    // their side, so the refusal is correct — but it has to name the version
-    // they would have needed.
-    let offered = request.uri().query().is_some_and(|query| {
-        query
-            .split('&')
-            .filter_map(|pair| pair.strip_prefix("ver="))
-            .any(|ver| ver == version)
-    });
-    if !offered {
-        return Err(MatrixError::new(
-            StatusCode::BAD_REQUEST,
-            "M_INCOMPATIBLE_ROOM_VERSION",
-            format!("this room is version {version}"),
-        ));
-    }
+    require_offered_version(request.uri().query(), version)?;
     let event = state
         .rooms
         .make_join_template(&room_id, &user_id)
@@ -776,6 +759,23 @@ pub(crate) async fn make_join(
         "room_version": version,
         "event": event,
     })))
+}
+
+/// Refuse a `make_join`/`make_knock` whose `ver` list lacks the room's version.
+///
+/// The `ver` list is the peer telling us what *they* can speak. If this
+/// room's version is not in it, no template we produce will parse on their
+/// side, so the refusal is correct -- but it has to name the version they
+/// would have needed, which is what `room_version` in the body is for.
+fn require_offered_version(query: Option<&str>, version: &str) -> Result<(), MatrixError> {
+    let offered = query.is_some_and(|query| {
+        form_urlencoded::parse(query.as_bytes())
+            .any(|(key, value)| key == "ver" && value == version)
+    });
+    if offered {
+        return Ok(());
+    }
+    Err(MatrixError::incompatible_room_version(version))
 }
 
 /// `GET /_matrix/federation/v1/make_leave/{roomId}/{userId}`
@@ -836,6 +836,7 @@ pub(crate) async fn make_knock(
         ));
     }
     let version = state.rooms.room_version(&room_id).map_err(room_error)?;
+    require_offered_version(request.uri().query(), version.as_str())?;
     let event = state
         .rooms
         .make_knock_template(&room_id, &user_id)

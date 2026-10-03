@@ -242,7 +242,9 @@ optimization would break compatibility:
 - **Auth rules.** The predicate is the spec's. We change when it is cheap to
   evaluate, never what it decides.
 - **Room versions.** We speak the versions the ecosystem speaks; we do not
-  invent one to make our life easier. (The v11-vs-v12 default is still open —
+  invent one to make our life easier. Spindle serves versions 6 to 12. Each
+  room uses the rules of its own version. Spindle does not serve versions 1
+  to 5 yet (#456). (The v11-vs-v12 default is still open —
   SPEC §11.6 — but that is a choice *between* real versions.)
 - **CS/SS endpoint semantics.** Sync tokens are opaque to clients, which is
   exactly why §10.2 is free to put a linear stream position inside one. Opaque

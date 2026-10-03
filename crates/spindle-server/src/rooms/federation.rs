@@ -191,6 +191,16 @@ impl Rooms {
     /// [`RoomError::Forbidden`] when the room does not accept knocks.
     pub fn make_knock_template(&self, room_id: &str, user_id: &str) -> Result<Value, RoomError> {
         self.with_room(room_id, |rooms, log| {
+            // Knocking arrived in v7. In an older room a `knock` join rule
+            // is a value the rules do not know and a knock membership is
+            // refused outright, so the template would be a promise the
+            // version cannot keep -- refused here, as Synapse does, at the
+            // cheap step.
+            if !rooms.rules_in(log, room_id)?.authorization.knocking {
+                return Err(RoomError::Forbidden(
+                    "this room's version does not support knocking".to_owned(),
+                ));
+            }
             // What this server would author on itself: a template naming
             // a tip this server cannot fold hands the user an event
             // `send_*` then refuses.
