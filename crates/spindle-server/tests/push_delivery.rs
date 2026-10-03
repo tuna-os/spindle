@@ -7,7 +7,7 @@
 //! that asked for `event_id_only` gets exactly that; a failed delivery is
 //! retried under the same event and a `rejected` pushkey is forgotten; a
 //! `MatrixRTC` ring (MSC4075) reaches the members it mentions at high
-//! priority and a decline (MSC4310) reaches nobody; and a gateway inside
+//! priority and a decline (MSC4075, which absorbed MSC4310) reaches nobody; and a gateway inside
 //! this server's network is refused at registration.
 
 use std::sync::{Arc, Mutex};
@@ -500,7 +500,8 @@ async fn a_ring_reaches_who_it_mentions_at_high_priority_and_a_decline_reaches_n
     // Carol was not mentioned: her phone stays quiet.
     gateway.settle(before + 1).await;
 
-    // MSC4310: a decline carries no mention and must not push by default.
+    // MSC4075 (the decline came from MSC4310, hence the unstable type): a
+    // decline carries no mention and must not push by default.
     hs.send(
         &bob,
         &room,

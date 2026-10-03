@@ -37,7 +37,7 @@ what became of each proposal.
 | [MSC3916](https://github.com/matrix-org/matrix-spec-proposals/pull/3916) | Authenticated media | v1.11 | — | `federation_media.rs`, `media.rs`, `spec_wave2.rs` |  |
 | [MSC3983](https://github.com/matrix-org/matrix-spec-proposals/pull/3983) | Appservices claim one-time keys | — | — | `appservice_key_proxy.rs` |  |
 | [MSC3984](https://github.com/matrix-org/matrix-spec-proposals/pull/3984) | Appservices answer key queries | — | — | `appservice_key_proxy.rs` |  |
-| [MSC4075](https://github.com/matrix-org/matrix-spec-proposals/pull/4075) | MatrixRTC ringing (m.rtc.notification) | — | — | `push_delivery.rs`, `rate-limits.md` | Rings are pushed and budgeted per sender (rings_per_minute). |
+| [MSC4075](https://github.com/matrix-org/matrix-spec-proposals/pull/4075) | MatrixRTC ringing (m.rtc.notification) | — | — | `push_delivery.rs`, `rate-limits.md` | Rings are pushed and budgeted per sender (rings_per_minute). Declines are part of this MSC now (m.rtc.decline), still sent as org.matrix.msc4310.rtc.decline, and push nobody. |
 | [MSC4140](https://github.com/matrix-org/matrix-spec-proposals/pull/4140) | Delayed events | — | `org.matrix.msc4140` | `delayed_events.rs`, `rtc_membership.rs` | All four endpoints; the dead-man's switch MatrixRTC members rely on. |
 | [MSC4143](https://github.com/matrix-org/matrix-spec-proposals/pull/4143) | MatrixRTC transport discovery (rtc/transports) | — | `org.matrix.msc4143` | `rtc_transports.rs`, `matrix-rtc.md` | Served under the unstable and the v1 path; answers an empty list when no backend is configured. Absorbed MSC4158. |
 | [MSC4186](https://github.com/matrix-org/matrix-spec-proposals/pull/4186) | Simplified sliding sync | merged, unreleased | — | `sliding_sync.rs` | Lists, room subscriptions, required_state, timeline, extensions, invites in the list, heroes and bump_stamp. What Element X syncs with. |
@@ -49,7 +49,6 @@ what became of each proposal.
 | [MSC4289](https://github.com/matrix-org/matrix-spec-proposals/pull/4289) | Explicitly privilege room creators (room v12) | v1.16 | — | `restricted_join.rs`, `rtc_membership.rs` |  |
 | [MSC4291](https://github.com/matrix-org/matrix-spec-proposals/pull/4291) | Room IDs as hashes of the create event (room v12) | v1.16 | — | `rooms.rs`, `federation_remote_join.rs` |  |
 | [MSC4309](https://github.com/matrix-org/matrix-spec-proposals/pull/4309) | Finalised delayed events in sync | — | — | `delayed_events.rs` | The org.matrix.msc4140.finalised_delayed_events sync section. |
-| [MSC4310](https://github.com/matrix-org/matrix-spec-proposals/pull/4310) | MatrixRTC ring decline | — | — | `push_delivery.rs` |  |
 | [MSC4354](https://github.com/matrix-org/matrix-spec-proposals/pull/4354) | Sticky events | — | `org.matrix.msc4354` | `sticky_events.rs`, `rtc_membership.rs` | sticky_duration_ms on a send, the key on the event, the sync section, federation push, and delayed+sticky. What MatrixRTC 2.0 makes m.rtc.member. |
 
 ## Planned
@@ -75,6 +74,7 @@ what became of each proposal.
 |---|---|---|---|---|---|
 | [MSC3575](https://github.com/matrix-org/matrix-spec-proposals/pull/3575) | Sliding sync (original) | — | — | `sliding_sync.rs` | Superseded by MSC4186, which kept the org.matrix.simplified_msc3575 route prefix; that is why the route names this number. |
 | [MSC4158](https://github.com/matrix-org/matrix-spec-proposals/pull/4158) | MatrixRTC foci (earlier form) | — | — | `rtc_transports.rs` | Absorbed into MSC4143. |
+| [MSC4310](https://github.com/matrix-org/matrix-spec-proposals/pull/4310) | MatrixRTC ring decline | — | — | `push_delivery.rs` | Absorbed into MSC4075 and closed upstream as obsolete. MSC4075 keeps org.matrix.msc4310.rtc.decline as the unstable event type, so the decline is still served, under MSC4075. |
 
 ## Declined
 
