@@ -33,7 +33,11 @@ fn minimal() -> Connection {
              CREATE TABLE event_edges (event_id TEXT, prev_event_id TEXT, room_id TEXT,
                                        is_state BOOL NOT NULL DEFAULT 0);
              CREATE TABLE current_state_events (event_id TEXT, room_id TEXT, type TEXT,
-                                                state_key TEXT);",
+                                                state_key TEXT);
+             CREATE TABLE event_to_state_groups (event_id TEXT, state_group BIGINT);
+             CREATE TABLE state_group_edges (state_group BIGINT, prev_state_group BIGINT);
+             CREATE TABLE state_groups_state (state_group BIGINT, room_id TEXT, type TEXT,
+                                              state_key TEXT, event_id TEXT);",
         )
         .unwrap();
     connection
@@ -185,14 +189,130 @@ fn an_absent_room_is_refused_by_name() {
     assert!(matches!(error, ReadError::UnknownRoom(_)), "{error:?}");
 }
 
-/// History starting at a backfill horizon is refused, naming what would fix it.
+/// Write one slot of a state group.
+fn slot(connection: &Connection, group: i64, event_type: &str, state_key: &str, event_id: &str) {
+    connection
+        .execute(
+            "INSERT INTO state_groups_state VALUES (?, ?, ?, ?, ?)",
+            rusqlite::params![group, ROOM, event_type, state_key, event_id],
+        )
+        .unwrap();
+}
+
+fn group_edge(connection: &Connection, group: i64, parent: i64) {
+    connection
+        .execute(
+            "INSERT INTO state_group_edges VALUES (?, ?)",
+            rusqlite::params![group, parent],
+        )
+        .unwrap();
+}
+
+/// A room Synapse joined over federation: its history starts at `$join`,
+/// whose parent it never fetched, and the state after `$join` is group 3 --
+/// a delta on group 2, itself a delta on the full state in group 1.
+fn horizon() -> Connection {
+    let connection = minimal();
+    event(
+        &connection,
+        "$join",
+        "m.room.member",
+        Some("@c:e.example"),
+        1,
+    );
+    event(&connection, "$after", "m.room.message", None, 2);
+    edge(&connection, "$join", "$unfetched", Some(ROOM), false);
+    edge(&connection, "$after", "$join", Some(ROOM), false);
+    connection
+        .execute("INSERT INTO event_to_state_groups VALUES ('$join', 3)", [])
+        .unwrap();
+
+    slot(&connection, 1, "m.room.create", "", "$create");
+    slot(&connection, 1, "m.room.member", "@a:e.example", "$a");
+    slot(&connection, 1, "m.room.join_rules", "", "$invite_only");
+    group_edge(&connection, 2, 1);
+    // Group 2 changes the join rules; group 1's value must not survive.
+    slot(&connection, 2, "m.room.join_rules", "", "$public");
+    group_edge(&connection, 3, 2);
+    slot(&connection, 3, "m.room.member", "@c:e.example", "$join");
+
+    for (event_type, state_key, event_id) in [
+        ("m.room.create", "", "$create"),
+        ("m.room.member", "@a:e.example", "$a"),
+        ("m.room.join_rules", "", "$public"),
+        ("m.room.member", "@c:e.example", "$join"),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO current_state_events VALUES (?, ?, ?, ?)",
+                rusqlite::params![event_id, ROOM, event_type, state_key],
+            )
+            .unwrap();
+    }
+    connection
+}
+
+fn key(event_type: &str, state_key: &str) -> (String, String) {
+    (event_type.to_owned(), state_key.to_owned())
+}
+
+/// The state at a horizon root is the whole delta chain, newest value first.
 ///
-/// The reader knows *why* the state is missing, so it says so rather than
-/// handing `plan` a room it would refuse for a vaguer reason. Resolving it
-/// means walking Synapse's state groups, which are deltas chained through
-/// `state_group_edges`.
+/// Reading only the root's own group would give one slot -- `$join` -- and an
+/// import seeded from it would start the room without its creator, its other
+/// members or its join rules. Reading the chain oldest-wins would give the
+/// join rules group 2 replaced. Both are plausible-looking states.
 #[test]
-fn a_room_without_a_create_event_names_state_groups() {
+fn a_horizon_root_reads_its_state_through_the_delta_chain() {
+    let connection = horizon();
+    let room = read_room(&connection, ROOM).expect("the horizon room reads");
+    let state = room.state_after_root.expect("no state was attached");
+
+    assert_eq!(state.len(), 4, "{state:?}");
+    assert_eq!(state[&key("m.room.create", "")], "$create");
+    assert_eq!(state[&key("m.room.member", "@a:e.example")], "$a");
+    assert_eq!(state[&key("m.room.member", "@c:e.example")], "$join");
+    assert_eq!(
+        state[&key("m.room.join_rules", "")],
+        "$public",
+        "an older group's value overrode a newer one"
+    );
+}
+
+/// With the state attached, the horizon room replays with no divergence --
+/// and the outcome says the check was seeded from the source.
+#[test]
+fn a_horizon_room_replays_and_says_it_was_seeded() {
+    let connection = horizon();
+    let room = read_room(&connection, ROOM).unwrap();
+    let outcome = replay(&room).expect("the horizon room replays");
+
+    assert!(outcome.clean(), "{:?}", outcome.divergence);
+    assert!(outcome.seeded_from_source);
+    assert_eq!(outcome.imported, 2);
+}
+
+/// A create-rooted room gets no seeded state: it folds forward from nothing,
+/// which is the stronger check, and reading state groups would weaken it.
+#[test]
+fn a_create_rooted_room_is_not_seeded() {
+    let connection = minimal();
+    creation(&connection);
+    connection
+        .execute(
+            "INSERT INTO event_to_state_groups VALUES ('$create', 1)",
+            [],
+        )
+        .unwrap();
+    slot(&connection, 1, "m.room.create", "", "$create");
+
+    let room = read_room(&connection, ROOM).unwrap();
+    assert!(room.state_after_root.is_none());
+}
+
+/// A horizon root with no state group is refused, naming the root.
+#[test]
+fn a_horizon_root_without_a_state_group_is_refused() {
     let connection = minimal();
     event(
         &connection,
@@ -203,14 +323,49 @@ fn a_room_without_a_create_event_names_state_groups() {
     );
 
     let error = read_room(&connection, ROOM).unwrap_err();
-    let ReadError::NeedsStateGroups { root, .. } = &error else {
+    let ReadError::MissingStateGroup { root, .. } = &error else {
         panic!("{error:?}");
     };
     assert_eq!(root, "$join");
     assert!(
-        error.to_string().contains("state_group_edges"),
-        "the refusal does not name what would resolve it: {error}"
+        error.to_string().contains("event_to_state_groups"),
+        "the refusal does not name where it looked: {error}"
     );
+}
+
+/// A chain that loops is refused rather than walked forever or cut short.
+#[test]
+fn a_state_group_cycle_is_refused() {
+    let connection = horizon();
+    connection
+        .execute("DELETE FROM state_group_edges WHERE state_group = 2", [])
+        .unwrap();
+    group_edge(&connection, 2, 3);
+
+    let error = read_room(&connection, ROOM).unwrap_err();
+    assert!(
+        matches!(error, ReadError::StateGroupCycle { .. }),
+        "{error:?}"
+    );
+}
+
+/// A group with two parents is refused rather than resolved by row order.
+#[test]
+fn a_state_group_with_two_parents_is_refused() {
+    let connection = horizon();
+    group_edge(&connection, 3, 1);
+
+    let error = read_room(&connection, ROOM).unwrap_err();
+    let ReadError::AmbiguousStateGroup {
+        state_group,
+        parents,
+        ..
+    } = &error
+    else {
+        panic!("{error:?}");
+    };
+    assert_eq!(*state_group, 3);
+    assert_eq!(parents.len(), 2);
 }
 
 #[test]
@@ -225,8 +380,9 @@ fn rooms_are_listed() {
     );
 }
 
-/// The whole path, against Synapse's own DDL: build the fixture, read it,
-/// replay it, and compare the result with what Synapse says the room is.
+/// The whole path, against Synapse's own DDL: build the fixture, read both of
+/// its rooms, replay them, and compare the result with what Synapse says each
+/// room is.
 ///
 /// This is the one that checks *column names*, which a hand-built schema
 /// cannot. Skipped without a checkout; point `SYNAPSE_SOURCE` at one to run it.
@@ -258,7 +414,13 @@ fn the_populated_fixture_reads_and_replays_without_divergence() {
 
     let connection = Connection::open(&fixture).unwrap();
     let listed = rooms(&connection).unwrap();
-    assert_eq!(listed, vec!["!fixture:example.org".to_owned()]);
+    assert_eq!(
+        listed,
+        vec![
+            "!fixture:example.org".to_owned(),
+            "!horizon:example.org".to_owned()
+        ]
+    );
 
     let fixture_room =
         read_room(&connection, "!fixture:example.org").expect("the fixture room reads");
@@ -283,4 +445,26 @@ fn the_populated_fixture_reads_and_replays_without_divergence() {
         outcome.divergence
     );
     assert_eq!(outcome.imported, 8, "{:?}", outcome.excluded);
+
+    // The horizon room: no m.room.create in its timeline, so its starting
+    // state comes from a three-group delta chain in the real state tables.
+    let horizon = read_room(&connection, "!horizon:example.org").expect("the horizon room reads");
+    let state = horizon
+        .state_after_root
+        .as_ref()
+        .expect("no state was read for the horizon root");
+    assert_eq!(state.len(), 4, "{state:?}");
+    assert_eq!(
+        state[&("m.room.join_rules".to_owned(), String::new())],
+        "$h_public",
+        "an older state group's value overrode a newer one"
+    );
+    let outcome = replay(&horizon).expect("the horizon room replays");
+    assert!(
+        outcome.clean(),
+        "the horizon room diverged: {:?}",
+        outcome.divergence
+    );
+    assert!(outcome.seeded_from_source);
+    assert_eq!(outcome.imported, 2, "{:?}", outcome.excluded);
 }

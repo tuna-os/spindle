@@ -56,6 +56,7 @@ REQUIRED: dict[str, tuple[str, ...]] = {
         "current_state_events",
         "state_groups",
         "state_groups_state",
+        "state_group_edges",
         "event_to_state_groups",
         "room_aliases",
         "room_stats_state",
@@ -228,8 +229,77 @@ CURRENT_STATE = {
 }
 
 
+def write_event(
+    database: sqlite3.Connection,
+    room_id: str,
+    event: tuple[str, str, str | None, tuple[str, ...], dict],
+    ordering: int,
+    *,
+    outlier: bool = False,
+    rejection: str | None = None,
+) -> None:
+    """Write one event across the tables Synapse spreads it over."""
+    event_id, event_type, state_key, prev_events, content = event
+    sender = state_key if state_key not in (None, "") else ALICE
+    database.execute(
+        "INSERT INTO events (stream_ordering, topological_ordering, event_id, "
+        "type, room_id, content, processed, outlier, depth, origin_server_ts, "
+        "sender, state_key, rejection_reason) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            ordering,
+            ordering,
+            event_id,
+            event_type,
+            room_id,
+            json.dumps(content),
+            True,
+            outlier,
+            ordering,
+            1_700_000_000_000 + ordering,
+            sender,
+            state_key,
+            rejection,
+        ),
+    )
+    pdu = {
+        "auth_events": [],
+        "content": content,
+        "depth": ordering,
+        "origin_server_ts": 1_700_000_000_000 + ordering,
+        "prev_events": list(prev_events),
+        "room_id": room_id,
+        "sender": sender,
+        "type": event_type,
+    }
+    if state_key is not None:
+        pdu["state_key"] = state_key
+    database.execute(
+        "INSERT INTO event_json (event_id, room_id, internal_metadata, json, "
+        "format_version) VALUES (?, ?, ?, ?, ?)",
+        (event_id, room_id, json.dumps({"outlier": outlier}), json.dumps(pdu), 3),
+    )
+    for parent in prev_events:
+        database.execute(
+            "INSERT INTO event_edges (event_id, prev_event_id, room_id, is_state) "
+            "VALUES (?, ?, ?, ?)",
+            (event_id, parent, room_id, False),
+        )
+    if event_type == "m.room.member":
+        database.execute(
+            "INSERT INTO room_memberships (event_id, user_id, sender, room_id, "
+            "membership, event_stream_ordering) VALUES (?, ?, ?, ?, ?, ?)",
+            (event_id, state_key, sender, room_id, content["membership"], ordering),
+        )
+    if rejection is not None:
+        database.execute(
+            "INSERT INTO rejections (event_id, reason, last_check) VALUES (?, ?, ?)",
+            (event_id, rejection, "1700000000"),
+        )
+
+
 def populate(database: sqlite3.Connection) -> None:
-    """Write one room into a database that already carries Synapse's schema.
+    """Write the fixture rooms into a database that already carries Synapse's schema.
 
     These rows are **synthesized**, not produced by Synapse. The schema they go
     into is real, so a reader's SQL is either right or wrong against it; what
@@ -249,71 +319,17 @@ def populate(database: sqlite3.Connection) -> None:
             (user, None, 1_700_000_000, 0, 0),
         )
 
-    ordering = 0
-    for event_id, event_type, state_key, prev_events, content in (
-        *TIMELINE,
-        OUTLIER,
-        REJECTED,
+    for ordering, (event_id, event_type, state_key, prev_events, content) in enumerate(
+        (*TIMELINE, OUTLIER, REJECTED), start=1
     ):
-        ordering += 1
-        outlier = event_id == OUTLIER[0]
-        rejection = REJECTION_REASON if event_id == REJECTED[0] else None
-        sender = state_key if state_key not in (None, "") else ALICE
-        database.execute(
-            "INSERT INTO events (stream_ordering, topological_ordering, event_id, "
-            "type, room_id, content, processed, outlier, depth, origin_server_ts, "
-            "sender, state_key, rejection_reason) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                ordering,
-                ordering,
-                event_id,
-                event_type,
-                ROOM_ID,
-                json.dumps(content),
-                True,
-                outlier,
-                ordering,
-                1_700_000_000_000 + ordering,
-                sender,
-                state_key,
-                rejection,
-            ),
+        write_event(
+            database,
+            ROOM_ID,
+            (event_id, event_type, state_key, prev_events, content),
+            ordering,
+            outlier=event_id == OUTLIER[0],
+            rejection=REJECTION_REASON if event_id == REJECTED[0] else None,
         )
-        pdu = {
-            "auth_events": [],
-            "content": content,
-            "depth": ordering,
-            "origin_server_ts": 1_700_000_000_000 + ordering,
-            "prev_events": list(prev_events),
-            "room_id": ROOM_ID,
-            "sender": sender,
-            "type": event_type,
-        }
-        if state_key is not None:
-            pdu["state_key"] = state_key
-        database.execute(
-            "INSERT INTO event_json (event_id, room_id, internal_metadata, json, "
-            "format_version) VALUES (?, ?, ?, ?, ?)",
-            (event_id, ROOM_ID, json.dumps({"outlier": outlier}), json.dumps(pdu), 3),
-        )
-        for parent in prev_events:
-            database.execute(
-                "INSERT INTO event_edges (event_id, prev_event_id, room_id, is_state) "
-                "VALUES (?, ?, ?, ?)",
-                (event_id, parent, ROOM_ID, False),
-            )
-        if event_type == "m.room.member":
-            database.execute(
-                "INSERT INTO room_memberships (event_id, user_id, sender, room_id, "
-                "membership, event_stream_ordering) VALUES (?, ?, ?, ?, ?, ?)",
-                (event_id, state_key, sender, ROOM_ID, content["membership"], ordering),
-            )
-        if rejection is not None:
-            database.execute(
-                "INSERT INTO rejections (event_id, reason, last_check) VALUES (?, ?, ?)",
-                (event_id, rejection, "1700000000"),
-            )
 
     child, parent = LEGACY_STATE_EDGE
     database.execute(
@@ -329,7 +345,114 @@ def populate(database: sqlite3.Connection) -> None:
             "membership) VALUES (?, ?, ?, ?, ?)",
             (event_id, ROOM_ID, event_type, state_key, membership),
         )
+    populate_horizon(database)
     database.commit()
+
+
+# A second room, joined over federation: Synapse holds nothing before the join,
+# so its history starts at a backfill horizon and there is no m.room.create to
+# fold state forward from. The state at the join has to come from Synapse's
+# state groups instead -- and a state group is a *delta* on its parent in
+# `state_group_edges`, not a state. Reading only the join's own group gives one
+# slot and loses the rest; reading the chain oldest-wins brings back the join
+# rules the middle group replaced. Both are plausible-looking states.
+HORIZON_ROOM_ID = "!horizon:example.org"
+CAROL = "@carol:elsewhere.example"
+
+# The state the join arrived with, held as outliers -- which is how Synapse
+# stores the state it is handed on a federated join. None of these are in the
+# room's timeline.
+HORIZON_OUTLIERS: tuple[tuple[str, str, str | None, tuple[str, ...], dict], ...] = (
+    ("$h_create", "m.room.create", "", (), {"room_version": ROOM_VERSION}),
+    ("$h_alice", "m.room.member", ALICE, ("$h_create",), {"membership": "join"}),
+    ("$h_invite", "m.room.join_rules", "", ("$h_alice",), {"join_rule": "invite"}),
+    ("$h_public", "m.room.join_rules", "", ("$h_invite",), {"join_rule": "public"}),
+)
+
+# The timeline Synapse holds: the join, whose parent it never fetched, and one
+# message after it.
+HORIZON_TIMELINE: tuple[tuple[str, str, str | None, tuple[str, ...], dict], ...] = (
+    ("$h_join", "m.room.member", CAROL, ("$h_unfetched",), {"membership": "join"}),
+    (
+        "$h_after",
+        "m.room.message",
+        None,
+        ("$h_join",),
+        {"msgtype": "m.text", "body": "after the horizon"},
+    ),
+)
+
+# (group, parent, delta). Group 101 is a full state; 102 replaces the join
+# rules; 103 adds the join. `$h_join` and everything after it map to 103.
+HORIZON_GROUPS: tuple[tuple[int, int | None, dict[tuple[str, str], str]], ...] = (
+    (
+        101,
+        None,
+        {
+            ("m.room.create", ""): "$h_create",
+            ("m.room.member", ALICE): "$h_alice",
+            ("m.room.join_rules", ""): "$h_invite",
+        },
+    ),
+    (102, 101, {("m.room.join_rules", ""): "$h_public"}),
+    (103, 102, {("m.room.member", CAROL): "$h_join"}),
+)
+
+HORIZON_STATE = {
+    ("m.room.create", ""): "$h_create",
+    ("m.room.member", ALICE): "$h_alice",
+    ("m.room.join_rules", ""): "$h_public",
+    ("m.room.member", CAROL): "$h_join",
+}
+
+
+def populate_horizon(database: sqlite3.Connection) -> None:
+    """Write the horizon room and the state-group chain it depends on."""
+    database.execute(
+        "INSERT INTO rooms (room_id, is_public, creator, room_version, "
+        "has_auth_chain_index) VALUES (?, ?, ?, ?, ?)",
+        (HORIZON_ROOM_ID, True, ALICE, ROOM_VERSION, False),
+    )
+    for ordering, event in enumerate((*HORIZON_OUTLIERS, *HORIZON_TIMELINE), start=101):
+        write_event(
+            database,
+            HORIZON_ROOM_ID,
+            event,
+            ordering,
+            outlier=event in HORIZON_OUTLIERS,
+        )
+
+    last_event = {101: "$h_alice", 102: "$h_public", 103: "$h_join"}
+    for group, parent, delta in HORIZON_GROUPS:
+        database.execute(
+            "INSERT INTO state_groups (id, room_id, event_id) VALUES (?, ?, ?)",
+            (group, HORIZON_ROOM_ID, last_event[group]),
+        )
+        if parent is not None:
+            database.execute(
+                "INSERT INTO state_group_edges (state_group, prev_state_group) "
+                "VALUES (?, ?)",
+                (group, parent),
+            )
+        for (event_type, state_key), event_id in delta.items():
+            database.execute(
+                "INSERT INTO state_groups_state (state_group, room_id, type, "
+                "state_key, event_id) VALUES (?, ?, ?, ?, ?)",
+                (group, HORIZON_ROOM_ID, event_type, state_key, event_id),
+            )
+    for event_id, _, _, _, _ in HORIZON_TIMELINE:
+        database.execute(
+            "INSERT INTO event_to_state_groups (event_id, state_group) VALUES (?, ?)",
+            (event_id, 103),
+        )
+
+    for (event_type, state_key), event_id in HORIZON_STATE.items():
+        membership = "join" if event_type == "m.room.member" else None
+        database.execute(
+            "INSERT INTO current_state_events (event_id, room_id, type, state_key, "
+            "membership) VALUES (?, ?, ?, ?, ?)",
+            (event_id, HORIZON_ROOM_ID, event_type, state_key, membership),
+        )
 
 
 def verify_populated(database: sqlite3.Connection) -> list[str]:
@@ -363,7 +486,7 @@ def verify_populated(database: sqlite3.Connection) -> list[str]:
     if len(honest) != 1:
         problems.append(f"{child} should have exactly one real parent, has {honest}")
 
-    if one("SELECT COUNT(*) FROM events WHERE outlier") != 1:
+    if one("SELECT COUNT(*) FROM events WHERE room_id = ? AND outlier", ROOM_ID) != 1:
         problems.append("the outlier is not recorded as one")
     if one("SELECT rejection_reason FROM events WHERE event_id = ?", REJECTED[0]) is None:
         problems.append(
@@ -380,6 +503,28 @@ def verify_populated(database: sqlite3.Connection) -> list[str]:
     }
     if state != CURRENT_STATE:
         problems.append(f"current_state_events does not match: {state}")
+
+    root_group = one(
+        "SELECT state_group FROM event_to_state_groups WHERE event_id = ?",
+        HORIZON_TIMELINE[0][0],
+    )
+    parent_group = one(
+        "SELECT prev_state_group FROM state_group_edges WHERE state_group = ?",
+        root_group,
+    )
+    if parent_group is None:
+        problems.append(
+            f"the horizon root's state group {root_group} has no parent; the fixture "
+            "no longer exercises the delta chain"
+        )
+    if one(
+        "SELECT COUNT(*) FROM events WHERE room_id = ? AND type = 'm.room.create' "
+        "AND NOT outlier",
+        HORIZON_ROOM_ID,
+    ):
+        problems.append(
+            f"{HORIZON_ROOM_ID} has a timeline m.room.create; it is not a horizon"
+        )
 
     return problems
 
@@ -406,7 +551,7 @@ def main() -> int:
     parser.add_argument(
         "--populate",
         action="store_true",
-        help="also write one room, shaped to exercise the importer's hard cases",
+        help="also write two rooms, shaped to exercise the importer's hard cases",
     )
     parser.add_argument("--quiet", action="store_true")
     arguments = parser.parse_args()
@@ -469,6 +614,11 @@ def main() -> int:
             print(
                 f"synapse-fixture: wrote {ROOM_ID} -- {len(TIMELINE)} timeline "
                 "events, 1 outlier, 1 rejected, 1 legacy is_state edge"
+            )
+            print(
+                f"synapse-fixture: wrote {HORIZON_ROOM_ID} -- {len(HORIZON_TIMELINE)} "
+                f"timeline events after a backfill horizon, {len(HORIZON_GROUPS)} "
+                "chained state groups"
             )
         if arguments.out and not arguments.check:
             print(f"synapse-fixture: wrote {arguments.out}")
