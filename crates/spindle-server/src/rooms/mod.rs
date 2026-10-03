@@ -522,11 +522,37 @@ impl Rooms {
                 },
             )?;
         }
-        spindle_store::Store::sync(self.store.as_ref(), Durability::Group)?;
+        // Synapse keeps a redacted event's original JSON in `event_json`
+        // and applies the redaction when the event is read, so the bodies
+        // copied above still hold what their senders deleted. Rewrite each
+        // target the way a redaction arriving over federation would, after
+        // every event is in, so a redaction stored before its target still
+        // takes effect. A target the import left out stays absent.
+        let redactions: Vec<(String, String)> = plan
+            .steps
+            .iter()
+            .filter_map(|step| {
+                let event_id = step.input.event_id.as_str();
+                let body = bodies.get(event_id)?;
+                if body["type"].as_str() != Some("m.room.redaction") {
+                    return None;
+                }
+                let target = body["content"]["redacts"]
+                    .as_str()
+                    .or_else(|| body["redacts"].as_str())?;
+                log.get(&EventId::new(target))
+                    .is_some()
+                    .then(|| (target.to_owned(), event_id.to_owned()))
+            })
+            .collect();
         self.open
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(plan.room_id.clone(), Arc::new(RwLock::new(log)));
+        for (target, redaction_id) in &redactions {
+            self.apply_redaction(&plan.room_id, target, redaction_id)?;
+        }
+        spindle_store::Store::sync(self.store.as_ref(), Durability::Group)?;
         Ok(())
     }
 

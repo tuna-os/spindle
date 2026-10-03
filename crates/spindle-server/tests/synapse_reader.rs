@@ -545,6 +545,11 @@ fn a_live_postgres_room_persists_with_its_message_bodies() {
             .get(&event.event_id)
             .expect("every persisted event came from Synapse")
             .clone();
+        // A redaction target is rewritten to its redacted form on import;
+        // its original body is exactly what must not come back.
+        if event.json["unsigned"]["redacted_because"].is_object() {
+            continue;
+        }
         assert!(
             event.json == expected,
             "stored event JSON changed for {}",
