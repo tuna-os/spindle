@@ -189,6 +189,15 @@ async fn serve() -> ExitCode {
     let bind = config.server.bind.clone();
     let name = config.server.name.clone();
     let metrics_bind = config.metrics.bind.clone();
+    // `[federation] enabled = false` with a federation bind is a
+    // contradiction; refusing it is safer than guessing which was meant.
+    if !config.federation.enabled && config.federation.bind.is_some() {
+        tracing::error!("[federation] bind is set while [federation] enabled = false");
+        return ExitCode::FAILURE;
+    }
+    if !config.federation.enabled {
+        tracing::warn!("federation is disabled: this server will not contact or answer peers");
+    }
     let federation_bind = config.federation.bind.clone();
     let federation_tls = config
         .federation

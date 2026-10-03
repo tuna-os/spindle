@@ -122,6 +122,10 @@ pub fn router(state: AppState) -> Router {
         // Complement's TestUnknownEndpoints) read the errcode to tell "this
         // server does not speak that" from "the thing was not found".
         .fallback(unknown_endpoint)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            federation_gate,
+        ))
         .layer(axum::middleware::from_fn(cors))
         .layer(axum::middleware::from_fn_with_state(state.clone(), observe))
         .with_state(state);
@@ -252,6 +256,24 @@ async fn cors(
 }
 
 /// Any `/_matrix` path no route above claimed.
+/// Answer the server-server API as unknown when `[federation] enabled` is
+/// off. A server that does not federate has no federation surface: nothing
+/// on the network can ask it to sign, join or serve anything as its
+/// `server_name`.
+async fn federation_gate(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = request.uri().path();
+    if !state.config.federation.enabled
+        && (path.starts_with("/_matrix/federation/") || path.starts_with("/_matrix/key/"))
+    {
+        return unknown_endpoint().await.into_response();
+    }
+    next.run(request).await
+}
+
 async fn unknown_endpoint() -> MatrixError {
     MatrixError::new(
         StatusCode::NOT_FOUND,
