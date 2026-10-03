@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**225 routes implemented; 0 known gaps in scope.**
+**226 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -116,10 +116,11 @@ neither implemented nor counted.
 
 - `POST /_matrix/client/v1/appservice/{appservice_id}/ping`
 
-### VoIP & MatrixRTC — 8 implemented, 0 planned
+### VoIP & MatrixRTC — 9 implemented, 0 planned
 
 - `GET /_matrix/client/unstable/org.matrix.msc4140/delayed_events`
 - `POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}`
+- `POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}`
 - `GET /_matrix/client/unstable/org.matrix.msc4143/rtc/transports`
 - `GET /_matrix/client/v1/rtc/transports`
 - `POST /_matrix/client/v3/user/{user_id}/openid/request_token`

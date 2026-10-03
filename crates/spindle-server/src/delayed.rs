@@ -487,6 +487,57 @@ impl Delayed {
         action: Action,
     ) -> Result<Option<DelayedEvent>, DelayError> {
         let event = self.get(delay_id, sender)?;
+        self.apply(event, action)
+    }
+
+    /// [`Self::act`] for whoever holds the delay ID, with no sender check:
+    /// MSC4140's `POST /delayed_events/{delay_id}/{action}`, which takes no
+    /// access token. The 128-bit random ID is the capability -- it is what
+    /// lets a client hand "keep my leave event pending while I am still in
+    /// the call" to a service that holds none of its credentials
+    /// (lk-jwt-service's `/delegate_delayed_leave`). An unknown ID is
+    /// [`DelayError::NotFound`], the same as a wrong one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::act`].
+    pub fn act_by_id(
+        &self,
+        delay_id: &str,
+        action: Action,
+    ) -> Result<Option<DelayedEvent>, DelayError> {
+        let sender = self.sender_of(delay_id)?;
+        let event = self.get(delay_id, &sender)?;
+        self.apply(event, action)
+    }
+
+    /// Who scheduled `delay_id`.
+    fn sender_of(&self, delay_id: &str) -> Result<String, DelayError> {
+        let raw = self
+            .store
+            .get(&spindle_core::keys::delayed_event_by_id(delay_id))?
+            .ok_or(DelayError::NotFound)?;
+        let bytes: [u8; 8] = raw
+            .as_slice()
+            .try_into()
+            .map_err(|_| DelayError::NotFound)?;
+        let stored = self
+            .store
+            .get(&spindle_core::keys::delayed_event(
+                u64::from_be_bytes(bytes),
+                delay_id,
+            ))?
+            .ok_or(DelayError::NotFound)?;
+        let event: DelayedEvent =
+            serde_json::from_slice(&stored).map_err(|_| DelayError::NotFound)?;
+        Ok(event.sender)
+    }
+
+    fn apply(
+        &self,
+        event: DelayedEvent,
+        action: Action,
+    ) -> Result<Option<DelayedEvent>, DelayError> {
         match action {
             Action::Cancel => {
                 self.erase(&event.delay_id)?;
