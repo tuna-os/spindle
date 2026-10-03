@@ -173,15 +173,15 @@ async fn report_event(
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
-            "/_matrix/client/v3/rooms/:room_id/report",
+            "/_matrix/client/v3/rooms/{room_id}/report",
             post(report_room),
         )
         .route(
-            "/_matrix/client/v3/users/:user_id/report",
+            "/_matrix/client/v3/users/{user_id}/report",
             post(report_user),
         )
         .route(
-            "/_matrix/client/v3/rooms/:room_id/report/:event_id",
+            "/_matrix/client/v3/rooms/{room_id}/report/{event_id}",
             post(report_event),
         )
 }
