@@ -172,6 +172,12 @@ pub const UNSTABLE_FEATURES: &[(&str, bool)] = &[
     // unstable and the plain names), and a disabled pusher receives
     // nothing. A client checks here before showing the toggle.
     ("org.matrix.msc3881", true),
+    // MSC4186's simplified sliding sync, under the flag name it inherited
+    // from MSC3575 along with the route prefix. The endpoint is always
+    // routed, and the Rust SDK only picks native sliding sync when this
+    // flag is set, so leaving it out made a working endpoint invisible:
+    // a client that requires native sliding sync refused to log in.
+    ("org.matrix.simplified_msc3575", true),
 ];
 
 #[must_use]
