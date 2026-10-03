@@ -406,3 +406,21 @@ fn traces_are_off_unless_an_exporter_is_named() {
     .unwrap_err();
     assert!(error.to_string().contains("jaeger"), "{error}");
 }
+
+/// `[federation] enabled` defaults on; off with a federation listener is a
+/// contradiction and is refused at load, naming the field to fix.
+#[test]
+fn disabled_federation_with_a_federation_listener_is_refused() {
+    let config = parse("[server]\nname = \"example.org\"\n").unwrap();
+    assert!(config.federation.enabled);
+
+    let config =
+        parse("[server]\nname = \"example.org\"\n[federation]\nenabled = false\n").unwrap();
+    assert!(!config.federation.enabled);
+
+    let error = parse(
+        "[server]\nname = \"example.org\"\n[federation]\nenabled = false\nbind = \"0.0.0.0:8448\"\n",
+    )
+    .expect_err("a federation listener on a server that does not federate");
+    assert!(error.to_string().contains("federation.bind"), "{error}");
+}

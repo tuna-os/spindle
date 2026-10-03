@@ -62,6 +62,9 @@ pub struct Federation {
     /// retried — stale typing redelivered late is a lie about the present,
     /// and whoever is still typing says so again within seconds.
     edu_queue: std::sync::Mutex<std::collections::HashMap<String, Vec<Value>>>,
+    /// `[federation] enabled`. Off refuses every outbound request in
+    /// [`Federation::base_url`], the one place each of them is addressed.
+    enabled: bool,
 }
 
 #[derive(Debug)]
@@ -176,7 +179,22 @@ impl Federation {
             allowed,
             negative: std::sync::Mutex::new(HashMap::new()),
             edu_queue: std::sync::Mutex::new(std::collections::HashMap::new()),
+            enabled: true,
         })
+    }
+
+    /// Federate or not (`[federation] enabled`). Disabled, every outbound
+    /// request is refused before its destination is resolved.
+    #[must_use]
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Whether this server federates at all.
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled
     }
 
     /// Record into `metrics` rather than a registry of this client's own.
@@ -226,6 +244,14 @@ impl Federation {
     /// the same judgement the resolver applies to a hostname: a literal
     /// never touches DNS, so this is the only place it can be vetted.
     fn base_url(&self, name: &str) -> Result<String, FederationError> {
+        // Every outbound request is addressed here, so this is the one
+        // switch that keeps a dark copy of a live server off the network:
+        // refused before a name is resolved or a socket opened.
+        if !self.enabled {
+            return Err(FederationError::Refused(format!(
+                "federation is disabled on this server; not contacting {name}"
+            )));
+        }
         // A configured peer goes where the operator said, and its host is
         // judged the same way a name's would be: a literal here, a hostname
         // by the resolver when the connection is made.

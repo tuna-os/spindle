@@ -529,6 +529,18 @@ const fn default_true() -> bool {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FederationConfig {
+    /// Federate at all. Off makes this server an island: every outbound
+    /// federation request (transactions, key fetches, joins, queries,
+    /// media) is refused in-process before a name is resolved or a socket
+    /// is opened, the outbox is not drained, the federation listener does
+    /// not start, and `/_matrix/federation/*` and `/_matrix/key/*` answer
+    /// `404 M_UNRECOGNIZED`.
+    ///
+    /// For a dark copy of a live server -- a migration rehearsal that runs
+    /// with the production `server_name` and signing key -- which must
+    /// never speak for that server to the rest of the federation.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// Fetch peer keys and send requests over plain http instead of https.
     ///
     /// For test rigs whose "servers" are loopback stubs. A production
@@ -588,6 +600,7 @@ fn default_retry_base_ms() -> u64 {
 impl Default for FederationConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             insecure_http: false,
             allow_internal: Vec::new(),
             retry_base_ms: default_retry_base_ms(),
@@ -761,9 +774,18 @@ impl Config {
         Self::parse(&text)
     }
 
-    /// `[federation] peers`: each URL is a scheme, host and port, and a
-    /// patience cap is never shorter than the base it caps.
+    /// `[federation]`: no listener on a server told not to federate, each
+    /// peer URL is a scheme, host and port, and a patience cap is never
+    /// shorter than the base it caps.
     fn validate_peers(&self) -> Result<(), ConfigError> {
+        // A federation listener with `enabled = false` is a contradiction;
+        // refusing it is safer than guessing which was meant.
+        if !self.federation.enabled && self.federation.bind.is_some() {
+            return Err(ConfigError::Invalid {
+                field: "federation.bind",
+                message: "must be unset while federation.enabled = false".to_owned(),
+            });
+        }
         for (name, peer) in &self.federation.peers {
             let url = reqwest::Url::parse(&peer.url).map_err(|error| ConfigError::Invalid {
                 field: "federation.peers.url",
