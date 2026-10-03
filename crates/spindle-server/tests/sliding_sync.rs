@@ -993,3 +993,30 @@ async fn an_invite_is_a_room_in_the_list() {
     assert!(entry.get("invite_state").is_none(), "{entry}");
     assert_eq!(entry["joined_count"], json!(2), "{entry}");
 }
+
+#[tokio::test]
+async fn versions_advertises_the_sliding_sync_it_serves() {
+    // Issue #507. The Rust SDK picks native sliding sync only when
+    // `/versions` carries this flag, so a server that serves MSC4186 and
+    // does not say so looks to Element X and Fern like one that cannot.
+    let harness = Harness::new();
+    let (status, versions) = harness
+        .call(
+            Request::builder()
+                .uri("/_matrix/client/versions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{versions}");
+    assert_eq!(
+        versions["unstable_features"]["org.matrix.simplified_msc3575"],
+        json!(true),
+        "{versions}"
+    );
+
+    // And the flag is not a promise the route fails to keep.
+    let alice = harness.register("alice").await;
+    let response = harness.sliding(&alice, None, &window()).await;
+    assert!(response["pos"].is_string(), "{response}");
+}

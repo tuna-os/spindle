@@ -80,10 +80,12 @@ def check(entries: list[dict]) -> int:
     for flag in advertised_flags():
         number = msc_of(flag)
         entry = by_number.get(number) if number else None
-        if number is None:
+        owners = [e for e in entries if flag in e.get("unstable", [])]
+        if number is None or owners:
             # Vendor flags (im.nheko.summary) are matched by the `unstable`
-            # field instead of by number.
-            owners = [e for e in entries if flag in e.get("unstable", [])]
+            # field instead of by number, and so is a flag an MSC inherited
+            # from the one it superseded: org.matrix.simplified_msc3575
+            # belongs to MSC4186, not to the superseded MSC3575.
             if not owners:
                 problems.append(f"/versions advertises {flag} and no ledger entry lists it under `unstable`")
             elif owners[0]["status"] not in BUILT:
