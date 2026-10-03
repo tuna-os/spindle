@@ -6,31 +6,32 @@ snapshot makes an online rehearsal consistent, but it does not make a live
 cutover safe. The production import begins only after the source is quiescent.
 
 The first supported deployment profile is Element Server Suite on Kubernetes.
-Its Synapse is a worker deployment, so stopping only the `main` pod is not a
-quiesce. The profile includes:
+Its Synapse has many workers. Thus a stop of only the `main` pod is not a
+quiesce. The profile has these parts:
 
 - the HAProxy front door;
-- Matrix Authentication Service, which owns login and refresh routes;
-- Synapse main, federation-sender and sliding-sync StatefulSets; and
-- the PostgreSQL `synapse` database, used as the final proof that no source
-  process remains connected.
+- Matrix Authentication Service (MAS), which owns the login and refresh routes;
+- the StatefulSets for Synapse main, the federation sender and `sliding-sync`;
+  and
+- the PostgreSQL `synapse` database. The final proof that no source process
+  stays connected comes from this database.
 
 ## Safe outage boundary
 
-[`scripts/synapse-k8s-cutover.sh`](../scripts/synapse-k8s-cutover.sh) implements
+[`scripts/synapse-k8s-cutover.sh`](../scripts/synapse-k8s-cutover.sh) does
 the reversible part of the cutover:
 
-1. record every selected workload's replica count and Kubernetes UID;
-2. scale HAProxy and MAS to zero and wait, closing both ingress paths;
-3. scale every Synapse worker to zero and wait;
-4. require zero sessions against the `synapse` PostgreSQL database;
+1. record the replica count and Kubernetes UID of each selected workload;
+2. scale HAProxy and MAS to zero and wait. This closes the two ingress paths;
+3. scale each Synapse worker to zero and wait;
+4. make sure that the `synapse` PostgreSQL database has zero sessions;
 5. leave a mode-0600 state file for an ordered rollback; and
-6. on rollback, start Synapse workers first and expose HAProxy/MAS only after
-   the workers are ready.
+6. on rollback, start the Synapse workers first. Start HAProxy and MAS only
+   after the workers are ready.
 
-`quiesce` is a dry run unless `--execute` is present. Both the kubeconfig and
-the exact context are mandatory, preventing an ambient-context typo from
-turning into an outage.
+`quiesce` is a dry run unless `--execute` is present. You must give the
+kubeconfig and the exact context. This prevents an outage from a typo in the
+default context.
 
 ```console
 scripts/synapse-k8s-cutover.sh plan \
@@ -43,7 +44,7 @@ scripts/synapse-k8s-cutover.sh quiesce \
   --state-dir /secure/path/cutover-state \
   --execute
 
-# If any later gate fails:
+# If a later gate fails:
 scripts/synapse-k8s-cutover.sh resume \
   --kubeconfig /secure/path/cluster.yaml \
   --context production \
@@ -51,33 +52,35 @@ scripts/synapse-k8s-cutover.sh resume \
   --execute
 ```
 
-Do not delete the state directory until the migration is accepted. The source
-database and media PVC remain untouched, so rollback is start-only rather than
-a reverse data migration—as long as Spindle has not been exposed to writes.
+Keep the state directory until you accept the migration. The script does not
+change the source database or the media PVC. Thus a rollback only starts the
+source again. It is not a reverse data migration. This is true until Spindle
+gets its first write.
 
 ## Gates before an automated traffic switch exists
 
-The script intentionally stops at a verified quiesce. Starting Spindle and
-patching ingress will be added only when all of these have executable checks:
+The script stops at a verified quiesce on purpose. We will add the Spindle
+start and the ingress patch only when each of these items has an executable
+check:
 
-- every retained room imports or has an explicit operator-approved exclusion;
-- all room versions present in the source, including older federated rooms,
-  pass Spindle's federation join/send tests;
-- all users' recovery data restores and a fresh Element session decrypts a
-  pre-migration encrypted event;
-- Synapse's server signing key and historical verify-key response survive the
-  cutover, so remote homeservers continue to verify old and new events;
-- MAS is configured for Spindle's provisioning endpoint and token
-  introspection, and an existing MAS session authenticates after the switch;
+- each retained room imports, or has an exclusion that the operator approves;
+- each room version in the source, also older federated rooms, passes the
+  Spindle federation join and send tests;
+- the recovery data of each user restores, and a new Element session can
+  decrypt an old encrypted event;
+- the Synapse server key and the old verify-key response stay the same after
+  the cutover. Then remote homeservers can verify old and new events;
+- MAS uses the Spindle provision endpoint and token introspection, and a
+  current MAS session can authenticate after the switch;
 - media, profiles, account data, devices, receipts, pushers, appservices and
   other selected state domains have count and sample validation;
 - the Spindle PVC is empty before import, durable after import, and mounted by
-  a readiness-probed workload; and
-- ingress is patched only after an offline client/federation validation job
-  succeeds, with Synapse still stopped.
+  a workload with a readiness probe; and
+- the operator patches ingress only after an offline job validates the client
+  and federation paths. Synapse stays stopped until then.
 
-Once those checks exist, the final transaction is: quiesce → import → validate
-→ start Spindle → switch MAS → switch ingress → smoke-test. Any failure before
-the ingress switch restores Synapse automatically. A failure after the switch
-first closes ingress, then chooses either a forward fix or a rollback; it never
-runs both homeservers concurrently.
+When those checks exist, the final sequence is: quiesce → import → validate
+→ start Spindle → switch MAS → switch ingress → smoke-test. If a step fails
+before the ingress switch, the script starts Synapse again. If a
+step fails after the switch, the operator first closes ingress, then does a
+forward fix or a rollback. The two homeservers never run at the same time.

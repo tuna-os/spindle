@@ -49,8 +49,8 @@ pub enum ReadError {
     ///
     /// Reconstructing the state there means resolving a Synapse *state group*,
     /// which is a delta against a parent group threaded through
-    /// `state_group_edges`. The native PostgreSQL reader does that walk; the
-    /// deliberately small SQLite fixture reader refuses these rooms. Refused
+    /// `state_group_edges`. The native `PostgreSQL` reader does that walk; the
+    /// deliberately small `SQLite` fixture reader refuses these rooms. Refused
     /// loudly, because the alternative is an import that starts from empty
     /// state and calls a room with different contents a success.
     NeedsStateGroups {
@@ -67,7 +67,7 @@ pub enum ReadError {
         room_id: String,
         state_group: i64,
     },
-    /// A caller supplied something other than PostgreSQL's snapshot token.
+    /// A caller supplied something other than `PostgreSQL`'s snapshot token.
     InvalidSnapshotId(String),
 }
 

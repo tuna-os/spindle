@@ -1,6 +1,6 @@
-//! Native, snapshot-consistent reads from a live Synapse PostgreSQL database.
+//! Native, snapshot-consistent reads from a live Synapse `PostgreSQL` database.
 //!
-//! This is the production path. The sibling SQLite reader remains useful for
+//! This is the production path. The sibling `SQLite` reader remains useful for
 //! small, shareable fixtures, but exporting a multi-gigabyte deployment just
 //! to decide whether it can migrate duplicates work and can mix database
 //! snapshots. A [`Snapshot`] holds one repeatable-read transaction and reads
@@ -13,7 +13,7 @@ use serde_json::Value;
 use super::{ReadError, is_create_rooted};
 use crate::import::{PlanError, SourceEvent, SourceRoom, StateMap, plan};
 
-/// A connection to Synapse's PostgreSQL database.
+/// A connection to Synapse's `PostgreSQL` database.
 pub struct Reader {
     client: Client,
 }
@@ -23,11 +23,11 @@ impl Reader {
     ///
     /// This is appropriate for a loopback port-forward or a private service
     /// mesh. Call [`Self::from_client`] with a TLS-configured client when the
-    /// PostgreSQL connection itself crosses an untrusted network.
+    /// `PostgreSQL` connection itself crosses an untrusted network.
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] if the configuration is invalid or PostgreSQL
+    /// Returns [`ReadError`] if the configuration is invalid or `PostgreSQL`
     /// cannot be reached.
     pub fn connect_no_tls(config: &str, password: Option<&str>) -> Result<Self, ReadError> {
         let mut config: Config = config.parse().map_err(ReadError::Postgres)?;
@@ -39,7 +39,7 @@ impl Reader {
         })
     }
 
-    /// Wrap a PostgreSQL client configured by the operator, including TLS.
+    /// Wrap a `PostgreSQL` client configured by the operator, including TLS.
     #[must_use]
     pub fn from_client(client: Client) -> Self {
         Self { client }
@@ -49,7 +49,7 @@ impl Reader {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] if PostgreSQL cannot begin the transaction.
+    /// Returns [`ReadError`] if `PostgreSQL` cannot begin the transaction.
     pub fn snapshot(&mut self) -> Result<Snapshot<'_>, ReadError> {
         let transaction = self
             .client
@@ -68,7 +68,7 @@ impl Reader {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] if the identifier is invalid or PostgreSQL cannot
+    /// Returns [`ReadError`] if the identifier is invalid or `PostgreSQL` cannot
     /// join the exported snapshot.
     pub fn snapshot_from(&mut self, snapshot_id: &str) -> Result<Snapshot<'_>, ReadError> {
         if snapshot_id.is_empty()
@@ -152,7 +152,7 @@ impl Snapshot<'_> {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] if PostgreSQL cannot export the transaction.
+    /// Returns [`ReadError`] if `PostgreSQL` cannot export the transaction.
     pub fn export_id(&mut self) -> Result<String, ReadError> {
         Ok(self
             .transaction

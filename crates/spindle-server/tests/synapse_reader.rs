@@ -290,7 +290,7 @@ fn live_postgres_reader() -> Option<PostgresReader> {
     )
 }
 
-/// Read and replay one production room without first copying it to SQLite.
+/// Read and replay one production room without first copying it to `SQLite`.
 #[test]
 fn a_live_postgres_room_reads_replays_and_matches_synapse_state() {
     let (Some(mut reader), Ok(room_id)) = (
@@ -323,7 +323,7 @@ fn a_live_postgres_room_reads_replays_and_matches_synapse_state() {
     );
 }
 
-/// Classify every joined room in one consistent live PostgreSQL snapshot.
+/// Classify every joined room in one consistent live `PostgreSQL` snapshot.
 ///
 /// Known migration blockers are results, not reasons to stop the audit: the
 /// point is to measure their prevalence before any cutover. Database errors,
