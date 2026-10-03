@@ -1306,11 +1306,12 @@ async fn make_room_admin(
         .admin(&actor)
         .state_event(&room_id, "m.room.power_levels", "")
         .unwrap_or_else(|_| json!({}));
-    let users_default = levels["users_default"].as_i64().unwrap_or(0);
-    let level_of = |user: &str| -> i64 { levels["users"][user].as_i64().unwrap_or(users_default) };
-    let required = levels["events"]["m.room.power_levels"]
-        .as_i64()
-        .or_else(|| levels["state_default"].as_i64())
+    // Room versions before 10 allow a level written as a string.
+    let parse = crate::rooms::power_level;
+    let users_default = parse(&levels["users_default"]).unwrap_or(0);
+    let level_of = |user: &str| -> i64 { parse(&levels["users"][user]).unwrap_or(users_default) };
+    let required = parse(&levels["events"]["m.room.power_levels"])
+        .or_else(|| parse(&levels["state_default"]))
         .unwrap_or(50);
 
     let local_suffix = format!(":{}", state.config.server.name);

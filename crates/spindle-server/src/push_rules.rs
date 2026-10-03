@@ -372,13 +372,12 @@ fn condition_holds(condition: &Value, event: &Value, context: &Context<'_>) -> b
             .is_some_and(|is| member_count_is(is, context.member_count)),
         Some("sender_notification_permission") => {
             let key = condition["key"].as_str().unwrap_or_default();
-            let required = context.power_levels["notifications"][key]
-                .as_i64()
-                .unwrap_or(50);
+            // Room versions before 10 allow a level written as a string.
+            let level_of = crate::rooms::power_level;
+            let required = level_of(&context.power_levels["notifications"][key]).unwrap_or(50);
             let sender = event["sender"].as_str().unwrap_or_default();
-            let level = context.power_levels["users"][sender]
-                .as_i64()
-                .or_else(|| context.power_levels["users_default"].as_i64())
+            let level = level_of(&context.power_levels["users"][sender])
+                .or_else(|| level_of(&context.power_levels["users_default"]))
                 .unwrap_or(0);
             level >= required
         }
@@ -601,6 +600,33 @@ mod tests {
                 .as_deref()
                 .is_some_and(|actions| actions.iter().any(|a| a["set_tweak"] == "sound")),
             "{rings:?}"
+        );
+    }
+
+    /// Rooms before v10 may state levels as strings, and an `@room` from a
+    /// moderator in such a room is still a moderator's `@room`. Read as a
+    /// missing level it fell back to 0 and never highlighted.
+    #[test]
+    fn a_room_mention_reads_string_power_levels_from_a_legacy_room() {
+        let ruleset = defaults("@alice:example.org");
+        let mut at_room = message("@bob:example.org", "everyone");
+        at_room["content"]["m.mentions"] = json!({ "room": true });
+        let levels = json!({
+            "users": { "@bob:example.org": " 50 " },
+            "notifications": { "room": "+50" },
+        });
+        assert!(
+            evaluate(&ruleset, &at_room, &context(&levels, 3))
+                .as_deref()
+                .is_some_and(is_highlight)
+        );
+        let too_low = json!({ "users": { "@bob:example.org": "10" } });
+        let actions = evaluate(&ruleset, &at_room, &context(&too_low, 3));
+        assert!(
+            actions
+                .as_deref()
+                .is_some_and(|actions| !is_highlight(actions)),
+            "{actions:?}"
         );
     }
 

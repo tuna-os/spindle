@@ -788,8 +788,8 @@ MSC3706 as planned, and this paragraph is the design it will be built to.
 
 | Version | Support | Notes |
 |---|---|---|
-| 1–5 | Read-only interop | Legacy event ID format; joinable, not creatable |
-| 6–10 | Full | Full DAG semantics with the class-D path |
+| 1–5 | Not served yet (#456) | v1/v2 name events `$random:server` and link them by `[id, hashes]` pairs; v3–v5 not yet exercised |
+| 6–10 | Full | Served at their own rules: two-server join, event exchange and redaction tested per version; v7 knocks, v8/v9 restricted joins, v1–v9 string power levels |
 | **11** | **Full** | `MSC3820` cleanups: no top-level `origin` (MSC3989), no `creator` in create content (MSC2175), `redacts` in content (MSC2174), updated redaction algorithm (MSC2176/MSC3821) |
 | **12** | **Full; default candidate — see below** | Current stable version; supported by Ruma 0.16 and by both surveyed Rust homeservers |
 | `org.matrix.msc3995.v1` | Experimental | LM room version with hub-assigned `prev_event` (§12.4) |

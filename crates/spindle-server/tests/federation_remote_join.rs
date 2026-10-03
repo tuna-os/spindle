@@ -783,22 +783,26 @@ async fn a_room_at_a_version_this_server_creates_is_one_it_can_also_join() {
     );
 }
 
-/// Version 10 is the dominant legacy version in the migration corpus. This
-/// exercises both sides of the join handshake at that actual version and
-/// then sends a federated event, rather than proving only that createRoom
-/// accepts the name.
-#[tokio::test]
-async fn a_v10_room_can_be_joined_and_used_across_two_servers() {
+/// Join, exchange events both ways and redact across two servers, at
+/// exactly `version`.
+///
+/// Each legacy version is exercised at its actual version rather than by
+/// proving only that createRoom accepts the name. The redaction matters
+/// because its target moved in v11 (MSC2174): a v1–v10 redaction names its
+/// target at the top level, and a server that put it in content would sign
+/// an event no peer of that version can apply.
+async fn join_exchange_and_redact_at(version: &str) {
     let remote = Instance::start().await;
     let local = Instance::start().await;
     let alice = remote.register("alice").await;
     let bob = local.register("bob").await;
 
-    let room = remote.public_room_at_version(&alice, Some("10")).await;
-    remote.say(&room, &alice, "before the v10 join").await;
+    let room = remote.public_room_at_version(&alice, Some(version)).await;
+    let before = format!("before the v{version} join");
+    remote.say(&room, &alice, &before).await;
 
     let (status, body) = local.join_via(&room, &bob, &remote.name).await;
-    assert_eq!(status, 200, "{body}");
+    assert_eq!(status, 200, "v{version}: {body}");
     let (status, create) = local
         .request(
             reqwest::Method::GET,
@@ -808,63 +812,86 @@ async fn a_v10_room_can_be_joined_and_used_across_two_servers() {
         )
         .await;
     assert_eq!(status, 200, "{create}");
-    assert_eq!(create["room_version"], "10", "{create}");
+    assert_eq!(create["room_version"], version, "{create}");
 
-    let target = local.say(&room, &bob, "after the v10 join").await;
+    let after = format!("after the v{version} join");
+    let target = local.say(&room, &bob, &after).await;
     assert!(
-        eventually(async || {
-            remote
-                .messages(&room, &alice)
-                .await
-                .contains(&"after the v10 join".to_owned())
-        })
-        .await,
-        "the resident server accepted the v10 event"
+        eventually(async || remote.messages(&room, &alice).await.contains(&after)).await,
+        "the resident server accepted the v{version} event"
     );
 
-    remote.redact(&room, &alice, &target).await;
+    let redaction = remote.redact(&room, &alice, &target).await;
+    let shape = remote.event(&room, &alice, &redaction).await;
+    assert_eq!(shape["redacts"], target.as_str(), "v{version}: {shape}");
+    assert!(shape["content"]["redacts"].is_null(), "v{version}: {shape}");
     assert!(
         eventually(async || remote.event(&room, &alice, &target).await["content"] == json!({}))
             .await,
-        "the resident applied its v10 redaction"
+        "the resident applied its v{version} redaction"
     );
     assert!(
         eventually(async || local.event(&room, &bob, &target).await["content"] == json!({})).await,
-        "the joining server applied the federated v10 redaction"
+        "the joining server applied the federated v{version} redaction"
     );
 
-    remote.say(&room, &alice, "back across the v10 room").await;
+    let back = format!("back across the v{version} room");
+    remote.say(&room, &alice, &back).await;
     assert!(
-        eventually(async || {
-            local
-                .messages(&room, &bob)
-                .await
-                .contains(&"back across the v10 room".to_owned())
-        })
-        .await,
-        "the joining server accepted the resident's v10 event"
+        eventually(async || local.messages(&room, &bob).await.contains(&back)).await,
+        "the joining server accepted the resident's v{version} event"
     );
 }
 
-/// Restricted joins were the path that previously exposed version
-/// substitution. Keep a two-server v10 regression alongside the general
-/// Complement-shaped sequence.
+/// Version 10 is the dominant legacy version in the migration corpus.
 #[tokio::test]
-async fn a_v10_restricted_room_admits_a_remote_member() {
+async fn a_v10_room_can_be_joined_and_used_across_two_servers() {
+    join_exchange_and_redact_at("10").await;
+}
+
+/// Version 9 rooms are in the migration corpus.
+#[tokio::test]
+async fn a_v9_room_can_be_joined_and_used_across_two_servers() {
+    join_exchange_and_redact_at("9").await;
+}
+
+/// Version 8 sits between v7's knocks and v9's restricted-join redaction fix.
+#[tokio::test]
+async fn a_v8_room_can_be_joined_and_used_across_two_servers() {
+    join_exchange_and_redact_at("8").await;
+}
+
+/// Version 7 is the version Complement's knock tests create; a v7
+/// `send_join` was once refused with `M_BAD_JSON`.
+#[tokio::test]
+async fn a_v7_room_can_be_joined_and_used_across_two_servers() {
+    join_exchange_and_redact_at("7").await;
+}
+
+/// Version 6 rooms are in the migration corpus, and it is the oldest
+/// version this server serves.
+#[tokio::test]
+async fn a_v6_room_can_be_joined_and_used_across_two_servers() {
+    join_exchange_and_redact_at("6").await;
+}
+
+/// A restricted room at `version` admits a remote member of the room it
+/// allows, through this server's nomination and countersignature.
+async fn restricted_join_at(version: &str) {
     let remote = Instance::start().await;
     let local = Instance::start().await;
     let alice = remote.register("alice").await;
     let bob = local.register("bob").await;
     let bob_id = format!("@bob:{}", local.name);
 
-    let space = remote.public_room_at_version(&alice, Some("10")).await;
+    let space = remote.public_room_at_version(&alice, Some(version)).await;
     assert_eq!(local.join_via(&space, &bob, &remote.name).await.0, 200);
     let room = remote
-        .restricted_room_at_version(&alice, &space, Some("10"))
+        .restricted_room_at_version(&alice, &space, Some(version))
         .await;
 
     let (status, body) = local.join_via(&room, &bob, &remote.name).await;
-    assert_eq!(status, 200, "{body}");
+    assert_eq!(status, 200, "v{version}: {body}");
     assert!(
         eventually(async || {
             remote
@@ -874,6 +901,52 @@ async fn a_v10_restricted_room_admits_a_remote_member() {
                 .is_some()
         })
         .await,
-        "the v10 resident records the restricted join"
+        "the v{version} resident records the restricted join"
     );
+    let member = remote.member_event(&room, &alice, &bob_id).await;
+    assert!(
+        member["content"]["join_authorised_via_users_server"].is_string(),
+        "v{version}: a restricted join names its authorising user: {member}"
+    );
+}
+
+/// Restricted joins were the path that previously exposed version
+/// substitution. Keep two-server regressions at every version that has them.
+#[tokio::test]
+async fn a_v10_restricted_room_admits_a_remote_member() {
+    restricted_join_at("10").await;
+}
+
+#[tokio::test]
+async fn a_v9_restricted_room_admits_a_remote_member() {
+    restricted_join_at("9").await;
+}
+
+/// Version 8 introduced restricted joins, and its redaction algorithm does
+/// not yet keep `join_authorised_via_users_server` (v9 fixed that). The
+/// countersignature is over the redacted form all the same, so it must
+/// verify without the field.
+#[tokio::test]
+async fn a_v8_restricted_room_admits_a_remote_member() {
+    restricted_join_at("8").await;
+}
+
+/// Before v8 `restricted` is a join rule the version does not know, so it
+/// admits nobody: no nomination is made and the join is refused, even for a
+/// user in the room the rule names.
+#[tokio::test]
+async fn a_v6_room_does_not_honour_a_restricted_join_rule() {
+    let remote = Instance::start().await;
+    let local = Instance::start().await;
+    let alice = remote.register("alice").await;
+    let bob = local.register("bob").await;
+
+    let space = remote.public_room_at_version(&alice, Some("6")).await;
+    assert_eq!(local.join_via(&space, &bob, &remote.name).await.0, 200);
+    let room = remote
+        .restricted_room_at_version(&alice, &space, Some("6"))
+        .await;
+
+    let (status, body) = local.join_via(&room, &bob, &remote.name).await;
+    assert_eq!(status, 403, "a v6 restricted room admitted a join: {body}");
 }

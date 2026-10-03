@@ -3119,29 +3119,14 @@ async fn create_room(
             request.preset.as_deref(),
             &request.invite,
             &initial_state,
-            // Honour a version this server advertises; ignore one it does
-            // not. Both halves are deliberate, and they are deliberate for
-            // different reasons.
-            //
-            // Honouring the advertised ones is a correctness fix, not a
-            // feature. `/capabilities` now lists v12 as available, and a
-            // client reads that list precisely so it can ask for something
-            // on it. Handing back v11 with a 200 would be the exact lie
-            // #201 removed from `make_join` -- worse here, because
-            // advertising v12 is what invites the request.
-            //
-            // Ignoring the rest preserves today's behaviour rather than
-            // endorsing it. An unadvertised version is still silently
-            // substituted, which is also a lie, but a pre-existing one:
-            // 30 allowlisted Complement tests create rooms at v7/v8/v9 to
-            // reach knock and restricted-join features and quietly receive
-            // the v11 room that happens to have them. Refusing those is a
-            // scope decision about which versions this server carries --
-            // #178 -- not something to change while fixing v12.
-            request
-                .room_version
-                .as_deref()
-                .filter(|version| crate::surface::supports_room_version(version)),
+            // The version asked for, refused with M_UNSUPPORTED_ROOM_VERSION
+            // when this server does not serve it. This used to substitute
+            // v11 for any unlisted version, which let Complement's v7 knock
+            // and v8 restricted-join tests pass on a room of the wrong
+            // version; with those versions served there is nothing left
+            // that the substitution kept working, and the spec asks for
+            // the refusal.
+            request.room_version.as_deref(),
             request.creation_content.as_ref(),
             request.power_level_content_override.as_ref(),
             &member_profile(&state, &identity.user_id),
@@ -8688,6 +8673,11 @@ pub(crate) fn room_error(error: crate::rooms::RoomError) -> MatrixError {
         // is the same explanation a federating peer would give. A generic
         // "forbidden" would make a client's bug report useless.
         crate::rooms::RoomError::Forbidden(rule) => MatrixError::forbidden(rule),
+        crate::rooms::RoomError::UnsupportedVersion(version) => MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_UNSUPPORTED_ROOM_VERSION",
+            format!("this server does not support room version {version}"),
+        ),
         // #225: this was a 500 with an empty body, which told a client
         // nothing and an operator nothing. It is not an internal error --
         // the server is working correctly and the *room* is in a state it

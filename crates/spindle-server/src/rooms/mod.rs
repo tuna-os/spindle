@@ -1291,6 +1291,14 @@ impl Rooms {
         room_id: &str,
         user_id: &str,
     ) -> Result<Option<String>, RoomError> {
+        // Restricted joins exist from v8 and `knock_restricted` from v10.
+        // Before that a `restricted` join rule is a value the rules do not
+        // know, so it admits nobody, and a nomination would be a field the
+        // version gives no meaning to -- a v6 room's join must not carry one.
+        let authorization = self.rules_in(log, room_id)?.authorization;
+        if !(authorization.restricted_join_rule || authorization.knock_restricted_join_rule) {
+            return Ok(None);
+        }
         let Some(rules) = current_state_id(log, &StateKey::new("m.room.join_rules", ""))
             .and_then(|id| self.read_event(room_id, &EventId::new(id.as_str())).ok())
         else {
@@ -1343,10 +1351,7 @@ impl Rooms {
         // the nominee outranks the room's invite level is the rules' call,
         // and making it here is how the two copies would start to diverge.
         let mut ranked: Vec<(i64, String)> = Vec::new();
-        if self
-            .rules_in(log, room_id)?
-            .authorization
-            .explicitly_privilege_room_creators
+        if authorization.explicitly_privilege_room_creators
             && let Some(create) = current_state_id(log, &StateKey::new("m.room.create", ""))
                 .and_then(|id| self.read_event(room_id, &EventId::new(id.as_str())).ok())
         {
@@ -1371,7 +1376,7 @@ impl Rooms {
             .and_then(|id| self.read_event(room_id, &EventId::new(id.as_str())).ok())
             .map_or(Value::Null, |event| event["content"].clone());
         for (user, level) in power["users"].as_object().into_iter().flatten() {
-            if let Some(level) = level.as_i64() {
+            if let Some(level) = power_level(level) {
                 ranked.push((level, user.clone()));
             }
         }
@@ -4984,6 +4989,35 @@ fn derives_room_id(create_content: &Value) -> bool {
         .is_some_and(|rules| rules.authorization.room_create_event_id_as_room_id)
 }
 
+/// A power level as an `m.room.power_levels` event states it.
+///
+/// Room versions 1 to 9 accept a level written as a string of an integer
+/// (`"50"`), and real rooms contain them: older clients and servers wrote
+/// them, and the auth rules of those versions read them as numbers. Version
+/// 10 made integers mandatory, so a valid v10+ event never has a string
+/// here and accepting one costs nothing there.
+///
+/// The parse is ruma's own (`deserialize_v1_powerlevel`): surrounding
+/// whitespace is ignored and one leading `+` is allowed. Anything else,
+/// including a float, is not a level, which is the same answer the auth
+/// rules give.
+pub(crate) fn power_level(value: &Value) -> Option<i64> {
+    // `js_int`'s range, which is what ruma parses a string level into.
+    const MAX_SAFE: i64 = (1 << 53) - 1;
+    if let Some(level) = value.as_i64() {
+        return Some(level);
+    }
+    let text = value.as_str()?.trim();
+    let level = match text.strip_prefix('+') {
+        Some(unsigned) => unsigned
+            .parse::<u64>()
+            .ok()
+            .and_then(|level| i64::try_from(level).ok())?,
+        None => text.parse::<i64>().ok()?,
+    };
+    (-MAX_SAFE..=MAX_SAFE).contains(&level).then_some(level)
+}
+
 pub(crate) fn version_in(content: &Value) -> Result<RoomVersionId, RoomError> {
     let named = content
         .get("room_version")
@@ -5812,6 +5846,27 @@ mod room_version_tests {
     /// asking for one version and receiving another was told it had
     /// succeeded. A lie a client cannot detect until something that depends
     /// on the version fails is worse than an error it can handle.
+    #[test]
+    fn a_power_level_may_be_a_string_the_way_ruma_reads_one() {
+        use serde_json::json;
+        for (value, expected) in [
+            (json!(50), Some(50)),
+            (json!(-5), Some(-5)),
+            (json!("50"), Some(50)),
+            (json!(" 100 "), Some(100)),
+            (json!("+7"), Some(7)),
+            (json!("-7"), Some(-7)),
+            (json!("+-7"), None),
+            (json!("9007199254740992"), None),
+            (json!("1.5"), None),
+            (json!(1.5), None),
+            (json!("fifty"), None),
+            (json!(null), None),
+        ] {
+            assert_eq!(super::power_level(&value), expected, "{value}");
+        }
+    }
+
     #[test]
     fn creating_a_room_at_an_unadvertised_version_is_refused() {
         let (_dir, _store, rooms) = rooms();
