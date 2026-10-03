@@ -140,11 +140,68 @@ lists Synapse retries resyncing. Each retry is logged as
 `403: Federation denied with <server>`, a refusal inside the process at
 layer 1. Netwatch shows that no socket was opened.
 
+## The dark Spindle
+
+```bash
+./rig.sh spindle-build <git-ref>   # spindle --features synapse-import, built in the toolbox
+./rig.sh spindle-import            # empty store, import, start the server
+./rig.sh spindle-isolation         # switches, resolver, exposure, netwatch summary
+./rig.sh verify http://dark-spindle.spindle-rehearsal.svc.cluster.local:8008 a   # also b, c
+./rig.sh element dark-spindle a    # also b, c, and dark-synapse for the baseline
+```
+
+`spindle-import` runs `spindle import-synapse-rehearsal` (PR #557) in a Job.
+In one run it imports every manifest room and the recovery material of users
+a, b and c (account data, device and cross-signing keys, signatures, key
+backup) from `synapse_dark`. Each user gets a login with their rig password,
+read from the Secret through `SPINDLE_REHEARSAL_PASSWORD_DIR`. The Synapse
+signing key is installed under its own key ID. The binary and the store
+live on the toolbox PVC (`/work/bin/spindle`, `/work/dark-spindle/store`).
+
+Isolation of `k8s/dark-spindle.yaml` follows the dark Synapse:
+
+1. `[federation] enabled = false` (#560). Every outbound federation request
+   is refused inside the process, before a name is resolved. The outbox is
+   not drained. `/_matrix/federation/*` and `/_matrix/key/*` answer `404`.
+2. `[push] enabled = false` and `[previews] enabled = false`. There are no
+   appservices, delegated auth, S3, TURN or LiveKit.
+3. Neither the import Job nor the server pod has a resolver
+   (`nameserver 127.0.0.1`). The Job reaches the database through
+   `hostAliases`.
+4. A ClusterIP Service on the client port is the only way in. There is no
+   Ingress, NodePort or LoadBalancer.
+5. A `netwatch` sidecar logs any socket that is not loopback or an inbound
+   client connection. `kubectl port-forward` connections show up as loopback.
+
+## `element`: a real Element Web recovery
+
+`./rig.sh element <dark-spindle|dark-synapse> <user>` runs on the
+workstation. It serves a pinned Element Web (v1.12.28) against a
+port-forward and drives headless Chromium through
+`element/recover.cjs`. The Chromium host resolver maps the namespace's
+service names to 127.0.0.1 and blocks every other origin. The script takes
+these steps:
+
+1. Password login.
+2. **Use recovery key**, then **Device verified**, then **Done**.
+3. In each encrypted room, page back to the room's start. Every message,
+   reply and redaction target the user may read must render without a
+   decryption failure, and the room must look like an encrypted room of
+   its own version: no "encryption not enabled" notice, no unencrypted
+   composer, no unstable-version banner.
+
+The report is written to `$OUT_DIR/<svc>-<user>-<time>/element-<user>.json`,
+with screenshots, the console log and the Matrix HTTP status lines.
+`NODE_PATH` must resolve `playwright`, and its Chromium must be installed.
+
 ## Limits
 
 * The dark Synapse database is a point-in-time copy. Real users' rows are in
   it but are never read or written by the rig. Only the three
   `spindle-mig-*` users and their four rooms are created.
-* The manifest proves decryptability with matrix-rust-sdk, the library under
-  Element X. Element Web uses the same crypto crate through WASM, but its
-  recovery UI is not exercised. For that, see `scripts/element-web-e2e/`.
+* `verify` proves decryptability with matrix-rust-sdk, the library under
+  Element X. `element` exercises Element Web's own recovery and restore
+  path, which `verify` cannot. Two Spindle faults showed up only there
+  (see `docs/evidence/migration-e2ee-rig-spindle.md`).
+* The import Job has no netwatch sidecar. It has no resolver, and its only
+  configured peer is the database.

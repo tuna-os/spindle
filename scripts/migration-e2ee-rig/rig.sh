@@ -10,6 +10,10 @@
 #   rig.sh seed                 create users, rooms, history; store keys + manifest
 #   rig.sh store-manifest       (re)publish the manifest ConfigMap from the PVC
 #   rig.sh verify [HS_URL] [USER]   fresh-device recovery + per-event decrypt report
+#   rig.sh spindle-build [REF]  build spindle (synapse-import) from a git ref in the toolbox
+#   rig.sh spindle-import       import all manifest rooms + users a,b,c into the dark Spindle
+#   rig.sh spindle-isolation    dark Spindle switches, resolver, exposure, netwatch summary
+#   rig.sh element SVC USER     fresh Element Web login + recovery key (workstation)
 #   rig.sh reset                delete dark Synapse, drop synapse_dark, clear rig state
 #
 # Environment: KUBECONFIG (default ~/.kube/config-aws-migration), NS
@@ -190,6 +194,57 @@ cmd_verify() {
   return $rc
 }
 
+# --- the dark Spindle --------------------------------------------------------
+
+# Build `spindle` (with the synapse-import feature) in the toolbox from a git
+# ref of this repository, into /work/bin/spindle on the PVC.
+cmd_spindle_build() {
+  local ref="${1:-HEAD}"
+  tb bash -c 'mkdir -p /work/spindle-src /work/bin && find /work/spindle-src -mindepth 1 -maxdepth 1 -exec rm -rf {} +'
+  git -C "$(git -C "$here" rev-parse --show-toplevel)" archive --format=tar "$ref" | tb tar -C /work/spindle-src -xf -
+  tb bash -c 'cd /work/spindle-src && CARGO_TARGET_DIR=/work/spindle-target \
+    cargo build --release -p spindle-server --features synapse-import --bin spindle 2>&1 | tail -n 5 &&
+    cp /work/spindle-target/release/spindle /work/bin/spindle.new && mv /work/bin/spindle.new /work/bin/spindle'
+}
+
+# Import every manifest room and users a, b, c from synapse_dark into an
+# empty store, then (re)start the dark Spindle on it.
+cmd_spindle_import() {
+  local ip rooms
+  ip="$(k get svc rehearsal-pg -o jsonpath='{.spec.clusterIP}')"
+  rooms="$(k get configmap spindle-mig-rig-manifest -o jsonpath='{.data.manifest\.json}' |
+    python3 -c 'import json,sys; print(",".join(r["room_id"] for r in json.load(sys.stdin)["rooms"]))')"
+  k scale deploy/dark-spindle --replicas=0 >/dev/null 2>&1 || true
+  k delete job dark-spindle-import --ignore-not-found --wait >/dev/null
+  tb bash -c 'rm -rf /work/dark-spindle/store && mkdir -p /work/dark-spindle && chown 10092:10092 /work/dark-spindle'
+  sed -e "s/__PG_IP__/$ip/g" -e "s/__ROOMS__/$rooms/g" "$here/k8s/dark-spindle.yaml" | k apply -f - >/dev/null
+  k scale deploy/dark-spindle --replicas=0 >/dev/null
+  if ! k wait --for=condition=complete job/dark-spindle-import --timeout=10m; then
+    k logs job/dark-spindle-import; exit 1
+  fi
+  k logs job/dark-spindle-import
+  k scale deploy/dark-spindle --replicas=1 >/dev/null
+  k rollout status deploy/dark-spindle --timeout=5m
+}
+
+cmd_spindle_isolation() {
+  local pod; pod="$(k get pod -l app=dark-spindle -o jsonpath='{.items[0].metadata.name}')"
+  echo "== [federation] and outbound switches as configured"
+  k get configmap dark-spindle-config -o jsonpath='{.data.spindle\.toml}' | grep -A1 -E '^\[(federation|push|previews)\]'
+  echo "== resolver in the pod"
+  k exec "$pod" -c spindle -- cat /etc/resolv.conf
+  echo "== services / ingresses exposing it"
+  k get svc,ingress -l app=dark-spindle -o wide 2>/dev/null || true
+  echo "== server-server API from inside the namespace (expect 404 M_UNRECOGNIZED)"
+  for p in /_matrix/key/v2/server /_matrix/federation/v1/version; do
+    tbo curl -s -o /dev/null -w "$p %{http_code}\n" "http://dark-spindle.$NS.svc.cluster.local:8008$p"
+  done
+  echo "== netwatch (sockets other than loopback/database/inbound client)"
+  k logs "$pod" -c netwatch | grep -E '"OUTBOUND"|heartbeat' | tail -n 3
+  local n; n="$(k logs "$pod" -c netwatch | grep -c '"new": "OUTBOUND"' || true)"
+  echo "outbound endpoints seen: ${n:-0}"
+}
+
 cmd_reset() {
   k delete deploy/dark-synapse --ignore-not-found --wait
   psql_pg -c "DROP DATABASE IF EXISTS synapse_dark"
@@ -209,6 +264,10 @@ case "${1:-}" in
   seed) cmd_seed ;;
   store-manifest) cmd_store_manifest ;;
   verify) shift; cmd_verify "$@" ;;
+  spindle-build) shift; cmd_spindle_build "$@" ;;
+  spindle-import) cmd_spindle_import ;;
+  spindle-isolation) cmd_spindle_isolation ;;
+  element) shift; "$here/element/element.sh" "$@" ;;
   reset) cmd_reset ;;
-  *) sed -n '2,15p' "$0"; exit 2 ;;
+  *) sed -n '2,19p' "$0"; exit 2 ;;
 esac
