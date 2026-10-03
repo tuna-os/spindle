@@ -774,9 +774,18 @@ impl Config {
         Self::parse(&text)
     }
 
-    /// `[federation] peers`: each URL is a scheme, host and port, and a
-    /// patience cap is never shorter than the base it caps.
+    /// `[federation]`: no listener on a server told not to federate, each
+    /// peer URL is a scheme, host and port, and a patience cap is never
+    /// shorter than the base it caps.
     fn validate_peers(&self) -> Result<(), ConfigError> {
+        // A federation listener with `enabled = false` is a contradiction;
+        // refusing it is safer than guessing which was meant.
+        if !self.federation.enabled && self.federation.bind.is_some() {
+            return Err(ConfigError::Invalid {
+                field: "federation.bind",
+                message: "must be unset while federation.enabled = false".to_owned(),
+            });
+        }
         for (name, peer) in &self.federation.peers {
             let url = reqwest::Url::parse(&peer.url).map_err(|error| ConfigError::Invalid {
                 field: "federation.peers.url",
