@@ -418,15 +418,45 @@ pub struct DelegatedAuthConfig {
     /// The OAuth 2.0 token introspection endpoint. MAS serves it at
     /// `{issuer}/oauth2/introspect`.
     pub introspection_endpoint: String,
-    /// Client credentials this server presents when introspecting.
-    pub client_id: String,
-    pub client_secret: String,
+    /// Client credentials this server presents when introspecting, for a
+    /// provider that has a client registered for it.
+    ///
+    /// Both absent, introspection presents `homeserver_secret` as a bearer
+    /// token instead. That is how Synapse's `matrix_authentication_service`
+    /// section introspects, so a MAS configured for Synapse that way (no
+    /// client of its own for the homeserver, as Element Server Suite
+    /// deploys it) answers this server unchanged.
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub client_secret: Option<String>,
     /// The token the provider presents when calling *us* — MAS's
     /// `matrix.secret`, guarding the `/_synapse/mas/*` provisioning
     /// surface. Absent, that surface answers 404 and the provider
     /// cannot manage accounts here.
     #[serde(default)]
     pub homeserver_secret: Option<String>,
+}
+
+impl DelegatedAuthConfig {
+    /// Introspection has to present something. Half a client pair is a
+    /// typo that would otherwise surface as every token being refused.
+    fn validate(&self) -> Result<(), ConfigError> {
+        match (&self.client_id, &self.client_secret) {
+            (Some(_), Some(_)) => Ok(()),
+            (None, None) if self.homeserver_secret.is_some() => Ok(()),
+            (None, None) => Err(ConfigError::Invalid {
+                field: "auth.delegated",
+                message: "introspection needs client_id and client_secret, or \
+                          homeserver_secret (MAS's matrix.secret) to present instead"
+                    .to_owned(),
+            }),
+            _ => Err(ConfigError::Invalid {
+                field: "auth.delegated.client_id",
+                message: "client_id and client_secret go together".to_owned(),
+            }),
+        }
+    }
 }
 
 /// Which appservice registration files to load at startup.
@@ -756,6 +786,9 @@ impl Config {
             message: error.to_string(),
         })?;
         config.validate()?;
+        if let Some(delegated) = &config.auth.delegated {
+            delegated.validate()?;
+        }
         Ok(config)
     }
 

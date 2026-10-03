@@ -141,10 +141,16 @@ impl Delegated {
         server_name: &str,
         token: &str,
     ) -> Result<Identity, MatrixError> {
-        let response = self
-            .client
-            .post(&self.config.introspection_endpoint)
-            .basic_auth(&self.config.client_id, Some(&self.config.client_secret))
+        let request = self.client.post(&self.config.introspection_endpoint);
+        // A registered client's credentials when there are some; otherwise
+        // the shared homeserver secret, which MAS accepts from the
+        // homeserver it serves (Synapse's `matrix_authentication_service`
+        // way). Config validation guarantees one or the other.
+        let request = match (&self.config.client_id, &self.config.client_secret) {
+            (Some(id), Some(secret)) => request.basic_auth(id, Some(secret)),
+            _ => request.bearer_auth(self.config.homeserver_secret.as_deref().unwrap_or_default()),
+        };
+        let response = request
             .form(&[("token", token), ("token_type_hint", "access_token")])
             .timeout(Duration::from_secs(10))
             .send()
