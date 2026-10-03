@@ -51,6 +51,32 @@ that came back smaller. Exits non-zero when anything is absent, and names the
 media IDs rather than only the content hashes: the hash is what the backend
 calls it, the ID is what you have to look for in your other copy.
 
+## A full disk
+
+When the disk fills, the store refuses the write that does not fit. The
+client gets a 500 for that request. From then on the store refuses every
+write until the process restarts, because fjall locks its database after a
+failed journal write. Nothing the server acknowledged is lost.
+
+What the probes say:
+
+- `/ready` answers 503 from the first refused write. A load balancer then
+  sends no clients to a server that cannot write.
+- `/health` stays at 200. The process is good and the disk is not. A restart
+  onto the same full disk only adds a crash loop.
+- Reads continue. `/sync` and `/messages` serve the history up to the last
+  acknowledged event.
+
+To recover, make space on the disk, then restart the server. Make a
+real amount of space, not a few megabytes: at start, the store must flush
+what it recovered before it accepts a write. In the drill, a 64 MiB disk
+with 2 MiB free did not recover, and with 16 MiB free it did.
+
+`just drill-disk-full` runs the drill. It mounts a 64 MiB tmpfs with sudo,
+then fills it under the store and under a server. CI runs it on each pull
+request. The two tests are `crates/spindle-store/tests/disk_full.rs` and
+`crates/spindle-server/tests/disk_full.rs`.
+
 ## Migration
 
 ```
