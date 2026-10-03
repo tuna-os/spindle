@@ -1,0 +1,64 @@
+# TEMPORARY: drop this file before the branch merges.
+#
+# Builds the Synapse migration rehearsal image (the release Dockerfile with
+# FEATURES=synapse-import, which adds `spindle import-synapse-rehearsal`)
+# and pushes it as ghcr.io/tuna-os/spindle:rehearsal-<shortsha>. It runs on
+# push to the rehearsal branch only, because a workflow_dispatch trigger
+# must be on the default branch before it can be dispatched.
+name: Rehearsal image
+
+on:
+  push:
+    branches: [m5/live-synapse-rehearsal-2]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: rehearsal-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: Rehearsal image for ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Log in to the registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Build and push the per-architecture image
+        run: |
+          tag="rehearsal-${GITHUB_SHA::7}"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${tag}-${{ matrix.arch }}"
+          docker build --build-arg FEATURES=synapse-import -t "$image" .
+          docker run --rm --entrypoint /usr/local/bin/spindle "$image" \
+            import-synapse-rehearsal 2>&1 | tee usage.txt || true
+          grep -q 'usage: spindle import-synapse-rehearsal' usage.txt
+          docker push "$image"
+
+  manifest:
+    name: Join the rehearsal images
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Log in to the registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Push the multi-architecture tag
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          tag="rehearsal-${GITHUB_SHA::7}"
+          docker manifest create "$image:${tag}" \
+            "$image:${tag}-amd64" "$image:${tag}-arm64"
+          digest=$(docker manifest push "$image:${tag}")
+          echo "Image: \`$image:${tag}@${digest}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "$image:${tag}@${digest}"
