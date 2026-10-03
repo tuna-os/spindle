@@ -150,8 +150,17 @@ def current(pin: dict) -> str | None:
     repo = pin["repo"]
     if pin["kind"] == "tag":
         pattern = re.compile(pin["tag_pattern"])
-        tags = [(sha, ref.removeprefix("refs/tags/")) for sha, ref in ls_remote(repo, "--tags", "--refs")]
-        tags = [(sha, name) for sha, name in tags if pattern.match(name)]
+        # An annotated tag lists as the tag object, then as `<tag>^{}` with
+        # the commit it points at. A pin names the commit, so the peeled
+        # line wins wherever there is one.
+        commits: dict[str, str] = {}
+        for sha, ref in ls_remote(repo, "--tags"):
+            name = ref.removeprefix("refs/tags/")
+            if name.endswith("^{}"):
+                commits[name.removesuffix("^{}")] = sha
+            else:
+                commits.setdefault(name, sha)
+        tags = [(sha, name) for name, sha in commits.items() if pattern.match(name)]
         if not tags:
             return None
         sha, newest = max(tags, key=lambda pair: version_of(pair[1]))

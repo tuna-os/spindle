@@ -710,11 +710,11 @@ jobs:
       # for its build alone, named to the rig rather than changing the pin.
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.0
       - name: Run the suite against Spindle
         env:
           RUST_SDK_SRC: tmp/matrix-rust-sdk
-          RUST_SDK_TOOLCHAIN: 1.93.0
+          RUST_SDK_TOOLCHAIN: 1.96.0
           SPINDLE_BIN: target/release/spindle
         run: contrib/rust-sdk/run.sh tmp/rust-sdk/results.log
       - name: Keep the log
