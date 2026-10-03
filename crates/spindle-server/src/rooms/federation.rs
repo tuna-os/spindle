@@ -349,16 +349,9 @@ impl Rooms {
                 .rev()
                 .filter(|entry| entry.li <= start)
                 .take(limit)
-                .map(|entry| {
-                    let mut event = rooms.read_event(room_id, &entry.event_id)?;
-                    if let Some(object) = event.as_object_mut() {
-                        object.insert(
-                            "event_id".to_owned(),
-                            Value::String(entry.event_id.as_str().to_owned()),
-                        );
-                    }
-                    Ok(event)
-                })
+                // The stored PDU as signed: see `Rooms::pdu` for why no
+                // `event_id` is added.
+                .map(|entry| rooms.read_event(room_id, &entry.event_id))
                 .collect()
         })
     }
@@ -411,16 +404,9 @@ impl Rooms {
                         && entry.depth >= min_depth
                 })
                 .take(limit)
-                .map(|entry| {
-                    let mut event = rooms.read_event(room_id, &entry.event_id)?;
-                    if let Some(object) = event.as_object_mut() {
-                        object.insert(
-                            "event_id".to_owned(),
-                            Value::String(entry.event_id.as_str().to_owned()),
-                        );
-                    }
-                    Ok(event)
-                })
+                // The stored PDU as signed: see `Rooms::pdu` for why no
+                // `event_id` is added.
+                .map(|entry| rooms.read_event(room_id, &entry.event_id))
                 .collect::<Result<_, RoomError>>()?;
             newest_first.reverse();
             Ok(newest_first)

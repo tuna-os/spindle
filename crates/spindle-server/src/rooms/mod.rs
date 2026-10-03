@@ -1851,6 +1851,24 @@ impl Rooms {
         Ok(event)
     }
 
+    /// One event as a federation peer must see it: the stored PDU, exactly
+    /// as it was signed.
+    ///
+    /// Unlike [`Rooms::event`], no `event_id` is added. From room version 3
+    /// the ID is the hash of the event, not a field of it, and a PDU that
+    /// carries one is malformed: Synapse refuses it outright (`v2/v3 events
+    /// must not have an explicit event_id`), which made every event this
+    /// server served over `/event`, `/backfill` and `/get_missing_events`
+    /// unusable to a Synapse peer (found by the migration drill, #563).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room or the event is unknown.
+    pub fn pdu(&self, room_id: &str, event_id: &str) -> Result<Value, RoomError> {
+        self.with_room_read(room_id, |_, _| Ok(()))?;
+        self.read_event(room_id, &EventId::new(event_id))
+    }
+
     /// Redact an event.
     ///
     /// **The redaction algorithm is ruma's**, for the same reason the auth

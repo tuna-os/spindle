@@ -612,7 +612,7 @@ pub(crate) async fn event(
         ));
     };
     federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
-    let event = state.rooms.event(&room_id, &event_id).map_err(room_error)?;
+    let event = state.rooms.pdu(&room_id, &event_id).map_err(room_error)?;
     Ok(Json(json!({
         "origin": state.config.server.name,
         "origin_server_ts": std::time::SystemTime::now()
