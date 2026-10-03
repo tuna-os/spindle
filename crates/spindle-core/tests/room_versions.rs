@@ -281,3 +281,109 @@ fn the_authorization_switches_per_version() {
         assert_eq!(rules.enforce_key_validity, keys, "v{name} key validity");
     }
 }
+
+fn v1_event(edges: &serde_json::Value) -> CanonicalJsonObject {
+    object(serde_json::json!({
+        "type": "m.room.message",
+        "sender": "@alice:example.org",
+        "room_id": "!room:example.org",
+        "content": { "body": "hi" },
+        "origin_server_ts": 1_700_000_000_000_u64,
+        "depth": 2,
+        "prev_events": edges,
+        "auth_events": edges,
+    }))
+}
+
+/// v1 and v2 events carry the ID their origin chose, `$opaque:origin`, and
+/// that ID is what a receiver reads -- the hash is not the name.
+#[test]
+fn v1_and_v2_events_are_named_by_their_origin() {
+    let key = key();
+    let map = key_map(&key);
+    let pair = serde_json::json!([["$parent:example.org", { "sha256": "aGFzaA" }]]);
+    for name in ["1", "2"] {
+        let signed = Pdu::sign(v(name), v1_event(&pair), "example.org", &key).unwrap();
+        let id = signed.event_id().as_str().to_owned();
+        assert!(
+            id.starts_with('$') && id.ends_with(":example.org"),
+            "v{name}: {id}"
+        );
+        assert_eq!(
+            signed.canonical().get("event_id"),
+            Some(&CanonicalJsonValue::String(id.clone())),
+            "the ID is inside the signed bytes"
+        );
+        // Two events, two names, even with identical content.
+        let again = Pdu::sign(v(name), v1_event(&pair), "example.org", &key).unwrap();
+        assert_ne!(again.event_id(), signed.event_id(), "v{name}");
+
+        let received = Pdu::from_remote(v(name), signed.canonical().clone()).unwrap();
+        assert_eq!(received.event_id().as_str(), id, "v{name}");
+        assert_eq!(
+            version::verify(&map, signed.canonical(), &v(name)).unwrap(),
+            Verified::All,
+            "v{name}: signed by the server its ID names"
+        );
+
+        // A v1 event without its name, or with a malformed one, is refused.
+        let mut nameless = signed.canonical().clone();
+        nameless.remove("event_id");
+        assert!(Pdu::from_remote(v(name), nameless).is_err(), "v{name}");
+        let mut malformed = signed.canonical().clone();
+        malformed.insert(
+            "event_id".to_owned(),
+            CanonicalJsonValue::String("$no-server".to_owned()),
+        );
+        assert!(Pdu::from_remote(v(name), malformed).is_err(), "v{name}");
+    }
+}
+
+/// Each version's edges have exactly one shape: `[id, hashes]` pairs in v1
+/// and v2, bare IDs from v3. The other shape is refused, not tolerated.
+#[test]
+fn edges_have_the_shape_their_version_requires() {
+    let key = key();
+    let pair = serde_json::json!([["$parent:example.org", { "sha256": "aGFzaA" }]]);
+    let bare = serde_json::json!(["$parent"]);
+    assert!(Pdu::sign(v("1"), v1_event(&bare), "example.org", &key).is_err());
+    assert!(Pdu::sign(v("3"), v1_event(&pair), "example.org", &key).is_err());
+    assert!(Pdu::sign(v("1"), v1_event(&pair), "example.org", &key).is_ok());
+    assert!(Pdu::sign(v("3"), v1_event(&bare), "example.org", &key).is_ok());
+}
+
+/// A v1 reference pins its parent by the parent's reference hash, which is
+/// standard base64 over the redacted form -- so redacting the parent later
+/// does not break the child's reference.
+#[test]
+fn a_v1_edge_carries_the_parent_reference_hash() {
+    let key = key();
+    let parent = Pdu::sign(
+        v("1"),
+        v1_event(&serde_json::json!([])),
+        "example.org",
+        &key,
+    )
+    .unwrap();
+    let edge = version::edge(parent.event_id().as_str(), parent.canonical(), &v("1")).unwrap();
+    let rules = v("1").rules().unwrap();
+    let expected = ruma::signatures::reference_hash(parent.canonical(), &rules).unwrap();
+    assert_eq!(
+        serde_json::to_value(&edge).unwrap(),
+        serde_json::json!([parent.event_id().as_str(), { "sha256": expected }])
+    );
+    let redacted = version::redact(parent.canonical(), &v("1")).unwrap();
+    assert_eq!(
+        version::edge(parent.event_id().as_str(), &redacted, &v("1")).unwrap(),
+        edge
+    );
+    // From v3 a reference is the bare ID.
+    assert_eq!(
+        version::edge("$x", parent.canonical(), &v("3")).unwrap(),
+        CanonicalJsonValue::String("$x".to_owned())
+    );
+    assert_eq!(
+        version::edge_ids(Some(&CanonicalJsonValue::Array(vec![edge]))),
+        vec![parent.event_id().as_str().to_owned()]
+    );
+}

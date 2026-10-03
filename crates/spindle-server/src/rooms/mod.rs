@@ -4109,6 +4109,8 @@ impl Rooms {
             depth,
             state_parents.as_deref(),
         )?;
+        // v1/v2 name parents by `[id, {"sha256": hash}]` pairs.
+        self.link_edges(room_id, &version, &mut canonical)?;
         // Before room v11 a redaction names its target in the top-level
         // `redacts` field. From v11 MSC2174 moved it into content. Keep the
         // route and public API version-neutral, then put the field where this
@@ -4175,6 +4177,47 @@ impl Rooms {
         // exactly the bytes a peer would receive, event ID included.
         self.authorize(log, room_id, &event_id, &json)?;
         Ok((event_id, json))
+    }
+
+    /// Write `object`'s `prev_events` and `auth_events` the way the room's
+    /// version does.
+    ///
+    /// From v3 a reference is the bare ID and there is nothing to do. In v1
+    /// and v2 it is `[event_id, {"sha256": reference_hash}]`: an ID there is
+    /// a name the origin chose, so the reference carries the hash that pins
+    /// what the parent says, the job a v3+ ID does by being the hash. The
+    /// hash is taken over the parent's stored body; redaction does not move
+    /// it, because the hash covers the redacted form.
+    pub(crate) fn link_edges(
+        &self,
+        room_id: &str,
+        version: &RoomVersionId,
+        object: &mut CanonicalJsonObject,
+    ) -> Result<(), RoomError> {
+        if spindle_core::version::names_events_by_hash(version) {
+            return Ok(());
+        }
+        for field in ["prev_events", "auth_events"] {
+            let ids = spindle_core::version::edge_ids(object.get(field));
+            let mut edges = Vec::with_capacity(ids.len());
+            for id in ids {
+                let parent = self.read_event(room_id, &EventId::new(id.as_str()))?;
+                let Ok(CanonicalJsonValue::Object(parent)) = CanonicalJsonValue::try_from(parent)
+                else {
+                    return Err(RoomError::Build(format!(
+                        "the stored body of {id} is not canonical JSON"
+                    )));
+                };
+                edges.push(
+                    spindle_core::version::edge(&id, &parent, version)
+                        .map_err(|error| RoomError::Build(error.to_string()))?,
+                );
+            }
+            if object.contains_key(field) {
+                object.insert(field.to_owned(), CanonicalJsonValue::Array(edges));
+            }
+        }
+        Ok(())
     }
 
     /// Step around a fork this server cannot fold, and say so.
@@ -4271,15 +4314,10 @@ impl Rooms {
     ) -> Result<String, RoomError> {
         let event_id = event_id.to_owned();
         let json = json.clone();
-        let prev: Vec<EventId> = json["prev_events"]
-            .as_array()
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(Value::as_str)
-                    .map(EventId::new)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let prev: Vec<EventId> = edge_ids(&json["prev_events"])
+            .into_iter()
+            .map(EventId::new)
+            .collect();
 
         let input = EventInput::new(event_id.clone(), prev);
         let input = match state_key {
@@ -4498,15 +4536,10 @@ impl Rooms {
         } else {
             None
         };
-        let prev: Vec<EventId> = json["prev_events"]
-            .as_array()
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(Value::as_str)
-                    .map(EventId::new)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let prev: Vec<EventId> = edge_ids(&json["prev_events"])
+            .into_iter()
+            .map(EventId::new)
+            .collect();
 
         let input = EventInput::new(event_id, prev);
         let input = match &state_key {
@@ -5034,6 +5067,26 @@ pub(crate) fn power_level(value: &Value) -> Option<i64> {
         None => text.parse::<i64>().ok()?,
     };
     (-MAX_SAFE..=MAX_SAFE).contains(&level).then_some(level)
+}
+
+/// The event IDs a `prev_events` or `auth_events` value names.
+///
+/// From v3 a reference is the bare ID; in v1 and v2 it is an
+/// `[event_id, {"sha256": hash}]` pair. Every reader of an edge list goes
+/// through here, so a v1 event's parents are its parents rather than an
+/// empty list -- which is what reading the pairs as strings produced, and
+/// which the log then refuses as an event with no predecessor.
+pub(crate) fn edge_ids(edges: &Value) -> Vec<String> {
+    edges
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|edge| match edge {
+            Value::String(id) => Some(id.clone()),
+            Value::Array(pair) => pair.first().and_then(Value::as_str).map(str::to_owned),
+            _ => None,
+        })
+        .collect()
 }
 
 pub(crate) fn version_in(content: &Value) -> Result<RoomVersionId, RoomError> {
@@ -5889,7 +5942,7 @@ mod room_version_tests {
     fn creating_a_room_at_an_unadvertised_version_is_refused() {
         let (_dir, _store, rooms) = rooms();
         let key = key();
-        let unsupported: Vec<_> = ["1", "5", "6", "9", "10"]
+        let unsupported: Vec<_> = ["1", "5", "6", "9", "10", "13"]
             .into_iter()
             .filter(|version| !crate::surface::supports_room_version(version))
             .collect();

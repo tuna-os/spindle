@@ -112,7 +112,9 @@ pub(crate) fn receive_one_pdu(
         // Which of the peer's keys may answer for this event depends on
         // when the peer says it signed it: a key retired at `expired_ts`
         // verifies nothing claimed after that moment (#296).
-        let key_map = keys.map_for(pdu["origin_server_ts"].as_u64());
+        let enforce =
+            spindle_core::rules_of(&version).is_some_and(|rules| rules.enforce_key_validity);
+        let key_map = keys.map_for(pdu["origin_server_ts"].as_u64(), enforce);
         match spindle_core::version::verify(&key_map, &canonical, &version) {
             Ok(ruma::signatures::Verified::All) => {}
             // The signature holds but the content hash does not: someone
@@ -177,6 +179,15 @@ fn room_version_of(state: &AppState, pdu: &Value) -> ruma::RoomVersionId {
     if pdu.get("prev_state_events").is_some() && pdu.get("auth_events").is_none() {
         return ruma::RoomVersionId::try_from(spindle_core::STATE_DAG_V12)
             .unwrap_or_else(|_| fallback());
+    }
+    // `[id, hashes]` references are v1/v2's shape and nobody else's; the
+    // two name events alike, so v1 reads either.
+    if pdu["auth_events"]
+        .as_array()
+        .and_then(|edges| edges.first())
+        .is_some_and(Value::is_array)
+    {
+        return ruma::RoomVersionId::V1;
     }
     fallback()
 }
@@ -300,18 +311,23 @@ pub(crate) fn sign_membership_template(
             ruma::CanonicalJsonValue::Integer(ruma::Int::try_from(now).unwrap_or_default()),
         );
     }
-    spindle_core::version::hash_and_sign(
+    // v1/v2: the joining server names its own event, `$opaque:ourname`,
+    // inside the bytes it signs; `Pdu::sign` mints it. A resident that put
+    // its own `event_id` in the template (Synapse builds one) named the
+    // event under *its* server, whose signature this event will never
+    // carry, so that name is dropped. From v3 the name is the hash and
+    // `Pdu::sign` computes it.
+    canonical.remove("event_id");
+    let pdu = spindle_core::Pdu::sign(
+        version.clone(),
+        canonical,
         &state.config.server.name,
         state.key.pair(),
-        &mut canonical,
-        version,
     )
-    .map_err(|error| format!("the template cannot be signed: {error}"))?;
-    let hash = spindle_core::version::reference_hash(&canonical, version)
-        .map_err(|error| format!("the signed event cannot be hashed: {error}"))?;
-    let event = serde_json::to_value(&canonical)
+    .map_err(|error| format!("the template cannot be signed: {error:?}"))?;
+    let event = serde_json::to_value(pdu.canonical())
         .map_err(|error| format!("the signed event cannot be serialized: {error}"))?;
-    Ok((format!("${hash}"), event))
+    Ok((pdu.event_id().as_str().to_owned(), event))
 }
 
 /// Add this server's signature to an event another server built.
@@ -1070,11 +1086,11 @@ pub(crate) async fn invite(
         .map_err(|error| MatrixError::bad_json(format!("room_version: {error}")))?;
     // The path names the event the inviter computed; disagreement means the
     // two servers are not looking at the same event.
-    let hash = spindle_core::version::reference_hash(&canonical, &version)
-        .map_err(|error| MatrixError::bad_json(format!("the invite cannot be hashed: {error}")))?;
-    if format!("${hash}") != event_id {
+    let named = spindle_core::version::event_id(&canonical, &version)
+        .map_err(|error| MatrixError::bad_json(format!("the invite cannot be named: {error}")))?;
+    if named != event_id {
         return Err(MatrixError::bad_json(format!(
-            "the event hashes to ${hash}, not {event_id}"
+            "the event is {named}, not {event_id}"
         )));
     }
     if spindle_core::version::hash_and_sign(

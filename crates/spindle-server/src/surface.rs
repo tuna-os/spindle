@@ -71,11 +71,21 @@ pub const SPEC_VERSIONS: &[SpecVersion] = &[
 /// (top level before v11), the restricted-join nomination (v8+), and knock
 /// templates (v7+).
 ///
-/// Versions 1 to 5 are not listed: v1 and v2 name events by
-/// `$random:server` rather than by hash and link them by `[id, hash]`
-/// pairs, which this server does not yet build, and v3 to v5 are not yet
-/// exercised.
+/// Versions 1 to 5 add their own differences, each handled where it lives:
+/// v1 and v2 name events `$opaque:server` and link them by
+/// `[id, {"sha256": hash}]` pairs (`spindle_core::version::event_id`,
+/// `edge`, `Rooms::link_edges`, `rooms::edge_ids`); v1 resolves state with
+/// the original algorithm (`state_res_v1`); v1 and v2 let a server redact
+/// its own events whatever its power (ruma, given the `redacts` target);
+/// v3 names events in standard rather than URL-safe base64; and v5 starts
+/// enforcing key validity (`PeerKeys::map_for`). The migration corpus holds
+/// a real v1 room.
 pub const ROOM_VERSIONS: &[&str] = &[
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
     "6",
     "7",
     "8",
@@ -199,31 +209,59 @@ pub fn required_routes() -> Vec<&'static str> {
 mod room_version_surface_tests {
     use super::{DEFAULT_ROOM_VERSION, ROOM_VERSIONS};
 
-    /// Every advertised version mints the event IDs this server computes.
+    /// Every advertised version names events the way its rules say, and
+    /// names a received event the way it named the event it signed.
     ///
     /// The advertised set is a claim, and this is the part of it that is
-    /// checkable without a running room: an event ID format other than `V3`
-    /// means IDs this implementation does not produce, so advertising such a
-    /// version would promise machinery that does not exist.
-    ///
-    /// It fails in both directions on purpose. Adding v3 or below fails here
-    /// rather than in a federation trace weeks later; and if a future room
-    /// version changes the format, adding it fails here too — which is the
-    /// moment to decide deliberately rather than discover it from a peer.
+    /// checkable without a running room. A version whose event ID format
+    /// this server did not implement would fail the round trip here rather
+    /// than in a federation trace weeks later.
     #[test]
-    fn every_advertised_version_uses_the_event_id_format_this_server_computes() {
+    fn every_advertised_version_names_its_events_by_its_own_rules() {
+        use ruma::room_version_rules::EventIdFormatVersion;
+        let document = ruma::signatures::Ed25519KeyPair::generate();
+        let key = ruma::signatures::Ed25519KeyPair::from_der(&document, "1".to_owned()).unwrap();
         for name in ROOM_VERSIONS {
             let version = ruma::RoomVersionId::try_from(*name)
                 .unwrap_or_else(|error| panic!("v{name} is not a room version: {error}"));
             let rules = spindle_core::rules_of(&version)
                 .unwrap_or_else(|| panic!("no rules for advertised v{name}"));
-            assert_eq!(
-                rules.event_id_format,
-                ruma::room_version_rules::EventIdFormatVersion::V3,
-                "v{name} is advertised but mints event IDs in {:?}, not the V3 \
-                 reference hashes this server computes",
-                rules.event_id_format,
-            );
+            if spindle_core::is_state_dag(&version) {
+                // MSC4242's event shape (no `auth_events`) has its own
+                // round-trip tests in `spindle_core::version`.
+                continue;
+            }
+            let edges = if rules.event_id_format == EventIdFormatVersion::V1 {
+                serde_json::json!([["$p:example.org", { "sha256": "abc" }]])
+            } else {
+                serde_json::json!(["$p"])
+            };
+            let ruma::CanonicalJsonValue::Object(event) =
+                ruma::CanonicalJsonValue::try_from(serde_json::json!({
+                    "type": "m.room.message",
+                    "sender": "@a:example.org",
+                    "room_id": "!r:example.org",
+                    "content": { "body": "hi" },
+                    "origin_server_ts": 1,
+                    "depth": 2,
+                    "prev_events": edges,
+                    "auth_events": edges,
+                }))
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            let signed = spindle_core::Pdu::sign(version.clone(), event, "example.org", &key)
+                .unwrap_or_else(|error| panic!("v{name} cannot sign: {error:?}"));
+            let id = signed.event_id().as_str();
+            match rules.event_id_format {
+                EventIdFormatVersion::V1 => assert!(id.ends_with(":example.org"), "v{name}: {id}"),
+                EventIdFormatVersion::V2 => assert!(!id.contains(':'), "v{name}: {id}"),
+                _ => assert!(!id.contains([':', '+', '/']), "v{name}: {id}"),
+            }
+            let received =
+                spindle_core::Pdu::from_remote(version, signed.canonical().clone()).unwrap();
+            assert_eq!(received.event_id(), signed.event_id(), "v{name}");
         }
     }
 

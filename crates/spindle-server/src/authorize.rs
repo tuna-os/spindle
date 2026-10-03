@@ -38,6 +38,8 @@ pub struct StoredEvent {
     state_key: Option<String>,
     prev_events: Vec<OwnedEventId>,
     auth_events: Vec<OwnedEventId>,
+    redacts: Option<OwnedEventId>,
+    depth: i64,
 }
 
 impl StoredEvent {
@@ -87,13 +89,26 @@ impl StoredEvent {
                 .ok_or_else(|| format!("`{field}` is missing or not an array"))?
                 .iter()
                 .map(|id| {
-                    let id = id
-                        .as_str()
-                        .ok_or_else(|| format!("`{field}` holds a non-string"))?;
+                    // A bare ID from v3; an `[id, hashes]` pair in v1/v2.
+                    let id = match id {
+                        Value::Array(pair) => pair.first().and_then(Value::as_str),
+                        other => other.as_str(),
+                    }
+                    .ok_or_else(|| format!("`{field}` holds a non-reference"))?;
                     OwnedEventId::try_from(id).map_err(|error| format!("`{field}`: {error}"))
                 })
                 .collect()
         };
+        // The redaction target: top level before v11, in content from v11
+        // (MSC2174). The v1/v2 rules read it -- a redaction is allowed when
+        // its target's ID names the redacter's own server -- so a stored
+        // event that hid it would refuse a redaction those rules admit.
+        let redacts = json["redacts"]
+            .as_str()
+            .or_else(|| json["content"]["redacts"].as_str())
+            .map(OwnedEventId::try_from)
+            .transpose()
+            .map_err(|error| format!("redacts: {error}"))?;
 
         Ok(Self {
             event_id: OwnedEventId::try_from(event_id)
@@ -119,7 +134,16 @@ impl StoredEvent {
             } else {
                 Vec::new()
             },
+            redacts,
+            depth: json["depth"].as_i64().unwrap_or(0),
         })
+    }
+
+    /// The event's signed `depth`, which only room version 1's state
+    /// resolution reads (it orders conflicted events by it).
+    #[must_use]
+    pub fn depth(&self) -> i64 {
+        self.depth
     }
 }
 
@@ -154,7 +178,7 @@ impl Event for StoredEvent {
         Box::new(self.auth_events.iter())
     }
     fn redacts(&self) -> Option<&Self::Id> {
-        None
+        self.redacts.as_ref()
     }
     fn rejected(&self) -> bool {
         false

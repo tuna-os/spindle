@@ -171,7 +171,7 @@ async fn a_room_requested_at_an_advertised_version_is_created_at_it() {
 
 /// An unserved version is refused, not substituted.
 ///
-/// Asking for v5 and receiving v11 with a 200 is a lie the client cannot
+/// Asking for v13 and receiving v11 with a 200 is a lie the client cannot
 /// detect until something that depends on the version fails. The spec's
 /// answer is `400 M_UNSUPPORTED_ROOM_VERSION`, and so is an unknown name.
 #[tokio::test]
@@ -179,7 +179,7 @@ async fn an_unserved_version_is_refused_rather_than_substituted() {
     let harness = Harness::new();
     let token = harness.register().await;
 
-    for version in ["5", "not-a-version"] {
+    for version in ["13", "not-a-version"] {
         assert!(!spindle_server::surface::supports_room_version(version));
         let (status, body) = harness
             .post(
@@ -199,7 +199,7 @@ async fn each_served_legacy_version_creates_that_version() {
     let harness = Harness::new();
     let token = harness.register().await;
 
-    for version in ["6", "7", "8", "9", "10"] {
+    for version in ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"] {
         let (status, body) = harness
             .post(
                 "/_matrix/client/v3/createRoom",

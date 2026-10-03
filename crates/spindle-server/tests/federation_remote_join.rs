@@ -221,7 +221,10 @@ impl Instance {
         let (status, body) = self
             .request(
                 reqwest::Method::PUT,
-                &format!("/_matrix/client/v3/rooms/{room}/redact/{target}/redact-{target}"),
+                &format!(
+                    "/_matrix/client/v3/rooms/{room}/redact/{0}/redact-{0}",
+                    target.replace('/', "%2F")
+                ),
                 Some(token),
                 Some(&json!({ "reason": "test" })),
             )
@@ -234,7 +237,10 @@ impl Instance {
         let (status, body) = self
             .request(
                 reqwest::Method::GET,
-                &format!("/_matrix/client/v3/rooms/{room}/event/{event_id}"),
+                &format!(
+                    "/_matrix/client/v3/rooms/{room}/event/{}",
+                    event_id.replace('/', "%2F")
+                ),
                 Some(token),
                 None,
             )
@@ -873,6 +879,126 @@ async fn a_v7_room_can_be_joined_and_used_across_two_servers() {
 #[tokio::test]
 async fn a_v6_room_can_be_joined_and_used_across_two_servers() {
     join_exchange_and_redact_at("6").await;
+}
+
+/// Version 5 enforces key validity; the keys are fresh, so events verify.
+#[tokio::test]
+async fn a_v5_room_can_be_joined_and_used_across_two_servers() {
+    join_exchange_and_redact_at("5").await;
+}
+
+/// Version 4 is the first with URL-safe hash IDs.
+#[tokio::test]
+async fn a_v4_room_can_be_joined_and_used_across_two_servers() {
+    join_exchange_and_redact_at("4").await;
+}
+
+/// Version 3 names events by standard base64, so an ID may hold `/` and has
+/// to be escaped in every URL path that carries it, `send_join` included.
+#[tokio::test]
+async fn a_v3_room_can_be_joined_and_used_across_two_servers() {
+    join_exchange_and_redact_at("3").await;
+}
+
+/// Version 2 is version 1's event shape with state resolution v2.
+#[tokio::test]
+async fn a_v2_room_can_be_joined_and_used_across_two_servers() {
+    join_exchange_and_redact_at("2").await;
+}
+
+/// Version 1 is in the migration corpus.
+#[tokio::test]
+async fn a_v1_room_can_be_joined_and_used_across_two_servers() {
+    join_exchange_and_redact_at("1").await;
+}
+
+/// In a v1 room every event carries an ID its origin chose, and names its
+/// parents by `[id, {"sha256": hash}]` pairs. The joining server names its
+/// own join under its own name, and the pairs it writes pin the hashes the
+/// resident computes.
+#[tokio::test]
+async fn v1_events_carry_their_names_and_hash_their_parents() {
+    let remote = Instance::start().await;
+    let local = Instance::start().await;
+    let alice = remote.register("alice").await;
+    let bob = local.register("bob").await;
+    let bob_id = format!("@bob:{}", local.name);
+
+    let room = remote.public_room_at_version(&alice, Some("1")).await;
+    let (status, body) = local.join_via(&room, &bob, &remote.name).await;
+    assert_eq!(status, 200, "{body}");
+    local.say(&room, &bob, "named by the sender").await;
+
+    let join = remote.member_event(&room, &alice, &bob_id).await;
+    let join_id = join["event_id"].as_str().unwrap();
+    assert!(
+        join_id.ends_with(&format!(":{}", local.name)),
+        "the joiner names its own join: {join}"
+    );
+    for field in ["prev_events", "auth_events"] {
+        let edges = join[field].as_array().unwrap_or_else(|| panic!("{join}"));
+        assert!(!edges.is_empty(), "{field}: {join}");
+        for edge in edges {
+            let pair = edge.as_array().unwrap_or_else(|| panic!("{field}: {join}"));
+            assert!(pair[0].as_str().unwrap().starts_with('$'), "{edge}");
+            assert!(pair[1]["sha256"].is_string(), "{edge}");
+        }
+    }
+
+    let (status, messages) = local
+        .request(
+            reqwest::Method::GET,
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=50"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{messages}");
+    for event in messages["chunk"].as_array().unwrap() {
+        let id = event["event_id"].as_str().unwrap();
+        let server = id.split_once(':').map(|(_, server)| server).unwrap();
+        let sender = event["sender"].as_str().unwrap();
+        assert!(
+            sender.ends_with(&format!(":{server}")),
+            "a v1 event is named under its sender's server: {event}"
+        );
+    }
+}
+
+/// Room versions 1 and 2 let a server redact the events it named itself,
+/// whatever the redacter's power: the rule compares the redaction's own ID
+/// with its target's, which only a server that reads the top-level
+/// `redacts` can apply. Bob holds no power in Alice's room.
+#[tokio::test]
+async fn a_v1_member_redacts_their_own_event_by_the_v1_rule() {
+    let remote = Instance::start().await;
+    let local = Instance::start().await;
+    let alice = remote.register("alice").await;
+    let bob = local.register("bob").await;
+
+    let room = remote.public_room_at_version(&alice, Some("1")).await;
+    assert_eq!(local.join_via(&room, &bob, &remote.name).await.0, 200);
+    let target = local.say(&room, &bob, "regrettable").await;
+    assert!(
+        eventually(async || {
+            remote
+                .messages(&room, &alice)
+                .await
+                .contains(&"regrettable".to_owned())
+        })
+        .await
+    );
+
+    local.redact(&room, &bob, &target).await;
+    assert!(
+        eventually(async || local.event(&room, &bob, &target).await["content"] == json!({})).await,
+        "bob's server applied his redaction"
+    );
+    assert!(
+        eventually(async || remote.event(&room, &alice, &target).await["content"] == json!({}))
+            .await,
+        "the resident accepted the v1 same-server redaction"
+    );
 }
 
 /// A restricted room at `version` admits a remote member of the room it
