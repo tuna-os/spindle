@@ -277,12 +277,7 @@ fn profile_routes() -> Router<AppState> {
 }
 
 
-struct ReportRequest {
-    #[serde(default)]
-    reason: Option<String>,
-    #[serde(default)]
-    score: Option<i64>,
-}
+
 
 /// The surface only an appservice speaks.
 fn appservice_routes() -> Router<AppState> {
@@ -562,10 +557,6 @@ fn timeline_routes() -> Router<AppState> {
         .route(
             "/_matrix/client/v3/rooms/{room_id}/upgrade",
             post(upgrade_room),
-        )
-        .route(
-            "/_matrix/client/v3/rooms/{room_id}/report/{event_id}",
-            post(report_event),
         )
         .route(
             "/_matrix/client/v3/rooms/{room_id}/redact/{event_id}/{txn_id}",
@@ -2001,56 +1992,7 @@ async fn well_known_support(State(state): State<AppState>) -> Result<Json<Value>
     Ok(Json(Value::Object(body)))
 }
 
-#[derive(Debug, Deserialize)]
-struct ReasonOnly {
-    reason: Option<String>,
-}
 
-/// `POST /_matrix/client/v3/rooms/{roomId}/report` (spec v1.13)
-///
-/// A report about a room rather than an event in it. The room must be one
-/// this server holds; a report about nothing is a 404, the same answer an
-/// event report gives.
-async fn report_room(
-    State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
-    axum::extract::Path(room_id): axum::extract::Path<String>,
-    Json(request): Json<ReasonOnly>,
-) -> Result<Json<Value>, MatrixError> {
-    // Deliberately open to strangers. A report is how somebody *outside*
-    // a room tells the admins about it (spec v1.13 says a reporter need
-    // not be joined), so the caller's own view of the room is not the
-    // gate here. What is checked is that the room exists at all: a
-    // member already knows that, and a stranger learns nothing more from
-    // the 404 than they would from a join attempt.
-    if may_read_room(&state, &identity.user_id, &room_id).is_err() {
-        // A stranger: still allowed to report, but only a room that exists.
-        if state.rooms.summary(&room_id).is_err() {
-            return Err(MatrixError::new(
-                StatusCode::NOT_FOUND,
-                "M_NOT_FOUND",
-                "no such room",
-            ));
-        }
-    }
-    let report_id = crate::admin::file_report(
-        &state,
-        &identity.user_id,
-        Some(&room_id),
-        None,
-        None,
-        request.reason.as_deref(),
-        None,
-    )?;
-    crate::admin::audit(
-        &state,
-        &identity.user_id,
-        "report",
-        &room_id,
-        &json!({ "room_id": room_id, "reason": request.reason, "report_id": report_id }),
-    )?;
-    Ok(Json(json!({})))
-}
 
 
 /// `GET /_matrix/client/v3/admin/whois/{userId}`
