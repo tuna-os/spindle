@@ -29,7 +29,7 @@
 set -euo pipefail
 
 # Bump deliberately, with the allowlist re-baselined in the same commit.
-COMPLEMENT_REV=6d2fdc286c2b44faaddd1037205869b2242a4005
+COMPLEMENT_REV=b465a032c6948c25b80e6f6111f236c1287fe780
 PACKAGES=("./tests/csapi" "./tests")
 
 results="${1:-tmp/complement-results.jsonl}"
