@@ -4687,9 +4687,29 @@ struct SyncQuery {
 }
 
 impl SyncQuery {
-    /// Whether to label the state block `state_after` (MSC4222).
+    /// Whether to send the state after the timeline (MSC4222).
     fn state_after(&self) -> bool {
-        self.use_state_after.or(self.unstable_use_state_after) == Some(true)
+        self.state_label() != "state"
+    }
+
+    /// The key the joined room's state block goes under.
+    ///
+    /// The response field is spelled the way the request flag was. A
+    /// client that asked with the unstable flag reads only the unstable
+    /// field: matrix-js-sdk, and so Element Web, sends
+    /// `org.matrix.msc4222.use_state_after=true` on every sync and reads
+    /// `org.matrix.msc4222.state_after`, falling back to `state`. Answering
+    /// it with the stable `state_after` left it with no state at all: every
+    /// room read as version 1, unnamed, and unencrypted, so its composer
+    /// offered to send in plaintext into an encrypted room.
+    fn state_label(&self) -> &'static str {
+        if self.use_state_after == Some(true) {
+            "state_after"
+        } else if self.use_state_after.is_none() && self.unstable_use_state_after == Some(true) {
+            "org.matrix.msc4222.state_after"
+        } else {
+            "state"
+        }
     }
 }
 
@@ -7332,7 +7352,7 @@ async fn sync(
         &identity,
         result.rooms,
         filter.as_ref(),
-        state_after,
+        query.state_label(),
         since,
     )?;
 
@@ -7622,7 +7642,7 @@ fn sync_join(
     identity: &crate::accounts::Identity,
     rooms: Vec<crate::rooms::SyncRoom>,
     filter: Option<&crate::filters::Filter>,
-    state_after: bool,
+    state_label: &'static str,
     since: Option<u64>,
 ) -> Result<BTreeMap<String, Box<RawValue>>, MatrixError> {
     let mut join: BTreeMap<String, Box<RawValue>> = BTreeMap::new();
@@ -7708,10 +7728,7 @@ fn sync_join(
         } else {
             raw(&json!({ "events": room_state }))?
         };
-        entry.insert(
-            if state_after { "state_after" } else { "state" },
-            state_json,
-        );
+        entry.insert(state_label, state_json);
         entry.insert("account_data", raw(&json!({ "events": room_data }))?);
         entry.insert(
             "ephemeral",
