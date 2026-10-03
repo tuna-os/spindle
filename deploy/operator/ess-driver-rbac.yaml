@@ -1,0 +1,36 @@
+# Least-privilege baseline for the ess-v1 operation driver. Bind this Role to
+# spindle-operator in the ESS namespace. Kubernetes RBAC cannot restrict list
+# by label; the driver itself refuses every selected workload not declared in
+# its topology before it mutates anything.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spindle-ess-driver
+  namespace: ess
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spindle-ess-driver
+  namespace: ess
+subjects:
+  - kind: ServiceAccount
+    name: spindle-operator
+    namespace: ess
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: spindle-ess-driver

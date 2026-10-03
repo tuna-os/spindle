@@ -1,0 +1,33 @@
+{
+  "profile": "ess-v1",
+  "scope": {
+    "namespace": "ess",
+    "selector": "spindle.tunaos.org/deployment=matrix-example-org"
+  },
+  "workloads": [
+    { "kind": "StatefulSet", "name": "ess-synapse-main", "role": "synapse" },
+    { "kind": "StatefulSet", "name": "ess-synapse-fed-sender", "role": "federation-sender" },
+    { "kind": "StatefulSet", "name": "ess-synapse-sliding-sync", "role": "sliding-sync" },
+    { "kind": "Deployment", "name": "ess-matrix-authentication-service", "role": "mas" },
+    { "kind": "StatefulSet", "name": "ess-postgresql", "role": "postgres" },
+    { "kind": "Deployment", "name": "ess-media-repository", "role": "media" },
+    { "kind": "Deployment", "name": "ess-element-call", "role": "element-call" },
+    { "kind": "Deployment", "name": "ess-livekit", "role": "livekit" }
+  ],
+  "routes": [
+    {
+      "kind": "Ingress",
+      "name": "ess-matrix",
+      "host": "matrix.example.org",
+      "path": "/",
+      "source_service": "ess-synapse-client",
+      "target_service": "spindle-client"
+    }
+  ],
+  "postgres": {
+    "namespace": "ess",
+    "pod_selector": "app.kubernetes.io/name=postgresql,app.kubernetes.io/instance=ess",
+    "maintenance_database": "postgres",
+    "databases": ["synapse", "mas"]
+  }
+}
