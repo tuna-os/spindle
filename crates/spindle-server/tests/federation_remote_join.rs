@@ -336,6 +336,17 @@ async fn a_user_joins_a_room_on_another_server_and_both_sides_converge() {
     assert_eq!(status, 200, "{topic}");
     assert_eq!(topic["topic"], "the room's real topic");
 
+    // `send_join` carries state and auth, but no timeline. The joining
+    // server follows it with backfill so pagination reaches messages from
+    // before the join.
+    assert!(
+        local
+            .messages(&room, &bob)
+            .await
+            .contains(&"before".to_owned()),
+        "pre-join history is available to the joining member"
+    );
+
     // Ordinary federation now carries messages both ways.
     remote.say(&room, &alice, "from the resident side").await;
     assert!(
@@ -358,6 +369,36 @@ async fn a_user_joins_a_room_on_another_server_and_both_sides_converge() {
         })
         .await,
         "joiner-side messages reach the resident server"
+    );
+}
+
+#[tokio::test]
+async fn version_ten_remote_join_backfills_without_version_substitution() {
+    let remote = Instance::start().await;
+    let local = Instance::start().await;
+    let alice = remote.register("alice").await;
+    let bob = local.register("bob").await;
+
+    let (status, body) = remote
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(&json!({ "room_version": "10", "preset": "public_chat" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    remote.say(&room, &alice, "version ten history").await;
+
+    let (status, body) = local.join_via(&room, &bob, &remote.name).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        local
+            .messages(&room, &bob)
+            .await
+            .contains(&"version ten history".to_owned()),
+        "v10 history is verified and stored under v10 rules"
     );
 }
 
