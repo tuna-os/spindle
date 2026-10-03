@@ -1454,11 +1454,17 @@ impl Run<'_, '_> {
         }
         room_report.from_source = resolved.from_source.len() as u64;
         for (event_id, reason) in &resolved.from_source {
-            let kind = reason
-                .split([' ', '{', '('])
-                .next()
-                .unwrap_or(reason)
-                .to_owned();
+            let kind = if reason.starts_with("a parent") {
+                "parent outside retained history".to_owned()
+            } else if reason.starts_with("head") {
+                "head over several forward extremities".to_owned()
+            } else {
+                reason
+                    .split([' ', '{', '('])
+                    .next()
+                    .unwrap_or(reason)
+                    .to_owned()
+            };
             *room_report.from_source_reasons.entry(kind).or_default() += 1;
             if room_report.from_source_examples.len() < 5 {
                 room_report
