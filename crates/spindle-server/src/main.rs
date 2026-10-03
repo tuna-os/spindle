@@ -24,7 +24,8 @@ async fn main() -> ExitCode {
             ) else {
                 eprintln!(
                     "usage: spindle import-synapse-rehearsal \
-                     <config> <postgres-config> <room-id> <user-id>"
+                     <config> <postgres-config> <room-id>[,<room-id>...] \
+                     <user-id>[,<user-id>...]"
                 );
                 return ExitCode::FAILURE;
             };
@@ -115,14 +116,61 @@ async fn main() -> ExitCode {
     serve().await
 }
 
-/// Build an isolated one-room, one-user cutover rehearsal from live Synapse.
+/// Split a comma-separated command-line list, dropping empty entries.
+#[cfg(feature = "synapse-import")]
+fn rehearsal_list(argument: &str) -> Vec<String> {
+    let mut items: Vec<String> = argument
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect();
+    items.sort_unstable();
+    items.dedup();
+    items
+}
+
+/// The disposable login password for one rehearsal user.
+///
+/// `SPINDLE_REHEARSAL_PASSWORD_DIR` names a directory holding one file per
+/// localpart (a mounted Kubernetes Secret, say), so each user keeps a
+/// distinct password. Without it, `SPINDLE_REHEARSAL_PASSWORD` is used for
+/// every user.
+#[cfg(feature = "synapse-import")]
+fn rehearsal_password(localpart: &str) -> Result<String, String> {
+    let password = if let Ok(dir) = std::env::var("SPINDLE_REHEARSAL_PASSWORD_DIR") {
+        let path = std::path::Path::new(&dir).join(localpart);
+        std::fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?
+            .trim_end_matches(['\r', '\n'])
+            .to_owned()
+    } else {
+        std::env::var("SPINDLE_REHEARSAL_PASSWORD").map_err(|_| {
+            "set SPINDLE_REHEARSAL_PASSWORD or SPINDLE_REHEARSAL_PASSWORD_DIR \
+             for the disposable local logins"
+                .to_owned()
+        })?
+    };
+    if password.is_empty() {
+        return Err(format!("the rehearsal password for {localpart} is empty"));
+    }
+    Ok(password)
+}
+
+/// Build an isolated cutover rehearsal from live Synapse.
+///
+/// `room_ids` and `user_ids` are comma-separated lists. Every room is read
+/// and validated, then persisted; every user gets their recovery material
+/// (account data, device and cross-signing keys, signatures, key backup)
+/// and a disposable local login. All reads come from one source snapshot,
+/// and nothing is written until every read has succeeded.
 #[cfg(feature = "synapse-import")]
 #[allow(clippy::too_many_lines)]
 fn import_synapse_rehearsal(
     config_path: &str,
     postgres: &str,
-    room_id: &str,
-    user_id: &str,
+    room_ids: &str,
+    user_ids: &str,
 ) -> ExitCode {
     let config = match Config::load(config_path) {
         Ok(config) => config,
@@ -131,27 +179,35 @@ fn import_synapse_rehearsal(
             return ExitCode::FAILURE;
         }
     };
-    let Some((localpart, domain)) = user_id
-        .strip_prefix('@')
-        .and_then(|user| user.split_once(':'))
-    else {
-        eprintln!("spindle: {user_id:?} is not a Matrix user ID");
-        return ExitCode::FAILURE;
-    };
-    if domain != config.server.name {
-        eprintln!(
-            "spindle: {user_id} does not belong to configured server {}",
-            config.server.name
-        );
+    let room_ids = rehearsal_list(room_ids);
+    let user_ids = rehearsal_list(user_ids);
+    if room_ids.is_empty() || user_ids.is_empty() {
+        eprintln!("spindle: name at least one room and one user");
         return ExitCode::FAILURE;
     }
-    let Ok(login_password) = std::env::var("SPINDLE_REHEARSAL_PASSWORD") else {
-        eprintln!("spindle: set SPINDLE_REHEARSAL_PASSWORD for the disposable local login");
-        return ExitCode::FAILURE;
-    };
-    if login_password.is_empty() {
-        eprintln!("spindle: SPINDLE_REHEARSAL_PASSWORD may not be empty");
-        return ExitCode::FAILURE;
+    let mut users = Vec::with_capacity(user_ids.len());
+    for user_id in &user_ids {
+        let Some((localpart, domain)) = user_id
+            .strip_prefix('@')
+            .and_then(|user| user.split_once(':'))
+        else {
+            eprintln!("spindle: {user_id:?} is not a Matrix user ID");
+            return ExitCode::FAILURE;
+        };
+        if domain != config.server.name {
+            eprintln!(
+                "spindle: {user_id} does not belong to configured server {}",
+                config.server.name
+            );
+            return ExitCode::FAILURE;
+        }
+        match rehearsal_password(localpart) {
+            Ok(password) => users.push((user_id.clone(), localpart.to_owned(), password)),
+            Err(error) => {
+                eprintln!("spindle: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
 
     let store = match FjallStore::open(&config.storage.path) {
@@ -174,21 +230,6 @@ fn import_synapse_rehearsal(
             return ExitCode::FAILURE;
         }
     }
-    if let Ok(path) = std::env::var("SPINDLE_SYNAPSE_SIGNING_KEY_FILE") {
-        let source = match std::fs::read_to_string(&path) {
-            Ok(source) => source,
-            Err(error) => {
-                eprintln!("spindle: cannot read Synapse signing key file {path}: {error}");
-                return ExitCode::FAILURE;
-            }
-        };
-        if let Err(error) =
-            spindle_server::signing::ServerKey::install_synapse(store.as_ref(), &source)
-        {
-            eprintln!("spindle: cannot install Synapse signing key: {error}");
-            return ExitCode::FAILURE;
-        }
-    }
 
     let database_password = std::env::var("SPINDLE_SYNAPSE_PASSWORD").ok();
     let mut source = match spindle_server::import::synapse::postgres::Reader::connect_no_tls(
@@ -208,55 +249,102 @@ fn import_synapse_rehearsal(
             return ExitCode::FAILURE;
         }
     };
-    let source_room = match snapshot.read_room(room_id) {
-        Ok(room) => room,
-        Err(error) => {
-            eprintln!("spindle: cannot read source room: {error}");
+
+    // Read everything first, so a bad room or user fails the run while the
+    // target store is still empty and the run can simply be repeated.
+    let mut sources = Vec::with_capacity(room_ids.len());
+    for room_id in &room_ids {
+        let source_room = match snapshot.read_room(room_id) {
+            Ok(room) => room,
+            Err(error) => {
+                eprintln!("spindle: cannot read source room {room_id}: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let bodies = match snapshot.event_bodies(room_id) {
+            Ok(bodies) => bodies,
+            Err(error) => {
+                eprintln!("spindle: cannot read event bodies of {room_id}: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        sources.push((source_room, bodies));
+    }
+    let mut recoveries = Vec::with_capacity(users.len());
+    for (user_id, _, _) in &users {
+        match snapshot.recovery_data(user_id) {
+            Ok(recovery) => recoveries.push(recovery),
+            Err(error) => {
+                eprintln!("spindle: cannot read recovery data of {user_id}: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    if let Ok(path) = std::env::var("SPINDLE_SYNAPSE_SIGNING_KEY_FILE") {
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) => {
+                eprintln!("spindle: cannot read Synapse signing key file {path}: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(error) =
+            spindle_server::signing::ServerKey::install_synapse(store.as_ref(), &source)
+        {
+            eprintln!("spindle: cannot install Synapse signing key: {error}");
             return ExitCode::FAILURE;
         }
-    };
-    let bodies = match snapshot.event_bodies(room_id) {
-        Ok(bodies) => bodies,
-        Err(error) => {
-            eprintln!("spindle: cannot read source event bodies: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let recovery = match snapshot.recovery_data(user_id) {
-        Ok(recovery) => recovery,
-        Err(error) => {
-            eprintln!("spindle: cannot read source recovery data: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
+    }
 
     let rooms = spindle_server::rooms::Rooms::new(Arc::clone(&store), &config.server.name);
-    let room = match spindle_server::import::persist_rehearsal(&rooms, &source_room, &bodies) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            eprintln!("spindle: room rehearsal failed: {error}");
-            return ExitCode::FAILURE;
+    for (source_room, bodies) in &sources {
+        match spindle_server::import::persist_rehearsal(&rooms, source_room, bodies) {
+            Ok(outcome) => println!(
+                "room {}: room_events={}",
+                source_room.room_id, outcome.imported
+            ),
+            Err(error) => {
+                eprintln!(
+                    "spindle: room rehearsal failed for {}: {error}",
+                    source_room.room_id
+                );
+                return ExitCode::FAILURE;
+            }
         }
-    };
+    }
     let account_data = spindle_server::account_data::AccountData::new(Arc::clone(&store));
     let devices = spindle_server::devices::Devices::new(Arc::clone(&store));
     let backups = spindle_server::backups::Backups::new(Arc::clone(&store));
-    let recovered = match spindle_server::import::synapse::recovery::restore(
-        &recovery,
-        &account_data,
-        &devices,
-        &backups,
-    ) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            eprintln!("spindle: recovery-data rehearsal failed: {error}");
+    let accounts = spindle_server::accounts::Accounts::new(store.as_ref(), &config.server.name);
+    for (recovery, (user_id, localpart, password)) in recoveries.iter().zip(&users) {
+        let recovered = match spindle_server::import::synapse::recovery::restore(
+            recovery,
+            &account_data,
+            &devices,
+            &backups,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                eprintln!("spindle: recovery-data rehearsal failed for {user_id}: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(error) = accounts.register(localpart, password) {
+            eprintln!("spindle: cannot create disposable login for {user_id}: {error}");
             return ExitCode::FAILURE;
         }
-    };
-    let accounts = spindle_server::accounts::Accounts::new(store.as_ref(), &config.server.name);
-    if let Err(error) = accounts.register(localpart, &login_password) {
-        eprintln!("spindle: cannot create disposable login: {error}");
-        return ExitCode::FAILURE;
+        println!(
+            "user {user_id}: account_data={} device_keys={} cross_signing_keys={} \
+             signatures={} skipped_signatures={} backup_versions={} backup_sessions={}",
+            recovered.account_data,
+            recovered.device_keys,
+            recovered.cross_signing_keys,
+            recovered.signatures,
+            recovered.skipped_signatures,
+            recovered.backup_versions,
+            recovered.backup_sessions
+        );
     }
     if let Err(error) =
         spindle_store::Store::sync(store.as_ref(), spindle_store::Durability::Strict)
@@ -266,13 +354,9 @@ fn import_synapse_rehearsal(
     }
 
     println!(
-        "rehearsal ready: room_events={} account_data={} device_keys={} \
-         cross_signing_keys={} backup_sessions={}",
-        room.imported,
-        recovered.account_data,
-        recovered.device_keys,
-        recovered.cross_signing_keys,
-        recovered.backup_sessions
+        "rehearsal ready: rooms={} users={}",
+        room_ids.len(),
+        user_ids.len()
     );
     println!(
         "rehearsal only: no media, remote cached keys, receipts, pushers, or federation cutover"
