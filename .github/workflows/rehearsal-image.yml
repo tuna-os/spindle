@@ -43,6 +43,9 @@ jobs:
           docker run --rm --entrypoint /usr/local/bin/spindle "$image" \
             import-synapse-rehearsal 2>&1 | tee usage.txt || true
           grep -q 'usage: spindle import-synapse-rehearsal' usage.txt
+          docker run --rm --entrypoint /usr/local/bin/spindle "$image" \
+            import-synapse 2>&1 | tee usage-full.txt || true
+          grep -q 'usage: spindle import-synapse <config>' usage-full.txt
           docker push "$image"
 
   manifest:

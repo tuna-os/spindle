@@ -219,6 +219,43 @@ impl Media {
         Ok(media_id)
     }
 
+    /// Store `bytes` under a media ID another server already handed out.
+    ///
+    /// The Synapse importer uses this: every `mxc://` URI in the imported
+    /// history names a media ID Synapse chose, and the import keeps those
+    /// IDs so the URIs still resolve. The size cap does not apply, because
+    /// the file was already accepted once and refusing it now would lose it.
+    /// Repeating the call with the same bytes writes the same record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the blob or its record cannot be written.
+    #[cfg(feature = "synapse-import")]
+    pub async fn put_imported(
+        &self,
+        media_id: &str,
+        bytes: &[u8],
+        content_type: &str,
+        filename: Option<&str>,
+        uploaded_by: &str,
+    ) -> Result<String, MediaError> {
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        self.blobs.put(&hash, bytes).await?;
+        let record = MediaRecord {
+            hash: hash.clone(),
+            content_type: content_type.to_owned(),
+            filename: filename.map(str::to_owned),
+            size: bytes.len(),
+            uploaded_by: uploaded_by.to_owned(),
+        };
+        Store::put(
+            self.store.as_ref(),
+            &keys::media(media_id),
+            &serde_json::to_vec(&record)?,
+        )?;
+        Ok(hash)
+    }
+
     /// Mint a media ID ahead of its bytes (`POST /_matrix/media/v1/create`,
     /// spec v1.7). Returns the ID and the moment the reservation lapses.
     ///

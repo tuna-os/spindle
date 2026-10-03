@@ -452,7 +452,7 @@ impl Rooms {
         }
     }
 
-    /// Persist one fully validated Synapse replay into a disposable store.
+    /// Persist one fully validated Synapse replay.
     ///
     /// Validation and state comparison happen in `import::persist_rehearsal`
     /// before this method writes anything. This method deliberately skips
@@ -471,6 +471,21 @@ impl Rooms {
         state_after_root: Option<&crate::import::StateMap>,
         bodies: &std::collections::BTreeMap<String, Value>,
     ) -> Result<(), RoomError> {
+        /// The rehearsal path: bodies in memory, no source state.
+        struct Bodies<'a>(&'a std::collections::BTreeMap<String, Value>);
+        impl crate::import::SourceState for Bodies<'_> {
+            fn state_after(&mut self, event_id: &str) -> Result<crate::import::StateMap, String> {
+                Err(format!(
+                    "the rehearsal path has no source state for {event_id}"
+                ))
+            }
+        }
+        impl crate::import::SynapseSource for Bodies<'_> {
+            fn body(&mut self, event_id: &str) -> Option<Value> {
+                self.0.get(event_id).cloned()
+            }
+        }
+
         if RoomStore::new(self.store.as_ref(), &plan.room_id)
             .load()?
             .is_some()
@@ -479,14 +494,92 @@ impl Rooms {
                 "the rehearsal target room is not empty".to_owned(),
             ));
         }
+        let mut source = Bodies(bodies);
+        self.persist_synapse_steps(&plan.room_id, &plan.steps, state_after_root, &mut source)?;
+        let redactions =
+            crate::import::redactions_in(&plan.steps, &|event_id| bodies.get(event_id));
+        self.finish_synapse_room(&plan.room_id, &redactions)?;
+        Ok(())
+    }
 
-        let mut log = RoomLog::new();
-        for step in &plan.steps {
+    /// Append a run of planned Synapse events to a room, resuming where an
+    /// earlier run stopped.
+    ///
+    /// The import calls this once per chunk of the plan, so the bodies of a
+    /// room with a million events never have to be in memory together. Each
+    /// event lands in one batch with its body and indexes, so after a crash
+    /// an event is either wholly present or absent. A step whose event the
+    /// log already holds is skipped, which makes a repeated call a no-op and
+    /// an interrupted import resumable without a purge.
+    ///
+    /// A step marked `gap`, and a step the log refuses because it would need
+    /// the Matrix state resolver or a parent's state it does not hold, is
+    /// appended with the state Synapse resolved for it (`source`), the way a
+    /// room joined over federation is seeded. The state such a seed names
+    /// can include events outside the timeline (Synapse holds them as
+    /// outliers); their bodies are stored too, because a state lookup would
+    /// otherwise find a slot whose event the room does not have.
+    ///
+    /// Returns how many events this call appended, and the events that took
+    /// Synapse's state with the reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if a body is missing, the log refuses an event
+    /// for any other reason, or storage cannot be written.
+    #[cfg(feature = "synapse-import")]
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn persist_synapse_steps(
+        &self,
+        room_id: &str,
+        steps: &[crate::import::Step],
+        state_after_root: Option<&crate::import::StateMap>,
+        source: &mut dyn crate::import::SynapseSource,
+    ) -> Result<(usize, Vec<(String, String)>), RoomError> {
+        let room = {
+            let mut open = self
+                .open
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(room) = open.get(room_id) {
+                Arc::clone(room)
+            } else {
+                let log = RoomStore::new(self.store.as_ref(), room_id)
+                    .load()?
+                    .map_or_else(RoomLog::new, |restored| restored.log);
+                let room = Arc::new(RwLock::new(log));
+                open.insert(room_id.to_owned(), Arc::clone(&room));
+                room
+            }
+        };
+        let mut log = room
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut appended = 0;
+        let mut from_source = Vec::new();
+        for step in steps {
             let event_id = step.input.event_id.as_str();
-            let body = bodies
-                .get(event_id)
+            if let Some(held) = log.get(&step.input.event_id) {
+                // A resumed run: the seed may have landed without the
+                // state rows that follow it in a separate commit.
+                if step.seed
+                    && let Some(state) = state_after_root
+                {
+                    let li = held.li.get();
+                    self.persist_seeded_state(&log, room_id, event_id, li, state, source, true)?;
+                }
+                continue;
+            }
+            let body = source
+                .body(event_id)
                 .ok_or_else(|| RoomError::MissingBody(event_id.to_owned()))?;
-            let entry = if step.seed {
+            let refused = |error: spindle_core::AppendError| {
+                RoomError::Append(format!("{event_id}: {error:?}"))
+            };
+            let seeded_state: Option<crate::import::StateMap>;
+            let first_seed = step.seed && log.entries().next().is_none();
+            let entry = if first_seed {
                 let state = state_after_root.map_or_else(
                     || {
                         step.input
@@ -498,62 +591,224 @@ impl Rooms {
                     },
                     crate::import::snapshot_from,
                 );
+                seeded_state = state_after_root.cloned();
                 log.append_seeded(step.input.clone(), state, step.depth)
+                    .map_err(refused)?
+                    .clone()
             } else {
-                log.append_remote(step.input.clone())
-            }
-            .map_err(|error| RoomError::Append(format!("{event_id}: {error:?}")))?
-            .clone();
-
-            let event_type = body["type"].as_str().unwrap_or_default();
-            let state_key = body.get("state_key").and_then(Value::as_str);
-            let sender = body["sender"].as_str().unwrap_or_default();
-            self.persist_entry(
-                &mut log,
-                &plan.room_id,
-                &entry,
-                event_id,
-                &PersistInput {
-                    event_type,
-                    state_key,
-                    sender,
-                    content: &body["content"],
-                    json: body,
-                },
-            )?;
-        }
-        // Synapse keeps a redacted event's original JSON in `event_json`
-        // and applies the redaction when the event is read, so the bodies
-        // copied above still hold what their senders deleted. Rewrite each
-        // target the way a redaction arriving over federation would, after
-        // every event is in, so a redaction stored before its target still
-        // takes effect. A target the import left out stays absent.
-        let redactions: Vec<(String, String)> = plan
-            .steps
-            .iter()
-            .filter_map(|step| {
-                let event_id = step.input.event_id.as_str();
-                let body = bodies.get(event_id)?;
-                if body["type"].as_str() != Some("m.room.redaction") {
-                    return None;
+                let reason = if step.head {
+                    Some(crate::import::HEAD_REASON.to_owned())
+                } else if step.gap {
+                    Some("a parent is outside the retained history".to_owned())
+                } else {
+                    match log
+                        .append_remote(step.input.clone())
+                        .map(|entry| entry.clone())
+                    {
+                        Ok(entry) => {
+                            self.persist_synapse_entry(&mut log, room_id, &entry, event_id, &body)?;
+                            appended += 1;
+                            continue;
+                        }
+                        Err(error) if crate::import::takes_source_state(&error) => {
+                            Some(format!("{error:?}"))
+                        }
+                        Err(error) => return Err(refused(error)),
+                    }
+                };
+                let state = source.state_after(event_id).map_err(|why| {
+                    RoomError::Append(format!("{event_id}: no Synapse state: {why}"))
+                })?;
+                if let Some(reason) = reason {
+                    from_source.push((event_id.to_owned(), reason));
                 }
-                let target = body["content"]["redacts"]
-                    .as_str()
-                    .or_else(|| body["redacts"].as_str())?;
-                log.get(&EventId::new(target))
-                    .is_some()
-                    .then(|| (target.to_owned(), event_id.to_owned()))
-            })
-            .collect();
+                let entry = log
+                    .append_seeded(
+                        step.input.clone(),
+                        crate::import::snapshot_from(&state),
+                        step.depth,
+                    )
+                    .map_err(refused)?
+                    .clone();
+                seeded_state = Some(state);
+                entry
+            };
+            self.persist_synapse_entry(&mut log, room_id, &entry, event_id, &body)?;
+            appended += 1;
+            if let Some(state) = &seeded_state {
+                // A mid-log seed resumes semantics: only bodies not yet
+                // stored, and only memberships the seed's state still names.
+                let resuming = !first_seed;
+                self.persist_seeded_state(
+                    &log,
+                    room_id,
+                    event_id,
+                    entry.li.get(),
+                    state,
+                    source,
+                    resuming,
+                )?;
+            }
+        }
+        Ok((appended, from_source))
+    }
+
+    /// Persist one appended Synapse event with its body and indexes.
+    #[cfg(feature = "synapse-import")]
+    fn persist_synapse_entry(
+        &self,
+        log: &mut RoomLog,
+        room_id: &str,
+        entry: &LogEntry,
+        event_id: &str,
+        body: &Value,
+    ) -> Result<(), RoomError> {
+        let event_type = body["type"].as_str().unwrap_or_default();
+        let state_key = body.get("state_key").and_then(Value::as_str);
+        let sender = body["sender"].as_str().unwrap_or_default();
+        self.persist_entry(
+            log,
+            room_id,
+            entry,
+            event_id,
+            &PersistInput {
+                event_type,
+                state_key,
+                sender,
+                content: &body["content"],
+                json: body,
+            },
+        )
+    }
+
+    /// Store the bodies of the state a seed names, and index its memberships
+    /// at the seed's position.
+    ///
+    /// When `resuming` (a resumed run, or a seed in the middle of the log), a
+    /// body already stored is left alone, and a membership is indexed only
+    /// while the room's current state still names the seeded event: a later
+    /// membership in the log has already written the newer fact, and the
+    /// older one must not overwrite it.
+    #[cfg(feature = "synapse-import")]
+    #[allow(clippy::too_many_arguments)]
+    fn persist_seeded_state(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        seed_id: &str,
+        li: i64,
+        state: &crate::import::StateMap,
+        source: &mut dyn crate::import::SynapseSource,
+        resuming: bool,
+    ) -> Result<(), RoomError> {
+        for ((event_type, state_key), state_event_id) in state {
+            if state_event_id == seed_id {
+                continue;
+            }
+            if resuming
+                && spindle_store::ReadView::get(
+                    self.store.as_ref(),
+                    &event_body_key(room_id, state_event_id),
+                )?
+                .is_some()
+            {
+                continue;
+            }
+            let body = source
+                .body(state_event_id)
+                .ok_or_else(|| RoomError::MissingBody(state_event_id.clone()))?;
+            spindle_store::Store::commit(
+                self.store.as_ref(),
+                &[
+                    (
+                        event_body_key(room_id, state_event_id),
+                        serde_json::to_vec(&body)?,
+                    ),
+                    (
+                        spindle_core::keys::event_room(state_event_id),
+                        room_id.as_bytes().to_vec(),
+                    ),
+                ],
+                Durability::Group,
+            )?;
+            let key = StateKey::new(event_type.as_str(), state_key.as_str());
+            if event_type == "m.room.member"
+                && (!resuming
+                    || current_state_id(log, &key).as_deref() == Some(state_event_id.as_str()))
+            {
+                self.index_membership(room_id, Some(state_key), &body["content"], li)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply the imported redactions, re-index memberships from the final
+    /// state, and make the room durable.
+    ///
+    /// Synapse keeps a redacted event's original JSON in `event_json` and
+    /// applies the redaction when the event is read, so the bodies copied in
+    /// still hold what their senders deleted. Each target is rewritten the
+    /// way a redaction arriving over federation would be, after every event
+    /// is in, so a redaction stored before its target still takes effect.
+    /// A target the import left out stays absent. Re-applying a redaction
+    /// to a body that is already redacted gives the same body, so a resumed
+    /// import may call this again.
+    ///
+    /// The membership index is written per appended event, in the import's
+    /// order. Where branches of a fork interleave, the last one written need
+    /// not be the one the room's state settled on, so each member's row is
+    /// written once more from the final state.
+    ///
+    /// Returns how many targets were redacted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if a target cannot be read or rewritten.
+    #[cfg(feature = "synapse-import")]
+    pub(crate) fn finish_synapse_room(
+        &self,
+        room_id: &str,
+        redactions: &[(String, String)],
+    ) -> Result<usize, RoomError> {
+        let (present, members): (Vec<&(String, String)>, Vec<(String, String, i64)>) = self
+            .with_room_read(room_id, |_, log| {
+                let present = redactions
+                    .iter()
+                    .filter(|(target, _)| log.get(&EventId::new(target.as_str())).is_some())
+                    .collect();
+                let members = current_state(log)
+                    .into_iter()
+                    .filter(|(key, _)| key.event_type().as_str() == "m.room.member")
+                    .map(|(key, event_id)| {
+                        let li = log
+                            .get(&EventId::new(event_id.as_str()))
+                            .map_or(0, |entry| entry.li.get());
+                        (key.state_key().to_owned(), event_id, li)
+                    })
+                    .collect();
+                Ok((present, members))
+            })?;
+        for (target, redaction_id) in &present {
+            self.apply_redaction(room_id, target, redaction_id)?;
+        }
+        for (user_id, event_id, li) in members {
+            let body = self.read_event(room_id, &EventId::new(event_id.as_str()))?;
+            self.index_membership(room_id, Some(&user_id), &body["content"], li)?;
+        }
+        spindle_store::Store::sync(self.store.as_ref(), Durability::Group)?;
+        Ok(present.len())
+    }
+
+    /// Drop a room's in-memory log after an import has written it.
+    ///
+    /// A full import walks every room once; keeping each log resident
+    /// would hold the whole server's history in memory by the end.
+    #[cfg(feature = "synapse-import")]
+    pub(crate) fn release_imported_room(&self, room_id: &str) {
         self.open
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(plan.room_id.clone(), Arc::new(RwLock::new(log)));
-        for (target, redaction_id) in &redactions {
-            self.apply_redaction(&plan.room_id, target, redaction_id)?;
-        }
-        spindle_store::Store::sync(self.store.as_ref(), Durability::Group)?;
-        Ok(())
+            .remove(room_id);
     }
 
     /// Create a room and return its ID.

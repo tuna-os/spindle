@@ -34,6 +34,7 @@ use rusqlite::{Connection, OptionalExtension};
 
 use super::{SourceEvent, SourceRoom, StateMap};
 
+pub mod full;
 pub mod postgres;
 pub mod recovery;
 

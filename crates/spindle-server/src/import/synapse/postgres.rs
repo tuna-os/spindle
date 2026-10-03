@@ -11,7 +11,7 @@ use ::postgres::{Client, Config, IsolationLevel, NoTls, Transaction};
 use serde_json::Value;
 
 use super::{ReadError, is_create_rooted};
-use crate::import::{PlanError, SourceEvent, SourceRoom, StateMap, plan};
+use crate::import::{PlanError, SourceEvent, SourceRoom, StateMap, plan_resolving};
 
 /// A connection to Synapse's `PostgreSQL` database.
 pub struct Reader {
@@ -219,8 +219,10 @@ impl Snapshot<'_> {
         }
 
         let rows = self.transaction.query(
-            "SELECT keytype, keydata FROM e2e_cross_signing_keys \
-             WHERE user_id = $1 ORDER BY keytype",
+            // A key that was replaced keeps its old row under a lower
+            // `stream_id`; only the newest row per type is the user's key.
+            "SELECT DISTINCT ON (keytype) keytype, keydata FROM e2e_cross_signing_keys \
+             WHERE user_id = $1 ORDER BY keytype, stream_id DESC",
             &[&user_id],
         )?;
         let mut cross_signing_keys = Vec::with_capacity(rows.len());
@@ -297,6 +299,45 @@ impl Snapshot<'_> {
             backup_versions,
             backup_sessions,
         })
+    }
+
+    /// Run one read-only query inside this snapshot.
+    ///
+    /// The full importer reads many small tables; each read is one query
+    /// here rather than one method per table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] if the query fails.
+    pub fn query(
+        &mut self,
+        sql: &str,
+        params: &[&(dyn ::postgres::types::ToSql + Sync)],
+    ) -> Result<Vec<::postgres::Row>, ReadError> {
+        Ok(self.transaction.query(sql, params)?)
+    }
+
+    /// Original signed JSON bodies for the named events.
+    ///
+    /// The full importer asks for one chunk of a room's plan at a time, so a
+    /// room with a million events never holds every body at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] if the query fails or a body is not valid JSON.
+    pub fn event_bodies_for(
+        &mut self,
+        event_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Value>, ReadError> {
+        let rows = self.transaction.query(
+            "SELECT event_id, json FROM event_json WHERE event_id = ANY($1)",
+            &[&event_ids],
+        )?;
+        let mut bodies = std::collections::HashMap::with_capacity(rows.len());
+        for row in rows {
+            bodies.insert(row.get(0), serde_json::from_str(&row.get::<_, String>(1))?);
+        }
+        Ok(bodies)
     }
 
     /// Original signed JSON bodies for every event row retained in a room.
@@ -391,12 +432,28 @@ impl Snapshot<'_> {
             state_after_root: None,
         };
 
+        // `plan_resolving` names the same root as `plan` for a room with one
+        // starting point, and still names one when there are several.
         if !is_create_rooted(&room)
-            && let Err(PlanError::NoRootState { root, .. }) = plan(&room)
+            && let Err(PlanError::NoRootState { root, .. }) = plan_resolving(&room)
         {
             room.state_after_root = Some(self.state_after_root(room_id, &root)?);
         }
         Ok(room)
+    }
+
+    /// The state after one event, as Synapse resolved it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] if the event has no state group or the chain
+    /// cannot be walked.
+    pub fn state_after_event(
+        &mut self,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<StateMap, ReadError> {
+        self.state_after_root(room_id, event_id)
     }
 
     /// Resolve Synapse's delta-compressed state group for a horizon root.

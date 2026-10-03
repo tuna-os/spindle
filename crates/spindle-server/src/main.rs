@@ -13,6 +13,26 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // `spindle import-synapse <config> <postgres-config> [options]` -- the
+    // full import (#240, #563). See `import_synapse` for the options.
+    if std::env::args().nth(1).as_deref() == Some("import-synapse") {
+        #[cfg(feature = "synapse-import")]
+        {
+            let arguments: Vec<String> = std::env::args().skip(2).collect();
+            return if let Ok(code) = std::thread::spawn(move || import_synapse(&arguments)).join() {
+                code
+            } else {
+                eprintln!("spindle: Synapse import worker panicked");
+                ExitCode::FAILURE
+            };
+        }
+        #[cfg(not(feature = "synapse-import"))]
+        {
+            eprintln!("spindle: rebuild with --features synapse-import to use this command");
+            return ExitCode::FAILURE;
+        }
+    }
+
     if std::env::args().nth(1).as_deref() == Some("import-synapse-rehearsal") {
         #[cfg(feature = "synapse-import")]
         {
@@ -155,6 +175,269 @@ fn rehearsal_password(localpart: &str) -> Result<String, String> {
         return Err(format!("the rehearsal password for {localpart} is empty"));
     }
     Ok(password)
+}
+
+const IMPORT_USAGE: &str = "usage: spindle import-synapse <config> <postgres-config> \
+    [--media <synapse media_store_path>] [--checkpoint <file>] [--dry-run] [--no-validate] \
+    [--rooms <id>,...] [--users <id>,...] [--exclude-rooms <file>] [--allow-nonempty]";
+
+/// The full Synapse import (#240, #563).
+///
+/// Options:
+///
+/// * `--media <dir>`: Synapse's `media_store_path`, read-only. Without it
+///   media is skipped and the report says so.
+/// * `--checkpoint <file>`: the restart checkpoint and final JSON report.
+///   Defaults to `<storage.path>.synapse-import.json`. Running the same
+///   command again resumes from it.
+/// * `--dry-run`: read, plan and compare every room, and write nothing.
+/// * `--no-validate`: skip the read-back check of the written store.
+/// * `--rooms`, `--users`: import only these (comma-separated).
+/// * `--exclude-rooms <file>`: one `<room_id> <reason>` per line.
+/// * `--allow-nonempty`: import into a store that already holds data and
+///   has no checkpoint of this run, such as a second, supplementary source.
+///
+/// Environment: `SPINDLE_SYNAPSE_PASSWORD` (database password),
+/// `SPINDLE_SYNAPSE_SIGNING_KEY_FILE` (Synapse's signing key), and
+/// `SPINDLE_REHEARSAL_PASSWORD_DIR` (a known login password per localpart,
+/// for test users only; every other account gets an unguessable one).
+#[cfg(feature = "synapse-import")]
+#[allow(clippy::too_many_lines)]
+fn import_synapse(arguments: &[String]) -> ExitCode {
+    use spindle_server::import::synapse::full;
+
+    let (Some(config_path), Some(postgres)) = (arguments.first(), arguments.get(1)) else {
+        eprintln!("{IMPORT_USAGE}");
+        return ExitCode::FAILURE;
+    };
+    let mut media_root = None;
+    let mut checkpoint = None;
+    let mut dry_run = false;
+    let mut validate = true;
+    let mut allow_nonempty = false;
+    let mut only_rooms = None;
+    let mut only_users = None;
+    let mut exclude_rooms = std::collections::BTreeMap::new();
+    let mut rest = arguments[2..].iter();
+    while let Some(flag) = rest.next() {
+        let mut value = || rest.next().cloned();
+        match flag.as_str() {
+            "--dry-run" => dry_run = true,
+            "--no-validate" => validate = false,
+            "--allow-nonempty" => allow_nonempty = true,
+            "--media" => media_root = value().map(std::path::PathBuf::from),
+            "--checkpoint" => checkpoint = value().map(std::path::PathBuf::from),
+            "--rooms" => {
+                only_rooms = value().map(|list| rehearsal_list(&list).into_iter().collect());
+            }
+            "--users" => {
+                only_users = value().map(|list| rehearsal_list(&list).into_iter().collect());
+            }
+            "--exclude-rooms" => {
+                let Some(path) = value() else {
+                    eprintln!("{IMPORT_USAGE}");
+                    return ExitCode::FAILURE;
+                };
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        eprintln!("spindle: cannot read {path}: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                for line in text.lines().map(str::trim) {
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    let (room_id, reason) =
+                        line.split_once(char::is_whitespace).unwrap_or((line, ""));
+                    exclude_rooms.insert(room_id.to_owned(), reason.trim().to_owned());
+                }
+            }
+            other => {
+                eprintln!("spindle: unknown option {other}\n{IMPORT_USAGE}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    let config = match Config::load(config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("spindle: cannot read {config_path}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let checkpoint = checkpoint.unwrap_or_else(|| {
+        let mut path = config.storage.path.clone().into_os_string();
+        path.push(".synapse-import.json");
+        std::path::PathBuf::from(path)
+    });
+    let previous = match full::load_checkpoint(&checkpoint) {
+        Ok(previous) => previous,
+        Err(error) => {
+            eprintln!("spindle: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(previous) = &previous {
+        eprintln!(
+            "resuming from {}: {} phases and {} rooms done",
+            checkpoint.display(),
+            previous.phases_done.len(),
+            previous.rooms.len()
+        );
+        if previous.dry_run != dry_run {
+            eprintln!(
+                "spindle: the checkpoint is from a {} run; remove it or match --dry-run",
+                if previous.dry_run { "dry" } else { "writing" }
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    let signing_key = match std::env::var("SPINDLE_SYNAPSE_SIGNING_KEY_FILE") {
+        Ok(path) => match std::fs::read_to_string(&path) {
+            Ok(source) => Some(source),
+            Err(error) => {
+                eprintln!("spindle: cannot read Synapse signing key file {path}: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+        Err(_) => None,
+    };
+    let password_dir = std::env::var("SPINDLE_REHEARSAL_PASSWORD_DIR").ok();
+
+    let store = match FjallStore::open(&config.storage.path) {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            eprintln!("spindle: cannot open the target store: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if previous.is_none() && !dry_run && !allow_nonempty {
+        let marker = spindle_core::keys::store_marker();
+        match spindle_store::ReadView::scan_prefix(store.as_ref(), &[]) {
+            Ok(rows) if rows.iter().all(|(key, _)| *key == marker) => {}
+            Ok(_) => {
+                eprintln!(
+                    "spindle: the target store holds data and there is no checkpoint at {}; \
+                     use an empty store, or --allow-nonempty for a supplementary source",
+                    checkpoint.display()
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(error) => {
+                eprintln!("spindle: cannot inspect the target store: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    let options = full::Options {
+        server_name: config.server.name.clone(),
+        checkpoint,
+        media_root,
+        only_rooms,
+        only_users,
+        exclude_rooms,
+        dry_run,
+        signing_key,
+        password_for: Box::new(move |localpart| {
+            let dir = password_dir.as_ref()?;
+            let password = std::fs::read_to_string(std::path::Path::new(dir).join(localpart))
+                .ok()?
+                .trim_end_matches(['\r', '\n'])
+                .to_owned();
+            (!password.is_empty()).then_some(password)
+        }),
+    };
+
+    let database_password = std::env::var("SPINDLE_SYNAPSE_PASSWORD").ok();
+    let mut source = match spindle_server::import::synapse::postgres::Reader::connect_no_tls(
+        postgres,
+        database_password.as_deref(),
+    ) {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("spindle: cannot connect to Synapse PostgreSQL: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut snapshot = match source.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!("spindle: cannot start Synapse snapshot: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut report = match full::run(
+        &options,
+        &mut snapshot,
+        &store,
+        spindle_server::blobs_for(&config),
+        previous,
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!(
+                "spindle: import stopped: {error}\nrun the same command again to resume from {}",
+                options.checkpoint.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    if validate && !dry_run {
+        if let Err(error) = full::validate(
+            &options,
+            &mut snapshot,
+            &store,
+            spindle_server::blobs_for(&config),
+            &mut report,
+        ) {
+            eprintln!("spindle: validation stopped: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    println!(
+        "import {}: rooms={} excluded_rooms={} events={} seconds={:.0} report={}",
+        if dry_run { "dry run" } else { "done" },
+        report.rooms.len(),
+        report.excluded_rooms.len(),
+        report
+            .rooms
+            .values()
+            .map(|room| room.imported_events)
+            .sum::<u64>(),
+        report.seconds,
+        options.checkpoint.display()
+    );
+    for (name, domain) in &report.domains {
+        println!(
+            "  {name}: source={} imported={} skipped={:?}",
+            domain.source, domain.imported, domain.skipped
+        );
+    }
+    for (room_id, excluded) in &report.excluded_rooms {
+        println!(
+            "  excluded {room_id} (v{}): {}",
+            excluded.version, excluded.reason
+        );
+    }
+    let clean = report.validation.as_ref().is_none_or(|validation| {
+        validation.rooms_divergent.is_empty()
+            && validation.rooms_short.is_empty()
+            && validation.sample_mismatches.is_empty()
+            && validation
+                .domains
+                .values()
+                .all(|(_, mismatches)| mismatches.is_empty())
+    });
+    if clean {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("spindle: validation found mismatches; see the report");
+        ExitCode::from(2)
+    }
 }
 
 /// Build an isolated cutover rehearsal from live Synapse.
