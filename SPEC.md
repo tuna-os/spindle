@@ -602,7 +602,7 @@ property test that runs both algorithms over generated DAGs and asserts equality
 ### 9.4 Making forks impossible
 
 Case 3 exists only because legacy peers author their own `prev_events`. Under
-MSC3995 (§12) participants submit *proposals* and the hub assigns
+MSC3995 (§12) participants submit Linearized PDUs and the hub assigns
 `prev_event`, so a fork cannot be constructed. For rooms where every peer is
 LM-capable, the class is H, and §9 is unreachable code.
 
@@ -792,7 +792,7 @@ MSC3706 as planned, and this paragraph is the design it will be built to.
 | 6–10 | Full | Full DAG semantics with the class-D path |
 | **11** | **Full** | `MSC3820` cleanups: no top-level `origin` (MSC3989), no `creator` in create content (MSC2175), `redacts` in content (MSC2174), updated redaction algorithm (MSC2176/MSC3821) |
 | **12** | **Full; default candidate — see below** | Current stable version; supported by Ruma 0.16 and by both surveyed Rust homeservers |
-| `org.matrix.msc3995.v1` | Experimental | LM room version with hub-assigned `prev_event` (§12.4) |
+| `org.matrix.msc3995` | Experimental, behind `unstable-msc3995` | MSC3995's LM room version, v10-based, with hub-assigned `prev_event` (§12.4) |
 
 The load-bearing decision is **not which version number** — it is that native
 rooms use an *ordinary* room version. A room whose DAG is a chain needs no new
@@ -817,73 +817,179 @@ create, and record it as an ADR rather than leaving it implied here.
 Class H/P is the MSC3995 star topology: participants send to the hub, the hub
 orders and fans out.
 
+### 12.0 Where the proposal stands
+
+Checked on 2026-10-02; recheck before any wire code lands (#22).
+
+- **[MSC3995](https://github.com/matrix-org/matrix-spec-proposals/pull/3995)**
+  is open, titled "[WIP] Linearized Matrix", labelled `needs-implementation`,
+  and has not been updated since 2023-08-19. Its text describes "Linearized
+  Matrix v2", warns that it is "going through extremely rapid iteration", and
+  leaves hub transfers, DAG usage attestation and `insert_after` validation as
+  TODOs or open problems.
+- **[`draft-ralston-mimi-linearized-matrix`](https://datatracker.ietf.org/doc/draft-ralston-mimi-linearized-matrix/)**
+  stopped at `-04` (January 2024) and is expired. It is the more complete of
+  the two texts: it fixes the participant content hash that the MSC leaves
+  open (`hashes.lpdu`), and specifies the transport. Hub transfer is still a
+  TODO there.
+- **The MIMI working group did not adopt it.** Its adopted protocol is
+  [`draft-ietf-mimi-protocol`](https://datatracker.ietf.org/doc/draft-ietf-mimi-protocol/)
+  (HTTPS and MLS; `-06`, April 2026), which is not a Matrix room protocol.
+- **No interoperable peer exists.** Both texts name unstable identifiers for
+  testing against "other Linearized Matrix implementations"; none is
+  maintained today.
+
+So "the actual proposal" is two stalled drafts that disagree in places. This
+section follows them where they agree, follows the I-D where only it has an
+answer, says which it follows and why where they conflict, and marks
+everything else as a Spindle extension (§12.5). Hub mode is still the plan.
+What changed is the expectation that another implementation will speak it,
+which is why every Spindle-specific field below is kept out of the ordinary
+Matrix namespace.
+
+| This section said | The proposal says | Now |
+|---|---|---|
+| Room version `org.matrix.msc3995.v1`, room version 11 plus two rules | MSC: `org.matrix.msc3995`, based on **v10** plus MSC2174/2175/2176/3821/3989 (which v11 already contains) and MSC1767, with `depth` removed. I-D: `I.1`, tested as `org.matrix.i-d.ralston-mimi-linearized-matrix.02` | §12.4 |
+| A new `PUT .../org.matrix.msc3995/send_event/{roomId}` endpoint | MSC: none. Participants put Linearized PDUs (LPDUs) in the ordinary `/send` transaction. I-D: `PUT /_matrix/federation/v2/send/{txnId}`, tested at `PUT /_matrix/federation/unstable/org.matrix.i-d.ralston-mimi-linearized-matrix.02/send/{txnId}` | §12.2 (the MSC's) |
+| A "proposal" with an origin signature | An LPDU: a top-level `hub_server`, no `auth_events`, `prev_events` or top-level `hashes`, and (I-D only) a `hashes.lpdu` content hash, signed by the origin | §12.2 |
+| `m.room.hub` content carries `server_name`, `epoch` and the previous epoch's final chain entry | The hub is the server of the `sender` of `m.room.hub`, or of `m.room.create` when there is none. The event must be signed by the current hub. No content schema is defined | §12.1 |
+| The hub signs `(room_id, li, event_id, chain[li])` | The hub signs the finished PDU in the ordinary way. No chain, `li` or attestation exists in either text | §12.5 |
+| Peers advertise LM support | MSC: `"m.linearized": true` on `/_matrix/key/v2/server`, marked as not what implementations do; they treat a join carrying `hub_server` as LM | §4.1 |
+| Legacy members make a hub room class D | Agrees. The MSC routes DAG-server events to the hub through one chosen DAG-capable server, with an `insert_after` key in `unsigned` that the hub cannot verify | §12.3 |
+
 ### 12.1 Hub designation
 
-`m.room.hub` state event:
+The hub is named by the `m.room.hub` state event (empty state key). Per the
+MSC, and sketched the same way in a TODO in the I-D, the **current hub is the server of that event's `sender`**, or the
+server of the `m.room.create` sender when the room has no `m.room.hub`. The
+MSC adds two auth rules for the room version:
+
+1. an event carrying `hub_server` is rejected unless it names the current hub;
+2. an `m.room.hub` event is rejected unless the current hub signed it, and,
+   like every event, the sender's server signed it too.
+
+A transfer therefore needs the outgoing and incoming hubs to both sign the
+event. Neither text defines how that dual signature is requested, who sends
+the event, or what happens when the outgoing hub is down; the MSC lists all
+three as open problems. Spindle's answer is the epoch scheme, carried in the
+event's content under its own namespace:
 
 ```json
 {
   "type": "m.room.hub",
   "state_key": "",
+  "sender": "@admin:hub.example.org",
   "content": {
-    "server_name": "hub.example.org",
-    "epoch": 7,
-    "prev_epoch_final_li": 10432,
-    "prev_epoch_final_chain": "base64(chain[10432])"
+    "org.spindle.epoch": 7,
+    "org.spindle.prev_epoch_final_li": 10432,
+    "org.spindle.prev_epoch_final_chain": "base64(chain[10432])"
   }
 }
 ```
 
-Absent an `m.room.hub` event, the hub is the server that sent `m.room.create`,
-per MSC3995. `epoch` is monotonic and, together with the chain commitment,
-prevents a deposed hub from continuing to serialize a divergent branch: an event
-signed by the hub of epoch `n` is invalid once the log contains an
-`m.room.hub` at epoch `n+1`, and the new epoch's first event must chain from the
-declared final entry of the previous epoch.
+The hub is still the `sender`'s server, so a peer that knows only the MSC
+reads the same hub from this event. The epoch is monotonic and, together with
+the chain commitment, prevents a deposed hub from continuing to serialize a
+divergent branch: an event signed by the hub of epoch `n` is invalid once the
+log contains an `m.room.hub` at epoch `n+1`, and the new epoch's first event
+must chain from the declared final entry of the previous epoch. A deposed hub
+that is down cannot co-sign its own replacement, so failover (§13.2) is a
+departure from the MSC's auth rule and works only between Spindle peers.
 
-### 12.2 Proposal submission
+### 12.2 Event submission
 
-Participants POST an unlinked, origin-signed event to the hub:
+A participant does not author `prev_events` or `auth_events`. It sends the
+hub a Linearized PDU in the `pdus` array of an ordinary federation
+transaction, as the MSC says:
 
 ```
-PUT /_matrix/federation/unstable/org.matrix.msc3995/send_event/{roomId}
+PUT /_matrix/federation/v1/send/{txnId}
 ```
+
+The I-D's `v2/send` path is not used. The room version (§12.4) is the MSC's,
+an LPDU is only valid in a room of that version, and so the room version
+already gates the unstable behaviour without a second endpoint. A build
+without `unstable-msc3995` rejects such a room before it reads an LPDU.
+
+The LPDU is a PDU with `hub_server` set to the current hub and without
+`auth_events`, `prev_events` and the top-level `hashes`. Spindle follows the
+I-D and requires `hashes.lpdu`, a content hash over the partial event, which
+the participant computes and then signs. The MSC has no such hash and says
+the hub can therefore change an LPDU's content; that is the gap §13.1 depends
+on being closed.
 
 The hub:
-1. verifies the origin signature over the proposal;
+1. verifies the origin signature and `hashes.lpdu` over the LPDU;
 2. authorizes it against current state (§7.1);
-3. assigns `li`, `prev_event`, `depth`, and `auth_events`;
-4. adds its own signature and the chain attestation;
-5. fans the completed PDU out to every participant, including the originator.
+3. assigns `li`, the single `prev_event` (its head), and `auth_events`;
+4. adds the top-level `hashes`, its own signature and the chain attestation
+   (§12.5);
+5. fans the completed PDU out to every server in the room, including the
+   originator.
 
-The originator learns its event's final `event_id` from the fan-out or the
-response. Clients see the standard `/send` response semantics because the
-originating server holds the client transaction open across the hub round trip,
-exactly as it already does for any event requiring remote authorization.
+The originator learns its event's final `event_id` from the fan-out.
+Clients see the standard `/send` response semantics because the originating
+server holds the client transaction open across the hub round trip, exactly
+as it already does for any event requiring remote authorization.
 
 ### 12.3 Dual representation
 
-A hub emits ordinary room-version-11 PDUs. A legacy homeserver in the room
-consumes them as a normal DAG and is unaware of the hub. An LM-only participant
-consumes the same PDUs as a linked list and never implements state resolution.
-This is MSC3995's dual-representation property, and it is what allows a room to
+A hub emits ordinary PDUs. A legacy homeserver in the room consumes them as
+a normal DAG and is unaware of the hub. An LM-only participant consumes the
+same PDUs as a linked list and never implements state resolution. This is
+MSC3995's dual-representation property, and it is what allows a room to
 contain both kinds of peer simultaneously — at the cost of readmitting the
-class-D fork path, which is why `m.room.hub` rooms with legacy members are class
-D, not class H.
+class-D fork path, which is why `m.room.hub` rooms with legacy members are
+class D, not class H.
+
+The MSC goes further than Spindle needs: it has the hub delegate
+linearization to one DAG-capable server, which marks each event's position
+with `unsigned.insert_after` and re-sends it when state resolution moves it.
+Spindle as a hub is itself DAG-capable (§9), so it never delegates, and it
+does not accept `insert_after` from a peer: the field is unsigned, and the
+MSC itself lists "how does a participant prove the hub didn't modify it" as
+unanswered.
 
 ### 12.4 The LM room version
 
-`org.matrix.msc3995.v1` is room version 11 plus two rules:
+The room version that makes forks structurally impossible is the one part of
+hub mode that is a wire format, so Spindle uses the MSC's own unstable
+identifier and accepts its rules as written rather than inventing a v11
+variant:
 
-1. `prev_events` MUST have exactly one element and MUST equal the hub's head at
-   the time of assignment.
-2. Every event MUST carry a hub signature over `(room_id, li, event_id, chain[li])`
-   from the server named in the current `m.room.hub`.
+- `org.matrix.msc3995` — room version 10 plus MSC2174, MSC2175, MSC2176,
+  MSC3821 and MSC3989, `depth` removed from the event format, and the two
+  auth rules of §12.1. It also lists MSC1767 (extensible events), a content
+  format rather than a room algorithm.
+- Every event carrying `hub_server` MUST have exactly one `prev_event` (the
+  I-D's rule), and its `auth_events` MUST include the current `m.room.hub`
+  (the MSC's auth events selection change).
+- `hub_server` is preserved by redaction; `depth` is not.
 
-A room created at this version cannot fork. Legacy servers cannot join it, which
-is the trade — hence rooms default to v11 and use this version only where every
+A room created at this version cannot fork while every event goes through
+the hub. Legacy servers cannot join it, which is the trade — hence rooms
+default to an ordinary version (§11.6) and use this one only where every
 peer is known to support it (federated MIMI/DMA interop deployments, or
-single-operator multi-server fleets).
+single-operator multi-server fleets). The I-D's `I.1` and its test string
+are not supported: the I-D is expired and no peer speaks either.
+
+### 12.5 Spindle extensions
+
+Everything in this list is in neither text. Each one is Spindle-namespaced on
+the wire, is negotiated only between Spindle peers, and must be absent from
+a build without the `unstable-msc3995` feature (§15). A peer that knows only
+the MSC sees ordinary LM events with extra, ignorable keys.
+
+| Extension | Where | Why the proposal is not enough |
+|---|---|---|
+| Epochs and `prev_epoch_final_*` on `m.room.hub` | §12.1 | The MSC has no answer for a transfer away from a hub that is down |
+| Chain attestation: the hub signs `(room_id, li, event_id, chain[li])`, carried in `unsigned` under `org.spindle.attestation` | §13.3 | The MSC's "participants don't know what they don't know" problem has "no current solutions"; a signed chain makes withheld or reordered history provable |
+| `m.room.checkpoint`, renamed `org.spindle.checkpoint` | §13.3 | No equivalent |
+| Failover election at `epoch + 1` without the outgoing hub's signature | §13.2 | Contradicts the MSC's dual-signature rule, so it only works between Spindle peers |
+
+`unsigned` is the place for the attestation because a PDU's `unsigned` does
+not feed the event ID, so adding it changes nothing a legacy peer validates;
+the attestation carries its own signature for the same reason.
 
 ---
 
@@ -896,7 +1002,7 @@ single-operator multi-server fleets).
 | Decide event order | Yes | That is its function |
 | Delay or drop an event | Yes | Detectable by the originator (no fan-out), not preventable |
 | Forge an event from another server | **No** | Origin Ed25519 signature |
-| Modify an event's content | **No** | Content hash covers content; reference hash covers the redacted event |
+| Modify an event's content | **No** | `hashes.lpdu` covers the participant's content and its signature covers the LPDU (§12.2); the reference hash covers the redacted event. This holds only because Spindle follows the I-D here: under the MSC's text alone the answer is yes |
 | Reorder committed history silently | **No** | Chain hash + hub signature per entry (§13.3) |
 | Present different histories to different participants | **No, not undetectably** | §13.3 |
 | Read E2EE content | **No** | Megolm/MLS; the hub is a transport |
@@ -908,12 +1014,13 @@ That is the deliberate trade — forking and merging is exactly the expensive th
 
 ### 13.2 Hub failover
 
-If the hub is unreachable for `hub_failover_timeout` (default 60s), participants
-may elect a new hub by sending an `m.room.hub` event at `epoch + 1`, authorized
-by the ordinary power-level rules (default: PL 100 required, i.e. room admins).
+If the hub is unreachable for `hub_failover_timeout` (default 60s), a room
+admin on a participant server may make that server the hub by sending an
+`m.room.hub` event at `epoch + 1` — the hub is the sender's server (§12.1) —
+authorized by the ordinary power-level rules (default: PL 100 required).
 Ties are broken by `(epoch, lexicographically smallest server_name)`. The new hub
-must include `prev_epoch_final_li` and the chain commitment it is continuing
-from; participants reject an epoch transition that would truncate entries they
+must include `org.spindle.prev_epoch_final_li` and the chain commitment it is
+continuing from; participants reject an epoch transition that would truncate entries they
 already hold attestations for.
 
 Because a partition can produce two candidate hubs, the epoch rule guarantees
@@ -922,6 +1029,11 @@ ordinary auth/state rules. Events serialized on the losing branch are re-propose
 by their originators, which is the same recovery a client already performs on a
 failed send.
 
+The MSC's auth rule requires the current hub to sign `m.room.hub`, and a hub
+that is down cannot. Failover therefore relaxes that rule, only between Spindle
+peers and only after the timeout (§12.5). A room with a non-Spindle LM peer has
+no failover: it waits for its hub, which is the MSC's own behaviour.
+
 ### 13.3 Equivocation detection
 
 The chain hash makes the log a transparency log. If a hub signs two different
@@ -929,7 +1041,7 @@ entries at the same `li`, or two entries whose chain hashes are inconsistent, an
 participant holding both signatures possesses a self-contained, non-repudiable
 proof of misbehavior.
 
-Spindle additionally supports periodic `m.room.checkpoint` state events carrying
+Spindle additionally supports periodic `org.spindle.checkpoint` state events carrying
 `chain[li]` and the current `StateRoot`. Because the state root is a hash of the
 materialized state, a checkpoint lets a participant verify not only ordering but
 the resulting *state* — something DAG Matrix cannot offer without recomputing
@@ -1273,7 +1385,9 @@ forward extremities.
 ## 23. Prior art and relationship to it
 
 - **MSC3995 / `draft-ralston-mimi-linearized-matrix`** — the source of the
-  linearized model, the hub topology, and dual representation. Spindle's
+  linearized model, the hub topology, and dual representation. Both are
+  stalled: the MSC is a WIP last updated in 2023, the draft expired at `-04`,
+  and MIMI adopted an MLS protocol instead (§12.0). Spindle's
   contribution is applying it as an internal storage strategy for *all* rooms,
   including non-federated ones, rather than only as a federation profile for
   thin third-party implementations.
