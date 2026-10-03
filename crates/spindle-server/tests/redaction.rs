@@ -1,5 +1,5 @@
-//! Redaction under the room's own algorithm, including the v1–v10 top-level
-//! target and v11's MSC2174 `content.redacts` target.
+//! Redaction under the room's own algorithm: the v1–v10 top-level target, and
+//! room version 11's (MSC3820) MSC2174 `content.redacts` target.
 //!
 //! Two things this file is really about.
 //!
