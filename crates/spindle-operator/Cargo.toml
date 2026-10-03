@@ -1,0 +1,39 @@
+[package]
+name = "spindle-operator"
+version = "0.1.0"
+description = "Standalone operator service: durable operations, audit and secure sessions for a Spindle deployment"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# Not published, for the same reason as spindle-server: the release is
+# binaries, and an accidental `cargo publish` should not be one command away.
+publish = false
+
+[dependencies]
+axum.workspace = true
+# The OIDC ID token arrives as a JWT; its payload is base64url. Already in
+# the lock through reqwest, so this names a version rather than adding one.
+base64 = "0.22"
+form_urlencoded.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+reqwest.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+# `process` runs out-of-process drivers, `fs` writes evidence files, `time`
+# bounds every call into a deployment so a dead homeserver cannot hang the
+# console that is meant to diagnose it.
+tokio = { workspace = true, features = ["process", "fs", "sync", "time", "io-util"] }
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# `json` for the tests' request and response bodies only.
+reqwest = { workspace = true, features = ["json"] }
+
+[lints]
+workspace = true

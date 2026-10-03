@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/spindle-core", "crates/spindle-server", "crates/spindle-store"]
+members = ["crates/spindle-core", "crates/spindle-operator", "crates/spindle-server", "crates/spindle-store"]
 resolver = "2"
 
 [workspace.package]
