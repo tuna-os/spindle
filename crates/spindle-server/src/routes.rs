@@ -4652,7 +4652,30 @@ async fn room_joined_members(
         .rooms
         .may_read(&identity.user_id, &room_id)
         .map_err(room_error)?;
-    let members = state.rooms.joined_members(&room_id).map_err(room_error)?;
+    let members = if state.rooms.erasure_active().map_err(room_error)? {
+        state
+            .rooms
+            .reader(&identity.user_id, &room_id)
+            .map_err(room_error)?
+            .members()
+            .map_err(room_error)?
+            .into_iter()
+            .filter(|event| event["content"]["membership"] == "join")
+            .filter_map(|event| {
+                event["state_key"].as_str().map(|user| {
+                    (
+                        user.to_owned(),
+                        json!({
+                            "display_name": event["content"]["displayname"],
+                            "avatar_url": event["content"]["avatar_url"]
+                        }),
+                    )
+                })
+            })
+            .collect()
+    } else {
+        state.rooms.joined_members(&room_id).map_err(room_error)?
+    };
     Ok(Json(json!({ "joined": members })))
 }
 
@@ -5483,7 +5506,13 @@ async fn room_summary(
         room_id_or_alias
     };
 
-    let summary = state.rooms.summary(&room_id).map_err(room_error)?;
+    let user_id = viewer
+        .as_ref()
+        .map_or("", |identity| identity.user_id.as_str());
+    let summary = state
+        .rooms
+        .summary_for(user_id, &room_id)
+        .map_err(room_error)?;
     let membership = match viewer {
         Some(identity) => {
             let joined = state.rooms.joined(&identity.user_id).map_err(room_error)?;
@@ -7121,36 +7150,31 @@ fn lazy_members_expanded(
         .collect()
 }
 
-fn sliding_room_entry(
+fn sliding_heroes(
+    state: &AppState,
+    reader: &crate::rooms::RoomReader<'_>,
+    roster: &crate::rooms::Roster,
+    viewer: &str,
+) -> Result<Vec<Value>, MatrixError> {
+    let mut heroes = roster.heroes.clone();
+    if state.rooms.erasure_active().map_err(room_error)? {
+        for hero in &mut heroes {
+            let member = reader
+                .state_event("m.room.member", &hero.user_id)
+                .map_err(room_error)?;
+            hero.displayname = member["displayname"].as_str().map(str::to_owned);
+            hero.avatar_url = member["avatar_url"].as_str().map(str::to_owned);
+        }
+    }
+    Ok(crate::sliding::heroes(&heroes, viewer))
+}
+
+fn sliding_required_state(
     state: &AppState,
     identity: &crate::accounts::Identity,
     room_id: &str,
     required_state: &[(String, String)],
-    timeline_limit: usize,
-    initial: bool,
-) -> Result<Value, MatrixError> {
-    let name = state
-        .rooms
-        .state_event_unscoped(room_id, "m.room.name", "")
-        .ok()
-        .and_then(|content| content["name"].as_str().map(str::to_owned));
-    let (events, limited, prev_batch) = if timeline_limit == 0 {
-        (Vec::new(), false, None)
-    } else {
-        state
-            .rooms
-            .timeline_tail_public(room_id, timeline_limit.min(50))
-            .map_err(room_error)?
-    };
-    let timeline = crate::sliding::Timeline {
-        events: events
-            .into_iter()
-            .map(|event| with_transaction_id(state, identity, event))
-            .collect(),
-        limited,
-        prev_batch: prev_batch.map(|li| crate::tokens::Pagination(li).to_string()),
-    };
-    let required_state = lazy_members_expanded(required_state, &timeline.events);
+) -> Result<Vec<Value>, MatrixError> {
     // A wildcard has to be answered by looking at everything; a list of
     // named keys does not. Element X asks for a handful of concrete keys
     // and gets sent the whole room state to filter down — a stored-body
@@ -7193,7 +7217,7 @@ fn sliding_room_entry(
                 let event_type = event["type"].as_str().unwrap_or_default();
                 let state_key = event["state_key"].as_str().unwrap_or_default();
                 crate::sliding::wants_state(
-                    &required_state,
+                    required_state,
                     &identity.user_id,
                     event_type,
                     state_key,
@@ -7201,12 +7225,56 @@ fn sliding_room_entry(
             })
             .collect()
     };
-    let roster = state.rooms.roster(room_id).map_err(room_error)?;
-    let avatar = state
+    state
         .rooms
-        .state_event_unscoped(room_id, "m.room.avatar", "")
+        .prune_erased_events(&identity.user_id, room_id, state_events)
+        .map_err(room_error)
+}
+
+fn sliding_room_entry(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    room_id: &str,
+    required_state: &[(String, String)],
+    timeline_limit: usize,
+    initial: bool,
+) -> Result<Value, MatrixError> {
+    let reader = state
+        .rooms
+        .reader(&identity.user_id, room_id)
+        .map_err(room_error)?;
+    let name = reader
+        .state_event("m.room.name", "")
+        .ok()
+        .and_then(|content| content["name"].as_str().map(str::to_owned));
+    let (events, limited, prev_batch) = if timeline_limit == 0 {
+        (Vec::new(), false, None)
+    } else {
+        state
+            .rooms
+            .timeline_tail_public(room_id, timeline_limit.min(50))
+            .map_err(room_error)?
+    };
+    let events = state
+        .rooms
+        .prune_erased_events(&identity.user_id, room_id, events)
+        .map_err(room_error)?;
+    let timeline = crate::sliding::Timeline {
+        events: events
+            .into_iter()
+            .map(|event| with_transaction_id(state, identity, event))
+            .collect(),
+        limited,
+        prev_batch: prev_batch.map(|li| crate::tokens::Pagination(li).to_string()),
+    };
+    let required_state = lazy_members_expanded(required_state, &timeline.events);
+    let state_events = sliding_required_state(state, identity, room_id, &required_state)?;
+    let roster = state.rooms.roster(room_id).map_err(room_error)?;
+    let avatar = reader
+        .state_event("m.room.avatar", "")
         .ok()
         .and_then(|content| content["url"].as_str().map(str::to_owned));
+    let heroes = sliding_heroes(state, &reader, &roster, &identity.user_id)?;
     let bump_stamp = state.rooms.last_activity(room_id).map_err(room_error)?;
     let unread = state
         .rooms
@@ -7219,7 +7287,7 @@ fn sliding_room_entry(
             avatar,
             joined_count: roster.joined.len(),
             invited_count: roster.invited.len(),
-            heroes: crate::sliding::heroes(&roster.heroes, &identity.user_id),
+            heroes,
             bump_stamp,
         },
         state_events,
@@ -7707,7 +7775,7 @@ fn sticky_section(
         .iter()
         .filter_map(|event| event["event_id"].as_str())
         .collect();
-    Ok(state
+    let events = state
         .rooms
         .sticky_events(room_id, if joined_now { None } else { since })
         .map_err(room_error)?
@@ -7717,7 +7785,11 @@ fn sticky_section(
             event["unsigned"]["msc4354_sticky_duration_ttl_ms"] = json!(ttl);
             event
         })
-        .collect())
+        .collect();
+    state
+        .rooms
+        .prune_erased_events(user_id, room_id, events)
+        .map_err(room_error)
 }
 
 fn sync_join(
@@ -8043,6 +8115,10 @@ fn relations(
         .relations(room_id, event_id, rel_type, event_type, from, limit)
         .map_err(room_error)?;
 
+    let chunk = state
+        .rooms
+        .prune_erased_events(user_id, room_id, chunk)
+        .map_err(room_error)?;
     let mut body = serde_json::Map::new();
     body.insert("chunk".to_owned(), Value::Array(chunk));
     // Absent when there is nothing more, which is how a client stops.
@@ -8557,6 +8633,10 @@ async fn room_threads(
         .threads(&room_id, &identity.user_id, participated_only, from, limit)
         .map_err(room_error)?;
 
+    let roots = state
+        .rooms
+        .prune_erased_events(&identity.user_id, &room_id, roots)
+        .map_err(room_error)?;
     let chunk: Vec<Value> = roots
         .into_iter()
         .map(|root| as_seen_by(&state, &room_id, &identity, root))
@@ -9378,6 +9458,7 @@ fn matches_term(summary: &crate::rooms::RoomSummary, term: &str) -> bool {
 /// failing.
 fn directory_page(
     state: &AppState,
+    user_id: &str,
     limit: Option<usize>,
     since: Option<&str>,
     term: Option<&str>,
@@ -9402,7 +9483,7 @@ fn directory_page(
     // whole listing down with it.
     let mut visible: Vec<crate::rooms::RoomSummary> = Vec::new();
     for room_id in &published {
-        let Ok(summary) = state.rooms.summary(room_id) else {
+        let Ok(summary) = state.rooms.summary_for(user_id, room_id) else {
             continue;
         };
         if term.is_some_and(|term| !matches_term(&summary, term)) {
@@ -9459,7 +9540,7 @@ async fn public_rooms(
     axum::extract::Query(query): axum::extract::Query<PublicRoomsQuery>,
 ) -> Result<Json<Value>, MatrixError> {
     refuse_remote_directory(query.server.as_ref(), &state.config.server.name)?;
-    directory_page(&state, query.limit, query.since.as_deref(), None, &[])
+    directory_page(&state, "", query.limit, query.since.as_deref(), None, &[])
 }
 
 /// `POST /_matrix/client/v3/publicRooms`
@@ -9469,12 +9550,13 @@ async fn public_rooms(
 /// attributable.
 async fn public_rooms_filtered(
     State(state): State<AppState>,
-    Authenticated(_identity): Authenticated,
+    Authenticated(identity): Authenticated,
     Json(request): Json<PublicRoomsRequest>,
 ) -> Result<Json<Value>, MatrixError> {
     refuse_remote_directory(request.server.as_ref(), &state.config.server.name)?;
     directory_page(
         &state,
+        &identity.user_id,
         request.limit,
         request.since.as_deref(),
         request.filter.generic_search_term.as_deref(),
@@ -9775,7 +9857,7 @@ async fn search(
             if let Some(wanted) = &criteria.event_context
                 && let Some(scope) = scopes.get(&hit.room_id)
             {
-                result["context"] = search_context(&state, hit, wanted, scope);
+                result["context"] = search_context(&state, &identity.user_id, hit, wanted, scope);
             }
             result
         })
@@ -9794,7 +9876,7 @@ async fn search(
     if criteria.include_state {
         room_events.insert(
             "state".to_owned(),
-            Value::Object(search_state(&state, &hits, &scopes)?),
+            Value::Object(search_state(&state, &identity.user_id, &hits, &scopes)?),
         );
     }
     Ok(Json(json!({
@@ -9836,7 +9918,7 @@ fn search_rooms(
         let matches = |event: &Value| search_matches(event, needle, keys, &criteria.filter);
         let (found, next) = state
             .rooms
-            .reader_with(&room_id, scope.clone())
+            .reader_with(user_id, &room_id, scope.clone())
             .search(cursor.get(&room_id).copied(), limit, &matches)
             .map_err(room_error)?;
         more |= next.is_some();
@@ -9986,7 +10068,7 @@ async fn notifications(
         };
         let (found, next) = state
             .rooms
-            .reader_with(&room_id, scope.clone())
+            .reader_with(&identity.user_id, &room_id, scope.clone())
             .search(cursor.get(&room_id).copied(), limit, &notifies)
             .map_err(room_error)?;
         more |= next.is_some();
@@ -10059,6 +10141,7 @@ fn render_notifications(
 /// one, exactly as `/state` answers.
 fn search_state(
     state: &AppState,
+    user_id: &str,
     hits: &[SearchHit],
     scopes: &BTreeMap<String, ReadScope>,
 ) -> Result<serde_json::Map<String, Value>, MatrixError> {
@@ -10074,7 +10157,7 @@ fn search_state(
         // carries that answer rather than asking again.
         let rendered = state
             .rooms
-            .reader_with(&hit.room_id, scope.clone())
+            .reader_with(user_id, &hit.room_id, scope.clone())
             .state_serialized()
             .map_err(room_error)?;
         let room_state = serde_json::from_str::<Value>(&rendered)
@@ -10089,6 +10172,7 @@ fn search_state(
 /// read is a hit without context rather than a failed search.
 fn search_context(
     state: &AppState,
+    user_id: &str,
     hit: &SearchHit,
     wanted: &SearchContext,
     scope: &ReadScope,
@@ -10097,7 +10181,7 @@ fn search_context(
     let after_limit = wanted.after_limit.unwrap_or(SEARCH_CONTEXT_EACH_SIDE);
     let Ok(context) = state
         .rooms
-        .reader_with(&hit.room_id, scope.clone())
+        .reader_with(user_id, &hit.room_id, scope.clone())
         .context(&hit.event.event_id, before_limit, after_limit)
     else {
         return Value::Null;
@@ -10431,7 +10515,7 @@ fn hierarchy_visible(
     user: &str,
     room_id: &str,
 ) -> Option<crate::rooms::RoomSummary> {
-    let summary = state.rooms.summary(room_id).ok()?;
+    let summary = state.rooms.summary_for(user, room_id).ok()?;
     if state.rooms.is_joined(user, room_id).unwrap_or(false) {
         return Some(summary);
     }
@@ -10878,7 +10962,7 @@ async fn federation_public_rooms(
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
     federation_origin(&state, &headers, "GET", &uri, None).await?;
-    directory_page(&state, query.limit, query.since.as_deref(), None, &[])
+    directory_page(&state, "", query.limit, query.since.as_deref(), None, &[])
 }
 
 /// `POST /_matrix/federation/v1/publicRooms`
@@ -10901,6 +10985,7 @@ async fn federation_public_rooms_filtered(
         serde_json::from_value(body).map_err(|error| MatrixError::bad_json(error.to_string()))?;
     directory_page(
         &state,
+        "",
         filter.limit,
         filter.since.as_deref(),
         filter.filter.generic_search_term.as_deref(),

@@ -67,6 +67,7 @@ impl ReadScope {
 pub struct RoomReader<'a> {
     rooms: &'a Rooms,
     room_id: String,
+    user_id: String,
     scope: ReadScope,
 }
 
@@ -153,10 +154,11 @@ impl Rooms {
     /// has to have come from [`Self::read_scope`]; this only avoids
     /// asking twice.
     #[must_use]
-    pub fn reader_with(&self, room_id: &str, scope: ReadScope) -> RoomReader<'_> {
+    pub fn reader_with(&self, user_id: &str, room_id: &str, scope: ReadScope) -> RoomReader<'_> {
         RoomReader {
             rooms: self,
             room_id: room_id.to_owned(),
+            user_id: user_id.to_owned(),
             scope,
         }
     }
@@ -209,12 +211,29 @@ impl Rooms {
         Ok(RoomReader {
             rooms: self,
             room_id: room_id.to_owned(),
+            user_id: user_id.to_owned(),
             scope: self.read_scope(user_id, room_id)?,
         })
     }
 }
 
 impl RoomReader<'_> {
+    fn prune_page(
+        &self,
+        (mut events, next): (Vec<TimelineEvent>, Option<i64>),
+    ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
+        if self.rooms.erasure_active()? {
+            for event in &mut events {
+                event.json = self.rooms.prune_erased_event(
+                    &self.user_id,
+                    &self.room_id,
+                    super::stamp(event.json.take(), &event.event_id),
+                )?;
+            }
+        }
+        Ok((events, next))
+    }
+
     /// How much of the room this reader admits.
     #[must_use]
     pub fn scope(&self) -> &ReadScope {
@@ -234,6 +253,18 @@ impl RoomReader<'_> {
     /// Returns [`RoomError`] if the room is unknown or its state cannot be
     /// read.
     pub fn state_serialized(&self) -> Result<String, RoomError> {
+        if self.rooms.erasure_active()? {
+            let events = match self.scope.bound() {
+                None => self.rooms.state(&self.room_id)?,
+                Some(bound) => self.rooms.state_as_of(&self.room_id, bound)?,
+            };
+            return Ok(Value::Array(self.rooms.prune_erased_events(
+                &self.user_id,
+                &self.room_id,
+                events,
+            )?)
+            .to_string());
+        }
         match self.scope.bound() {
             None => Ok(self
                 .rooms
@@ -253,6 +284,23 @@ impl RoomReader<'_> {
     /// Returns [`RoomError`] if the room is unknown or the event is not in
     /// the state this caller may read.
     pub fn state_event(&self, event_type: &str, state_key: &str) -> Result<Value, RoomError> {
+        if self.rooms.erasure_active()? {
+            let events = match self.scope.bound() {
+                None => vec![
+                    self.rooms
+                        .state_event_full(&self.room_id, event_type, state_key)?,
+                ],
+                Some(bound) => self.rooms.state_as_of(&self.room_id, bound)?,
+            };
+            let event = events
+                .into_iter()
+                .find(|event| event["type"] == event_type && event["state_key"] == state_key)
+                .ok_or_else(|| RoomError::MissingBody(format!("{event_type}/{state_key}")))?;
+            return Ok(self
+                .rooms
+                .prune_erased_event(&self.user_id, &self.room_id, event)?["content"]
+                .clone());
+        }
         match self.scope.bound() {
             None => self.rooms.state_event(&self.room_id, event_type, state_key),
             Some(bound) => {
@@ -304,7 +352,7 @@ impl RoomReader<'_> {
     }
 
     fn members_bounded(&self, bound: Option<i64>) -> Result<Vec<Value>, RoomError> {
-        match bound {
+        let events = match bound {
             None => self.rooms.state_where(&self.room_id, |key| {
                 key.event_type().as_str() == "m.room.member"
             }),
@@ -314,7 +362,9 @@ impl RoomReader<'_> {
                 .into_iter()
                 .filter(|event| event["type"] == "m.room.member")
                 .collect()),
-        }
+        }?;
+        self.rooms
+            .prune_erased_events(&self.user_id, &self.room_id, events)
     }
 
     /// A page of the room's timeline, oldest position first, carrying only
@@ -333,8 +383,10 @@ impl RoomReader<'_> {
         from: Option<i64>,
         limit: usize,
     ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
-        self.rooms
-            .messages_visible(&self.room_id, from, limit, &|li| self.scope.admits(li))
+        self.prune_page(
+            self.rooms
+                .messages_visible(&self.room_id, from, limit, &|li| self.scope.admits(li))?,
+        )
     }
 
     /// A page of the timeline in either direction (`/messages` with `dir`
@@ -348,8 +400,10 @@ impl RoomReader<'_> {
         page: super::Page,
         limit: usize,
     ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
-        self.rooms
-            .page_visible(&self.room_id, page, limit, &|li| self.scope.admits(li))
+        self.prune_page(
+            self.rooms
+                .page_visible(&self.room_id, page, limit, &|li| self.scope.admits(li))?,
+        )
     }
 
     /// The window around one event, as this caller may see it.
@@ -363,10 +417,30 @@ impl RoomReader<'_> {
         before: usize,
         after: usize,
     ) -> Result<Context, RoomError> {
-        self.rooms
-            .context_visible(&self.room_id, event_id, before, after, &|li| {
-                self.scope.admits(li)
-            })
+        let mut context =
+            self.rooms
+                .context_visible(&self.room_id, event_id, before, after, &|li| {
+                    self.scope.admits(li)
+                })?;
+        if self.rooms.erasure_active()? {
+            context.event =
+                self.rooms
+                    .prune_erased_event(&self.user_id, &self.room_id, context.event)?;
+            context.events_before = self.rooms.prune_erased_events(
+                &self.user_id,
+                &self.room_id,
+                context.events_before,
+            )?;
+            context.events_after = self.rooms.prune_erased_events(
+                &self.user_id,
+                &self.room_id,
+                context.events_after,
+            )?;
+            context.state =
+                self.rooms
+                    .prune_erased_events(&self.user_id, &self.room_id, context.state)?;
+        }
+        Ok(context)
     }
 
     /// The events in this room matching `matches`, as this caller may see
@@ -383,6 +457,7 @@ impl RoomReader<'_> {
         matches: &(dyn Fn(&Value) -> bool + Sync),
     ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
         self.rooms.search(
+            &self.user_id,
             &self.room_id,
             from,
             limit,
@@ -408,6 +483,13 @@ impl RoomReader<'_> {
                 return Ok(None);
             }
         }
-        self.rooms.event(&self.room_id, event_id).map(Some)
+        let event = self.rooms.event(&self.room_id, event_id)?;
+        if self.rooms.erasure_active()? {
+            return self
+                .rooms
+                .prune_erased_event(&self.user_id, &self.room_id, event)
+                .map(Some);
+        }
+        Ok(Some(event))
     }
 }

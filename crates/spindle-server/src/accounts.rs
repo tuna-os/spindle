@@ -241,6 +241,11 @@ impl<'a, S: Store> Accounts<'a, S> {
     ///
     /// Returns a storage or decoding error.
     pub fn set_deactivated(&self, localpart: &str, deactivated: bool) -> Result<(), AccountError> {
+        // All account updates share the erasure lock so a concurrent
+        // flag/password write cannot restore an older erasure decision.
+        let _guard = ERASURE_POLICY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(mut account) = self.account(localpart)? else {
             return Ok(());
         };
@@ -562,6 +567,11 @@ impl<'a, S: Store> Accounts<'a, S> {
     ///
     /// Returns a storage or decoding error.
     pub fn set_admin(&self, localpart: &str, admin: bool) -> Result<bool, AccountError> {
+        // All account updates share the erasure lock so a concurrent
+        // flag/password write cannot restore an older erasure decision.
+        let _guard = ERASURE_POLICY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(mut account) = self.account(localpart)? else {
             return Ok(false);
         };
@@ -578,6 +588,11 @@ impl<'a, S: Store> Accounts<'a, S> {
     ///
     /// Returns a storage or decoding error.
     pub fn set_locked(&self, localpart: &str, locked: bool) -> Result<bool, AccountError> {
+        // All account updates share the erasure lock so a concurrent
+        // flag/password write cannot restore an older erasure decision.
+        let _guard = ERASURE_POLICY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(mut account) = self.account(localpart)? else {
             return Ok(false);
         };
@@ -594,6 +609,11 @@ impl<'a, S: Store> Accounts<'a, S> {
     ///
     /// Returns a storage or decoding error.
     pub fn set_suspended(&self, localpart: &str, suspended: bool) -> Result<bool, AccountError> {
+        // All account updates share the erasure lock so a concurrent
+        // flag/password write cannot restore an older erasure decision.
+        let _guard = ERASURE_POLICY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(mut account) = self.account(localpart)? else {
             return Ok(false);
         };
@@ -609,6 +629,11 @@ impl<'a, S: Store> Accounts<'a, S> {
     ///
     /// Returns a storage, decoding, or hashing error.
     pub fn set_password(&self, localpart: &str, password: &str) -> Result<bool, AccountError> {
+        // All account updates share the erasure lock so a concurrent
+        // flag/password write cannot restore an older erasure decision.
+        let _guard = ERASURE_POLICY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(mut account) = self.account(localpart)? else {
             return Ok(false);
         };

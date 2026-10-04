@@ -143,6 +143,7 @@ pub struct Hero {
 type Destinations = ([u8; 32], Arc<Vec<String>>);
 
 mod admin;
+mod erasure;
 mod federation;
 mod read;
 mod synapse_positions;
@@ -1567,7 +1568,7 @@ impl Rooms {
             .iter()
             .any(|event| event.get("state_key").is_some());
         let current = state_after || !state_in_window;
-        if state_block == StateBlock::Deferred && current {
+        if state_block == StateBlock::Deferred && current && !self.erasure_active()? {
             // Nothing to do: the caller serves the cached render.
             return Ok((Vec::new(), true));
         }
@@ -2635,6 +2636,11 @@ impl Rooms {
                 Err(RoomError::MissingBody(_)) => continue,
                 Err(error) => return Err(error),
             };
+            let reply = if self.erasure_active()? {
+                self.prune_erased_event(viewer, room_id, reply)?
+            } else {
+                reply
+            };
             let Some((_, root)) = relates_to(&reply["content"]) else {
                 continue;
             };
@@ -3304,6 +3310,7 @@ impl Rooms {
     /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
     fn search(
         &self,
+        user_id: &str,
         room_id: &str,
         from: Option<i64>,
         limit: usize,
@@ -3319,6 +3326,7 @@ impl Rooms {
                 .collect())
         })?;
         let watermark = self.purge_watermark(room_id)?;
+        let erasure_active = self.erasure_active()?;
         let mut hits = Vec::new();
         for (li, event_id) in candidates {
             if hits.len() == limit {
@@ -3332,6 +3340,12 @@ impl Rooms {
                     continue;
                 }
                 Err(error) => return Err(error),
+            };
+            let json = stamp(json, &event_id);
+            let json = if erasure_active {
+                self.prune_erased_event(user_id, room_id, json)?
+            } else {
+                json
             };
             if matches(&json) {
                 hits.push(TimelineEvent { event_id, li, json });
@@ -3718,7 +3732,21 @@ impl Rooms {
             });
         }
 
-        let left = self.left_rooms(user_id, since, range)?;
+        let mut left = self.left_rooms(user_id, since, range)?;
+        if self.erasure_active()? {
+            for room in rooms.iter_mut().chain(left.iter_mut()) {
+                room.events = self.prune_erased_events(
+                    user_id,
+                    &room.room_id,
+                    std::mem::take(&mut room.events),
+                )?;
+                room.state = self.prune_erased_events(
+                    user_id,
+                    &room.room_id,
+                    std::mem::take(&mut room.state),
+                )?;
+            }
+        }
 
         // How stale was the freshest thing we just handed over? A client
         // keeping up sees milliseconds; a server falling behind sees this
@@ -4350,6 +4378,11 @@ impl Rooms {
                 Ok(event) => event,
                 Err(RoomError::MissingBody(_)) => continue,
                 Err(error) => return Err(error),
+            };
+            let event = if self.erasure_active()? {
+                self.prune_erased_event(viewer, room_id, event)?
+            } else {
+                event
             };
             // Redacted: the relation is gone from the content, so it is gone
             // from the aggregate.

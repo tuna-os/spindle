@@ -695,14 +695,20 @@ impl Rooms {
                         .pending_knock(user_id, room_id)?
                         .and_then(|record| record["knock_state"].as_array().cloned()),
                 };
-                return Ok(stripped.unwrap_or_default());
+                return self.prune_erased_stripped(stripped.unwrap_or_default());
             }
             Err(error) => return Err(error),
         };
+        let erasure_active = self.erasure_active()?;
         let mut stripped = Vec::with_capacity(ids.len() + 1);
         let mut inviter: Option<String> = None;
         for (event_type, state_key, id) in ids {
             let event = self.read_event(room_id, &EventId::new(id.as_str()))?;
+            let event = if erasure_active {
+                self.prune_erased_event(user_id, room_id, super::stamp(event, &id))?
+            } else {
+                event
+            };
             if event_type == "m.room.member" && state_key == user_id {
                 inviter = event["sender"].as_str().map(str::to_owned);
             }
@@ -727,6 +733,11 @@ impl Rooms {
             })?;
             if let Some(id) = id {
                 let event = self.read_event(room_id, &EventId::new(id.as_str()))?;
+                let event = if erasure_active {
+                    self.prune_erased_event(user_id, room_id, super::stamp(event, &id))?
+                } else {
+                    event
+                };
                 stripped.push(serde_json::json!({
                     "type": "m.room.member",
                     "state_key": inviter,
