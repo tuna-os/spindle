@@ -489,7 +489,9 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
         } else {
             tally.disagree += 1;
             if let Some(path) = std::env::var_os("CORPUS_SYNAPSE_FIXTURE") {
-                if !std::path::Path::new(&path).exists() {
+                let selected = std::env::var("CORPUS_SYNAPSE_FIXTURE_EVENT")
+                    .map_or(true, |id| id == merge.event_id);
+                if selected && !std::path::Path::new(&path).exists() {
                     let rows = |snapshot: &StateSnapshot| {
                         let mut rows = Vec::new();
                         snapshot.for_each(|key, id| {
