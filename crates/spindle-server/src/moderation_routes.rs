@@ -12,9 +12,8 @@ use serde_json::{Value, json};
 
 use crate::auth::Authenticated;
 use crate::errors::MatrixError;
-use crate::rooms::may_read_room;
+use crate::routes::{internal, localpart_of, may_read_room};
 use crate::{AppState, accounts::Accounts};
-use spindle_core::localpart_of;
 
 /// `POST /_matrix/client/v3/rooms/{room_id}/report`
 ///
@@ -76,10 +75,7 @@ async fn report_user(
     let local = user_id.ends_with(&format!(":{}", state.config.server.name))
         && accounts
             .account(&localpart_of(&user_id))
-            .map_err(|error| {
-                let err_string = error.to_string();
-                MatrixError::new(StatusCode::INTERNAL_SERVER_ERROR, "M_UNKNOWN", &err_string)
-            })?
+            .map_err(|error| internal(&error))?
             .is_some();
     if !local {
         return Err(MatrixError::new(

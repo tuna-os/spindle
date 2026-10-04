@@ -276,9 +276,6 @@ fn profile_routes() -> Router<AppState> {
         )
 }
 
-
-
-
 /// The surface only an appservice speaks.
 fn appservice_routes() -> Router<AppState> {
     Router::new().route(
@@ -1992,9 +1989,6 @@ async fn well_known_support(State(state): State<AppState>) -> Result<Json<Value>
     Ok(Json(Value::Object(body)))
 }
 
-
-
-
 /// `GET /_matrix/client/v3/admin/whois/{userId}`
 ///
 /// The user's devices. The spec's shape carries the sessions and
@@ -2400,7 +2394,7 @@ async fn delete_device(
 }
 
 /// `@alice:example.org` and `alice` both mean the same localpart.
-fn localpart_of(user: &str) -> String {
+pub(crate) fn localpart_of(user: &str) -> String {
     // Folded to lowercase for the same reason registration folds: the
     // grammar is lowercase, and "Alice" logging in means the alice who
     // registered.
@@ -2410,7 +2404,7 @@ fn localpart_of(user: &str) -> String {
         .to_lowercase()
 }
 
-fn internal(error: &AccountError) -> MatrixError {
+pub(crate) fn internal(error: &AccountError) -> MatrixError {
     MatrixError::internal(&error.to_string())
 }
 
@@ -10073,7 +10067,11 @@ fn hierarchy_visible(
 /// caller may not see. The alternative is a 404-versus-403 oracle that tells
 /// a stranger which room IDs exist, which is the smaller half of the same
 /// question they were asking.
-fn may_read_room(state: &AppState, user_id: &str, room_id: &str) -> Result<(), MatrixError> {
+pub(crate) fn may_read_room(
+    state: &AppState,
+    user_id: &str,
+    room_id: &str,
+) -> Result<(), MatrixError> {
     state.rooms.may_read(user_id, room_id).map_err(room_error)
 }
 
