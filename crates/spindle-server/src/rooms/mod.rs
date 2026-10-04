@@ -5370,7 +5370,7 @@ impl Rooms {
         let rules = self.rules_in(log, room_id)?;
         let fetch = |id: &ruma::EventId| -> Option<StoredEvent> {
             let body = self.read_event(room_id, &EventId::new(id.as_str())).ok()?;
-            let event = StoredEvent::parse_in(id.as_str(), room_id, &body).ok()?;
+            let event = StoredEvent::parse_auth_in(id.as_str(), room_id, &body).ok()?;
             let rejected = log
                 .sidelined(&EventId::new(id.as_str()))
                 .is_some_and(|entry| entry.kind == Sideline::Rejected);
@@ -5715,7 +5715,7 @@ impl Rooms {
         // any state at all.
         let load = |id: &str| -> Option<StoredEvent> {
             let body = self.read_event(room_id, &EventId::new(id)).ok()?;
-            StoredEvent::parse_in(id, room_id, &body).ok()
+            StoredEvent::parse_auth_in(id, room_id, &body).ok()
         };
 
         // Per-room, for the same reason as redaction above and with more at
