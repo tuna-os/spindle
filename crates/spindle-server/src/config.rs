@@ -876,7 +876,7 @@ impl Config {
         Ok(())
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    fn validate_media(&self) -> Result<(), ConfigError> {
         if self.media.max_upload_bytes == 0 || self.media.max_upload_bytes == usize::MAX {
             return Err(ConfigError::Invalid {
                 field: "media.max_upload_bytes",
@@ -884,6 +884,11 @@ impl Config {
                     .to_owned(),
             });
         }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_media()?;
         // Both caps are the reason #36 asks for them: a zero here does not
         // mean "unlimited", it means every schedule is refused and the
         // dead-man's switch silently stops working. An operator who typed
