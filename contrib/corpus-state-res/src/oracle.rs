@@ -77,7 +77,7 @@ pub fn compare(
         .collect();
     let rejected: HashSet<&str> = rejected.iter().map(String::as_str).collect();
     let fetch = |id: &ruma::EventId| {
-        StoredEvent::parse_in(id.as_str(), room, bodies.get(id.as_str())?)
+        StoredEvent::parse_auth_in(id.as_str(), room, bodies.get(id.as_str())?)
             .ok()
             .map(|event| event.with_rejected(rejected.contains(id.as_str())))
     };
