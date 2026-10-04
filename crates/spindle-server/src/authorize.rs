@@ -40,6 +40,7 @@ pub struct StoredEvent {
     auth_events: Vec<OwnedEventId>,
     redacts: Option<OwnedEventId>,
     depth: i64,
+    rejected: bool,
 }
 
 impl StoredEvent {
@@ -136,6 +137,7 @@ impl StoredEvent {
             },
             redacts,
             depth: json["depth"].as_i64().unwrap_or(0),
+            rejected: false,
         })
     }
 
@@ -144,6 +146,24 @@ impl StoredEvent {
     #[must_use]
     pub fn depth(&self) -> i64 {
         self.depth
+    }
+
+    /// The same event, marked rejected or not.
+    ///
+    /// A rejected event is still stored -- a later event may name it -- but
+    /// the auth rules must not count it: state resolution's iterative auth
+    /// checks skip a rejected auth event, and an event whose auth events
+    /// include a rejected one is itself rejected.
+    #[must_use]
+    pub fn with_rejected(mut self, rejected: bool) -> Self {
+        self.rejected = rejected;
+        self
+    }
+
+    /// The event's `auth_events`, as stored.
+    #[must_use]
+    pub fn auth_event_ids(&self) -> &[OwnedEventId] {
+        &self.auth_events
     }
 }
 
@@ -181,7 +201,7 @@ impl Event for StoredEvent {
         self.redacts.as_ref()
     }
     fn rejected(&self) -> bool {
-        false
+        self.rejected
     }
 }
 

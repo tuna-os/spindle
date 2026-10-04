@@ -401,6 +401,10 @@ pub enum Keyspace {
     /// latest account-data write. Kept beside [`Self::AccountData`] rather
     /// than inside its value so existing stored JSON remains its own format.
     AccountDataStream = 0x3c,
+    /// `(room_id, event_id)` -> a soft-failed or rejected event held for
+    /// the room's DAG but kept out of its timeline (`spindle_core::Sideline`):
+    /// its parents, depth, verdict and the root of the state after it.
+    Sidelined = 0x3d,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -586,6 +590,14 @@ pub fn room_prefix(keyspace: Keyspace, room_id: &str) -> Vec<u8> {
     key.push(keyspace as u8);
     key.extend_from_slice(&len.to_be_bytes());
     key.extend_from_slice(room);
+    key
+}
+
+/// One sidelined event's row ([`Keyspace::Sidelined`]).
+#[must_use]
+pub fn sidelined(room_id: &str, event_id: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::Sidelined, room_id);
+    key.extend_from_slice(event_id.as_bytes());
     key
 }
 

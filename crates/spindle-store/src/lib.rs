@@ -44,7 +44,7 @@ use spindle_core::{
     keys::{KEY_SCHEMA_VERSION, Keyspace, content_addressed, room_li, room_prefix, store_marker},
 };
 
-use crate::codec::{CodecError, EntryRecord, RECORD_VERSION, RoomRecord};
+use crate::codec::{CodecError, EntryRecord, RECORD_VERSION, RoomRecord, SidelinedRecord};
 
 /// How hard a commit tries to be on disk before it is acknowledged.
 ///
@@ -1263,6 +1263,62 @@ impl<'a, S: Store> RoomStore<'a, S> {
         }
     }
 
+    /// Journal a soft-failed or rejected event: its record, the state
+    /// nodes its state adds over `previous` (a parent's state, which is
+    /// already stored), the room's metadata and the caller's records, in
+    /// one batch. Like [`Self::journal_entry_with`], the sync is the
+    /// caller's.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the batch cannot be journalled.
+    pub fn journal_sidelined(
+        &self,
+        entry: &spindle_core::SidelinedEntry,
+        state: &spindle_core::StateSnapshot,
+        previous: Option<&spindle_core::StateSnapshot>,
+        log: &RoomLog,
+        extra: &[Record],
+    ) -> Result<(), StoreError> {
+        let mut writes = vec![
+            (
+                spindle_core::keys::sidelined(&self.room_id, entry.event_id.as_str()),
+                SidelinedRecord::from_entry(entry).encode(),
+            ),
+            (
+                room_prefix(Keyspace::RoomMeta, &self.room_id),
+                Self::meta(log).encode(),
+            ),
+        ];
+        for (address, node) in state.delta_nodes(previous) {
+            writes.push((
+                content_addressed(Keyspace::StateNode, address.as_bytes()),
+                node,
+            ));
+        }
+        writes.extend_from_slice(extra);
+        self.store.commit_deferred(&writes)
+    }
+
+    /// Put the room's sidelined events back into a restored log, each with
+    /// its state rehydrated from the stored trie.
+    fn restore_sidelined(&self, log: &mut RoomLog) -> Result<(), StoreError> {
+        let prefix = room_prefix(Keyspace::Sidelined, &self.room_id);
+        let mut load_node = |address: &StateRoot| {
+            self.store
+                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
+                .ok()
+                .flatten()
+        };
+        for (_, value) in self.store.scan_prefix(&prefix)? {
+            let entry = SidelinedRecord::decode(&value)?.to_entry()?;
+            let state = spindle_core::StateSnapshot::rehydrate(entry.state_root, &mut load_node)
+                .unwrap_or_default();
+            log.restore_sidelined(entry, state);
+        }
+        Ok(())
+    }
+
     fn meta(log: &RoomLog) -> RoomRecord {
         RoomRecord {
             next_forward: log.next_forward(),
@@ -1397,7 +1453,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 .flatten()
         };
 
-        let restored = RoomLog::restore_with_state(
+        let mut restored = RoomLog::restore_with_state(
             entries,
             meta.next_forward,
             meta.next_backward,
@@ -1406,6 +1462,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 .map(|id| EventId::new(id.as_str())),
             &mut load_node,
         )?;
+        self.restore_sidelined(&mut restored.log)?;
         Ok(Some(restored))
     }
 }

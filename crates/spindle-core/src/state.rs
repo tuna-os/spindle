@@ -185,6 +185,47 @@ impl StateSnapshot {
         }
     }
 
+    /// Return a new snapshot without `key`, or an unchanged clone when the
+    /// key is absent.
+    ///
+    /// State resolution can drop a slot: a key only some branches hold
+    /// is conflicted, and when none of its candidates passes the
+    /// authorization checks the resolved state has no value for it. The
+    /// trie stays canonical -- a branch left holding one leaf collapses to
+    /// it, exactly the shape inserting that leaf alone would have built --
+    /// so a state reached by removing a key has the same root as the same
+    /// state reached by never adding it.
+    #[must_use]
+    pub fn remove(&self, key: &StateKey) -> Self {
+        let Some(root) = &self.root else {
+            return self.clone();
+        };
+        match root.remove(key, &key.digest(), 0) {
+            Removal::Absent => self.clone(),
+            Removal::Emptied => Self::new(),
+            Removal::Replaced(root) => Self {
+                root: Some(root),
+                len: self.len.saturating_sub(1),
+            },
+        }
+    }
+
+    /// Every slot whose value differs between `self` and `other`, as
+    /// `(key, ours, theirs)`, in key order.
+    ///
+    /// Proportional to the difference, not to the state: content addressing
+    /// means a subtree with the same hash on both sides is the same subtree,
+    /// and the walk does not enter it. Two snapshots that share all but a
+    /// few paths -- two branches of a fork, or a state and the one an event
+    /// moved it to -- compare in `O(changed x log n)`.
+    #[must_use]
+    pub fn diff(&self, other: &Self) -> Vec<StateDifference> {
+        let mut out = Vec::new();
+        diff_nodes(self.root.as_deref(), other.root.as_deref(), &mut out);
+        out.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+        out
+    }
+
     /// Visit every state slot in deterministic key order.
     /// Visit every entry, **in key order**.
     ///
@@ -203,6 +244,88 @@ impl StateSnapshot {
             visitor(key, event_id);
         }
     }
+}
+
+/// One slot two snapshots disagree on, from [`StateSnapshot::diff`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateDifference {
+    pub key: StateKey,
+    /// The value in the snapshot `diff` was called on.
+    pub ours: Option<Box<str>>,
+    /// The value in the snapshot passed to `diff`.
+    pub theirs: Option<Box<str>>,
+}
+
+/// Collect the slots `left` and `right` disagree on.
+///
+/// Equal hashes end the descent. Two branches recurse slot by slot; any
+/// other pairing -- a leaf against a branch, two leaves, one side absent --
+/// is small on at least one side, and is compared by collecting both.
+fn diff_nodes(left: Option<&Node>, right: Option<&Node>, out: &mut Vec<StateDifference>) {
+    match (left, right) {
+        (None, None) => {}
+        (Some(left), Some(right)) if left.hash() == right.hash() => {}
+        (
+            Some(Node::Branch {
+                bitmap: left_bits, ..
+            }),
+            Some(Node::Branch {
+                bitmap: right_bits, ..
+            }),
+        ) => {
+            let (Some(left), Some(right)) = (left, right) else {
+                return;
+            };
+            let mut slots = left_bits | right_bits;
+            while slots != 0 {
+                let slot = slots.trailing_zeros();
+                slots &= slots - 1;
+                diff_nodes(child_at_slot(left, slot), child_at_slot(right, slot), out);
+            }
+        }
+        (left, right) => {
+            let mut ours = Vec::new();
+            let mut theirs = Vec::new();
+            if let Some(left) = left {
+                left.collect(&mut ours);
+            }
+            if let Some(right) = right {
+                right.collect(&mut theirs);
+            }
+            let ours: std::collections::BTreeMap<&StateKey, &str> = ours.into_iter().collect();
+            let theirs: std::collections::BTreeMap<&StateKey, &str> =
+                theirs.into_iter().collect();
+            for (key, value) in &ours {
+                let other = theirs.get(key).copied();
+                if other != Some(*value) {
+                    out.push(StateDifference {
+                        key: (*key).clone(),
+                        ours: Some((*value).into()),
+                        theirs: other.map(Into::into),
+                    });
+                }
+            }
+            for (key, value) in &theirs {
+                if !ours.contains_key(key) {
+                    out.push(StateDifference {
+                        key: (*key).clone(),
+                        ours: None,
+                        theirs: Some((*value).into()),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// What removing a key did to a node.
+enum Removal {
+    /// The key was not there; the node is unchanged.
+    Absent,
+    /// Nothing is left.
+    Emptied,
+    /// The node that replaces it.
+    Replaced(Arc<Node>),
 }
 
 #[derive(Clone, Debug)]
@@ -327,6 +450,71 @@ impl Node {
             }
             (Self::Branch { .. } | Self::Leaf { .. }, Self::Branch { .. }) => {
                 unreachable!("only leaf nodes are inserted")
+            }
+        }
+    }
+
+    /// This node without `key`.
+    ///
+    /// A branch left with a single child that is a leaf becomes that leaf,
+    /// because that is the shape an insert-only trie holding the same keys
+    /// has; a single child that is a branch stays wrapped, because that
+    /// shape is what two digests sharing this slot produce on insert too.
+    fn remove(&self, key: &StateKey, digest: &[u8; 32], depth: usize) -> Removal {
+        match self {
+            Self::Leaf {
+                digest: leaf_digest,
+                entries,
+                ..
+            } => {
+                if leaf_digest != digest {
+                    return Removal::Absent;
+                }
+                let Ok(index) = entries.binary_search_by(|(candidate, _)| candidate.cmp(key))
+                else {
+                    return Removal::Absent;
+                };
+                let mut kept = entries.to_vec();
+                kept.remove(index);
+                if kept.is_empty() {
+                    Removal::Emptied
+                } else {
+                    Removal::Replaced(Arc::new(Self::leaf_from_entries(*leaf_digest, kept)))
+                }
+            }
+            Self::Branch {
+                bitmap, children, ..
+            } => {
+                let slot = digest_slot(digest, depth);
+                let bit = 1_u32 << slot;
+                if bitmap & bit == 0 {
+                    return Removal::Absent;
+                }
+                let index = (bitmap & (bit - 1)).count_ones() as usize;
+                let Some(child) = children.get(index) else {
+                    return Removal::Absent;
+                };
+                let mut next = children.to_vec();
+                let mut bits = *bitmap;
+                match child.remove(key, digest, depth + 1) {
+                    Removal::Absent => return Removal::Absent,
+                    Removal::Replaced(child) => {
+                        if let Some(slot) = next.get_mut(index) {
+                            *slot = child;
+                        }
+                    }
+                    Removal::Emptied => {
+                        next.remove(index);
+                        bits &= !bit;
+                    }
+                }
+                match next.as_slice() {
+                    [] => Removal::Emptied,
+                    [only] if matches!(only.as_ref(), Self::Leaf { .. }) => {
+                        Removal::Replaced(Arc::clone(only))
+                    }
+                    _ => Removal::Replaced(Arc::new(Self::branch(bits, next))),
+                }
             }
         }
     }

@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
 use serde_json::Value;
-use spindle_core::{AppendError, EventId, EventInput, LogEntry, Pdu, RoomLog, StateKey};
+use spindle_core::{EventId, EventInput, LogEntry, Pdu, RoomLog, StateKey};
 use spindle_store::RoomStore;
 
 use super::{
@@ -37,12 +37,7 @@ impl Rooms {
     /// Returns [`RoomError`] if the room or its indexes cannot be read.
     pub fn server_in_room(&self, room_id: &str, domain: &str) -> Result<bool, RoomError> {
         let members = self.with_room_read(room_id, |_, log| {
-            let Some(state) = log
-                .entries()
-                .next_back()
-                .map(|entry| entry.li)
-                .and_then(|li| log.state_after(li))
-            else {
+            let Some(state) = log.current_state() else {
                 return Ok(Vec::new());
             };
             let mut members = Vec::new();
@@ -100,17 +95,14 @@ impl Rooms {
             ));
         }
         self.with_room(room_id, |rooms, log| {
-            // What this server would author on itself: a template naming
-            // a tip this server cannot fold hands the user an event
-            // `send_*` then refuses.
-            self.set_aside_contested(log, room_id)?;
+            // What this server would author on itself: the newest forward
+            // extremities, and the state they resolve to.
             let head = log
                 .entries()
                 .next_back()
                 .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
-            let state = log
-                .state_after(head.li)
-                .ok_or_else(|| RoomError::StateUnavailable("no head state".to_owned()))?;
+            let parents: Vec<EventId> = log.authoring_extremities().cloned().collect();
+            let (state, _) = rooms.state_for_parents(log, room_id, &parents)?;
 
             // `read_event`, not `event()`: the latter re-enters `with_room`
             // on a lock this closure already holds.
@@ -149,17 +141,14 @@ impl Rooms {
                 content["join_authorised_via_users_server"] = Value::String(nominee);
             }
             let auth = auth_events_for(
-                log,
+                Some(&state),
                 &rooms.rules_in(log, room_id)?.authorization,
                 user_id,
                 "m.room.member",
                 Some(user_id),
                 &content,
             )?;
-            let prev: Vec<String> = log
-                .authoring_extremities()
-                .map(|id| id.as_str().to_owned())
-                .collect();
+            let prev: Vec<String> = parents.iter().map(|id| id.as_str().to_owned()).collect();
             let depth = head.depth.saturating_add(1);
             let mut template = serde_json::json!({
                 "type": "m.room.member",
@@ -201,17 +190,14 @@ impl Rooms {
                     "this room's version does not support knocking".to_owned(),
                 ));
             }
-            // What this server would author on itself: a template naming
-            // a tip this server cannot fold hands the user an event
-            // `send_*` then refuses.
-            self.set_aside_contested(log, room_id)?;
+            // What this server would author on itself: the newest forward
+            // extremities, and the state they resolve to.
             let head = log
                 .entries()
                 .next_back()
                 .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
-            let state = log
-                .state_after(head.li)
-                .ok_or_else(|| RoomError::StateUnavailable("no head state".to_owned()))?;
+            let parents: Vec<EventId> = log.authoring_extremities().cloned().collect();
+            let (state, _) = rooms.state_for_parents(log, room_id, &parents)?;
             let join_rule = state
                 .get(&StateKey::new("m.room.join_rules", ""))
                 .map(str::to_owned)
@@ -226,17 +212,14 @@ impl Rooms {
 
             let content = serde_json::json!({ "membership": "knock" });
             let auth = auth_events_for(
-                log,
+                Some(&state),
                 &rooms.rules_in(log, room_id)?.authorization,
                 user_id,
                 "m.room.member",
                 Some(user_id),
                 &content,
             )?;
-            let prev: Vec<String> = log
-                .authoring_extremities()
-                .map(|id| id.as_str().to_owned())
-                .collect();
+            let prev: Vec<String> = parents.iter().map(|id| id.as_str().to_owned()).collect();
             let depth = head.depth.saturating_add(1);
             let mut template = serde_json::json!({
                 "type": "m.room.member",
@@ -268,14 +251,14 @@ impl Rooms {
     /// [`RoomError::Forbidden`] when the user has nothing to leave.
     pub fn make_leave_template(&self, room_id: &str, user_id: &str) -> Result<Value, RoomError> {
         self.with_room(room_id, |rooms, log| {
-            // What this server would author on itself: a template naming
-            // a tip this server cannot fold hands the user an event
-            // `send_*` then refuses.
-            self.set_aside_contested(log, room_id)?;
+            // What this server would author on itself: the newest forward
+            // extremities, and the state they resolve to.
             let head = log
                 .entries()
                 .next_back()
                 .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
+            let parents: Vec<EventId> = log.authoring_extremities().cloned().collect();
+            let (state, _) = rooms.state_for_parents(log, room_id, &parents)?;
             let membership = spindle_store::ReadView::get(
                 self.store.as_ref(),
                 &spindle_core::keys::user_room(
@@ -293,17 +276,14 @@ impl Rooms {
 
             let content = serde_json::json!({ "membership": "leave" });
             let auth = auth_events_for(
-                log,
+                Some(&state),
                 &rooms.rules_in(log, room_id)?.authorization,
                 user_id,
                 "m.room.member",
                 Some(user_id),
                 &content,
             )?;
-            let prev: Vec<String> = log
-                .authoring_extremities()
-                .map(|id| id.as_str().to_owned())
-                .collect();
+            let prev: Vec<String> = parents.iter().map(|id| id.as_str().to_owned()).collect();
             let depth = head.depth.saturating_add(1);
             let mut template = serde_json::json!({
                 "type": "m.room.member",
@@ -577,26 +557,12 @@ impl Rooms {
         event_id: &str,
     ) -> Result<(Vec<IdentifiedEvent>, Vec<IdentifiedEvent>), RoomError> {
         let before = self.with_room_read(room_id, |rooms, log| {
-            let mut load = |address: &spindle_core::StateRoot| {
-                spindle_store::ReadView::get(
-                    rooms.store.as_ref(),
-                    &spindle_core::keys::content_addressed(
-                        spindle_core::keys::Keyspace::StateNode,
-                        address.as_bytes(),
-                    ),
-                )
-                .ok()
-                .flatten()
-            };
-            log.state_before(&EventId::new(event_id), &mut load)
-                .map_err(|error| match error {
-                    AppendError::UnknownPredecessor(_) => {
-                        RoomError::MissingBody(event_id.to_owned())
-                    }
-                    other => RoomError::Build(format!(
-                        "cannot rebuild the state before {event_id}: {other:?}"
-                    )),
-                })
+            if !log.holds(&EventId::new(event_id)) {
+                return Err(RoomError::MissingBody(event_id.to_owned()));
+            }
+            rooms.resolve_in(log, room_id, |log, resolver, load| {
+                log.state_before(&EventId::new(event_id), resolver, load)
+            })
         })?;
         let pdus = self.state_pairs_of(room_id, &before)?;
 
@@ -680,10 +646,7 @@ impl Rooms {
             "m.room.encryption",
         ];
         let ids = match self.with_room_read(room_id, |_, log| {
-            let Some(head) = log.entries().next_back() else {
-                return Ok(Vec::new());
-            };
-            let Some(state) = log.state_after(head.li) else {
+            let Some(state) = log.current_state() else {
                 return Ok(Vec::new());
             };
             let mut ids: Vec<(String, String, String)> = Vec::new();
@@ -744,11 +707,8 @@ impl Rooms {
         if let Some(inviter) = inviter.filter(|inviter| inviter != user_id) {
             let key = spindle_core::StateKey::new("m.room.member", inviter.as_str());
             let id = self.with_room_read(room_id, |_, log| {
-                let Some(head) = log.entries().next_back() else {
-                    return Ok(None);
-                };
                 Ok(log
-                    .state_after(head.li)
+                    .current_state()
                     .and_then(|state| state.get(&key).map(str::to_owned)))
             })?;
             if let Some(id) = id {

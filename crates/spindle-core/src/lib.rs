@@ -32,10 +32,11 @@ pub mod version;
 pub use log::{
     AppendError, ChainHash, DEFAULT_RESIDENT_WINDOW, EventId, EventInput, ForkWindow,
     ForkWindowError, LinearIndex, LogEntry, NodeLoader, RestoreError, RestoredEntry, RestoredLog,
-    RoomLog, SetAside,
+    MAX_AUTHORED_PREV_EVENTS, RoomLog, Sideline, SidelinedEntry, StateResolver, Strict,
 };
 pub use pdu::{Pdu, PduError};
 pub use state::{
-    CONTENT_DIGEST_VERSION, EventType, RehydrateError, StateKey, StateRoot, StateSnapshot,
+    CONTENT_DIGEST_VERSION, EventType, RehydrateError, StateDifference, StateKey, StateRoot,
+    StateSnapshot,
 };
 pub use version::{STATE_DAG_V12, VersionError, is_state_dag, rules_of};
