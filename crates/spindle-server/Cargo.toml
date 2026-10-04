@@ -29,6 +29,7 @@ reqwest.workspace = true
 sha2.workspace = true
 sha1.workspace = true
 hmac.workspace = true
+hickory-resolver.workspace = true
 blake3.workspace = true
 image.workspace = true
 rand.workspace = true
@@ -60,6 +61,7 @@ synapse-import = ["dep:postgres", "dep:rusqlite"]
 corpus-replay = []
 
 [dev-dependencies]
+tokio-rustls = "0.26"
 # `state-res` so the tests can judge our events with the same implementation a
 # federating peer would (ADR 0002: ruma judges, it never builds our side).
 ruma = { workspace = true, features = ["state-res", "events"] }

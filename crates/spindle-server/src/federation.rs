@@ -21,6 +21,9 @@ use spindle_store::{FjallStore, ReadView, Store};
 use crate::netguard::{Cidr, VettingResolver, permits};
 use crate::signing::ServerKey;
 
+mod srv;
+use srv::Destination;
+
 /// How long a fetched key document serves at most, whatever its own
 /// `valid_until_ts` says. The spec's cap: a peer cannot mint a key valid
 /// for years and have caches honour it — seven days is the ceiling, so a
@@ -89,6 +92,8 @@ pub struct Federation {
     /// The port `.well-known` is fetched from: 443, as the spec says. Tests
     /// that cannot bind 443 move it with [`Federation::with_well_known_port`].
     well_known_port: u16,
+    destinations: Arc<std::sync::Mutex<HashMap<String, (Destination, Instant)>>>,
+    srv_dns: Arc<std::sync::OnceLock<Result<hickory_resolver::TokioResolver, String>>>,
 }
 
 #[derive(Debug)]
@@ -124,17 +129,17 @@ struct Peer {
 }
 
 /// What each server name's `.well-known/matrix/server` said, and until
-/// when to believe it: `Some(base URL)` for a delegation, `None` for no
-/// usable answer (the name is then reached at `name:8448`).
+/// when to believe it: `Some(server name)` for a delegation, `None` for no
+/// usable answer (SRV discovery then uses the original name).
 type Delegations = std::sync::Mutex<HashMap<String, (Option<String>, Instant)>>;
 
 /// Where one request goes: see [`Federation::address`].
 enum Address {
     /// Known without asking the network: a configured peer, a name with
     /// an explicit port, or an IP literal.
-    Fixed(String),
-    /// A bare hostname: its `.well-known` decides, and `fallback`
-    /// (`name:8448`) is used when it has none.
+    Fixed(Destination),
+    /// A bare hostname: `.well-known`, then SRV decide; `fallback`
+    /// (`name:8448`) is used when neither provides a destination.
     Discover {
         name: String,
         fallback: String,
@@ -143,15 +148,15 @@ enum Address {
 }
 
 impl Address {
-    /// The base URL, asking `.well-known` if the name needs it.
-    async fn resolve(self) -> Result<String, FederationError> {
+    /// The destination, discovering delegation and SRV if needed.
+    async fn resolve(self) -> Result<Destination, FederationError> {
         match self {
-            Self::Fixed(url) => Ok(url),
+            Self::Fixed(destination) => Ok(destination),
             Self::Discover {
                 name,
                 fallback,
                 discovery,
-            } => Ok(discovery.delegation(&name).await.unwrap_or(fallback)),
+            } => discovery.destination(&name, &fallback).await,
         }
     }
 }
@@ -166,6 +171,8 @@ struct Discovery {
     allowed: Vec<Cidr>,
     delegations: Arc<Delegations>,
     well_known_port: u16,
+    destinations: Arc<std::sync::Mutex<HashMap<String, (Destination, Instant)>>>,
+    srv_dns: Arc<std::sync::OnceLock<Result<hickory_resolver::TokioResolver, String>>>,
 }
 
 impl Discovery {
@@ -202,14 +209,14 @@ impl Discovery {
         }
         let (delegated, ttl) = match self.fetch_well_known(name).await {
             Ok((server, ttl)) => match self.vetted_url(&server) {
-                Ok(url) => (Some(url), ttl),
+                Ok(_) => (Some(server), ttl),
                 Err(error) => {
                     tracing::debug!(%name, %server, %error, "unusable federation delegation");
                     (None, WELL_KNOWN_FAILURE)
                 }
             },
             Err(error) => {
-                tracing::debug!(%name, %error, "no federation delegation; using port 8448");
+                tracing::debug!(%name, %error, "no federation delegation; checking SRV");
                 (None, WELL_KNOWN_FAILURE)
             }
         };
@@ -224,6 +231,101 @@ impl Discovery {
         }
         delegations.insert(name.to_owned(), (delegated.clone(), now + ttl));
         delegated
+    }
+
+    async fn destination(
+        &self,
+        name: &str,
+        fallback: &str,
+    ) -> Result<Destination, FederationError> {
+        let now = Instant::now();
+        if let Some((destination, until)) = self
+            .destinations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            && *until > now
+        {
+            return Ok(destination.clone());
+        }
+        let delegated = self.delegation(name).await;
+        let delegation_until = self
+            .delegations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .map_or(now, |(_, until)| *until);
+        let logical = delegated.as_deref().unwrap_or(name);
+        let server = ruma::OwnedServerName::try_from(logical)
+            .map_err(|error| FederationError::Refused(error.to_string()))?;
+        let (destination, until) = if server.port().is_none() && !server.is_ip_literal() {
+            let resolver = self
+                .srv_dns
+                .get_or_init(|| {
+                    hickory_resolver::Resolver::builder_tokio()
+                        .map(|mut builder| {
+                            builder.options_mut().ip_strategy =
+                                hickory_resolver::config::LookupIpStrategy::Ipv4AndIpv6;
+                            builder.build()
+                        })
+                        .map_err(|error| error.to_string())
+                })
+                .as_ref()
+                .map_err(|error| FederationError::Refused(error.clone()))?;
+            let (srv, until) = tokio::time::timeout(
+                Duration::from_secs(10),
+                srv::resolve(resolver, logical, &self.allowed, self.insecure_http),
+            )
+            .await
+            .map_err(|_| FederationError::Refused("SRV discovery timed out".to_owned()))??;
+            let url = if delegated.is_some() {
+                self.vetted_url(logical)?
+            } else {
+                fallback.to_owned()
+            };
+            (
+                srv.unwrap_or_else(|| {
+                    Destination::fixed(url, Some(logical.to_owned()), self.client.clone())
+                }),
+                until,
+            )
+        } else {
+            (
+                Destination::fixed(
+                    self.vetted_url(logical)?,
+                    Some(logical.to_owned()),
+                    self.client.clone(),
+                ),
+                now + WELL_KNOWN_MIN,
+            )
+        };
+        let mut cache = self
+            .destinations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A cached SRV destination owns TLS connection pools. Bound their
+        // total count, rather than treating a hundred-target answer like
+        // one entry with a negligible memory cost.
+        cache.remove(name);
+        cache.retain(|_, (_, until)| *until > now);
+        while cache.values().map(|(d, _)| d.pool_size()).sum::<usize>() + destination.pool_size()
+            > 128
+        {
+            let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, (_, until))| *until)
+                .map(|(name, _)| name.clone())
+            else {
+                break;
+            };
+            cache.remove(&oldest);
+        }
+        // A DNS answer cannot extend a delegation beyond its own expiry.
+        cache.insert(
+            name.to_owned(),
+            (destination.clone(), until.min(delegation_until)),
+        );
+        Ok(destination)
     }
 
     /// GET `https://<name>/.well-known/matrix/server` and return the
@@ -332,14 +434,7 @@ impl Federation {
         // the first hop and the redirect policy every hop after it (#312):
         // a public peer that answers `302 Location: http://169.254.169.254/`
         // would otherwise be followed straight past the resolver.
-        let client = reqwest::Client::builder()
-            .dns_resolver(Arc::new(VettingResolver {
-                allowed: allowed.clone(),
-            }))
-            .redirect(crate::netguard::redirect_policy(
-                allowed.clone(),
-                "federatable",
-            ))
+        let client = client_builder(&allowed)
             .build()
             .map_err(|error| FederationError::Refused(error.to_string()))?;
         Ok(Self {
@@ -356,6 +451,8 @@ impl Federation {
             enabled: true,
             delegations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             well_known_port: 443,
+            destinations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            srv_dns: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -426,8 +523,13 @@ impl Federation {
     }
 
     /// The URL a request to `name` goes to, or a refusal.
-    async fn base_url(&self, name: &str) -> Result<String, FederationError> {
-        self.address(name)?.resolve().await
+    async fn request(
+        &self,
+        method: reqwest::Method,
+        name: &str,
+        uri: &str,
+    ) -> Result<srv::Request, FederationError> {
+        Ok(self.address(name)?.resolve().await?.request(method, uri))
     }
 
     /// Where a request to `name` goes, as far as can be said without the
@@ -462,7 +564,11 @@ impl Federation {
                     "{name} is configured at an address this server does not reach"
                 )));
             }
-            return Ok(Address::Fixed(peer.url.clone()));
+            return Ok(Address::Fixed(Destination::fixed(
+                peer.url.clone(),
+                None,
+                self.client.clone(),
+            )));
         }
         let discovery = self.discovery();
         let url = discovery.vetted_url(name)?;
@@ -485,7 +591,11 @@ impl Federation {
                 discovery,
             });
         }
-        Ok(Address::Fixed(url))
+        Ok(Address::Fixed(Destination::fixed(
+            url,
+            Some(name.to_owned()),
+            self.client.clone(),
+        )))
     }
 
     fn discovery(&self) -> Discovery {
@@ -495,6 +605,8 @@ impl Federation {
             allowed: self.allowed.clone(),
             delegations: Arc::clone(&self.delegations),
             well_known_port: self.well_known_port,
+            destinations: Arc::clone(&self.destinations),
+            srv_dns: Arc::clone(&self.srv_dns),
         }
     }
 
@@ -740,10 +852,9 @@ impl Federation {
     /// ([`Federation::base_url`]): `.well-known` delegation first, then
     /// `name:8448`.
     async fn fetch_key_document(&self, origin: &str) -> Result<Value, FederationError> {
-        let url = format!("{}/_matrix/key/v2/server", self.base_url(origin).await?);
         let document: Value = self
-            .client
-            .get(&url)
+            .request(reqwest::Method::GET, origin, "/_matrix/key/v2/server")
+            .await?
             .timeout(Duration::from_secs(10))
             .send()
             .await
@@ -797,8 +908,8 @@ impl Federation {
         let uri = format!("/_matrix/federation/v1/make_join/{room_id}/{user_id}?{versions}");
         let authorization = self.sign_request("GET", &uri, destination, None)?;
         let response = self
-            .client
-            .get(format!("{}{uri}", self.base_url(destination).await?))
+            .request(reqwest::Method::GET, destination, &uri)
+            .await?
             .header("authorization", authorization)
             .timeout(Duration::from_secs(30))
             .send()
@@ -847,8 +958,8 @@ impl Federation {
         let uri = format!("/_matrix/federation/v1/make_knock/{room_id}/{user_id}?{versions}");
         let authorization = self.sign_request("GET", &uri, destination, None)?;
         let response = self
-            .client
-            .get(format!("{}{uri}", self.base_url(destination).await?))
+            .request(reqwest::Method::GET, destination, &uri)
+            .await?
             .header("authorization", authorization)
             .timeout(Duration::from_secs(30))
             .send()
@@ -895,8 +1006,8 @@ impl Federation {
         );
         let authorization = self.sign_request("PUT", &uri, destination, Some(knock))?;
         let response = self
-            .client
-            .put(format!("{}{uri}", self.base_url(destination).await?))
+            .request(reqwest::Method::PUT, destination, &uri)
+            .await?
             .header("authorization", authorization)
             .header("content-type", "application/json")
             .timeout(Duration::from_secs(60))
@@ -935,14 +1046,13 @@ impl Federation {
     ) -> Result<Value, FederationError> {
         let method = if body.is_some() { "POST" } else { "GET" };
         let authorization = self.sign_request(method, uri, destination, body)?;
-        let endpoint = format!("{}{uri}", self.base_url(destination).await?);
         let request = match body {
             Some(body) => self
-                .client
-                .post(endpoint)
+                .request(reqwest::Method::POST, destination, uri)
+                .await?
                 .header("content-type", "application/json")
                 .body(body.to_string()),
-            None => self.client.get(endpoint),
+            None => self.request(reqwest::Method::GET, destination, uri).await?,
         };
         let response = request
             .header("authorization", authorization)
@@ -1038,8 +1148,8 @@ impl Federation {
         let uri = format!("/_matrix/federation/v1/query/directory?room_alias={encoded}");
         let authorization = self.sign_request("GET", &uri, destination, None)?;
         let response = self
-            .client
-            .get(format!("{}{uri}", self.base_url(destination).await?))
+            .request(reqwest::Method::GET, destination, &uri)
+            .await?
             .header("authorization", authorization)
             .timeout(Duration::from_secs(10))
             .send()
@@ -1078,8 +1188,8 @@ impl Federation {
         let uri = format!("/_matrix/federation/v1/query/profile?user_id={encoded}");
         let authorization = self.sign_request("GET", &uri, destination, None)?;
         let response = self
-            .client
-            .get(format!("{}{uri}", self.base_url(destination).await?))
+            .request(reqwest::Method::GET, destination, &uri)
+            .await?
             .header("authorization", authorization)
             .timeout(Duration::from_secs(10))
             .send()
@@ -1121,8 +1231,8 @@ impl Federation {
         );
         let authorization = self.sign_request("PUT", &uri, destination, Some(join))?;
         let response = self
-            .client
-            .put(format!("{}{uri}", self.base_url(destination).await?))
+            .request(reqwest::Method::PUT, destination, &uri)
+            .await?
             .header("authorization", authorization)
             .header("content-type", "application/json")
             .timeout(Duration::from_secs(60))
@@ -1173,8 +1283,8 @@ impl Federation {
         );
         let authorization = self.sign_request("PUT", &uri, destination, Some(body))?;
         let response = self
-            .client
-            .put(format!("{}{uri}", self.base_url(destination).await?))
+            .request(reqwest::Method::PUT, destination, &uri)
+            .await?
             .header("authorization", authorization)
             .header("content-type", "application/json")
             .timeout(Duration::from_secs(30))
@@ -1215,8 +1325,8 @@ impl Federation {
         let uri = format!("/_matrix/federation/v1/make_leave/{room_id}/{user_id}");
         let authorization = self.sign_request("GET", &uri, destination, None)?;
         let response = self
-            .client
-            .get(format!("{}{uri}", self.base_url(destination).await?))
+            .request(reqwest::Method::GET, destination, &uri)
+            .await?
             .header("authorization", authorization)
             .timeout(Duration::from_secs(30))
             .send()
@@ -1258,8 +1368,8 @@ impl Federation {
         );
         let authorization = self.sign_request("PUT", &uri, destination, Some(leave))?;
         let response = self
-            .client
-            .put(format!("{}{uri}", self.base_url(destination).await?))
+            .request(reqwest::Method::PUT, destination, &uri)
+            .await?
             .header("authorization", authorization)
             .header("content-type", "application/json")
             .timeout(Duration::from_secs(30))
@@ -1297,8 +1407,8 @@ impl Federation {
         let uri = format!("/_matrix/federation/v1/media/download/{media_id}");
         let authorization = self.sign_request("GET", &uri, destination, None)?;
         let response = self
-            .client
-            .get(format!("{}{uri}", self.base_url(destination).await?))
+            .request(reqwest::Method::GET, destination, &uri)
+            .await?
             .header("authorization", authorization)
             .timeout(Duration::from_secs(60))
             .send()
@@ -1336,13 +1446,11 @@ impl Federation {
 
         // Legacy fallback: the public v3 endpoint, no signature. Kept for
         // peers predating authenticated media; a 404 there is final.
-        let legacy = format!(
-            "{}/_matrix/media/v3/download/{destination}/{media_id}?allow_redirect=false",
-            self.base_url(destination).await?
-        );
+        let legacy =
+            format!("/_matrix/media/v3/download/{destination}/{media_id}?allow_redirect=false");
         let response = self
-            .client
-            .get(legacy)
+            .request(reqwest::Method::GET, destination, &legacy)
+            .await?
             .timeout(Duration::from_secs(60))
             .send()
             .await
@@ -1412,7 +1520,6 @@ impl Federation {
         let uri = format!("/_matrix/federation/v1/send/{txn_id}");
         let authorization = self.sign_request("PUT", &uri, destination, Some(body))?;
         Ok(PreparedTransaction {
-            client: self.client.clone(),
             address: self.address(destination)?,
             uri,
             authorization,
@@ -1425,7 +1532,6 @@ impl Federation {
 /// destination's `.well-known` is asked (if it must be) when it is sent,
 /// after the outbox has let go of the store.
 struct PreparedTransaction {
-    client: reqwest::Client,
     address: Address,
     uri: String,
     authorization: String,
@@ -1434,10 +1540,9 @@ struct PreparedTransaction {
 
 /// Send one built transaction and read the peer's verdict.
 async fn deliver(prepared: PreparedTransaction, destination: &str) -> Result<(), FederationError> {
-    let base = prepared.address.resolve().await?;
-    let response = prepared
-        .client
-        .put(format!("{base}{}", prepared.uri))
+    let destination_address = prepared.address.resolve().await?;
+    let response = destination_address
+        .request(reqwest::Method::PUT, &prepared.uri)
         .header("authorization", prepared.authorization)
         .header("content-type", "application/json")
         .timeout(Duration::from_secs(30))
@@ -1452,6 +1557,18 @@ async fn deliver(prepared: PreparedTransaction, destination: &str) -> Result<(),
         )));
     }
     Ok(())
+}
+
+fn client_builder(allowed: &[Cidr]) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .no_proxy()
+        .dns_resolver(Arc::new(VettingResolver {
+            allowed: allowed.to_vec(),
+        }))
+        .redirect(crate::netguard::redirect_policy(
+            allowed.to_vec(),
+            "federatable",
+        ))
 }
 
 /// One pending delivery: its store key and the PDU it carries.
