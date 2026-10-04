@@ -2,13 +2,12 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use hickory_resolver::config::{LookupIpStrategy, NameServerConfig, ResolverConfig};
-use hickory_resolver::name_server::TokioConnectionProvider;
-use hickory_resolver::proto::op::{Message, MessageType, OpCode};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::proto::op::{Message, OpCode};
 use hickory_resolver::proto::rr::{
     Name, RData, Record, RecordType,
     rdata::{A, SRV},
 };
-use hickory_resolver::proto::xfer::Protocol;
 use rand::SeedableRng;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
@@ -44,25 +43,21 @@ async fn dns(records: Vec<(&str, RData)>) -> Dns {
         loop {
             let (length, peer) = socket.recv_from(&mut bytes).await.unwrap();
             let query = Message::from_vec(&bytes[..length]).unwrap();
-            let mut response = Message::new();
-            response
-                .set_id(query.id())
-                .set_message_type(MessageType::Response)
-                .set_op_code(OpCode::Query)
-                .set_authoritative(true)
-                .set_recursion_desired(true)
-                .set_recursion_available(true);
-            for question in query.queries() {
+            let mut response = Message::response(query.metadata.id, OpCode::Query);
+            response.metadata.authoritative = true;
+            response.metadata.recursion_desired = true;
+            response.metadata.recursion_available = true;
+            for question in &query.queries {
                 response.add_query(question.clone());
-                let name = question.name().to_utf8();
+                let name = question.name.to_utf8();
                 queries.lock().unwrap().push(name.clone());
                 for data in answers
-                    .get(&(name, question.query_type()))
+                    .get(&(name, question.query_type))
                     .into_iter()
                     .flatten()
                 {
                     response.add_answer(Record::from_rdata(
-                        question.name().clone(),
+                        question.name.clone(),
                         30,
                         data.clone(),
                     ));
@@ -74,18 +69,16 @@ async fn dns(records: Vec<(&str, RData)>) -> Dns {
                 .unwrap();
         }
     });
-    let config = ResolverConfig::from_parts(
-        None,
-        vec![],
-        vec![NameServerConfig::new(address, Protocol::Udp)],
-    );
+    let mut server = NameServerConfig::udp(address.ip());
+    server.connections[0].port = address.port();
+    let config = ResolverConfig::from_parts(None, vec![], vec![server]);
     let mut builder =
-        hickory_resolver::Resolver::builder_with_config(config, TokioConnectionProvider::default());
+        hickory_resolver::Resolver::builder_with_config(config, TokioRuntimeProvider::default());
     builder.options_mut().attempts = 1;
     builder.options_mut().timeout = Duration::from_millis(500);
     builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
     Dns {
-        resolver: builder.build(),
+        resolver: builder.build().unwrap(),
         asked,
         task,
     }

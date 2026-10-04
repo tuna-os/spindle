@@ -263,7 +263,7 @@ impl Discovery {
                 .srv_dns
                 .get_or_init(|| {
                     hickory_resolver::Resolver::builder_tokio()
-                        .map(|mut builder| {
+                        .and_then(|mut builder| {
                             builder.options_mut().ip_strategy =
                                 hickory_resolver::config::LookupIpStrategy::Ipv4AndIpv6;
                             builder.build()
