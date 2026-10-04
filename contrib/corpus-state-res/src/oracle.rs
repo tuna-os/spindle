@@ -79,11 +79,24 @@ pub fn compare(
     let fetch = |id: &ruma::EventId| {
         StoredEvent::parse_auth_in(id.as_str(), room, bodies.get(id.as_str())?)
             .ok()
-            .map(|event| event.with_rejected(rejected.contains(id.as_str())))
+            .map(|event| {
+                event
+                    .with_rejected(rejected.contains(id.as_str()))
+                    .with_preserved_rejection(
+                        rejected.contains(id.as_str())
+                            && std::env::var_os("CORPUS_REEVALUATE_REJECTED").is_none(),
+                    )
+            })
     };
-    match ruma::state_res::resolve(&rules.authorization, v2, maps.iter(), chains, fetch, |_| {
-        None
-    }) {
+    match ruma::state_res::resolve_with_candidate_policy(
+        &rules.authorization,
+        v2,
+        maps.iter(),
+        chains,
+        fetch,
+        |_| None,
+        |event| !event.preserved_rejection(),
+    ) {
         Ok(map) => {
             let mut snapshot = StateSnapshot::new();
             for ((kind, key), id) in map {

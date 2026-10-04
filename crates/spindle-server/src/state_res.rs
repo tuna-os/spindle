@@ -294,7 +294,8 @@ impl AuthGraph {
 /// A root names a whole state by content, and every input a resolution
 /// reads -- the events, their auth chains, the room version through the
 /// create event -- is fixed by those states. So two calls with the same
-/// roots are the same call, in any room, at any time.
+/// roots and imported rejection policy are the same call. The policy identity
+/// is part of the cache key because rejection metadata is not in signed PDUs.
 #[derive(Debug, Default)]
 pub struct ResolutionCache {
     entries: Mutex<CacheEntries>,
@@ -312,13 +313,14 @@ type CacheEntries = (
 const RESOLUTION_CACHE_CAPACITY: usize = 512;
 
 impl ResolutionCache {
-    fn key(states: &[StateSnapshot]) -> Vec<[u8; 32]> {
+    fn key(states: &[StateSnapshot], policy: [u8; 32]) -> Vec<[u8; 32]> {
         let mut key: Vec<[u8; 32]> = states
             .iter()
             .map(|state| *state.root().as_bytes())
             .collect();
         key.sort_unstable();
         key.dedup();
+        key.insert(0, policy);
         key
     }
 
@@ -393,7 +395,11 @@ impl<'a> RoomResolver<'a> {
             .log
             .sidelined(&EventId::new(id))
             .is_some_and(|entry| entry.kind == Sideline::Rejected);
-        Some(event.with_rejected(rejected))
+        Some(
+            event
+                .with_rejected(rejected)
+                .with_preserved_rejection(self.log.historically_rejected(&EventId::new(id))),
+        )
     }
 
     fn resolve_maps(
@@ -421,13 +427,14 @@ impl<'a> RoomResolver<'a> {
                 let mut chains: Vec<EventIdSet<OwnedEventId>> =
                     vec![difference.into_iter().collect()];
                 chains.extend((1..maps.len()).map(|_| EventIdSet::new()));
-                ruma::state_res::resolve(
+                ruma::state_res::resolve_with_candidate_policy(
                     &self.rules.authorization,
                     v2,
                     maps.iter(),
                     chains,
                     fetch,
                     |_| Some(subgraph.iter().cloned().collect()),
+                    |event| !event.preserved_rejection(),
                 )
                 .map_err(|error| error.to_string())
             }
@@ -543,7 +550,7 @@ fn to_snapshot(
 
 impl StateResolver for RoomResolver<'_> {
     fn resolve(&mut self, states: &[StateSnapshot]) -> Result<StateSnapshot, AppendError> {
-        let key = ResolutionCache::key(states);
+        let key = ResolutionCache::key(states, self.log.historical_rejection_policy_id());
         if let Some(hit) = self.cache.get(&key) {
             self.stats.cache_hits += 1;
             return Ok(hit);

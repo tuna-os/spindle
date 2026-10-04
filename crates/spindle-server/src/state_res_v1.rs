@@ -75,7 +75,11 @@ pub fn resolve(
 
     let mut conflicted: StateMap<Vec<StoredEvent>> = StateMap::new();
     for (key, ids) in conflicted_ids {
-        let events: Vec<StoredEvent> = ids.iter().filter_map(&fetch).collect();
+        let events: Vec<StoredEvent> = ids
+            .iter()
+            .filter_map(&fetch)
+            .filter(|event| !event.preserved_rejection())
+            .collect();
         match events.len() {
             0 => {}
             1 => {

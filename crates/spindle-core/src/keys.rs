@@ -405,6 +405,9 @@ pub enum Keyspace {
     /// the room's DAG but kept out of its timeline (`spindle_core::Sideline`):
     /// its parents, depth, verdict and the root of the state after it.
     Sidelined = 0x3d,
+    /// Preserved rejection decisions from imported Synapse history. 0x40
+    /// is reserved for the account-erasure policy marker.
+    HistoricalRejection = 0x41,
     /// `(room_id, synapse_stream_ordering)` -> the linear index the
     /// importer gave that event (#568). Lets a Synapse pagination token
     /// a client kept across the migration name a place in this room.
@@ -603,6 +606,14 @@ pub fn room_prefix(keyspace: Keyspace, room_id: &str) -> Vec<u8> {
 #[must_use]
 pub fn sidelined(room_id: &str, event_id: &str) -> Vec<u8> {
     let mut key = room_prefix(Keyspace::Sidelined, room_id);
+    key.extend_from_slice(event_id.as_bytes());
+    key
+}
+
+/// A preserved historical rejection, scoped to its room.
+#[must_use]
+pub fn historical_rejection(room_id: &str, event_id: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::HistoricalRejection, room_id);
     key.extend_from_slice(event_id.as_bytes());
     key
 }
