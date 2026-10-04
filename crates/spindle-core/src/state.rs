@@ -203,6 +203,118 @@ impl StateSnapshot {
             visitor(key, event_id);
         }
     }
+
+    /// Every slot where `self` and `other` disagree, in key order, as
+    /// `(key, ours, theirs)`. A slot only one side holds has `None` on the
+    /// other.
+    ///
+    /// Two snapshots that share history share most of their trie: path
+    /// copying keeps an untouched subtree at the same content address, so
+    /// the walk skips every subtree whose hash matches and visits only the
+    /// paths that changed. Diffing two states of a large room that differ
+    /// in a few slots costs those few paths, not a pass over every member --
+    /// which is what a fork merge or a state comparison needs.
+    #[must_use]
+    pub fn diff<'a>(
+        &'a self,
+        other: &'a Self,
+    ) -> Vec<(&'a StateKey, Option<&'a str>, Option<&'a str>)> {
+        let mut out = Vec::new();
+        diff_nodes(self.root.as_deref(), other.root.as_deref(), &mut out);
+        out.sort_unstable_by(|(left, ..), (right, ..)| left.cmp(right));
+        out
+    }
+}
+
+type SlotDiff<'a> = (&'a StateKey, Option<&'a str>, Option<&'a str>);
+
+/// Descend two tries in step, skipping subtrees with equal hashes.
+///
+/// Both tries place a key by the same digest bits, so a branch slot on one
+/// side can only hold keys that the same slot holds on the other. Where the
+/// shapes differ at a level (a leaf on one side, a branch on the other), the
+/// two subtrees are small by construction -- a leaf sits where its slot has
+/// one digest -- and are compared entry by entry.
+fn diff_nodes<'a>(left: Option<&'a Node>, right: Option<&'a Node>, out: &mut Vec<SlotDiff<'a>>) {
+    match (left, right) {
+        (None, None) => {}
+        (Some(left), Some(right)) if left.hash() == right.hash() => {}
+        (
+            Some(Node::Branch {
+                bitmap: left_bitmap,
+                children: left_children,
+                ..
+            }),
+            Some(Node::Branch {
+                bitmap: right_bitmap,
+                children: right_children,
+                ..
+            }),
+        ) => {
+            let child = |bitmap: u32, children: &'a [Arc<Node>], bit: u32| -> Option<&'a Node> {
+                if bitmap & bit == 0 {
+                    return None;
+                }
+                let index = (bitmap & (bit - 1)).count_ones() as usize;
+                children.get(index).map(AsRef::as_ref)
+            };
+            let mut slots = left_bitmap | right_bitmap;
+            while slots != 0 {
+                let bit = slots & slots.wrapping_neg();
+                slots &= !bit;
+                diff_nodes(
+                    child(*left_bitmap, left_children, bit),
+                    child(*right_bitmap, right_children, bit),
+                    out,
+                );
+            }
+        }
+        (left, right) => {
+            let mut ours = Vec::new();
+            let mut theirs = Vec::new();
+            if let Some(node) = left {
+                node.collect(&mut ours);
+            }
+            if let Some(node) = right {
+                node.collect(&mut theirs);
+            }
+            ours.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+            theirs.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+            let (mut i, mut j) = (0, 0);
+            loop {
+                match (ours.get(i), theirs.get(j)) {
+                    (None, None) => break,
+                    (Some((key, value)), None) => {
+                        out.push((*key, Some(*value), None));
+                        i += 1;
+                    }
+                    (None, Some((key, value))) => {
+                        out.push((*key, None, Some(*value)));
+                        j += 1;
+                    }
+                    (Some((left_key, left_value)), Some((right_key, right_value))) => {
+                        match left_key.cmp(right_key) {
+                            Ordering::Less => {
+                                out.push((*left_key, Some(*left_value), None));
+                                i += 1;
+                            }
+                            Ordering::Greater => {
+                                out.push((*right_key, None, Some(*right_value)));
+                                j += 1;
+                            }
+                            Ordering::Equal => {
+                                if left_value != right_value {
+                                    out.push((*left_key, Some(*left_value), Some(*right_value)));
+                                }
+                                i += 1;
+                                j += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
