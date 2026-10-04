@@ -122,7 +122,7 @@ fn recovered_auth_is_available_after_reopen_without_changing_state_or_heads() {
                 &json!({"prev_events":[event.0],"auth_events":[event.0]}),
             )
             .unwrap();
-        assert_eq!(prev, [event.0.clone()]);
+        assert_eq!(prev.as_slice(), std::slice::from_ref(&event.0));
         assert!(
             auth.is_empty(),
             "an auth body does not supply predecessor state"
