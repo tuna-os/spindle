@@ -599,7 +599,12 @@ async fn a_replayed_transaction_answers_from_history_even_when_the_world_changed
     // A new transaction retries against the history that is now available.
     let (_, retried) = harness.deliver(&peer, "t-after-join", vec![early]).await;
     assert_eq!(
-        retried["pdus"].as_object().unwrap().values().next().unwrap(),
+        retried["pdus"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap(),
         &json!({}),
         "a missing parent must not permanently reject an otherwise valid event: {retried}"
     );
