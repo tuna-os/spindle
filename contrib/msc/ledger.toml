@@ -379,3 +379,12 @@ unstable = ["org.matrix.msc3881"]
 evidence = ["crates/spindle-server/tests/pushers.rs"]
 notes = "Pushers carry `enabled` and `device_id` under the unstable and the plain names; a disabled pusher stays registered and receives nothing."
 
+
+
+[[msc]]
+number = 4108
+title = "QR code login"
+status = "partial"
+unstable = ["org.matrix.msc4108"]
+evidence = ["crates/spindle-server/tests/rendezvous.rs"]
+notes = "Homeserver rendezvous mailbox with conditional reads and writes, expiry and capacity limits. OAuth device authorization and secure-channel negotiation belong to MAS and the clients; their integrated rehearsal is pending."

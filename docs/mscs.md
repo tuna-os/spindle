@@ -52,6 +52,12 @@ what became of each proposal.
 | [MSC4310](https://github.com/matrix-org/matrix-spec-proposals/pull/4310) | MatrixRTC ring decline | — | — | `push_delivery.rs` |  |
 | [MSC4354](https://github.com/matrix-org/matrix-spec-proposals/pull/4354) | Sticky events | — | `org.matrix.msc4354` | `sticky_events.rs`, `rtc_membership.rs` | sticky_duration_ms on a send, the key on the event, the sync section, federation push, and delayed+sticky. What MatrixRTC 2.0 makes m.rtc.member. |
 
+## Partly served
+
+| MSC | Title | Stable in | Flags | Evidence | Notes |
+|---|---|---|---|---|---|
+| [MSC4108](https://github.com/matrix-org/matrix-spec-proposals/pull/4108) | QR code login | — | `org.matrix.msc4108` | `rendezvous.rs` | Homeserver rendezvous mailbox with conditional reads and writes, expiry and capacity limits. OAuth device authorization and secure-channel negotiation belong to MAS and the clients; their integrated rehearsal is pending. |
+
 ## Planned
 
 | MSC | Title | Stable in | Flags | Evidence | Notes |
