@@ -1376,11 +1376,20 @@ fn snapshot_over(base: Option<&StateSnapshot>, map: &StateMap) -> (StateSnapshot
             }
         }
     }
-    if base.len() + added != map.len() {
-        // `map` lacks a slot `base` holds: the snapshot has no removal.
-        return (snapshot_from(map), map.clone());
-    }
     let mut state = base.clone();
+    if base.len() + added != map.len() {
+        // Drop missing slots along their trie paths, retaining all shared
+        // nodes. Rebuilding each seed retained a full trie at every gap.
+        let mut missing = Vec::new();
+        base.for_each(|key, _| {
+            if !map.contains_key(&key_pair(key)) {
+                missing.push(key.clone());
+            }
+        });
+        for key in missing {
+            state = state.remove(&key);
+        }
+    }
     for ((kind, state_key), value) in &changed {
         state = state.apply(
             StateKey::new(kind.clone(), state_key.clone()),
@@ -1401,32 +1410,14 @@ fn same_state(state: &StateSnapshot, map: &StateMap) -> bool {
 /// `state` with `slots` applied; a `None` value removes the slot.
 #[must_use]
 pub fn apply_slots(state: &StateSnapshot, slots: &[(StateKey, Option<String>)]) -> StateSnapshot {
-    if slots.iter().all(|(_, value)| value.is_some()) {
-        let mut next = state.clone();
-        for (key, value) in slots {
-            if let Some(value) = value {
-                next = next.apply(key.clone(), value.clone());
-            }
-        }
-        return next;
-    }
-    // The snapshot has no removal; a resolution that drops a slot is rare
-    // enough to rebuild for.
-    let mut map = StateMap::new();
-    state.for_each(|key, value| {
-        map.insert(key_pair(key), value.to_owned());
-    });
+    let mut next = state.clone();
     for (key, value) in slots {
-        match value {
-            Some(value) => {
-                map.insert(key_pair(key), value.clone());
-            }
-            None => {
-                map.remove(&key_pair(key));
-            }
-        }
+        next = match value {
+            Some(value) => next.apply(key.clone(), value.clone()),
+            None => next.remove(key),
+        };
     }
-    snapshot_from(&map)
+    next
 }
 
 pub(crate) fn snapshot_from(map: &StateMap) -> StateSnapshot {
@@ -1768,4 +1759,29 @@ pub fn replay(room: &SourceRoom) -> Result<Outcome, ImportError> {
         excluded: plan.excluded,
         seeded_from_source: plan.seeded_from_source,
     })
+}
+
+#[cfg(test)]
+mod seed_sharing_tests {
+    use super::*;
+
+    #[test]
+    fn a_gap_removing_one_member_shares_the_existing_room_trie() {
+        let mut map = StateMap::new();
+        for index in 0..10_000 {
+            map.insert(
+                ("m.room.member".to_owned(), format!("@u{index}:example.org")),
+                format!("$e{index}"),
+            );
+        }
+        let base = snapshot_from(&map);
+        map.remove(&("m.room.member".to_owned(), "@u3000:example.org".to_owned()));
+        let (seed, changed) = snapshot_over(Some(&base), &map);
+        assert_eq!(seed.root(), snapshot_from(&map).root());
+        assert!(
+            changed.is_empty(),
+            "removal needs no replacement event bodies"
+        );
+        assert!(seed.delta_nodes(Some(&base)).len() <= 52);
+    }
 }

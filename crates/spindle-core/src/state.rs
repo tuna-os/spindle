@@ -204,6 +204,31 @@ impl StateSnapshot {
         }
     }
 
+    /// Return a new snapshot without `key`, or an unchanged clone when the
+    /// key is absent.
+    ///
+    /// State resolution can drop a slot: a key only some branches hold
+    /// is conflicted, and when none of its candidates passes the
+    /// authorization checks the resolved state has no value for it. The
+    /// trie stays canonical -- a branch left holding one leaf collapses to
+    /// it, exactly the shape inserting that leaf alone would have built --
+    /// so a state reached by removing a key has the same root as the same
+    /// state reached by never adding it.
+    #[must_use]
+    pub fn remove(&self, key: &StateKey) -> Self {
+        let Some(root) = &self.root else {
+            return self.clone();
+        };
+        match root.remove(key, &key.digest(), 0) {
+            Removal::Absent => self.clone(),
+            Removal::Emptied => Self::new(),
+            Removal::Replaced(root) => Self {
+                root: Some(root),
+                len: self.len.saturating_sub(1),
+            },
+        }
+    }
+
     /// Every slot where `self` and `other` disagree, in key order, as
     /// `(key, ours, theirs)`. A slot only one side holds has `None` on the
     /// other.
@@ -315,6 +340,16 @@ fn diff_nodes<'a>(left: Option<&'a Node>, right: Option<&'a Node>, out: &mut Vec
             }
         }
     }
+}
+
+/// What removing a key did to a node.
+enum Removal {
+    /// The key was not there; the node is unchanged.
+    Absent,
+    /// Nothing is left.
+    Emptied,
+    /// The node that replaces it.
+    Replaced(Arc<Node>),
 }
 
 #[derive(Clone, Debug)]
@@ -439,6 +474,71 @@ impl Node {
             }
             (Self::Branch { .. } | Self::Leaf { .. }, Self::Branch { .. }) => {
                 unreachable!("only leaf nodes are inserted")
+            }
+        }
+    }
+
+    /// This node without `key`.
+    ///
+    /// A branch left with a single child that is a leaf becomes that leaf,
+    /// because that is the shape an insert-only trie holding the same keys
+    /// has; a single child that is a branch stays wrapped, because that
+    /// shape is what two digests sharing this slot produce on insert too.
+    fn remove(&self, key: &StateKey, digest: &[u8; 32], depth: usize) -> Removal {
+        match self {
+            Self::Leaf {
+                digest: leaf_digest,
+                entries,
+                ..
+            } => {
+                if leaf_digest != digest {
+                    return Removal::Absent;
+                }
+                let Ok(index) = entries.binary_search_by(|(candidate, _)| candidate.cmp(key))
+                else {
+                    return Removal::Absent;
+                };
+                let mut kept = entries.to_vec();
+                kept.remove(index);
+                if kept.is_empty() {
+                    Removal::Emptied
+                } else {
+                    Removal::Replaced(Arc::new(Self::leaf_from_entries(*leaf_digest, kept)))
+                }
+            }
+            Self::Branch {
+                bitmap, children, ..
+            } => {
+                let slot = digest_slot(digest, depth);
+                let bit = 1_u32 << slot;
+                if bitmap & bit == 0 {
+                    return Removal::Absent;
+                }
+                let index = (bitmap & (bit - 1)).count_ones() as usize;
+                let Some(child) = children.get(index) else {
+                    return Removal::Absent;
+                };
+                let mut next = children.to_vec();
+                let mut bits = *bitmap;
+                match child.remove(key, digest, depth + 1) {
+                    Removal::Absent => return Removal::Absent,
+                    Removal::Replaced(child) => {
+                        if let Some(slot) = next.get_mut(index) {
+                            *slot = child;
+                        }
+                    }
+                    Removal::Emptied => {
+                        next.remove(index);
+                        bits &= !bit;
+                    }
+                }
+                match next.as_slice() {
+                    [] => Removal::Emptied,
+                    [only] if matches!(only.as_ref(), Self::Leaf { .. }) => {
+                        Removal::Replaced(Arc::clone(only))
+                    }
+                    _ => Removal::Replaced(Arc::new(Self::branch(bits, next))),
+                }
             }
         }
     }
