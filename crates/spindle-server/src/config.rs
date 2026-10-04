@@ -16,6 +16,8 @@ pub struct Config {
     #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
+    pub media: MediaConfig,
+    #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
     pub ratelimit: RateLimitConfig,
@@ -707,6 +709,28 @@ pub struct StorageConfig {
     pub s3: Option<S3Config>,
 }
 
+/// Media upload limits, advertised to clients and enforced on both upload paths.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaConfig {
+    /// Largest accepted upload, in bytes. Set this to the source server's cap
+    /// when migrating so existing clients retain their upload allowance.
+    #[serde(default = "default_max_upload_bytes")]
+    pub max_upload_bytes: usize,
+}
+
+fn default_max_upload_bytes() -> usize {
+    crate::media::MAX_UPLOAD
+}
+
+impl Default for MediaConfig {
+    fn default() -> Self {
+        Self {
+            max_upload_bytes: default_max_upload_bytes(),
+        }
+    }
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
@@ -853,6 +877,13 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        if self.media.max_upload_bytes == 0 || self.media.max_upload_bytes == usize::MAX {
+            return Err(ConfigError::Invalid {
+                field: "media.max_upload_bytes",
+                message: "must be greater than zero and leave room for the HTTP rejection sentinel"
+                    .to_owned(),
+            });
+        }
         // Both caps are the reason #36 asks for them: a zero here does not
         // mean "unlimited", it means every schedule is refused and the
         // dead-man's switch silently stops working. An operator who typed

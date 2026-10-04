@@ -110,7 +110,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::presence_routes::routes())
         .merge(room_routes())
         .merge(timeline_routes())
-        .merge(media_routes())
+        .merge(media_routes(state.media.max_upload_bytes()))
         .merge(discovery_routes())
         .merge(federation_read_routes())
         .merge(crate::mas::routes())
@@ -754,7 +754,7 @@ fn timeline_routes() -> Router<AppState> {
 /// authenticated endpoints exist to impose. A client old enough to need them
 /// gets a 404, which is the truthful answer for a surface this server does not
 /// offer.
-fn media_routes() -> Router<AppState> {
+fn media_routes(max_upload_bytes: usize) -> Router<AppState> {
     Router::new()
         .route(
             "/_matrix/media/v3/upload",
@@ -762,7 +762,7 @@ fn media_routes() -> Router<AppState> {
                 // Axum's default body limit is 2 MiB, which would reject an
                 // upload before the handler ever saw it -- with a bare 413 and
                 // no Matrix error code. The server would then be advertising a
-                // 50 MiB limit in `/config` and enforcing 2 MiB, which is the
+                // configured limit in `/config` and enforcing 2 MiB, which is the
                 // worst kind of disagreement: the client is told the file is
                 // fine, sends it, and gets an opaque failure.
                 //
@@ -770,14 +770,14 @@ fn media_routes() -> Router<AppState> {
                 // `Media::put` is the thing that refuses, and refuses with
                 // `M_TOO_LARGE`.
                 .layer(axum::extract::DefaultBodyLimit::max(
-                    crate::media::MAX_UPLOAD + 1,
+                    max_upload_bytes.saturating_add(1),
                 )),
         )
         .route("/_matrix/media/v1/create", post(create_media))
         .route(
             "/_matrix/media/v3/upload/{server_name}/{media_id}",
             axum::routing::put(upload_reserved_media).layer(axum::extract::DefaultBodyLimit::max(
-                crate::media::MAX_UPLOAD + 1,
+                max_upload_bytes.saturating_add(1),
             )),
         )
         .route("/_matrix/media/v3/config", get(media_config))
@@ -877,10 +877,10 @@ async fn preview_url(
 }
 
 /// `GET /_matrix/media/v3/config` and its `/client/v1` twin.
-async fn media_config(State(_state): State<AppState>) -> Json<Value> {
+async fn media_config(State(state): State<AppState>) -> Json<Value> {
     // Stated rather than discovered: a client that knows the limit can refuse
     // a file before spending a minute sending it.
-    Json(json!({ "m.upload.size": crate::media::MAX_UPLOAD }))
+    Json(json!({ "m.upload.size": state.media.max_upload_bytes() }))
 }
 
 /// `GET /_matrix/client/v1/media/download/{server_name}/{media_id}`

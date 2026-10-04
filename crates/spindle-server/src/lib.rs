@@ -193,11 +193,10 @@ pub fn app_with_metrics(
     let store_for_backups = Arc::clone(&store);
     let account_data = Arc::new(account_data::AccountData::new(Arc::clone(&store)));
     let blobs = blobs_for(&config);
-    let media = Arc::new(media::Media::new(
-        Arc::clone(&store),
-        blobs,
-        config.server.name.clone(),
-    ));
+    let media = Arc::new(
+        media::Media::new(Arc::clone(&store), blobs, config.server.name.clone())
+            .with_max_upload_bytes(config.media.max_upload_bytes),
+    );
     let directory = Arc::new(directory::Directory::new(
         Arc::clone(&store),
         config.server.name.clone(),

@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use spindle_core::keys;
 use spindle_store::{FjallStore, ReadView, Store, StoreError};
 
-/// The largest upload accepted, in bytes.
+/// The default largest upload accepted, in bytes.
 ///
 /// A limit the server states rather than discovers: `/config` advertises it,
 /// so a client can refuse a file before spending a minute sending it.
@@ -163,6 +163,7 @@ pub struct Media {
     store: Arc<FjallStore>,
     blobs: crate::blobs::Blobs,
     server_name: String,
+    max_upload_bytes: usize,
 }
 
 impl Media {
@@ -176,14 +177,28 @@ impl Media {
             store,
             blobs,
             server_name: server_name.into(),
+            max_upload_bytes: MAX_UPLOAD,
         }
+    }
+
+    /// Use the configured cap for uploads and remote media caching.
+    #[must_use]
+    pub fn with_max_upload_bytes(mut self, max_upload_bytes: usize) -> Self {
+        self.max_upload_bytes = max_upload_bytes;
+        self
+    }
+
+    /// The same limit advertised by the media configuration endpoints.
+    #[must_use]
+    pub const fn max_upload_bytes(&self) -> usize {
+        self.max_upload_bytes
     }
 
     /// Store `bytes`, returning the new media ID.
     ///
     /// # Errors
     ///
-    /// Returns [`MediaError::TooLarge`] past [`MAX_UPLOAD`], or
+    /// Returns [`MediaError::TooLarge`] past [`Self::max_upload_bytes`], or
     /// [`MediaError`] if the blob or its record cannot be written.
     pub async fn put(
         &self,
@@ -192,10 +207,10 @@ impl Media {
         filename: Option<&str>,
         uploaded_by: &str,
     ) -> Result<String, MediaError> {
-        if bytes.len() > MAX_UPLOAD {
+        if bytes.len() > self.max_upload_bytes {
             return Err(MediaError::TooLarge {
                 size: bytes.len(),
-                limit: MAX_UPLOAD,
+                limit: self.max_upload_bytes,
             });
         }
         let hash = blake3::hash(bytes).to_hex().to_string();
@@ -317,7 +332,7 @@ impl Media {
     /// [`MediaError::AlreadyUploaded`] when the ID already has bytes,
     /// [`MediaError::Unknown`] when no live reservation stands,
     /// [`MediaError::NotReserver`] when someone else reserved it,
-    /// [`MediaError::TooLarge`] past [`MAX_UPLOAD`], or [`MediaError`] if
+    /// [`MediaError::TooLarge`] past [`Self::max_upload_bytes`], or [`MediaError`] if
     /// the blob or its record cannot be written.
     pub async fn put_reserved(
         &self,
@@ -336,10 +351,10 @@ impl Media {
         if reservation.user_id != uploaded_by {
             return Err(MediaError::NotReserver(media_id.to_owned()));
         }
-        if bytes.len() > MAX_UPLOAD {
+        if bytes.len() > self.max_upload_bytes {
             return Err(MediaError::TooLarge {
                 size: bytes.len(),
-                limit: MAX_UPLOAD,
+                limit: self.max_upload_bytes,
             });
         }
         let hash = blake3::hash(bytes).to_hex().to_string();
@@ -376,7 +391,7 @@ impl Media {
     ///
     /// # Errors
     ///
-    /// Returns [`MediaError::TooLarge`] past [`MAX_UPLOAD`], or
+    /// Returns [`MediaError::TooLarge`] past [`Self::max_upload_bytes`], or
     /// [`MediaError`] if the blob or its record cannot be written.
     pub async fn put_remote(
         &self,
@@ -386,10 +401,10 @@ impl Media {
         content_type: &str,
         filename: Option<&str>,
     ) -> Result<(), MediaError> {
-        if bytes.len() > MAX_UPLOAD {
+        if bytes.len() > self.max_upload_bytes {
             return Err(MediaError::TooLarge {
                 size: bytes.len(),
-                limit: MAX_UPLOAD,
+                limit: self.max_upload_bytes,
             });
         }
         let hash = blake3::hash(bytes).to_hex().to_string();

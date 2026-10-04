@@ -21,9 +21,32 @@ fn the_minimal_configuration_is_a_server_name() {
     assert_eq!(config.server.name, "example.org");
     assert_eq!(config.server.bind, "127.0.0.1:8008");
     assert_eq!(config.storage.path.to_str(), Some("./data"));
+    assert_eq!(config.media.max_upload_bytes, 50 * 1024 * 1024);
     // Loopback by default: a server that binds every interface the moment it
     // is installed has made an exposure decision on the operator's behalf.
     assert!(config.server.bind.starts_with("127.0.0.1"));
+}
+
+#[test]
+fn media_upload_limit_preserves_a_migrated_servers_allowance() {
+    let config = parse("[server]\nname='example.org'\n[media]\nmax_upload_bytes=104857600\n")
+        .expect("100 MiB is the source server's configured allowance");
+    assert_eq!(config.media.max_upload_bytes, 100 * 1024 * 1024);
+    for limit in [0, usize::MAX] {
+        let error = parse(&format!(
+            "[server]\nname='example.org'\n[media]\nmax_upload_bytes={limit}\n"
+        ))
+        .expect_err("zero and an overflowing HTTP sentinel are invalid");
+        assert!(matches!(
+            error,
+            ConfigError::Invalid {
+                field: "media.max_upload_bytes",
+                ..
+            } | ConfigError::Syntax { .. }
+        ));
+    }
+    assert!(parse("[server]\nname='example.org'\n[media]\nmax_upload_bytes=-1\n").is_err());
+    assert!(parse("[server]\nname='example.org'\n[media]\nmax_upload_byte=3\n").is_err());
 }
 
 #[test]

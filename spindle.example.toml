@@ -35,6 +35,11 @@ bind = "127.0.0.1:8008"
 [storage]
 path = "./data"
 
+# Upload allowance in bytes, enforced on POST and reserved-media PUT and
+# advertised by both media config endpoints. Match the old server on migration.
+# [media]
+# max_upload_bytes = 52428800 # 50 MiB default; 104857600 for 100 MiB
+
 # Media blobs in an S3-compatible bucket instead of on local disk. The
 # metadata store stays local either way: it is the index, and an index a
 # network hop away would put a round trip in front of every media request
