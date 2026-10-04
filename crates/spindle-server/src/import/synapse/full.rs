@@ -216,6 +216,21 @@ pub struct Report {
     pub validation: Option<Validation>,
 }
 
+impl Report {
+    fn prepare_mode(&mut self, dry_run: bool) {
+        if self.dry_run != dry_run {
+            // A dry run wrote nothing. Its completed phases and room plans
+            // must not suppress real writes; a new dry run checks again too.
+            self.phases_done.clear();
+            self.domains.clear();
+            self.rooms.clear();
+            self.excluded_rooms.clear();
+            self.validation = None;
+        }
+        self.dry_run = dry_run;
+    }
+}
+
 /// The check of the written store against Synapse.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Validation {
@@ -476,8 +491,13 @@ pub fn run(
         media: crate::media::Media::new(Arc::clone(store), blobs, &options.server_name),
     };
     let mut report = previous.unwrap_or_default();
+    if !report.server_name.is_empty() && report.server_name != options.server_name {
+        return Err(Error::Checkpoint(
+            "checkpoint belongs to another server name".to_owned(),
+        ));
+    }
     report.server_name.clone_from(&options.server_name);
-    report.dry_run = options.dry_run;
+    report.prepare_mode(options.dry_run);
     report.runs += 1;
     report
         .rooms
@@ -3008,6 +3028,35 @@ mod tests {
         assert!(!is_local("@a:notreilly.asia", "reilly.asia"));
         assert!(!is_local("@a:reilly.asia.evil", "reilly.asia"));
         assert_eq!(localpart("@a:reilly.asia"), "a");
+    }
+
+    #[test]
+    fn switching_from_a_dry_run_cannot_skip_real_writes() {
+        let mut report = Report {
+            dry_run: true,
+            ..Report::default()
+        };
+        report.phases_done.insert("users".to_owned());
+        report
+            .rooms
+            .insert("!r:example.org".to_owned(), RoomReport::default());
+        report.validation = Some(Validation::default());
+        report.prepare_mode(false);
+        assert!(!report.dry_run);
+        assert!(report.phases_done.is_empty());
+        assert!(report.rooms.is_empty());
+        assert!(report.validation.is_none());
+    }
+
+    #[test]
+    fn a_checkpoint_in_the_same_mode_keeps_completed_phases() {
+        let mut report = Report {
+            dry_run: true,
+            ..Report::default()
+        };
+        report.phases_done.insert("users".to_owned());
+        report.prepare_mode(true);
+        assert!(report.phases_done.contains("users"));
     }
 
     #[test]
