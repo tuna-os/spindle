@@ -74,6 +74,7 @@ impl Provider {
                             .find(|(key, _)| key == "token").map(|(_, value)| value.into_owned()).unwrap_or_default();
                         let scopes = match token.as_str() {
                             "mat_admin_access_token" => Some("urn:matrix:org.matrix.msc2967.client:api:* urn:synapse:admin:* urn:mas:admin"),
+                            "mat_stable_admin_access_token" => Some("urn:matrix:client:api:* urn:synapse:admin:* urn:mas:admin"),
                             "mat_stable_access_token" => Some("urn:matrix:client:api:* urn:matrix:client:device:STABLEDEV"),
                             "mat_multiple_devices" => Some("urn:matrix:client:api:* urn:matrix:client:device:ONE urn:matrix:client:device:TWO"),
                             "mat_mas_admin_only" => Some("urn:matrix:client:api:* urn:mas:admin"),
@@ -561,4 +562,124 @@ async fn delegated_scopes_accept_stable_names_and_reject_ambiguous_devices() {
             .await;
         assert_eq!(status, 401, "{token}: {body}");
     }
+}
+
+#[tokio::test]
+async fn delegated_admin_whoami_identifies_an_account_without_inventing_a_device() {
+    for token in ["mat_admin_access_token", "mat_stable_admin_access_token"] {
+        let (provider, url) = Provider::serve().await;
+        let server = Instance::start(Some(&url)).await;
+        let (status, body) = server
+            .request(
+                reqwest::Method::GET,
+                "/_matrix/client/v3/account/whoami",
+                Some(token),
+                None,
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "Element Admin reads whoami before opening its console: {body}"
+        );
+        assert_eq!(body["user_id"], format!("@alice:{}", server.name));
+        assert!(
+            body.get("device_id").is_none(),
+            "whoami must omit an absent device: {body}"
+        );
+        let accounts = spindle_server::accounts::Accounts::new(server.store.as_ref(), &server.name);
+        assert!(accounts.devices_of("alice").unwrap().is_empty());
+        assert!(!accounts.account("alice").unwrap().unwrap().admin);
+        let (status, body) = server
+            .request(
+                reqwest::Method::POST,
+                "/_matrix/client/v3/keys/upload",
+                Some(token),
+                Some(&json!({})),
+            )
+            .await;
+        assert_eq!(
+            status, 401,
+            "account-only authentication cannot upload device keys: {body}"
+        );
+        let (status, body) = server
+            .request(
+                reqwest::Method::GET,
+                "/_synapse/admin/v2/users",
+                Some(token),
+                None,
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "the same token still grants admin routes: {body}"
+        );
+        assert_eq!(
+            provider.introspections().len(),
+            1,
+            "one shared cached verdict"
+        );
+    }
+}
+
+#[tokio::test]
+async fn delegated_account_identity_checks_scopes_and_cached_account_holds() {
+    let (_provider, url) = Provider::serve().await;
+    let server = Instance::start(Some(&url)).await;
+    for token in [
+        "inactive",
+        "mat_mas_admin_only",
+        "mat_multiple_devices",
+        "mat_empty_device",
+    ] {
+        let (status, body) = server
+            .request(
+                reqwest::Method::GET,
+                "/_matrix/client/v3/account/whoami",
+                Some(token),
+                None,
+            )
+            .await;
+        assert_eq!(status, 401, "bad account scope must remain invalid: {body}");
+    }
+    let token = "mat_admin_access_token";
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let accounts = spindle_server::accounts::Accounts::new(server.store.as_ref(), &server.name);
+    accounts.set_locked("alice", true).unwrap();
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 401,
+        "a cached provider verdict cannot bypass a local lock: {body}"
+    );
+    assert_eq!(body["errcode"], "M_USER_LOCKED");
+    accounts.set_locked("alice", false).unwrap();
+    accounts.set_deactivated("alice", true).unwrap();
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 401,
+        "a cached provider verdict cannot bypass deactivation: {body}"
+    );
+    assert_eq!(body["errcode"], "M_UNKNOWN_TOKEN");
+    assert!(accounts.devices_of("alice").unwrap().is_empty());
 }

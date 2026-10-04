@@ -21,7 +21,7 @@ use axum::extract::ConnectInfo;
 use std::net::SocketAddr;
 
 use crate::accounts::{AccountError, Accounts};
-use crate::auth::Authenticated;
+use crate::auth::{AccountAuthenticated, Authenticated};
 use crate::errors::MatrixError;
 use crate::inbound::{
     FederationStateQuery, federation_origin, join_candidates, merge_returned_signatures,
@@ -2043,11 +2043,12 @@ async fn logout(
 }
 
 /// `GET /_matrix/client/v3/account/whoami`
-async fn whoami(Authenticated(identity): Authenticated) -> Json<Value> {
-    Json(json!({
-        "user_id": identity.user_id,
-        "device_id": identity.device_id,
-    }))
+async fn whoami(AccountAuthenticated(identity): AccountAuthenticated) -> Json<Value> {
+    let mut body = json!({"user_id": identity.user_id});
+    if !identity.device_id.is_empty() {
+        body["device_id"] = json!(identity.device_id);
+    }
+    Json(body)
 }
 
 /// `POST /_matrix/client/v3/logout/all`

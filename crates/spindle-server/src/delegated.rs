@@ -133,6 +133,40 @@ impl Delegated {
         })
     }
 
+    /// Resolve an account identity for `/whoami`. Element Admin's OAuth scopes
+    /// grant an account and admin capability without allocating a device.
+    /// The empty internal device ID is omitted from that endpoint's response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an authentication error for inactive tokens or invalid scopes.
+    pub async fn identify_account(
+        &self,
+        store: &spindle_store::FjallStore,
+        server_name: &str,
+        token: &str,
+    ) -> Result<Identity, MatrixError> {
+        let verdict = self.resolve(store, server_name, token).await?;
+        let accounts = Accounts::new(store, server_name);
+        let localpart = verdict
+            .user_id
+            .strip_prefix('@')
+            .and_then(|rest| rest.split_once(':'))
+            .map(|(localpart, _)| localpart)
+            .ok_or_else(MatrixError::unknown_token)?;
+        if accounts
+            .account(localpart)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?
+            .is_none_or(|account| account.deactivated)
+        {
+            return Err(MatrixError::unknown_token());
+        }
+        Ok(Identity {
+            user_id: verdict.user_id,
+            device_id: verdict.device_id.unwrap_or_default(),
+        })
+    }
+
     /// Authenticate an admin token without provisioning a synthetic device.
     /// The capability belongs to the token; it never changes the account's flag.
     ///
