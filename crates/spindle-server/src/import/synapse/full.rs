@@ -122,6 +122,9 @@ pub struct RoomReport {
     pub source_events: u64,
     /// Events in the planned (and, unless a dry run, written) log.
     pub imported_events: u64,
+    /// Imported events indexed for cached Synapse pagination tokens.
+    #[serde(default)]
+    pub pagination_positions: u64,
     pub outliers: u64,
     pub rejected: u64,
     pub frayed: u64,
@@ -516,6 +519,18 @@ pub fn run(
     let total = rooms.len();
     for (index, room_id) in rooms.iter().enumerate() {
         if run.report.rooms.contains_key(room_id) {
+            if !run.options.dry_run && run.report.rooms[room_id].imported_events > 0 {
+                let count =
+                    run.index_positions(room_id, run.report.rooms[room_id].imported_events)?;
+                run.report
+                    .rooms
+                    .get_mut(room_id)
+                    .expect("checked above")
+                    .pagination_positions = count as u64;
+                run.target.rooms.release_imported_room(room_id);
+                run.sync()?;
+                save_checkpoint(&run.options.checkpoint, &run.report)?;
+            }
             continue;
         }
         run.import_room(room_id, index + 1, total)?;
@@ -1523,6 +1538,33 @@ impl Run<'_, '_> {
         save_checkpoint(&self.options.checkpoint, &self.report)
     }
 
+    fn index_positions(&mut self, room_id: &str, expected: u64) -> Result<usize, Error> {
+        let rows = self.snapshot.query(
+            "SELECT stream_ordering, depth, event_id FROM events WHERE room_id = $1",
+            &[&room_id],
+        )?;
+        let positions: Vec<(i64, i64, String)> = rows
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        let count = self
+            .target
+            .rooms
+            .record_synapse_positions(
+                room_id,
+                positions
+                    .iter()
+                    .map(|(stream, depth, id)| (*stream, *depth, id.as_str())),
+            )
+            .map_err(write_error)?;
+        if count as u64 != expected {
+            return Err(write_error(format!(
+                "{room_id}: indexed {count} pagination positions for {expected} imported events"
+            )));
+        }
+        Ok(count)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn import_room(&mut self, room_id: &str, position: usize, total: usize) -> Result<(), Error> {
         let started = Instant::now();
@@ -1784,6 +1826,8 @@ impl Run<'_, '_> {
                     .rooms
                     .finish_synapse_room(room_id, &redactions)
                     .map_err(write_error)? as u64;
+                room_report.pagination_positions =
+                    self.index_positions(room_id, room_report.imported_events)? as u64;
                 self.target.rooms.release_imported_room(room_id);
                 self.sync()?;
             }
