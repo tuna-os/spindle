@@ -22,6 +22,8 @@
 //! With no rooms named, every room with such a merge is replayed. One JSON
 //! line per room on stdout, then a summary line.
 
+mod oracle;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,7 +31,9 @@ use std::time::{Duration, Instant};
 use postgres::fallible_iterator::FallibleIterator;
 use postgres::{Client, NoTls};
 use serde_json::{Value, json};
-use spindle_core::{EventId, EventInput, RoomLog, Sideline, SidelinedEntry, StateKey, StateSnapshot};
+use spindle_core::{
+    EventId, EventInput, RoomLog, Sideline, SidelinedEntry, StateKey, StateSnapshot,
+};
 use spindle_server::rooms::{RoomError, Rooms};
 
 struct Merge {
@@ -197,7 +201,13 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
     // own group (its edge), which for a state event is the state before it.
     let mut needed: HashSet<i64> = HashSet::new();
     for merge in &merges {
-        needed.extend(merge.prev_groups.iter().copied().filter(|group| *group >= 0));
+        needed.extend(
+            merge
+                .prev_groups
+                .iter()
+                .copied()
+                .filter(|group| *group >= 0),
+        );
         needed.extend(merge.own_group);
     }
     let own_groups: Vec<i64> = merges.iter().filter_map(|merge| merge.own_group).collect();
@@ -318,7 +328,9 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
 
     // Bodies: every state event of the room (outliers included: auth chains
     // reach them), and the merges and their parents.
-    let dir = tempfile::Builder::new().prefix("corpus-state-res").tempdir()?;
+    let dir = tempfile::Builder::new()
+        .prefix("corpus-state-res")
+        .tempdir()?;
     let store = Arc::new(spindle_store::FjallStore::open(dir.path())?);
     let rooms = Rooms::new(Arc::clone(&store), "replay.invalid");
     let mut wanted_ids: Vec<String> = Vec::new();
@@ -338,7 +350,10 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
             bodies.insert(id, body);
         }
     }
-    let batch: Vec<(String, Value)> = bodies.iter().map(|(id, body)| (id.clone(), body.clone())).collect();
+    let batch: Vec<(String, Value)> = bodies
+        .iter()
+        .map(|(id, body)| (id.clone(), body.clone()))
+        .collect();
     for chunk in batch.chunks(5_000) {
         rooms.store_replay_bodies(room_id, chunk)?;
     }
@@ -398,8 +413,12 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
                 .get(parent)
                 .and_then(|body| body["depth"].as_u64())
                 .unwrap_or(0);
-            log.append_seeded(EventInput::new(parent.as_str(), Vec::new()), (*snapshot).clone(), depth)
-                .map_err(|error| format!("{parent}: {error:?}"))?;
+            log.append_seeded(
+                EventInput::new(parent.as_str(), Vec::new()),
+                (*snapshot).clone(),
+                depth,
+            )
+            .map_err(|error| format!("{parent}: {error:?}"))?;
         }
         rooms.install_replay_log(room_id, log);
 
@@ -408,7 +427,9 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
         tally.durations.push(started.elapsed());
         match &verdict {
             Ok(()) => tally.accepted += 1,
-            Err(RoomError::Forbidden(why)) if why.starts_with("soft-failed") => tally.soft_failed += 1,
+            Err(RoomError::Forbidden(why)) if why.starts_with("soft-failed") => {
+                tally.soft_failed += 1
+            }
             Err(RoomError::Forbidden(why)) if why.starts_with("rejected") => tally.rejected += 1,
             Err(_) => tally.errors += 1,
         }
@@ -430,9 +451,9 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
         // Synapse's state before the event: the merge's own group, or for a
         // state event the group its own group was built on when that delta
         // is the event alone; otherwise the own group minus the event's slot.
-        let own_key: Option<StateKey> = body["state_key"].as_str().map(|state_key| {
-            StateKey::new(body["type"].as_str().unwrap_or_default(), state_key)
-        });
+        let own_key: Option<StateKey> = body["state_key"]
+            .as_str()
+            .map(|state_key| StateKey::new(body["type"].as_str().unwrap_or_default(), state_key));
         let Some(own_group) = merge.own_group else {
             tally.errors += 1;
             continue;
@@ -491,6 +512,9 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
                     "verdict": format!("{verdict:?}"),
                     "differences": differences.len(),
                     "first": shown,
+                    "full_chain_oracle": if std::env::var_os("CORPUS_FULL_CHAIN_ORACLE").is_some() {
+                        oracle::compare(room_id, &parents, &bodies, &rejected, expected, &ours, ignore.as_ref())
+                    } else { Value::Null },
                 }));
             }
         }
