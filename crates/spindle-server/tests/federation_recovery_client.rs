@@ -188,8 +188,7 @@ async fn declared_oversized_responses_are_refused_before_reading_the_body() {
     let name = listener.local_addr().unwrap().to_string();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = [0; 4096];
-        stream.read(&mut request).await.unwrap();
+        read_request_headers(&mut stream).await;
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 16777217\r\n\r\n")
             .await
@@ -214,8 +213,7 @@ async fn chunked_responses_are_bounded_without_a_content_length() {
     let name = listener.local_addr().unwrap().to_string();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = [0; 4096];
-        stream.read(&mut request).await.unwrap();
+        read_request_headers(&mut stream).await;
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
             .await
@@ -235,4 +233,17 @@ async fn chunked_responses_are_bounded_without_a_content_length() {
     let result = federation.remote_event(&name, "$x").await.unwrap_err();
     assert!(result.to_string().contains("too large"));
     server.await.unwrap();
+}
+
+async fn read_request_headers(stream: &mut tokio::net::TcpStream) {
+    let mut headers = Vec::new();
+    while !headers.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        stream.read_exact(&mut byte).await.unwrap();
+        headers.push(byte[0]);
+        assert!(
+            headers.len() <= 64 * 1024,
+            "request headers exceed test limit"
+        );
+    }
 }
