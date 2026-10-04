@@ -337,6 +337,21 @@ impl RoomReader<'_> {
             .messages_visible(&self.room_id, from, limit, &|li| self.scope.admits(li))
     }
 
+    /// A page of the timeline in either direction (`/messages` with `dir`
+    /// and `to`), as this caller may see it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::messages`].
+    pub fn page(
+        &self,
+        page: super::Page,
+        limit: usize,
+    ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
+        self.rooms
+            .page_visible(&self.room_id, page, limit, &|li| self.scope.admits(li))
+    }
+
     /// The window around one event, as this caller may see it.
     ///
     /// # Errors

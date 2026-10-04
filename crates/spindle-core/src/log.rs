@@ -425,6 +425,18 @@ impl RoomLog {
         self.entries.values()
     }
 
+    /// The entries whose linear index falls in `range`, oldest first.
+    ///
+    /// A `BTreeMap` range probe, so a page that starts deep in a room's
+    /// history does not first walk past everything on the other side of
+    /// it: `entries().filter(..)` reads the same rows and drops most.
+    pub fn entries_in(
+        &self,
+        range: impl std::ops::RangeBounds<i64>,
+    ) -> impl DoubleEndedIterator<Item = &LogEntry> {
+        self.entries.range(range).map(|(_, entry)| entry)
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()

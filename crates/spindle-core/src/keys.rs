@@ -401,6 +401,12 @@ pub enum Keyspace {
     /// latest account-data write. Kept beside [`Self::AccountData`] rather
     /// than inside its value so existing stored JSON remains its own format.
     AccountDataStream = 0x3c,
+    /// `(room_id, synapse_stream_ordering)` -> the linear index the
+    /// importer gave that event (#568). Lets a Synapse pagination token
+    /// a client kept across the migration name a place in this room.
+    SynapsePosition = 0x3e,
+    /// Imported Synapse room order, keyed by depth and stream.
+    SynapseTopologicalPosition = 0x3f,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -1045,6 +1051,26 @@ pub fn sticky(room_id: &str, expires_ms: u64, event_id: &str) -> Vec<u8> {
     let mut key = room_prefix(Keyspace::Sticky, room_id);
     key.extend_from_slice(&expires_ms.to_be_bytes());
     key.extend_from_slice(event_id.as_bytes());
+    key
+}
+
+/// `(room_id, stream_ordering)` key for [`Keyspace::SynapsePosition`].
+///
+/// [`order_preserving`] because Synapse gives backfilled events negative
+/// stream orderings, and those sort below every live one.
+#[must_use]
+pub fn synapse_position(room_id: &str, stream_ordering: i64) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::SynapsePosition, room_id);
+    key.extend_from_slice(&order_preserving(stream_ordering));
+    key
+}
+
+/// Imported Synapse `(room_id, depth, stream_ordering)` position.
+#[must_use]
+pub fn synapse_topological_position(room_id: &str, depth: i64, stream: i64) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::SynapseTopologicalPosition, room_id);
+    key.extend_from_slice(&order_preserving(depth));
+    key.extend_from_slice(&order_preserving(stream));
     key
 }
 
