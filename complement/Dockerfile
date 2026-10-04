@@ -21,6 +21,7 @@ WORKDIR /src
 # placeholder build simply will not cover it and the real build compiles
 # it from scratch. The failure mode is a slower build, not a wrong one.
 COPY Cargo.toml Cargo.lock ./
+COPY vendor ./vendor
 COPY crates/spindle-core/Cargo.toml crates/spindle-core/
 COPY crates/spindle-store/Cargo.toml crates/spindle-store/
 COPY crates/spindle-server/Cargo.toml crates/spindle-server/
