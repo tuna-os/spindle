@@ -263,11 +263,15 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
     let mut snaps: HashMap<i64, StateSnapshot> = HashMap::new();
     let mut last: StateSnapshot = StateSnapshot::new();
     {
-        let mut rows = db.query_raw(
-            "SELECT state_group, type, state_key, event_id FROM state_groups_state
+        let mut rows = db
+            .query_raw(
+                "SELECT state_group, type, state_key, event_id FROM state_groups_state
               WHERE state_group = ANY($1) ORDER BY state_group",
-            &[&groups],
-        )?;
+                &[&groups],
+            )?
+            .fuse();
+        // Empty trailing delta groups must not poll the database stream again
+        // after EOF: the driver's row stream is not fused.
         let mut pending: Option<(i64, String, String, String)> = None;
         for group in &groups {
             let mut delta: Vec<(StateKey, String)> = Vec::new();
