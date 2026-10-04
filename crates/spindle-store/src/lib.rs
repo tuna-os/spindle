@@ -44,7 +44,7 @@ use spindle_core::{
     keys::{KEY_SCHEMA_VERSION, Keyspace, content_addressed, room_li, room_prefix, store_marker},
 };
 
-use crate::codec::{CodecError, EntryRecord, RECORD_VERSION, RoomRecord};
+use crate::codec::{CodecError, EntryRecord, RECORD_VERSION, RoomRecord, SidelinedRecord};
 
 /// How hard a commit tries to be on disk before it is acknowledged.
 ///
@@ -1327,6 +1327,119 @@ impl<'a, S: Store> RoomStore<'a, S> {
         }
     }
 
+    /// Journal a soft-failed or rejected event: its record, the state
+    /// nodes its state adds over `previous` (a parent's state, which is
+    /// already stored), the room's metadata and the caller's records, in
+    /// one batch. Like [`Self::journal_entry_with`], the sync is the
+    /// caller's.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the batch cannot be journalled.
+    pub fn journal_sidelined(
+        &self,
+        entry: &spindle_core::SidelinedEntry,
+        state: &spindle_core::StateSnapshot,
+        previous: Option<&spindle_core::StateSnapshot>,
+        log: &RoomLog,
+        extra: &[Record],
+    ) -> Result<(), StoreError> {
+        let mut writes = vec![
+            (
+                spindle_core::keys::sidelined(&self.room_id, entry.event_id.as_str()),
+                SidelinedRecord::from_entry(entry).encode(),
+            ),
+            (
+                room_prefix(Keyspace::RoomMeta, &self.room_id),
+                Self::meta(log).encode(),
+            ),
+        ];
+        for (address, node) in state.delta_nodes(previous) {
+            writes.push((
+                content_addressed(Keyspace::StateNode, address.as_bytes()),
+                node,
+            ));
+        }
+        writes.extend_from_slice(extra);
+        self.store.commit_deferred(&writes)
+    }
+
+    /// Put the room's sidelined events back into a restored log, each with
+    /// its state rehydrated from the stored trie.
+    fn restore_sidelined(&self, log: &mut RoomLog) -> Result<(), StoreError> {
+        let prefix = room_prefix(Keyspace::Sidelined, &self.room_id);
+        let mut load_node = |address: &StateRoot| {
+            self.store
+                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
+                .ok()
+                .flatten()
+        };
+        for (_, value) in self.store.scan_prefix(&prefix)? {
+            let entry = SidelinedRecord::decode(&value)?.to_entry()?;
+            let state = spindle_core::StateSnapshot::rehydrate(entry.state_root, &mut load_node)
+                .unwrap_or_default();
+            log.restore_sidelined(entry, state);
+        }
+        Ok(())
+    }
+
+    /// Commit imported historical rejection decisions and their PDU records.
+    ///
+    /// The markers never become timeline entries. In-memory decisions are
+    /// published only after the atomic durable write succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error, or refuses an ID already in the accepted log.
+    pub fn commit_historical_rejections(
+        &self,
+        log: &mut RoomLog,
+        ids: &[EventId],
+        extra: &[Record],
+        durability: Durability,
+    ) -> Result<(), StoreError> {
+        let mut writes = extra.to_vec();
+        for id in ids {
+            if log.get(id).is_some() {
+                return Err(StoreError::Backend(
+                    "historical rejection is already in the accepted log".into(),
+                ));
+            }
+            writes.push((
+                spindle_core::keys::historical_rejection(&self.room_id, id.as_str()),
+                vec![1],
+            ));
+        }
+        self.store.commit(&writes, durability)?;
+        for id in ids {
+            log.preserve_historical_rejection(id.clone());
+        }
+        Ok(())
+    }
+
+    /// Restore imported rejection markers without treating them as timeline entries.
+    fn restore_historical_rejections(&self, log: &mut RoomLog) -> Result<(), StoreError> {
+        let prefix = room_prefix(Keyspace::HistoricalRejection, &self.room_id);
+        for (key, value) in self.store.scan_prefix(&prefix)? {
+            if value != [1] {
+                return Err(CodecError::Malformed(value.first().copied().unwrap_or(0)).into());
+            }
+            let id = key.get(prefix.len()..).ok_or(CodecError::Truncated)?;
+            let id = std::str::from_utf8(id).map_err(|_| CodecError::NotUtf8)?;
+            if id.is_empty() {
+                return Err(CodecError::Truncated.into());
+            }
+            let id = EventId::new(id);
+            if log.get(&id).is_some() {
+                return Err(StoreError::Backend(
+                    "historical rejection overlaps accepted log".into(),
+                ));
+            }
+            log.preserve_historical_rejection(id);
+        }
+        Ok(())
+    }
+
     fn meta(log: &RoomLog) -> RoomRecord {
         RoomRecord {
             next_forward: log.next_forward(),
@@ -1376,6 +1489,12 @@ impl<'a, S: Store> RoomStore<'a, S> {
             &room_prefix(Keyspace::RoomMeta, &self.room_id),
             &Self::meta(log).encode(),
         )?;
+        for id in log.historical_rejections() {
+            self.store.put(
+                &spindle_core::keys::historical_rejection(&self.room_id, id.as_str()),
+                &[1],
+            )?;
+        }
         self.store.flush()
     }
 
@@ -1393,14 +1512,16 @@ impl<'a, S: Store> RoomStore<'a, S> {
         let Some((meta, entries)) = self.read_records()? else {
             return Ok(None);
         };
-        Ok(Some(RoomLog::restore(
+        let mut restored = RoomLog::restore(
             entries,
             meta.next_forward,
             meta.next_backward,
             meta.forward_extremities
                 .into_iter()
                 .map(|id| EventId::new(id.as_str())),
-        )?))
+        )?;
+        self.restore_historical_rejections(&mut restored.log)?;
+        Ok(Some(restored))
     }
 
     fn read_records(&self) -> Result<Option<(RoomRecord, Vec<RestoredEntry>)>, StoreError> {
@@ -1461,7 +1582,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 .flatten()
         };
 
-        let restored = RoomLog::restore_with_state(
+        let mut restored = RoomLog::restore_with_state(
             entries,
             meta.next_forward,
             meta.next_backward,
@@ -1470,6 +1591,8 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 .map(|id| EventId::new(id.as_str())),
             &mut load_node,
         )?;
+        self.restore_sidelined(&mut restored.log)?;
+        self.restore_historical_rejections(&mut restored.log)?;
         Ok(Some(restored))
     }
 }

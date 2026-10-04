@@ -40,11 +40,10 @@ outward as a federation profile:
    persistent hash-array-mapped trie with structural sharing. Advancing state by
    one event copies ~3 nodes. State at an arbitrary historical point is a single
    pointer lookup.
-3. **State resolution is an exception path.** It runs only over the bounded
-   window between a fork point and the current head, only when a legacy DAG peer
-   actually forks, and only when the fork contains conflicting *state* events.
-   It never runs over a whole room, and in a non-federated room it never runs at
-   all.
+3. **State resolution is an exception path.** It runs only when a legacy DAG
+   peer actually forks and the branches' states differ, it is the room
+   version's own algorithm when it does (§9, ADR 0005), and in a non-federated
+   room it never runs at all.
 4. **Wire format is unchanged.** Native Spindle rooms are ordinary **room
    version 11** rooms. A chain is a valid DAG. Existing clients and existing
    homeservers cannot tell the difference, which is what makes "completely
@@ -432,11 +431,14 @@ it is the same six lookups.
 
 ### 7.2 Rejection and soft-fail
 
-Both are retained exactly per spec. A rejected event is persisted with
-`flags.rejected` and excluded from state and from client-visible timelines. A
-soft-failed event is persisted and not sent to clients, but remains a valid DAG
-ancestor. These flags live in the log entry, so "was this soft-failed" is a field
-read rather than a query.
+Both are retained exactly per spec (§9.3). A received event is checked against
+its auth events, against the state before it — its parents' states, resolved
+when they differ — and against the room's current state. A rejected event
+changes no state; a soft-failed one keeps its own write for any child that
+names it. Neither is sent to clients nor becomes a forward extremity, and both
+remain valid DAG ancestors. *Amended (ADR 0005):* they are kept as sidelined
+entries beside the log rather than flagged inside it, so no timeline reader
+can show one by forgetting a flag.
 
 ### 7.3 Power level changes
 
@@ -490,8 +492,9 @@ POST /_matrix/federation/v1/send/{txnId}
   ├─ 5. respond 200 with per-PDU results
   └─ 6. per-room executors drain their partitions:
          ├─ prev_events all known?  ── no ──▶ /get_missing_events, then retry
-         ├─ prev_events == our head? ── yes ─▶ append at tail (§8.1 steps 3–12)
-         └─ otherwise ─────────────────────▶ fork handling (§9)
+         ├─ state before = parents' states, resolved if they differ (§9.2)
+         ├─ receipt checks: auth events, state before, current state (§9.3)
+         └─ append at tail (§8.1 steps 3–12), or sideline if refused
 ```
 
 Step 3 uses batched Ed25519 verification, which amortizes the dominant per-PDU
@@ -538,70 +541,68 @@ Forks are possible only in class D, only from legacy peers, and only when a peer
 authors an event whose `prev_events` are not our head — i.e. it sent concurrently
 with us or was partitioned.
 
+*Amended by ADR 0005 (#563).* The fork merge this section first specified —
+three cases, two of them resolved without state resolution — does not equal
+Matrix state resolution, and a server whose state disagrees with its peers'
+after a fork never converges with them. What follows is what Spindle does
+instead; the counterexamples are in ADR 0005 and in
+`spindle-core/tests/state_res_equivalence.rs`.
+
 ### 9.1 The window
 
 Let `A` be the greatest `li` such that every `prev_event` of the incoming event
 is at `li <= A`. The **fork window** is `(A, head]`. In practice `|window|` is
 bounded by the network round trip times the room's event rate: single digits in
-almost every real case. Spindle caps it at `max_fork_window` (default 512); a
-window that exceeds the cap falls back to full spec-compliant state resolution
-over the affected range, which is correct but slow, and is logged as an anomaly.
+almost every real case.
 
-The cap bounds the **work**, not merely the answer. Discovering the window must
-not require walking each tip's full ancestry back to the room's first event and
-intersecting: that would make detecting a three-event fork in a million-event
-room cost a million-node traversal, which is exactly the cost this section
-claims to remove. The window is found by a bounded reverse breadth-first search
-from the tips that stops as soon as the frontiers meet, with the budget applied
-to nodes *visited*.
+The window is found by a bounded reverse breadth-first search from the tips
+that stops as soon as the frontiers meet, with the budget applied to nodes
+*visited* (`RoomLog::fork_window`). It no longer feeds resolution — resolution
+takes whole states, which every entry already has (§6) — and stays as the
+bounded ancestry measurement it is, for diagnostics and the benchmarks.
 
-### 9.2 Three cases, cheapest first
+### 9.2 One rule: resolve whenever the parents' states differ
 
-**Case 1 — non-state event, no state conflict (the common case, ~99%).**
-The incoming event is not a state event. It cannot conflict with anything. Its
-DAG position is behind our head, but the client-visible order is `li` order, and
-`li` order is a valid linearization of the DAG. Append at the tail with
-`prev_li = head`, preserving its original `prev_events` in `federation_json`
-(we must not alter a signed event). Cost: identical to §8.1. **No state
-resolution.**
+Wherever Spindle needs one state from several — the state before an event
+(received, authored here, or asked for by `/state_ids`), and the room's current
+state over its forward extremities — it compares the parents' state roots:
 
-**Case 2 — state event, no conflict in window.**
-The incoming event is a state event whose `(type, state_key)` was not modified
-by any event in the fork window. The fold is order-independent for
-non-overlapping keys, so `apply()` at the tail produces exactly the state that
-state res v2 would produce. Append at the tail. Cost: one `apply()`. **No state
-resolution.**
+- **One parent, or parents with identical state:** that state. No resolution.
+  This is the common case by far: a fork of messages, a non-state event on a
+  stale parent, and every event of a linear room. It is also the only case in
+  which the old fork merge provably equals state resolution: with identical
+  inputs the conflicted set is empty in every room version's algorithm, and
+  each returns the input unchanged.
+- **Parents with different states:** the room version's algorithm — v1 for
+  room version 1 (`state_res_v1`), v2 for versions 2–11, v2.1 for version 12
+  — over the parents' materialized states (`spindle_server::state_res`).
 
-**Case 3 — state event conflicting within the window.**
-Run State Resolution v2, but with both inputs bounded by the window:
+Cost is the fork's, not the room's. Inputs are snapshots in hand; the auth
+difference is Synapse's walk over a ranked, cached auth DAG, stopping as soon
+as every set reaches what is left; resolutions are cached by the content
+addresses of their inputs, so the next local event, the room's current state
+and a peer's event over the same tips share one. ADR 0005 has the details.
 
-- The conflicted state set is the ≤`|window|` state events in the window plus
-  the incoming event.
-- The auth difference is computed over the auth events of *those events only*,
-  which are already resident in the trie — not over the room's auth chain.
+### 9.3 Receipt checks and the current state
 
-The resolved state is materialized as a new root and appended as a state
-correction. Cost: O(|window| log |window|) with a small constant, over a set that
-is almost always under ten events.
+A received PDU passes the spec's checks in the spec's order: against its auth
+events, against the state before it (§9.2), and — unless its parents are
+exactly the forward extremities — against the room's current state. Failing
+either of the first two rejects it; failing only the third soft-fails it. Both
+are kept outside the linear log (`SidelinedEntry`): a later event may name
+them, and its state is computed through them, but they have no `li`, no stream
+position and no client-visible body, and neither is a forward extremity.
 
-### 9.3 Equivalence argument
-
-The claim that makes this safe: **on a chain, `fold` and `state_res_v2` agree,
-and on a fork, window-bounded state res agrees with full state res.**
-
-- On a chain, the conflicted state set is empty (no two branches), so state res
-  v2 reduces to "take the unconflicted state", which is exactly the fold.
-- On a fork, events at `li <= A` are common ancestors of both branches and
-  therefore unconflicted by definition; state res v2 passes unconflicted state
-  through unchanged. Restricting the input to the window is therefore not an
-  approximation — it discards only inputs that provably cannot change the output.
-
-This is stated as a theorem and tested as one: §19.2 specifies a differential
-property test that runs both algorithms over generated DAGs and asserts equality.
+The room's current state is its forward extremities' states resolved
+(`RoomLog::current_state`): with one extremity, that event's state; with
+several, recorded after every append and recomputed once when a room reopens
+with a fork open. It — not the state after the newest entry, which after a fork
+is one branch's — is what local events are authorized against and what
+clients are told.
 
 ### 9.4 Making forks impossible
 
-Case 3 exists only because legacy peers author their own `prev_events`. Under
+Forks exist only because legacy peers author their own `prev_events`. Under
 MSC3995 (§12) participants submit *proposals* and the hub assigns
 `prev_event`, so a fork cannot be constructed. For rooms where every peer is
 LM-capable, the class is H, and §9 is unreachable code.
@@ -1000,7 +1001,8 @@ operator toil.
 
 Implementation language is **Rust**, on the `ruma` crate family for spec types:
 `ruma-events`, `ruma-client-api`, `ruma-federation-api`, `ruma-common`,
-`ruma-signatures`, and `ruma-state-res` (used *only* in the §9.2 case-3 path).
+`ruma-signatures`, and `ruma-state-res` (the auth predicate everywhere, and state
+resolution wherever an event's parents hold different states, §9.2).
 Unstable MSCs are gated behind Cargo features (`unstable-msc3995`,
 `unstable-msc3820`, `unstable-msc4186`, `unstable-msc4244`, `unstable-msc4256`),
 so nothing experimental compiles into a production binary by accident.
@@ -1102,7 +1104,7 @@ the rows where Synapse and the Rust servers diverge.
 | `/sync` incremental (active client) | Stream queries per stream type | Ring-buffer slice, no storage read |
 | Join room with S state events | Fetch + state res over S | Fetch + S folds, no state res |
 | Federation catch-up after outage | Graph walk to find what to resend | Sequential scan of `stream` |
-| Concurrent-send merge | State res v2 over the conflicted set. Measured at 2.2–3.1× our cost across the whole fork range (`docs/benchmarks.md`) — a constant factor, not a superlinear gap | Case 1/2: none. Case 3: bounded window |
+| Concurrent-send merge | State res v2 over the conflicted set | Identical parent states: none. Otherwise the same algorithm, over snapshots in hand, with a cached auth DAG and resolution cache (§9.2, ADR 0005) |
 
 ### 18.2 Latency budget, local send, class L
 
@@ -1157,16 +1159,17 @@ because Spindle is faster-but-different is a bug in Spindle.
 
 ### 19.2 Differential property testing — the core safety net
 
-The load-bearing claim of this design is §9.3. It is tested directly:
+The load-bearing claims of this design are the fold (§6) and §9.2's resolver.
+They are tested directly:
 
 ```
 property linear_fold_matches_state_res:
     for arbitrary chain DAG D:
         assert fold_state(D) == ruma_state_res_v2(D)
 
-property window_bounded_matches_full:
-    for arbitrary forked DAG D with fork depth ≤ max_fork_window:
-        assert window_state_res(D) == ruma_state_res_v2(D)
+property live_resolver_matches_reference:
+    for arbitrary contested fork F, in every room-version family:
+        assert RoomResolver(F) == ruma_state_res(F, full auth chains)
 
 property linearization_is_valid_topological_order:
     for arbitrary DAG D:

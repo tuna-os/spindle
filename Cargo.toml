@@ -1,6 +1,7 @@
 [workspace]
 members = ["crates/spindle-core", "crates/spindle-server", "crates/spindle-store"]
 resolver = "2"
+exclude = ["vendor/ruma-state-res"]
 
 [workspace.package]
 edition = "2024"
@@ -75,3 +76,6 @@ pedantic = "deny"
 # large stack frame is a crash on a deep call, and a large future is a
 # per-request allocation. See clippy.toml for the thresholds.
 large_stack_frames = "deny"
+
+[patch.crates-io]
+ruma-state-res = { path = "vendor/ruma-state-res" }

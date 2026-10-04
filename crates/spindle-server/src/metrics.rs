@@ -68,6 +68,8 @@ pub enum Origin {
 pub struct Metrics {
     fork_cases: [AtomicU64; 3],
     events: [AtomicU64; 2],
+    /// `[soft-failed, rejected]` PDUs kept out of the timeline.
+    sidelined: [AtomicU64; 2],
     /// `[exclusive, shared]` acquisitions of one room's lock.
     room_locks: [AtomicU64; 2],
     /// `[exclusive, shared]` acquisitions of the registry that finds rooms.
@@ -166,6 +168,15 @@ impl Metrics {
         self.fork_cases[ForkCase::StateContested.index()].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a received PDU kept for the DAG but out of the timeline: one
+    /// that failed the auth checks against its auth events or the state
+    /// before it (`rejected`), or only against the room's current state
+    /// (soft-failed). A peer whose events keep landing here disagrees with
+    /// this server about the room's state, which is the thing to look at.
+    pub fn record_sidelined(&self, rejected: bool) {
+        self.sidelined[usize::from(rejected)].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// The exposition, in the Prometheus text format.
     #[must_use]
     pub fn render(&self) -> String {
@@ -224,6 +235,19 @@ impl Metrics {
                 "spindle_fork_resolutions_total{{case=\"{}\"}} {}",
                 case.label(),
                 self.fork_cases[case.index()].load(Ordering::Relaxed)
+            );
+        }
+
+        out.push_str(
+            "# HELP spindle_pdus_sidelined_total Received events kept out of the timeline \
+         by the checks on receipt of a PDU.\n\
+         # TYPE spindle_pdus_sidelined_total counter\n",
+        );
+        for (verdict, index) in [("soft_failed", 0), ("rejected", 1)] {
+            let _ = writeln!(
+                out,
+                "spindle_pdus_sidelined_total{{verdict=\"{verdict}\"}} {}",
+                self.sidelined[index].load(Ordering::Relaxed)
             );
         }
 

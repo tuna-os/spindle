@@ -149,6 +149,127 @@ impl EntryRecord {
     }
 }
 
+/// A soft-failed or rejected event held outside the timeline
+/// (`spindle_core::SidelinedEntry`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SidelinedRecord {
+    pub event_id: String,
+    pub prev_events: Vec<String>,
+    pub depth: u64,
+    pub state_key: Option<(String, String)>,
+    /// 1 soft-failed, 2 rejected.
+    pub kind: u8,
+    pub state_root: [u8; 32],
+}
+
+impl SidelinedRecord {
+    #[must_use]
+    pub fn from_entry(entry: &spindle_core::SidelinedEntry) -> Self {
+        Self {
+            event_id: entry.event_id.as_str().to_owned(),
+            prev_events: entry
+                .prev_events
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect(),
+            depth: entry.depth,
+            state_key: entry.state_key.as_ref().map(|key| {
+                (
+                    key.event_type().as_str().to_owned(),
+                    key.state_key().to_owned(),
+                )
+            }),
+            kind: match entry.kind {
+                spindle_core::Sideline::SoftFailed => 1,
+                spindle_core::Sideline::Rejected => 2,
+            },
+            state_root: *entry.state_root.as_bytes(),
+        }
+    }
+
+    /// The entry this record describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError::Malformed`] for a verdict this version does not
+    /// define.
+    pub fn to_entry(&self) -> Result<spindle_core::SidelinedEntry, CodecError> {
+        Ok(spindle_core::SidelinedEntry {
+            event_id: EventId::new(self.event_id.as_str()),
+            prev_events: self
+                .prev_events
+                .iter()
+                .map(|id| EventId::new(id.as_str()))
+                .collect(),
+            depth: self.depth,
+            state_key: self
+                .state_key
+                .as_ref()
+                .map(|(event_type, key)| StateKey::new(event_type.as_str(), key.as_str())),
+            kind: match self.kind {
+                1 => spindle_core::Sideline::SoftFailed,
+                2 => spindle_core::Sideline::Rejected,
+                other => return Err(CodecError::Malformed(other)),
+            },
+            state_root: spindle_core::StateRoot::from_bytes(self.state_root),
+        })
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![RECORD_VERSION, self.kind];
+        out.extend_from_slice(&self.depth.to_be_bytes());
+        out.extend_from_slice(&self.state_root);
+        put_str(&mut out, &self.event_id);
+        put_len(&mut out, self.prev_events.len());
+        for parent in &self.prev_events {
+            put_str(&mut out, parent);
+        }
+        match &self.state_key {
+            Some((event_type, state_key)) => {
+                out.push(1);
+                put_str(&mut out, event_type);
+                put_str(&mut out, state_key);
+            }
+            None => out.push(0),
+        }
+        out
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] for an unknown version or a truncated record.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut cursor = Cursor { bytes, at: 0 };
+        let version = cursor.byte()?;
+        if version != RECORD_VERSION {
+            return Err(CodecError::UnsupportedVersion(version));
+        }
+        let kind = cursor.byte()?;
+        let depth = u64::from_be_bytes(cursor.array::<8>()?);
+        let state_root = cursor.array::<32>()?;
+        let event_id = cursor.string()?;
+        let parent_count = cursor.count()?;
+        let mut prev_events = Vec::with_capacity(parent_count);
+        for _ in 0..parent_count {
+            prev_events.push(cursor.string()?);
+        }
+        let state_key = match cursor.byte()? {
+            0 => None,
+            1 => Some((cursor.string()?, cursor.string()?)),
+            other => return Err(CodecError::Malformed(other)),
+        };
+        Ok(Self {
+            event_id,
+            prev_events,
+            depth,
+            state_key,
+            kind,
+            state_root,
+        })
+    }
+}
+
 /// Per-room durable metadata: the counters and heads a reopen must recover.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoomRecord {

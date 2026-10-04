@@ -23,7 +23,10 @@ use ruma::room_version_rules::RoomVersionRules;
 use ruma::signatures::Ed25519KeyPair;
 use ruma::{CanonicalJsonObject, CanonicalJsonValue, RoomVersionId};
 use serde_json::{Map, Value};
-use spindle_core::{EventId, EventInput, LogEntry, Pdu, RoomLog, StateKey, is_state_dag};
+use spindle_core::{
+    AppendError, EventId, EventInput, LogEntry, Pdu, RoomLog, Sideline, StateKey, StateResolver,
+    StateRoot, StateSnapshot, is_state_dag,
+};
 use spindle_store::{Durability, FjallStore, RoomStore, StoreError};
 
 /// Native rooms are v11 (SPEC §11.6).
@@ -246,6 +249,13 @@ pub struct Rooms {
     /// paths while warm; a room not in the map is recomputed on demand.
     /// Rooms of stock versions never appear here.
     state_heads: Mutex<HashMap<String, BTreeSet<String>>>,
+    /// Each room's auth DAG, built as state resolution needs it and kept
+    /// while the server runs (`state_res::AuthGraph`). A state event's auth
+    /// edges are part of its signed body, so nothing here goes stale.
+    auth_graphs: Mutex<HashMap<String, Arc<Mutex<crate::state_res::AuthGraph>>>>,
+    /// Resolutions already computed, keyed by the roots of the states they
+    /// resolved (`state_res::ResolutionCache`).
+    resolutions: crate::state_res::ResolutionCache,
     /// The server-global order `/sync` needs (SPEC §10.2). The linear index
     /// orders events within one room; nothing orders them across rooms, so
     /// this is the one counter that exists purely because a per-room order is
@@ -459,6 +469,8 @@ impl Rooms {
             destinations: Mutex::new(HashMap::new()),
             room_versions: Mutex::new(HashMap::new()),
             state_heads: Mutex::new(HashMap::new()),
+            auth_graphs: Mutex::new(HashMap::new()),
+            resolutions: crate::state_res::ResolutionCache::default(),
             // Resumed, not reset. A counter that restarted at zero would
             // re-issue stream ids already on disk, overwriting the entries
             // they point at -- the same shape of bug as a room registry that
@@ -470,6 +482,47 @@ impl Rooms {
             )),
             appended: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Install a room's in-memory log as built elsewhere, replacing any open
+    /// one, and store event bodies under it.
+    ///
+    /// For the corpus replay (`contrib/corpus-state-res`) only: it seeds a
+    /// log with a fork's parents at the states Synapse recorded for them,
+    /// then hands the merge event to [`Self::receive_remote`] -- the live
+    /// path -- and compares what it resolves with Synapse's answer. Behind
+    /// a feature so no server build can reach it.
+    #[cfg(feature = "corpus-replay")]
+    #[doc(hidden)]
+    pub fn install_replay_log(&self, room_id: &str, log: RoomLog) {
+        self.open
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(room_id.to_owned(), Arc::new(RwLock::new(log)));
+    }
+
+    /// Store event bodies for [`Self::install_replay_log`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the store cannot be written.
+    #[cfg(feature = "corpus-replay")]
+    #[doc(hidden)]
+    pub fn store_replay_bodies(
+        &self,
+        room_id: &str,
+        bodies: &[(String, Value)],
+    ) -> Result<(), RoomError> {
+        let mut writes = Vec::with_capacity(bodies.len() * 2);
+        for (event_id, body) in bodies {
+            writes.push((event_body_key(room_id, event_id), serde_json::to_vec(body)?));
+            writes.push((
+                spindle_core::keys::event_room(event_id),
+                room_id.as_bytes().to_vec(),
+            ));
+        }
+        spindle_store::Store::commit(self.store.as_ref(), &writes, Durability::Group)?;
+        Ok(())
     }
 
     /// Create a room and return its ID.
@@ -556,7 +609,7 @@ impl Rooms {
         // identity being established.
         let (create_id, create_json, room_id) = self.birth(creator, key, &create_content)?;
         let mut log = RoomLog::new();
-        self.authorize(&log, &room_id, &create_id, &create_json)?;
+        self.authorize(&log, &room_id, &create_id, &create_json, None)?;
         self.commit_event(
             &mut log,
             &room_id,
@@ -1184,11 +1237,7 @@ impl Rooms {
     /// Returns [`RoomError`] if the room is unknown or a body is missing.
     fn state_serialized(&self, room_id: &str) -> Result<Arc<String>, RoomError> {
         let root = self.with_room_read(room_id, |_, log| {
-            Ok(log
-                .entries()
-                .next_back()
-                .and_then(|head| log.state_after(head.li))
-                .map(|state| *state.root().as_bytes()))
+            Ok(log.current_state().map(|state| *state.root().as_bytes()))
         })?;
         let Some(root) = root else {
             // A room with no state renders as the empty array; not worth a
@@ -1414,11 +1463,7 @@ impl Rooms {
         // ID makes the choice reproducible. `for_each` yields state keys in
         // order, so taking the first is exactly that.
         let mut fallback = None;
-        let Some(state) = log
-            .entries()
-            .next_back()
-            .and_then(|head| log.state_after(head.li))
-        else {
+        let Some(state) = log.current_state() else {
             return Ok(None);
         };
         state.for_each(|key, _| {
@@ -1478,9 +1523,8 @@ impl Rooms {
         content: &Value,
         room_id: Option<&str>,
     ) -> Result<(String, Value), RoomError> {
-        let empty = RoomLog::new();
         let auth = auth_events_for(
-            &empty,
+            None,
             &rules_of(&version_in(content)?)?.authorization,
             creator,
             "m.room.create",
@@ -1640,12 +1684,7 @@ impl Rooms {
     /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
     pub fn roster(&self, room_id: &str) -> Result<Arc<Roster>, RoomError> {
         let (root, members) = self.with_room_read(room_id, |_, log| {
-            let root = log
-                .entries()
-                .next_back()
-                .map(|entry| entry.li)
-                .and_then(|li| log.state_after(li))
-                .map(|state| *state.root().as_bytes());
+            let root = log.current_state().map(|state| *state.root().as_bytes());
             let members = current_state(log)
                 .into_iter()
                 .filter(|(key, _)| key.event_type().as_str() == "m.room.member")
@@ -1865,7 +1904,16 @@ impl Rooms {
         // The room has to exist before its events can be looked up, or an
         // unknown room would answer "no such event" and a client could not
         // tell the two apart.
-        self.with_room_read(room_id, |_, _| Ok(()))?;
+        // A soft-failed or rejected event is held for the DAG only; the spec
+        // keeps it from clients, so here it is as absent as one never sent.
+        self.with_room_read(room_id, |_, log| {
+            if log.sidelined(&EventId::new(event_id)).is_some()
+                || log.historically_rejected(&EventId::new(event_id))
+            {
+                return Err(RoomError::MissingBody(event_id.to_owned()));
+            }
+            Ok(())
+        })?;
         let mut event = self.read_event(room_id, &EventId::new(event_id))?;
         if let Some(object) = event.as_object_mut() {
             object.insert("event_id".to_owned(), Value::String(event_id.to_owned()));
@@ -2389,7 +2437,10 @@ impl Rooms {
         snapshot.for_each(|_, event_id| ids.push(event_id.to_owned()));
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            let event = self.event(room_id, &id)?;
+            // Federation state must carry the signed PDU. A client event
+            // adds event_id; hashing it at the joining server changes the
+            // reference hash and breaks later auth-event lookups.
+            let event = self.pdu(room_id, &id)?;
             out.push((id, event));
         }
         Ok(out)
@@ -4083,7 +4134,22 @@ impl Rooms {
         let restored = RoomStore::new(self.store.as_ref(), room_id)
             .load()?
             .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
-        let room = Arc::new(RwLock::new(restored.log));
+        let mut log = restored.log;
+        // A room closed with a fork open reopens with several extremities
+        // and no recorded resolution: resolve it now, once, so every reader
+        // after this sees the room's current state rather than one branch's.
+        if !log.current_is_settled() {
+            match self.resolve_in(&log, room_id, |log, resolver, load| {
+                log.resolve_current(resolver, load)
+            }) {
+                Ok(current) => log.set_current(current),
+                Err(error) => tracing::warn!(
+                    room = room_id,
+                    "cannot resolve the reopened room's forward extremities: {error}"
+                ),
+            }
+        }
+        let room = Arc::new(RwLock::new(log));
         open.insert(room_id.to_owned(), Arc::clone(&room));
         Ok(room)
     }
@@ -4154,19 +4220,20 @@ impl Rooms {
         content: &Value,
         sticky_ms: Option<u64>,
     ) -> Result<(String, Value), RoomError> {
-        // Before `prev` is read, so the event names only tips that fold.
-        self.set_aside_contested(log, room_id)?;
         let depth = log
             .entries()
             .next_back()
             .map_or(0, |entry| entry.depth.saturating_add(1));
-        let prev: Vec<String> = log
-            .authoring_extremities()
-            .map(|id| id.as_str().to_owned())
-            .collect();
+        let parents: Vec<EventId> = log.authoring_extremities().cloned().collect();
+        let prev: Vec<String> = parents.iter().map(|id| id.as_str().to_owned()).collect();
+        // The state the event sits on: its parents' states, resolved by the
+        // room version's algorithm when a fork left them different. That is
+        // what it is authorized against and what its auth events cite --
+        // the room's current state, whenever it names every extremity.
+        let (state_before, _) = self.state_for_parents(log, room_id, &parents)?;
 
         let auth = auth_events_for(
-            log,
+            Some(&state_before),
             &self.rules_in(log, room_id)?.authorization,
             sender,
             event_type,
@@ -4257,7 +4324,9 @@ impl Rooms {
         // client; storing all three gives every client-facing read path the
         // same complete event without making timeline reads reopen state.
         if let Some(state_key) = state_key
-            && let Some(previous_id) = current_state_id(log, &StateKey::new(event_type, state_key))
+            && let Some(previous_id) = state_before
+                .get(&StateKey::new(event_type, state_key))
+                .map(str::to_owned)
             && let Ok(previous) = self.read_event(room_id, &EventId::new(previous_id.as_str()))
             && let Some(object) = json.as_object_mut()
         {
@@ -4275,7 +4344,7 @@ impl Rooms {
         // holds materialized. Signing first costs a wasted signature on a
         // refused event and buys something worth more: what gets authorized is
         // exactly the bytes a peer would receive, event ID included.
-        self.authorize(log, room_id, &event_id, &json)?;
+        self.authorize(log, room_id, &event_id, &json, Some(&state_before))?;
         Ok((event_id, json))
     }
 
@@ -4320,35 +4389,201 @@ impl Rooms {
         Ok(())
     }
 
-    /// Step around a fork this server cannot fold, and say so.
+    /// The state an event naming `parents` sits on, and whether producing
+    /// it took a resolution (the parents held different states).
     ///
-    /// SPEC §9.2 case 3 reaches here with no resolver behind it (#16). The
-    /// core sets the contesting tip aside so that what remains folds
-    /// (`RoomLog::set_aside_contested`); this is where that decision is
-    /// counted and logged. Once per tip, not once per send: the tip stays
-    /// set aside until something builds on it, so a later send finds
-    /// nothing to set aside and costs one fold. A count that moved on every
-    /// send while one fork stayed open would make §18.3's ratio a measure
-    /// of how chatty the local users are rather than of forks.
-    ///
-    /// The log line is the anomaly record SPEC §9.1 asks for. It spells the
-    /// key the way `/state_ids` does and names the tip set aside, which is
-    /// what an operator needs to find the branch this server is not
-    /// showing.
-    fn set_aside_contested(&self, log: &mut RoomLog, room_id: &str) -> Result<(), RoomError> {
-        let set_aside = log
-            .set_aside_contested()
-            .map_err(|error| RoomError::Append(format!("{error:?}")))?;
-        for spindle_core::SetAside { extremity, key } in set_aside {
-            self.metrics.record_contested_state();
-            let key = format!("{}/{}", key.event_type().as_str(), key.state_key());
-            tracing::warn!(
+    /// One parent, or parents that agree, cost nothing; anything else is
+    /// the room version's resolver (`state_res`), whose results are cached
+    /// by the roots they resolved.
+    fn state_for_parents(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        parents: &[EventId],
+    ) -> Result<(StateSnapshot, bool), RoomError> {
+        let mut roots = BTreeSet::new();
+        for parent in parents {
+            if let Some(entry) = log.get(parent) {
+                roots.insert(*entry.state_root.as_bytes());
+            } else if let Some(sidelined) = log.sidelined(parent) {
+                roots.insert(*sidelined.state_root.as_bytes());
+            } else {
+                return Err(RoomError::Append(format!(
+                    "{:?}",
+                    AppendError::UnknownPredecessor(parent.clone())
+                )));
+            }
+        }
+        if roots.len() <= 1 {
+            let mut load = |root: &StateRoot| self.load_node(root);
+            let state = log
+                .resolve_parents(parents, &mut spindle_core::Strict, &mut load)
+                .map_err(|error| self.append_error(&error))?;
+            return Ok((state, false));
+        }
+        let state = self.resolve_in(log, room_id, |log, resolver, load| {
+            log.resolve_parents(parents, resolver, load)
+        })?;
+        Ok((state, true))
+    }
+
+    /// Run `work` with this room's resolver: the room version's algorithm
+    /// over the room's bodies, auth DAG and the shared resolution cache.
+    fn resolve_in<T>(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        work: impl FnOnce(
+            &RoomLog,
+            &mut dyn StateResolver,
+            &mut dyn FnMut(&StateRoot) -> Option<Vec<u8>>,
+        ) -> Result<T, AppendError>,
+    ) -> Result<T, RoomError> {
+        let rules = self.rules_in(log, room_id)?;
+        let graph = self.auth_graph(room_id);
+        let body = |id: &str| self.read_event(room_id, &EventId::new(id)).ok();
+        let mut resolver = crate::state_res::RoomResolver::new(
+            &rules,
+            room_id,
+            log,
+            &body,
+            &graph,
+            &self.resolutions,
+        );
+        let mut load = |root: &StateRoot| self.load_node(root);
+        let started = std::time::Instant::now();
+        let result = work(log, &mut resolver, &mut load);
+        let stats = resolver.stats;
+        if stats.resolutions > 0 {
+            tracing::info!(
                 room = room_id,
-                extremity = extremity.as_str(),
-                key = key.as_str(),
-                "a federated fork contests a state key this server cannot resolve yet (#16); \
-                 the branch is set aside and local events are authored without it"
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                auth_graph = graph
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+                "resolved a fork's state with the room version's algorithm"
             );
+        }
+        result.map_err(|error| self.append_error(&error))
+    }
+
+    /// The room's auth DAG, created empty on first use.
+    fn auth_graph(&self, room_id: &str) -> Arc<Mutex<crate::state_res::AuthGraph>> {
+        Arc::clone(
+            self.auth_graphs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(room_id.to_owned())
+                .or_default(),
+        )
+    }
+
+    /// One stored state-trie node, by its content address.
+    fn load_node(&self, root: &StateRoot) -> Option<Vec<u8>> {
+        spindle_store::ReadView::get(
+            self.store.as_ref(),
+            &spindle_core::keys::content_addressed(
+                spindle_core::keys::Keyspace::StateNode,
+                root.as_bytes(),
+            ),
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// An append failure as a room error, naming a resolution failure as
+    /// what it is.
+    fn append_error(&self, error: &AppendError) -> RoomError {
+        match error {
+            AppendError::NeedsStateResolution { key, .. } => {
+                self.metrics.record_contested_state();
+                RoomError::Contested {
+                    // The `type/state_key` spelling `/state_ids` uses, so an
+                    // operator can match this against what the room reports.
+                    key: format!("{}/{}", key.event_type().as_str(), key.state_key()),
+                }
+            }
+            AppendError::ResolutionFailed(why) => {
+                RoomError::Append(format!("state resolution failed: {why}"))
+            }
+            other => RoomError::Append(format!("{other:?}")),
+        }
+    }
+
+    /// Bring the room's current state up to date after an append, and the
+    /// membership index with it.
+    ///
+    /// With one forward extremity the current state is that event's state
+    /// and there is nothing to do. With several it is their resolution,
+    /// computed here. When the append was not the plain linear case -- one
+    /// tip, built on by one event -- the current state may have moved by
+    /// more than the event itself, so every membership it moved is
+    /// re-indexed from the resolved state rather than from the event.
+    fn settle(
+        &self,
+        log: &mut RoomLog,
+        room_id: &str,
+        entry: Option<&LogEntry>,
+        previous_current: Option<StateSnapshot>,
+        previous_tips: &BTreeSet<EventId>,
+    ) -> Result<(), RoomError> {
+        if log.forward_extremities().len() > 1 {
+            match self.resolve_in(log, room_id, |log, resolver, load| {
+                log.resolve_current(resolver, load)
+            }) {
+                Ok(current) => log.set_current(current),
+                Err(error) => {
+                    tracing::warn!(
+                        room = room_id,
+                        "cannot resolve the room's current state over its forward                          extremities: {error}"
+                    );
+                }
+            }
+        }
+        let linear = entry.is_some_and(|entry| {
+            previous_tips.len() == 1
+                && entry.prev_events.len() == 1
+                && entry
+                    .prev_events
+                    .first()
+                    .is_some_and(|parent| previous_tips.contains(parent))
+        }) && log.forward_extremities().len() == 1;
+        if linear {
+            return Ok(());
+        }
+        let Some(after) = log.current_state().cloned() else {
+            return Ok(());
+        };
+        let mut keys: BTreeSet<StateKey> = previous_current
+            .map(|before| {
+                before
+                    .diff(&after)
+                    .into_iter()
+                    .map(|(key, _, _)| key.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(key) = entry.and_then(|entry| entry.state_key.clone()) {
+            keys.insert(key);
+        }
+        for key in keys {
+            if key.event_type().as_str() != "m.room.member" {
+                continue;
+            }
+            let (content, li) = match after.get(&key) {
+                Some(id) => {
+                    let id = EventId::new(id);
+                    let body = self.read_event(room_id, &id)?;
+                    let li = log.get(&id).or(entry).map_or(0, |entry| entry.li.get());
+                    (body["content"].clone(), li)
+                }
+                None => (
+                    serde_json::json!({ "membership": "leave" }),
+                    entry.map_or(0, |entry| entry.li.get()),
+                ),
+            };
+            self.index_membership(room_id, Some(key.state_key()), &content, li)?;
         }
         Ok(())
     }
@@ -4419,36 +4654,26 @@ impl Rooms {
             .map(EventId::new)
             .collect();
 
+        // Resolved again rather than carried over from `build_event`: the
+        // two are the same question, so this is a cache hit, and for an
+        // event built before the log moved it is the right answer anyway.
+        let (state_before, resolved) = self.state_for_parents(log, room_id, &prev)?;
         let input = EventInput::new(event_id.clone(), prev);
         let input = match state_key {
             Some(state_key) => input.with_state_key(StateKey::new(event_type, state_key)),
             None => input,
         };
 
+        let previous_current = log.current_state().cloned();
+        let previous_tips = log.forward_extremities().clone();
         let entry = log
-            .append_remote(input)
-            .map_err(|error| {
-                // §9.2 case 3: the key is contested inside the window, so
-                // this append needs the resolver. `build_event` set the
-                // contesting tips aside before naming any, so this is
-                // reached only when the fork landed between building and
-                // committing -- the invite handshake leaves that gap open.
-                // Counted where the decision is made (#166), whether it
-                // is then resolved or — as today — refused.
-                if let spindle_core::AppendError::NeedsStateResolution { key, .. } = &error {
-                    self.metrics.record_contested_state();
-                    return RoomError::Contested {
-                        // The `type/state_key` spelling `/state_ids` uses,
-                        // so an operator can match this against what the
-                        // room actually reports holding.
-                        key: format!("{}/{}", key.event_type().as_str(), key.state_key()),
-                    };
-                }
-                RoomError::Append(format!("{error:?}"))
-            })?
+            .append_resolved(input, state_before)
+            .map_err(|error| self.append_error(&error))?
             .clone();
-        self.metrics
-            .record_append(crate::metrics::Origin::Local, case_of(state_key.is_some()));
+        self.metrics.record_append(
+            crate::metrics::Origin::Local,
+            case_of(state_key.is_some(), resolved),
+        );
 
         self.persist_entry(
             log,
@@ -4463,6 +4688,7 @@ impl Rooms {
                 json: &json,
             },
         )?;
+        self.settle(log, room_id, Some(&entry), previous_current, &previous_tips)?;
         self.enqueue_outbound(log, room_id, &json)?;
         Ok(event_id)
     }
@@ -4522,12 +4748,7 @@ impl Rooms {
     /// reentrant. Same rule as [`Self::rules_in`], and the same deadlock if
     /// it is broken.
     fn destinations_in(&self, log: &RoomLog, room_id: &str) -> Result<Arc<Vec<String>>, RoomError> {
-        let Some(state) = log
-            .entries()
-            .next_back()
-            .map(|entry| entry.li)
-            .and_then(|li| log.state_after(li))
-        else {
+        let Some(state) = log.current_state() else {
             return Ok(Arc::new(Vec::new()));
         };
         let root = *state.root().as_bytes();
@@ -4597,9 +4818,30 @@ impl Rooms {
             == Some(JOIN_STR.as_bytes()))
     }
 
-    /// The shared back half of receiving a complete, signed event: dedupe,
-    /// authorize, append, persist — and fan out only when this server is the
-    /// event's origin, because each server fans out its own events.
+    /// The shared back half of receiving a complete, signed event: the
+    /// spec's checks on receipt of a PDU, then append and persist -- and
+    /// fan out only when this server is the event's origin, because each
+    /// server fans out its own events.
+    ///
+    /// The checks, in the spec's order
+    /// (<https://spec.matrix.org/v1.16/server-server-api/#checks-performed-on-receipt-of-a-pdu>):
+    ///
+    /// 1. against the event's own auth events -- the state-independent rules
+    ///    on the list itself, then the rules against the state it names;
+    /// 2. against the state before the event: its parents' states, resolved
+    ///    by the room version's algorithm when they differ;
+    /// 3. against the room's current state, unless the event's parents are
+    ///    exactly the forward extremities (then the two are the same state).
+    ///
+    /// Failing 1 or 2 rejects the event; failing only 3 soft-fails it. Both
+    /// are kept, outside the timeline (`Sideline`): a later event may name
+    /// either as a parent, and its state is computed through them. An event
+    /// that passes is appended with the state before it, and the room's
+    /// current state is re-resolved over the new forward extremities.
+    ///
+    /// Parents or auth events this server does not hold are refused without
+    /// keeping anything: that is a gap to fill, not a verdict.
+    #[allow(clippy::too_many_lines, reason = "the receipt checks, in order")]
     fn ingest(
         &self,
         log: &mut RoomLog,
@@ -4609,16 +4851,81 @@ impl Rooms {
         fan_out: bool,
     ) -> Result<(), RoomError> {
         // Redelivery is not an error: transactions retry, and the event
-        // is already exactly where it would go.
+        // is already exactly where it would go. A redelivered event that
+        // was refused is refused again, with the same verdict.
         if log.get(&EventId::new(event_id)).is_some() {
             return Ok(());
         }
+        if log.historically_rejected(&EventId::new(event_id)) {
+            return Err(RoomError::Forbidden(format!(
+                "rejected: {event_id} was rejected before migration"
+            )));
+        }
+        if let Some(sidelined) = log.sidelined(&EventId::new(event_id)) {
+            return Err(RoomError::Forbidden(match sidelined.kind {
+                Sideline::SoftFailed => format!("{event_id} was soft-failed"),
+                Sideline::Rejected => format!("{event_id} was rejected"),
+            }));
+        }
         self.check_state_parents(log, room_id, json)?;
-        self.authorize(log, room_id, event_id, json)?;
 
         let event_type = json["type"].as_str().unwrap_or_default().to_owned();
         let state_key = json["state_key"].as_str().map(str::to_owned);
         let sender = json["sender"].as_str().unwrap_or_default().to_owned();
+        let prev: Vec<EventId> = edge_ids(&json["prev_events"])
+            .into_iter()
+            .map(EventId::new)
+            .collect();
+        if prev.is_empty() {
+            return Err(RoomError::Append(format!(
+                "{:?}",
+                AppendError::MissingPredecessor
+            )));
+        }
+        let (state_before, resolved) = self.state_for_parents(log, room_id, &prev)?;
+        let verdict = self.receipt_checks(log, room_id, event_id, json, &state_before, &prev)?;
+
+        let input = EventInput::new(event_id, prev.clone());
+        let input = match &state_key {
+            Some(state_key) => {
+                input.with_state_key(StateKey::new(event_type.as_str(), state_key.as_str()))
+            }
+            None => input,
+        };
+
+        if let Some((kind, reason)) = verdict {
+            let entry = log
+                .sideline(input, state_before, kind)
+                .map_err(|error| self.append_error(&error))?
+                .clone();
+            let state = log
+                .sidelined_state(&entry.event_id)
+                .cloned()
+                .unwrap_or_default();
+            let mut load = |root: &StateRoot| self.load_node(root);
+            let previous = prev
+                .first()
+                .and_then(|parent| log.state_after_any(parent, &mut load).ok());
+            RoomStore::new(self.store.as_ref(), room_id).journal_sidelined(
+                &entry,
+                &state,
+                previous.as_ref(),
+                log,
+                &[
+                    (event_body_key(room_id, event_id), serde_json::to_vec(json)?),
+                    (
+                        spindle_core::keys::event_room(event_id),
+                        room_id.as_bytes().to_vec(),
+                    ),
+                ],
+            )?;
+            self.metrics.record_sidelined(kind == Sideline::Rejected);
+            return Err(RoomError::Forbidden(match kind {
+                Sideline::SoftFailed => format!("soft-failed against the current state: {reason}"),
+                Sideline::Rejected => format!("rejected: {reason}"),
+            }));
+        }
+
         let redaction_target = if event_type == "m.room.redaction" {
             let version = self.version_in_log(log, room_id)?;
             let rules = rules_of(&version)?;
@@ -4636,36 +4943,16 @@ impl Rooms {
         } else {
             None
         };
-        let prev: Vec<EventId> = edge_ids(&json["prev_events"])
-            .into_iter()
-            .map(EventId::new)
-            .collect();
 
-        let input = EventInput::new(event_id, prev);
-        let input = match &state_key {
-            Some(state_key) => {
-                input.with_state_key(StateKey::new(event_type.as_str(), state_key.as_str()))
-            }
-            None => input,
-        };
+        let previous_current = log.current_state().cloned();
+        let previous_tips = log.forward_extremities().clone();
         let entry = log
-            .append_remote(input)
-            .map_err(|error| {
-                if let spindle_core::AppendError::NeedsStateResolution { key, .. } = &error {
-                    self.metrics.record_contested_state();
-                    return RoomError::Contested {
-                        // The `type/state_key` spelling `/state_ids` uses,
-                        // so an operator can match this against what the
-                        // room actually reports holding.
-                        key: format!("{}/{}", key.event_type().as_str(), key.state_key()),
-                    };
-                }
-                RoomError::Append(format!("{error:?}"))
-            })?
+            .append_resolved(input, state_before)
+            .map_err(|error| self.append_error(&error))?
             .clone();
         self.metrics.record_append(
             crate::metrics::Origin::Federated,
-            case_of(state_key.is_some()),
+            case_of(state_key.is_some(), resolved),
         );
 
         let content = json["content"].clone();
@@ -4682,6 +4969,7 @@ impl Rooms {
                 json,
             },
         )?;
+        self.settle(log, room_id, Some(&entry), previous_current, &previous_tips)?;
         // A federated redaction has the same effect as one authored here.
         // The target's location changed in v11, so it was resolved above
         // under this room's rules rather than by looking in both places and
@@ -4697,6 +4985,132 @@ impl Rooms {
             self.enqueue_outbound(log, room_id, json)?;
         }
         Ok(())
+    }
+
+    /// The spec's checks on receipt of a PDU, past signatures and hashes:
+    /// `None` to accept, or the verdict and the rule that refused.
+    ///
+    /// A malformed event, or one whose auth events this server does not
+    /// hold, is an error rather than a verdict -- nothing is kept for it.
+    fn receipt_checks(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        event_id: &str,
+        json: &Value,
+        state_before: &StateSnapshot,
+        prev: &[EventId],
+    ) -> Result<Option<(Sideline, String)>, RoomError> {
+        use ruma::state_res::events::Event as _;
+
+        let candidate = StoredEvent::parse_in(event_id, room_id, json).map_err(|error| {
+            RoomError::Build(format!("cannot authorize a malformed event: {error}"))
+        })?;
+        let rules = self.rules_in(log, room_id)?;
+        let fetch =
+            |id: &ruma::EventId| -> Option<StoredEvent> {
+                let body = self.read_event(room_id, &EventId::new(id.as_str())).ok()?;
+                let event = StoredEvent::parse_auth_in(id.as_str(), room_id, &body).ok()?;
+                let rejected = log
+                    .sidelined(&EventId::new(id.as_str()))
+                    .is_some_and(|entry| entry.kind == Sideline::Rejected);
+                Some(event.with_rejected(rejected).with_preserved_rejection(
+                    log.historically_rejected(&EventId::new(id.as_str())),
+                ))
+            };
+
+        // 1. The auth events. A state-DAG room (MSC4242) carries none: its
+        // events are authorized by the state DAG, which 2 checks.
+        let version = self.version_in_log(log, room_id)?;
+        if !is_state_dag(&version) {
+            let missing = std::cell::Cell::new(false);
+            if let Err(why) = ruma::state_res::check_state_independent_auth_rules(
+                &rules.authorization,
+                candidate.clone(),
+                |id| {
+                    let event = fetch(id);
+                    if event.is_none() {
+                        missing.set(true);
+                    }
+                    event
+                },
+            ) {
+                // A known invalid auth entry is already a verdict, even if
+                // later entries are absent. Preserve its predecessor state
+                // so valid descendants can follow it. An actual missing
+                // dependency stays retryable and receives no stored verdict.
+                if missing.get() {
+                    return Err(RoomError::Append(format!("auth events: {why}")));
+                }
+                return Ok(Some((Sideline::Rejected, format!("auth events: {why}"))));
+            }
+            let mut named: HashMap<(ruma::events::StateEventType, String), StoredEvent> =
+                HashMap::new();
+            for id in candidate.auth_event_ids() {
+                let Some(event) = fetch(id) else {
+                    return Err(RoomError::Append(format!(
+                        "auth event {id} of {event_id} is not held here"
+                    )));
+                };
+                if let Some(key) = event.state_key() {
+                    named.insert(
+                        (
+                            ruma::events::StateEventType::from(event.event_type().to_string()),
+                            key.to_owned(),
+                        ),
+                        event,
+                    );
+                }
+            }
+            if rules.authorization.room_create_event_id_as_room_id
+                && let Some(hash) = room_id.strip_prefix('!')
+                && let Ok(create_id) = ruma::OwnedEventId::try_from(format!("${hash}"))
+                && let Some(create) = fetch(&create_id)
+            {
+                named.insert(
+                    (ruma::events::StateEventType::RoomCreate, String::new()),
+                    create,
+                );
+            }
+            if let Err(why) =
+                crate::authorize::authorize(&rules.authorization, &candidate, |kind, key| {
+                    named
+                        .get(&(kind.clone(), key.to_owned()))
+                        .filter(|event| !event.rejected())
+                        .cloned()
+                })
+            {
+                return Ok(Some((Sideline::Rejected, format!("auth events: {why}"))));
+            }
+        }
+
+        // 2. The state before the event.
+        let by_state = |state: &StateSnapshot, kind: &ruma::events::StateEventType, key: &str| {
+            let id = state.get(&StateKey::new(kind.to_string().as_str(), key))?;
+            fetch(&ruma::OwnedEventId::try_from(id).ok()?).filter(|event| !event.rejected())
+        };
+        if let Err(why) =
+            crate::authorize::authorize(&rules.authorization, &candidate, |kind, key| {
+                by_state(state_before, kind, key)
+            })
+        {
+            return Ok(Some((Sideline::Rejected, why)));
+        }
+
+        // 3. The room's current state -- skipped when the parents are the
+        // forward extremities, because then it is the state before.
+        let tips: BTreeSet<&EventId> = log.forward_extremities().iter().collect();
+        let parents: BTreeSet<&EventId> = prev.iter().collect();
+        if tips != parents
+            && let Some(current) = log.current_state()
+            && let Err(why) =
+                crate::authorize::authorize(&rules.authorization, &candidate, |kind, key| {
+                    by_state(current, kind, key)
+                })
+        {
+            return Ok(Some((Sideline::SoftFailed, why)));
+        }
+        Ok(None)
     }
 
     /// Everything an appended entry writes beside itself, shared by the
@@ -4931,22 +5345,23 @@ impl Rooms {
         room_id: &str,
         event_id: &str,
         json: &Value,
+        state: Option<&StateSnapshot>,
     ) -> Result<(), RoomError> {
         let candidate = StoredEvent::parse_in(event_id, room_id, json).map_err(|error| {
             RoomError::Build(format!("cannot authorize a malformed event: {error}"))
         })?;
 
-        // Nothing is resident before the create event, and the create event is
-        // the one the rules check without any state at all.
-        let state = log
-            .entries()
-            .next_back()
-            .map(|entry| entry.li)
-            .and_then(|li| log.state_after(li));
-
+        // `state` is what the event sits on: the state before it, which for
+        // an event naming every forward extremity is the current state.
+        // `None` only for the create event, which the rules check without
+        // any state at all.
         let load = |id: &str| -> Option<StoredEvent> {
             let body = self.read_event(room_id, &EventId::new(id)).ok()?;
-            StoredEvent::parse_in(id, room_id, &body).ok()
+            StoredEvent::parse_auth_in(id, room_id, &body)
+                .ok()
+                .map(|event| {
+                    event.with_preserved_rejection(log.historically_rejected(&EventId::new(id)))
+                })
         };
 
         // Per-room, for the same reason as redaction above and with more at
@@ -5208,22 +5623,16 @@ fn rules_of(version: &RoomVersionId) -> Result<RoomVersionRules, RoomError> {
         .ok_or_else(|| RoomError::Build(format!("no rules for room version {version}")))
 }
 
+/// One slot of the room's current state: the forward extremities' states,
+/// resolved when a fork left several (`RoomLog::current_state`).
 fn current_state_id(log: &RoomLog, wanted: &StateKey) -> Option<String> {
-    log.entries()
-        .next_back()
-        .map(|entry| entry.li)
-        .and_then(|li| log.state_after(li))
+    log.current_state()
         .and_then(|state| state.get(wanted).map(str::to_owned))
 }
 
 /// The room's current state, as `(key, event_id)` pairs.
 fn current_state(log: &RoomLog) -> Vec<(StateKey, String)> {
-    let Some(state) = log
-        .entries()
-        .next_back()
-        .map(|entry| entry.li)
-        .and_then(|li| log.state_after(li))
-    else {
+    let Some(state) = log.current_state() else {
         return Vec::new();
     };
     let mut out = Vec::with_capacity(state.len());
@@ -5235,12 +5644,13 @@ fn current_state(log: &RoomLog) -> Vec<(StateKey, String)> {
     out
 }
 
-/// Which of SPEC §9.2's cheap cases an append took.
-///
-/// Case 3 is never returned here: a contested key does not reach a
-/// successful append, so it is counted at the error instead.
-fn case_of(is_state: bool) -> crate::metrics::ForkCase {
-    if is_state {
+/// Which of SPEC §9.2's cases an append took: whether its parents' states
+/// had to be resolved (case 3, now the room version's algorithm), and
+/// otherwise whether it was a state event.
+fn case_of(is_state: bool, resolved: bool) -> crate::metrics::ForkCase {
+    if resolved {
+        crate::metrics::ForkCase::StateContested
+    } else if is_state {
         crate::metrics::ForkCase::StateUncontested
     } else {
         crate::metrics::ForkCase::NonState
@@ -5319,7 +5729,7 @@ fn sanitized_member_content(event_type: &str, content: &Value) -> Value {
 }
 
 fn auth_events_for(
-    log: &RoomLog,
+    state: Option<&StateSnapshot>,
     rules: &ruma::room_version_rules::AuthorizationRules,
     sender: &str,
     event_type: &str,
@@ -5329,14 +5739,9 @@ fn auth_events_for(
     if event_type == "m.room.create" {
         return Ok(Vec::new());
     }
-    let head = log
-        .entries()
-        .next_back()
-        .map(|entry| entry.li)
+    let state = state
+        .filter(|state| !state.is_empty())
         .ok_or_else(|| RoomError::StateUnavailable("the room has no events".to_owned()))?;
-    let state = log.state_after(head).ok_or_else(|| {
-        RoomError::StateUnavailable(format!("the state after li {} is not resident", head.get()))
-    })?;
 
     let mut auth = Vec::new();
     let mut cite = |kind: &str, key: &str| {
@@ -5344,7 +5749,11 @@ fn auth_events_for(
             auth.push(id.to_owned());
         }
     };
-    cite("m.room.create", "");
+    // v12 derives the create event from the room ID and forbids it in
+    // auth_events. Earlier versions require an explicit reference.
+    if !rules.room_create_event_id_as_room_id {
+        cite("m.room.create", "");
+    }
     cite("m.room.power_levels", "");
     cite("m.room.member", sender);
     if event_type == "m.room.member" {

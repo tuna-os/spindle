@@ -175,16 +175,98 @@ pub struct ForkWindow {
     pub visited: usize,
 }
 
-/// A forward extremity this server has stopped authoring on, and why.
+/// Why an event that is part of the room's DAG is kept out of its timeline.
 ///
-/// Returned by [`RoomLog::set_aside_contested`]: `extremity` is a tip whose
-/// branch moved `key` away from the value it shared with the linear head's
-/// branch, which is SPEC §9.2 case 3 and needs the room-version resolver.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SetAside {
-    pub extremity: EventId,
-    pub key: StateKey,
+/// The spec's checks on receipt of a PDU have three outcomes, and only one
+/// of them is "append to the room". The other two still keep the event:
+/// a later event may name it in `prev_events`, and the state at that later
+/// event is computed from it like any other parent's.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Sideline {
+    /// Allowed by the state before it, refused by the room's current state.
+    /// Its state is the state before it with it applied, but it is not a
+    /// forward extremity and no client is shown it.
+    SoftFailed,
+    /// Refused by its auth events or by the state before it. It changes no
+    /// state: the state after it is the state before it.
+    Rejected,
 }
+
+/// An event held for the DAG but not in the timeline: soft-failed or
+/// rejected (see [`Sideline`]).
+///
+/// Kept outside the linear log on purpose. Nothing that walks the log --
+/// pagination, sync, search, the stream -- can show it to a client by
+/// mistake, because nothing that walks the log sees it.
+#[derive(Clone, Debug)]
+pub struct SidelinedEntry {
+    pub event_id: EventId,
+    pub prev_events: Vec<EventId>,
+    pub depth: u64,
+    pub state_key: Option<StateKey>,
+    pub kind: Sideline,
+    /// The state after it: the state before it, plus the event itself when
+    /// it soft-failed.
+    pub state_root: StateRoot,
+}
+
+/// The room version's state resolution algorithm, supplied from above.
+///
+/// The core holds the states; what to do when they disagree is the room
+/// version's call, and the rules, the event bodies and the auth DAG that
+/// call reads live above the core (ADR 0002). [`RoomLog`] asks only when it
+/// must: never for a single parent, and never when every parent holds the
+/// same state.
+pub trait StateResolver {
+    /// Resolve two or more pairwise-different states into one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppendError`] when the states cannot be resolved -- an
+    /// event a candidate needs cannot be read, or this resolver declines
+    /// to resolve a conflict at all ([`Strict`]).
+    fn resolve(&mut self, states: &[StateSnapshot]) -> Result<StateSnapshot, AppendError>;
+}
+
+/// The resolver that resolves nothing: parents that disagree are refused
+/// with [`AppendError::NeedsStateResolution`], naming the first slot they
+/// disagree on.
+///
+/// For callers with no room version behind them -- the log's own
+/// restore-time refold and tests -- and for the importer, whose answer to a
+/// contested fork is the state its source already resolved.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Strict;
+
+impl StateResolver for Strict {
+    fn resolve(&mut self, states: &[StateSnapshot]) -> Result<StateSnapshot, AppendError> {
+        let Some((first, rest)) = states.split_first() else {
+            return Ok(StateSnapshot::new());
+        };
+        for other in rest {
+            if let Some((key, _, _)) = first.diff(other).into_iter().next() {
+                let candidates = states
+                    .iter()
+                    .filter_map(|state| state.get(key))
+                    .map(EventId::new)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                return Err(AppendError::NeedsStateResolution {
+                    key: key.clone(),
+                    candidates,
+                });
+            }
+        }
+        Ok(first.clone())
+    }
+}
+
+/// How many forward extremities a locally authored event names, newest
+/// first. Synapse's figure: enough to collapse an ordinary fork in one
+/// event, few enough that a peer flooding stale extremities cannot make
+/// every local event resolve twenty states.
+pub const MAX_AUTHORED_PREV_EVENTS: usize = 10;
 
 /// A per-room log in linear-index order, plus the minimal DAG overlay
 /// federation requires.
@@ -197,15 +279,22 @@ pub struct RoomLog {
     entries: BTreeMap<i64, LogEntry>,
     positions: HashMap<EventId, i64>,
     forward_extremities: BTreeSet<EventId>,
-    /// Forward extremities a local event no longer names, because folding
-    /// them needs the resolver (SPEC §9.2 case 3). Always a subset of
-    /// `forward_extremities`: they are still tips of the DAG, still pinned
-    /// resident, and still persisted as extremities, so the resolver finds
-    /// them where it expects to. Only the *decision* not to author on them
-    /// is held here, and it is in-memory by design: a reopen retries the
-    /// fold once, which is cheap, rather than trusting a stored verdict
-    /// about state it has not looked at.
-    set_aside: BTreeSet<EventId>,
+    /// Soft-failed and rejected events: in the DAG, out of the timeline.
+    sidelined: HashMap<EventId, SidelinedEntry>,
+    /// Their states, held resident: they are few, and a child naming one
+    /// needs its state at once.
+    sidelined_state: HashMap<EventId, StateSnapshot>,
+    /// Rejection decisions imported from a former homeserver and preserved
+    /// by operator choice. These IDs remain auth-graph references, never
+    /// candidates for insertion into resolved state or the client log.
+    historical_rejections: BTreeSet<EventId>,
+    historical_rejection_policy_id: [u8; 32],
+    /// The room's current state when it has several forward extremities:
+    /// their states resolved by the room version's algorithm. With one
+    /// extremity it is that extremity's state, and this is `None`. Set by
+    /// whoever holds the resolver ([`RoomLog::set_current`]); see
+    /// [`RoomLog::current_state`].
+    current: Option<StateSnapshot>,
     next_forward: i64,
     next_backward: i64,
     head_chain: ChainHash,
@@ -224,7 +313,11 @@ impl Default for RoomLog {
             entries: BTreeMap::new(),
             positions: HashMap::new(),
             forward_extremities: BTreeSet::new(),
-            set_aside: BTreeSet::new(),
+            sidelined: HashMap::new(),
+            sidelined_state: HashMap::new(),
+            historical_rejections: BTreeSet::new(),
+            historical_rejection_policy_id: [0; 32],
+            current: None,
             next_forward: 1,
             next_backward: 0,
             head_chain: ChainHash::seed(),
@@ -273,97 +366,246 @@ impl RoomLog {
             .and_then(|li| self.resident.get(li))
     }
 
-    /// The state before `event_id`: its parents folded, which is what the
-    /// event was authorized against and what federation's `/state` and
-    /// `/state_ids` answer for it.
+    /// The state before `event_id`: its parents' states resolved by the
+    /// room version's algorithm, which is what the event was authorized
+    /// against and what federation's `/state` and `/state_ids` answer for it.
     ///
     /// Not the state after the entry before it in this server's order. The
     /// two agree in a linear room and part after a fork: the entry before
-    /// the event that merges two branches belongs to one of them, and its
-    /// state lacks the other's writes, while the merge event was authorized
-    /// against the fold of both. Reading the linear predecessor told a peer
-    /// a state this server never held at that event; the federation fork
-    /// tests caught it by comparing that read with the client's (#16).
+    /// the event that merges two branches belongs to one of them, while the
+    /// merge event was authorized against the resolution of both (#16).
     ///
     /// Resident snapshots serve where the window still holds them; older
     /// ones are rehydrated through `load`, the store's content-addressed
     /// read, because a peer may ask about an event older than the window.
-    /// The fold is the append path's own: a fork whose base the window
-    /// cannot reach takes the same conservative rule, refused rather than
-    /// guessed, and a fold that fails names a log no append produced.
     ///
     /// Parents this server does not hold are outside its history, not a
     /// corrupt index -- the frontier of a backfill names them -- and are
-    /// left out of the fold. An event none of whose parents is held has no
-    /// fold to compute, and answers the state after the entry before it in
-    /// linear order, which for backfilled history is the older event.
+    /// left out. An event none of whose parents is held answers the state
+    /// after the entry before it in linear order, which for backfilled
+    /// history is the older event.
     ///
     /// # Errors
     ///
     /// Returns [`AppendError::UnknownPredecessor`] for an event the log does
     /// not hold, [`AppendError::StateNotResident`] for a parent whose state
-    /// is neither resident nor rehydratable, and
-    /// [`AppendError::NeedsStateResolution`] for parents that do not fold.
+    /// is neither resident nor rehydratable, and whatever `resolver` returns
+    /// for parents it cannot resolve.
     pub fn state_before(
         &self,
         event_id: &EventId,
-        load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+        resolver: &mut dyn StateResolver,
+        load: &mut dyn FnMut(&StateRoot) -> Option<Vec<u8>>,
     ) -> Result<StateSnapshot, AppendError> {
-        let Some(entry) = self.get(event_id) else {
+        let (prev_events, li) = if let Some(entry) = self.get(event_id) {
+            (&entry.prev_events, Some(entry.li))
+        } else if let Some(sidelined) = self.sidelined.get(event_id) {
+            (&sidelined.prev_events, None)
+        } else {
             return Err(AppendError::UnknownPredecessor(event_id.clone()));
         };
-        let held: Vec<EventId> = entry
-            .prev_events
+        let held: Vec<EventId> = prev_events
             .iter()
-            .filter(|parent| self.positions.contains_key(*parent))
+            .filter(|parent| self.holds(parent))
             .cloned()
             .collect();
         if held.is_empty() {
+            let Some(li) = li else {
+                return Ok(StateSnapshot::new());
+            };
             return match self
-                .entry_at_or_before(entry.li.get().saturating_sub(1))
-                .filter(|previous| previous.li < entry.li)
+                .entry_at_or_before(li.get().saturating_sub(1))
+                .filter(|previous| previous.li < li)
             {
-                Some(previous) => self.state_after_or_rehydrated(&previous.event_id, load),
+                Some(previous) => self.state_after_any(&previous.event_id, load),
                 None => Ok(StateSnapshot::new()),
             };
         }
-        let mut parents = Vec::with_capacity(held.len());
-        for parent in &held {
-            parents.push(self.state_after_or_rehydrated(parent, load)?);
-        }
-        let base = if held.len() > 1 {
-            match self.fork_window(&held, self.resident_window) {
-                Ok(window) => {
-                    Some(self.state_after_or_rehydrated(&window.nearest_common_ancestor, load)?)
-                }
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-        let parents: Vec<&StateSnapshot> = parents.iter().collect();
-        merge_states(&parents, base.as_ref())
+        self.resolve_parents(&held, resolver, load)
     }
 
-    /// The state after `event_id`, from the window if it is still there and
-    /// from the store through `load` if not.
-    fn state_after_or_rehydrated(
+    /// The state an event naming `prev_events` sits on: their states,
+    /// resolved when they differ.
+    ///
+    /// This is the only place state resolution is entered from. One parent,
+    /// or several holding the same state, is answered without it -- the
+    /// one case where SPEC 9.2's fork merge provably equals every room
+    /// version's algorithm, since states that do not differ have nothing to
+    /// resolve and both algorithms return them unchanged. Anything else goes
+    /// to `resolver`, which is the room version's algorithm (ADR 0005).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppendError::UnknownPredecessor`] for a parent this log does
+    /// not hold (as an entry or sidelined), [`AppendError::StateNotResident`]
+    /// for a parent whose state cannot be read, and the resolver's error.
+    pub fn resolve_parents(
+        &self,
+        prev_events: &[EventId],
+        resolver: &mut dyn StateResolver,
+        load: &mut dyn FnMut(&StateRoot) -> Option<Vec<u8>>,
+    ) -> Result<StateSnapshot, AppendError> {
+        let mut states: Vec<StateSnapshot> = Vec::with_capacity(prev_events.len());
+        for parent in prev_events {
+            let state = self.state_after_any(parent, load)?;
+            if !states.iter().any(|held| held.root() == state.root()) {
+                states.push(state);
+            }
+        }
+        match states.len() {
+            0 => Ok(StateSnapshot::new()),
+            1 => Ok(states.pop().unwrap_or_default()),
+            _ => resolver.resolve(&states),
+        }
+    }
+
+    /// The state after `event_id`, an entry or a sidelined event: from the
+    /// window if it is still there and from the store through `load` if not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppendError::UnknownPredecessor`] for an event this log does
+    /// not hold and [`AppendError::StateNotResident`] for state that cannot
+    /// be rehydrated.
+    pub fn state_after_any(
         &self,
         event_id: &EventId,
-        load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+        load: &mut dyn FnMut(&StateRoot) -> Option<Vec<u8>>,
     ) -> Result<StateSnapshot, AppendError> {
-        let Some(entry) = self.get(event_id) else {
-            return Err(AppendError::UnknownPredecessor(event_id.clone()));
-        };
-        if let Some(state) = self.resident.get(&entry.li.get()) {
-            return Ok(state.clone());
-        }
-        StateSnapshot::rehydrate(entry.state_root, load).map_err(|_| {
-            AppendError::StateNotResident {
-                li: entry.li,
-                event_id: event_id.clone(),
+        if let Some(entry) = self.get(event_id) {
+            if let Some(state) = self.resident.get(&entry.li.get()) {
+                return Ok(state.clone());
             }
+            return StateSnapshot::rehydrate(entry.state_root, &mut |root: &StateRoot| load(root))
+                .map_err(|_| AppendError::StateNotResident {
+                    li: entry.li,
+                    event_id: event_id.clone(),
+                });
+        }
+        if let Some(sidelined) = self.sidelined.get(event_id) {
+            if let Some(state) = self.sidelined_state.get(event_id) {
+                return Ok(state.clone());
+            }
+            return StateSnapshot::rehydrate(sidelined.state_root, &mut |root: &StateRoot| {
+                load(root)
+            })
+            .map_err(|_| AppendError::StateNotResident {
+                li: LinearIndex(0),
+                event_id: event_id.clone(),
+            });
+        }
+        Err(AppendError::UnknownPredecessor(event_id.clone()))
+    }
+
+    /// Whether this log holds `event_id`, in the timeline or sidelined.
+    #[must_use]
+    pub fn holds(&self, event_id: &EventId) -> bool {
+        self.positions.contains_key(event_id) || self.sidelined.contains_key(event_id)
+    }
+
+    /// A soft-failed or rejected event this log holds, if `event_id` is one.
+    #[must_use]
+    pub fn sidelined(&self, event_id: &EventId) -> Option<&SidelinedEntry> {
+        self.sidelined.get(event_id)
+    }
+
+    /// Preserve a former homeserver's rejection of an imported historical event.
+    pub fn preserve_historical_rejection(&mut self, event_id: EventId) {
+        if !self.historical_rejections.contains(&event_id) {
+            let mut hash = blake3::Hasher::new();
+            hash.update(b"spindle historical rejection policy v1");
+            hash.update(&self.historical_rejection_policy_id);
+            hash.update(event_id.as_str().as_bytes());
+            self.historical_rejection_policy_id = *hash.finalize().as_bytes();
+            self.historical_rejections.insert(event_id);
+        }
+    }
+
+    /// Identity for cached resolutions under the imported rejection policy.
+    ///
+    /// Repeated markers do not change it. A different insertion order may
+    /// create a safe cache miss; a changed policy must never reuse old state.
+    #[must_use]
+    pub fn historical_rejection_policy_id(&self) -> [u8; 32] {
+        self.historical_rejection_policy_id
+    }
+
+    /// Whether an imported historical rejection must remain rejected.
+    #[must_use]
+    pub fn historically_rejected(&self, event_id: &EventId) -> bool {
+        self.historical_rejections.contains(event_id)
+    }
+
+    /// Imported rejection decisions, including IDs whose PDU is unavailable.
+    pub fn historical_rejections(&self) -> impl Iterator<Item = &EventId> {
+        self.historical_rejections.iter()
+    }
+
+    /// Every soft-failed or rejected event this log holds.
+    pub fn sidelined_entries(&self) -> impl Iterator<Item = &SidelinedEntry> {
+        self.sidelined.values()
+    }
+
+    /// The room's current state: the state of its one forward extremity,
+    /// or -- with several -- their states resolved, as last set by
+    /// [`Self::set_current`].
+    ///
+    /// This, not the state after the newest entry, is what local events
+    /// are authorized against, what soft-fail checks read, and what a
+    /// client is told the room's state is. The two agree whenever the room
+    /// has one extremity, which is the linear case and almost always the
+    /// real one; after a fork the newest entry belongs to one branch.
+    ///
+    /// `None` only for an empty room, or when a fork is open and no
+    /// resolution has been recorded; readers that need an answer then fall
+    /// back to the newest entry's state, which is what this returned before
+    /// the resolver existed.
+    #[must_use]
+    pub fn current_state(&self) -> Option<&StateSnapshot> {
+        if self.forward_extremities.len() == 1 {
+            let tip = self.forward_extremities.first()?;
+            return self.state_after_event(tip);
+        }
+        self.current.as_ref().or_else(|| {
+            self.entries
+                .keys()
+                .next_back()
+                .and_then(|li| self.resident.get(li))
         })
+    }
+
+    /// Whether [`Self::current_state`] is a recorded resolution, or the
+    /// single extremity's state. `false` means a fork is open and nobody
+    /// has resolved it yet.
+    #[must_use]
+    pub fn current_is_settled(&self) -> bool {
+        self.forward_extremities.len() <= 1 || self.current.is_some()
+    }
+
+    /// Resolve the forward extremities' states into the room's current
+    /// state. Pure: record the answer with [`Self::set_current`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resolve_parents`].
+    pub fn resolve_current(
+        &self,
+        resolver: &mut dyn StateResolver,
+        load: &mut dyn FnMut(&StateRoot) -> Option<Vec<u8>>,
+    ) -> Result<StateSnapshot, AppendError> {
+        let tips: Vec<EventId> = self.forward_extremities.iter().cloned().collect();
+        self.resolve_parents(&tips, resolver, load)
+    }
+
+    /// Record the room's current state, as [`Self::resolve_current`]
+    /// computed it. Ignored while the room has one extremity, whose own
+    /// state is the current state by definition.
+    pub fn set_current(&mut self, state: StateSnapshot) {
+        if self.forward_extremities.len() > 1 {
+            self.current = Some(state);
+        } else {
+            self.current = None;
+        }
     }
 
     /// How many snapshots are currently held in memory.
@@ -488,20 +730,21 @@ impl RoomLog {
         &self.forward_extremities
     }
 
-    /// The forward extremities a locally authored event names: every tip
-    /// except those [`Self::set_aside_contested`] has set aside.
+    /// The forward extremities a locally authored event names: the newest
+    /// [`MAX_AUTHORED_PREV_EVENTS`] tips, in linear order.
     ///
-    /// In a linear room this is exactly one entry, the head.
+    /// In a linear room this is exactly one entry, the head. After a fork
+    /// it is both tips, and the event that names them is the merge.
     pub fn authoring_extremities(&self) -> impl Iterator<Item = &EventId> {
-        self.forward_extremities
+        let mut tips: Vec<(i64, &EventId)> = self
+            .forward_extremities
             .iter()
-            .filter(|tip| !self.set_aside.contains(*tip))
-    }
-
-    /// The forward extremities this server has stopped authoring on.
-    #[must_use]
-    pub fn set_aside_extremities(&self) -> &BTreeSet<EventId> {
-        &self.set_aside
+            .map(|tip| (self.positions.get(tip).copied().unwrap_or(i64::MIN), tip))
+            .collect();
+        tips.sort_unstable_by(|left, right| right.cmp(left));
+        tips.truncate(MAX_AUTHORED_PREV_EVENTS);
+        tips.sort_unstable();
+        tips.into_iter().map(|(_, tip)| tip)
     }
 
     /// Next index a live append will take. Durable state; a reopen must
@@ -666,28 +909,29 @@ impl RoomLog {
 
     /// Append a received event without changing its signed `prev_events`.
     ///
+    /// Parents that disagree are refused ([`Strict`]): this is the form for
+    /// callers with no resolver. The server appends through
+    /// [`Self::resolve_parents`] and [`Self::append_resolved`].
+    ///
     /// # Errors
     ///
     /// Returns [`AppendError`] when the event is duplicated, has invalid or
-    /// unknown predecessors, exceeds the Matrix parent limit, or needs full
-    /// state resolution.
+    /// unknown predecessors, exceeds the Matrix parent limit, or its parents'
+    /// states differ.
     pub fn append_remote(&mut self, input: EventInput) -> Result<&LogEntry, AppendError> {
         self.append(input)
     }
 
-    /// Author an event on every current extremity this server can fold.
+    /// Author an event on the current extremities ([`Self::authoring_extremities`]).
     ///
     /// In a linear room this is exactly one parent. After a stale class-D PDU it
     /// is a bounded set of parents, which collapses the federation DAG back to
     /// one extremity while the event still receives one linear storage index.
-    /// A tip set aside by [`Self::set_aside_contested`] is left out, and stays
-    /// a forward extremity for the resolver.
     ///
     /// # Errors
     ///
     /// Returns [`AppendError`] when the new event is duplicated, the room has
-    /// invalid predecessor state, or competing parent states need the Matrix
-    /// room-version resolver.
+    /// invalid predecessor state, or the parents' states differ ([`Strict`]).
     pub fn append_local(
         &mut self,
         event_id: impl Into<Box<str>>,
@@ -701,146 +945,63 @@ impl RoomLog {
         self.append(input)
     }
 
-    /// Stop authoring on every tip that contests a state key with the linear
-    /// head, until what remains folds. Returns what was set aside, and why.
-    ///
-    /// SPEC §9.2 case 3 is the one case the log cannot fold on its own: two
-    /// branches moved the same key away from the value they inherited, and
-    /// choosing between them is the room-version resolver's call (ADR 0001).
-    /// Until that is wired into ingest (#16) the choice is not made here --
-    /// it is *deferred*. The contested tip keeps its place as a forward
-    /// extremity, its state stays pinned, and local events simply stop
-    /// naming it, so the room keeps taking writes on its linear log instead
-    /// of refusing every one of them (#225).
-    ///
-    /// The tip that stays is the linear head: the entry this server's own
-    /// order puts last, whose state is what authorization already reads.
-    /// The tips set aside are the ones that *claim* the key -- whose branch
-    /// moved it from the inherited value -- other than the head. A tip that
-    /// merely inherited the key is not in the argument and is kept, so a
-    /// three-way fork loses only the branch that actually disagrees.
-    ///
-    /// Idempotent and cheap once done: with the contested tips out of the
-    /// authoring set the remaining fold succeeds on the first pass, and the
-    /// result is empty. Each pass costs one bounded fork window (SPEC §9.1)
-    /// and one fold, and there are at most as many passes as tips.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AppendError`] when a tip's state is not resident, which the
-    /// extremity pin makes unreachable, or when the fold is contested by no
-    /// tip other than the head, which the definition of contested makes
-    /// unreachable; both are refused rather than guessed at.
-    pub fn set_aside_contested(&mut self) -> Result<Vec<SetAside>, AppendError> {
-        let mut set_aside = Vec::new();
-        loop {
-            let tips: Vec<EventId> = self.authoring_extremities().cloned().collect();
-            if tips.len() < 2 {
-                return Ok(set_aside);
-            }
-            let parents = self.parents_of(&tips)?;
-            let Err(error) = merge_states(&parents.states, parents.base) else {
-                return Ok(set_aside);
-            };
-            let AppendError::NeedsStateResolution { key, .. } = &error else {
-                return Err(error);
-            };
-            let inherited = parents.base.and_then(|base| base.get(key));
-            let head = tips.iter().max_by_key(|tip| self.positions.get(*tip));
-            let claimants: Vec<EventId> = tips
-                .iter()
-                .zip(&parents.states)
-                .filter(|(tip, state)| {
-                    Some(*tip) != head
-                        && state.get(key).is_some_and(|value| Some(value) != inherited)
-                })
-                .map(|(tip, _)| tip.clone())
-                .collect();
-            if claimants.is_empty() {
-                return Err(error);
-            }
-            for extremity in claimants {
-                self.set_aside.insert(extremity.clone());
-                set_aside.push(SetAside {
-                    extremity,
-                    key: key.clone(),
-                });
-            }
-        }
-    }
-
-    /// The inputs to folding a set of parents into one state.
-    ///
-    /// Every parent an append can name is either recent or a pinned
-    /// extremity, so a parent whose state is not resident is unreachable by
-    /// construction. It is an error rather than a panic because "unreachable
-    /// by construction" is a claim about code that can be changed.
-    fn parents_of(&self, prev_events: &[EventId]) -> Result<Parents<'_>, AppendError> {
-        let mut states = Vec::with_capacity(prev_events.len());
-        let mut depth = 0_u64;
-        for parent in prev_events {
-            let Some(entry) = self.get(parent) else {
-                return Err(AppendError::UnknownPredecessor(parent.clone()));
-            };
-            let Some(state) = self.resident.get(&entry.li.get()) else {
-                return Err(AppendError::StateNotResident {
-                    li: entry.li,
-                    event_id: parent.clone(),
-                });
-            };
-            states.push(state);
-            depth = depth.max(entry.depth.saturating_add(1));
-        }
-
-        // The merge base: the state as both branches last agreed on it.
-        // Without it a key only one branch touched looks contested, because
-        // the untouched branch still carries the older event ID -- see the
-        // rule in `merge_states`. Only forks need one; a single parent has
-        // nothing to disagree with.
-        //
-        // `fork_window` is bounded by the resident window, which is the same
-        // bound the fast path already lives inside (SPEC §9.1): a fork deeper
-        // than that has no resident snapshot to merge from anyway. When it
-        // cannot answer, `base` stays `None` and the merge falls back to the
-        // conservative rule -- refusing rather than guessing.
-        let base = if prev_events.len() > 1 {
-            self.fork_window(prev_events, self.resident_window)
-                .ok()
-                .and_then(|window| self.positions.get(&window.nearest_common_ancestor).copied())
-                .and_then(|li| self.resident.get(&li))
-        } else {
-            None
-        };
-
-        Ok(Parents {
-            states,
-            base,
-            depth,
-        })
-    }
-
-    fn append(&mut self, input: EventInput) -> Result<&LogEntry, AppendError> {
-        if self.positions.contains_key(&input.event_id) {
-            return Err(AppendError::DuplicateEvent(input.event_id));
+    /// Validate an event's parents and compute its depth.
+    fn check_parents(&self, input: &EventInput) -> Result<u64, AppendError> {
+        if self.holds(&input.event_id) {
+            return Err(AppendError::DuplicateEvent(input.event_id.clone()));
         }
         if input.prev_events.len() > MAX_PREV_EVENTS {
             return Err(AppendError::TooManyPredecessors(input.prev_events.len()));
         }
         if let Some(first) = input.prev_events.first()
             && self.entries.is_empty()
+            && self.sidelined.is_empty()
         {
             return Err(AppendError::UnknownPredecessor(first.clone()));
         }
         if !self.entries.is_empty() && input.prev_events.is_empty() {
             return Err(AppendError::MissingPredecessor);
         }
+        let mut depth = 0_u64;
+        for parent in &input.prev_events {
+            let parent_depth = if let Some(entry) = self.get(parent) {
+                entry.depth
+            } else if let Some(sidelined) = self.sidelined.get(parent) {
+                sidelined.depth
+            } else {
+                return Err(AppendError::UnknownPredecessor(parent.clone()));
+            };
+            depth = depth.max(parent_depth.saturating_add(1));
+        }
+        Ok(depth)
+    }
 
-        let Parents {
-            states,
-            base,
-            depth,
-        } = self.parents_of(&input.prev_events)?;
-        let mut state_after = merge_states(&states, base)?;
+    fn append(&mut self, input: EventInput) -> Result<&LogEntry, AppendError> {
+        self.check_parents(&input)?;
+        let state_before =
+            self.resolve_parents(&input.prev_events, &mut Strict, &mut |_: &StateRoot| None)?;
+        self.append_resolved(input, state_before)
+    }
+
+    /// Append an accepted event whose state before it the caller resolved
+    /// ([`Self::resolve_parents`]).
+    ///
+    /// The event becomes a forward extremity and its parents stop being
+    /// ones. With one extremity left, the room's current state is that
+    /// event's; with several, the caller records their resolution with
+    /// [`Self::set_current`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppendError`] when the event is duplicated, names too many
+    /// or unknown parents, or the index space is exhausted.
+    pub fn append_resolved(
+        &mut self,
+        input: EventInput,
+        state_before: StateSnapshot,
+    ) -> Result<&LogEntry, AppendError> {
+        let depth = self.check_parents(&input)?;
+        let mut state_after = state_before;
         let state_key = input.state_key;
         if let Some(state_key) = state_key.clone() {
             state_after = state_after.apply(state_key, input.event_id.as_str());
@@ -866,17 +1027,70 @@ impl RoomLog {
 
         for parent in &entry.prev_events {
             self.forward_extremities.remove(parent);
-            // A tip somebody built on is a tip no longer, set aside or not;
-            // whatever was built on it is a fresh tip, judged afresh.
-            self.set_aside.remove(parent);
         }
         self.forward_extremities.insert(entry.event_id.clone());
+        if self.forward_extremities.len() == 1 {
+            self.current = None;
+        }
         self.positions.insert(entry.event_id.clone(), li);
         self.entries.insert(li, entry);
         // After the extremity set is updated, so a parent that just stopped
         // being an extremity stops being pinned by it.
         self.make_resident(li, state_after);
         Ok(self.issued_entry(li))
+    }
+
+    /// Hold a soft-failed or rejected event for the DAG, outside the
+    /// timeline ([`Sideline`]).
+    ///
+    /// A rejected event's state is the state before it; a soft-failed
+    /// event's is that state with the event applied, because the spec only
+    /// keeps a soft-failed event from clients and extremities, not from
+    /// the state of whatever later names it. Neither changes the forward
+    /// extremities: the event is not one, and its parents stay what they
+    /// were.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppendError`] when the event is duplicated or names too many
+    /// or unknown parents.
+    pub fn sideline(
+        &mut self,
+        input: EventInput,
+        state_before: StateSnapshot,
+        kind: Sideline,
+    ) -> Result<&SidelinedEntry, AppendError> {
+        let depth = self.check_parents(&input)?;
+        let state_after = match (&input.state_key, kind) {
+            (Some(key), Sideline::SoftFailed) => {
+                state_before.apply(key.clone(), input.event_id.as_str())
+            }
+            _ => state_before,
+        };
+        let entry = SidelinedEntry {
+            event_id: input.event_id.clone(),
+            prev_events: input.prev_events,
+            depth,
+            state_key: input.state_key,
+            kind,
+            state_root: state_after.root(),
+        };
+        self.restore_sidelined(entry, state_after);
+        self.sidelined
+            .get(&input.event_id)
+            .ok_or(AppendError::UnknownPredecessor(input.event_id))
+    }
+
+    /// Put back a sidelined event read from storage, with its state.
+    pub fn restore_sidelined(&mut self, entry: SidelinedEntry, state: StateSnapshot) {
+        self.sidelined_state.insert(entry.event_id.clone(), state);
+        self.sidelined.insert(entry.event_id.clone(), entry);
+    }
+
+    /// The sidelined event's state, when it is resident.
+    #[must_use]
+    pub fn sidelined_state(&self, event_id: &EventId) -> Option<&StateSnapshot> {
+        self.sidelined_state.get(event_id)
     }
 
     /// Append an event whose state is supplied rather than derived — the
@@ -928,7 +1142,7 @@ impl RoomLog {
         };
 
         self.forward_extremities.clear();
-        self.set_aside.clear();
+        self.current = None;
         self.forward_extremities.insert(entry.event_id.clone());
         self.positions.insert(entry.event_id.clone(), li);
         self.entries.insert(li, entry);
@@ -1117,7 +1331,11 @@ impl RoomLog {
             entries: BTreeMap::new(),
             positions: HashMap::new(),
             forward_extremities: forward_extremities.into_iter().collect(),
-            set_aside: BTreeSet::new(),
+            sidelined: HashMap::new(),
+            sidelined_state: HashMap::new(),
+            historical_rejections: BTreeSet::new(),
+            historical_rejection_policy_id: [0; 32],
+            current: None,
             next_forward,
             next_backward,
             head_chain: ChainHash::seed(),
@@ -1159,12 +1377,9 @@ impl RoomLog {
             // is the authority for exactly these entries. Computing an
             // ancestor mid-rebuild would also be asking a half-built log
             // about ancestry it does not yet hold.
-            let mut folded = match merge_states(&parents, None) {
-                Ok(state) => state,
-                // A conflict means the fold cannot be reproduced; fall through
-                // to the stored trie rather than refusing to open the room.
-                Err(_) => StateSnapshot::new(),
-            };
+            // A conflict means the fold cannot be reproduced; fall through
+            // to the stored trie rather than refusing to open the room.
+            let mut folded = restored_fold(&parents).unwrap_or_default();
             if let Some(state_key) = restored.state_key.clone() {
                 folded = folded.apply(state_key, restored.event_id.as_str());
             }
@@ -1232,88 +1447,14 @@ impl RoomLog {
     }
 }
 
-/// What [`RoomLog::parents_of`] hands a fold: the parents' resident
-/// snapshots in the parents' order, the state at their nearest common
-/// ancestor when there is a fork and the window can find it, and the depth
-/// the child takes.
-struct Parents<'a> {
-    states: Vec<&'a StateSnapshot>,
-    base: Option<&'a StateSnapshot>,
-    depth: u64,
-}
-
-/// Fold the parents of a fork into one state, or refuse if they disagree.
-///
-/// `base` is the state at their nearest common ancestor: the last point both
-/// branches agreed. It is what separates SPEC §9.2's case 2 from case 3, and
-/// leaving it out was #225.
-///
-/// The subtlety is that a parent's snapshot describes *all* of that branch's
-/// state, not the part it changed. So for a key one branch wrote and the
-/// other never touched, the two parents disagree on paper — one carries the
-/// new event, the other the value both inherited — while nothing is actually
-/// in conflict. Matrix's own state resolution says the same thing by
-/// building its conflicted set from events that *differ from the base*; a
-/// key only one side moved is unconflicted there too, and free here.
-///
-/// So a candidate equal to the base is a branch declining to make a claim.
-/// Contested means two or more branches moved the key *away* from the base,
-/// and that alone is case 3.
-///
-/// With no base — a fork too deep for the window, or one whose ancestry the
-/// log cannot walk — nothing is known to be inherited, so every candidate
-/// counts as a claim and any disagreement is refused. That is the old
-/// behaviour, kept deliberately as the conservative fallback: refusing a
-/// merge is recoverable, and merging two branches wrongly is not.
-fn merge_states(
-    parents: &[&StateSnapshot],
-    base: Option<&StateSnapshot>,
-) -> Result<StateSnapshot, AppendError> {
-    let Some(first) = parents.first() else {
-        return Ok(StateSnapshot::new());
-    };
-    if parents.len() == 1 {
-        return Ok((*first).clone());
-    }
-
-    let mut values: BTreeMap<StateKey, BTreeSet<Box<str>>> = BTreeMap::new();
-    for parent in parents {
-        parent.for_each(|key, event_id| {
-            values
-                .entry(key.clone())
-                .or_default()
-                .insert(event_id.into());
-        });
-    }
-
-    let mut merged = StateSnapshot::new();
-    for (key, candidates) in values {
-        let event_id = if candidates.len() > 1 {
-            let inherited = base.and_then(|base| base.get(&key));
-            let mut claims = candidates
-                .iter()
-                .filter(|candidate| Some(candidate.as_ref()) != inherited);
-            match (claims.next(), claims.next()) {
-                (Some(only), None) => only.clone(),
-                _ => {
-                    return Err(AppendError::NeedsStateResolution {
-                        key,
-                        candidates: candidates.into_iter().map(EventId).collect(),
-                    });
-                }
-            }
-        } else {
-            // A key reached this map by having a value inserted under it, so
-            // an empty set does not happen; if it somehow did, a key with no
-            // candidate has nothing to apply, which is what skipping it says.
-            let Some(only) = candidates.into_iter().next() else {
-                continue;
-            };
-            only
-        };
-        merged = merged.apply(key, event_id);
-    }
-    Ok(merged)
+/// Fold a restored entry's parents: their state when they agree, `None`
+/// when they do not -- the stored trie is then the authority, because only
+/// the room version's resolver could have produced it.
+fn restored_fold(parents: &[&StateSnapshot]) -> Option<StateSnapshot> {
+    let (first, rest) = parents.split_first()?;
+    rest.iter()
+        .all(|other| other.root() == first.root())
+        .then(|| (*first).clone())
 }
 
 /// A violation of the executable room-log invariants.
@@ -1332,6 +1473,8 @@ pub enum AppendError {
         key: StateKey,
         candidates: Vec<EventId>,
     },
+    /// The room version's resolver could not resolve the parents' states.
+    ResolutionFailed(String),
     /// A named predecessor's state has been evicted from memory.
     ///
     /// Unreachable on the append path, which can only name recent entries or
