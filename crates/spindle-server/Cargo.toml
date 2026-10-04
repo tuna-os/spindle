@@ -56,6 +56,8 @@ opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "trace"] }
 # Off by default: the reader is a one-shot migration path, and neither the
 # server binary nor the hot CI gate should pay a C compile for it.
 synapse-import = ["dep:postgres", "dep:rusqlite"]
+# Enable the production-corpus replay harness.
+corpus-replay = []
 
 [dev-dependencies]
 # `state-res` so the tests can judge our events with the same implementation a

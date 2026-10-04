@@ -439,14 +439,11 @@ fn a_horizon_start_with_state_imports_and_says_the_check_is_weaker() {
     );
 }
 
-/// A fork over two different state slots replays and both writes survive.
-///
-/// Synapse rooms fork routinely, and this is the arrangement that regressed
-/// once already (#225): two branches writing *different* keys that already
-/// held values looked contested and were refused. An import is where that
-/// surfaces as a room that cannot be moved at all.
+/// Topology alone cannot resolve a fork whose parent states disagree.
+/// The full importer supplies the room version, signed bodies, and Matrix
+/// resolver; the versionless replay helper must refuse to invent a result.
 #[test]
-fn a_fork_on_separate_state_slots_replays() {
+fn a_fork_on_separate_state_slots_requires_a_room_version_resolver() {
     let source = room(
         vec![
             create("$create"),
@@ -464,10 +461,14 @@ fn a_fork_on_separate_state_slots_replays() {
         ]),
     );
 
-    let outcome = replay(&source).expect("a forked room imports");
-
-    assert_eq!(outcome.imported, 6);
-    assert!(outcome.clean(), "{:?}", outcome.divergence);
+    assert!(matches!(
+        replay(&source),
+        Err(ImportError::Append {
+            event_id,
+            error: spindle_core::AppendError::NeedsStateResolution { .. },
+            ..
+        }) if event_id == "$merge"
+    ));
 }
 
 /// A room with nothing importable in it says so rather than reporting success.

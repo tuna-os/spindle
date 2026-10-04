@@ -1705,7 +1705,8 @@ pub fn compare(state: &StateSnapshot, current_state: &StateMap) -> Vec<Divergenc
 /// # Errors
 ///
 /// Returns [`ImportError`] when the room cannot be ordered or the log refuses
-/// an event the plan offered it.
+/// an event the plan offered it. A fork with different parent states needs
+/// the full importer's room-version resolver; topology alone cannot resolve it.
 pub fn replay(room: &SourceRoom) -> Result<Outcome, ImportError> {
     let plan = plan(room)?;
     let mut log = RoomLog::new();
