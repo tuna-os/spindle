@@ -669,8 +669,10 @@ impl Rooms {
     ///
     /// # Errors
     ///
-    /// Returns [`RoomError::UnknownRoom`] if the room does not exist, or
-    /// [`RoomError::Forbidden`] if the rules refuse the transition.
+    /// Returns [`RoomError::UnknownRoom`] if the room does not exist,
+    /// [`RoomError::NonResidentRoom`] if a fresh join must be brokered by a
+    /// resident server, or [`RoomError::Forbidden`] if the rules refuse the
+    /// transition.
     pub fn set_membership(
         &self,
         room_id: &str,
@@ -733,15 +735,35 @@ impl Rooms {
             content["reason"] = Value::String(reason.to_owned());
         }
         self.with_room(room_id, |rooms, log| {
-            // The one thing about a join this server has to work out for
-            // itself, because the rules cannot: see
-            // [`Self::restricted_join_nominee`]. It is added to the content
-            // before signing, since the nomination is part of what every
-            // other server verifies.
-            if membership == JOIN_STR
-                && let Some(nominee) = rooms.restricted_join_nominee(log, room_id, target)?
-            {
-                content["join_authorised_via_users_server"] = Value::String(nominee);
+            if membership == JOIN_STR {
+                let current = spindle_store::ReadView::get(
+                    rooms.store.as_ref(),
+                    &spindle_core::keys::user_room(
+                        spindle_core::keys::Keyspace::Membership,
+                        target,
+                        room_id,
+                    ),
+                )?;
+                // A log survives its server leaving, but stops receiving
+                // state at that point. It may authorize only an invite that
+                // was delivered to this user, or a join while some local
+                // member still makes this server resident. Keep this check
+                // under the room lock so the final local leave cannot race
+                // a fresh join onto an obsolete state snapshot.
+                if current.as_deref() != Some(INVITE_STR.as_bytes())
+                    && !rooms.domain_has_joined_member(log, room_id, rooms.server_name.as_str())?
+                {
+                    return Err(RoomError::NonResidentRoom(room_id.to_owned()));
+                }
+
+                // The one thing about a join this server has to work out for
+                // itself, because the rules cannot: see
+                // [`Self::restricted_join_nominee`]. It is added to the
+                // content before signing, since the nomination is part of
+                // what every other server verifies.
+                if let Some(nominee) = rooms.restricted_join_nominee(log, room_id, target)? {
+                    content["join_authorised_via_users_server"] = Value::String(nominee);
+                }
             }
             rooms.append(
                 log,
@@ -1258,6 +1280,51 @@ impl Rooms {
     /// Whether this server is the one that speaks for `user_id`.
     fn is_local(&self, user_id: &str) -> bool {
         user_id.split_once(':').map(|(_, domain)| domain) == Some(self.server_name.as_str())
+    }
+
+    /// Whether `domain` currently has a joined member in this room log.
+    ///
+    /// The caller supplies the open log because fresh joins already hold the
+    /// room lock. Calling [`Self::server_in_room`] from there would try to
+    /// acquire the same non-reentrant lock again.
+    fn domain_has_joined_member(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        domain: &str,
+    ) -> Result<bool, RoomError> {
+        let Some(state) = log
+            .entries()
+            .next_back()
+            .and_then(|entry| log.state_after(entry.li))
+        else {
+            return Ok(false);
+        };
+        let mut candidates = Vec::new();
+        state.for_each(|key, _| {
+            if key.event_type().as_str() == "m.room.member"
+                && key
+                    .state_key()
+                    .split_once(':')
+                    .is_some_and(|(_, member_domain)| member_domain == domain)
+            {
+                candidates.push(key.state_key().to_owned());
+            }
+        });
+        for user_id in candidates {
+            let membership = spindle_store::ReadView::get(
+                self.store.as_ref(),
+                &spindle_core::keys::user_room(
+                    spindle_core::keys::Keyspace::Membership,
+                    &user_id,
+                    room_id,
+                ),
+            )?;
+            if membership.as_deref() == Some(JOIN_STR.as_bytes()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The `join_authorised_via_users_server` a restricted room's join needs
@@ -5439,6 +5506,9 @@ pub enum RoomError {
     /// rule rather than the field.
     InvalidPowerLevels(String),
     UnknownRoom(String),
+    /// The room has a retained log but no joined member from this server, so
+    /// its state is not current enough to authorize a fresh local join.
+    NonResidentRoom(String),
     MissingBody(String),
     Build(String),
     Append(String),
@@ -5490,6 +5560,9 @@ impl std::fmt::Display for RoomError {
                 write!(formatter, "invalid power_level_content_override: {why}")
             }
             Self::UnknownRoom(id) => write!(formatter, "no such room: {id}"),
+            Self::NonResidentRoom(id) => {
+                write!(formatter, "this server is no longer resident in {id}")
+            }
             Self::MissingBody(id) => write!(formatter, "the body of {id} is missing"),
             Self::Build(message) => write!(formatter, "cannot build the event: {message}"),
             Self::Append(message) => write!(formatter, "cannot append: {message}"),

@@ -1371,6 +1371,79 @@ impl Federation {
         Ok((content_type, filename, bytes.to_vec()))
     }
 
+    /// Deliver every durable PDU already queued for `destination` before a
+    /// membership handshake asks that destination to judge newer state.
+    ///
+    /// The background drain and a direct membership request use separate
+    /// HTTP connections, so request order alone does not order them. A leave
+    /// can otherwise still be in the outbox when `make_join` reaches the peer,
+    /// which then truthfully treats the user as joined and admits a join that
+    /// the state after the leave would refuse. Sending the queued batches here
+    /// establishes the missing happens-before edge. Concurrent background
+    /// delivery is harmless: transaction IDs are stable and PDU event IDs are
+    /// deduplicated by the receiver.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] when the queue cannot be read or removed,
+    /// or when the peer does not acknowledge a batch.
+    pub async fn flush_outbox(&self, destination: &str) -> Result<(), FederationError> {
+        loop {
+            let rows = ReadView::scan_prefix(
+                self.store.as_ref(),
+                &keys::federation_outbox_prefix(destination),
+            )
+            .map_err(|error| FederationError::Storage(error.to_string()))?;
+            let batch: Vec<_> = rows.into_iter().take(50).collect();
+            if batch.is_empty() {
+                return Ok(());
+            }
+            let pdus: Vec<Value> = batch
+                .iter()
+                .filter_map(|(_, value)| serde_json::from_slice(value).ok())
+                .collect();
+            let first_seq = batch[0]
+                .0
+                .get(batch[0].0.len() - 8..)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map_or(0, u64::from_be_bytes);
+            let body = serde_json::json!({
+                "origin": self.server_name,
+                "origin_server_ts": now_millis(),
+                "pdus": pdus,
+            });
+            let response = self
+                .transaction_request(destination, &format!("o{first_seq}"), &body)?
+                .send()
+                .await
+                .map_err(|error| FederationError::Refused(format!("send: {error}")))?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(FederationError::Refused(format!(
+                    "{destination} answered {status}"
+                )));
+            }
+            let answer: Value = response
+                .json()
+                .await
+                .map_err(|error| FederationError::Refused(format!("send body: {error}")))?;
+            if let Some((event_id, result)) = answer["pdus"].as_object().and_then(|results| {
+                results
+                    .iter()
+                    .find(|(_, result)| result.get("error").is_some())
+            }) {
+                return Err(FederationError::Refused(format!(
+                    "{destination} refused queued event {event_id}: {}",
+                    result["error"]
+                )));
+            }
+            for (key, _) in batch {
+                Store::delete(self.store.as_ref(), &key)
+                    .map_err(|error| FederationError::Storage(error.to_string()))?;
+            }
+        }
+    }
+
     /// Deliver one signed transaction to a peer.
     ///
     /// # Errors
