@@ -738,3 +738,78 @@ fn a_live_rejected_malformed_power_event_cannot_be_reconsidered() {
         Some(valid_power.as_str())
     );
 }
+
+#[test]
+fn recovered_auth_body_rebuilds_ancestor_ranks_and_auth_difference() {
+    let bodies = std::cell::RefCell::new(HashMap::from([
+        ("$left", vec!["$late".to_owned()]),
+        ("$right", vec!["$common".to_owned()]),
+        ("$common", vec![]),
+    ]));
+    let auth = |id: &str| bodies.borrow().get(id).cloned();
+    let mut graph = AuthGraph::default();
+    graph.ensure("$left", &auth);
+    graph.ensure("$right", &auth);
+    assert!(graph.missing.contains("$late"));
+    assert_eq!(graph.nodes[graph.index["$left"] as usize].rank, 1);
+    let checked = std::cell::RefCell::new(Vec::new());
+    graph.refresh_missing(&|id| {
+        checked.borrow_mut().push(id.to_owned());
+        bodies.borrow().contains_key(id)
+    });
+    assert_eq!(*checked.borrow(), ["$late"]);
+    assert_eq!(
+        graph.generation, 0,
+        "an absent body does not invalidate a graph"
+    );
+    bodies
+        .borrow_mut()
+        .insert("$late", vec!["$common".to_owned()]);
+    graph.refresh_missing(&|id| bodies.borrow().contains_key(id));
+    assert_eq!(graph.generation, 1);
+    let left = graph.ensure("$left", &auth);
+    let right = graph.ensure("$right", &auth);
+    assert_eq!(graph.nodes[left as usize].rank, 2);
+    let difference: BTreeSet<_> = graph
+        .auth_difference(&[vec![left], vec![right]])
+        .into_iter()
+        .map(|index| graph.nodes[index as usize].id.to_string())
+        .collect();
+    assert_eq!(
+        difference,
+        BTreeSet::from(["$left".to_owned(), "$right".to_owned(), "$late".to_owned()])
+    );
+    assert!(graph.missing.is_empty());
+}
+
+#[test]
+fn a_recovered_auth_body_cannot_reuse_a_resolution_from_before_its_arrival() {
+    let room = Room::new(RoomVersionId::V11);
+    let rules = room.rules();
+    let bodies = std::cell::RefCell::new(room.bodies.clone());
+    let body = |id: &str| bodies.borrow().get(id).cloned();
+    let graph = Mutex::new(AuthGraph::default());
+    // A previous fork touched this unavailable auth ancestor.
+    graph.lock().unwrap().ensure("$late", &|_| None);
+    let cache = ResolutionCache::default();
+    let log = RoomLog::new();
+    let state = room.snapshot();
+    let mut resolver = RoomResolver::new(&rules, &room.id, &log, &body, &graph, &cache);
+    let first = resolver.resolve(&[state.clone(), state.clone()]).unwrap();
+    resolver.resolve(&[state.clone(), state.clone()]).unwrap();
+    assert_eq!(resolver.stats.cache_hits, 1);
+    bodies
+        .borrow_mut()
+        .insert("$late".to_owned(), json!({"auth_events": []}));
+    let recovered = resolver.resolve(&[state.clone(), state]).unwrap();
+    assert_eq!(first.root(), recovered.root());
+    assert_eq!(
+        resolver.stats.resolutions, 2,
+        "new auth evidence must force resolution"
+    );
+    assert_eq!(
+        resolver.stats.cache_hits, 1,
+        "the pre-recovery cache cannot answer"
+    );
+    assert_eq!(graph.lock().unwrap().generation, 1);
+}

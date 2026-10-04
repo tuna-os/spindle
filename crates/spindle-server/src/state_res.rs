@@ -24,12 +24,11 @@
 //! - **The conflicted state subgraph** for v2.1, from the same graph.
 //! - **The auth DAG itself**, per room, built lazily from stored bodies and
 //!   kept: each node is a state event with its auth edges and its rank (one
-//!   more than its highest auth event's), so the walk needs no body read
-//!   after the first resolution in a room.
-//! - **A cache of resolutions** keyed by the set of input state roots. A
-//!   root is the content address of a whole state, so a hit is provably the
-//!   same question: every event naming the same tips, and the room's
-//!   current state over them, cost one resolution between them.
+//!   more than its highest auth event's). Available bodies are read once
+//!   per graph build; unavailable bodies are rechecked before cache reuse.
+//! - **A cache of resolutions** keyed by input state roots, room identity,
+//!   rejection policy and auth graph generation. A recovered auth body
+//!   changes the question even when all input state roots stay identical.
 //!
 //! Every "is this event allowed" question inside resolution is ruma's
 //! `check_state_dependent_auth_rules`, exactly as on the send path
@@ -67,13 +66,16 @@ struct Node {
 
 /// A room's auth DAG over the state events resolution has touched.
 ///
-/// Built on demand from stored bodies, one read per event ever, and then
-/// kept for as long as the room is: a state event's `auth_events` are part
-/// of its signed body and never change, so nothing here is ever stale.
+/// Built on demand from stored bodies, one read per event per build, and then
+/// kept while the room is open. Signed auth edges never change, but a body
+/// absent during an earlier resolution can arrive later. Such arrivals rebuild
+/// ranks and give subsequent resolutions a new cache generation.
 #[derive(Debug, Default)]
 pub struct AuthGraph {
     index: HashMap<Box<str>, u32>,
     nodes: Vec<Node>,
+    missing: HashSet<Box<str>>,
+    generation: u64,
 }
 
 impl AuthGraph {
@@ -87,6 +89,18 @@ impl AuthGraph {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    /// Recheck only bodies that were unavailable, not every cached auth edge.
+    /// A recovered ancestor can change ranks throughout the graph, so rebuild
+    /// all ranks together instead of repairing just that ancestor's node.
+    fn refresh_missing(&mut self, body_exists: &dyn Fn(&str) -> bool) {
+        if self.missing.iter().any(|id| body_exists(id)) {
+            self.index.clear();
+            self.nodes.clear();
+            self.missing.clear();
+            self.generation = self.generation.wrapping_add(1);
+        }
     }
 
     fn intern(&mut self, id: &str) -> u32 {
@@ -139,7 +153,11 @@ impl AuthGraph {
                 continue;
             }
             let node_id = node.id.clone();
-            let auth: Vec<u32> = auth_of(&node_id)
+            let edges = auth_of(&node_id);
+            if edges.is_none() {
+                self.missing.insert(node_id.clone());
+            }
+            let auth: Vec<u32> = edges
                 .unwrap_or_default()
                 .iter()
                 .map(|auth| self.intern(auth))
@@ -557,7 +575,21 @@ fn to_snapshot(
 
 impl StateResolver for RoomResolver<'_> {
     fn resolve(&mut self, states: &[StateSnapshot]) -> Result<StateSnapshot, AppendError> {
-        let key = ResolutionCache::key(states, self.log.resolution_policy_id());
+        let generation = {
+            let mut graph = self
+                .graph
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            graph.refresh_missing(&|id| (self.body)(id).is_some());
+            graph.generation
+        };
+        // Roots and rejection policy can stay identical when a missing auth
+        // body arrives. The old answer must not survive that new evidence.
+        let mut policy = blake3::Hasher::new();
+        policy.update(&self.log.resolution_policy_id());
+        policy.update(self.room_id.as_bytes());
+        policy.update(&generation.to_be_bytes());
+        let key = ResolutionCache::key(states, *policy.finalize().as_bytes());
         if let Some(hit) = self.cache.get(&key) {
             self.stats.cache_hits += 1;
             return Ok(hit);
