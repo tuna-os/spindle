@@ -665,15 +665,76 @@ fn changing_imported_rejection_policy_cannot_reuse_a_cached_resolution() {
     let cache = ResolutionCache::default();
     let states = [StateSnapshot::new()];
     let mut log = RoomLog::new();
-    let original = ResolutionCache::key(&states, log.historical_rejection_policy_id());
+    let original = ResolutionCache::key(&states, log.resolution_policy_id());
     cache.put(original.clone(), StateSnapshot::new());
     log.preserve_historical_rejection(EventId::new("$historical-ban"));
-    let changed = ResolutionCache::key(&states, log.historical_rejection_policy_id());
+    let changed = ResolutionCache::key(&states, log.resolution_policy_id());
     assert_ne!(changed, original);
     assert!(cache.get(&changed).is_none());
     log.preserve_historical_rejection(EventId::new("$historical-ban"));
     assert_eq!(
-        ResolutionCache::key(&states, log.historical_rejection_policy_id()),
+        ResolutionCache::key(&states, log.resolution_policy_id()),
         changed
+    );
+}
+
+#[test]
+fn a_live_rejected_malformed_power_event_cannot_be_reconsidered() {
+    let base = Room::new(RoomVersionId::V10);
+    let power_key = ("m.room.power_levels".to_owned(), String::new());
+    let original_power = base.state[&power_key].clone();
+    let mut left = base.fork("left");
+    let mut content = base.bodies[&original_power]["content"].clone();
+    content["users"]["@bridge:*"] = json!(50);
+    let malformed = left.add(ALICE, "m.room.power_levels", Some(""), &content, 100);
+    left.add(
+        ALICE,
+        "m.room.topic",
+        Some(""),
+        &json!({"topic": "left"}),
+        101,
+    );
+    // The peer's branch references the refused PDU in its auth chain. It
+    // stays outside our accepted state but appears in the auth difference.
+    left.state.insert(power_key.clone(), original_power.clone());
+    let mut right = base.fork("right");
+    let mut valid_content = base.bodies[&original_power]["content"].clone();
+    valid_content["users"][BOB] = json!(45);
+    let valid_power = right.add(ALICE, "m.room.power_levels", Some(""), &valid_content, 90);
+    right.add(
+        ALICE,
+        "m.room.topic",
+        Some(""),
+        &json!({"topic": "right"}),
+        102,
+    );
+    let mut room = base.clone();
+    room.absorb(&left);
+    room.absorb(&right);
+    let mut log = RoomLog::new();
+    let previous_policy = log.resolution_policy_id();
+    log.restore_sidelined(
+        spindle_core::SidelinedEntry {
+            event_id: EventId::new(malformed.as_str()),
+            prev_events: Vec::new(),
+            depth: left.depth[&malformed],
+            state_key: Some(StateKey::new("m.room.power_levels", "")),
+            kind: spindle_core::Sideline::Rejected,
+            state_root: StateSnapshot::new().root(),
+        },
+        StateSnapshot::new(),
+    );
+    assert_ne!(log.resolution_policy_id(), previous_policy);
+    let rules = room.rules();
+    let body = |id: &str| room.bodies.get(id).cloned();
+    let graph = Mutex::new(AuthGraph::default());
+    let cache = ResolutionCache::default();
+    let mut resolver = RoomResolver::new(&rules, &room.id, &log, &body, &graph, &cache);
+    let actual = resolver
+        .resolve(&[left.snapshot(), right.snapshot()])
+        .unwrap();
+    assert_eq!(
+        actual.get(&StateKey::new("m.room.power_levels", "")),
+        Some(valid_power.as_str())
     );
 }

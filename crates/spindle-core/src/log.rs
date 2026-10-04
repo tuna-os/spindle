@@ -289,6 +289,7 @@ pub struct RoomLog {
     /// candidates for insertion into resolved state or the client log.
     historical_rejections: BTreeSet<EventId>,
     historical_rejection_policy_id: [u8; 32],
+    native_rejection_policy_id: [u8; 32],
     /// The room's current state when it has several forward extremities:
     /// their states resolved by the room version's algorithm. With one
     /// extremity it is that extremity's state, and this is `None`. Set by
@@ -317,6 +318,7 @@ impl Default for RoomLog {
             sidelined_state: HashMap::new(),
             historical_rejections: BTreeSet::new(),
             historical_rejection_policy_id: [0; 32],
+            native_rejection_policy_id: [0; 32],
             current: None,
             next_forward: 1,
             next_backward: 0,
@@ -528,6 +530,16 @@ impl RoomLog {
     #[must_use]
     pub fn historical_rejection_policy_id(&self) -> [u8; 32] {
         self.historical_rejection_policy_id
+    }
+
+    /// Identity of rejection decisions that can affect cached resolution.
+    #[must_use]
+    pub fn resolution_policy_id(&self) -> [u8; 32] {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"spindle-resolution-policy-v1");
+        hash.update(&self.historical_rejection_policy_id);
+        hash.update(&self.native_rejection_policy_id);
+        *hash.finalize().as_bytes()
     }
 
     /// Whether an imported historical rejection must remain rejected.
@@ -1083,6 +1095,17 @@ impl RoomLog {
 
     /// Put back a sidelined event read from storage, with its state.
     pub fn restore_sidelined(&mut self, entry: SidelinedEntry, state: StateSnapshot) {
+        let previous = self.sidelined.get(&entry.event_id).map(|old| old.kind);
+        if previous != Some(entry.kind)
+            && (entry.kind == Sideline::Rejected || previous == Some(Sideline::Rejected))
+        {
+            let mut hash = blake3::Hasher::new();
+            hash.update(b"spindle-native-rejection-policy-v1");
+            hash.update(&self.native_rejection_policy_id);
+            hash.update(entry.event_id.as_str().as_bytes());
+            hash.update(&[u8::from(entry.kind == Sideline::Rejected)]);
+            self.native_rejection_policy_id = *hash.finalize().as_bytes();
+        }
         self.sidelined_state.insert(entry.event_id.clone(), state);
         self.sidelined.insert(entry.event_id.clone(), entry);
     }
@@ -1335,6 +1358,7 @@ impl RoomLog {
             sidelined_state: HashMap::new(),
             historical_rejections: BTreeSet::new(),
             historical_rejection_policy_id: [0; 32],
+            native_rejection_policy_id: [0; 32],
             current: None,
             next_forward,
             next_backward,
