@@ -375,7 +375,7 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
             parents.iter().skip(index + 1).any(|right| {
                 left.diff(right)
                     .iter()
-                    .any(|difference| difference.ours.is_some() && difference.theirs.is_some())
+                    .any(|(_, ours, theirs)| ours.is_some() && theirs.is_some())
             })
         });
 
@@ -459,7 +459,7 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
         let differences: Vec<_> = ours
             .diff(expected)
             .into_iter()
-            .filter(|difference| Some(&difference.key) != ignore.as_ref())
+            .filter(|(key, _, _)| Some(*key) != ignore.as_ref())
             .collect();
         if conflicted {
             tally.conflicted += 1;
@@ -475,11 +475,11 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
                 let shown: Vec<Value> = differences
                     .iter()
                     .take(10)
-                    .map(|difference| {
+                    .map(|(key, ours, theirs)| {
                         json!({
-                            "key": format!("{}|{}", difference.key.event_type().as_str(), difference.key.state_key()),
-                            "spindle": difference.ours.as_deref(),
-                            "synapse": difference.theirs.as_deref(),
+                            "key": format!("{}|{}", key.event_type().as_str(), key.state_key()),
+                            "spindle": ours,
+                            "synapse": theirs,
                         })
                     })
                     .collect();

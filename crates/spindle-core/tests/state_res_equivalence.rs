@@ -115,7 +115,7 @@ fn room_with_bob() -> RoomBuilder {
 }
 
 #[test]
-fn a_ban_on_one_branch_voids_the_other_branchs_write() {
+fn a_ban_on_one_branch_voids_the_write_on_the_other_branch() {
     let base = room_with_bob();
 
     let mut left = base.fork("-l");
