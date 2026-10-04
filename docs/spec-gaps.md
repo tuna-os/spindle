@@ -72,7 +72,7 @@ and the diff is the work the release brought.
 
 ## Served beyond the spec at this pin
 
-89 routes the pinned spec does not define: MSC surfaces under
+91 routes the pinned spec does not define: MSC surfaces under
 `unstable/`, the admin and MAS-compatibility APIs, and stable spellings
 newer than the pin. Each MSC route must be accounted for in
 `contrib/msc/ledger.toml`; `scripts/msc-ledger.py --check` enforces that.
@@ -82,6 +82,7 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_matrix/client/unstable/org.matrix.msc2965/auth_metadata`
 - `/_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device`
 - `/_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device/{}/events`
+- `/_matrix/client/unstable/org.matrix.msc4108/rendezvous`
 - `/_matrix/client/unstable/org.matrix.msc4140/delayed_events`
 - `/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{}`
 - `/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{}/{}`
@@ -148,6 +149,7 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_synapse/admin/v2/users/{}`
 - `/_synapse/admin/v2/users/{}/delete_devices`
 - `/_synapse/admin/v2/users/{}/devices`
+- `/_synapse/client/rendezvous/{}`
 - `/_synapse/mas/allow_cross_signing_reset`
 - `/_synapse/mas/delete_device`
 - `/_synapse/mas/delete_user`
