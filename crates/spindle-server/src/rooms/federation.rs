@@ -69,6 +69,239 @@ impl Rooms {
         Ok(false)
     }
 
+    /// Dependencies of a received event that this room does not hold yet.
+    /// Predecessors need a position and state; auth events need a body only.
+    ///
+    /// # Errors
+    /// Returns [`RoomError`] if the room or dependency bodies cannot be read.
+    pub fn missing_remote_dependencies(
+        &self,
+        room_id: &str,
+        event: &Value,
+    ) -> Result<(Vec<String>, Vec<String>), RoomError> {
+        self.with_room_read(room_id, |rooms, log| {
+            let mut predecessors = super::edge_ids(&event["prev_events"]);
+            if spindle_core::is_state_dag(&rooms.version_in_log(log, room_id)?) {
+                predecessors.extend(super::edge_ids(&event["prev_state_events"]));
+            }
+            predecessors.sort();
+            predecessors.dedup();
+            predecessors.retain(|id| {
+                let id = EventId::new(id.as_str());
+                log.get(&id).is_none() && log.sidelined(&id).is_none()
+            });
+            let mut auth = Vec::new();
+            for id in super::edge_ids(&event["auth_events"]) {
+                match rooms.read_event(room_id, &EventId::new(id.as_str())) {
+                    Ok(_) => {}
+                    Err(RoomError::MissingBody(_)) => auth.push(id),
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok((predecessors, auth))
+        })
+    }
+
+    /// The current forward extremities to delimit a missing-event window.
+    ///
+    /// # Errors
+    /// Returns [`RoomError`] if the room cannot be read.
+    pub fn remote_recovery_heads(&self, room_id: &str) -> Result<Vec<String>, RoomError> {
+        self.with_room_read(room_id, |_, log| {
+            Ok(log
+                .forward_extremities()
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect())
+        })
+    }
+
+    /// Retain signature-verified auth dependencies without timeline or client
+    /// indexes. The caller verifies signatures before this synchronous step;
+    /// this step verifies IDs, room ownership and the cited auth rules.
+    /// Existing bodies and Synapse rejection decisions are never overwritten.
+    ///
+    /// # Errors
+    /// Returns [`RoomError`] for malformed, foreign-room or unauthorized
+    /// dependencies, an incomplete/cyclic auth chain, or an atomic write failure.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "validate the entire auth batch before one atomic commit"
+    )]
+    pub fn retain_remote_auth(
+        &self,
+        room_id: &str,
+        events: &[(String, Value)],
+    ) -> Result<(), RoomError> {
+        use ruma::state_res::events::Event as _;
+        use spindle_store::Store as _;
+        use std::collections::BTreeMap;
+
+        self.with_room(room_id, |rooms, log| {
+            let version = rooms.version_in_log(log, room_id)?;
+            if spindle_core::is_state_dag(&version) {
+                return Err(RoomError::Append(
+                    "state-DAG dependencies require predecessor state".to_owned(),
+                ));
+            }
+            let rules = rooms.rules_in(log, room_id)?;
+            let create_id = log
+                .current_state()
+                .and_then(|state| state.get(&StateKey::new("m.room.create", "")))
+                .ok_or_else(|| RoomError::Append("the room has no create event".to_owned()))?
+                .to_owned();
+            let mut pending = BTreeMap::new();
+            for (id, body) in events {
+                match rooms.read_event(room_id, &EventId::new(id.as_str())) {
+                    Ok(_) => continue,
+                    Err(RoomError::MissingBody(_)) => {}
+                    Err(error) => return Err(error),
+                }
+                if let Some(held_room) = spindle_store::ReadView::get(
+                    rooms.store.as_ref(),
+                    &spindle_core::keys::event_room(id),
+                )? && held_room != room_id.as_bytes()
+                {
+                    return Err(RoomError::Forbidden(
+                        "auth event ID is already held in another room".to_owned(),
+                    ));
+                }
+                let ruma::CanonicalJsonValue::Object(canonical) =
+                    ruma::CanonicalJsonValue::try_from(body.clone())
+                        .map_err(|error| RoomError::Build(error.to_string()))?
+                else {
+                    return Err(RoomError::Build("auth event is not an object".to_owned()));
+                };
+                let pdu = Pdu::from_remote(version.clone(), canonical)
+                    .map_err(|error| RoomError::Build(format!("auth event: {error:?}")))?;
+                if pdu.event_id().as_str() != id {
+                    return Err(RoomError::Build(
+                        "auth event ID does not match its body".to_owned(),
+                    ));
+                }
+                let candidate = crate::authorize::StoredEvent::parse_in(id, room_id, body)
+                    .map_err(RoomError::Build)?;
+                if candidate.room_id().map(ruma::RoomId::as_str) != Some(room_id)
+                    || candidate.state_key().is_none()
+                {
+                    return Err(RoomError::Forbidden(
+                        "auth dependency is not state in this room".to_owned(),
+                    ));
+                }
+                if candidate.event_type() == &ruma::events::TimelineEventType::RoomCreate
+                    && id != &create_id
+                {
+                    return Err(RoomError::Forbidden(
+                        "auth dependency replaces the room's create event".to_owned(),
+                    ));
+                }
+                pending
+                    .entry(id.clone())
+                    .or_insert((body.clone(), candidate));
+            }
+            let mut accepted: BTreeMap<String, crate::authorize::StoredEvent> = BTreeMap::new();
+            let mut writes = Vec::new();
+            while !pending.is_empty() {
+                let ready: Vec<String> = pending
+                    .iter()
+                    .filter(|(_, (_, event))| {
+                        event
+                            .auth_event_ids()
+                            .iter()
+                            .all(|auth| !pending.contains_key(auth.as_str()))
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                if ready.is_empty() {
+                    return Err(RoomError::Forbidden(
+                        "auth dependencies contain a cycle".to_owned(),
+                    ));
+                }
+                for id in ready {
+                    let (body, candidate) = pending
+                        .remove(&id)
+                        .ok_or_else(|| RoomError::Build("ready auth event is absent".to_owned()))?;
+                    let fetch = |auth: &ruma::EventId| {
+                        if let Some(event) = accepted.get(auth.as_str()) {
+                            return Some(event.clone());
+                        }
+                        let body = rooms
+                            .read_event(room_id, &EventId::new(auth.as_str()))
+                            .ok()?;
+                        let event = crate::authorize::StoredEvent::parse_auth_in(
+                            auth.as_str(),
+                            room_id,
+                            &body,
+                        )
+                        .ok()?;
+                        let rejected = log
+                            .sidelined(&EventId::new(auth.as_str()))
+                            .is_some_and(|entry| entry.kind == spindle_core::Sideline::Rejected);
+                        Some(event.with_rejected(rejected).with_preserved_rejection(
+                            log.historically_rejected(&EventId::new(auth.as_str())),
+                        ))
+                    };
+                    ruma::state_res::check_state_independent_auth_rules(
+                        &rules.authorization,
+                        candidate.clone(),
+                        fetch,
+                    )
+                    .map_err(|why| RoomError::Forbidden(format!("recovered auth events: {why}")))?;
+                    let mut named = std::collections::HashMap::new();
+                    for auth in candidate.auth_event_ids() {
+                        let event =
+                            fetch(auth).ok_or_else(|| RoomError::MissingBody(auth.to_string()))?;
+                        if event.event_type() == &ruma::events::TimelineEventType::RoomCreate
+                            && auth.as_str() != create_id
+                        {
+                            return Err(RoomError::Forbidden(
+                                "auth chain uses another create event".to_owned(),
+                            ));
+                        }
+                        if let Some(key) = event.state_key() {
+                            named.insert(
+                                (
+                                    ruma::events::StateEventType::from(
+                                        event.event_type().to_string(),
+                                    ),
+                                    key.to_owned(),
+                                ),
+                                event,
+                            );
+                        }
+                    }
+                    if rules.authorization.room_create_event_id_as_room_id {
+                        let create = ruma::OwnedEventId::try_from(create_id.as_str())
+                            .map_err(|error| RoomError::Build(error.to_string()))?;
+                        let event = fetch(&create)
+                            .ok_or_else(|| RoomError::MissingBody(create_id.clone()))?;
+                        named.insert(
+                            (ruma::events::StateEventType::RoomCreate, String::new()),
+                            event,
+                        );
+                    }
+                    crate::authorize::authorize(&rules.authorization, &candidate, |kind, key| {
+                        named
+                            .get(&(kind.clone(), key.to_owned()))
+                            .filter(|event| !event.rejected())
+                            .cloned()
+                    })
+                    .map_err(RoomError::Forbidden)?;
+                    writes.push((event_body_key(room_id, &id), serde_json::to_vec(&body)?));
+                    writes.push((
+                        spindle_core::keys::event_room(&id),
+                        room_id.as_bytes().to_vec(),
+                    ));
+                    accepted.insert(id, candidate);
+                }
+            }
+            rooms
+                .store
+                .commit(&writes, spindle_store::Durability::Group)?;
+            Ok(())
+        })
+    }
+
     /// A join-event template for a remote user, for `make_join`.
     ///
     /// The template is everything but the signature: the caller's server

@@ -1044,6 +1044,18 @@ impl Federation {
         body: Option<&Value>,
         what: &'static str,
     ) -> Result<Value, FederationError> {
+        self.signed_json_bounded(destination, uri, body, what, None)
+            .await
+    }
+
+    async fn signed_json_bounded(
+        &self,
+        destination: &str,
+        uri: &str,
+        body: Option<&Value>,
+        what: &'static str,
+        maximum: Option<usize>,
+    ) -> Result<Value, FederationError> {
         let method = if body.is_some() { "POST" } else { "GET" };
         let authorization = self.sign_request(method, uri, destination, body)?;
         let request = match body {
@@ -1054,25 +1066,187 @@ impl Federation {
                 .body(body.to_string()),
             None => self.request(reqwest::Method::GET, destination, uri).await?,
         };
-        let response = request
+        let mut response = request
             .header("authorization", authorization)
             .timeout(Duration::from_secs(30))
             .send()
             .await
             .map_err(|error| FederationError::Refused(format!("{what}: {error}")))?;
         let status = response.status();
-        let answer: Value = response
-            .bytes()
-            .await
-            .map_err(|error| FederationError::Refused(format!("{what} body: {error}")))
-            .and_then(|bytes| {
-                serde_json::from_slice(&bytes)
-                    .map_err(|error| FederationError::Refused(format!("{what} body: {error}")))
-            })?;
+        let bytes: axum::body::Bytes = if let Some(maximum) = maximum {
+            if response
+                .content_length()
+                .is_some_and(|length| length > maximum as u64)
+            {
+                return Err(FederationError::Refused(format!(
+                    "{what} response is too large"
+                )));
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|error| FederationError::Refused(format!("{what} body: {error}")))?
+            {
+                if chunk.len() > maximum.saturating_sub(bytes.len()) {
+                    return Err(FederationError::Refused(format!(
+                        "{what} response is too large"
+                    )));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            bytes.into()
+        } else {
+            response
+                .bytes()
+                .await
+                .map_err(|error| FederationError::Refused(format!("{what} body: {error}")))?
+        };
+        let answer: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| FederationError::Refused(format!("{what} body: {error}")))?;
         if !status.is_success() {
             return Err(peer_refusal(destination, what, status, answer));
         }
         Ok(answer)
+    }
+
+    /// Fetch a bounded predecessor window. Returned PDUs still need event
+    /// identity, signature and room authorization checks before storage.
+    ///
+    /// # Errors
+    /// Returns [`FederationError`] for an invalid limit, a refused request,
+    /// an oversized response, or an invalid response shape.
+    pub async fn remote_missing_events(
+        &self,
+        destination: &str,
+        room_id: &str,
+        earliest: &[String],
+        latest: &[String],
+        limit: usize,
+    ) -> Result<Vec<Value>, FederationError> {
+        if !(1..=100).contains(&limit) {
+            return Err(FederationError::Refused(
+                "missing-event limit must be 1..=100".to_owned(),
+            ));
+        }
+        let uri = format!(
+            "/_matrix/federation/v1/get_missing_events/{}",
+            path_segment(room_id)
+        );
+        let body = serde_json::json!({
+            "earliest_events": earliest, "latest_events": latest,
+            "limit": limit, "min_depth": 0,
+        });
+        let response = self
+            .signed_json_bounded(
+                destination,
+                &uri,
+                Some(&body),
+                "get_missing_events",
+                Some(16 * 1024 * 1024),
+            )
+            .await?;
+        let events = response["events"].as_array().ok_or_else(|| {
+            FederationError::Refused("get_missing_events response has no events array".to_owned())
+        })?;
+        if events.len() > limit || events.iter().any(|event| !event.is_object()) {
+            return Err(FederationError::Refused(
+                "get_missing_events returned an invalid event window".to_owned(),
+            ));
+        }
+        Ok(events.clone())
+    }
+
+    /// Fetch one event body for dependency recovery. The requesting caller
+    /// must verify its computed ID and signature against the requested ID.
+    ///
+    /// # Errors
+    /// Returns [`FederationError`] if the peer refuses or returns anything
+    /// other than one PDU in a bounded transaction response.
+    pub async fn remote_event(
+        &self,
+        destination: &str,
+        event_id: &str,
+    ) -> Result<Value, FederationError> {
+        let uri = format!("/_matrix/federation/v1/event/{}", path_segment(event_id));
+        let response = self
+            .signed_json_bounded(destination, &uri, None, "event", Some(16 * 1024 * 1024))
+            .await?;
+        let pdus = response["pdus"]
+            .as_array()
+            .filter(|pdus| pdus.len() == 1 && pdus[0].is_object())
+            .ok_or_else(|| {
+                FederationError::Refused("event response must contain exactly one PDU".to_owned())
+            })?;
+        Ok(pdus[0].clone())
+    }
+
+    /// Fetch the peer's auth chain. Bodies are untrusted until each event's
+    /// identity, signature and auth dependencies have been checked.
+    ///
+    /// # Errors
+    /// Returns [`FederationError`] if the request is refused or the response
+    /// exceeds the byte budget or has an invalid auth chain.
+    pub async fn remote_event_auth(
+        &self,
+        destination: &str,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<Vec<Value>, FederationError> {
+        let uri = format!(
+            "/_matrix/federation/v1/event_auth/{}/{}",
+            path_segment(room_id),
+            path_segment(event_id)
+        );
+        let response = self
+            .signed_json_bounded(
+                destination,
+                &uri,
+                None,
+                "event_auth",
+                Some(16 * 1024 * 1024),
+            )
+            .await?;
+        let events = response["auth_chain"]
+            .as_array()
+            .filter(|events| events.iter().all(Value::is_object))
+            .ok_or_else(|| {
+                FederationError::Refused("event_auth response has no valid auth chain".to_owned())
+            })?;
+        Ok(events.clone())
+    }
+
+    /// Fetch the IDs of state and auth events before a missing predecessor.
+    /// The caller must fetch and validate the bodies before using that state.
+    ///
+    /// # Errors
+    /// Returns [`FederationError`] for a refusal, an oversized response or
+    /// invalid state/auth ID arrays.
+    pub async fn remote_state_ids(
+        &self,
+        destination: &str,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<Value, FederationError> {
+        let encoded: String = form_urlencoded::byte_serialize(event_id.as_bytes()).collect();
+        let uri = format!(
+            "/_matrix/federation/v1/state_ids/{}?event_id={encoded}",
+            path_segment(room_id),
+        );
+        let response = self
+            .signed_json_bounded(destination, &uri, None, "state_ids", Some(16 * 1024 * 1024))
+            .await?;
+        for field in ["pdu_ids", "auth_chain_ids"] {
+            if !response[field]
+                .as_array()
+                .is_some_and(|ids| ids.iter().all(Value::is_string))
+            {
+                return Err(FederationError::Refused(format!(
+                    "state_ids response has no valid {field} array"
+                )));
+            }
+        }
+        Ok(response)
     }
 
     /// Ask a peer for its users' device keys (`user/keys/query`).
