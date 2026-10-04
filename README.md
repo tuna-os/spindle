@@ -50,7 +50,7 @@ curl -XPOST localhost:8008/_matrix/client/v3/register \
 ```
 
 Point Element, Element X, Cinny, Nheko or FluffyChat at `http://localhost:8008`
-and it works unmodified — Spindle serves ordinary rooms of room versions 6 to
+and it works unmodified — Spindle serves ordinary rooms of room versions 1 to
 12, so there is no client capability to negotiate.
 
 [`spindle.example.toml`](spindle.example.toml) documents every setting, and a

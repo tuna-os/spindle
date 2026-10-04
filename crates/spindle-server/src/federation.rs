@@ -650,7 +650,9 @@ impl Federation {
             .ok_or_else(|| FederationError::Refused(format!("no keys for {origin}")))?;
         let cached: Value = serde_json::from_slice(&bytes)
             .map_err(|error| FederationError::Storage(error.to_string()))?;
-        PeerKeys::from_document(origin, &cached["document"])
+        let mut keys = PeerKeys::from_document(origin, &cached["document"])?;
+        keys.valid_until = cached["fetched_valid_until"].as_u64();
+        Ok(keys)
     }
 
     /// The origin's key document as it published it, from cache or
@@ -887,7 +889,10 @@ impl Federation {
         event_id: &str,
         knock: &Value,
     ) -> Result<Value, FederationError> {
-        let uri = format!("/_matrix/federation/v1/send_knock/{room_id}/{event_id}");
+        let uri = format!(
+            "/_matrix/federation/v1/send_knock/{room_id}/{}",
+            path_segment(event_id)
+        );
         let authorization = self.sign_request("PUT", &uri, destination, Some(knock))?;
         let response = self
             .client
@@ -1110,7 +1115,10 @@ impl Federation {
         event_id: &str,
         join: &Value,
     ) -> Result<Value, FederationError> {
-        let uri = format!("/_matrix/federation/v2/send_join/{room_id}/{event_id}");
+        let uri = format!(
+            "/_matrix/federation/v2/send_join/{room_id}/{}",
+            path_segment(event_id)
+        );
         let authorization = self.sign_request("PUT", &uri, destination, Some(join))?;
         let response = self
             .client
@@ -1159,7 +1167,10 @@ impl Federation {
         event_id: &str,
         body: &Value,
     ) -> Result<Value, FederationError> {
-        let uri = format!("/_matrix/federation/v2/invite/{room_id}/{event_id}");
+        let uri = format!(
+            "/_matrix/federation/v2/invite/{room_id}/{}",
+            path_segment(event_id)
+        );
         let authorization = self.sign_request("PUT", &uri, destination, Some(body))?;
         let response = self
             .client
@@ -1241,7 +1252,10 @@ impl Federation {
         event_id: &str,
         leave: &Value,
     ) -> Result<(), FederationError> {
-        let uri = format!("/_matrix/federation/v2/send_leave/{room_id}/{event_id}");
+        let uri = format!(
+            "/_matrix/federation/v2/send_leave/{room_id}/{}",
+            path_segment(event_id)
+        );
         let authorization = self.sign_request("PUT", &uri, destination, Some(leave))?;
         let response = self
             .client
@@ -1691,6 +1705,10 @@ pub struct PeerKeys {
     /// Keys of *other* servers that must also verify the event -- the
     /// countersignature on a restricted join is ours, not the peer's.
     vouched: ruma::signatures::PublicKeyMap,
+    /// How long the current keys answer for an event, for the versions
+    /// that enforce it (v5+): the document's `valid_until_ts` capped at
+    /// seven days after the fetch. `None` when unknown.
+    valid_until: Option<u64>,
 }
 
 impl PeerKeys {
@@ -1723,10 +1741,28 @@ impl PeerKeys {
     /// at `origin_server_ts`: every current key, plus each retired key whose
     /// expiry is after that moment. An event with no timestamp gets current
     /// keys only.
+    ///
+    /// `enforce_key_validity` is room version 5's rule, kept by every later
+    /// version: a current key answers only for events signed no later than
+    /// the document's `valid_until_ts` (capped at seven days after it was
+    /// fetched, which is what the cache stores). Versions 1 to 4 do not
+    /// have the rule, and an old event there still verifies with a key
+    /// whose document has lapsed.
     #[must_use]
-    pub fn map_for(&self, origin_server_ts: Option<u64>) -> ruma::signatures::PublicKeyMap {
+    pub fn map_for(
+        &self,
+        origin_server_ts: Option<u64>,
+        enforce_key_validity: bool,
+    ) -> ruma::signatures::PublicKeyMap {
         let at = origin_server_ts.unwrap_or(u64::MAX);
-        let mut set: ruma::signatures::PublicKeySet = self.current.clone();
+        let lapsed = enforce_key_validity
+            && origin_server_ts.is_some()
+            && self.valid_until.is_some_and(|until| at > until);
+        let mut set: ruma::signatures::PublicKeySet = if lapsed {
+            ruma::signatures::PublicKeySet::new()
+        } else {
+            self.current.clone()
+        };
         for (key_id, (key, expired_ts)) in &self.retired {
             if at < *expired_ts {
                 set.entry(key_id.clone()).or_insert_with(|| key.clone());
@@ -1741,6 +1777,28 @@ impl PeerKeys {
     pub fn vouch(&mut self, server: String, key_id: String, key: ruma::serde::Base64) {
         self.vouched.entry(server).or_default().insert(key_id, key);
     }
+}
+
+/// An identifier as one path segment of a federation URL.
+///
+/// A room v3 event ID is standard base64 and may contain `/`, which would
+/// otherwise split the segment and send the request to a route that does
+/// not exist. Only the characters that change a path's meaning are
+/// escaped, so every ID from v4 on (URL-safe) and every v1/v2 ID goes out
+/// byte for byte as it always did -- the request signature covers the URI,
+/// and a needless change to it is a change both sides must agree on.
+pub(crate) fn path_segment(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    for character in id.chars() {
+        match character {
+            '/' => out.push_str("%2F"),
+            '?' => out.push_str("%3F"),
+            '#' => out.push_str("%23"),
+            '%' => out.push_str("%25"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn parse_key(key: &str) -> Result<ruma::serde::Base64, FederationError> {
@@ -2131,5 +2189,49 @@ mod well_known_tests {
         assert_eq!(ttl("max-age=99999999"), WELL_KNOWN_MAX);
         assert_eq!(ttl("no-store"), WELL_KNOWN_MIN);
         assert_eq!(ttl("private"), WELL_KNOWN_DEFAULT);
+    }
+}
+
+#[cfg(test)]
+mod key_validity_tests {
+    use super::PeerKeys;
+    use serde_json::json;
+
+    fn keys() -> PeerKeys {
+        let document = json!({
+            "verify_keys": { "ed25519:new": { "key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" } },
+            "old_verify_keys": {
+                "ed25519:old": {
+                    "key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+                    "expired_ts": 500,
+                },
+            },
+        });
+        let mut keys = PeerKeys::from_document("peer.example", &document).unwrap();
+        keys.valid_until = Some(1_000);
+        keys
+    }
+
+    fn held(keys: &PeerKeys, ts: u64, enforce: bool) -> Vec<String> {
+        keys.map_for(Some(ts), enforce)["peer.example"]
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Room version 5's rule: a current key answers only for events signed
+    /// before its document's `valid_until_ts`. Versions 1–4 do not have it.
+    #[test]
+    fn a_lapsed_document_answers_only_where_the_version_does_not_enforce_validity() {
+        let keys = keys();
+        assert_eq!(held(&keys, 900, true), ["ed25519:new"]);
+        assert!(
+            held(&keys, 1_001, true).is_empty(),
+            "v5+ refuses a lapsed key"
+        );
+        assert_eq!(held(&keys, 1_001, false), ["ed25519:new"], "v1–v4 do not");
+        // A retired key is bounded by its own `expired_ts` in every version.
+        assert_eq!(held(&keys, 400, true), ["ed25519:new", "ed25519:old"]);
+        assert_eq!(held(&keys, 600, false), ["ed25519:new"]);
     }
 }

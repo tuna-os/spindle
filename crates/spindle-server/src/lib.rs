@@ -50,6 +50,7 @@ pub mod server_notices;
 pub mod shared_secret_registration;
 pub mod signing;
 pub mod sliding;
+pub mod state_res_v1;
 pub mod stream;
 pub mod surface;
 pub mod telemetry;

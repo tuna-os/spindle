@@ -3633,15 +3633,20 @@ async fn invite_user(
 
     // What comes back must be the same event, co-signature aside — and the
     // reference hash proves it, because signatures are outside the hash.
+    // (A v1/v2 ID is not the hash, so the hash is compared to the hash of
+    // what was sent, and the ID to the ID.)
     let cosigned = response["event"].clone();
-    let same = ruma::CanonicalJsonValue::try_from(cosigned.clone())
-        .ok()
-        .and_then(|value| match value {
-            ruma::CanonicalJsonValue::Object(object) => Some(object),
-            _ => None,
-        })
-        .and_then(|object| spindle_core::version::reference_hash(&object, &version).ok())
-        .is_some_and(|hash| format!("${hash}") == event_id);
+    let object = |value: &Value| match ruma::CanonicalJsonValue::try_from(value.clone()) {
+        Ok(ruma::CanonicalJsonValue::Object(object)) => Some(object),
+        _ => None,
+    };
+    let same = match (object(&cosigned), object(&event)) {
+        (Some(theirs), Some(ours)) => {
+            spindle_core::version::same_event(&theirs, &ours, &version)
+                && spindle_core::version::event_id(&ours, &version).is_ok_and(|id| id == event_id)
+        }
+        _ => false,
+    };
     if !same {
         return Err(MatrixError::new(
             StatusCode::BAD_GATEWAY,
