@@ -87,9 +87,9 @@ impl StoredEvent {
             return Ok(event);
         }
         let mut content = json["content"].clone();
-        let mapped = content["users"]
-            .as_object_mut()
-            .expect("users was an object");
+        let Some(mapped) = content["users"].as_object_mut() else {
+            return Err("power-level users changed shape".into());
+        };
         for id in invalid {
             let substitute = legacy_power_user_id(id);
             if mapped.contains_key(&substitute) {
@@ -281,11 +281,17 @@ pub fn authorize(
 /// Same stable representation used by the Synapse importer for legacy IDs.
 fn legacy_power_user_id(id: &str) -> String {
     use sha2::{Digest, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = Sha256::digest(id.as_bytes());
     let hex: String = digest
         .iter()
         .take(10)
-        .map(|byte| format!("{byte:02x}"))
+        .flat_map(|byte| {
+            [
+                char::from(HEX[usize::from(byte >> 4)]),
+                char::from(HEX[usize::from(byte & 15)]),
+            ]
+        })
         .collect();
     let server = id
         .split_once(':')
@@ -301,9 +307,11 @@ mod legacy_power_tests {
     use serde_json::json;
 
     fn body(kind: &str, sender: &str, key: &str, content: Value) -> Value {
-        json!({"room_id":"!room:example.org", "type":kind, "sender":sender,
-            "state_key":key, "content":content, "origin_server_ts":1,
-            "prev_events":[], "auth_events":[]})
+        let mut event = json!({"room_id":"!room:example.org", "type":kind, "sender":sender,
+            "state_key":key, "origin_server_ts":1,
+            "prev_events":[], "auth_events":[]});
+        event["content"] = content;
+        event
     }
 
     #[test]
