@@ -31,6 +31,16 @@ const DEVICE_SCOPE: &str = "urn:matrix:org.matrix.msc2967.client:device:";
 
 /// The scope that grants the client API at all.
 const API_SCOPE: &str = "urn:matrix:org.matrix.msc2967.client:api:*";
+const STABLE_API_SCOPE: &str = "urn:matrix:client:api:*";
+const STABLE_DEVICE_SCOPE: &str = "urn:matrix:client:device:";
+const ADMIN_SCOPE: &str = "urn:synapse:admin:*";
+
+#[derive(Clone)]
+struct Verdict {
+    user_id: String,
+    device_id: Option<String>,
+    admin: bool,
+}
 
 /// The delegated provider, plus the caches that keep it off the hot path.
 pub struct Delegated {
@@ -39,7 +49,7 @@ pub struct Delegated {
     /// Token-hash → verdict. Introspecting on every request would put
     /// the provider in every API call's latency; the hash keeps usable
     /// tokens out of process memory dumps, same as the token store.
-    verdicts: Mutex<HashMap<[u8; 32], (Identity, Instant)>>,
+    verdicts: Mutex<HashMap<[u8; 32], (Verdict, Instant)>>,
     /// The provider's metadata document, fetched once on first ask.
     metadata: Mutex<Option<Value>>,
 }
@@ -116,6 +126,42 @@ impl Delegated {
         server_name: &str,
         token: &str,
     ) -> Result<Identity, MatrixError> {
+        let verdict = self.resolve(store, server_name, token).await?;
+        Ok(Identity {
+            user_id: verdict.user_id,
+            device_id: verdict.device_id.ok_or_else(MatrixError::unknown_token)?,
+        })
+    }
+
+    /// Authenticate an admin token without provisioning a synthetic device.
+    /// The capability belongs to the token; it never changes the account's flag.
+    ///
+    /// # Errors
+    ///
+    /// Returns an authentication error for invalid tokens or missing admin scope.
+    pub async fn identify_admin(
+        &self,
+        store: &spindle_store::FjallStore,
+        server_name: &str,
+        token: &str,
+    ) -> Result<Identity, MatrixError> {
+        let verdict = self.resolve(store, server_name, token).await?;
+        if !verdict.admin {
+            return Err(MatrixError::forbidden("token does not grant the admin API"));
+        }
+        Ok(Identity {
+            user_id: verdict.user_id,
+            // Admin handlers use the identity for authorization and audit only.
+            device_id: verdict.device_id.unwrap_or_default(),
+        })
+    }
+
+    async fn resolve(
+        &self,
+        store: &spindle_store::FjallStore,
+        server_name: &str,
+        token: &str,
+    ) -> Result<Verdict, MatrixError> {
         let key: [u8; 32] = *blake3::hash(token.as_bytes()).as_bytes();
         if let Some((identity, fresh_until)) = self
             .verdicts
@@ -140,8 +186,11 @@ impl Delegated {
         store: &spindle_store::FjallStore,
         server_name: &str,
         token: &str,
-    ) -> Result<Identity, MatrixError> {
-        let request = self.client.post(&self.config.introspection_endpoint);
+    ) -> Result<Verdict, MatrixError> {
+        let request = self
+            .client
+            .post(&self.config.introspection_endpoint)
+            .header("X-MAS-Supports-Device-Id", "1");
         // A registered client's credentials when there are some; otherwise
         // the shared homeserver secret, which MAS accepts from the
         // homeserver it serves (Synapse's `matrix_authentication_service`
@@ -155,6 +204,7 @@ impl Delegated {
             .timeout(Duration::from_secs(10))
             .send()
             .await
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|_| MatrixError::unknown_token())?;
         let verdict: Value = response
             .bytes()
@@ -166,14 +216,34 @@ impl Delegated {
             return Err(MatrixError::unknown_token());
         }
         let scope = verdict["scope"].as_str().unwrap_or_default();
-        if !scope.split(' ').any(|part| part == API_SCOPE) {
+        let scopes: std::collections::HashSet<_> = scope.split_ascii_whitespace().collect();
+        if !scopes.contains(API_SCOPE) && !scopes.contains(STABLE_API_SCOPE) {
             return Err(MatrixError::unknown_token());
         }
-        let device_id = scope
-            .split(' ')
-            .find_map(|part| part.strip_prefix(DEVICE_SCOPE))
-            .ok_or_else(MatrixError::unknown_token)?
-            .to_owned();
+        let device_ids: std::collections::HashSet<_> = scopes
+            .iter()
+            .filter_map(|part| {
+                part.strip_prefix(DEVICE_SCOPE)
+                    .or_else(|| part.strip_prefix(STABLE_DEVICE_SCOPE))
+            })
+            .collect();
+        if device_ids.len() > 1 {
+            return Err(MatrixError::unknown_token());
+        }
+        let device_id = verdict["device_id"]
+            .as_str()
+            .or_else(|| device_ids.into_iter().next())
+            .map(str::to_owned);
+        if device_id
+            .as_ref()
+            .is_some_and(|id| id.is_empty() || id.len() > 255)
+        {
+            return Err(MatrixError::unknown_token());
+        }
+        let admin = scopes.contains(ADMIN_SCOPE);
+        if device_id.is_none() && !admin {
+            return Err(MatrixError::unknown_token());
+        }
         let localpart = verdict["username"]
             .as_str()
             .ok_or_else(MatrixError::unknown_token)?
@@ -192,18 +262,20 @@ impl Delegated {
         // The device row exists because the provider bound the token to
         // it — MSC3861's account/device mapping, written down so device
         // lists and E2EE key uploads have something to hang off.
-        if accounts
-            .device(&localpart, &device_id)
-            .map_err(|error| MatrixError::internal(&error.to_string()))?
-            .is_none()
+        if let Some(device_id) = &device_id
+            && accounts
+                .device(&localpart, device_id)
+                .map_err(|error| MatrixError::internal(&error.to_string()))?
+                .is_none()
         {
             accounts
-                .put_device(&localpart, &device_id, None)
+                .put_device(&localpart, device_id, None)
                 .map_err(|error| MatrixError::internal(&error.to_string()))?;
         }
-        Ok(Identity {
+        Ok(Verdict {
             user_id: accounts.user_id(&localpart),
             device_id,
+            admin,
         })
     }
 }

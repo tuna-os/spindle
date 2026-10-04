@@ -29,6 +29,13 @@ With `[auth.delegated]` configured:
   provider, with the verdict cached for 120 seconds. The account and
   device are provisioned on first sight, bound to what the provider's
   scopes say (MSC2967), never to anything the client claims.
+- Tokens with `urn:synapse:admin:*` can use the admin API without a
+  device scope. Element Admin needs this access. This permission
+  stays on the token and does not set the account's permanent `admin`
+  flag. A token without a device cannot use device-dependent client
+  endpoints. Spindle accepts stable `urn:matrix:client:*` scopes and
+  scope names from MSC2967. The `urn:mas:admin` scope alone does not
+  grant access to Spindle's admin API.
 - The `/_synapse/mas/*` provisioning surface opens (only with
   `homeserver_secret` set, and only to its holder): MAS uses it to
   create users, manage devices, set display names, and deactivate
