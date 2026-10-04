@@ -1,0 +1,219 @@
+# Spindle B: drill-b after the cut-over. Same Service, same TLS front,
+# same server_name and signing key as Synapse B; only the server behind
+# the front changes. drill.sh fills in:
+#   __PG_IP__          the rehearsal-pg ClusterIP (import Job only)
+#   __SPINDLE_IMAGE__  the rehearsal image (built with synapse-import)
+#   __SPINDLE_BIN__    /usr/local/bin/spindle, or a binary built in
+#                      mig-rig-toolbox under /work/drill/bin (read-only)
+#   __ROOMS__ / __USERS__  what the importer moves
+#
+# Isolation is the same as Synapse's in synapse.yaml, except that Spindle
+# has no domain whitelist: the private resolver, `allow_internal` naming
+# only the witness's front (every other private address is refused by
+# resolved address), and netwatch.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: drill-b-spindle-config
+  labels: {app: drill-b-spindle-config, part-of: federation-drill}
+data:
+  spindle.toml: |
+    [server]
+    name = "reilly.asia"
+    bind = "0.0.0.0:8008"
+    public_base_url = "https://matrix.reilly.asia"
+
+    [storage]
+    path = "/data/spindle/store"
+
+    [federation]
+    enabled = true
+    allow_internal = ["10.111.63.11/32"]
+
+    [registration]
+    require_token = true
+
+    [push]
+    enabled = false
+
+    [previews]
+    enabled = false
+
+    [ratelimit]
+    enabled = false
+
+    [logging]
+    filter = "info,spindle_server=debug"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: drill-b-import
+  labels: {app: drill-b-import, part-of: federation-drill}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {app: drill-b-import, part-of: federation-drill}
+    spec:
+      restartPolicy: Never
+      nodeSelector: {kubernetes.io/hostname: ip-10-20-1-11}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["127.0.0.1"]
+        searches: []
+      hostAliases:
+      - ip: "__PG_IP__"
+        hostnames: [rehearsal-pg]
+      securityContext:
+        runAsUser: 10093
+        runAsGroup: 10093
+        fsGroup: 10093
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: import
+        image: __SPINDLE_IMAGE__
+        command:
+        - __SPINDLE_BIN__
+        - import-synapse-rehearsal
+        - /conf/spindle.toml
+        - host=rehearsal-pg port=5432 user=postgres dbname=drill_b
+        - "__ROOMS__"
+        - "__USERS__"
+        env:
+        - name: SPINDLE_SYNAPSE_PASSWORD
+          valueFrom: {secretKeyRef: {name: rehearsal-pg, key: POSTGRES_PASSWORD}}
+        - {name: SPINDLE_REHEARSAL_PASSWORD_DIR, value: /secrets/passwords}
+        - {name: SPINDLE_SYNAPSE_SIGNING_KEY_FILE, value: /secrets/signing/signing.key}
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+          limits: {cpu: "1", memory: 2Gi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: [ALL]}
+        volumeMounts:
+        - {name: conf, mountPath: /conf, readOnly: true}
+        - {name: data, mountPath: /data}
+        - {name: work, mountPath: /work, readOnly: true}
+        - {name: passwords, mountPath: /secrets/passwords, readOnly: true}
+        - {name: signing, mountPath: /secrets/signing, readOnly: true}
+      volumes:
+      - name: conf
+        configMap: {name: drill-b-spindle-config}
+      - name: data
+        persistentVolumeClaim: {claimName: drill-b-data}
+      - name: work
+        persistentVolumeClaim: {claimName: mig-rig-work, readOnly: true}
+      - name: passwords
+        secret: {secretName: drill-passwords}
+      - name: signing
+        secret:
+          secretName: drill-b-secrets
+          items: [{key: signing.key, path: signing.key}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drill-b
+  labels: {app: drill-b, part-of: federation-drill}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: drill-b}
+  template:
+    metadata:
+      labels: {app: drill-b, part-of: federation-drill, server: spindle}
+    spec:
+      nodeSelector: {kubernetes.io/hostname: ip-10-20-1-11}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["10.111.63.10"]
+        searches: []
+        options: [{name: ndots, value: "1"}, {name: attempts, value: "1"}, {name: timeout, value: "2"}]
+      securityContext:
+        runAsUser: 10093
+        runAsGroup: 10093
+        fsGroup: 10093
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: front
+        image: nginxinc/nginx-unprivileged:1.27-alpine
+        env:
+        - {name: SERVER_NAME, value: "reilly.asia"}
+        - {name: FED_HOST, value: "matrix.reilly.asia"}
+        - {name: FED_UPSTREAM, value: "127.0.0.1:8008"}
+        - {name: NGINX_ENVSUBST_FILTER, value: "^(SERVER_NAME|FED_HOST|FED_UPSTREAM)$"}
+        ports:
+        - {name: https, containerPort: 8443}
+        resources:
+          requests: {cpu: 10m, memory: 32Mi}
+          limits: {memory: 128Mi}
+        securityContext:
+          runAsUser: 101
+          runAsGroup: 101
+          allowPrivilegeEscalation: false
+          capabilities: {drop: [ALL]}
+        volumeMounts:
+        - {name: front, mountPath: /etc/nginx/templates, readOnly: true}
+        - {name: tls, mountPath: /tls, readOnly: true}
+      - name: spindle
+        image: __SPINDLE_IMAGE__
+        command: [__SPINDLE_BIN__, /conf/spindle.toml]
+        env:
+        # rustls-native-certs reads only this file when it is set: the
+        # private CA is the one root Spindle B trusts.
+        - {name: SSL_CERT_FILE, value: /tls/ca.crt}
+        ports:
+        - {name: client, containerPort: 8008}
+        readinessProbe:
+          httpGet: {path: /_matrix/client/versions, port: 8008}
+          periodSeconds: 5
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+          limits: {cpu: "1", memory: 2Gi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: [ALL]}
+        volumeMounts:
+        - {name: conf, mountPath: /conf, readOnly: true}
+        - {name: data, mountPath: /data}
+        - {name: work, mountPath: /work, readOnly: true}
+        - {name: tls, mountPath: /tls, readOnly: true}
+      - name: netwatch
+        image: oci.element.io/synapse:v1.156.0
+        command: [python3, -u, /netwatch/netwatch.py]
+        env:
+        - {name: ALLOWED, value: "resolver=10.111.63.10:53,peer=10.111.63.11:443"}
+        - {name: LISTEN_PORTS, value: "8008,8443"}
+        resources:
+          requests: {cpu: 10m, memory: 32Mi}
+          limits: {memory: 128Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: [ALL]}
+        volumeMounts:
+        - {name: netwatch, mountPath: /netwatch, readOnly: true}
+      volumes:
+      - name: conf
+        configMap: {name: drill-b-spindle-config}
+      - name: front
+        configMap:
+          name: drill-front
+          items: [{key: front.conf.template, path: default.conf.template}]
+      - name: netwatch
+        configMap:
+          name: drill-front
+          items: [{key: netwatch.py, path: netwatch.py}]
+      - name: data
+        persistentVolumeClaim: {claimName: drill-b-data}
+      - name: work
+        persistentVolumeClaim: {claimName: mig-rig-work, readOnly: true}
+      - name: tls
+        secret: {secretName: drill-b-tls}
