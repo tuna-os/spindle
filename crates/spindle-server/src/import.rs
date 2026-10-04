@@ -1524,6 +1524,31 @@ pub fn persist_rehearsal(
         .iter()
         .filter_map(|id| bodies.get(id).map(|body| (id.clone(), body.clone())))
         .collect();
+    let accepted: HashSet<&str> = plan
+        .steps
+        .iter()
+        .map(|step| step.input.event_id.as_str())
+        .collect();
+    let required_auth: HashSet<String> = bodies
+        .values()
+        .flat_map(|body| crate::rooms::edge_ids(&body["auth_events"]))
+        .collect();
+    let auth_bodies = source
+        .events
+        .iter()
+        .filter(|event| {
+            (event.state_key.is_some() || required_auth.contains(&event.event_id))
+                && !accepted.contains(event.event_id.as_str())
+        })
+        .filter_map(|event| {
+            bodies
+                .get(&event.event_id)
+                .map(|body| (event.event_id.clone(), body.clone()))
+        })
+        .collect();
+    rooms
+        .persist_imported_auth_pdus(&source.room_id, &auth_bodies)
+        .map_err(PersistError::Room)?;
     rooms
         .preserve_imported_rejections(&source.room_id, &rejected, &rejected_bodies)
         .map_err(PersistError::Room)?;

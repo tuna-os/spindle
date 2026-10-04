@@ -56,7 +56,7 @@ use crate::import::{
 const CHUNK: usize = 2_000;
 
 /// Checkpoints before these rejection and continuity rules must replay again.
-const REJECTION_POLICY_VERSION: u32 = 2;
+const REJECTION_POLICY_VERSION: u32 = 3;
 
 /// How many events a room report samples for the body comparison.
 const SAMPLES_PER_ROOM: usize = 5;
@@ -126,6 +126,9 @@ pub struct RoomReport {
     /// Rejected PDUs retained for auth, outside the accepted timeline.
     #[serde(default)]
     pub preserved_rejections: u64,
+    /// State PDUs outside the accepted timeline retained for auth context.
+    #[serde(default)]
+    pub retained_auth_pdus: u64,
     pub version: String,
     /// Rows in Synapse's `events` table for the room.
     pub source_events: u64,
@@ -1668,7 +1671,7 @@ impl Run<'_, '_> {
             } else if reason == DISAGREED_REASON {
                 "resolver disagrees with Synapse: Synapse's slots".to_owned()
             } else if reason == ELSEWHERE_REASON {
-                "Synapse took this state from a peer: Synapse's state".to_owned()
+                "source state differs from the derivation: Synapse's state".to_owned()
             } else if reason == HEAD_REASON {
                 "head: Synapse's current state".to_owned()
             } else {
@@ -1813,6 +1816,41 @@ impl Run<'_, '_> {
                         plan.steps.len(),
                         room_report.body_bytes
                     ));
+                }
+            }
+            let accepted: BTreeSet<&str> = plan
+                .steps
+                .iter()
+                .map(|step| step.input.event_id.as_str())
+                .collect();
+            let required_auth: BTreeSet<String> = self
+                .snapshot
+                .auth_edges(room_id)?
+                .into_iter()
+                .map(|(_, id)| id)
+                .collect();
+            let auth_ids: Vec<String> = source
+                .events
+                .iter()
+                .filter(|event| {
+                    (event.state_key.is_some() || required_auth.contains(&event.event_id))
+                        && !accepted.contains(event.event_id.as_str())
+                })
+                .map(|event| event.event_id.clone())
+                .collect();
+            for ids in auth_ids.chunks(CHUNK) {
+                let bodies = self.snapshot.event_bodies_for(ids)?;
+                if bodies.len() != ids.len() {
+                    return Err(Error::Write(format!(
+                        "{room_id}: source auth PDU bodies are missing"
+                    )));
+                }
+                if !self.options.dry_run {
+                    room_report.retained_auth_pdus +=
+                        self.target
+                            .rooms
+                            .persist_imported_auth_pdus(room_id, &bodies)
+                            .map_err(write_error)? as u64;
                 }
             }
             if self.options.dry_run {
@@ -2223,6 +2261,7 @@ pub fn validate(
     let rooms = crate::rooms::Rooms::new(Arc::clone(store), &options.server_name);
     let mut validation = Validation::default();
     let mut historical_rejections = Check::default();
+    let mut auth_context = Check::default();
 
     let room_ids: Vec<String> = report.rooms.keys().cloned().collect();
     for room_id in &room_ids {
@@ -2328,6 +2367,31 @@ pub fn validate(
             }
         }
 
+        for row in snapshot.query(
+            "SELECT DISTINCT a.auth_id FROM event_auth a JOIN event_json j ON j.event_id = a.auth_id WHERE a.room_id = $1",
+            &[room_id],
+        )? {
+            let id: String = row.get(0);
+            auth_context.expect(rooms.pdu(room_id, &id).is_ok(), || {
+                format!("{room_id} {id}: retained source auth PDU is missing")
+            });
+        }
+        let auth_markers = ReadView::scan_prefix(
+            store.as_ref(),
+            &spindle_core::keys::room_prefix(
+                spindle_core::keys::Keyspace::ImportedAuthOnly,
+                room_id,
+            ),
+        )
+        .map_err(write_error)?;
+        auth_context.expect(auth_markers.iter().all(|(_, value)| value == &[1]), || {
+            format!("{room_id}: corrupt auth marker")
+        });
+        auth_context.expect(
+            auth_markers.len() as u64 == report.rooms[room_id].retained_auth_pdus,
+            || format!("{room_id}: stored auth marker count differs from checkpoint"),
+        );
+
         let excluded_here = report.rooms[room_id].frayed + report.rooms[room_id].orphaned;
         for row in snapshot.query(
             "SELECT event.event_id, body.json, \
@@ -2384,6 +2448,10 @@ pub fn validate(
         started.elapsed().as_secs_f64()
     );
 
+    validation.domains.insert(
+        "auth_context".to_owned(),
+        (auth_context.rows, auth_context.mismatches),
+    );
     validation.domains.insert(
         "historical_rejections".to_owned(),
         (historical_rejections.rows, historical_rejections.mismatches),

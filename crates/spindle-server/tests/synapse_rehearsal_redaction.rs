@@ -232,3 +232,143 @@ fn imported_rejections_survive_reopen_without_entering_the_timeline() {
         "join"
     );
 }
+
+#[test]
+fn auth_outliers_are_retained_for_federation_and_hidden_from_clients() {
+    let create = source("$create", "m.room.create", Some(""), &[]);
+    let member = source("$member", "m.room.member", Some(ALICE), &["$create"]);
+    let mut auth = source("$auth", "m.room.power_levels", Some(""), &[]);
+    auth.outlier = true;
+    let bodies = BTreeMap::from([
+        (
+            "$create".to_owned(),
+            body(
+                "$create",
+                &create,
+                json!({"creator": ALICE, "room_version": "10"}),
+                &[],
+            ),
+        ),
+        (
+            "$member".to_owned(),
+            body(
+                "$member",
+                &member,
+                json!({"membership": "join"}),
+                &[("auth_events", json!(["$create", "$auth"]))],
+            ),
+        ),
+        (
+            "$auth".to_owned(),
+            body("$auth", &auth, json!({"users": {ALICE: 100}}), &[]),
+        ),
+    ]);
+    let room = SourceRoom {
+        room_id: ROOM.to_owned(),
+        events: vec![create, member, auth],
+        current_state: StateMap::from([
+            (
+                ("m.room.create".to_owned(), String::new()),
+                "$create".to_owned(),
+            ),
+            (
+                ("m.room.member".to_owned(), ALICE.to_owned()),
+                "$member".to_owned(),
+            ),
+        ]),
+        state_after_root: None,
+        forward_extremities: Vec::new(),
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(spindle_store::FjallStore::open(directory.path()).unwrap());
+    let rooms = Rooms::new(Arc::clone(&store), "example.org");
+    assert_eq!(
+        persist_rehearsal(&rooms, &room, &bodies).unwrap().imported,
+        2
+    );
+    drop(rooms);
+    let rooms = Rooms::new(store, "example.org");
+    assert!(rooms.event(ROOM, "$auth").is_err());
+    assert_eq!(rooms.pdu(ROOM, "$auth").unwrap(), bodies["$auth"]);
+}
+
+#[test]
+fn an_imported_redaction_also_prunes_seeded_state_outside_the_timeline() {
+    let mut create = source("$create", "m.room.create", Some(""), &[]);
+    let mut member = source("$member", "m.room.member", Some(ALICE), &[]);
+    let mut topic = source("$topic", "m.room.topic", Some(""), &[]);
+    for event in [&mut create, &mut member, &mut topic] {
+        event.outlier = true;
+    }
+    let message = source("$retained", "m.room.message", None, &["$missing"]);
+    let redaction = source("$redaction", "m.room.redaction", None, &["$retained"]);
+    let bodies = BTreeMap::from([
+        (
+            "$create".to_owned(),
+            body(
+                "$create",
+                &create,
+                json!({"creator": ALICE, "room_version": "10"}),
+                &[],
+            ),
+        ),
+        (
+            "$member".to_owned(),
+            body("$member", &member, json!({"membership": "join"}), &[]),
+        ),
+        (
+            "$topic".to_owned(),
+            body("$topic", &topic, json!({"topic": "deleted topic"}), &[]),
+        ),
+        (
+            "$retained".to_owned(),
+            body(
+                "$retained",
+                &message,
+                json!({"msgtype": "m.text", "body": "retained"}),
+                &[],
+            ),
+        ),
+        (
+            "$redaction".to_owned(),
+            body(
+                "$redaction",
+                &redaction,
+                json!({}),
+                &[("redacts", json!("$topic"))],
+            ),
+        ),
+    ]);
+    let state = StateMap::from([
+        (
+            ("m.room.create".to_owned(), String::new()),
+            "$create".to_owned(),
+        ),
+        (
+            ("m.room.member".to_owned(), ALICE.to_owned()),
+            "$member".to_owned(),
+        ),
+        (
+            ("m.room.topic".to_owned(), String::new()),
+            "$topic".to_owned(),
+        ),
+    ]);
+    let room = SourceRoom {
+        room_id: ROOM.to_owned(),
+        events: vec![create, member, topic, message, redaction],
+        current_state: state.clone(),
+        state_after_root: Some(state),
+        forward_extremities: Vec::new(),
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(spindle_store::FjallStore::open(directory.path()).unwrap());
+    let rooms = Rooms::new(Arc::clone(&store), "example.org");
+    persist_rehearsal(&rooms, &room, &bodies).unwrap();
+    drop(rooms);
+    let rooms = Rooms::new(store, "example.org");
+    assert_eq!(
+        rooms.state_event_full(ROOM, "m.room.topic", "").unwrap()["content"],
+        json!({})
+    );
+    assert!(rooms.event(ROOM, "$topic").is_err());
+}

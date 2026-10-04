@@ -782,6 +782,37 @@ impl Rooms {
         Ok(())
     }
 
+    /// Retain source auth context without adding timeline or relation entries.
+    /// Existing bodies are left intact, including redactions from a resumed run.
+    #[cfg(feature = "synapse-import")]
+    pub(crate) fn persist_imported_auth_pdus(
+        &self,
+        room_id: &str,
+        bodies: &std::collections::HashMap<String, Value>,
+    ) -> Result<usize, RoomError> {
+        self.with_room(room_id, |rooms, log| {
+            let mut writes = Vec::new();
+            let mut retained = 0;
+            for (id, body) in bodies {
+                if log.get(&EventId::new(id.as_str())).is_some() {
+                    continue;
+                }
+                let key = event_body_key(room_id, id);
+                if spindle_store::ReadView::get(rooms.store.as_ref(), &key)?.is_none() {
+                    writes.push((key, serde_json::to_vec(body)?));
+                }
+                writes.push((spindle_core::keys::imported_auth_only(room_id, id), vec![1]));
+                writes.push((
+                    spindle_core::keys::event_room(id),
+                    room_id.as_bytes().to_vec(),
+                ));
+                retained += 1;
+            }
+            spindle_store::Store::commit(rooms.store.as_ref(), &writes, Durability::Group)?;
+            Ok(retained)
+        })
+    }
+
     /// Keep source rejection decisions and their original PDUs outside the timeline.
     /// Markers and bodies land atomically; repeating a chunk is safe.
     #[cfg(feature = "synapse-import")]
@@ -848,8 +879,20 @@ impl Rooms {
             self.with_room_read(room_id, |_, log| {
                 let present = redactions
                     .iter()
-                    .filter(|(target, _)| log.get(&EventId::new(target.as_str())).is_some())
-                    .collect();
+                    .filter_map(|pair @ (target, _)| {
+                        if log.historically_rejected(&EventId::new(target.as_str())) {
+                            return None;
+                        }
+                        match spindle_store::ReadView::get(
+                            self.store.as_ref(),
+                            &event_body_key(room_id, target),
+                        ) {
+                            Ok(Some(_)) => Some(Ok(pair)),
+                            Ok(None) => None,
+                            Err(error) => Some(Err(RoomError::Storage(error))),
+                        }
+                    })
+                    .collect::<Result<_, RoomError>>()?;
                 let members = current_state(log)
                     .into_iter()
                     .filter(|(key, _)| key.event_type().as_str() == "m.room.member")
@@ -2310,6 +2353,15 @@ impl Rooms {
         self.with_room_read(room_id, |_, log| {
             if log.sidelined(&EventId::new(event_id)).is_some()
                 || log.historically_rejected(&EventId::new(event_id))
+            {
+                return Err(RoomError::MissingBody(event_id.to_owned()));
+            }
+            if log.get(&EventId::new(event_id)).is_none()
+                && spindle_store::ReadView::get(
+                    self.store.as_ref(),
+                    &spindle_core::keys::imported_auth_only(room_id, event_id),
+                )?
+                .is_some()
             {
                 return Err(RoomError::MissingBody(event_id.to_owned()));
             }
