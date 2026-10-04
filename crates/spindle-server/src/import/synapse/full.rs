@@ -55,6 +55,9 @@ use crate::import::{
 /// How many planned events are read and written together.
 const CHUNK: usize = 2_000;
 
+/// Checkpoints before this policy must replay their rooms again.
+const REJECTION_POLICY_VERSION: u32 = 1;
+
 /// How many events a room report samples for the body comparison.
 const SAMPLES_PER_ROOM: usize = 5;
 
@@ -117,6 +120,12 @@ pub struct SlotDivergence {
 /// What happened to one imported room.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RoomReport {
+    /// Historical rejection policy used for this replay and persisted store.
+    #[serde(default)]
+    pub rejection_policy_version: u32,
+    /// Rejected PDUs retained for auth, outside the accepted timeline.
+    #[serde(default)]
+    pub preserved_rejections: u64,
     pub version: String,
     /// Rows in Synapse's `events` table for the room.
     pub source_events: u64,
@@ -344,7 +353,7 @@ struct SnapshotSource<'a, 'snapshot> {
     /// The states the replay settled, for the write.
     settled: Option<&'a HashMap<String, Settled>>,
     /// Each event's state group, and each group's `prev_state_group`.
-    groups: Option<&'a (HashMap<String, i64>, HashMap<i64, i64>)>,
+    groups: Option<&'a super::postgres::StateGroupGraph>,
 }
 
 impl SourceState for SnapshotSource<'_, '_> {
@@ -481,6 +490,9 @@ pub fn run(
     report.server_name.clone_from(&options.server_name);
     report.dry_run = options.dry_run;
     report.runs += 1;
+    report
+        .rooms
+        .retain(|_, room| room.rejection_policy_version == REJECTION_POLICY_VERSION);
     let earlier_seconds = report.seconds;
     let mut run = Run {
         options,
@@ -522,11 +534,9 @@ pub fn run(
             if !run.options.dry_run && run.report.rooms[room_id].imported_events > 0 {
                 let count =
                     run.index_positions(room_id, run.report.rooms[room_id].imported_events)?;
-                run.report
-                    .rooms
-                    .get_mut(room_id)
-                    .expect("checked above")
-                    .pagination_positions = count as u64;
+                if let Some(room) = run.report.rooms.get_mut(room_id) {
+                    room.pagination_positions = count as u64;
+                }
                 run.target.rooms.release_imported_room(room_id);
                 run.sync()?;
                 save_checkpoint(&run.options.checkpoint, &run.report)?;
@@ -1578,6 +1588,7 @@ impl Run<'_, '_> {
             .map_or_else(|| "1".to_owned(), |row| row.get(0));
         let source = self.snapshot.read_room(room_id)?;
         let mut room_report = RoomReport {
+            rejection_policy_version: REJECTION_POLICY_VERSION,
             version: version.clone(),
             source_events: source.events.len() as u64,
             state_slots: source.current_state.len() as u64,
@@ -1588,7 +1599,7 @@ impl Run<'_, '_> {
         // state would diverge is reported and never persisted. The replay
         // derives every event's state, with the room version's resolver at
         // each fork; the states it settled are kept for the write.
-        let mut resolver = match RoomResolver::load(self.snapshot, room_id, &version) {
+        let mut auth_engine = match RoomResolver::load(self.snapshot, room_id, &version) {
             Ok(resolver) => resolver,
             Err(error) => {
                 return self.exclude(
@@ -1607,14 +1618,14 @@ impl Run<'_, '_> {
                 room_id,
                 bodies: HashMap::new(),
                 states: &mut states,
-                resolver: Some(&mut resolver),
+                resolver: Some(&mut auth_engine),
                 settled: None,
                 groups: Some(&groups),
             };
             replay_resolving(&source, &mut lookup, false)
         };
-        room_report.compat_user_ids = resolver.stand_ins.iter().cloned().collect();
-        drop(resolver);
+        room_report.compat_user_ids = auth_engine.stand_ins.iter().cloned().collect();
+        drop(auth_engine);
         let resolved = match resolved {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -1821,6 +1832,20 @@ impl Run<'_, '_> {
             if self.options.dry_run {
                 room_report.redactions_applied = redactions.len() as u64;
             } else {
+                let rejected: Vec<String> = source
+                    .events
+                    .iter()
+                    .filter(|event| event.rejected)
+                    .map(|event| event.event_id.clone())
+                    .collect();
+                for ids in rejected.chunks(CHUNK) {
+                    let bodies = self.snapshot.event_bodies_for(ids)?;
+                    room_report.preserved_rejections +=
+                        self.target
+                            .rooms
+                            .preserve_imported_rejections(room_id, ids, &bodies)
+                            .map_err(write_error)? as u64;
+                }
                 room_report.redactions_applied = self
                     .target
                     .rooms
@@ -2211,6 +2236,7 @@ pub fn validate(
     let started = Instant::now();
     let rooms = crate::rooms::Rooms::new(Arc::clone(store), &options.server_name);
     let mut validation = Validation::default();
+    let mut historical_rejections = Check::default();
 
     let room_ids: Vec<String> = report.rooms.keys().cloned().collect();
     for room_id in &room_ids {
@@ -2270,6 +2296,52 @@ pub fn validate(
             );
         }
 
+        let rejected: Vec<String> = snapshot.query(
+            "SELECT e.event_id FROM events e JOIN rejections r USING (event_id) WHERE e.room_id = $1 ORDER BY e.event_id",
+            &[room_id],
+        )?.into_iter().map(|row| row.get(0)).collect();
+        let markers = ReadView::scan_prefix(
+            store.as_ref(),
+            &spindle_core::keys::room_prefix(
+                spindle_core::keys::Keyspace::HistoricalRejection,
+                room_id,
+            ),
+        )
+        .map_err(write_error)?;
+        historical_rejections.expect(markers.len() == rejected.len(), || {
+            format!(
+                "{room_id}: stored rejection count {} differs from source {}",
+                markers.len(),
+                rejected.len()
+            )
+        });
+        historical_rejections.expect(
+            report.rooms[room_id].preserved_rejections == rejected.len() as u64,
+            || format!("{room_id}: checkpoint rejection count differs from source"),
+        );
+        for ids in rejected.chunks(CHUNK) {
+            let bodies = snapshot.event_bodies_for(ids)?;
+            for id in ids {
+                let marker = ReadView::get(
+                    store.as_ref(),
+                    &spindle_core::keys::historical_rejection(room_id, id),
+                )
+                .map_err(write_error)?;
+                historical_rejections.expect(marker.as_deref() == Some(&[1]), || {
+                    format!("{room_id} {id}: missing rejection marker")
+                });
+                let held = rooms.pdu(room_id, id).ok();
+                historical_rejections.expect(
+                    held.as_ref()
+                        .is_some_and(|body| Some(body) == bodies.get(id)),
+                    || format!("{room_id} {id}: rejected PDU differs from source"),
+                );
+                historical_rejections.expect(rooms.event(room_id, id).is_err(), || {
+                    format!("{room_id} {id}: rejected PDU is exposed to clients")
+                });
+            }
+        }
+
         let excluded_here = report.rooms[room_id].frayed + report.rooms[room_id].orphaned;
         for row in snapshot.query(
             "SELECT event.event_id, body.json, \
@@ -2324,6 +2396,11 @@ pub fn validate(
         validation.events_sampled,
         validation.sample_mismatches.len(),
         started.elapsed().as_secs_f64()
+    );
+
+    validation.domains.insert(
+        "historical_rejections".to_owned(),
+        (historical_rejections.rows, historical_rejections.mismatches),
     );
 
     let server_name = options.server_name.as_str();

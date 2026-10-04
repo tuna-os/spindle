@@ -1508,6 +1508,19 @@ pub fn persist_rehearsal(
     rooms
         .persist_synapse_plan(&plan, source.state_after_root.as_ref(), bodies)
         .map_err(PersistError::Room)?;
+    let rejected: Vec<String> = source
+        .events
+        .iter()
+        .filter(|event| event.rejected)
+        .map(|event| event.event_id.clone())
+        .collect();
+    let rejected_bodies = rejected
+        .iter()
+        .filter_map(|id| bodies.get(id).map(|body| (id.clone(), body.clone())))
+        .collect();
+    rooms
+        .preserve_imported_rejections(&source.room_id, &rejected, &rejected_bodies)
+        .map_err(PersistError::Room)?;
     Ok(outcome)
 }
 

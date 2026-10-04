@@ -91,6 +91,12 @@ pub struct Snapshot<'client> {
     transaction: Transaction<'client>,
 }
 
+/// Event state groups and their storage compression predecessors.
+pub type StateGroupGraph = (
+    std::collections::HashMap<String, i64>,
+    std::collections::HashMap<i64, i64>,
+);
+
 /// One global or room-scoped account-data record.
 pub struct AccountDataRow {
     pub room_id: String,
@@ -493,16 +499,7 @@ impl Snapshot<'_> {
     /// # Errors
     ///
     /// Returns [`ReadError`] if a query fails.
-    pub fn state_group_graph(
-        &mut self,
-        room_id: &str,
-    ) -> Result<
-        (
-            std::collections::HashMap<String, i64>,
-            std::collections::HashMap<i64, i64>,
-        ),
-        ReadError,
-    > {
+    pub fn state_group_graph(&mut self, room_id: &str) -> Result<StateGroupGraph, ReadError> {
         let rows = self.transaction.query(
             "SELECT groups.event_id, groups.state_group \
              FROM event_to_state_groups AS groups \

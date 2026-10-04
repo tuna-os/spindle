@@ -782,6 +782,39 @@ impl Rooms {
         Ok(())
     }
 
+    /// Keep source rejection decisions and their original PDUs outside the timeline.
+    /// Markers and bodies land atomically; repeating a chunk is safe.
+    #[cfg(feature = "synapse-import")]
+    pub(crate) fn preserve_imported_rejections(
+        &self,
+        room_id: &str,
+        ids: &[String],
+        bodies: &std::collections::HashMap<String, Value>,
+    ) -> Result<usize, RoomError> {
+        self.with_room(room_id, |rooms, log| {
+            let mut writes = Vec::with_capacity(ids.len() * 2);
+            let mut markers = Vec::with_capacity(ids.len());
+            for id in ids {
+                let body = bodies
+                    .get(id)
+                    .ok_or_else(|| RoomError::MissingBody(id.clone()))?;
+                writes.push((event_body_key(room_id, id), serde_json::to_vec(body)?));
+                writes.push((
+                    spindle_core::keys::event_room(id),
+                    room_id.as_bytes().to_vec(),
+                ));
+                markers.push(EventId::new(id.as_str()));
+            }
+            RoomStore::new(rooms.store.as_ref(), room_id).commit_historical_rejections(
+                log,
+                &markers,
+                &writes,
+                Durability::Group,
+            )?;
+            Ok(markers.len())
+        })
+    }
+
     /// Apply the imported redactions, re-index memberships from the final
     /// state, and make the room durable.
     ///

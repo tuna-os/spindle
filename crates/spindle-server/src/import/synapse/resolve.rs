@@ -31,6 +31,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt::Write as _;
 
 use ruma::events::StateEventType;
 use ruma::room_version_rules::{RoomVersionRules, StateResolutionVersion};
@@ -48,6 +49,7 @@ use crate::import::Resolution;
 pub struct RoomResolver {
     room_id: String,
     rules: RoomVersionRules,
+    rejected: HashSet<String>,
     ids: HashMap<String, u32>,
     names: Vec<String>,
     /// Auth events by interned ID. `None`: not read yet (no `event_auth` row).
@@ -72,6 +74,10 @@ impl RoomResolver {
         let mut resolver = Self {
             room_id: room_id.to_owned(),
             rules,
+            rejected: snapshot.query(
+                "SELECT e.event_id FROM events e JOIN rejections r USING (event_id) WHERE e.room_id = $1",
+                &[&room_id],
+            ).map_err(|error| error.to_string())?.into_iter().map(|row| row.get(0)).collect(),
             ids: HashMap::new(),
             names: Vec::new(),
             auth: Vec::new(),
@@ -109,8 +115,7 @@ impl RoomResolver {
             return auth.clone();
         }
         let name = self.names.get(id as usize).cloned().unwrap_or_default();
-        let named = self
-            .body(snapshot, &name)
+        let named = Self::body(snapshot, &name)
             .map(|body| crate::rooms::edge_ids(&body["auth_events"]))
             .unwrap_or_default();
         let ids: Vec<u32> = named.iter().map(|auth| self.intern(auth)).collect();
@@ -120,7 +125,7 @@ impl RoomResolver {
         ids
     }
 
-    fn body(&self, snapshot: &mut Snapshot<'_>, event_id: &str) -> Option<Value> {
+    fn body(snapshot: &mut Snapshot<'_>, event_id: &str) -> Option<Value> {
         snapshot
             .event_bodies_for(&[event_id.to_owned()])
             .ok()?
@@ -171,7 +176,14 @@ impl RoomResolver {
     fn parse(&mut self, event_id: &str, body: &Value) -> Option<StoredEvent> {
         let (body, replaced) = compat_body(body);
         self.stand_ins.extend(replaced);
-        StoredEvent::parse_in(event_id, &self.room_id, &body).ok()
+        StoredEvent::parse_in(event_id, &self.room_id, &body)
+            .ok()
+            .map(|event| {
+                let rejected = self.rejected.contains(event_id);
+                event
+                    .with_rejected(rejected)
+                    .with_preserved_rejection(rejected)
+            })
     }
 
     /// Resolve the states of an event's parents, or of a room's forward
@@ -329,7 +341,14 @@ impl RoomResolver {
                 .ok()?
                 .remove(id.as_str())?;
             let (body, _) = compat_body(&body);
-            let parsed = StoredEvent::parse_in(id.as_str(), &self.room_id, &body).ok();
+            let parsed = StoredEvent::parse_in(id.as_str(), &self.room_id, &body)
+                .ok()
+                .map(|event| {
+                    let rejected = self.rejected.contains(id.as_str());
+                    event
+                        .with_rejected(rejected)
+                        .with_preserved_rejection(rejected)
+                });
             self.events
                 .borrow_mut()
                 .insert(id.to_string(), parsed.clone());
@@ -349,13 +368,14 @@ impl RoomResolver {
                     .iter()
                     .filter_map(|id| OwnedEventId::try_from(id.as_str()).ok())
                     .collect();
-                ruma::state_res::resolve(
+                ruma::state_res::resolve_with_candidate_policy(
                     &self.rules.authorization,
                     rules,
                     maps.iter(),
                     vec![difference, EventIdSet::new()],
-                    |id| fetch(id),
+                    fetch,
                     |_| Some(subgraph.clone()),
+                    |event| !event.preserved_rejection(),
                 )
                 .map_err(|error| error.to_string())?
             }
@@ -440,11 +460,10 @@ pub fn stand_in(user_id: &str) -> String {
         return user_id.to_owned();
     }
     let digest = Sha256::digest(user_id.as_bytes());
-    let hex: String = digest
-        .iter()
-        .take(10)
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let mut hex = String::with_capacity(20);
+    for byte in digest.iter().take(10) {
+        let _ = write!(hex, "{byte:02x}");
+    }
     let server = user_id
         .split_once(':')
         .map(|(_, server)| server)

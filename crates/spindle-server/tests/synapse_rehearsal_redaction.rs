@@ -154,3 +154,81 @@ fn an_imported_redaction_redacts_its_target() {
         .expect("the redaction reads");
     assert_eq!(redaction["redacts"], "$secret");
 }
+
+#[test]
+fn imported_rejections_survive_reopen_without_entering_the_timeline() {
+    let create = source("$create", "m.room.create", Some(""), &[]);
+    let member = source("$member", "m.room.member", Some(ALICE), &["$create"]);
+    let mut rejected = source("$rejected", "m.room.member", Some(ALICE), &["$member"]);
+    rejected.rejected = true;
+    let bodies = BTreeMap::from([
+        (
+            "$create".to_owned(),
+            body(
+                "$create",
+                &create,
+                json!({"creator": ALICE, "room_version": "10"}),
+                &[],
+            ),
+        ),
+        (
+            "$member".to_owned(),
+            body("$member", &member, json!({"membership": "join"}), &[]),
+        ),
+        (
+            "$rejected".to_owned(),
+            body("$rejected", &rejected, json!({"membership": "ban"}), &[]),
+        ),
+    ]);
+    let room = SourceRoom {
+        room_id: ROOM.to_owned(),
+        events: vec![create, member, rejected],
+        current_state: StateMap::from([
+            (
+                ("m.room.create".to_owned(), String::new()),
+                "$create".to_owned(),
+            ),
+            (
+                ("m.room.member".to_owned(), ALICE.to_owned()),
+                "$member".to_owned(),
+            ),
+        ]),
+        state_after_root: None,
+        forward_extremities: Vec::new(),
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(spindle_store::FjallStore::open(directory.path()).unwrap());
+    let rooms = Rooms::new(Arc::clone(&store), "example.org");
+    assert_eq!(
+        persist_rehearsal(&rooms, &room, &bodies).unwrap().imported,
+        2
+    );
+    drop(rooms);
+    let restored = spindle_store::RoomStore::new(store.as_ref(), ROOM)
+        .load()
+        .unwrap()
+        .unwrap();
+    assert!(
+        restored
+            .log
+            .historically_rejected(&spindle_core::EventId::new("$rejected"))
+    );
+    assert!(
+        restored
+            .log
+            .get(&spindle_core::EventId::new("$rejected"))
+            .is_none()
+    );
+    let rooms = Rooms::new(store, "example.org");
+    assert!(rooms.event(ROOM, "$rejected").is_err());
+    assert_eq!(
+        rooms.pdu(ROOM, "$rejected").unwrap()["content"]["membership"],
+        "ban"
+    );
+    assert_eq!(
+        rooms
+            .state_event_full(ROOM, "m.room.member", ALICE)
+            .unwrap()["content"]["membership"],
+        "join"
+    );
+}

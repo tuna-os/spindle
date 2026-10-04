@@ -17,7 +17,7 @@
 //! server whose key is known, over the version's redacted form, as ruma's
 //! own check would after its sender lookup.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use ruma::CanonicalJsonValue;
 use ruma::room_version_rules::RoomVersionRules;
@@ -178,7 +178,7 @@ impl KeyRing {
             for ((server, key_id, candidates, _), index) in slots.iter().zip(choice) {
                 if let Some(candidate) = candidates.get(*index) {
                     map.entry(server.clone())
-                        .or_insert_with(BTreeMap::new)
+                        .or_default()
                         .insert(key_id.clone(), candidate.key.clone());
                 }
             }
