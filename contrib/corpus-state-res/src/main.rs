@@ -65,6 +65,13 @@ struct Tally {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(filter) = std::env::var("RUST_LOG") {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .init();
+    }
     let url = std::env::var("DATABASE_URL")?;
     let mut db = Client::connect(&url, NoTls)?;
     db.batch_execute("SET default_transaction_read_only = on")?;
@@ -99,10 +106,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect()
     };
 
+    drop(db);
     let mut total = Tally::default();
     for (room_id, version) in rooms {
+        // A room's CPU replay can outlast an idle database connection. Start
+        // a fresh read-only connection for each room rather than carrying it
+        // across that work; include the room in any source-read error.
+        let mut db = Client::connect(&url, NoTls)?;
+        db.batch_execute("SET default_transaction_read_only = on")?;
         let started = Instant::now();
-        let tally = replay_room(&mut db, &room_id)?;
+        let tally = replay_room(&mut db, &room_id)
+            .map_err(|error| format!("replay room {room_id}: {error}"))?;
         let mut durations = tally.durations.clone();
         durations.sort();
         let quantile = |q: f64| {
