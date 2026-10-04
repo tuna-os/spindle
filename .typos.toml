@@ -38,6 +38,7 @@ extend-ignore-re = [
 # Vendored, generated, or measured: not ours to spell-check.
 extend-exclude = [
     "Cargo.lock",
+    "vendor/ruma-state-res/",
     "complement/allowlist.txt",
     "docs/benchmarks/data/*.json",
     "tmp/",
