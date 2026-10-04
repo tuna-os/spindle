@@ -5013,6 +5013,27 @@ impl Rooms {
         // events are authorized by the state DAG, which 2 checks.
         let version = self.version_in_log(log, room_id)?;
         if !is_state_dag(&version) {
+            let missing = std::cell::Cell::new(false);
+            if let Err(why) = ruma::state_res::check_state_independent_auth_rules(
+                &rules.authorization,
+                candidate.clone(),
+                |id| {
+                    let event = fetch(id);
+                    if event.is_none() {
+                        missing.set(true);
+                    }
+                    event
+                },
+            ) {
+                // A known invalid auth entry is already a verdict, even if
+                // later entries are absent. Preserve its predecessor state
+                // so valid descendants can follow it. An actual missing
+                // dependency stays retryable and receives no stored verdict.
+                if missing.get() {
+                    return Err(RoomError::Append(format!("auth events: {why}")));
+                }
+                return Ok(Some((Sideline::Rejected, format!("auth events: {why}"))));
+            }
             let mut named: HashMap<(ruma::events::StateEventType, String), StoredEvent> =
                 HashMap::new();
             for id in candidate.auth_event_ids() {
@@ -5040,13 +5061,6 @@ impl Rooms {
                     (ruma::events::StateEventType::RoomCreate, String::new()),
                     create,
                 );
-            }
-            if let Err(why) = ruma::state_res::check_state_independent_auth_rules(
-                &rules.authorization,
-                candidate.clone(),
-                fetch,
-            ) {
-                return Ok(Some((Sideline::Rejected, format!("auth events: {why}"))));
             }
             if let Err(why) =
                 crate::authorize::authorize(&rules.authorization, &candidate, |kind, key| {

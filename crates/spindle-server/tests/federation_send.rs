@@ -321,6 +321,81 @@ fn message_event(
 }
 
 #[tokio::test]
+async fn known_invalid_auth_before_a_missing_entry_preserves_valid_descendants() {
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
+    let join = join_event(&harness.store, &peer, &room, &head);
+    let (_, joined) = harness.deliver(&peer, "auth-order-join", vec![join]).await;
+    assert!(
+        joined["pdus"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|v| v == &json!({}))
+    );
+    let head = harness.head_event(&room, &alice).await;
+    let rooms = spindle_server::rooms::Rooms::new(harness.store.clone(), "example.org");
+    let join_rules = rooms
+        .state(&room)
+        .unwrap()
+        .into_iter()
+        .find(|event| event["type"] == "m.room.join_rules")
+        .unwrap();
+    let mut invalid = message_event(&harness.store, &peer, &room, &head, "invalid auth list");
+    let auth = invalid["auth_events"].as_array_mut().unwrap();
+    auth.insert(0, join_rules["event_id"].clone());
+    auth.push(json!("$missing-auth-event"));
+    let invalid = peer.event(invalid);
+    let canonical = serde_json::from_value(invalid.clone()).unwrap();
+    let invalid_id = format!(
+        "${}",
+        ruma::signatures::reference_hash(&canonical, &RoomVersionId::V11.rules().unwrap(),)
+            .unwrap()
+    );
+    let (_, rejected) = harness
+        .deliver(&peer, "auth-order-invalid", vec![invalid])
+        .await;
+    assert!(
+        rejected["pdus"][&invalid_id]["error"]
+            .as_str()
+            .unwrap()
+            .contains("unexpected auth event"),
+        "{rejected}"
+    );
+    let sentinel = message_event(
+        &harness.store,
+        &peer,
+        &room,
+        &invalid_id,
+        "valid descendant",
+    );
+    let (_, accepted) = harness
+        .deliver(&peer, "auth-order-sentinel", vec![sentinel])
+        .await;
+    assert!(
+        accepted["pdus"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|v| v == &json!({})),
+        "{accepted}"
+    );
+    let (_, event) = harness
+        .send(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room}/event/{invalid_id}"),
+            &alice,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(event["errcode"], "M_NOT_FOUND");
+    let last = harness.head_event(&room, &alice).await;
+    assert_ne!(last, invalid_id);
+}
+
+#[tokio::test]
 async fn a_remote_join_and_message_land_and_read_back_over_the_cs_api() {
     let peer = Peer::start().await;
     let harness = Harness::new();
