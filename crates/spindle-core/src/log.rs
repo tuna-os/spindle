@@ -284,6 +284,11 @@ pub struct RoomLog {
     /// Their states, held resident: they are few, and a child naming one
     /// needs its state at once.
     sidelined_state: HashMap<EventId, StateSnapshot>,
+    /// Rejection decisions imported from a former homeserver and preserved
+    /// by operator choice. These IDs remain auth-graph references, never
+    /// candidates for insertion into resolved state or the client log.
+    historical_rejections: BTreeSet<EventId>,
+    historical_rejection_policy_id: [u8; 32],
     /// The room's current state when it has several forward extremities:
     /// their states resolved by the room version's algorithm. With one
     /// extremity it is that extremity's state, and this is `None`. Set by
@@ -310,6 +315,8 @@ impl Default for RoomLog {
             forward_extremities: BTreeSet::new(),
             sidelined: HashMap::new(),
             sidelined_state: HashMap::new(),
+            historical_rejections: BTreeSet::new(),
+            historical_rejection_policy_id: [0; 32],
             current: None,
             next_forward: 1,
             next_backward: 0,
@@ -500,6 +507,38 @@ impl RoomLog {
     #[must_use]
     pub fn sidelined(&self, event_id: &EventId) -> Option<&SidelinedEntry> {
         self.sidelined.get(event_id)
+    }
+
+    /// Preserve a former homeserver's rejection of an imported historical event.
+    pub fn preserve_historical_rejection(&mut self, event_id: EventId) {
+        if !self.historical_rejections.contains(&event_id) {
+            let mut hash = blake3::Hasher::new();
+            hash.update(b"spindle historical rejection policy v1");
+            hash.update(&self.historical_rejection_policy_id);
+            hash.update(event_id.as_str().as_bytes());
+            self.historical_rejection_policy_id = *hash.finalize().as_bytes();
+            self.historical_rejections.insert(event_id);
+        }
+    }
+
+    /// Identity for cached resolutions under the imported rejection policy.
+    ///
+    /// Repeated markers do not change it. A different insertion order may
+    /// create a safe cache miss; a changed policy must never reuse old state.
+    #[must_use]
+    pub fn historical_rejection_policy_id(&self) -> [u8; 32] {
+        self.historical_rejection_policy_id
+    }
+
+    /// Whether an imported historical rejection must remain rejected.
+    #[must_use]
+    pub fn historically_rejected(&self, event_id: &EventId) -> bool {
+        self.historical_rejections.contains(event_id)
+    }
+
+    /// Imported rejection decisions, including IDs whose PDU is unavailable.
+    pub fn historical_rejections(&self) -> impl Iterator<Item = &EventId> {
+        self.historical_rejections.iter()
     }
 
     /// Every soft-failed or rejected event this log holds.
@@ -1294,6 +1333,8 @@ impl RoomLog {
             forward_extremities: forward_extremities.into_iter().collect(),
             sidelined: HashMap::new(),
             sidelined_state: HashMap::new(),
+            historical_rejections: BTreeSet::new(),
+            historical_rejection_policy_id: [0; 32],
             current: None,
             next_forward,
             next_backward,

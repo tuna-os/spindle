@@ -19,3 +19,6 @@ tempfile = "3"
 
 ruma = { version = "0.17", features = ["state-res"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[patch.crates-io]
+ruma-state-res = { path = "../../vendor/ruma-state-res" }

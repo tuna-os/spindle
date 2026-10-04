@@ -2275,7 +2275,9 @@ impl Rooms {
         // A soft-failed or rejected event is held for the DAG only; the spec
         // keeps it from clients, so here it is as absent as one never sent.
         self.with_room_read(room_id, |_, log| {
-            if log.sidelined(&EventId::new(event_id)).is_some() {
+            if log.sidelined(&EventId::new(event_id)).is_some()
+                || log.historically_rejected(&EventId::new(event_id))
+            {
                 return Err(RoomError::MissingBody(event_id.to_owned()));
             }
             Ok(())
@@ -5222,6 +5224,11 @@ impl Rooms {
         if log.get(&EventId::new(event_id)).is_some() {
             return Ok(());
         }
+        if log.historically_rejected(&EventId::new(event_id)) {
+            return Err(RoomError::Forbidden(format!(
+                "rejected: {event_id} was rejected before migration"
+            )));
+        }
         if let Some(sidelined) = log.sidelined(&EventId::new(event_id)) {
             return Err(RoomError::Forbidden(match sidelined.kind {
                 Sideline::SoftFailed => format!("{event_id} was soft-failed"),
@@ -5368,14 +5375,17 @@ impl Rooms {
             RoomError::Build(format!("cannot authorize a malformed event: {error}"))
         })?;
         let rules = self.rules_in(log, room_id)?;
-        let fetch = |id: &ruma::EventId| -> Option<StoredEvent> {
-            let body = self.read_event(room_id, &EventId::new(id.as_str())).ok()?;
-            let event = StoredEvent::parse_auth_in(id.as_str(), room_id, &body).ok()?;
-            let rejected = log
-                .sidelined(&EventId::new(id.as_str()))
-                .is_some_and(|entry| entry.kind == Sideline::Rejected);
-            Some(event.with_rejected(rejected))
-        };
+        let fetch =
+            |id: &ruma::EventId| -> Option<StoredEvent> {
+                let body = self.read_event(room_id, &EventId::new(id.as_str())).ok()?;
+                let event = StoredEvent::parse_auth_in(id.as_str(), room_id, &body).ok()?;
+                let rejected = log
+                    .sidelined(&EventId::new(id.as_str()))
+                    .is_some_and(|entry| entry.kind == Sideline::Rejected);
+                Some(event.with_rejected(rejected).with_preserved_rejection(
+                    log.historically_rejected(&EventId::new(id.as_str())),
+                ))
+            };
 
         // 1. The auth events. A state-DAG room (MSC4242) carries none: its
         // events are authorized by the state DAG, which 2 checks.
@@ -5715,7 +5725,11 @@ impl Rooms {
         // any state at all.
         let load = |id: &str| -> Option<StoredEvent> {
             let body = self.read_event(room_id, &EventId::new(id)).ok()?;
-            StoredEvent::parse_auth_in(id, room_id, &body).ok()
+            StoredEvent::parse_auth_in(id, room_id, &body)
+                .ok()
+                .map(|event| {
+                    event.with_preserved_rejection(log.historically_rejected(&EventId::new(id)))
+                })
         };
 
         // Per-room, for the same reason as redaction above and with more at

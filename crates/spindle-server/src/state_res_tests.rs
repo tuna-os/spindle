@@ -17,7 +17,7 @@ use ruma::state_res::StateMap;
 use ruma::state_res::utils::event_id_set::EventIdSet;
 use ruma::{OwnedEventId, RoomVersionId};
 use serde_json::{Value, json};
-use spindle_core::{RoomLog, StateKey, StateResolver, StateSnapshot};
+use spindle_core::{EventId, RoomLog, StateKey, StateResolver, StateSnapshot};
 
 use super::{AuthGraph, ResolutionCache, RoomResolver};
 use crate::authorize::StoredEvent;
@@ -658,4 +658,22 @@ fn auth_difference_includes_extremities_beyond_one_machine_word() {
     sets.push(vec![last]);
     let found: std::collections::BTreeSet<_> = graph.auth_difference(&sets).into_iter().collect();
     assert_eq!(found, [common, last].into_iter().collect());
+}
+
+#[test]
+fn changing_imported_rejection_policy_cannot_reuse_a_cached_resolution() {
+    let cache = ResolutionCache::default();
+    let states = [StateSnapshot::new()];
+    let mut log = RoomLog::new();
+    let original = ResolutionCache::key(&states, log.historical_rejection_policy_id());
+    cache.put(original.clone(), StateSnapshot::new());
+    log.preserve_historical_rejection(EventId::new("$historical-ban"));
+    let changed = ResolutionCache::key(&states, log.historical_rejection_policy_id());
+    assert_ne!(changed, original);
+    assert!(cache.get(&changed).is_none());
+    log.preserve_historical_rejection(EventId::new("$historical-ban"));
+    assert_eq!(
+        ResolutionCache::key(&states, log.historical_rejection_policy_id()),
+        changed
+    );
 }

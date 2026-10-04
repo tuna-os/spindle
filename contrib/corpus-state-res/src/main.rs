@@ -133,6 +133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "skipped_parent_outside_history": tally.skipped_outside_history,
                 "compared": tally.compared,
                 "masked_own_slot": tally.masked_own_slot,
+                "preserve_historical_rejections": std::env::var_os("CORPUS_REEVALUATE_REJECTED").is_none(),
                 "agree": tally.agree,
                 "disagree": tally.disagree,
                 "conflicted": tally.conflicted,
@@ -399,6 +400,9 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
 
         let mut log = RoomLog::new();
         for id in &rejected {
+            if std::env::var_os("CORPUS_REEVALUATE_REJECTED").is_none() {
+                log.preserve_historical_rejection(EventId::new(id));
+            }
             log.restore_sidelined(
                 SidelinedEntry {
                     event_id: EventId::new(id.as_str()),

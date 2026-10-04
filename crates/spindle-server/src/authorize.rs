@@ -41,6 +41,7 @@ pub struct StoredEvent {
     redacts: Option<OwnedEventId>,
     depth: i64,
     rejected: bool,
+    preserved_rejection: bool,
 }
 
 impl StoredEvent {
@@ -182,6 +183,7 @@ impl StoredEvent {
             redacts,
             depth: json["depth"].as_i64().unwrap_or(0),
             rejected: false,
+            preserved_rejection: false,
         })
     }
 
@@ -190,6 +192,19 @@ impl StoredEvent {
     #[must_use]
     pub fn depth(&self) -> i64 {
         self.depth
+    }
+
+    /// Preserve a former homeserver's imported rejection decision.
+    #[must_use]
+    pub fn with_preserved_rejection(mut self, preserved: bool) -> Self {
+        self.preserved_rejection = preserved;
+        self
+    }
+
+    /// Whether operator-selected historical rejection policy skips this candidate.
+    #[must_use]
+    pub fn preserved_rejection(&self) -> bool {
+        self.preserved_rejection
     }
 
     /// The same event, marked rejected or not.
@@ -245,7 +260,7 @@ impl Event for StoredEvent {
         self.redacts.as_ref()
     }
     fn rejected(&self) -> bool {
-        self.rejected
+        self.rejected || self.preserved_rejection
     }
 }
 
