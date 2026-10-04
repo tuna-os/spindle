@@ -537,15 +537,12 @@ impl Rooms {
     ///
     /// Before rather than after, matching what a joining or backfilling
     /// server needs: the state its new event was authorized against. That
-    /// is the fold of the event's parents (`RoomLog::state_before`), which
-    /// in a linear room is one content-addressed rehydration of the entry
-    /// before it -- the read SPEC §18.1 is about. It used to be *only*
-    /// that, the linear predecessor's root whatever the event's parents,
-    /// which after a fork is one branch's state: a peer asking at the
-    /// event that merged two branches was told a state missing the other
-    /// branch's writes, while a client of this server saw both. The
-    /// federation fork tests compare the two reads, and that is what they
-    /// found (#16).
+    /// is its parents' states, resolved when they differ
+    /// ([`Self::state_before_event`]), which in a linear room is one
+    /// content-addressed rehydration of the entry before it -- the read
+    /// SPEC §18.1 is about. It used to be the linear predecessor's root
+    /// whatever the event's parents, which after a fork is one branch's
+    /// state (#16).
     ///
     /// # Errors
     ///
@@ -556,14 +553,7 @@ impl Rooms {
         room_id: &str,
         event_id: &str,
     ) -> Result<(Vec<IdentifiedEvent>, Vec<IdentifiedEvent>), RoomError> {
-        let before = self.with_room_read(room_id, |rooms, log| {
-            if !log.holds(&EventId::new(event_id)) {
-                return Err(RoomError::MissingBody(event_id.to_owned()));
-            }
-            rooms.resolve_in(log, room_id, |log, resolver, load| {
-                log.state_before(&EventId::new(event_id), resolver, load)
-            })
-        })?;
+        let before = self.state_before_event(room_id, event_id)?;
         let pdus = self.state_pairs_of(room_id, &before)?;
 
         // The auth chain is every event the state transitively cites: a
@@ -574,6 +564,30 @@ impl Rooms {
             .collect();
         let auth_chain = self.auth_chain_from(room_id, frontier);
         Ok((pdus, auth_chain))
+    }
+
+    /// The state the room was in just before `event_id`: its parents'
+    /// states, resolved by the room version's algorithm when they differ
+    /// (ADR 0005) -- exactly what the event was authorized against when it
+    /// arrived, and what the live path computes for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::MissingBody`] for an event the room does not
+    /// hold, or [`RoomError`] if a state cannot be read or resolved.
+    pub fn state_before_event(
+        &self,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<spindle_core::StateSnapshot, RoomError> {
+        self.with_room_read(room_id, |rooms, log| {
+            if !log.holds(&EventId::new(event_id)) {
+                return Err(RoomError::MissingBody(event_id.to_owned()));
+            }
+            rooms.resolve_in(log, room_id, |log, resolver, load| {
+                log.state_before(&EventId::new(event_id), resolver, load)
+            })
+        })
     }
 
     /// The auth chain of one event (`GET /event_auth/{roomId}/{eventId}`):

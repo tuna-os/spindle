@@ -197,6 +197,15 @@ impl RoomBuilder {
         event_id
     }
 
+    /// Set the clock the next event's `origin_server_ts` is read from: it
+    /// takes `ts + 1`. Real servers' clocks disagree, and state resolution
+    /// orders by them, so a fixture that can only count upwards cannot
+    /// build the forks where that matters.
+    #[allow(dead_code, reason = "used by some of the binaries that share this module")]
+    pub fn set_clock(&mut self, ts: u64) {
+        self.timestamp = ts;
+    }
+
     /// The v11 auth-event selection: create, the sender's membership, power
     /// levels, and — for a join, invite or knock — the join rules.
     ///

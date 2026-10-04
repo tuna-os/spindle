@@ -114,8 +114,19 @@ fn a_stale_forward_extremity_keeps_its_state_however_old_it_gets() {
     );
 
     // And the merge it exists for actually works: one local event collapses the
-    // fork, because the two sides touched disjoint state slots.
-    let merged = log.append_local("$merge", None).unwrap().li;
+    // fork. The two sides hold different states, so the merge asks a resolver
+    // -- here a union, standing in for the room version's algorithm -- and
+    // the stale side's state is in hand for it without a store read.
+    let prev: Vec<spindle_core::EventId> = log.authoring_extremities().cloned().collect();
+    let before = log
+        .resolve_parents(&prev, &mut Union, &mut |_: &spindle_core::StateRoot| {
+            panic!("a pinned extremity's state is resident")
+        })
+        .unwrap();
+    let merged = log
+        .append_resolved(EventInput::new("$merge", prev), before)
+        .unwrap()
+        .li;
     assert_eq!(log.forward_extremities().len(), 1);
     let merged_state = log.state_after(merged).unwrap();
     assert_eq!(
@@ -186,6 +197,10 @@ fn a_short_room_keeps_every_snapshot() {
 fn every_predecessor_an_append_can_name_has_resident_state() {
     let window = 8;
     let mut log = RoomLog::with_resident_window(window);
+    // A state event first: an empty state needs no store to rehydrate, so an
+    // evicted entry with nothing in its state would be answerable anyway.
+    log.append_local("$create", Some(StateKey::new("m.room.create", "")))
+        .unwrap();
     for number in 0..500 {
         log.append_local(format!("$event-{number}"), None).unwrap();
     }
@@ -205,4 +220,26 @@ fn every_predecessor_an_append_can_name_has_resident_state() {
         },
         "reaching past the window must fail loudly, not append onto empty state"
     );
+}
+
+/// The union of the states, later ones winning: a stand-in resolver for the
+/// residency tests, which are about what the log holds, not what a room
+/// version decides.
+struct Union;
+
+impl spindle_core::StateResolver for Union {
+    fn resolve(
+        &mut self,
+        states: &[spindle_core::StateSnapshot],
+    ) -> Result<spindle_core::StateSnapshot, spindle_core::AppendError> {
+        let mut out = states.first().cloned().unwrap_or_default();
+        for other in states.iter().skip(1) {
+            for difference in out.clone().diff(other) {
+                if let Some(theirs) = difference.theirs {
+                    out = out.apply(difference.key, theirs);
+                }
+            }
+        }
+        Ok(out)
+    }
 }

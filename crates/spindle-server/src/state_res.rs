@@ -454,10 +454,10 @@ impl<'a> RoomResolver<'a> {
     }
 }
 
-/// A snapshot as ruma's state map. Keys whose event ID ruma cannot parse
-/// are left out, as they would be on any server: an ID that does not parse
-/// names no event anyone can fetch.
-fn to_map(state: &StateSnapshot) -> StateMap<OwnedEventId> {
+/// A snapshot as ruma's state map, and the slots it could not carry: an
+/// event ID ruma cannot parse names no event the resolver can fetch, so it
+/// cannot take part, and its slot is left exactly as the base holds it.
+fn to_map(state: &StateSnapshot, unparsed: &mut HashSet<StateKey>) -> StateMap<OwnedEventId> {
     let mut map = StateMap::new();
     state.for_each(|key, id| {
         if let Ok(id) = OwnedEventId::try_from(id) {
@@ -468,6 +468,8 @@ fn to_map(state: &StateSnapshot) -> StateMap<OwnedEventId> {
                 ),
                 id,
             );
+        } else {
+            unparsed.insert(key.clone());
         }
     });
     map
@@ -475,9 +477,13 @@ fn to_map(state: &StateSnapshot) -> StateMap<OwnedEventId> {
 
 /// `resolved` as a snapshot, built on `base` so that it shares every
 /// subtree the two have in common: only the slots that differ are written.
-fn to_snapshot(base: &StateSnapshot, resolved: &StateMap<OwnedEventId>) -> StateSnapshot {
+fn to_snapshot(
+    base: &StateSnapshot,
+    resolved: &StateMap<OwnedEventId>,
+    unparsed: HashSet<StateKey>,
+) -> StateSnapshot {
     let mut state = base.clone();
-    let mut kept: HashSet<StateKey> = HashSet::new();
+    let mut kept: HashSet<StateKey> = unparsed;
     for ((event_type, state_key), id) in resolved {
         let key = StateKey::new(event_type.to_string(), state_key.as_str());
         if state.get(&key) != Some(id.as_str()) {
@@ -507,13 +513,28 @@ impl StateResolver for RoomResolver<'_> {
         let Some(base) = states.first() else {
             return Ok(StateSnapshot::new());
         };
-        let maps: Vec<StateMap<OwnedEventId>> = states.iter().map(to_map).collect();
+        let mut unparsed = HashSet::new();
+        let maps: Vec<StateMap<OwnedEventId>> = states
+            .iter()
+            .map(|state| to_map(state, &mut unparsed))
+            .collect();
+        if !unparsed.is_empty() {
+            tracing::warn!(
+                room = self.room_id,
+                slots = unparsed.len(),
+                "state names event IDs that do not parse; those slots keep their value"
+            );
+        }
         let resolved = self
             .resolve_maps(&maps)
             .map_err(AppendError::ResolutionFailed)?;
-        let state = to_snapshot(base, &resolved);
+        let state = to_snapshot(base, &resolved, unparsed);
         self.stats.resolutions += 1;
         self.cache.put(key, state.clone());
         Ok(state)
     }
 }
+
+#[cfg(test)]
+#[path = "state_res_tests.rs"]
+mod tests;

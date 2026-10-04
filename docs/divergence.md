@@ -66,7 +66,8 @@ Reading top to bottom: the further down, the more of it is ours.
 | **Where the state fed to `auth_check` comes from** | — | **Yes** |
 | **Event ordering and pagination** | — | **Yes** — the linear index |
 | **State representation** | — | **Yes** — content-addressed HAMT |
-| **Federation-fork handling** | ruma-state-res as fallback only | **Yes** — the bounded window |
+| Federation-fork state resolution | ruma-state-res (v2, v2.1); `state_res_v1` for room v1 — the algorithm the siblings and Synapse run | No (ADR 0005) |
+| **Inputs to that resolution** | — | **Yes** — materialized states, a ranked auth DAG, a root-keyed cache |
 | **On-disk format** | — | **Yes** — `spindle-store` |
 | **Integrity/audit construction** | — | **Yes** — the log chain |
 
@@ -127,30 +128,39 @@ persistence and corruption detection possible — not by speed. A divergence
 that survives on architectural grounds after losing on its original grounds is
 one to keep honest, not one to quietly restate.
 
-### 4.3 The bounded fork window (`core/src/log.rs`, SPEC §9)
+### 4.3 Fork resolution (`server/src/state_res.rs`, SPEC §9, ADR 0005)
 
-Full state resolution v2 is O(conflicted state × auth chain) and the siblings
-invoke it whenever an incoming event's state differs
-(`event_handler/resolve_state.rs`, `state_at_incoming.rs` in continuwuity).
-We reverse-BFS the ancestry to the nearest common ancestor with a hard cap on
-*work done*, not merely on the answer returned (#33), and take the cheapest of
-three cases; only a genuine same-slot conflict reaches `ruma-state-res`.
+This row used to be a divergence of algorithm: SPEC §9.2 merged a fork itself
+when the branches moved different state slots, and only a same-slot conflict
+was to reach `ruma-state-res`. That merge is not state resolution. A ban on one
+branch voids the other branch's write under state resolution and not under the
+merge, and a branch whose server's clock runs behind loses a slot under state
+resolution and keeps it under the merge
+(`core/tests/state_res_equivalence.rs`). Either leaves Spindle and every
+Synapse in the room on different state forever. The same-slot case was never
+resolved at all; the contesting tip was set aside (#225).
 
-This is the divergence with the most correctness risk attached, which is why
-§9.3's equivalence claim is tested differentially against the reference
-resolver rather than argued (#34, SPEC §19.2).
+So the algorithm is no longer ours. Whenever an event's parents, or the room's
+forward extremities, hold different states, Spindle runs the room version's
+algorithm, as the siblings do (`event_handler/resolve_state.rs`,
+`state_at_incoming.rs` in continuwuity). The receipt checks — auth events,
+state before, current state; reject or soft-fail — are the spec's, in the
+spec's order.
 
-Case 3 is found today but not yet resolved (#16). What happens instead is a
-deferral, and it is worth stating because the alternative was worse: when a
-local event finds the tips it would name contesting a key, the core sets the
-contesting tip aside (`RoomLog::set_aside_contested`). The room keeps taking
-local writes on its linear head; the tip stays a forward extremity with its
-state pinned, where the resolver will look for it; the case-3 counter moves
-once per tip; and the server logs the anomaly SPEC §9.1 asks for. A peer's
-event naming both tips is still refused, so the two servers' views of that
-key stay apart until the resolver lands. What #225 removed is the room
-becoming unwritable for its own users in the meantime — a refused merge that
-every later local append repeated, forever.
+What stays ours is the cost of the inputs:
+
+- the states are snapshots every entry already has (§4.2), so "the state at
+  this event" is not a computation;
+- parents with identical state roots skip resolution, which is the one case
+  the old merge provably shared with every version's algorithm;
+- the auth difference is Synapse's walk over a per-room auth DAG ranked once
+  and kept, not full chains handed to ruma;
+- resolutions are cached by their inputs' content addresses.
+
+The oracle is ruma's own resolver, run the slow way with full chains, on
+generated contested forks in every room-version family
+(`server/src/state_res_tests.rs`), plus the production corpus replayed through
+the live path and compared with Synapse's state groups (#563).
 
 ### 4.4 The log chain (`core/src/log.rs`, SPEC §5.3)
 
@@ -245,8 +255,8 @@ optimization would break compatibility:
   invent one to make our life easier. Spindle serves versions 1 to 12. Each
   room uses the rules of its own version. Ruma has no state resolution for
   version 1, so `server/src/state_res_v1.rs` follows the spec and Synapse.
-  It agrees with Synapse on every fork of a real v1 room. Case 3 of §4.3
-  is still deferred for every version, version 1 included.
+  It agrees with Synapse on every fork of a real v1 room, and since ADR 0005
+  it is what a v1 room's forks are resolved with on the live path.
   (The v11-vs-v12 default is still open —
   SPEC §11.6 — but that is a choice *between* real versions.)
 - **CS/SS endpoint semantics.** Sync tokens are opaque to clients, which is
@@ -290,5 +300,6 @@ Before writing something the upstreams already do:
 
 And the inverse: before inheriting something, check it is not one of the four
 rows in §3 that we exist to do differently. Reaching for `state_res::resolve`
-on an ingest path is the specific mistake to watch for — it is the correct call
-in both sibling projects and the wrong one here, everywhere except §9's case 3.
+on an ingest path is no longer a mistake: since ADR 0005 it is the call
+whenever an event's parents hold different states, as in both sibling
+projects. What remains ours is never calling it when they do not.

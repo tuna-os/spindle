@@ -462,6 +462,47 @@ impl Rooms {
         }
     }
 
+    /// Install a room's in-memory log as built elsewhere, replacing any open
+    /// one, and store event bodies under it.
+    ///
+    /// For the corpus replay (`contrib/corpus-state-res`) only: it seeds a
+    /// log with a fork's parents at the states Synapse recorded for them,
+    /// then hands the merge event to [`Self::receive_remote`] -- the live
+    /// path -- and compares what it resolves with Synapse's answer. Behind
+    /// a feature so no server build can reach it.
+    #[cfg(feature = "corpus-replay")]
+    #[doc(hidden)]
+    pub fn install_replay_log(&self, room_id: &str, log: RoomLog) {
+        self.open
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(room_id.to_owned(), Arc::new(RwLock::new(log)));
+    }
+
+    /// Store event bodies for [`Self::install_replay_log`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the store cannot be written.
+    #[cfg(feature = "corpus-replay")]
+    #[doc(hidden)]
+    pub fn store_replay_bodies(
+        &self,
+        room_id: &str,
+        bodies: &[(String, Value)],
+    ) -> Result<(), RoomError> {
+        let mut writes = Vec::with_capacity(bodies.len() * 2);
+        for (event_id, body) in bodies {
+            writes.push((event_body_key(room_id, event_id), serde_json::to_vec(body)?));
+            writes.push((
+                spindle_core::keys::event_room(event_id),
+                room_id.as_bytes().to_vec(),
+            ));
+        }
+        spindle_store::Store::commit(self.store.as_ref(), &writes, Durability::Group)?;
+        Ok(())
+    }
+
     /// Create a room and return its ID.
     ///
     /// The create sequence is fixed and ordered: create, the creator's
