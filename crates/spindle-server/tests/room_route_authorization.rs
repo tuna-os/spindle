@@ -8,7 +8,7 @@
 //!
 //! The table below is the hand-written half: every room-scoped client route
 //! the router registers, each either walked with a stranger or exempted with
-//! a written reason. The generated half reads `src/routes.rs` and refuses to
+//! a written reason. The generated half reads the route modules and refuses to
 //! pass if a route with `{room_id}` in it is registered there and missing
 //! here -- or is here and no longer there. Adding a route without deciding
 //! what a stranger gets from it is the thing this file makes impossible.
@@ -270,7 +270,7 @@ const TABLE: &[Route] = &[
 
 // -- the generated half ---------------------------------------------------
 
-/// Every room-scoped client route registered in `src/routes.rs`, read from
+/// Every room-scoped client route registered in the route modules, read from
 /// the source so this cannot drift from the router.
 ///
 /// A string scan rather than a parser: every registration is a string
@@ -279,8 +279,14 @@ const TABLE: &[Route] = &[
 /// such literal counts -- so that the failure mode is "the table lists a
 /// path the router does not" rather than a route slipping past.
 fn routes_in_source() -> Vec<String> {
-    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/routes.rs"))
-        .expect("the router's source is beside this test");
+    let source = ["routes.rs", "moderation_routes.rs"]
+        .into_iter()
+        .map(|module| {
+            std::fs::read_to_string(format!("{}/src/{module}", env!("CARGO_MANIFEST_DIR")))
+                .expect("the router's source is beside this test")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut found: Vec<String> = source
         .split('"')
         .filter(|literal| literal.starts_with("/_matrix/client/") && literal.contains("{room_id}"))
@@ -304,7 +310,7 @@ fn every_room_route_the_router_registers_is_in_the_table() {
         .collect();
     assert!(
         missing.is_empty(),
-        "routes registered in src/routes.rs with no row in this table -- decide what a \
+        "routes registered in the route modules with no row in this table -- decide what a \
          stranger gets from each, then add it: {missing:#?}"
     );
     let stale: Vec<&String> = listed
@@ -313,7 +319,7 @@ fn every_room_route_the_router_registers_is_in_the_table() {
         .collect();
     assert!(
         stale.is_empty(),
-        "rows in this table for routes src/routes.rs no longer registers: {stale:#?}"
+        "rows in this table for routes the route modules no longer register: {stale:#?}"
     );
 }
 
