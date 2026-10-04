@@ -35,6 +35,8 @@ struct Candidate {
     valid_until: u64,
 }
 
+type SigningSlot<'a> = (String, String, Vec<&'a Candidate>, Option<&'a Candidate>);
+
 /// Every server key Synapse holds, by server and key ID.
 #[derive(Debug, Default)]
 pub struct KeyRing {
@@ -157,7 +159,7 @@ impl KeyRing {
         };
 
         // Each (server, key ID) the event is signed with, and its candidates.
-        let mut slots: Vec<(String, String, Vec<&Candidate>, Option<&Candidate>)> = Vec::new();
+        let mut slots: Vec<SigningSlot<'_>> = Vec::new();
         for (server, keys) in signatures {
             for key_id in keys.as_object().into_iter().flatten().map(|(id, _)| id) {
                 let (candidates, newest) = self.candidates(server, key_id, ts);
@@ -200,19 +202,12 @@ impl KeyRing {
         let preferred = vec![0_usize; slots.len()];
         let mut outcome = check(&preferred);
         let mut choice = preferred.clone();
-        if outcome.is_err() {
-            // Try each alternative key on its own, then all at once.
-            'search: for slot in 0..slots.len() {
-                for alternative in 1..slots[slot].2.len() {
-                    let mut trial = preferred.clone();
-                    trial[slot] = alternative;
-                    if let Ok(verified) = check(&trial) {
-                        outcome = Ok(verified);
-                        choice = trial;
-                        break 'search;
-                    }
-                }
-            }
+        if outcome.is_err()
+            && let Ok(trial) = matching_signing_keys(&object, rules, &slots)
+            && let Ok(verified) = check(&trial)
+        {
+            outcome = Ok(verified);
+            choice = trial;
         }
         match outcome {
             Err(error) => Verdict::Unverifiable(error),
@@ -235,6 +230,62 @@ impl KeyRing {
             }
         }
     }
+}
+
+/// Choose each signer's key independently, then let the caller check the
+/// original event against all required signers and its content hash. This
+/// costs the sum of the candidate counts rather than their Cartesian product.
+fn matching_signing_keys(
+    object: &ruma::CanonicalJsonObject,
+    rules: &RoomVersionRules,
+    slots: &[SigningSlot<'_>],
+) -> Result<Vec<usize>, String> {
+    let redacted = ruma::canonical_json::redact(object.clone(), &rules.redaction, None)
+        .map_err(|error| error.to_string())?;
+    slots
+        .iter()
+        .map(|(server, key_id, candidates, _)| {
+            let signature = object
+                .get("signatures")
+                .and_then(CanonicalJsonValue::as_object)
+                .and_then(|signatures| signatures.get(server))
+                .and_then(CanonicalJsonValue::as_object)
+                .and_then(|signatures| signatures.get(key_id))
+                .cloned()
+                .ok_or_else(|| "signing slot has no signature".to_owned())?;
+            let mut isolated = redacted.clone();
+            // Signatures are excluded from the signed bytes. Isolate this
+            // slot only to test its key; the final check uses the untouched
+            // original object's complete signature map.
+            isolated.insert(
+                "signatures".to_owned(),
+                CanonicalJsonValue::Object(
+                    [(
+                        server.clone(),
+                        CanonicalJsonValue::Object(
+                            [(key_id.clone(), signature)].into_iter().collect(),
+                        ),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            );
+            let selected = candidates.iter().position(|candidate| {
+                let map: PublicKeyMap = [(
+                    server.clone(),
+                    [(key_id.clone(), candidate.key.clone())]
+                        .into_iter()
+                        .collect(),
+                )]
+                .into_iter()
+                .collect();
+                ruma::signatures::verify_json(&map, &isolated).is_ok()
+            });
+            // An unrelated signature need not verify under this version's
+            // rules. The final check decides which signatures are required.
+            Ok(selected.unwrap_or(0))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -293,6 +344,51 @@ mod tests {
         let stranger = pair("0");
         assert!(matches!(
             ring.verify(&signed(&stranger, "self.host", 500), &rules),
+            Verdict::Unverifiable(_)
+        ));
+    }
+
+    #[test]
+    fn two_required_signers_can_both_need_alternative_historical_keys() {
+        let rules = ruma::RoomVersionId::V1.rules().unwrap();
+        let sender_old = pair("0");
+        let event_old = pair("0");
+        let sender_new = pair("0");
+        let event_new = pair("0");
+        let mut object: ruma::CanonicalJsonObject = serde_json::from_value(serde_json::json!({
+            "event_id": "$event:event.host", "room_id": "!r:sender.host",
+            "type": "m.room.message", "sender": "@a:sender.host",
+            "origin_server_ts": 5_000, "content": {"body": "synthetic", "msgtype": "m.text"},
+            "prev_events": [], "auth_events": [], "depth": 3,
+        }))
+        .unwrap();
+        ruma::signatures::hash_and_sign_event(
+            "sender.host",
+            &sender_old,
+            &mut object,
+            &rules.redaction,
+        )
+        .unwrap();
+        ruma::signatures::hash_and_sign_event(
+            "event.host",
+            &event_old,
+            &mut object,
+            &rules.redaction,
+        )
+        .unwrap();
+        let mut ring = KeyRing::default();
+        for (server, old, new) in [
+            ("sender.host", &sender_old, &sender_new),
+            ("event.host", &event_old, &event_new),
+        ] {
+            ring.add(server, "ed25519:0", &public(old), 1_000);
+            ring.add(server, "ed25519:0", &public(new), 10_000);
+        }
+        let mut event = serde_json::to_value(object).unwrap();
+        assert_eq!(ring.verify(&event, &rules), Verdict::Historical);
+        event["depth"] = serde_json::json!(4);
+        assert!(matches!(
+            ring.verify(&event, &rules),
             Verdict::Unverifiable(_)
         ));
     }
