@@ -785,7 +785,7 @@ impl std::error::Error for AccountError {}
 /// Returns [`AccountError::Hashing`] if hashing fails.
 pub fn hash_password(password: &str) -> Result<String, AccountError> {
     let salt = salt();
-    Ok(Argon2::default()
+    Ok(ReusableArgon2
         .hash_password_with_salt(password.as_bytes(), &salt)
         .map_err(|error| AccountError::Hashing(error.to_string()))?
         .to_string())
