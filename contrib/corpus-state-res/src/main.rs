@@ -401,7 +401,7 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
         let mut log = RoomLog::new();
         for id in &rejected {
             if std::env::var_os("CORPUS_REEVALUATE_REJECTED").is_none() {
-                log.preserve_historical_rejection(EventId::new(id));
+                log.preserve_historical_rejection(EventId::new(id.as_str()));
             }
             log.restore_sidelined(
                 SidelinedEntry {
