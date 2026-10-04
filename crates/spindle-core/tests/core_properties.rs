@@ -270,7 +270,10 @@ fn the_current_state_is_the_resolution_of_the_forward_extremities() {
     room.append_local("$topic-ours", Some(topic.clone()))
         .unwrap();
     assert!(room.current_is_settled());
-    assert_eq!(room.current_state().unwrap().get(&topic), Some("$topic-ours"));
+    assert_eq!(
+        room.current_state().unwrap().get(&topic),
+        Some("$topic-ours")
+    );
 
     let mut resolver = Recording::default();
     append_resolved(
@@ -315,13 +318,23 @@ fn a_rejected_event_changes_no_state_and_no_extremity() {
     .unwrap();
 
     assert!(room.holds(&EventId::new("$bad")));
-    assert!(room.get(&EventId::new("$bad")).is_none(), "not in the timeline");
+    assert!(
+        room.get(&EventId::new("$bad")).is_none(),
+        "not in the timeline"
+    );
     assert_eq!(room.len(), 1);
-    assert_eq!(room.forward_extremities().iter().collect::<Vec<_>>(), vec![&head]);
+    assert_eq!(
+        room.forward_extremities().iter().collect::<Vec<_>>(),
+        vec![&head]
+    );
     let after = room
         .state_after_any(&EventId::new("$bad"), &mut no_store)
         .unwrap();
-    assert_eq!(after.root(), before.root(), "a rejected event moves no state");
+    assert_eq!(
+        after.root(),
+        before.root(),
+        "a rejected event moves no state"
+    );
 
     // A child naming it sits on the state before it.
     let mut resolver = Recording::default();
@@ -363,7 +376,10 @@ fn a_soft_failed_event_keeps_its_state_for_its_children() {
         .unwrap()
         .clone();
     assert_eq!(sidelined.kind, Sideline::SoftFailed);
-    assert_eq!(room.forward_extremities().iter().collect::<Vec<_>>(), vec![&head]);
+    assert_eq!(
+        room.forward_extremities().iter().collect::<Vec<_>>(),
+        vec![&head]
+    );
     assert_eq!(
         room.current_state().unwrap().get(&topic),
         None,

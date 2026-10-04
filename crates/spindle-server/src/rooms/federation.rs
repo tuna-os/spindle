@@ -615,7 +615,7 @@ impl Rooms {
             if !seen.insert(id.clone()) {
                 continue;
             }
-            let Ok(event) = self.event(room_id, &id) else {
+            let Ok(event) = self.pdu(room_id, &id) else {
                 continue;
             };
             frontier.extend(cited_auth_events(&event));

@@ -44,7 +44,9 @@ use ruma::room_version_rules::{RoomVersionRules, StateResolutionVersion};
 use ruma::state_res::StateMap;
 use ruma::state_res::utils::event_id_set::EventIdSet;
 use serde_json::Value;
-use spindle_core::{AppendError, EventId, RoomLog, Sideline, StateKey, StateResolver, StateSnapshot};
+use spindle_core::{
+    AppendError, EventId, RoomLog, Sideline, StateKey, StateResolver, StateSnapshot,
+};
 
 use crate::authorize::StoredEvent;
 
@@ -145,7 +147,11 @@ impl AuthGraph {
                 .collect();
             stack.push((index, true));
             for child in &auth {
-                if self.nodes.get(*child as usize).is_some_and(|node| !node.loaded) {
+                if self
+                    .nodes
+                    .get(*child as usize)
+                    .is_some_and(|node| !node.loaded)
+                {
                     stack.push((*child, false));
                 }
             }
@@ -165,7 +171,29 @@ impl AuthGraph {
     /// event's mark is final when it is visited. The walk ends when nothing
     /// left to visit is unreached by some set.
     fn auth_difference(&self, sets: &[Vec<u32>]) -> Vec<u32> {
-        let count = sets.len().min(64);
+        // Parent counts are bounded, but forward extremities can exceed
+        // a machine word after a long partition. Every branch must count.
+        if sets.len() > 64 {
+            let mut counts: HashMap<u32, usize> = HashMap::new();
+            for set in sets {
+                let mut seen = HashSet::new();
+                let mut pending = set.clone();
+                while let Some(index) = pending.pop() {
+                    if !seen.insert(index) {
+                        continue;
+                    }
+                    *counts.entry(index).or_default() += 1;
+                    if let Some(node) = self.node(index) {
+                        pending.extend(&node.auth);
+                    }
+                }
+            }
+            return counts
+                .into_iter()
+                .filter_map(|(index, count)| (count != sets.len()).then_some(index))
+                .collect();
+        }
+        let count = sets.len();
         let full: u64 = if count == 64 {
             u64::MAX
         } else {
@@ -273,7 +301,10 @@ pub struct ResolutionCache {
 }
 
 /// The cached resolutions, and their keys oldest first for eviction.
-type CacheEntries = (HashMap<Vec<[u8; 32]>, StateSnapshot>, VecDeque<Vec<[u8; 32]>>);
+type CacheEntries = (
+    HashMap<Vec<[u8; 32]>, StateSnapshot>,
+    VecDeque<Vec<[u8; 32]>>,
+);
 
 /// Resolutions kept. Each is a state root and a snapshot sharing nearly all
 /// of its structure with its inputs, so this bounds bookkeeping, not memory
@@ -282,7 +313,10 @@ const RESOLUTION_CACHE_CAPACITY: usize = 512;
 
 impl ResolutionCache {
     fn key(states: &[StateSnapshot]) -> Vec<[u8; 32]> {
-        let mut key: Vec<[u8; 32]> = states.iter().map(|state| *state.root().as_bytes()).collect();
+        let mut key: Vec<[u8; 32]> = states
+            .iter()
+            .map(|state| *state.root().as_bytes())
+            .collect();
         key.sort_unstable();
         key.dedup();
         key
@@ -362,7 +396,10 @@ impl<'a> RoomResolver<'a> {
         Some(event.with_rejected(rejected))
     }
 
-    fn resolve_maps(&self, maps: &[StateMap<OwnedEventId>]) -> Result<StateMap<OwnedEventId>, String> {
+    fn resolve_maps(
+        &self,
+        maps: &[StateMap<OwnedEventId>],
+    ) -> Result<StateMap<OwnedEventId>, String> {
         let cache: RefCell<HashMap<OwnedEventId, Option<StoredEvent>>> =
             RefCell::new(HashMap::new());
         let fetch = |id: &ruma::EventId| -> Option<StoredEvent> {
@@ -379,7 +416,8 @@ impl<'a> RoomResolver<'a> {
                 crate::state_res_v1::resolve(&self.rules.authorization, maps, |id| fetch(id))
             }
             StateResolutionVersion::V2(v2) => {
-                let (difference, subgraph) = self.difference_and_subgraph(maps, v2.consider_conflicted_state_subgraph);
+                let (difference, subgraph) =
+                    self.difference_and_subgraph(maps, v2.consider_conflicted_state_subgraph);
                 let mut chains: Vec<EventIdSet<OwnedEventId>> =
                     vec![difference.into_iter().collect()];
                 chains.extend((1..maps.len()).map(|_| EventIdSet::new()));

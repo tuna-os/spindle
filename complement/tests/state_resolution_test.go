@@ -176,12 +176,15 @@ func TestContestedForkResolvesLikeThePeer(t *testing.T) {
 			}
 
 			// And it is what state resolution decides, whatever the order.
-			must.Equal(t, gjsonField(ours, "m.room.member|"+eve), branchA[0].EventID(), "the ban stands")
-			if ours["m.room.topic|"] == branchB[0].EventID() {
-				t.Fatalf("a write by a user the other branch banned survived resolution")
-			}
-			if _, joined := ours["m.room.member|"+hank]; joined && ours["m.room.member|"+hank] == branchB[1].EventID() {
-				if ours["m.room.join_rules|"] == branchA[1].EventID() {
+			must.Equal(t, ours["m.room.member|"+eve], branchA[0].EventID(), "the ban stands")
+			// Room version 1 does not conflict a slot only one branch holds
+			// (the topic and hank's membership), so there both writes stand
+			// on every server; from v2 they are re-checked and dropped.
+			if version != "1" {
+				if ours["m.room.topic|"] == branchB[0].EventID() {
+					t.Fatalf("a write by a user the other branch banned survived resolution")
+				}
+				if ours["m.room.member|"+hank] == branchB[1].EventID() && ours["m.room.join_rules|"] == branchA[1].EventID() {
 					t.Fatalf("a join survived a concurrent change to invite-only")
 				}
 			}
@@ -283,8 +286,4 @@ func diff(left, right map[string]string) string {
 		fmt.Fprintf(&out, "%s %s: hs1=%s hs2=%s\n", marker, key, left[key], right[key])
 	}
 	return out.String()
-}
-
-func gjsonField(state map[string]string, key string) string {
-	return state[key]
 }

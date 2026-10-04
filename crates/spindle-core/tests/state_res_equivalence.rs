@@ -152,7 +152,10 @@ fn a_ban_on_one_branch_voids_the_other_branchs_write() {
         "state resolution drops a write by a user the other branch banned"
     );
     assert_eq!(merged.get(&topic_key), Some(&topic.as_str().to_owned()));
-    assert_ne!(merged, reference, "the retired merge and state resolution disagree");
+    assert_ne!(
+        merged, reference,
+        "the retired merge and state resolution disagree"
+    );
 }
 
 #[test]
@@ -218,10 +221,7 @@ impl StateResolver for Oracle<'_> {
                 let mut map = StateMap::new();
                 state.for_each(|key, id| {
                     map.insert(
-                        (
-                            key.event_type().as_str().into(),
-                            key.state_key().to_owned(),
-                        ),
+                        (key.event_type().as_str().into(), key.state_key().to_owned()),
                         OwnedEventId::try_from(id).expect("fixture IDs parse"),
                     );
                 });
@@ -296,8 +296,10 @@ fn the_log_takes_the_resolvers_answer_and_nothing_else() {
     let mut head: Option<String> = None;
     for (id, (event_type, key)) in shared {
         let prev = head.iter().map(|id| EventId::new(id.as_str())).collect();
-        log.append_remote(EventInput::new(id.clone(), prev).with_state_key(StateKey::new(event_type, key)))
-            .unwrap();
+        log.append_remote(
+            EventInput::new(id.clone(), prev).with_state_key(StateKey::new(event_type, key)),
+        )
+        .unwrap();
         head = Some(id);
     }
     let ancestor = head.unwrap();
@@ -313,7 +315,9 @@ fn the_log_takes_the_resolvers_answer_and_nothing_else() {
     let mut no_store = |_: &spindle_core::StateRoot| -> Option<Vec<u8>> {
         panic!("the tips' states are resident")
     };
-    let before = log.resolve_parents(&prev, &mut oracle, &mut no_store).unwrap();
+    let before = log
+        .resolve_parents(&prev, &mut oracle, &mut no_store)
+        .unwrap();
     let merged = log
         .append_resolved(EventInput::new("$merge", prev), before)
         .unwrap()
@@ -321,7 +325,11 @@ fn the_log_takes_the_resolvers_answer_and_nothing_else() {
     assert_eq!(oracle.calls, 1);
     assert_eq!(
         normalize_ours(log.state_after(merged).unwrap()),
-        normalize(&reference_resolve(&graph, &left.state_map(), &right.state_map())),
+        normalize(&reference_resolve(
+            &graph,
+            &left.state_map(),
+            &right.state_map()
+        )),
     );
 }
 
@@ -337,7 +345,8 @@ fn a_fork_whose_states_differ_is_never_merged_without_a_resolver() {
         .clone();
 
     log.append_remote(
-        EventInput::new("$left", vec![root.clone()]).with_state_key(StateKey::new("m.room.topic", "")),
+        EventInput::new("$left", vec![root.clone()])
+            .with_state_key(StateKey::new("m.room.topic", "")),
     )
     .unwrap();
     log.append_remote(

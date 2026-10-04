@@ -201,7 +201,10 @@ impl RoomBuilder {
     /// takes `ts + 1`. Real servers' clocks disagree, and state resolution
     /// orders by them, so a fixture that can only count upwards cannot
     /// build the forks where that matters.
-    #[allow(dead_code, reason = "used by some of the binaries that share this module")]
+    #[allow(
+        dead_code,
+        reason = "used by some of the binaries that share this module"
+    )]
     pub fn set_clock(&mut self, ts: u64) {
         self.timestamp = ts;
     }

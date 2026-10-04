@@ -2406,7 +2406,10 @@ impl Rooms {
         snapshot.for_each(|_, event_id| ids.push(event_id.to_owned()));
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            let event = self.event(room_id, &id)?;
+            // Federation state must carry the signed PDU. A client event
+            // adds event_id; hashing it at the joining server changes the
+            // reference hash and breaks later auth-event lookups.
+            let event = self.pdu(room_id, &id)?;
             out.push((id, event));
         }
         Ok(out)
@@ -4470,10 +4473,7 @@ impl Rooms {
                 Some(id) => {
                     let id = EventId::new(id);
                     let body = self.read_event(room_id, &id)?;
-                    let li = log
-                        .get(&id)
-                        .or(entry)
-                        .map_or(0, |entry| entry.li.get());
+                    let li = log.get(&id).or(entry).map_or(0, |entry| entry.li.get());
                     (body["content"].clone(), li)
                 }
                 None => (
@@ -4965,9 +4965,11 @@ impl Rooms {
             let id = state.get(&StateKey::new(kind.to_string().as_str(), key))?;
             fetch(&ruma::OwnedEventId::try_from(id).ok()?).filter(|event| !event.rejected())
         };
-        if let Err(why) = crate::authorize::authorize(&rules.authorization, &candidate, |kind, key| {
-            by_state(state_before, kind, key)
-        }) {
+        if let Err(why) =
+            crate::authorize::authorize(&rules.authorization, &candidate, |kind, key| {
+                by_state(state_before, kind, key)
+            })
+        {
             return Ok(Some((Sideline::Rejected, why)));
         }
 
@@ -5619,7 +5621,11 @@ fn auth_events_for(
             auth.push(id.to_owned());
         }
     };
-    cite("m.room.create", "");
+    // v12 derives the create event from the room ID and forbids it in
+    // auth_events. Earlier versions require an explicit reference.
+    if !rules.room_create_event_id_as_room_id {
+        cite("m.room.create", "");
+    }
     cite("m.room.power_levels", "");
     cite("m.room.member", sender);
     if event_type == "m.room.member" {

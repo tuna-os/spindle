@@ -293,8 +293,7 @@ fn diff_nodes(left: Option<&Node>, right: Option<&Node>, out: &mut Vec<StateDiff
                 right.collect(&mut theirs);
             }
             let ours: std::collections::BTreeMap<&StateKey, &str> = ours.into_iter().collect();
-            let theirs: std::collections::BTreeMap<&StateKey, &str> =
-                theirs.into_iter().collect();
+            let theirs: std::collections::BTreeMap<&StateKey, &str> = theirs.into_iter().collect();
             for (key, value) in &ours {
                 let other = theirs.get(key).copied();
                 if other != Some(*value) {

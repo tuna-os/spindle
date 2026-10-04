@@ -927,7 +927,8 @@ impl RoomLog {
 
     fn append(&mut self, input: EventInput) -> Result<&LogEntry, AppendError> {
         self.check_parents(&input)?;
-        let state_before = self.resolve_parents(&input.prev_events, &mut Strict, &mut |_: &StateRoot| None)?;
+        let state_before =
+            self.resolve_parents(&input.prev_events, &mut Strict, &mut |_: &StateRoot| None)?;
         self.append_resolved(input, state_before)
     }
 

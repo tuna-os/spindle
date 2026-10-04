@@ -218,7 +218,14 @@ impl Server {
         )
     }
 
-    async fn put_state(&self, room: &str, token: &str, kind: &str, key: &str, content: &Value) -> (u16, Value) {
+    async fn put_state(
+        &self,
+        room: &str,
+        token: &str,
+        kind: &str,
+        key: &str,
+        content: &Value,
+    ) -> (u16, Value) {
         self.request(
             reqwest::Method::PUT,
             &format!("/_matrix/client/v3/rooms/{room}/state/{kind}/{key}"),
@@ -303,7 +310,11 @@ async fn eventually(mut check: impl AsyncFnMut() -> bool) -> bool {
 /// A room on server 0 at `version` with a member on every server: alice
 /// (s0) and bob (s1) as admins at 100, `others` as members at 0. Returns the
 /// room, and every member's `(server, token, user_id)` in order.
-async fn room_across(net: &Net, version: &str, bob_level: i64) -> (String, Vec<(usize, String, String)>) {
+async fn room_across(
+    net: &Net,
+    version: &str,
+    bob_level: i64,
+) -> (String, Vec<(usize, String, String)>) {
     let mut members = Vec::new();
     let (alice, alice_id) = net.servers[0].register("alice").await;
     let (status, body) = net.servers[0]
@@ -368,6 +379,18 @@ async fn room_across(net: &Net, version: &str, bob_level: i64) -> (String, Vec<(
         )
         .await;
     assert_eq!(status, 200, "{body}");
+    // A topic before the fork, so that a branch's topic write contests a
+    // slot every branch holds -- the case every version conflicts.
+    let (status, body) = net.servers[0]
+        .put_state(
+            &room,
+            &members[0].1,
+            "m.room.topic",
+            "",
+            &json!({ "topic": "base" }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
     converge(net, &room, &members).await;
     (room, members)
 }
@@ -422,11 +445,23 @@ async fn a_ban_voids_a_concurrent_write(version: &str) {
 
     net.link(0, 1, false);
     let (status, body) = net.servers[0]
-        .put_state(&room, &alice.1, "m.room.member", &bob.2, &json!({ "membership": "ban" }))
+        .put_state(
+            &room,
+            &alice.1,
+            "m.room.member",
+            &bob.2,
+            &json!({ "membership": "ban" }),
+        )
         .await;
     assert_eq!(status, 200, "{body}");
     let (status, body) = net.servers[1]
-        .put_state(&room, &bob.1, "m.room.topic", "", &json!({ "topic": "bob's, before the ban" }))
+        .put_state(
+            &room,
+            &bob.1,
+            "m.room.topic",
+            "",
+            &json!({ "topic": "bob's, before the ban" }),
+        )
         .await;
     assert_eq!(status, 200, "{body}");
     net.link(0, 1, true);
@@ -485,7 +520,13 @@ async fn concurrent_power_levels_agree(version: &str) {
         from_bob[alice.2.clone()] = json!(100);
     }
     let (status, first) = net.servers[0]
-        .put_state(&room, &alice.1, "m.room.power_levels", "", &levels(from_alice))
+        .put_state(
+            &room,
+            &alice.1,
+            "m.room.power_levels",
+            "",
+            &levels(from_alice),
+        )
         .await;
     assert_eq!(status, 200, "{first}");
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -500,11 +541,22 @@ async fn concurrent_power_levels_agree(version: &str) {
     let _ = net.servers[1].say(&room, &bob.1, "merge-1").await;
     let state = converge(&net, &room, &members).await;
     let winner = &state[&("m.room.power_levels".to_owned(), String::new())];
-    assert_eq!(
-        winner,
-        second["event_id"].as_str().unwrap(),
-        "v{version}: the later of two equally powerful changes wins"
-    );
+    if version == "1" {
+        // Room version 1 orders the two by depth, equal here, and then by
+        // the SHA-1 of their IDs: either may win, and agreeing is the test.
+        assert!(
+            [&first, &second]
+                .iter()
+                .any(|sent| sent["event_id"].as_str() == Some(winner.as_str())),
+            "v1: the winner is one of the two changes"
+        );
+    } else {
+        assert_eq!(
+            winner,
+            second["event_id"].as_str().unwrap(),
+            "v{version}: the later of two equally powerful changes wins"
+        );
+    }
 }
 
 /// A join on one side against a join-rule change on the other.
@@ -520,20 +572,35 @@ async fn a_join_loses_to_a_concurrent_invite_only(version: &str) {
 
     net.link(0, 1, false);
     let (status, body) = net.servers[0]
-        .put_state(&room, &alice.1, "m.room.join_rules", "", &json!({ "join_rule": "invite" }))
+        .put_state(
+            &room,
+            &alice.1,
+            "m.room.join_rules",
+            "",
+            &json!({ "join_rule": "invite" }),
+        )
         .await;
     assert_eq!(status, 200, "{body}");
-    net.servers[1].join(&room, &erin, &net.servers[0].name).await;
+    net.servers[1]
+        .join(&room, &erin, &net.servers[0].name)
+        .await;
     net.link(0, 1, true);
 
     tokio::time::sleep(Duration::from_millis(500)).await;
     let _ = net.servers[0].say(&room, &alice.1, "merge-0").await;
     let _ = net.servers[1].say(&room, &members[1].1, "merge-1").await;
     let state = converge(&net, &room, &members).await;
-    assert!(
-        !state.contains_key(&("m.room.member".to_owned(), erin_id.clone())),
-        "v{version}: a join the join rules no longer admit is resolved away: {state:?}"
-    );
+    let erin_key = ("m.room.member".to_owned(), erin_id.clone());
+    if version == "1" {
+        // Room version 1 does not conflict a key only one branch holds, so
+        // the join stands -- as it does on Synapse (`state/v1.py`).
+        assert!(state.contains_key(&erin_key), "v1: {state:?}");
+    } else {
+        assert!(
+            !state.contains_key(&erin_key),
+            "v{version}: a join the join rules no longer admit is resolved away: {state:?}"
+        );
+    }
 }
 
 macro_rules! per_version {
@@ -578,13 +645,24 @@ per_version!(a_join_loses_to_a_concurrent_invite_only,
 async fn three_servers_converge(version: &str) {
     let net = Net::start(3).await;
     let (room, members) = room_across(&net, version, 100).await;
-    let (alice, bob, dave1, carol, dave2) =
-        (&members[0], &members[1], &members[2], &members[3], &members[4]);
+    let (alice, bob, dave1, carol, dave2) = (
+        &members[0],
+        &members[1],
+        &members[2],
+        &members[3],
+        &members[4],
+    );
 
     net.isolate_all();
     // s0: alice bans carol (s2), and opens a join rule change.
     let (status, body) = net.servers[0]
-        .put_state(&room, &alice.1, "m.room.member", &carol.2, &json!({ "membership": "ban" }))
+        .put_state(
+            &room,
+            &alice.1,
+            "m.room.member",
+            &carol.2,
+            &json!({ "membership": "ban" }),
+        )
         .await;
     assert_eq!(status, 200, "{body}");
     // s1: bob, also an admin, raises dave1 and sets the name.
@@ -613,16 +691,34 @@ async fn three_servers_converge(version: &str) {
         .await;
     assert_eq!(status, 200, "{body}");
     let (status, body) = net.servers[1]
-        .put_state(&room, &dave1.1, "m.room.name", "", &json!({ "name": "dave1's" }))
+        .put_state(
+            &room,
+            &dave1.1,
+            "m.room.name",
+            "",
+            &json!({ "name": "dave1's" }),
+        )
         .await;
     assert_eq!(status, 200, "{body}");
     // s2: carol leaves and rejoins (her own membership churn) while dave2
     // tries to set the topic with no power to.
     let _ = net.servers[2]
-        .put_state(&room, &carol.1, "m.room.member", &carol.2, &json!({ "membership": "leave" }))
+        .put_state(
+            &room,
+            &carol.1,
+            "m.room.member",
+            &carol.2,
+            &json!({ "membership": "leave" }),
+        )
         .await;
     let _ = net.servers[2]
-        .put_state(&room, &dave2.1, "m.room.topic", "", &json!({ "topic": "dave2's" }))
+        .put_state(
+            &room,
+            &dave2.1,
+            "m.room.topic",
+            "",
+            &json!({ "topic": "dave2's" }),
+        )
         .await;
     net.heal_all();
 
@@ -637,7 +733,10 @@ async fn three_servers_converge(version: &str) {
         .state_event(&room, &dave2.1, "m.room.member", &carol.2)
         .await
         .expect("carol has a membership");
-    assert_eq!(carol_member["membership"], "ban", "v{version}: {carol_member}");
+    assert_eq!(
+        carol_member["membership"], "ban",
+        "v{version}: {carol_member}"
+    );
     let name = net.servers[2]
         .state_event(&room, &dave2.1, "m.room.name", "")
         .await

@@ -82,7 +82,13 @@ impl Room {
             create["creator"] = json!(ALICE);
         }
         room.add(ALICE, "m.room.create", Some(""), &create, 1);
-        room.add(ALICE, "m.room.member", Some(ALICE), &json!({ "membership": "join" }), 2);
+        room.add(
+            ALICE,
+            "m.room.member",
+            Some(ALICE),
+            &json!({ "membership": "join" }),
+            2,
+        );
         let mut users = json!({ BOB: 50 });
         if !v12 {
             users[ALICE] = json!(100);
@@ -101,10 +107,34 @@ impl Room {
             }),
             3,
         );
-        room.add(ALICE, "m.room.join_rules", Some(""), &json!({ "join_rule": "public" }), 4);
-        room.add(BOB, "m.room.member", Some(BOB), &json!({ "membership": "join" }), 5);
-        room.add(CAROL, "m.room.member", Some(CAROL), &json!({ "membership": "join" }), 6);
-        room.add(ALICE, "m.room.topic", Some(""), &json!({ "topic": "base" }), 7);
+        room.add(
+            ALICE,
+            "m.room.join_rules",
+            Some(""),
+            &json!({ "join_rule": "public" }),
+            4,
+        );
+        room.add(
+            BOB,
+            "m.room.member",
+            Some(BOB),
+            &json!({ "membership": "join" }),
+            5,
+        );
+        room.add(
+            CAROL,
+            "m.room.member",
+            Some(CAROL),
+            &json!({ "membership": "join" }),
+            6,
+        );
+        room.add(
+            ALICE,
+            "m.room.topic",
+            Some(""),
+            &json!({ "topic": "base" }),
+            7,
+        );
         room
     }
 
@@ -131,7 +161,13 @@ impl Room {
     }
 
     /// The v1-v12 auth event selection, from this branch's state.
-    fn auth_for(&self, sender: &str, kind: &str, state_key: Option<&str>, content: &Value) -> Vec<String> {
+    fn auth_for(
+        &self,
+        sender: &str,
+        kind: &str,
+        state_key: Option<&str>,
+        content: &Value,
+    ) -> Vec<String> {
         if kind == "m.room.create" {
             return Vec::new();
         }
@@ -143,17 +179,29 @@ impl Room {
         keys.push(("m.room.power_levels".to_owned(), String::new()));
         keys.push(("m.room.member".to_owned(), sender.to_owned()));
         if kind == "m.room.member" {
-            if matches!(content["membership"].as_str(), Some("join" | "invite" | "knock")) {
+            if matches!(
+                content["membership"].as_str(),
+                Some("join" | "invite" | "knock")
+            ) {
                 keys.push(("m.room.join_rules".to_owned(), String::new()));
             }
             if let Some(target) = state_key.filter(|target| *target != sender) {
                 keys.push(("m.room.member".to_owned(), target.to_owned()));
             }
         }
-        keys.iter().filter_map(|key| self.state.get(key).cloned()).collect()
+        keys.iter()
+            .filter_map(|key| self.state.get(key).cloned())
+            .collect()
     }
 
-    fn add(&mut self, sender: &str, kind: &str, state_key: Option<&str>, content: &Value, ts: u64) -> String {
+    fn add(
+        &mut self,
+        sender: &str,
+        kind: &str,
+        state_key: Option<&str>,
+        content: &Value,
+        ts: u64,
+    ) -> String {
         self.counter += 1;
         let id = if kind == "m.room.create" && self.room_id == "!create" {
             "$create".to_owned()
@@ -197,7 +245,9 @@ impl Room {
 
     fn absorb(&mut self, other: &Self) {
         for (id, body) in &other.bodies {
-            self.bodies.entry(id.clone()).or_insert_with(|| body.clone());
+            self.bodies
+                .entry(id.clone())
+                .or_insert_with(|| body.clone());
         }
     }
 
@@ -250,19 +300,34 @@ impl Room {
 fn operate(branch: &mut Room, rng: &mut Rng, clock: &mut u64) {
     // Clocks are deliberately not monotonic across branches: a branch's
     // server may be ahead of or behind the others.
-    *clock = clock.saturating_add(rng.below(40)).saturating_sub(15).max(10);
+    *clock = clock
+        .saturating_add(rng.below(40))
+        .saturating_sub(15)
+        .max(10);
     let ts = *clock;
     let pick = |rng: &mut Rng| [ALICE, BOB, CAROL][usize::try_from(rng.below(3)).unwrap_or(0)];
     match rng.below(8) {
         0 | 1 => {
             let sender = pick(rng);
-            branch.add(sender, "m.room.topic", Some(""), &json!({ "topic": format!("t{ts}") }), ts);
+            branch.add(
+                sender,
+                "m.room.topic",
+                Some(""),
+                &json!({ "topic": format!("t{ts}") }),
+                ts,
+            );
         }
         2 => {
             let target = [BOB, CAROL][usize::try_from(rng.below(2)).unwrap_or(0)];
             let sender = pick(rng);
             let membership = ["ban", "leave"][usize::try_from(rng.below(2)).unwrap_or(0)];
-            branch.add(sender, "m.room.member", Some(target), &json!({ "membership": membership }), ts);
+            branch.add(
+                sender,
+                "m.room.member",
+                Some(target),
+                &json!({ "membership": membership }),
+                ts,
+            );
         }
         3 => {
             let level = [0, 50, 100][usize::try_from(rng.below(3)).unwrap_or(0)];
@@ -289,15 +354,33 @@ fn operate(branch: &mut Room, rng: &mut Rng, clock: &mut u64) {
         }
         4 => {
             let rule = ["public", "invite"][usize::try_from(rng.below(2)).unwrap_or(0)];
-            branch.add(ALICE, "m.room.join_rules", Some(""), &json!({ "join_rule": rule }), ts);
+            branch.add(
+                ALICE,
+                "m.room.join_rules",
+                Some(""),
+                &json!({ "join_rule": rule }),
+                ts,
+            );
         }
         5 => {
             let joiner = [BOB, CAROL][usize::try_from(rng.below(2)).unwrap_or(0)];
-            branch.add(joiner, "m.room.member", Some(joiner), &json!({ "membership": "join" }), ts);
+            branch.add(
+                joiner,
+                "m.room.member",
+                Some(joiner),
+                &json!({ "membership": "join" }),
+                ts,
+            );
         }
         6 => {
             let sender = pick(rng);
-            branch.add(sender, "m.room.name", Some(""), &json!({ "name": format!("n{ts}") }), ts);
+            branch.add(
+                sender,
+                "m.room.name",
+                Some(""),
+                &json!({ "name": format!("n{ts}") }),
+                ts,
+            );
         }
         _ => {
             let sender = pick(rng);
@@ -314,8 +397,10 @@ fn reference(graph: &Room, branches: &[Room]) -> BTreeMap<Key, String> {
     let fetch = |id: &ruma::EventId| graph.stored(id.as_str());
     let resolved = match &rules.state_res {
         StateResolutionVersion::V1 => {
-            crate::state_res_v1::resolve(&rules.authorization, &maps, |id| graph.stored(id.as_str()))
-                .expect("v1 resolves")
+            crate::state_res_v1::resolve(&rules.authorization, &maps, |id| {
+                graph.stored(id.as_str())
+            })
+            .expect("v1 resolves")
         }
         StateResolutionVersion::V2(v2) => {
             let chains: Vec<EventIdSet<OwnedEventId>> = maps
@@ -340,9 +425,7 @@ fn reference(graph: &Room, branches: &[Room]) -> BTreeMap<Key, String> {
                     .collect();
                 let mut out = EventIdSet::new();
                 for id in graph.bodies.keys() {
-                    let below = conflicted
-                        .iter()
-                        .any(|c| graph.ancestors(c).contains(id));
+                    let below = conflicted.iter().any(|c| graph.ancestors(c).contains(id));
                     let above = graph
                         .ancestors(id)
                         .iter()
@@ -353,8 +436,15 @@ fn reference(graph: &Room, branches: &[Room]) -> BTreeMap<Key, String> {
                 }
                 Some(out)
             };
-            ruma::state_res::resolve(&rules.authorization, v2, maps.iter(), chains, fetch, subgraph)
-                .expect("the reference resolves")
+            ruma::state_res::resolve(
+                &rules.authorization,
+                v2,
+                maps.iter(),
+                chains,
+                fetch,
+                subgraph,
+            )
+            .expect("the reference resolves")
         }
         other => panic!("no reference for {other:?}"),
     };
@@ -368,7 +458,10 @@ fn ours(state: &StateSnapshot) -> BTreeMap<Key, String> {
     let mut out = BTreeMap::new();
     state.for_each(|key, id| {
         out.insert(
-            (key.event_type().as_str().to_owned(), key.state_key().to_owned()),
+            (
+                key.event_type().as_str().to_owned(),
+                key.state_key().to_owned(),
+            ),
             id.to_owned(),
         );
     });
@@ -547,4 +640,22 @@ fn a_slot_resolved_away_is_removed_canonically() {
             .apply(StateKey::new("m.room.create", ""), "$c")
             .root()
     );
+}
+
+#[test]
+fn auth_difference_includes_extremities_beyond_one_machine_word() {
+    let mut graph = AuthGraph::default();
+    let auth = |id: &str| {
+        Some(if id == "$root" {
+            Vec::new()
+        } else {
+            vec!["$root".to_owned()]
+        })
+    };
+    let common = graph.ensure("$common", &auth);
+    let last = graph.ensure("$last", &auth);
+    let mut sets = vec![vec![common]; 64];
+    sets.push(vec![last]);
+    let found: std::collections::BTreeSet<_> = graph.auth_difference(&sets).into_iter().collect();
+    assert_eq!(found, [common, last].into_iter().collect());
 }
