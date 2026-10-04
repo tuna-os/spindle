@@ -43,7 +43,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # Native reads from a live Synapse PostgreSQL database. Kept behind the same
 # one-shot migration feature as the SQLite fixture reader.
 postgres = "0.19"
-hickory-resolver = "0.25.2"
+hickory-resolver = "0.26.1"
 imbl = "7"
 # `state-res` is a runtime dependency, not just an oracle: SPEC 9.3 and
 # docs/divergence.md both require the local send path to use the same auth

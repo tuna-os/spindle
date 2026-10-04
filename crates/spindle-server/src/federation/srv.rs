@@ -158,20 +158,28 @@ pub(super) async fn resolve(
             Err(error) if error.is_no_records_found() || error.is_nx_domain() => continue,
             Err(error) => return Err(FederationError::Refused(format!("SRV lookup: {error}"))),
         };
-        let mut until = lookup.as_lookup().valid_until();
+        let mut until = lookup.valid_until();
         let mut candidates = Vec::new();
-        for record in lookup.iter().take(100) {
-            if record.target().is_root() {
+        for record in lookup
+            .answers()
+            .iter()
+            .filter_map(|record| match &record.data {
+                hickory_resolver::proto::rr::RData::SRV(record) => Some(record),
+                _ => None,
+            })
+            .take(100)
+        {
+            if record.target.is_root() {
                 return Err(FederationError::Refused(format!(
                     "{logical} advertises no federation service"
                 )));
             }
-            if record.port() == 0 {
+            if record.port == 0 {
                 return Err(FederationError::Refused(
                     "SRV target has port zero".to_owned(),
                 ));
             }
-            let addresses = match resolver.lookup_ip(record.target().clone()).await {
+            let addresses = match resolver.lookup_ip(record.target.clone()).await {
                 Ok(addresses) => addresses,
                 Err(error) => {
                     tracing::debug!(%logical, %error, "unreachable SRV target");
@@ -182,7 +190,7 @@ pub(super) async fn resolve(
             let vetted: Vec<SocketAddr> = addresses
                 .iter()
                 .filter(|ip| permits(allowed, *ip))
-                .map(|ip| SocketAddr::new(ip, record.port()))
+                .map(|ip| SocketAddr::new(ip, record.port))
                 .collect();
             if vetted.is_empty() {
                 continue;
@@ -192,8 +200,8 @@ pub(super) async fn resolve(
                 .build()
                 .map_err(|error| FederationError::Refused(error.to_string()))?;
             candidates.push(Candidate {
-                priority: record.priority(),
-                weight: record.weight(),
+                priority: record.priority,
+                weight: record.weight,
                 client,
             });
         }
