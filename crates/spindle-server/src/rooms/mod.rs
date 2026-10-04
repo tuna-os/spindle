@@ -144,10 +144,12 @@ type Destinations = ([u8; 32], Arc<Vec<String>>);
 mod admin;
 mod federation;
 mod read;
+mod synapse_positions;
 mod unread;
 
 pub use admin::AdminTimelineEntry;
 pub use read::{ReadScope, RoomReader};
+pub use synapse_positions::SynapseGap;
 
 pub use unread::{Receipt, Scored, Unread, Unscored};
 use unread::{ScoreTally, UnreadIndex};
@@ -382,6 +384,26 @@ pub enum StateAtAnchor {
     Ts(u64),
     /// An event ID; resolves to exactly that entry.
     Event(String),
+}
+
+/// Which way a `/messages` page walks from its token (`dir`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Direction {
+    /// Older events, newest first (`dir=b`).
+    Backward,
+    /// Newer events, oldest first (`dir=f`).
+    Forward,
+}
+
+/// The bounds of one `/messages` page, as positions in the linear index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Page {
+    /// The gap the page starts from; `None` is the room's end in the
+    /// page's direction (its head going back, its start going forward).
+    pub from: Option<i64>,
+    /// A gap the page stops at, from the request's `to`.
+    pub to: Option<i64>,
+    pub direction: Direction,
 }
 
 /// Which side of a timestamp `/timestamp_to_event` should look.
@@ -2611,29 +2633,36 @@ impl Rooms {
             // Each side has its own limit and stops at the end of the log
             // rather than running off it.
             let before: Vec<String> = log
-                .entries()
+                .entries_in(..target)
                 .rev()
-                .filter(|entry| entry.li.get() < target && visible(entry.li.get()))
+                .filter(|entry| visible(entry.li.get()))
                 .take(before_limit)
                 .map(|entry| entry.event_id.as_str().to_owned())
                 .collect();
             let after: Vec<String> = log
-                .entries()
-                .filter(|entry| entry.li.get() > target && visible(entry.li.get()))
+                .entries_in(target.saturating_add(1)..)
+                .filter(|entry| visible(entry.li.get()))
                 .take(after_limit)
                 .map(|entry| entry.event_id.as_str().to_owned())
                 .collect();
 
-            // The oldest and newest positions this window reached, which are
-            // where a client paginates on from.
+            // The gaps at the window's two edges, which are where a client
+            // paginates on from: just below the oldest event it holds, and
+            // just above the newest. A position names the gap *below* an
+            // entry, so the upper edge is one past the last entry taken --
+            // naming the entry itself handed a forward page that entry a
+            // second time.
             let start = before.last().map_or(target, |id| {
                 log.get(&EventId::new(id.as_str()))
                     .map_or(target, |entry| entry.li.get())
             });
-            let end = after.last().map_or(target, |id| {
-                log.get(&EventId::new(id.as_str()))
-                    .map_or(target, |entry| entry.li.get())
-            });
+            let end = after
+                .last()
+                .map_or(target, |id| {
+                    log.get(&EventId::new(id.as_str()))
+                        .map_or(target, |entry| entry.li.get())
+                })
+                .saturating_add(1);
             Ok(Some((before, after, start, end, state_root)))
         })?;
 
@@ -3007,6 +3036,43 @@ impl Rooms {
         limit: usize,
         visible: &(dyn Fn(i64) -> bool + Sync),
     ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
+        self.page_visible(
+            room_id,
+            Page {
+                from,
+                to: None,
+                direction: Direction::Backward,
+            },
+            limit,
+            visible,
+        )
+    }
+
+    /// One `/messages` page in either direction, of the positions
+    /// `visible` admits.
+    ///
+    /// Positions are the gaps between entries: `t{p}` sits just below the
+    /// entry at `p`. A backward page from `p` takes entries under it,
+    /// newest first; a forward page takes entries at or above it, oldest
+    /// first. `to`, when given, is a gap the page does not cross. The
+    /// returned token is the gap a following page in the same direction
+    /// starts from, and `None` when there is nothing further that way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
+    pub(crate) fn page_visible(
+        &self,
+        room_id: &str,
+        page: Page,
+        limit: usize,
+        visible: &(dyn Fn(i64) -> bool + Sync),
+    ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
+        let Page {
+            from,
+            to,
+            direction,
+        } = page;
         // Against the open log, not a fresh `load()`. Reloading rebuilt the
         // whole `RoomLog` from storage on every page, which made the one
         // endpoint SPEC §10.4 calls "a reverse range scan ... that is the
@@ -3016,19 +3082,53 @@ impl Rooms {
         let wanted = self.with_room_read(room_id, |_, log| {
             let mut wanted = Vec::new();
             let mut next = None;
-            for entry in log.entries().rev() {
+            let mut take = |entry: &spindle_core::LogEntry, gap_after: i64| {
                 let li = entry.li.get();
-                if from.is_some_and(|from| li >= from) {
-                    continue;
-                }
                 if !visible(li) {
-                    continue;
+                    return true;
                 }
                 if wanted.len() == limit {
-                    next = Some(li + 1);
-                    break;
+                    next = Some(gap_after);
+                    return false;
                 }
                 wanted.push((li, entry.event_id.as_str().to_owned()));
+                true
+            };
+            match direction {
+                Direction::Backward => {
+                    let upper = from.unwrap_or(i64::MAX);
+                    let lower = to.unwrap_or(i64::MIN);
+                    if lower < upper {
+                        for entry in log.entries_in(lower..upper).rev() {
+                            // The next backward page starts just above the
+                            // entry this one could not take.
+                            if !take(entry, entry.li.get() + 1) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Direction::Forward => {
+                    let lower = from.unwrap_or(i64::MIN);
+                    let upper = to.unwrap_or(i64::MAX);
+                    if lower < upper {
+                        for entry in log.entries_in(lower..upper) {
+                            // And the next forward page just below it.
+                            if !take(entry, entry.li.get()) {
+                                break;
+                            }
+                        }
+                    }
+                    // A forward page that reaches the newest event still
+                    // names where to carry on, one past it: the room's live
+                    // end is not its last, and a client following it forward
+                    // (a permalink's focused timeline) resumes there. Only an
+                    // empty page names none. That is Synapse's answer, and
+                    // what matrix-rust-sdk's `/context` test pages on.
+                    if next.is_none() {
+                        next = wanted.last().map(|(li, _)| li + 1);
+                    }
+                }
             }
             Ok((wanted, next))
         })?;
