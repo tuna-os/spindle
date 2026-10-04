@@ -159,8 +159,8 @@ What stays ours is the cost of the inputs:
 
 The oracle is ruma's own resolver, run the slow way with full chains, on
 generated contested forks in every room-version family
-(`server/src/state_res_tests.rs`), plus the production corpus replayed through
-the live path and compared with Synapse's state groups (#563).
+(`server/src/state_res_tests.rs`). The corpus harness also compares live state
+with the state groups from Synapse. Issue #563 tracks the complete rehearsal.
 
 ### 4.4 The log chain (`core/src/log.rs`, SPEC §5.3)
 

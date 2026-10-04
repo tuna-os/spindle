@@ -1,197 +1,148 @@
 # ADR 0005: Matrix state resolution on the live path
 
-**Status:** accepted (#563, gate "State resolution matches peers on contested forks")
+**Status:** accepted. Migration evidence remains a gate in #563.
 
 ## Context
 
-SPEC §9.2 handled a federation fork with Spindle's own merge, cheapest case
-first:
+SPEC §9.2 once used a custom merge for forks. It handled forks in three ways:
 
-1. a non-state event on a stale parent: append it, no resolution;
-2. a state event whose slot nothing else in the fork window touched: fold it
-   in, no resolution;
-3. a slot both branches moved: hand it to the room version's resolver.
+1. A non-state event had a stale parent.
+2. On each branch, a different slot changed.
+3. Branches changed the same slot.
 
-Case 3 was never wired in. The log set the contesting tip aside
-(`RoomLog::set_aside_contested`, #225) and authored local events without it,
-so the room stayed writable, but Spindle and its peers held different state for
-that slot from then on.
+The first two cases did not call the resolver. For the third case, Spindle set a tip aside through `RoomLog::set_aside_contested` (#225).
+Local users could still write. Peers could retain a different state indefinitely.
 
-SPEC §9.3 claimed cases 1 and 2 were *equal* to state resolution, so only
-case 3 needed the resolver. That claim is false. State resolution does not
-merge slot by slot; it re-runs the authorization rules over everything that
-differs, in an order fixed by power level, `origin_server_ts` and event ID.
-Two counterexamples, both now tests in
-`crates/spindle-core/tests/state_res_equivalence.rs` against ruma's reference
-resolver:
+Separate slots do not imply independent authorization. For example, a ban can void a concurrent topic change by the banned user.
+A timestamp can also make an older value win over its replacement.
+`crates/spindle-core/tests/state_res_equivalence.rs` tests both cases against ruma.
 
-- **A ban voids the other branch's write.** Branch A: Bob sets the topic.
-  Branch B: Alice bans Bob. Each branch moved one slot, so §9.2 took both.
-  State resolution applies the ban, then re-checks Bob's topic against it and
-  drops the topic.
-- **Clocks decide ties.** Branch A sets the topic from a server whose clock
-  runs behind. Branch B touches another slot. §9.2 took A's topic because only
-  A moved it. State resolution orders the two topic values by timestamp, and
-  the value A replaced has the later timestamp, so it wins.
-
-There is a third gap. The room's *current* state is the resolution of all its
-forward extremities, and Spindle read the newest log entry's state instead,
-which after a fork is one branch's. Incoming PDUs were authorized against that
-same head state, not against the state before the event as the spec requires.
-So soft-failure and rejection did not exist.
-
-Each of these leaves Spindle and every Synapse in the room permanently on
-different current state. No later event converges them, because each side
-keeps resolving its own forks its own way. After cutover, `reilly.asia` would
-drift from its peers on the first contested fork. The corpus has 365 v9, 177
-v6 and 15 v1 conflicted forks, plus the v10 rooms (#573), so this is not
-hypothetical.
+The latest log entry also represented only one branch after a fork.
+In Matrix, current state comes from all forward extremities.
+Spindle must use that state, and the state before each event from a peer, for authorization.
+These differences block the migration of `reilly.asia` until the comparison with peers passes.
 
 ## Decision
 
-**Wherever Spindle needs one state from several, it runs the room version's
-state resolution algorithm.** There are three such places, and all three go
-through `RoomLog::resolve_parents`:
+Spindle uses the algorithm of the room version. It calls the resolver when inputs differ.
+`RoomLog::resolve_parents` supplies this operation for three paths:
 
-- **The state before an event:** an incoming PDU, a locally built event, a
-  `make_*` template, and `/state` and `/state_ids` at an event. It is the
-  states after the event's `prev_events`, resolved.
-- **The room's current state:** the states of its forward extremities,
-  resolved after every append that leaves more than one, and once when a room
-  reopens with a fork open (`RoomLog::current_state`).
-- **Restore:** an entry whose parents disagree is not refolded. Its state is
-  rehydrated from the trie that was stored when it was resolved.
+- **Before an event:** resolve the states after its parents.
+  This applies to events from peers, local events, templates, and federation reads at an event.
+- **Current state:** resolve the states at all forward extremities.
+  Recompute this state after an append with multiple tips, and when the room reopens.
+- **Restore:** rehydrate the stored trie for an entry with different parent states.
+  Do not substitute another merge algorithm.
 
-The resolver is `spindle_server::state_res::RoomResolver`. It dispatches on
-the room version:
+The server supplies `state_res::RoomResolver`:
 
-- room version 1: `state_res_v1` (#573, agrees with Synapse on all 15
-  conflicted v1 forks);
-- room versions 2 to 11: `ruma::state_res::resolve` with state resolution
-  v2.0;
-- room version 12 and MSC4242: v2.1 (empty initial state, conflicted state
-  subgraph).
+- Version 1 uses `state_res_v1` (#573).
+- Versions 2 to 11 use ruma with state resolution v2.0.
+- Version 12 and MSC4242 use v2.1, with an empty initial state and the conflicted subgraph.
 
-Every authorization question inside resolution is ruma's
-`check_state_dependent_auth_rules`, the same predicate as the send path.
+Resolution uses ruma's `check_state_dependent_auth_rules` for authorization.
+The send path uses the same predicate.
 
-### What is left of the §9.2 merge
+### Identical input states
 
-Only the case that provably equals every room version's algorithm survives:
-**one parent, or parents whose states are identical** (the same content
-address). With identical state sets, every algorithm has an empty conflicted
-set and returns the unconflicted state unchanged:
+A single parent needs no resolution. Multiple parents also need no resolution when their roots match.
+Their state sets and auth chains match, so every supported algorithm returns the same state.
+A fork of messages often has this property.
+A stale message can still leave a tip with a different state; current state then needs resolution.
 
-- v1 splits on keys with different values;
-- v2.0 and v2.1 build the auth difference from identical chains, which is
-  empty.
+The core retains `Strict` for callers without room-version rules.
+It returns `NeedsStateResolution` when parents disagree.
+The full importer supplies the resolver or a recorded state from Synapse.
+We cannot determine a valid result from topology alone.
 
-This is the overwhelmingly common case. A fork of messages, or a non-state
-event on a stale parent, has parents with the same state.
+The server no longer calls `set_aside_contested`.
+A local event names up to ten of the newest extremities, as Synapse does.
+The server authorizes it against the resolution of those parents.
 
-Everything else goes to the resolver:
+### Checks for incoming events
 
-- case 2 (disjoint slots), because of the counterexamples above;
-- the current state after case 1, because a stale non-state event leaves an
-  extremity whose state differs from the head's.
+After signature and hash checks, `Rooms::ingest` checks authorization in this order:
 
-The core keeps `Strict`, a resolver that resolves nothing and refuses with
-`NeedsStateResolution`. It serves callers with no room version: the log's own
-tests, and the importer, which takes Synapse's resolved state at a contested
-fork.
+1. Validate the auth-event list and the state it names.
+   If an auth event has a rejection, reject the dependent event.
+2. Validate the event against the resolved state before it.
+   Failure of either check rejects the event.
+3. Validate it against current state.
+   Failure of this check alone causes a soft failure.
+   Skip this duplicate check when the parents equal the current extremities.
 
-`set_aside_contested` is gone. With a resolver there is nothing to step around.
-A local event names the newest ten forward extremities (Synapse's figure) and
-is authorized against their resolution.
+The store retains both rejected events and events with a soft failure as `SidelinedEntry` records.
+The `Sidelined` keyspace holds their parents, depths, verdicts, and state roots.
 
-### The checks on receipt of a PDU
+- A rejected event retains the state before it.
+- An event with a soft failure contributes its own state change to its retained snapshot.
+- Neither event becomes a forward extremity.
+- Neither event gets a linear index or a stream row.
+- Client endpoints cannot return either event.
 
-`Rooms::ingest` now runs the spec's checks in the spec's order, after
-signatures and hashes:
+Timeline readers therefore need no extra filter.
+The log excludes these events by construction.
 
-1. Against the event's auth events: the state-independent rules on the list
-   itself, then the rules against the state the list names. A rejected auth
-   event rejects the event.
-2. Against the state before the event (resolved as above). Failing 1 or 2
-   **rejects** the event.
-3. Against the room's current state, unless the event's parents are exactly
-   the forward extremities (then the two states are the same). Failing only
-   this check **soft-fails** the event.
+An unknown parent or auth event shows missing history.
+The server refuses the event without a permanent verdict.
+A new transaction can retry it after that history arrives.
+Automatic gap retrieval through `/get_missing_events` and `/state_ids` remains separate work.
 
-Rejected and soft-failed events are kept, because a later event may name
-them. They are kept *outside the linear log*, as `SidelinedEntry`, under a new
-`Sidelined` keyspace with their state root:
+### Cost and caches
 
-- A rejected event's state is the state before it.
-- A soft-failed event's state includes the event.
-- Neither is a forward extremity.
-- Neither has a linear index, a stream row or a body any client endpoint
-  returns.
+Every log entry already holds the content address of its state.
+The server can rehydrate a snapshot without a walk through the timeline.
+Resolution adds these operations:
 
-So no timeline reader (pagination, sync, search) needed a filter. Nothing that
-walks the log sees them.
+- Compare one root per input. Equal roots end the operation immediately.
+- Compute the auth difference through a graph walk, following Synapse's approach.
+  Each node starts with the sets that contain it.
+  Sets flow down auth edges in reverse topological order.
+  Stop when every set can reach every node left to visit.
+- Cache each node's rank and auth edges in `AuthGraph`.
+  Signed bodies fix those edges for the lifetime of the event.
+- Give ruma the difference as one chain beside empty chains.
+  Its union-minus-intersection operation then preserves that difference.
+- Compute the v2.1 subgraph from the same graph.
+- Cache results in `ResolutionCache`, keyed by sorted input roots.
+  Fixed roots represent the same state and the same resolution question.
 
-Prev or auth events this server does not hold are refused without keeping
-anything. That is a gap to fill, not a verdict. Filling gaps
-(`/get_missing_events`, `/state_ids` at the gap) is separate work.
+The graph supports all input sets. It supports more than 64 sets.
+A repeated current-state read or local append can reuse an existing result.
+The store does not persist current state over multiple tips; the room resolves it once after restart.
 
-### Cost, for a room of a million events
+### Validation
 
-What Synapse spends on state groups, Spindle already has: every entry carries
-the content address of the state after it. The state at any event is one trie
-rehydration, and resolution inputs are snapshots in hand. What resolution adds:
+The test and evidence paths include:
 
-- **Comparing the parents:** one root comparison per parent, so free in the
-  linear case.
-- **The auth difference:** Synapse's own walk
-  (`_get_auth_chain_difference_txn`), not full chains handed to ruma. Each
-  state event is seeded with the sets that contain it. Sets flow down
-  `auth_events` edges, highest rank first. The walk stops as soon as
-  everything left is reached by every set.
-  - The rank (one more than the highest auth event's) lives in a per-room
-    `AuthGraph`. It is built from stored bodies the first time a room resolves
-    and kept for as long as the server runs: an auth edge is part of a signed
-    body and never changes.
-  - The walk is in-memory integer work proportional to the state, not to the
-    room's history.
-  - The difference is handed to ruma as one chain beside empty ones, which
-    ruma's union-minus-intersection returns unchanged.
-- **The conflicted subgraph (v2.1):** computed from the same graph.
-- **Repeats:** a `ResolutionCache` keyed by the sorted input roots. A root
-  addresses a whole state, and every input a resolution reads is fixed by
-  those states, so a hit is the same question. The next local event, the
-  current state over the same tips, and a peer's event naming them all cost
-  one resolution between them.
+- Generated forks compared with ruma in `state_res_tests.rs`.
+- Two-server and three-server partition tests in `tests/federation_state_resolution.rs`.
+- Complement cases against Spindle and Synapse.
+- A corpus harness for `Rooms::receive_remote`, with comparison against Synapse's recorded states.
+- Property tests for canonical trie removal and shared nodes.
 
-The resolved current state is not persisted. A room that reopens with a fork
-open resolves once.
+The corpus harness and interop jobs provide evidence paths.
+Their presence does not establish that the complete production rehearsal has passed.
+Issue #563 tracks those gates.
 
 ## Consequences
 
-- Spindle resolves contested forks the way its peers do. The tests and the
-  evidence are in #563:
-  - unit tests per room-version family;
-  - two-server and three-server contested forks;
-  - a replay of the production corpus's conflicted forks through
-    `Rooms::receive_remote`, compared with Synapse's state groups.
-- SPEC §6's heading "State without state resolution" now describes the linear
-  case only. SPEC §9 is rewritten to match this ADR. §9.3's equivalence claim
-  is withdrawn and replaced by the identical-states rule, which is the only
-  form of it that is true.
-- ADR 0001's "if the parent states are identical or differ only on disjoint
-  state slots, their materialized snapshots merge without full state
-  resolution" narrows to "identical".
-- The fork window (`RoomLog::fork_window`, SPEC §9.1) no longer feeds
-  resolution. It stays as the bounded ancestry search it is, for diagnostics.
-- `spindle_fork_resolutions_total{case="3"}` now counts appends whose parents
-  were resolved. It no longer counts deferrals.
-- `spindle_pdus_sidelined_total{verdict}` counts soft-failed and rejected
-  PDUs. A peer whose events land there disagrees with this server about the
-  room's state.
-- The importer's `append_remote` refuses every fork whose parents disagree,
-  not only same-slot ones, so more imported events take Synapse's state. That
-  is the correct answer for history Synapse already resolved.
-- Unparseable IDs. An event ID ruma cannot parse is left out of the maps
-  handed to the resolver, and so is an event whose sender ruma refuses (#573
-  found one bridge user). These are the inputs where a resolution can still
-  differ from Synapse's. The corpus check counts them.
+SPEC §6 describes the linear case. SPEC §9 now follows this ADR.
+The previous equivalence claim for separate slots no longer applies.
+ADR 0001's fast path narrows to identical states.
+`RoomLog::fork_window` remains a bounded search for diagnostics.
+It no longer supplies the resolver's input.
+
+`spindle_fork_resolutions_total{case="3"}` counts appends that need resolution because their parents differ.
+It counts no deferral.
+`spindle_pdus_sidelined_total{verdict}` counts rejections and soft failures.
+Use these counters to find disagreements with peers.
+
+The versionless importer refuses a fork with different parent states.
+The full importer uses the rules from Matrix and checks its result against Synapse.
+A recorded state can also preserve history that Synapse already resolved.
+
+The live resolver omits IDs and senders that ruma cannot parse.
+Historical bridge users can expose this limitation.
+The corpus check must report these inputs and any differences.
+They remain a migration gate.
