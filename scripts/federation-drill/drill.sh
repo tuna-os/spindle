@@ -13,6 +13,7 @@
 #   drill.sh partition on|off   503 federation at both fronts (contested fork)
 #   drill.sh seal               stop Synapse B after its queue drains, back up
 #   drill.sh import ROOMS USERS run the importer into Spindle B's store
+#   drill.sh verify-import     verify the full import against expected fixture IDs
 #   drill.sh up-b-spindle       deploy Spindle B in drill-b's place
 #   drill.sh rollback           stop Spindle B, restore the seal, start Synapse B
 #                               (SPINDLE_IMAGE / SPINDLE_BIN pick the build)
@@ -61,6 +62,37 @@ front_cm() {
      --from-file=netwatch.py="$HERE/netwatch.py" --dry-run=client -o yaml | $K apply -f -
 }
 
+# Read only the completed import report, in a disposable pod on the PVC's node.
+# The proof image is independent of the server's runtime image.
+verify_import() {
+  ROOMS=$($K get cm drill-b-spindle-config -o jsonpath='{.data.expected-rooms}')
+  USERS=$($K get cm drill-b-spindle-config -o jsonpath='{.data.expected-users}')
+  [ -n "$ROOMS" ] && [ -n "$USERS" ] || { echo 'missing expected fixture IDs' >&2; return 1; }
+  $K create configmap drill-import-proof --from-file=verify-import.py="$HERE/verify-import.py" \
+    --dry-run=client -o yaml | $K apply -f -
+  $K delete pod drill-import-proof --ignore-not-found --wait >/dev/null
+  proof_pod=$(python3 - "$ROOMS" "$USERS" <<'PY'
+import json,sys
+print(json.dumps({'metadata':{'labels':{'part-of':'federation-drill'}},'spec':{
+ 'nodeSelector':{'kubernetes.io/hostname':'ip-10-20-1-11'},
+ 'automountServiceAccountToken':False,'enableServiceLinks':False,
+ 'dnsPolicy':'None','dnsConfig':{'nameservers':['127.0.0.1'],'searches':[]},
+ 'securityContext':{'runAsUser':10093,'runAsGroup':10093,'runAsNonRoot':True,
+                    'seccompProfile':{'type':'RuntimeDefault'}},
+ 'containers':[{'name':'drill-import-proof','image':'python:3.12-slim',
+   'command':['python3','/verify/verify-import.py','/data/spindle/report.json',*sys.argv[1:]],
+   'resources':{'requests':{'cpu':'10m','memory':'32Mi'},'limits':{'cpu':'1','memory':'128Mi'}},
+   'securityContext':{'allowPrivilegeEscalation':False,'capabilities':{'drop':['ALL']}},
+   'volumeMounts':[{'name':'data','mountPath':'/data','readOnly':True},
+                  {'name':'verify','mountPath':'/verify','readOnly':True}]}],
+ 'volumes':[{'name':'data','persistentVolumeClaim':{'claimName':'drill-b-data','readOnly':True}},
+            {'name':'verify','configMap':{'name':'drill-import-proof'}}]}}))
+PY
+  )
+  $K run drill-import-proof --rm -i --restart=Never --image=python:3.12-slim \
+    --overrides="$proof_pod"
+}
+
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 
 case "${1:-}" in
@@ -70,7 +102,8 @@ tls)
     -subj "/CN=spindle federation drill private CA" -keyout ca.key -out ca.crt \
     -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
   for pair in "witness witness.lab matrix.witness.lab" "reilly reilly.asia matrix.reilly.asia"; do
-    set -- $pair
+    read -r -a cert_args <<< "$pair"
+    set -- "${cert_args[@]}"
     openssl req -newkey rsa:2048 -nodes -subj "/CN=$2" -keyout "$1.key" -out "$1.csr" 2>/dev/null
     printf 'subjectAltName=DNS:%s,DNS:%s\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' "$2" "$3" > "$1.ext"
     openssl x509 -req -in "$1.csr" -CA ca.crt -CAkey ca.key -CAcreateserial -days 30 -extfile "$1.ext" -out "$1.crt" 2>/dev/null
@@ -80,7 +113,8 @@ tls)
 secrets)
   dir=$2
   for pair in "drill-a witness" "drill-b reilly"; do
-    set -- $pair
+    read -r -a cert_args <<< "$pair"
+    set -- "${cert_args[@]}"
     $K create secret generic "$1-tls" --from-file=tls.chain.crt="$dir/$2.chain.crt" \
        --from-file=tls.key="$dir/$2.key" --from-file=ca.crt="$dir/ca.crt" --dry-run=client -o yaml | $K apply -f -
   done
@@ -133,15 +167,17 @@ partition)
 seal)
   # 4.3: no new client traffic is the caller's job (the drill client
   # stops). Wait for the federation queue on B to drain, then stop B.
+  drained=false
   for i in $(seq 1 60); do
     pending=$(psql_ -d drill_b -c "SELECT count(*) FROM destinations WHERE retry_last_ts > 0 OR failure_ts IS NOT NULL" || echo "?")
     # PDUs not yet acknowledged by a destination: destination_rooms rows
     # past the destination's last successful stream position.
     lag=$(psql_ -d drill_b -c "SELECT count(*) FROM destination_rooms r JOIN destinations d USING (destination) WHERE r.stream_ordering > coalesce(d.last_successful_stream_ordering, 0)" || echo "?")
-    echo "seal: destinations in backoff=$pending, rooms with unsent PDUs=$lag"
-    [ "$pending" = 0 ] && [ "$lag" -le 0 ] 2>/dev/null && break
+    echo "seal: attempt=$i destinations in backoff=$pending, rooms with unsent PDUs=$lag"
+    if [ "$pending" = 0 ] && [ "$lag" -le 0 ] 2>/dev/null; then drained=true; break; fi
     sleep 5
   done
+  [ "$drained" = true ] || { echo 'seal refused: federation did not drain' >&2; exit 1; }
   $K scale deploy/drill-b --replicas=0
   $K wait --for=delete pod -l app=drill-b --timeout=180s || true
   stamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -155,6 +191,13 @@ import)
   # 4.4: the importer against Synapse B's stopped database, into an empty
   # store. The test accounts keep their passwords (one file each).
   ROOMS=$2 USERS=$3
+  source_users=$(psql_ -d drill_b -c "SELECT coalesce(json_agg(name ORDER BY name)::text, '[]') FROM users WHERE right(name, length('reilly.asia') + 1) = ':reilly.asia'")
+  python3 - "$USERS" "$source_users" <<'PY'
+import json,sys
+expected=sys.argv[1].split(',')
+if not all(expected) or len(set(expected)) != len(expected) or set(expected) != set(json.loads(sys.argv[2])):
+ raise SystemExit('import refused: source accounts differ from expected fixture users')
+PY
   $K exec drill-client -- cat /state/passwords.json > "$tmp/pw.json"
   args=()
   for u in $(echo "$USERS" | tr ',' ' '); do
@@ -164,13 +207,22 @@ import)
   done
   $K create secret generic drill-passwords "${args[@]}" --dry-run=client -o yaml | $K apply -f -
   $K delete job drill-b-import --ignore-not-found --wait
-  on_data 'rm -rf /d/spindle && mkdir -p /d/spindle && echo store emptied'
+  # shellcheck disable=SC2016 # The timestamp expands inside the data pod.
+  on_data 'if [ -e /d/spindle ]; then mv /d/spindle /d/spindle.before-import-$(date -u +%Y%m%dT%H%M%SZ); fi; mkdir -p /d/spindle && echo fresh target prepared'
   export ROOMS USERS
   render_deploy spindle.yaml drill-b reilly.asia matrix.reilly.asia "$A_IP" "" \
     | $K apply -l 'app in (drill-b-spindle-config,drill-b-import)' -f -
-  $K wait --for=condition=complete job/drill-b-import --timeout=900s || true
-  $K logs job/drill-b-import --tail=-1 ;;
+  if ! $K wait --for=condition=complete job/drill-b-import --timeout=900s; then
+    $K logs job/drill-b-import --tail=25 >&2
+    exit 1
+  fi
+  $K logs job/drill-b-import --tail=25
+  verify_import ;;
+verify-import)
+  verify_import ;;
 up-b-spindle)
+  verify_import
+  export ROOMS USERS
   front_cm
   $K delete deploy/drill-b --ignore-not-found --wait
   $K wait --for=delete pod -l app=drill-b --timeout=180s || true

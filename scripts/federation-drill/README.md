@@ -87,6 +87,28 @@ $D/drill.sh netwatch
 $D/drill.sh teardown
 ```
 
+`import` runs the full `import-synapse` command against the sealed drill
+database, including devices, crypto, backups, account data, and media. It
+imports every retained room and local account in that database. `ROOMS`
+and `USERS` are the exact expected fixture IDs, rather than import filters.
+Known synthetic passwords are passed through the rehearsal password secret;
+production authentication remains owned by MAS.
+
+The import Job must finish successfully. `verify-import.py` then checks its
+checkpoint and read-back report from a disposable pod with the data PVC
+mounted read-only. It requires every expected room, zero exclusions, rejection
+policy version 3, verified event signatures, complete pagination positions,
+matching state and event samples, and nonempty crypto and backup evidence.
+`up-b-spindle` repeats that check before replacing the lab server. These
+checks establish import continuity; the subsequent clients must still prove
+sign-in and decryption. A seal also refuses to proceed if federation has not
+drained.
+
+Use a server image and binary built with `synapse-import`. When providing a
+locally built binary through `SPINDLE_BIN`, its runtime image must support
+that binary's libc version. The verifier uses its own Python image and does
+not require Python in the server image.
+
 `fedcheck.py` runs inside the `synapse` container of `drill-a`, with the
 script on standard input. It uses the resolver, trust store, server key
 and database of A. It checks events with the event code of Synapse.

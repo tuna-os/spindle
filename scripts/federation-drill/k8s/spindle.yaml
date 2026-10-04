@@ -17,6 +17,8 @@ metadata:
   name: drill-b-spindle-config
   labels: {app: drill-b-spindle-config, part-of: federation-drill}
 data:
+  expected-rooms: "__ROOMS__"
+  expected-users: "__USERS__"
   spindle.toml: |
     [server]
     name = "reilly.asia"
@@ -78,11 +80,13 @@ spec:
         image: __SPINDLE_IMAGE__
         command:
         - __SPINDLE_BIN__
-        - import-synapse-rehearsal
+        - import-synapse
         - /conf/spindle.toml
         - host=rehearsal-pg port=5432 user=postgres dbname=drill_b
-        - "__ROOMS__"
-        - "__USERS__"
+        - --media
+        - /data/media_store
+        - --checkpoint
+        - /data/spindle/report.json
         env:
         - name: SPINDLE_SYNAPSE_PASSWORD
           valueFrom: {secretKeyRef: {name: rehearsal-pg, key: POSTGRES_PASSWORD}}
