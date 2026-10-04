@@ -810,6 +810,7 @@ impl Config {
             message: error.to_string(),
         })?;
         config.validate()?;
+        config.validate_media()?;
         if let Some(delegated) = &config.auth.delegated {
             delegated.validate()?;
         }
@@ -888,7 +889,6 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        self.validate_media()?;
         // Both caps are the reason #36 asks for them: a zero here does not
         // mean "unlimited", it means every schedule is refused and the
         // dead-man's switch silently stops working. An operator who typed
