@@ -630,6 +630,9 @@ pub trait SourceState {
         None
     }
 
+    /// Report bounded replay progress while large rooms are still being derived.
+    fn replay_progress(&mut self, _position: usize, _total: usize) {}
+
     /// How the source arrived at the state of `event_id`: from its
     /// parents, or from somewhere else. A source that cannot tell says
     /// [`Continuity::Derived`], and the import trusts the derivation.
@@ -968,6 +971,9 @@ fn replay_pass(
     let last_position = plan.steps.len().saturating_sub(1);
 
     for (position, step) in plan.steps.iter().enumerate() {
+        if position % 1_000 == 0 {
+            source.replay_progress(position, plan.steps.len());
+        }
         let event_id = step.input.event_id.as_str();
         let apply_own = |state: StateSnapshot| match step.input.state_key.clone() {
             Some(key) => state.apply(key, event_id.to_owned()),

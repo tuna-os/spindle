@@ -55,8 +55,8 @@ use crate::import::{
 /// How many planned events are read and written together.
 const CHUNK: usize = 2_000;
 
-/// Checkpoints before this policy must replay their rooms again.
-const REJECTION_POLICY_VERSION: u32 = 1;
+/// Checkpoints before these rejection and continuity rules must replay again.
+const REJECTION_POLICY_VERSION: u32 = 2;
 
 /// How many events a room report samples for the body comparison.
 const SAMPLES_PER_ROOM: usize = 5;
@@ -393,41 +393,27 @@ impl SourceState for SnapshotSource<'_, '_> {
         Some(resolver.resolve(self.snapshot, sets))
     }
 
+    fn replay_progress(&mut self, position: usize, total: usize) {
+        if total > 10_000 {
+            eprintln!("replay room={} events={position}/{total}", self.room_id);
+        }
+    }
+
     fn continuity(
         &mut self,
         event_id: &str,
         parents: &[spindle_core::EventId],
         is_state: bool,
     ) -> Continuity {
-        let Some((groups, edges)) = self.groups else {
+        let Some(graph) = self.groups else {
             return Continuity::Derived;
         };
-        let Some(group) = groups.get(event_id) else {
-            return Continuity::Unknown;
-        };
-        // A state event's group is a delta of one slot on the group
-        // before it; anything else shares the group before it.
-        let before = if is_state {
-            match edges.get(group) {
-                Some(before) => *before,
-                None => return Continuity::Unknown,
-            }
+        if graph.proves_derived(event_id, parents, is_state) {
+            Continuity::Derived
         } else {
-            *group
-        };
-        let expected: Vec<i64> = parents
-            .iter()
-            .filter_map(|parent| groups.get(parent.as_str()).copied())
-            .collect();
-        if expected.contains(&before) {
-            return Continuity::Derived;
-        }
-        match edges.get(&before) {
-            Some(prev) if expected.contains(prev) && expected.iter().any(|g| g != prev) => {
-                Continuity::Resolved
-            }
-            Some(_) => Continuity::Elsewhere,
-            None => Continuity::Unknown,
+            // The database stores compression provenance, not semantic
+            // before-state. Without a proof, compare the source state in full.
+            Continuity::Unknown
         }
     }
 }

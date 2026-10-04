@@ -91,11 +91,43 @@ pub struct Snapshot<'client> {
     transaction: Transaction<'client>,
 }
 
-/// Event state groups and their storage compression predecessors.
-pub type StateGroupGraph = (
-    std::collections::HashMap<String, i64>,
-    std::collections::HashMap<i64, i64>,
-);
+/// Event groups, compression edges, and deltas verified to overwrite only
+/// the source event's own state slot. Compression edges alone prove no
+/// relationship to an event's semantic before-state.
+#[derive(Default)]
+pub struct StateGroupGraph {
+    pub events: std::collections::HashMap<String, i64>,
+    pub predecessors: std::collections::HashMap<i64, i64>,
+    pub single_event_deltas: std::collections::HashMap<i64, String>,
+}
+
+impl StateGroupGraph {
+    /// Prove equality with one parent's state, after applying the own slot.
+    pub(crate) fn proves_derived(
+        &self,
+        event_id: &str,
+        parents: &[spindle_core::EventId],
+        is_state: bool,
+    ) -> bool {
+        let Some(group) = self.events.get(event_id) else {
+            return false;
+        };
+        let before = if is_state {
+            if self.single_event_deltas.get(group).map(String::as_str) != Some(event_id) {
+                return false;
+            }
+            let Some(before) = self.predecessors.get(group) else {
+                return false;
+            };
+            before
+        } else {
+            group
+        };
+        parents
+            .iter()
+            .any(|parent| self.events.get(parent.as_str()) == Some(before))
+    }
+}
 
 /// One global or room-scoped account-data record.
 pub struct AccountDataRow {
@@ -492,9 +524,9 @@ impl Snapshot<'_> {
             .collect())
     }
 
-    /// Each of a room's events' state group, and each such group's
-    /// `prev_state_group`: enough to tell, per event, whether Synapse
-    /// derived its state from its parents or took it from elsewhere.
+    /// Load compression edges and verify deltas before using them as proof
+    /// of source-state equality. A compression predecessor can name any
+    /// earlier group, so an edge on its own is insufficient.
     ///
     /// # Errors
     ///
@@ -526,7 +558,25 @@ impl Snapshot<'_> {
         for row in rows {
             edges.insert(row.get::<_, i64>(0), row.get::<_, i64>(1));
         }
-        Ok((groups, edges))
+        let rows = self.transaction.query(
+            "SELECT s.state_group, min(s.event_id) \
+             FROM state_groups_state s \
+             JOIN state_group_edges g ON g.state_group = s.state_group \
+             LEFT JOIN events e ON e.event_id = s.event_id \
+             WHERE s.state_group = ANY($1) \
+             GROUP BY s.state_group HAVING count(*) = 1 \
+             AND bool_and(COALESCE(e.room_id = $2 AND e.type = s.type AND e.state_key = s.state_key, false))",
+            &[&ids, &room_id],
+        )?;
+        let single_event_deltas = rows
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        Ok(StateGroupGraph {
+            events: groups,
+            predecessors: edges,
+            single_event_deltas,
+        })
     }
 
     /// The state after one event as Synapse resolved it, for the named slots
@@ -686,5 +736,51 @@ impl Snapshot<'_> {
             state.entry((row.get(1), row.get(2))).or_insert(row.get(3));
         }
         Ok(state)
+    }
+}
+
+#[cfg(test)]
+mod continuity_tests {
+    use super::StateGroupGraph;
+    use spindle_core::EventId;
+
+    fn graph() -> StateGroupGraph {
+        StateGroupGraph {
+            events: [("$parent".to_owned(), 1), ("$event".to_owned(), 2)].into(),
+            predecessors: [(2, 1)].into(),
+            single_event_deltas: std::collections::HashMap::default(),
+        }
+    }
+
+    #[test]
+    fn a_compression_edge_without_a_verified_delta_proves_nothing() {
+        assert!(!graph().proves_derived("$event", &[EventId::new("$parent")], true));
+    }
+
+    #[test]
+    fn an_own_slot_delta_on_a_parent_proves_the_after_state() {
+        let mut graph = graph();
+        graph.single_event_deltas.insert(2, "$event".to_owned());
+        assert!(graph.proves_derived("$event", &[EventId::new("$parent")], true));
+        assert!(!graph.proves_derived("$event", &[EventId::new("$missing")], true));
+        graph.single_event_deltas.insert(2, "$different".to_owned());
+        assert!(!graph.proves_derived("$event", &[EventId::new("$parent")], true));
+    }
+
+    #[test]
+    fn a_compression_ancestor_of_a_parent_is_not_a_resolution_proof() {
+        let mut graph = graph();
+        graph.single_event_deltas.insert(2, "$event".to_owned());
+        graph.events.insert("$parent".to_owned(), 3);
+        graph.predecessors.insert(3, 1);
+        assert!(!graph.proves_derived("$event", &[EventId::new("$parent")], true));
+    }
+
+    #[test]
+    fn nonstate_group_equality_needs_no_delta() {
+        let mut graph = graph();
+        graph.events.insert("$event".to_owned(), 1);
+        assert!(graph.proves_derived("$event", &[EventId::new("$parent")], false));
+        assert!(!graph.proves_derived("$event", &[EventId::new("$parent")], true));
     }
 }
