@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Resolve an opt-in corpus fixture with an installed Synapse (no DB writes)."""
 import asyncio
+import ast
+import inspect
 import json
 import sys
 
@@ -8,11 +10,34 @@ import sys
 import synapse.event_auth  # noqa: F401
 from synapse.api.room_versions import KNOWN_ROOM_VERSIONS
 from synapse.events import make_event_from_dict
+import synapse.state.v2 as state_v2
 from synapse.state.v2 import resolve_events_with_store
 from synapse.storage.databases.main.event_federation import StateDifference
 
 
-async def replay(path):
+async def replay(path, reevaluate_rejected=False):
+    if reevaluate_rejected:
+        # A diagnostic counterfactual: remove only the unconditional candidate
+        # skip in this private process. Auth dependencies retain their original
+        # rejection flags; no installed source or stored event is changed.
+        tree = ast.parse(inspect.getsource(state_v2._iterative_auth_checks))
+        changed = 0
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
+                and isinstance(node.test.left, ast.Attribute)
+                and isinstance(node.test.left.value, ast.Name)
+                and node.test.left.value.id == "event"
+                and node.test.left.attr == "rejected_reason"
+                and len(node.test.ops) == 1 and isinstance(node.test.ops[0], ast.IsNot)
+                and len(node.test.comparators) == 1
+                and isinstance(node.test.comparators[0], ast.Constant)
+                and node.test.comparators[0].value is None):
+                node.body = [ast.copy_location(ast.Pass(), node.body[0])]
+                changed += 1
+        if changed != 1:
+            raise ValueError("Installed Synapse candidate-rejection guard changed")
+        exec(compile(ast.fix_missing_locations(tree), "<candidate-policy-diagnostic>", "exec"),
+             state_v2.__dict__)
     with open(path) as source:
         fixture = json.load(source)
     bodies = fixture["bodies"]
@@ -91,8 +116,9 @@ async def replay(path):
         "synapse_differs_from_live": differences(fixture["live"]),
         "masked_own_slot": ignore is not None,
         "unavailable_auth_pdus": len(missing_auth),
+        "reevaluated_previously_rejected": reevaluate_rejected,
     }))
 
 
 if __name__ == "__main__":
-    asyncio.run(replay(sys.argv[1]))
+    asyncio.run(replay(sys.argv[1], "--reevaluate-rejected" in sys.argv[2:]))
