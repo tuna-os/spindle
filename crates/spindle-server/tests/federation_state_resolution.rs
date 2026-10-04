@@ -334,6 +334,24 @@ async fn room_across(
             let (token, user_id) = server.register(&format!("{name}{index}")).await;
             server.join(&room, &token, &net.servers[0].name).await;
             members.push((index, token, user_id));
+            // A local join on a server already in the room returns before
+            // its outbox reaches the resident. Wait for that causal step
+            // before the next server asks the resident for its join state.
+            // The forks under test start only after this linear bootstrap.
+            let expected = members.len();
+            assert!(
+                eventually(async || {
+                    net.servers[0]
+                        .state(&room, &members[0].1)
+                        .await
+                        .keys()
+                        .filter(|(kind, _)| kind == "m.room.member")
+                        .count()
+                        == expected
+                })
+                .await,
+                "the resident did not see the bootstrap join"
+            );
         }
     }
     // Everyone sees everyone before anything is contested.
