@@ -390,11 +390,18 @@ impl<'a> RoomResolver<'a> {
     /// A stored event as ruma reads it, rejected or not as this log says.
     fn stored(&self, id: &str) -> Option<StoredEvent> {
         let body = (self.body)(id)?;
-        let event = StoredEvent::parse_auth_in(id, self.room_id, &body).ok()?;
         let rejected = self
             .log
             .sidelined(&EventId::new(id))
             .is_some_and(|entry| entry.kind == Sideline::Rejected);
+        // A freshly refused malformed event must not acquire legacy
+        // compatibility merely because resolution revisits its stored body.
+        let event = if rejected {
+            StoredEvent::parse_in(id, self.room_id, &body)
+        } else {
+            StoredEvent::parse_auth_in(id, self.room_id, &body)
+        }
+        .ok()?;
         Some(
             event
                 .with_rejected(rejected)
@@ -550,7 +557,7 @@ fn to_snapshot(
 
 impl StateResolver for RoomResolver<'_> {
     fn resolve(&mut self, states: &[StateSnapshot]) -> Result<StateSnapshot, AppendError> {
-        let key = ResolutionCache::key(states, self.log.historical_rejection_policy_id());
+        let key = ResolutionCache::key(states, self.log.resolution_policy_id());
         if let Some(hit) = self.cache.get(&key) {
             self.stats.cache_hits += 1;
             return Ok(hit);
