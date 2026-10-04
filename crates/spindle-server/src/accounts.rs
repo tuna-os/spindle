@@ -14,7 +14,7 @@
 //! paid on login, which is rare; the alternative is paid by every user whose
 //! password is recovered from a stolen hash.
 
-use argon2::Argon2;
+use crate::passwords::ReusableArgon2;
 use argon2::password_hash::phc::{PasswordHash, Salt};
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use serde::{Deserialize, Serialize};
@@ -172,7 +172,7 @@ impl<'a, S: Store> Accounts<'a, S> {
         }
 
         let salt = salt();
-        let password_hash = Argon2::default()
+        let password_hash = ReusableArgon2
             .hash_password_with_salt(password.as_bytes(), &salt)
             .map_err(|error| AccountError::Hashing(error.to_string()))?
             .to_string();
@@ -283,7 +283,7 @@ impl<'a, S: Store> Accounts<'a, S> {
         let account = self.account(localpart)?;
         let hash = account.as_ref().map_or(DUMMY_HASH, |a| &a.password_hash);
         let parsed = PasswordHash::new(hash).map_err(|e| AccountError::Hashing(e.to_string()))?;
-        let matches = Argon2::default()
+        let matches = ReusableArgon2
             .verify_password(password.as_bytes(), &parsed)
             .is_ok();
         // A deactivated account keeps its hash (the row is the localpart
@@ -569,7 +569,7 @@ impl<'a, S: Store> Accounts<'a, S> {
             return Ok(false);
         };
         let salt = salt();
-        account.password_hash = Argon2::default()
+        account.password_hash = ReusableArgon2
             .hash_password_with_salt(password.as_bytes(), &salt)
             .map_err(|error| AccountError::Hashing(error.to_string()))?
             .to_string();
