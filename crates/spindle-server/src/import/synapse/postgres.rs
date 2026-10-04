@@ -425,11 +425,23 @@ impl Snapshot<'_> {
             current_state.insert((row.get(0), row.get(1)), row.get(2));
         }
 
+        let mut forward_extremities: Vec<String> = self
+            .transaction
+            .query(
+                "SELECT event_id FROM event_forward_extremities WHERE room_id = $1",
+                &[&room_id],
+            )?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        forward_extremities.sort_unstable();
+
         let mut room = SourceRoom {
             room_id: room_id.to_owned(),
             events,
             current_state,
             state_after_root: None,
+            forward_extremities,
         };
 
         // `plan_resolving` names the same root as `plan` for a room with one
@@ -454,6 +466,159 @@ impl Snapshot<'_> {
         event_id: &str,
     ) -> Result<StateMap, ReadError> {
         self.state_after_root(room_id, event_id)
+    }
+
+    /// Every `(event, auth event)` edge Synapse holds for a room, outliers
+    /// included: the auth DAG the room version's resolver walks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] if the query fails.
+    pub fn auth_edges(&mut self, room_id: &str) -> Result<Vec<(String, String)>, ReadError> {
+        Ok(self
+            .transaction
+            .query(
+                "SELECT event_id, auth_id FROM event_auth WHERE room_id = $1",
+                &[&room_id],
+            )?
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
+    }
+
+    /// Each of a room's events' state group, and each such group's
+    /// `prev_state_group`: enough to tell, per event, whether Synapse
+    /// derived its state from its parents or took it from elsewhere.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] if a query fails.
+    pub fn state_group_graph(
+        &mut self,
+        room_id: &str,
+    ) -> Result<
+        (
+            std::collections::HashMap<String, i64>,
+            std::collections::HashMap<i64, i64>,
+        ),
+        ReadError,
+    > {
+        let rows = self.transaction.query(
+            "SELECT groups.event_id, groups.state_group \
+             FROM event_to_state_groups AS groups \
+             INNER JOIN events ON events.event_id = groups.event_id \
+             WHERE events.room_id = $1",
+            &[&room_id],
+        )?;
+        let mut groups = std::collections::HashMap::with_capacity(rows.len());
+        for row in rows {
+            groups.insert(row.get::<_, String>(0), row.get::<_, i64>(1));
+        }
+        let ids: Vec<i64> = {
+            let mut ids: Vec<i64> = groups.values().copied().collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
+        let rows = self.transaction.query(
+            "SELECT state_group, prev_state_group FROM state_group_edges \
+             WHERE state_group = ANY($1)",
+            &[&ids],
+        )?;
+        let mut edges = std::collections::HashMap::with_capacity(rows.len());
+        for row in rows {
+            edges.insert(row.get::<_, i64>(0), row.get::<_, i64>(1));
+        }
+        Ok((groups, edges))
+    }
+
+    /// The state after one event as Synapse resolved it, for the named slots
+    /// only. A slot Synapse's state does not hold is absent from the map.
+    ///
+    /// The importer compares the room version's resolver with Synapse at
+    /// each fork on the slots the fork contested; reading the whole state of
+    /// a room with tens of thousands of members for each would dominate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] if the event has no state group or a query fails.
+    pub fn state_after_event_keys(
+        &mut self,
+        room_id: &str,
+        event_id: &str,
+        keys: &[(String, String)],
+    ) -> Result<StateMap, ReadError> {
+        let groups = self.state_group_chain(room_id, event_id)?;
+        let types: Vec<&str> = keys.iter().map(|(kind, _)| kind.as_str()).collect();
+        let state_keys: Vec<&str> = keys.iter().map(|(_, key)| key.as_str()).collect();
+        let rows = self.transaction.query(
+            "SELECT state_group, type, state_key, event_id \
+             FROM state_groups_state \
+             WHERE room_id = $1 AND state_group = ANY($2) \
+               AND type = ANY($3) AND state_key = ANY($4)",
+            &[&room_id, &groups, &types, &state_keys],
+        )?;
+        let wanted: std::collections::HashSet<(&str, &str)> = keys
+            .iter()
+            .map(|(kind, key)| (kind.as_str(), key.as_str()))
+            .collect();
+        let depth: std::collections::HashMap<i64, usize> = groups
+            .iter()
+            .enumerate()
+            .map(|(depth, state_group)| (*state_group, depth))
+            .collect();
+        let mut rows: Vec<_> = rows.into_iter().collect();
+        rows.sort_unstable_by_key(|row| depth.get(&row.get::<_, i64>(0)).copied());
+        let mut state = StateMap::new();
+        for row in rows {
+            let (kind, key): (String, String) = (row.get(1), row.get(2));
+            if wanted.contains(&(kind.as_str(), key.as_str())) {
+                state.entry((kind, key)).or_insert(row.get(3));
+            }
+        }
+        Ok(state)
+    }
+
+    /// The state groups behind `event_id`'s, newest first.
+    fn state_group_chain(&mut self, room_id: &str, event_id: &str) -> Result<Vec<i64>, ReadError> {
+        let Some(row) = self.transaction.query_opt(
+            "SELECT state_group FROM event_to_state_groups WHERE event_id = $1",
+            &[&event_id],
+        )?
+        else {
+            return Err(ReadError::MissingStateGroup {
+                room_id: room_id.to_owned(),
+                root: event_id.to_owned(),
+            });
+        };
+        let root_group: i64 = row.get(0);
+        let chain = self.transaction.query(
+            "WITH RECURSIVE chain(state_group, depth, path, cycle) AS ( \
+                 SELECT $1::bigint, 0::bigint, ARRAY[$1::bigint], FALSE \
+                 UNION ALL \
+                 SELECT edge.prev_state_group, chain.depth + 1, \
+                        chain.path || edge.prev_state_group, \
+                        edge.prev_state_group = ANY(chain.path) \
+                 FROM chain \
+                 INNER JOIN state_group_edges AS edge \
+                         ON edge.state_group = chain.state_group \
+                 WHERE NOT chain.cycle \
+             ) \
+             SELECT state_group, cycle FROM chain ORDER BY depth",
+            &[&root_group],
+        )?;
+        let mut groups = Vec::with_capacity(chain.len());
+        for row in chain {
+            let state_group: i64 = row.get(0);
+            if row.get::<_, bool>(1) {
+                return Err(ReadError::StateGroupCycle {
+                    room_id: room_id.to_owned(),
+                    state_group,
+                });
+            }
+            groups.push(state_group);
+        }
+        Ok(groups)
     }
 
     /// Resolve Synapse's delta-compressed state group for a horizon root.

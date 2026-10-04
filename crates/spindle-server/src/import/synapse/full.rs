@@ -44,9 +44,12 @@ use spindle_store::{FjallStore, ReadView, Store};
 
 use super::ReadError;
 use super::postgres::Snapshot;
+use super::resolve::RoomResolver;
+use super::signatures::{KeyRing, Verdict};
 use crate::import::{
-    Excluded, SourceRoom, SourceState, StateMap, SynapseSource, check_body, plan_resolving,
-    redaction_target, replay_resolving,
+    Continuity, DISAGREED_REASON, ELSEWHERE_REASON, Excluded, GAP_REASON, HEAD_REASON,
+    HEAD_RESOLVED_REASON, RESOLVED_REASON, Resolution, Settled, SourceRoom, SourceState, StateMap,
+    SynapseSource, check_body, plan_resolving, redaction_target, replay_resolving,
 };
 
 /// How many planned events are read and written together.
@@ -135,6 +138,34 @@ pub struct RoomReport {
     pub from_source_reasons: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub from_source_examples: Vec<String>,
+    /// Forks (events whose parents' states differ, and the head over
+    /// several forward extremities) the room version's resolver settled.
+    #[serde(default)]
+    pub resolved_forks: u64,
+    /// Of those, the forks where the resolver gave Synapse's answer on
+    /// every contested slot.
+    #[serde(default)]
+    pub resolver_agreed: u64,
+    /// Forks where it did not, with the slots; Synapse's value was taken.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolver_disagreed: Vec<String>,
+    /// Replay passes until the log's fold agreed with the derived state.
+    #[serde(default)]
+    pub replay_passes: u64,
+    /// Every event's signatures, checked with the key valid when it was
+    /// signed: counts by outcome.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub signatures: BTreeMap<String, u64>,
+    /// A few events that verified only with an older key, or not at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signature_examples: Vec<String>,
+    /// Events compared in full with Synapse's state, because Synapse's
+    /// state groups do not show the state derived from the parents.
+    #[serde(default)]
+    pub full_checks: u64,
+    /// User IDs ruma rejects that the resolver read through a stand-in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compat_user_ids: Vec<String>,
     pub state_slots: u64,
     /// Planned replay state against `current_state_events`. Empty to import.
     pub divergence: Vec<SlotDivergence>,
@@ -291,6 +322,8 @@ struct Run<'a, 'snapshot> {
     users: BTreeSet<String>,
     /// Rooms imported in this or an earlier run.
     imported_rooms: BTreeSet<String>,
+    /// Every server key Synapse holds, for the signature check.
+    keys: Option<KeyRing>,
 }
 
 /// Bodies and resolved state for one room, read from the Synapse snapshot.
@@ -303,6 +336,12 @@ struct SnapshotSource<'a, 'snapshot> {
     room_id: &'a str,
     bodies: HashMap<String, Value>,
     states: &'a mut HashMap<String, StateMap>,
+    /// The room version's resolver, for the replay.
+    resolver: Option<&'a mut RoomResolver>,
+    /// The states the replay settled, for the write.
+    settled: Option<&'a HashMap<String, Settled>>,
+    /// Each event's state group, and each group's `prev_state_group`.
+    groups: Option<&'a (HashMap<String, i64>, HashMap<i64, i64>)>,
 }
 
 impl SourceState for SnapshotSource<'_, '_> {
@@ -314,8 +353,70 @@ impl SourceState for SnapshotSource<'_, '_> {
             .snapshot
             .state_after_event(self.room_id, event_id)
             .map_err(|error| error.to_string())?;
-        self.states.insert(event_id.to_owned(), state.clone());
+        // Not cached: a room with tens of thousands of members would hold
+        // one full map per gap. The replay keeps what the write needs.
         Ok(state)
+    }
+
+    fn state_after_keys(
+        &mut self,
+        event_id: &str,
+        keys: &[(String, String)],
+    ) -> Result<StateMap, String> {
+        if let Some(state) = self.states.get(event_id) {
+            let mut state = state.clone();
+            state.retain(|key, _| keys.contains(key));
+            return Ok(state);
+        }
+        self.snapshot
+            .state_after_event_keys(self.room_id, event_id, keys)
+            .map_err(|error| error.to_string())
+    }
+
+    fn resolve(
+        &mut self,
+        sets: &[&spindle_core::StateSnapshot],
+    ) -> Option<Result<Resolution, String>> {
+        let resolver = self.resolver.as_deref_mut()?;
+        Some(resolver.resolve(self.snapshot, sets))
+    }
+
+    fn continuity(
+        &mut self,
+        event_id: &str,
+        parents: &[spindle_core::EventId],
+        is_state: bool,
+    ) -> Continuity {
+        let Some((groups, edges)) = self.groups else {
+            return Continuity::Derived;
+        };
+        let Some(group) = groups.get(event_id) else {
+            return Continuity::Unknown;
+        };
+        // A state event's group is a delta of one slot on the group
+        // before it; anything else shares the group before it.
+        let before = if is_state {
+            match edges.get(group) {
+                Some(before) => *before,
+                None => return Continuity::Unknown,
+            }
+        } else {
+            *group
+        };
+        let expected: Vec<i64> = parents
+            .iter()
+            .filter_map(|parent| groups.get(parent.as_str()).copied())
+            .collect();
+        if expected.contains(&before) {
+            return Continuity::Derived;
+        }
+        match edges.get(&before) {
+            Some(prev) if expected.contains(prev) && expected.iter().any(|g| g != prev) => {
+                Continuity::Resolved
+            }
+            Some(_) => Continuity::Elsewhere,
+            None => Continuity::Unknown,
+        }
     }
 }
 
@@ -328,6 +429,10 @@ impl SynapseSource for SnapshotSource<'_, '_> {
             .event_bodies_for(&[event_id.to_owned()])
             .ok()?
             .remove(event_id)
+    }
+
+    fn settled(&mut self, event_id: &str) -> Option<Settled> {
+        self.settled?.get(event_id).cloned()
     }
 }
 
@@ -382,6 +487,7 @@ pub fn run(
         report,
         started: Instant::now(),
         users: BTreeSet::new(),
+        keys: None,
     };
 
     run.discover_users()?;
@@ -395,6 +501,17 @@ pub fn run(
     run.phase("backups", Run::import_backups)?;
     run.phase("account_data", Run::import_account_data)?;
     run.phase("pushers", Run::import_pushers)?;
+
+    let own = options
+        .signing_key
+        .as_deref()
+        .and_then(|source| crate::signing::ServerKey::parse_synapse(source).ok())
+        .map(|key| (key.key_id(), key.public_key_base64()));
+    run.keys = Some(KeyRing::load(
+        run.snapshot,
+        own.as_ref()
+            .map(|(id, key)| (options.server_name.as_str(), id.as_str(), key.as_str())),
+    )?);
 
     let total = rooms.len();
     for (index, room_id) in rooms.iter().enumerate() {
@@ -428,8 +545,19 @@ impl Run<'_, '_> {
     }
 
     fn progress(&self, what: &str) {
+        // Resident memory, so an operator watching a large import can see
+        // it approach the container's limit before the kernel does.
+        let rss = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find(|line| line.starts_with("VmRSS:"))
+                    .map(|line| line.trim_start_matches("VmRSS:").trim().to_owned())
+            })
+            .unwrap_or_default();
         eprintln!(
-            "progress: {what} elapsed={:.0}s",
+            "progress: {what} elapsed={:.0}s rss={rss}",
             self.started.elapsed().as_secs_f64()
         );
     }
@@ -560,7 +688,7 @@ impl Run<'_, '_> {
 
     /// Count what the import leaves behind, so the report can name it.
     fn record_not_migrated(&mut self) {
-        let tables: [(&str, &str, &str); 15] = [
+        let tables: [(&str, &str, &str); 14] = [
             (
                 "access_tokens",
                 "SELECT count(*) FROM access_tokens",
@@ -590,11 +718,6 @@ impl Run<'_, '_> {
                 "event_reports",
                 "SELECT count(*) FROM event_reports",
                 "moderation reports are not carried; export them from the Synapse admin API before cutover",
-            ),
-            (
-                "erased_users",
-                "SELECT count(*) FROM erased_users",
-                "Spindle has no GDPR-erasure flag; the accounts are imported deactivated",
             ),
             (
                 "remote_media_cache",
@@ -677,7 +800,19 @@ impl Run<'_, '_> {
 
     #[allow(clippy::too_many_lines)]
     fn import_users(&mut self) -> Result<(), Error> {
-        self.reset(&["users", "deactivated_users", "admins", "profiles"]);
+        self.reset(&[
+            "users",
+            "deactivated_users",
+            "admins",
+            "erased_users",
+            "profiles",
+        ]);
+        let erased: BTreeSet<String> = self
+            .snapshot
+            .query("SELECT user_id FROM erased_users", &[])?
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect();
         let rows = self.snapshot.query(
             "SELECT name, COALESCE(is_guest, 0)::int, COALESCE(deactivated, 0)::int, COALESCE(admin, 0)::int, \
                     appservice_id, COALESCE(locked, FALSE), COALESCE(suspended, FALSE) \
@@ -719,6 +854,10 @@ impl Run<'_, '_> {
             if admin {
                 self.domain("admins").source += 1;
             }
+            let is_erased = erased.contains(&user_id);
+            if is_erased {
+                self.domain("erased_users").source += 1;
+            }
             if appservice.is_some() {
                 *self
                     .domain("users")
@@ -756,6 +895,12 @@ impl Run<'_, '_> {
             accounts
                 .set_suspended(&localpart, suspended)
                 .map_err(write_error)?;
+            accounts
+                .set_erased(&localpart, is_erased)
+                .map_err(write_error)?;
+            if is_erased {
+                self.domain("erased_users").imported += 1;
+            }
             self.domain("users").imported += 1;
             if deactivated {
                 self.domain("deactivated_users").imported += 1;
@@ -1398,40 +1543,36 @@ impl Run<'_, '_> {
         };
 
         // Replay first, with no bodies and nothing written: a room whose
-        // state would diverge is reported and never persisted. The states
-        // Synapse resolved are kept for the write that follows.
+        // state would diverge is reported and never persisted. The replay
+        // derives every event's state, with the room version's resolver at
+        // each fork; the states it settled are kept for the write.
+        let mut resolver = match RoomResolver::load(self.snapshot, room_id, &version) {
+            Ok(resolver) => resolver,
+            Err(error) => {
+                return self.exclude(
+                    room_id,
+                    &source,
+                    &version,
+                    format!("no resolver for the room: {error}"),
+                );
+            }
+        };
+        let groups = self.snapshot.state_group_graph(room_id)?;
         let mut states = HashMap::new();
-        let mut head_from_source = false;
-        let mut resolved = {
+        let resolved = {
             let mut lookup = SnapshotSource {
                 snapshot: &mut *self.snapshot,
                 room_id,
                 bodies: HashMap::new(),
                 states: &mut states,
+                resolver: Some(&mut resolver),
+                settled: None,
+                groups: Some(&groups),
             };
             replay_resolving(&source, &mut lookup, false)
         };
-        // Synapse's current state resolves every forward extremity; a log's
-        // is its last entry's. When they differ, the last entry takes
-        // Synapse's current state, and the replay is checked again.
-        if let Ok(first) = &resolved
-            && !first.outcome.clean()
-            && let Ok(plan) = plan_resolving(&source)
-            && let Some(last) = plan.steps.last()
-        {
-            states.insert(
-                last.input.event_id.as_str().to_owned(),
-                source.current_state.clone(),
-            );
-            head_from_source = true;
-            let mut lookup = SnapshotSource {
-                snapshot: &mut *self.snapshot,
-                room_id,
-                bodies: HashMap::new(),
-                states: &mut states,
-            };
-            resolved = replay_resolving(&source, &mut lookup, true);
-        }
+        room_report.compat_user_ids = resolver.stand_ins.iter().cloned().collect();
+        drop(resolver);
         let resolved = match resolved {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -1443,6 +1584,31 @@ impl Run<'_, '_> {
                 );
             }
         };
+        room_report.replay_passes = resolved.passes as u64;
+        room_report.full_checks = resolved.full_checks as u64;
+        room_report.resolved_forks = resolved.forks.len() as u64;
+        for fork in &resolved.forks {
+            if fork.disagreements.is_empty() {
+                room_report.resolver_agreed += 1;
+            } else {
+                room_report.resolver_disagreed.push(format!(
+                    "{}: {}",
+                    fork.event_id,
+                    fork.disagreements
+                        .iter()
+                        .map(|slot| format!(
+                            "({}, {:?}) resolver={} synapse={}",
+                            slot.key.event_type().as_str(),
+                            slot.key.state_key(),
+                            slot.spindle.as_deref().unwrap_or("-"),
+                            slot.synapse.as_deref().unwrap_or("-")
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ));
+            }
+        }
+        let settled = resolved.settled;
         let outcome = resolved.outcome;
         for excluded in &outcome.excluded {
             match excluded {
@@ -1454,10 +1620,18 @@ impl Run<'_, '_> {
         }
         room_report.from_source = resolved.from_source.len() as u64;
         for (event_id, reason) in &resolved.from_source {
-            let kind = if reason.starts_with("a parent") {
-                "parent outside retained history".to_owned()
-            } else if reason.starts_with("head") {
-                "head over several forward extremities".to_owned()
+            let kind = if reason == GAP_REASON {
+                "parent outside retained history: Synapse's state".to_owned()
+            } else if reason == RESOLVED_REASON {
+                "resolver: the log's fold differs".to_owned()
+            } else if reason == HEAD_RESOLVED_REASON {
+                "head: resolver over the forward extremities".to_owned()
+            } else if reason == DISAGREED_REASON {
+                "resolver disagrees with Synapse: Synapse's slots".to_owned()
+            } else if reason == ELSEWHERE_REASON {
+                "Synapse took this state from a peer: Synapse's state".to_owned()
+            } else if reason == HEAD_REASON {
+                "head: Synapse's current state".to_owned()
             } else {
                 reason
                     .split([' ', '{', '('])
@@ -1506,11 +1680,13 @@ impl Run<'_, '_> {
             return self.exclude(room_id, &source, &version, reason);
         }
 
-        let mut plan = plan_resolving(&source).map_err(|error| Error::Write(error.to_string()))?;
-        if head_from_source && let Some(last) = plan.steps.last_mut() {
-            crate::import::mark_head_from_source(last);
-        }
-        if !self.options.dry_run {
+        let plan = plan_resolving(&source).map_err(|error| Error::Write(error.to_string()))?;
+        let rules = ruma::RoomVersionId::try_from(version.as_str())
+            .ok()
+            .and_then(|version| spindle_core::rules_of(&version));
+        // Every event's body is read and checked, and its signatures are
+        // verified, in a dry run too; only the writes are skipped.
+        {
             let events: HashMap<&str, &crate::import::SourceEvent> = source
                 .events
                 .iter()
@@ -1540,16 +1716,45 @@ impl Run<'_, '_> {
                     if let Some(target) = redaction_target(body) {
                         redactions.push((target.to_owned(), event_id.to_owned()));
                     }
+                    let verdict = match (&self.keys, &rules) {
+                        (Some(keys), Some(rules)) => keys.verify(body, rules),
+                        _ => Verdict::Unverifiable("no keys or no rules".to_owned()),
+                    };
+                    let label = match &verdict {
+                        Verdict::Verified => "verified",
+                        Verdict::Historical => "verified with an older key under a reused key ID",
+                        Verdict::RedactedCopy => "signatures verify, received redacted",
+                        Verdict::Unverifiable(_) => "unverifiable",
+                    };
+                    *room_report.signatures.entry(label.to_owned()).or_default() += 1;
+                    if matches!(verdict, Verdict::Unverifiable(_) | Verdict::Historical)
+                        && room_report.signature_examples.len() < 10
+                    {
+                        let why = match &verdict {
+                            Verdict::Unverifiable(why) => why.clone(),
+                            _ => "older key".to_owned(),
+                        };
+                        room_report.signature_examples.push(format!(
+                            "{event_id} ({}): {why}",
+                            body["sender"].as_str().unwrap_or("?")
+                        ));
+                    }
                 }
                 room_report.body_bytes += bodies
                     .values()
                     .map(|body| body.to_string().len() as u64)
                     .sum::<u64>();
+                if self.options.dry_run {
+                    continue;
+                }
                 let mut chunk_source = SnapshotSource {
                     snapshot: &mut *self.snapshot,
                     room_id,
                     bodies,
                     states: &mut states,
+                    resolver: None,
+                    settled: Some(&settled),
+                    groups: None,
                 };
                 let (appended, _) = self
                     .target
@@ -1571,14 +1776,18 @@ impl Run<'_, '_> {
                     ));
                 }
             }
-            room_report.redactions_applied = self
-                .target
-                .rooms
-                .finish_synapse_room(room_id, &redactions)
-                .map_err(write_error)? as u64;
-            self.target.rooms.release_imported_room(room_id);
-            self.sync()?;
-            if written < plan.steps.len() {
+            if self.options.dry_run {
+                room_report.redactions_applied = redactions.len() as u64;
+            } else {
+                room_report.redactions_applied = self
+                    .target
+                    .rooms
+                    .finish_synapse_room(room_id, &redactions)
+                    .map_err(write_error)? as u64;
+                self.target.rooms.release_imported_room(room_id);
+                self.sync()?;
+            }
+            if !self.options.dry_run && written < plan.steps.len() {
                 eprintln!(
                     "room {room_id}: resumed; {} events were already present",
                     plan.steps.len() - written
@@ -2092,8 +2301,9 @@ pub fn validate(
 
     let mut users = Check::default();
     for row in snapshot.query(
-        "SELECT name, COALESCE(deactivated, 0)::int, COALESCE(admin, 0)::int FROM users \
-         WHERE COALESCE(is_guest, 0) = 0 ORDER BY name",
+        "SELECT name, COALESCE(deactivated, 0)::int, COALESCE(admin, 0)::int, \
+                EXISTS (SELECT 1 FROM erased_users WHERE erased_users.user_id = users.name) \
+         FROM users WHERE COALESCE(is_guest, 0) = 0 ORDER BY name",
         &[],
     )? {
         let user_id: String = row.get(0);
@@ -2103,9 +2313,12 @@ pub fn validate(
         let account = accounts.account(localpart(&user_id)).map_err(write_error)?;
         let deactivated = row.get::<_, i32>(1) != 0;
         let admin = row.get::<_, i32>(2) != 0;
+        let erased: bool = row.get(3);
         users.expect(
             account.as_ref().is_some_and(|account| {
-                account.deactivated == deactivated && account.admin == admin
+                account.deactivated == deactivated
+                    && account.admin == admin
+                    && account.erased == erased
             }),
             || format!("{user_id}: account missing or flags differ"),
         );

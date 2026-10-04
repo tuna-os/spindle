@@ -595,6 +595,17 @@ impl Rooms {
                 log.append_seeded(step.input.clone(), state, step.depth)
                     .map_err(refused)?
                     .clone()
+            } else if let Some(settled) = source.settled(event_id) {
+                // The replay derived this event's state (the room version's
+                // resolver, the head over the forward extremities, or
+                // Synapse's state at a gap) and found the log's fold is not it.
+                from_source.push((event_id.to_owned(), settled.reason.clone()));
+                let entry = log
+                    .append_seeded(step.input.clone(), settled.state, step.depth)
+                    .map_err(refused)?
+                    .clone();
+                seeded_state = Some(settled.slots);
+                entry
             } else {
                 let reason = if step.head {
                     Some(crate::import::HEAD_REASON.to_owned())

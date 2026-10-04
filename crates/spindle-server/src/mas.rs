@@ -371,6 +371,9 @@ pub(crate) fn deactivate_user(
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
     let user_id = accounts.user_id(localpart);
     if erase {
+        accounts
+            .set_erased(localpart, true)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
         state
             .profiles
             .set(&user_id, Some(None), Some(None))

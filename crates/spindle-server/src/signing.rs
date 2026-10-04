@@ -81,6 +81,27 @@ impl ServerKey {
         if !store.scan_prefix(&storage_prefix())?.is_empty() {
             return Err(SigningError::AlreadyExists);
         }
+        let (version, document) = Self::parse_synapse_document(source)?;
+        let pair = Ed25519KeyPair::from_der(&document, version.clone())
+            .map_err(|error| SigningError::Unreadable(error.to_string()))?;
+        store.put(&storage_key(&version), &document)?;
+        Ok(Self { pair })
+    }
+
+    /// Read a Synapse `.signing.key` file without installing it: the
+    /// importer checks the server's own events against its public half.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SigningError`] if the file is malformed.
+    pub fn parse_synapse(source: &str) -> Result<Self, SigningError> {
+        let (version, document) = Self::parse_synapse_document(source)?;
+        let pair = Ed25519KeyPair::from_der(&document, version)
+            .map_err(|error| SigningError::Unreadable(error.to_string()))?;
+        Ok(Self { pair })
+    }
+
+    fn parse_synapse_document(source: &str) -> Result<(String, Vec<u8>), SigningError> {
         let mut fields = source.split_whitespace();
         let (Some(algorithm), Some(version), Some(seed), None) =
             (fields.next(), fields.next(), fields.next(), fields.next())
@@ -113,10 +134,7 @@ impl ServerKey {
         let mut document = Vec::with_capacity(ED25519_PKCS8_V1_PREFIX.len() + seed.len());
         document.extend_from_slice(ED25519_PKCS8_V1_PREFIX);
         document.extend_from_slice(&seed);
-        let pair = Ed25519KeyPair::from_der(&document, version.to_owned())
-            .map_err(|error| SigningError::Unreadable(error.to_string()))?;
-        store.put(&storage_key(version), &document)?;
-        Ok(Self { pair })
+        Ok((version.to_owned(), document))
     }
 
     /// `ed25519:0`, as it appears in a signature block and in `/_matrix/key/v2/server`.

@@ -37,6 +37,8 @@ use super::{SourceEvent, SourceRoom, StateMap};
 pub mod full;
 pub mod postgres;
 pub mod recovery;
+pub mod resolve;
+pub mod signatures;
 
 /// Why a room could not be read.
 #[derive(Debug)]
@@ -242,6 +244,7 @@ pub fn read_room(connection: &Connection, room_id: &str) -> Result<SourceRoom, R
         events,
         current_state,
         state_after_root: None,
+        forward_extremities: Vec::new(),
     };
 
     // Refuse a horizon start here rather than handing `plan` a room it will

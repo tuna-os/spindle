@@ -116,6 +116,7 @@ fn create_rooted() -> (SourceRoom, MemorySource) {
             ("m.room.topic", "", "$topic"),
         ]),
         state_after_root: None,
+        forward_extremities: Vec::new(),
     };
     (
         room,
@@ -214,6 +215,7 @@ fn a_room_seeded_at_a_horizon_holds_the_state_before_it() {
         events: vec![outlier_create, outlier_bob, alice, message],
         current_state: full.clone(),
         state_after_root: Some(full),
+        forward_extremities: Vec::new(),
     };
     let plan = plan(&room).expect("a horizon room plans with its root state");
     assert!(plan.seeded_from_source);
@@ -293,6 +295,7 @@ fn gapped_and_contested() -> (SourceRoom, MemorySource) {
         events,
         current_state: resolved,
         state_after_root: None,
+        forward_extremities: Vec::new(),
     };
     (room, MemorySource { bodies, states })
 }

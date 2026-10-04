@@ -67,6 +67,7 @@ fn room(events: Vec<SourceEvent>, state: StateMap) -> SourceRoom {
         events,
         current_state: state,
         state_after_root: None,
+        forward_extremities: Vec::new(),
     }
 }
 

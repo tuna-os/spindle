@@ -125,6 +125,7 @@ fn an_imported_redaction_redacts_its_target() {
         events: vec![create, member, secret, kept, redaction],
         current_state: current,
         state_after_root: None,
+        forward_extremities: Vec::new(),
     };
 
     let directory = tempfile::tempdir().unwrap();

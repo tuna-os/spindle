@@ -59,6 +59,13 @@ pub struct Account {
     /// and log out, and nothing else; a write answers `M_USER_SUSPENDED`.
     #[serde(default)]
     pub suspended: bool,
+    /// Erased (GDPR): the user asked for their data to be forgotten when
+    /// the account was deactivated. Carried from Synapse's `erased_users`
+    /// and set by a deactivation with `erase`. Spindle clears the profile
+    /// on erasure; it does not yet hide an erased user's events from
+    /// members who join later, which Synapse does (#576).
+    #[serde(default)]
+    pub erased: bool,
 }
 
 /// One logged-in device.
@@ -177,6 +184,7 @@ impl<'a, S: Store> Accounts<'a, S> {
             admin: false,
             locked: false,
             suspended: false,
+            erased: false,
         };
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
@@ -212,6 +220,7 @@ impl<'a, S: Store> Accounts<'a, S> {
             admin: false,
             locked: false,
             suspended: false,
+            erased: false,
         };
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
@@ -230,6 +239,22 @@ impl<'a, S: Store> Accounts<'a, S> {
             return Ok(());
         };
         account.deactivated = deactivated;
+        self.store
+            .put(&account_key(localpart), &encode(&account)?)?;
+        Ok(())
+    }
+
+    /// Mark an account erased (or not), leaving everything else. An
+    /// unknown localpart is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or decoding error.
+    pub fn set_erased(&self, localpart: &str, erased: bool) -> Result<(), AccountError> {
+        let Some(mut account) = self.account(localpart)? else {
+            return Ok(());
+        };
+        account.erased = erased;
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
         Ok(())
