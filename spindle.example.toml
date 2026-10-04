@@ -81,6 +81,9 @@ allow_private = []
 # account needs a token an admin minted at `/_spindle/admin/v1/registration_tokens`.
 # [registration]
 # require_token = false
+# Synapse-compatible `/_synapse/admin/v1/register`. Leave unset unless an
+# integration explicitly needs it: this secret can create administrator users.
+# shared_secret = "replace-with-a-long-random-secret"
 
 # Notices from the operator to a user (`POST /_spindle/admin/v1/send_server_notice`).
 # Absent, the endpoint refuses and says so. The account is created on first use.
@@ -105,6 +108,14 @@ enabled = true
 allow_internal = []
 
 [federation]
+# Federate at all. false makes the server an island: every outbound
+# federation request is refused before a name is resolved or a socket is
+# opened, the outbox is not drained, `bind` must be unset, and
+# /_matrix/federation/* and /_matrix/key/* answer 404 M_UNRECOGNIZED. For a
+# dark copy of a live server (a migration rehearsal with the production
+# server name and signing key) that must never speak for it to peers.
+enabled = true
+
 # Fetch peer keys and send requests over plain http instead of https. For
 # test rigs whose "servers" are loopback stubs. A production deployment with
 # this on has disabled federation authentication in all but name: anyone on
@@ -179,6 +190,10 @@ registrations = []
 # The token the provider presents when calling *us* — MAS's `matrix.secret`,
 # guarding the `/_synapse/mas/*` provisioning surface. Without it that
 # surface answers 404 and the provider cannot manage accounts here.
+# With client_id/client_secret left out, introspection presents this
+# secret as a bearer token instead, the way Synapse's
+# `matrix_authentication_service` section does — so a MAS set up for that
+# (no client of its own for the homeserver) needs no change.
 # homeserver_secret = "..."
 
 [turn]

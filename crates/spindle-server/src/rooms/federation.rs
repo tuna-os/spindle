@@ -191,6 +191,16 @@ impl Rooms {
     /// [`RoomError::Forbidden`] when the room does not accept knocks.
     pub fn make_knock_template(&self, room_id: &str, user_id: &str) -> Result<Value, RoomError> {
         self.with_room(room_id, |rooms, log| {
+            // Knocking arrived in v7. In an older room a `knock` join rule
+            // is a value the rules do not know and a knock membership is
+            // refused outright, so the template would be a promise the
+            // version cannot keep -- refused here, as Synapse does, at the
+            // cheap step.
+            if !rooms.rules_in(log, room_id)?.authorization.knocking {
+                return Err(RoomError::Forbidden(
+                    "this room's version does not support knocking".to_owned(),
+                ));
+            }
             // What this server would author on itself: a template naming
             // a tip this server cannot fold hands the user an event
             // `send_*` then refuses.
@@ -339,16 +349,9 @@ impl Rooms {
                 .rev()
                 .filter(|entry| entry.li <= start)
                 .take(limit)
-                .map(|entry| {
-                    let mut event = rooms.read_event(room_id, &entry.event_id)?;
-                    if let Some(object) = event.as_object_mut() {
-                        object.insert(
-                            "event_id".to_owned(),
-                            Value::String(entry.event_id.as_str().to_owned()),
-                        );
-                    }
-                    Ok(event)
-                })
+                // The stored PDU as signed: see `Rooms::pdu` for why no
+                // `event_id` is added.
+                .map(|entry| rooms.read_event(room_id, &entry.event_id))
                 .collect()
         })
     }
@@ -401,16 +404,9 @@ impl Rooms {
                         && entry.depth >= min_depth
                 })
                 .take(limit)
-                .map(|entry| {
-                    let mut event = rooms.read_event(room_id, &entry.event_id)?;
-                    if let Some(object) = event.as_object_mut() {
-                        object.insert(
-                            "event_id".to_owned(),
-                            Value::String(entry.event_id.as_str().to_owned()),
-                        );
-                    }
-                    Ok(event)
-                })
+                // The stored PDU as signed: see `Rooms::pdu` for why no
+                // `event_id` is added.
+                .map(|entry| rooms.read_event(room_id, &entry.event_id))
                 .collect::<Result<_, RoomError>>()?;
             newest_first.reverse();
             Ok(newest_first)
@@ -528,11 +524,12 @@ impl Rooms {
         auth: &[String],
         depth: u64,
     ) -> Result<(), RoomError> {
+        let version = self.version_in_log(log, room_id)?;
         let Some(object) = template.as_object_mut() else {
             return Err(RoomError::Build("a template is an object".to_owned()));
         };
         object.insert("prev_events".to_owned(), serde_json::json!(prev));
-        if spindle_core::is_state_dag(&self.version_in_log(log, room_id)?) {
+        if spindle_core::is_state_dag(&version) {
             object.insert(
                 "prev_state_events".to_owned(),
                 serde_json::json!(self.state_dag_heads(log, room_id)?),
@@ -540,6 +537,17 @@ impl Rooms {
         } else {
             object.insert("auth_events".to_owned(), serde_json::json!(auth));
             object.insert("depth".to_owned(), serde_json::json!(depth));
+        }
+        if !spindle_core::version::names_events_by_hash(&version) {
+            // v1/v2: the references are `[id, hashes]` pairs, which only
+            // the resident can write -- it holds the parents.
+            let Ok(ruma::CanonicalJsonValue::Object(mut canonical)) =
+                ruma::CanonicalJsonValue::try_from(template.clone())
+            else {
+                return Err(RoomError::Build("a template is canonical JSON".to_owned()));
+            };
+            self.link_edges(room_id, &version, &mut canonical)?;
+            *template = serde_json::to_value(&canonical)?;
         }
         Ok(())
     }
@@ -889,15 +897,10 @@ impl Rooms {
             if let Some(key) = state_key.clone() {
                 *snapshot = snapshot.apply(key, id);
             }
-            let prev: Vec<EventId> = event["prev_events"]
-                .as_array()
-                .map(|ids| {
-                    ids.iter()
-                        .filter_map(Value::as_str)
-                        .map(EventId::new)
-                        .collect()
-                })
-                .unwrap_or_default();
+            let prev: Vec<EventId> = super::edge_ids(&event["prev_events"])
+                .into_iter()
+                .map(EventId::new)
+                .collect();
             let input = match state_key {
                 Some(key) => EventInput::new(id, prev).with_state_key(key),
                 None => EventInput::new(id, prev),
@@ -1053,9 +1056,9 @@ impl Rooms {
             return Ok(true);
         };
         let names_invite = |key: &str| {
-            leave[key]
-                .as_array()
-                .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(invite_id)))
+            super::edge_ids(&leave[key])
+                .iter()
+                .any(|id| id == invite_id)
         };
         Ok(names_invite("auth_events") || names_invite("prev_events"))
     }
@@ -1185,13 +1188,5 @@ fn order_state_dag(events: Vec<(String, Value)>) -> Vec<(String, Value)> {
 
 /// The event ids an event's `auth_events` names.
 fn cited_auth_events(event: &Value) -> Vec<String> {
-    event["auth_events"]
-        .as_array()
-        .map(|ids| {
-            ids.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+    super::edge_ids(&event["auth_events"])
 }

@@ -112,7 +112,9 @@ pub(crate) fn receive_one_pdu(
         // Which of the peer's keys may answer for this event depends on
         // when the peer says it signed it: a key retired at `expired_ts`
         // verifies nothing claimed after that moment (#296).
-        let key_map = keys.map_for(pdu["origin_server_ts"].as_u64());
+        let enforce =
+            spindle_core::rules_of(&version).is_some_and(|rules| rules.enforce_key_validity);
+        let key_map = keys.map_for(pdu["origin_server_ts"].as_u64(), enforce);
         match spindle_core::version::verify(&key_map, &canonical, &version) {
             Ok(ruma::signatures::Verified::All) => {}
             // The signature holds but the content hash does not: someone
@@ -177,6 +179,15 @@ fn room_version_of(state: &AppState, pdu: &Value) -> ruma::RoomVersionId {
     if pdu.get("prev_state_events").is_some() && pdu.get("auth_events").is_none() {
         return ruma::RoomVersionId::try_from(spindle_core::STATE_DAG_V12)
             .unwrap_or_else(|_| fallback());
+    }
+    // `[id, hashes]` references are v1/v2's shape and nobody else's; the
+    // two name events alike, so v1 reads either.
+    if pdu["auth_events"]
+        .as_array()
+        .and_then(|edges| edges.first())
+        .is_some_and(Value::is_array)
+    {
+        return ruma::RoomVersionId::V1;
     }
     fallback()
 }
@@ -300,18 +311,23 @@ pub(crate) fn sign_membership_template(
             ruma::CanonicalJsonValue::Integer(ruma::Int::try_from(now).unwrap_or_default()),
         );
     }
-    spindle_core::version::hash_and_sign(
+    // v1/v2: the joining server names its own event, `$opaque:ourname`,
+    // inside the bytes it signs; `Pdu::sign` mints it. A resident that put
+    // its own `event_id` in the template (Synapse builds one) named the
+    // event under *its* server, whose signature this event will never
+    // carry, so that name is dropped. From v3 the name is the hash and
+    // `Pdu::sign` computes it.
+    canonical.remove("event_id");
+    let pdu = spindle_core::Pdu::sign(
+        version.clone(),
+        canonical,
         &state.config.server.name,
         state.key.pair(),
-        &mut canonical,
-        version,
     )
-    .map_err(|error| format!("the template cannot be signed: {error}"))?;
-    let hash = spindle_core::version::reference_hash(&canonical, version)
-        .map_err(|error| format!("the signed event cannot be hashed: {error}"))?;
-    let event = serde_json::to_value(&canonical)
+    .map_err(|error| format!("the template cannot be signed: {error:?}"))?;
+    let event = serde_json::to_value(pdu.canonical())
         .map_err(|error| format!("the signed event cannot be serialized: {error}"))?;
-    Ok((format!("${hash}"), event))
+    Ok((pdu.event_id().as_str().to_owned(), event))
 }
 
 /// Add this server's signature to an event another server built.
@@ -612,7 +628,7 @@ pub(crate) async fn event(
         ));
     };
     federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
-    let event = state.rooms.event(&room_id, &event_id).map_err(room_error)?;
+    let event = state.rooms.pdu(&room_id, &event_id).map_err(room_error)?;
     Ok(Json(json!({
         "origin": state.config.server.name,
         "origin_server_ts": std::time::SystemTime::now()
@@ -750,24 +766,7 @@ pub(crate) async fn make_join(
     // room. For a room of any other version that answer is simply false.
     let version = state.rooms.room_version(&room_id).map_err(room_error)?;
     let version = version.as_str();
-
-    // The `ver` list is the peer telling us what *they* can speak. If this
-    // room's version is not in it, no template we produce will parse on
-    // their side, so the refusal is correct — but it has to name the version
-    // they would have needed.
-    let offered = request.uri().query().is_some_and(|query| {
-        query
-            .split('&')
-            .filter_map(|pair| pair.strip_prefix("ver="))
-            .any(|ver| ver == version)
-    });
-    if !offered {
-        return Err(MatrixError::new(
-            StatusCode::BAD_REQUEST,
-            "M_INCOMPATIBLE_ROOM_VERSION",
-            format!("this room is version {version}"),
-        ));
-    }
+    require_offered_version(request.uri().query(), version)?;
     let event = state
         .rooms
         .make_join_template(&room_id, &user_id)
@@ -776,6 +775,23 @@ pub(crate) async fn make_join(
         "room_version": version,
         "event": event,
     })))
+}
+
+/// Refuse a `make_join`/`make_knock` whose `ver` list lacks the room's version.
+///
+/// The `ver` list is the peer telling us what *they* can speak. If this
+/// room's version is not in it, no template we produce will parse on their
+/// side, so the refusal is correct -- but it has to name the version they
+/// would have needed, which is what `room_version` in the body is for.
+fn require_offered_version(query: Option<&str>, version: &str) -> Result<(), MatrixError> {
+    let offered = query.is_some_and(|query| {
+        form_urlencoded::parse(query.as_bytes())
+            .any(|(key, value)| key == "ver" && value == version)
+    });
+    if offered {
+        return Ok(());
+    }
+    Err(MatrixError::incompatible_room_version(version))
 }
 
 /// `GET /_matrix/federation/v1/make_leave/{roomId}/{userId}`
@@ -836,6 +852,7 @@ pub(crate) async fn make_knock(
         ));
     }
     let version = state.rooms.room_version(&room_id).map_err(room_error)?;
+    require_offered_version(request.uri().query(), version.as_str())?;
     let event = state
         .rooms
         .make_knock_template(&room_id, &user_id)
@@ -1069,11 +1086,11 @@ pub(crate) async fn invite(
         .map_err(|error| MatrixError::bad_json(format!("room_version: {error}")))?;
     // The path names the event the inviter computed; disagreement means the
     // two servers are not looking at the same event.
-    let hash = spindle_core::version::reference_hash(&canonical, &version)
-        .map_err(|error| MatrixError::bad_json(format!("the invite cannot be hashed: {error}")))?;
-    if format!("${hash}") != event_id {
+    let named = spindle_core::version::event_id(&canonical, &version)
+        .map_err(|error| MatrixError::bad_json(format!("the invite cannot be named: {error}")))?;
+    if named != event_id {
         return Err(MatrixError::bad_json(format!(
-            "the event hashes to ${hash}, not {event_id}"
+            "the event is {named}, not {event_id}"
         )));
     }
     if spindle_core::version::hash_and_sign(

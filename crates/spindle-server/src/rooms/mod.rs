@@ -818,6 +818,7 @@ impl Rooms {
         event_id: &str,
         invite_state: &[Value],
     ) -> Result<(), RoomError> {
+        let stream_id = self.allocate_stream_id();
         spindle_store::Store::put(
             self.store.as_ref(),
             &spindle_core::keys::user_room(
@@ -829,6 +830,7 @@ impl Rooms {
                 "origin": origin,
                 "event_id": event_id,
                 "invite_state": invite_state,
+                "stream_id": stream_id,
             })
             .to_string()
             .as_bytes(),
@@ -1289,6 +1291,14 @@ impl Rooms {
         room_id: &str,
         user_id: &str,
     ) -> Result<Option<String>, RoomError> {
+        // Restricted joins exist from v8 and `knock_restricted` from v10.
+        // Before that a `restricted` join rule is a value the rules do not
+        // know, so it admits nobody, and a nomination would be a field the
+        // version gives no meaning to -- a v6 room's join must not carry one.
+        let authorization = self.rules_in(log, room_id)?.authorization;
+        if !(authorization.restricted_join_rule || authorization.knock_restricted_join_rule) {
+            return Ok(None);
+        }
         let Some(rules) = current_state_id(log, &StateKey::new("m.room.join_rules", ""))
             .and_then(|id| self.read_event(room_id, &EventId::new(id.as_str())).ok())
         else {
@@ -1341,10 +1351,7 @@ impl Rooms {
         // the nominee outranks the room's invite level is the rules' call,
         // and making it here is how the two copies would start to diverge.
         let mut ranked: Vec<(i64, String)> = Vec::new();
-        if self
-            .rules_in(log, room_id)?
-            .authorization
-            .explicitly_privilege_room_creators
+        if authorization.explicitly_privilege_room_creators
             && let Some(create) = current_state_id(log, &StateKey::new("m.room.create", ""))
                 .and_then(|id| self.read_event(room_id, &EventId::new(id.as_str())).ok())
         {
@@ -1369,7 +1376,7 @@ impl Rooms {
             .and_then(|id| self.read_event(room_id, &EventId::new(id.as_str())).ok())
             .map_or(Value::Null, |event| event["content"].clone());
         for (user, level) in power["users"].as_object().into_iter().flatten() {
-            if let Some(level) = level.as_i64() {
+            if let Some(level) = power_level(level) {
                 ranked.push((level, user.clone()));
             }
         }
@@ -1842,6 +1849,24 @@ impl Rooms {
             object.insert("event_id".to_owned(), Value::String(event_id.to_owned()));
         }
         Ok(event)
+    }
+
+    /// One event as a federation peer must see it: the stored PDU, exactly
+    /// as it was signed.
+    ///
+    /// Unlike [`Rooms::event`], no `event_id` is added. From room version 3
+    /// the ID is the hash of the event, not a field of it, and a PDU that
+    /// carries one is malformed: Synapse refuses it outright (`v2/v3 events
+    /// must not have an explicit event_id`), which made every event this
+    /// server served over `/event`, `/backfill` and `/get_missing_events`
+    /// unusable to a Synapse peer (found by the migration drill, #563).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room or the event is unknown.
+    pub fn pdu(&self, room_id: &str, event_id: &str) -> Result<Value, RoomError> {
+        self.with_room_read(room_id, |_, _| Ok(()))?;
+        self.read_event(room_id, &EventId::new(event_id))
     }
 
     /// Redact an event.
@@ -2999,7 +3024,7 @@ impl Rooms {
     ) -> Result<SyncResult, RoomError> {
         let position = self.stream_position();
         let joined = self.joined(user_id)?;
-        let invited = self.invited(user_id)?;
+        let invited = self.invited_since(user_id, since, position)?;
         let knocked = self.knocked(user_id)?;
 
         // The range each room is asked about. `None` on an initial sync,
@@ -3128,6 +3153,48 @@ impl Rooms {
     /// Returns [`RoomError`] if the index cannot be read.
     pub fn invited(&self, user_id: &str) -> Result<Vec<String>, RoomError> {
         self.membership_rooms(user_id, INVITE)
+    }
+
+    /// Current invites which are news in this sync window.
+    ///
+    /// Membership is a standing index: reading every current invite on every
+    /// incremental sync makes the same response immediately readable forever,
+    /// with an unchanged token. Local invites can be positioned through the
+    /// room's reverse stream index. Out-of-band federated invites have no room
+    /// log, so their pending record carries the side-stream position allocated
+    /// when it was accepted.
+    fn invited_since(
+        &self,
+        user_id: &str,
+        since: Option<u64>,
+        until: u64,
+    ) -> Result<Vec<String>, RoomError> {
+        let invited = self.invited(user_id)?;
+        let Some(since) = since else {
+            return Ok(invited);
+        };
+        let mut changed = Vec::new();
+        for room_id in invited {
+            if let Some(pending) = self.pending_invite(user_id, &room_id)? {
+                if pending["stream_id"]
+                    .as_u64()
+                    .is_some_and(|position| position > since && position <= until)
+                {
+                    changed.push(room_id);
+                }
+                continue;
+            }
+            let Some((_, membership_li)) = self.membership_event(&room_id, user_id)? else {
+                continue;
+            };
+            if self
+                .room_slice(&room_id, since, until)?
+                .contains(&membership_li)
+            {
+                changed.push(room_id);
+            }
+        }
+        Ok(changed)
     }
 
     /// Rooms this user has knocked on and not yet been answered about.
@@ -4042,6 +4109,23 @@ impl Rooms {
             depth,
             state_parents.as_deref(),
         )?;
+        // v1/v2 name parents by `[id, {"sha256": hash}]` pairs.
+        self.link_edges(room_id, &version, &mut canonical)?;
+        // Before room v11 a redaction names its target in the top-level
+        // `redacts` field. From v11 MSC2174 moved it into content. Keep the
+        // route and public API version-neutral, then put the field where this
+        // room's own rules require it before hashing and signing.
+        if event_type == "m.room.redaction"
+            && !rules_of(&version)?.redaction.content_field_redacts
+            && let Some(redacts) = canonical
+                .get_mut("content")
+                .and_then(|content| match content {
+                    CanonicalJsonValue::Object(content) => content.remove("redacts"),
+                    _ => None,
+                })
+        {
+            canonical.insert("redacts".to_owned(), redacts);
+        }
         // MSC4354: the stickiness rides the event as a top-level key. It is
         // outside the redacted form, so it is covered by neither the event
         // ID nor the signature -- a redacted sticky event is an ordinary
@@ -4060,7 +4144,32 @@ impl Rooms {
             .map_err(|error| RoomError::Build(format!("{error:?}")))?;
 
         let event_id = pdu.event_id().as_str().to_owned();
-        let json = canonical_to_json(pdu.canonical());
+        let mut json = canonical_to_json(pdu.canonical());
+
+        // State replacement metadata is unsigned because it describes the
+        // local server's view of the state transition, rather than the event
+        // the sender signed. Clients still depend on it: in particular,
+        // matrix-js-sdk follows a join's previous membership event to retain
+        // an invite's `is_direct` hint after the invite is accepted.
+        //
+        // Keep `replaces_state` as well as the expanded content. Synapse
+        // persists the former and expands the latter while reading for a
+        // client; storing all three gives every client-facing read path the
+        // same complete event without making timeline reads reopen state.
+        if let Some(state_key) = state_key
+            && let Some(previous_id) = current_state_id(log, &StateKey::new(event_type, state_key))
+            && let Ok(previous) = self.read_event(room_id, &EventId::new(previous_id.as_str()))
+            && let Some(object) = json.as_object_mut()
+        {
+            object.insert(
+                "unsigned".to_owned(),
+                serde_json::json!({
+                    "replaces_state": previous_id,
+                    "prev_content": previous["content"],
+                    "prev_sender": previous["sender"],
+                }),
+            );
+        }
 
         // Authorized before it is appended, against the state the log already
         // holds materialized. Signing first costs a wasted signature on a
@@ -4068,6 +4177,47 @@ impl Rooms {
         // exactly the bytes a peer would receive, event ID included.
         self.authorize(log, room_id, &event_id, &json)?;
         Ok((event_id, json))
+    }
+
+    /// Write `object`'s `prev_events` and `auth_events` the way the room's
+    /// version does.
+    ///
+    /// From v3 a reference is the bare ID and there is nothing to do. In v1
+    /// and v2 it is `[event_id, {"sha256": reference_hash}]`: an ID there is
+    /// a name the origin chose, so the reference carries the hash that pins
+    /// what the parent says, the job a v3+ ID does by being the hash. The
+    /// hash is taken over the parent's stored body; redaction does not move
+    /// it, because the hash covers the redacted form.
+    pub(crate) fn link_edges(
+        &self,
+        room_id: &str,
+        version: &RoomVersionId,
+        object: &mut CanonicalJsonObject,
+    ) -> Result<(), RoomError> {
+        if spindle_core::version::names_events_by_hash(version) {
+            return Ok(());
+        }
+        for field in ["prev_events", "auth_events"] {
+            let ids = spindle_core::version::edge_ids(object.get(field));
+            let mut edges = Vec::with_capacity(ids.len());
+            for id in ids {
+                let parent = self.read_event(room_id, &EventId::new(id.as_str()))?;
+                let Ok(CanonicalJsonValue::Object(parent)) = CanonicalJsonValue::try_from(parent)
+                else {
+                    return Err(RoomError::Build(format!(
+                        "the stored body of {id} is not canonical JSON"
+                    )));
+                };
+                edges.push(
+                    spindle_core::version::edge(&id, &parent, version)
+                        .map_err(|error| RoomError::Build(error.to_string()))?,
+                );
+            }
+            if object.contains_key(field) {
+                object.insert(field.to_owned(), CanonicalJsonValue::Array(edges));
+            }
+        }
+        Ok(())
     }
 
     /// Step around a fork this server cannot fold, and say so.
@@ -4164,15 +4314,10 @@ impl Rooms {
     ) -> Result<String, RoomError> {
         let event_id = event_id.to_owned();
         let json = json.clone();
-        let prev: Vec<EventId> = json["prev_events"]
-            .as_array()
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(Value::as_str)
-                    .map(EventId::new)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let prev: Vec<EventId> = edge_ids(&json["prev_events"])
+            .into_iter()
+            .map(EventId::new)
+            .collect();
 
         let input = EventInput::new(event_id.clone(), prev);
         let input = match state_key {
@@ -4374,15 +4519,27 @@ impl Rooms {
         let event_type = json["type"].as_str().unwrap_or_default().to_owned();
         let state_key = json["state_key"].as_str().map(str::to_owned);
         let sender = json["sender"].as_str().unwrap_or_default().to_owned();
-        let prev: Vec<EventId> = json["prev_events"]
-            .as_array()
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(Value::as_str)
-                    .map(EventId::new)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let redaction_target = if event_type == "m.room.redaction" {
+            let version = self.version_in_log(log, room_id)?;
+            let rules = rules_of(&version)?;
+            let target = if rules.redaction.content_field_redacts {
+                json["content"]["redacts"].as_str()
+            } else {
+                json["redacts"].as_str()
+            }
+            .ok_or_else(|| {
+                RoomError::Build(format!(
+                    "a room v{version} redaction has no target in the version's required field"
+                ))
+            })?;
+            Some(target.to_owned())
+        } else {
+            None
+        };
+        let prev: Vec<EventId> = edge_ids(&json["prev_events"])
+            .into_iter()
+            .map(EventId::new)
+            .collect();
 
         let input = EventInput::new(event_id, prev);
         let input = match &state_key {
@@ -4425,6 +4582,17 @@ impl Rooms {
                 json,
             },
         )?;
+        // A federated redaction has the same effect as one authored here.
+        // The target's location changed in v11, so it was resolved above
+        // under this room's rules rather than by looking in both places and
+        // accepting an ambiguous event. A target that has not arrived yet is
+        // left untouched; normal transaction order and the predecessor edge
+        // make the already-present case the common one.
+        if let Some(target) = redaction_target
+            && log.get(&EventId::new(target.as_str())).is_some()
+        {
+            self.apply_redaction(room_id, &target, event_id)?;
+        }
         if fan_out {
             self.enqueue_outbound(log, room_id, json)?;
         }
@@ -4870,6 +5038,55 @@ fn derives_room_id(create_content: &Value) -> bool {
         .ok()
         .and_then(|version| spindle_core::rules_of(&version))
         .is_some_and(|rules| rules.authorization.room_create_event_id_as_room_id)
+}
+
+/// A power level as an `m.room.power_levels` event states it.
+///
+/// Room versions 1 to 9 accept a level written as a string of an integer
+/// (`"50"`), and real rooms contain them: older clients and servers wrote
+/// them, and the auth rules of those versions read them as numbers. Version
+/// 10 made integers mandatory, so a valid v10+ event never has a string
+/// here and accepting one costs nothing there.
+///
+/// The parse is ruma's own (`deserialize_v1_powerlevel`): surrounding
+/// whitespace is ignored and one leading `+` is allowed. Anything else,
+/// including a float, is not a level, which is the same answer the auth
+/// rules give.
+pub(crate) fn power_level(value: &Value) -> Option<i64> {
+    // `js_int`'s range, which is what ruma parses a string level into.
+    const MAX_SAFE: i64 = (1 << 53) - 1;
+    if let Some(level) = value.as_i64() {
+        return Some(level);
+    }
+    let text = value.as_str()?.trim();
+    let level = match text.strip_prefix('+') {
+        Some(unsigned) => unsigned
+            .parse::<u64>()
+            .ok()
+            .and_then(|level| i64::try_from(level).ok())?,
+        None => text.parse::<i64>().ok()?,
+    };
+    (-MAX_SAFE..=MAX_SAFE).contains(&level).then_some(level)
+}
+
+/// The event IDs a `prev_events` or `auth_events` value names.
+///
+/// From v3 a reference is the bare ID; in v1 and v2 it is an
+/// `[event_id, {"sha256": hash}]` pair. Every reader of an edge list goes
+/// through here, so a v1 event's parents are its parents rather than an
+/// empty list -- which is what reading the pairs as strings produced, and
+/// which the log then refuses as an event with no predecessor.
+pub(crate) fn edge_ids(edges: &Value) -> Vec<String> {
+    edges
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|edge| match edge {
+            Value::String(id) => Some(id.clone()),
+            Value::Array(pair) => pair.first().and_then(Value::as_str).map(str::to_owned),
+            _ => None,
+        })
+        .collect()
 }
 
 pub(crate) fn version_in(content: &Value) -> Result<RoomVersionId, RoomError> {
@@ -5429,6 +5646,40 @@ fn highest_stream_id(store: &FjallStore, from_stream: u64) -> u64 {
     .filter_map(|(_, value)| value.as_slice().try_into().map(u64::from_be_bytes).ok())
     .max()
     .unwrap_or(0);
+    // An out-of-band federated invite has no room event and therefore no
+    // `Stream` row, but its pending record carries the side-stream position
+    // that makes it a one-shot incremental-sync change. Resume above those
+    // positions too, or a restart can reuse one and make a later invite sit
+    // at or below a token the client already holds.
+    let from_pending_invites = spindle_store::ReadView::scan_prefix(
+        store,
+        &[
+            spindle_core::keys::KEY_SCHEMA_VERSION,
+            spindle_core::keys::Keyspace::PendingInvite as u8,
+        ],
+    )
+    .unwrap_or_default()
+    .iter()
+    .filter_map(|(_, value)| {
+        serde_json::from_slice::<Value>(value)
+            .ok()?
+            .get("stream_id")?
+            .as_u64()
+    })
+    .max()
+    .unwrap_or(0);
+    let from_account_data = spindle_store::ReadView::scan_prefix(
+        store,
+        &[
+            spindle_core::keys::KEY_SCHEMA_VERSION,
+            spindle_core::keys::Keyspace::AccountDataStream as u8,
+        ],
+    )
+    .unwrap_or_default()
+    .iter()
+    .filter_map(|(_, value)| value.as_slice().try_into().map(u64::from_be_bytes).ok())
+    .max()
+    .unwrap_or(0);
     // The federation outbox is the fourth drawer: its rows carry the
     // sequence in the key's last eight bytes and have no stream row, and a
     // counter resumed below one would eventually overwrite a pending
@@ -5447,6 +5698,8 @@ fn highest_stream_id(store: &FjallStore, from_stream: u64) -> u64 {
     from_stream
         .max(from_to_device)
         .max(from_device_lists)
+        .max(from_pending_invites)
+        .max(from_account_data)
         .max(from_outbox)
 }
 
@@ -5665,10 +5918,39 @@ mod room_version_tests {
     /// succeeded. A lie a client cannot detect until something that depends
     /// on the version fails is worse than an error it can handle.
     #[test]
+    fn a_power_level_may_be_a_string_the_way_ruma_reads_one() {
+        use serde_json::json;
+        for (value, expected) in [
+            (json!(50), Some(50)),
+            (json!(-5), Some(-5)),
+            (json!("50"), Some(50)),
+            (json!(" 100 "), Some(100)),
+            (json!("+7"), Some(7)),
+            (json!("-7"), Some(-7)),
+            (json!("+-7"), None),
+            (json!("9007199254740992"), None),
+            (json!("1.5"), None),
+            (json!(1.5), None),
+            (json!("fifty"), None),
+            (json!(null), None),
+        ] {
+            assert_eq!(super::power_level(&value), expected, "{value}");
+        }
+    }
+
+    #[test]
     fn creating_a_room_at_an_unadvertised_version_is_refused() {
         let (_dir, _store, rooms) = rooms();
         let key = key();
-        for unsupported in ["1", "9", "10"] {
+        let unsupported: Vec<_> = ["1", "5", "6", "9", "10", "13"]
+            .into_iter()
+            .filter(|version| !crate::surface::supports_room_version(version))
+            .collect();
+        assert!(
+            !unsupported.is_empty(),
+            "the legacy-version refusal fixture needs a newer candidate"
+        );
+        for unsupported in unsupported {
             let result = rooms.create(
                 "@alice:example.org",
                 &key,

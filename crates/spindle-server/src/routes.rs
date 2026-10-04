@@ -66,6 +66,7 @@ pub const MOUNTED: &[&str] = &[
     "/_spindle/rtc/livekit/sfu/get",
     "/_matrix/client/unstable/org.matrix.msc4140/delayed_events",
     "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}",
+    "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}",
     "/_matrix/client/v3/rooms/{room_id}/state",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}",
@@ -106,6 +107,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::dehydrated::routes())
         .merge(device_routes())
         .merge(profile_routes())
+        .merge(crate::presence_routes::routes())
         .merge(room_routes())
         .merge(timeline_routes())
         .merge(media_routes())
@@ -121,6 +123,10 @@ pub fn router(state: AppState) -> Router {
         // Complement's TestUnknownEndpoints) read the errcode to tell "this
         // server does not speak that" from "the thing was not found".
         .fallback(unknown_endpoint)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            federation_gate,
+        ))
         .layer(axum::middleware::from_fn(cors))
         .layer(axum::middleware::from_fn_with_state(state.clone(), observe))
         .with_state(state);
@@ -251,6 +257,24 @@ async fn cors(
 }
 
 /// Any `/_matrix` path no route above claimed.
+/// Answer the server-server API as unknown when `[federation] enabled` is
+/// off. A server that does not federate has no federation surface: nothing
+/// on the network can ask it to sign, join or serve anything as its
+/// `server_name`.
+async fn federation_gate(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = request.uri().path();
+    if !state.config.federation.enabled
+        && (path.starts_with("/_matrix/federation/") || path.starts_with("/_matrix/key/"))
+    {
+        return unknown_endpoint().await.into_response();
+    }
+    next.run(request).await
+}
+
 async fn unknown_endpoint() -> MatrixError {
     MatrixError::new(
         StatusCode::NOT_FOUND,
@@ -272,101 +296,6 @@ fn profile_routes() -> Router<AppState> {
             "/_matrix/client/v3/profile/{user_id}/avatar_url",
             get(get_profile_avatar).put(put_profile_avatar),
         )
-        .route(
-            "/_matrix/client/v3/presence/{user_id}/status",
-            get(get_presence).put(put_presence),
-        )
-}
-
-/// `PUT /_matrix/client/v3/presence/{user_id}/status`
-///
-/// Only your own. The spec is explicit that this sets *the caller's*
-/// presence, and a server that let one user mark another offline would be
-/// handing out a small denial-of-service against every client that renders
-/// an online indicator.
-async fn put_presence(
-    State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
-    axum::extract::Path(user_id): axum::extract::Path<String>,
-    Json(request): Json<PresenceRequest>,
-) -> Result<Json<Value>, MatrixError> {
-    if user_id != identity.user_id {
-        return Err(MatrixError::forbidden(
-            "you cannot set another user's presence",
-        ));
-    }
-    let presence = crate::presence::State::parse(&request.presence).ok_or_else(|| {
-        MatrixError::bad_json(format!(
-            "presence must be 'online', 'offline' or 'unavailable', not {:?}",
-            request.presence
-        ))
-    })?;
-    state
-        .presence
-        .set(&identity.user_id, presence, request.status_msg.as_deref())
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    Ok(Json(json!({})))
-}
-
-/// `GET /_matrix/client/v3/presence/{user_id}/status`
-///
-/// Your own, or someone you share a room with. The spec defines a 403 here
-/// for exactly this, and it is worth having rather than serving presence to
-/// anyone who asks: presence is a continuous signal about when a person is
-/// at their computer, and an unauthenticated-in-practice one would let any
-/// account on this server watch any other.
-async fn get_presence(
-    State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
-    axum::extract::Path(user_id): axum::extract::Path<String>,
-) -> Result<Json<Value>, MatrixError> {
-    if user_id != identity.user_id && !shares_a_room(&state, &identity.user_id, &user_id)? {
-        return Err(MatrixError::forbidden(
-            "you are not allowed to see this user's presence status",
-        ));
-    }
-    let status = state
-        .presence
-        .get(&user_id)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    let mut body = json!({
-        "presence": status.state.as_str(),
-        "last_active_ago": status.last_active_ago,
-        "currently_active": status.currently_active,
-    });
-    if let Some(message) = status.status_msg {
-        body["status_msg"] = Value::String(message);
-    }
-    Ok(Json(body))
-}
-
-/// Whether two users are in a room together.
-///
-/// Asked of the *smaller* side's room list first -- the caller's -- because
-/// the answer is symmetric and the caller is the one whose membership this
-/// server is certain to hold.
-fn shares_a_room(state: &AppState, asker: &str, about: &str) -> Result<bool, MatrixError> {
-    let rooms = state
-        .rooms
-        .joined(asker)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    for room in rooms {
-        if state
-            .rooms
-            .is_joined(about, &room)
-            .map_err(|error| MatrixError::internal(&error.to_string()))?
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-#[derive(Debug, Deserialize)]
-struct PresenceRequest {
-    presence: String,
-    #[serde(default)]
-    status_msg: Option<String>,
 }
 
 /// `POST /_matrix/client/v3/rooms/{room_id}/report/{event_id}`
@@ -776,6 +705,13 @@ fn timeline_routes() -> Router<AppState> {
         .route(
             "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}",
             post(delayed_event_action),
+        )
+        // The current MSC4140 shape: the action in the path and no access
+        // token, so a delegate (lk-jwt-service) can keep a leave event
+        // pending, or send it, for a client that has gone away.
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}",
+            post(delayed_event_action_by_id),
         )
         .route("/_matrix/client/v3/rooms/{room_id}/state", get(room_state))
         // Two routes, because the spec has two forms and a router cannot
@@ -3213,29 +3149,14 @@ async fn create_room(
             request.preset.as_deref(),
             &request.invite,
             &initial_state,
-            // Honour a version this server advertises; ignore one it does
-            // not. Both halves are deliberate, and they are deliberate for
-            // different reasons.
-            //
-            // Honouring the advertised ones is a correctness fix, not a
-            // feature. `/capabilities` now lists v12 as available, and a
-            // client reads that list precisely so it can ask for something
-            // on it. Handing back v11 with a 200 would be the exact lie
-            // #201 removed from `make_join` -- worse here, because
-            // advertising v12 is what invites the request.
-            //
-            // Ignoring the rest preserves today's behaviour rather than
-            // endorsing it. An unadvertised version is still silently
-            // substituted, which is also a lie, but a pre-existing one:
-            // 30 allowlisted Complement tests create rooms at v7/v8/v9 to
-            // reach knock and restricted-join features and quietly receive
-            // the v11 room that happens to have them. Refusing those is a
-            // scope decision about which versions this server carries --
-            // #178 -- not something to change while fixing v12.
-            request
-                .room_version
-                .as_deref()
-                .filter(|version| crate::surface::supports_room_version(version)),
+            // The version asked for, refused with M_UNSUPPORTED_ROOM_VERSION
+            // when this server does not serve it. This used to substitute
+            // v11 for any unlisted version, which let Complement's v7 knock
+            // and v8 restricted-join tests pass on a room of the wrong
+            // version; with those versions served there is nothing left
+            // that the substitution kept working, and the spec asks for
+            // the refusal.
+            request.room_version.as_deref(),
             request.creation_content.as_ref(),
             request.power_level_content_override.as_ref(),
             &member_profile(&state, &identity.user_id),
@@ -3290,6 +3211,13 @@ async fn create_room(
                 .map_err(room_error)?;
         }
     }
+    // A client's sync loop may already be long-polling while createRoom is
+    // assembling the room. The room only becomes visible after `create`
+    // installs its completed log, so wake once the whole operation (including
+    // invites and aliases) is observable. Without this, Element Web leaves a
+    // freshly-created DM on "We're creating a room" until its 30-second poll
+    // happens to expire.
+    state.rooms.wake_sync_waiters();
     Ok(Json(json!({ "room_id": room_id })))
 }
 
@@ -3705,15 +3633,20 @@ async fn invite_user(
 
     // What comes back must be the same event, co-signature aside — and the
     // reference hash proves it, because signatures are outside the hash.
+    // (A v1/v2 ID is not the hash, so the hash is compared to the hash of
+    // what was sent, and the ID to the ID.)
     let cosigned = response["event"].clone();
-    let same = ruma::CanonicalJsonValue::try_from(cosigned.clone())
-        .ok()
-        .and_then(|value| match value {
-            ruma::CanonicalJsonValue::Object(object) => Some(object),
-            _ => None,
-        })
-        .and_then(|object| spindle_core::version::reference_hash(&object, &version).ok())
-        .is_some_and(|hash| format!("${hash}") == event_id);
+    let object = |value: &Value| match ruma::CanonicalJsonValue::try_from(value.clone()) {
+        Ok(ruma::CanonicalJsonValue::Object(object)) => Some(object),
+        _ => None,
+    };
+    let same = match (object(&cosigned), object(&event)) {
+        (Some(theirs), Some(ours)) => {
+            spindle_core::version::same_event(&theirs, &ours, &version)
+                && spindle_core::version::event_id(&ours, &version).is_ok_and(|id| id == event_id)
+        }
+        _ => false,
+    };
     if !same {
         return Err(MatrixError::new(
             StatusCode::BAD_GATEWAY,
@@ -4774,9 +4707,29 @@ struct SyncQuery {
 }
 
 impl SyncQuery {
-    /// Whether to label the state block `state_after` (MSC4222).
+    /// Whether to send the state after the timeline (MSC4222).
     fn state_after(&self) -> bool {
-        self.use_state_after.or(self.unstable_use_state_after) == Some(true)
+        self.state_label() != "state"
+    }
+
+    /// The key the joined room's state block goes under.
+    ///
+    /// The response field is spelled the way the request flag was. A
+    /// client that asked with the unstable flag reads only the unstable
+    /// field: matrix-js-sdk, and so Element Web, sends
+    /// `org.matrix.msc4222.use_state_after=true` on every sync and reads
+    /// `org.matrix.msc4222.state_after`, falling back to `state`. Answering
+    /// it with the stable `state_after` left it with no state at all: every
+    /// room read as version 1, unnamed, and unencrypted, so its composer
+    /// offered to send in plaintext into an encrypted room.
+    fn state_label(&self) -> &'static str {
+        if self.use_state_after == Some(true) {
+            "state_after"
+        } else if self.use_state_after.is_none() && self.unstable_use_state_after == Some(true) {
+            "org.matrix.msc4222.state_after"
+        } else {
+            "state"
+        }
     }
 }
 
@@ -4974,10 +4927,12 @@ fn write_account_data(
     {
         return Err(limit_exceeded("account data entries", cap));
     }
+    let position = state.rooms.allocate_stream_id();
     state
         .account_data
-        .put(user_id, room_id, event_type, content)
+        .put(user_id, room_id, event_type, content, position)
         .map_err(|error| account_data_error(&error))?;
+    state.rooms.wake_sync_waiters();
     Ok(Json(json!({})))
 }
 
@@ -5132,10 +5087,12 @@ fn ruleset_of(state: &AppState, user_id: &str) -> Result<Value, MatrixError> {
 }
 
 fn save_ruleset(state: &AppState, user_id: &str, ruleset: &Value) -> Result<(), MatrixError> {
+    let position = state.rooms.allocate_stream_id();
     state
         .account_data
-        .put(user_id, "", crate::push_rules::TYPE, ruleset)
+        .put(user_id, "", crate::push_rules::TYPE, ruleset, position)
         .map_err(|error| account_data_error(&error))?;
+    state.rooms.wake_sync_waiters();
     // What was scored under the old rules says nothing under the new.
     state.rooms.forget_scores(user_id);
     Ok(())
@@ -5704,10 +5661,12 @@ async fn set_tag(
     // keeps there. Stored as given: the server has no opinion about tag
     // content for the same reason it has none about account data generally.
     tags["tags"][&tag] = content;
+    let position = state.rooms.allocate_stream_id();
     state
         .account_data
-        .put(&user_id, &room_id, "m.tag", &tags)
+        .put(&user_id, &room_id, "m.tag", &tags, position)
         .map_err(|error| account_data_error(&error))?;
+    state.rooms.wake_sync_waiters();
     Ok(Json(json!({})))
 }
 
@@ -5736,10 +5695,12 @@ async fn delete_tag(
             format!("{room_id} is not tagged {tag}"),
         ));
     }
+    let position = state.rooms.allocate_stream_id();
     state
         .account_data
-        .put(&user_id, &room_id, "m.tag", &tags)
+        .put(&user_id, &room_id, "m.tag", &tags, position)
         .map_err(|error| account_data_error(&error))?;
+    state.rooms.wake_sync_waiters();
     Ok(Json(json!({})))
 }
 
@@ -6620,6 +6581,56 @@ struct SlidingQuery {
     timeout: Option<u64>,
 }
 
+/// The stream position a sliding sync `pos` names.
+///
+/// A `pos` this server did not mint -- the one a client kept from the
+/// homeserver this one replaced -- is MSC4186's `M_UNKNOWN_POS`: the answer
+/// a client is built to handle, by dropping the position and starting the
+/// connection over. Anything else (a 400 `M_BAD_JSON`) is an error it
+/// retries with the same `pos`, forever.
+fn sliding_position(
+    identity: &crate::accounts::Identity,
+    pos: Option<&str>,
+) -> Result<Option<u64>, MatrixError> {
+    match crate::tokens::Sync::resume(pos)
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?
+    {
+        crate::tokens::Resume::Foreign => {
+            tracing::info!(
+                user_id = %identity.user_id,
+                "sliding sync pos from another server; answering M_UNKNOWN_POS"
+            );
+            Err(MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_UNKNOWN_POS",
+                "unknown position; start the connection over without `pos`",
+            ))
+        }
+        resume => Ok(resume.position()),
+    }
+}
+
+/// Where a `/sync` resumes from.
+///
+/// A token another homeserver minted (a client that synced against the
+/// server this one replaced) is answered as an initial sync: every room in
+/// full, timelines limited, so the client rebuilds rather than retrying a
+/// position that no longer exists. See `tokens::Resume`.
+fn sync_resume(
+    identity: &crate::accounts::Identity,
+    since: Option<&str>,
+) -> Result<crate::tokens::Resume, MatrixError> {
+    let resume = crate::tokens::Sync::resume(since)
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    if resume == crate::tokens::Resume::Foreign {
+        tracing::info!(
+            user_id = %identity.user_id,
+            "sync token from another server; answering as an initial sync"
+        );
+    }
+    Ok(resume)
+}
+
 /// `POST /_matrix/client/unstable/org.matrix.simplified_msc3575/sync`
 ///
 /// Stateless (`sliding.rs` explains why): `pos` is a stream position, and the
@@ -6632,15 +6643,7 @@ async fn sliding_sync(
     axum::extract::Query(query): axum::extract::Query<SlidingQuery>,
     Json(request): Json<crate::sliding::SlidingRequest>,
 ) -> Result<Json<Value>, MatrixError> {
-    let since = match query.pos.as_deref() {
-        Some(token) => Some(
-            token
-                .parse::<crate::tokens::Sync>()
-                .map_err(|error| MatrixError::bad_json(error.to_string()))?
-                .0,
-        ),
-        None => None,
-    };
+    let since = sliding_position(&identity, query.pos.as_deref())?;
     let lists = request.decoded_lists().map_err(MatrixError::bad_json)?;
     let subscriptions = request
         .decoded_subscriptions()
@@ -6870,15 +6873,11 @@ fn to_device_extension(
     extension: &crate::sliding::ToDeviceExtension,
     position: u64,
 ) -> Result<Value, MatrixError> {
-    let acknowledged = match extension.since.as_deref() {
-        Some(token) => Some(
-            token
-                .parse::<crate::tokens::Sync>()
-                .map_err(|error| MatrixError::bad_json(error.to_string()))?
-                .0,
-        ),
-        None => None,
-    };
+    // Another server's to-device token acknowledges nothing here: every
+    // pending message is delivered, which is the side to err on.
+    let acknowledged = crate::tokens::Sync::resume(extension.since.as_deref())
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?
+        .position();
     let mut events = state
         .devices
         .take_pending(&identity.user_id, &identity.device_id, acknowledged)
@@ -6926,7 +6925,7 @@ fn account_data_extension(
     identity: &crate::accounts::Identity,
     in_view: &[String],
 ) -> Result<Value, MatrixError> {
-    let global = sync_account_data(state, identity, None)?;
+    let global = sync_account_data(state, identity, None, None, state.rooms.stream_position())?;
     let mut rooms = serde_json::Map::new();
     for room_id in in_view {
         let data = state
@@ -7268,6 +7267,28 @@ fn visible_device_changes(
     Ok(visible)
 }
 
+/// The asker and everyone joined to a room the asker is joined to: the
+/// widest device-list change set the asker may be told about, for a sync
+/// that resumes from another server's token (`tokens::Resume::Foreign`).
+fn everyone_sharing_a_room(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+) -> Result<Vec<String>, MatrixError> {
+    let mut everyone = std::collections::BTreeSet::new();
+    everyone.insert(identity.user_id.clone());
+    for room_id in state.rooms.joined(&identity.user_id).map_err(room_error)? {
+        everyone.extend(
+            state
+                .rooms
+                .joined_member_ids(&room_id)
+                .map_err(room_error)?
+                .iter()
+                .cloned(),
+        );
+    }
+    Ok(everyone.into_iter().collect())
+}
+
 /// The E2EE sections of a `/sync` response, fetched before assembly.
 ///
 /// To-device messages come first and destructively (`since` acknowledges the
@@ -7281,7 +7302,7 @@ fn visible_device_changes(
 fn sync_device_sections(
     state: &AppState,
     identity: &crate::accounts::Identity,
-    since: Option<u64>,
+    resume: crate::tokens::Resume,
     next_batch: u64,
 ) -> Result<
     (
@@ -7294,11 +7315,19 @@ fn sync_device_sections(
 > {
     let to_device = state
         .devices
-        .take_pending(&identity.user_id, &identity.device_id, since)
+        .take_pending(&identity.user_id, &identity.device_id, resume.position())
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    let device_changes = match since {
-        Some(since) => visible_device_changes(state, identity, since, next_batch)?,
-        None => Vec::new(),
+    let device_changes = match resume {
+        crate::tokens::Resume::From(since) => {
+            visible_device_changes(state, identity, since, next_batch)?
+        }
+        crate::tokens::Resume::Start => Vec::new(),
+        // The client believes this is an incremental sync, so it will not
+        // re-query keys the way a fresh login does. Device changes made on
+        // the old server between its last sync and the switch are in a
+        // stream this server never saw; naming everyone it shares a room
+        // with makes it re-query them, rather than encrypt to a stale list.
+        crate::tokens::Resume::Foreign => everyone_sharing_a_room(state, identity)?,
     };
     let key_counts = state
         .devices
@@ -7321,15 +7350,8 @@ async fn sync(
     Authenticated(identity): Authenticated,
     axum::extract::Query(query): axum::extract::Query<SyncQuery>,
 ) -> Result<axum::response::Response, MatrixError> {
-    let since = match query.since.as_deref() {
-        Some(token) => Some(
-            token
-                .parse::<crate::tokens::Sync>()
-                .map_err(|error| MatrixError::bad_json(error.to_string()))?
-                .0,
-        ),
-        None => None,
-    };
+    let resume = sync_resume(&identity, query.since.as_deref())?;
+    let since = resume.position();
     let filter = requested_filter(&state, &identity.user_id, query.filter.as_deref())?;
     // A filter's own timeline limit outranks the query parameter: the client
     // set both, and the filter is the more specific of the two.
@@ -7388,7 +7410,11 @@ async fn sync(
     // staring at nothing for the whole timeout.
     if let Some(since) = since {
         let timeout = std::time::Duration::from_millis(query.timeout.unwrap_or(0).min(60_000));
-        if result.is_empty() && !timeout.is_zero() {
+        // A side stream (account data, to-device messages, receipts) can
+        // advance the shared token without putting a room in this result.
+        // That is already news: waiting merely because the room sections are
+        // empty misses a wake that landed just before this request subscribed.
+        if result.is_empty() && result.next_batch == since && !timeout.is_zero() {
             // Either an appended event or a change in who is typing ends the
             // wait. Typing is not an event and has no stream position, so it
             // cannot be discovered by re-reading the log -- without this arm a
@@ -7407,7 +7433,7 @@ async fn sync(
         &identity,
         result.rooms,
         filter.as_ref(),
-        state_after,
+        query.state_label(),
         since,
     )?;
 
@@ -7416,9 +7442,9 @@ async fn sync(
     let leave = sync_leave(result.left, filter.as_ref());
 
     let (to_device, device_changes, key_counts, unused_fallback) =
-        sync_device_sections(&state, &identity, since, result.next_batch)?;
+        sync_device_sections(&state, &identity, resume, result.next_batch)?;
 
-    let global = sync_account_data(&state, &identity, filter.as_ref())?;
+    let global = sync_account_data(&state, &identity, filter.as_ref(), since, result.next_batch)?;
 
     // Assembled from pre-serialized parts rather than as one `Value`, so the
     // joined rooms' state blocks -- which `sync_join` may have taken straight
@@ -7498,10 +7524,12 @@ fn sync_account_data(
     state: &AppState,
     identity: &crate::accounts::Identity,
     filter: Option<&crate::filters::Filter>,
+    since: Option<u64>,
+    until: u64,
 ) -> Result<Vec<Value>, MatrixError> {
     let mut global = state
         .account_data
-        .all(&identity.user_id, "")
+        .between(&identity.user_id, "", since, until)
         .map_err(|error| account_data_error(&error))?;
     // The ruleset is stored bare -- `/pushrules/` edits it a rule at a
     // time and wraps it in `global` on the way out -- but the account-data
@@ -7520,9 +7548,10 @@ fn sync_account_data(
     // written at registration for the reason `ruleset_of` gives: only an edit
     // freezes a ruleset, so an unedited one keeps tracking the defaults as the
     // spec adds rules.
-    if !global
-        .iter()
-        .any(|event| event["type"] == crate::push_rules::TYPE)
+    if since.is_none()
+        && !global
+            .iter()
+            .any(|event| event["type"] == crate::push_rules::TYPE)
     {
         global.push(json!({
             "type": crate::push_rules::TYPE,
@@ -7694,7 +7723,7 @@ fn sync_join(
     identity: &crate::accounts::Identity,
     rooms: Vec<crate::rooms::SyncRoom>,
     filter: Option<&crate::filters::Filter>,
-    state_after: bool,
+    state_label: &'static str,
     since: Option<u64>,
 ) -> Result<BTreeMap<String, Box<RawValue>>, MatrixError> {
     let mut join: BTreeMap<String, Box<RawValue>> = BTreeMap::new();
@@ -7780,10 +7809,7 @@ fn sync_join(
         } else {
             raw(&json!({ "events": room_state }))?
         };
-        entry.insert(
-            if state_after { "state_after" } else { "state" },
-            state_json,
-        );
+        entry.insert(state_label, state_json);
         entry.insert("account_data", raw(&json!({ "events": room_data }))?);
         entry.insert(
             "ephemeral",
@@ -8220,47 +8246,86 @@ async fn delayed_event_action(
         .act(&delay_id, &identity.user_id, action)
         .map_err(delay_error)?;
     if let Some(event) = to_send {
-        let sent = match &event.state_key {
-            Some(state_key) => state.rooms.set_state(
-                &event.room_id,
-                &event.sender,
-                state.key.pair(),
-                &event.event_type,
-                state_key,
-                &event.content,
-            ),
-            None => state.rooms.send(
-                &event.room_id,
-                &event.sender,
-                state.key.pair(),
-                &event.event_type,
-                &event.content,
-            ),
-        };
-        // MSC4309, for the same reason the fire loop records its outcome:
-        // this device learns the result from the response, but the user's
-        // *other* devices are exactly as uninformed as if the delay had
-        // fired on its own. A failure to record must not fail the send that
-        // already happened, so it is logged rather than returned.
-        let record = crate::delayed::FinalisedDelay {
-            delay_id: event.delay_id.clone(),
-            room_id: event.room_id.clone(),
-            event_type: event.event_type.clone(),
-            state_key: event.state_key.clone(),
-            event_id: sent.as_ref().ok().cloned(),
-            error: sent.as_ref().err().map(ToString::to_string),
-        };
-        if let Err(error) =
-            state
-                .delayed
-                .finalise(&event.sender, state.rooms.stream_position(), &record)
-        {
-            tracing::warn!(
-                delay_id = %event.delay_id,
-                "a delayed event was sent but its outcome was not recorded: {error}"
-            );
-        }
-        sent.map_err(room_error)?;
+        send_delayed_now(&state, &event)?;
+    }
+    Ok(Json(json!({})))
+}
+
+/// Send a delayed event now, on its owner's behalf, and record the outcome
+/// for MSC4309 -- the `send` action, from either route.
+fn send_delayed_now(
+    state: &AppState,
+    event: &crate::delayed::DelayedEvent,
+) -> Result<(), MatrixError> {
+    let sent = match &event.state_key {
+        Some(state_key) => state.rooms.set_state(
+            &event.room_id,
+            &event.sender,
+            state.key.pair(),
+            &event.event_type,
+            state_key,
+            &event.content,
+        ),
+        None => state.rooms.send(
+            &event.room_id,
+            &event.sender,
+            state.key.pair(),
+            &event.event_type,
+            &event.content,
+        ),
+    };
+    // MSC4309, for the same reason the fire loop records its outcome:
+    // this device learns the result from the response, but the user's
+    // *other* devices are exactly as uninformed as if the delay had
+    // fired on its own. A failure to record must not fail the send that
+    // already happened, so it is logged rather than returned.
+    let record = crate::delayed::FinalisedDelay {
+        delay_id: event.delay_id.clone(),
+        room_id: event.room_id.clone(),
+        event_type: event.event_type.clone(),
+        state_key: event.state_key.clone(),
+        event_id: sent.as_ref().ok().cloned(),
+        error: sent.as_ref().err().map(ToString::to_string),
+    };
+    if let Err(error) =
+        state
+            .delayed
+            .finalise(&event.sender, state.rooms.stream_position(), &record)
+    {
+        tracing::warn!(
+            delay_id = %event.delay_id,
+            "a delayed event was sent but its outcome was not recorded: {error}"
+        );
+    }
+    sent.map_err(room_error)?;
+    Ok(())
+}
+
+/// `POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}`
+///
+/// No access token: the delay ID is the capability (see
+/// [`crate::delayed::Delayed::act_by_id`]). This is what
+/// lk-jwt-service calls to restart a delegated leave event while the
+/// participant is still connected to the SFU, and to send it when they are
+/// not; answering it 404 makes the service drop the delegation, and the
+/// leave fires while the caller is still in the call.
+async fn delayed_event_action_by_id(
+    State(state): State<AppState>,
+    axum::extract::Path((delay_id, action)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    let action = crate::delayed::Action::parse(&action).ok_or_else(|| {
+        MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_UNRECOGNIZED",
+            format!("no delayed-event action {action:?}"),
+        )
+    })?;
+    if let Some(event) = state
+        .delayed
+        .act_by_id(&delay_id, action)
+        .map_err(delay_error)?
+    {
+        send_delayed_now(&state, &event)?;
     }
     Ok(Json(json!({})))
 }
@@ -8760,6 +8825,11 @@ pub(crate) fn room_error(error: crate::rooms::RoomError) -> MatrixError {
         // is the same explanation a federating peer would give. A generic
         // "forbidden" would make a client's bug report useless.
         crate::rooms::RoomError::Forbidden(rule) => MatrixError::forbidden(rule),
+        crate::rooms::RoomError::UnsupportedVersion(version) => MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_UNSUPPORTED_ROOM_VERSION",
+            format!("this server does not support room version {version}"),
+        ),
         // #225: this was a 500 with an empty body, which told a client
         // nothing and an operator nothing. It is not an internal error --
         // the server is working correctly and the *room* is in a state it

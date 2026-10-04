@@ -92,3 +92,123 @@ impl std::str::FromStr for Sync {
             .map_err(|_| TokenError::Malformed)
     }
 }
+
+/// Where a client's stored stream token says to resume from.
+///
+/// A client keeps its `since` (or `pos`, or to-device `since`) across
+/// restarts, so the first request after this server takes over from
+/// another homeserver carries a token the other server minted:
+/// Synapse's `s1600473_59519903_…` or `20489/s1600473_…`. That token is
+/// not a client bug and not garbage worth a 400. Answering it with an
+/// error leaves the client retrying the same token forever, which is an
+/// outage that only signing out ends. It names a position in a stream
+/// that no longer exists, and each endpoint has a way to say "start
+/// over" (see [`Sync::resume`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Resume {
+    /// No token: the client is starting from nothing.
+    Start,
+    /// One of ours.
+    From(u64),
+    /// Not a token this server minted: another server's, carried across
+    /// a migration.
+    Foreign,
+}
+
+impl Resume {
+    /// The stream position to read after, if there is one.
+    #[must_use]
+    pub const fn position(self) -> Option<u64> {
+        match self {
+            Self::From(position) => Some(position),
+            Self::Start | Self::Foreign => None,
+        }
+    }
+}
+
+impl Sync {
+    /// Read an optional stream token for resuming.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::WrongKind`] for a pagination token sent where a sync
+    /// token belongs: that is this server's own token on the wrong
+    /// endpoint, a client bug worth naming. [`TokenError::Malformed`] for
+    /// anything that is neither ours nor shaped like Synapse's: garbage is
+    /// still a 400, and only a token a real predecessor could have minted
+    /// is [`Resume::Foreign`].
+    pub fn resume(token: Option<&str>) -> Result<Resume, TokenError> {
+        let Some(token) = token else {
+            return Ok(Resume::Start);
+        };
+        match token.parse::<Self>() {
+            Ok(Self(position)) => Ok(Resume::From(position)),
+            Err(TokenError::Malformed) if synapse_shaped(token) => Ok(Resume::Foreign),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Whether `token` has the shape of a Synapse stream token: a `/sync`
+/// `since` (`s1600473_59519903_…`, or `m…~…_…` with several writers), a
+/// sliding sync `pos` (the same behind a connection position, `20489/…`),
+/// or a to-device `since` (a bare stream ID, `8005`). None of these can be
+/// one of ours, which are always `s` followed by digits only.
+fn synapse_shaped(token: &str) -> bool {
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    if digits(token) {
+        return true;
+    }
+    let stream = match token.split_once('/') {
+        Some((connection, rest)) if digits(connection) => rest,
+        Some(_) => return false,
+        None => token,
+    };
+    (stream.starts_with('s') || stream.starts_with('m'))
+        && stream.contains('_')
+        && stream
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'~' | b'.' | b'-'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Resume, Sync, TokenError};
+
+    #[test]
+    fn resume_reads_our_tokens_and_names_foreign_ones() {
+        assert_eq!(Sync::resume(None), Ok(Resume::Start));
+        assert_eq!(Sync::resume(Some("s42")), Ok(Resume::From(42)));
+        // Synapse's /sync, sliding sync and to-device tokens.
+        for synapse in [
+            "s1600473_59519903_23_1472883_8005_125_9029_4969314_0_165_2_1_1",
+            "20489/s1600473_59519903_23_1472883_8005_125_9029_4969314_0_165_2_1_1",
+            "8005",
+            "m1600473~1.1600470~2.1600473_59519903_23_1472883_8005_125_9029_4969314_0_165_2_1_1",
+        ] {
+            assert_eq!(
+                Sync::resume(Some(synapse)),
+                Ok(Resume::Foreign),
+                "{synapse}"
+            );
+        }
+        // Garbage is still garbage.
+        for garbage in ["banana", "", "s12x", "x/s1_2", "s1_2 3"] {
+            assert_eq!(
+                Sync::resume(Some(garbage)),
+                Err(TokenError::Malformed),
+                "{garbage}"
+            );
+        }
+        // Our own pagination token on the sync endpoint is still a 400.
+        assert_eq!(
+            Sync::resume(Some("t17")),
+            Err(TokenError::WrongKind {
+                expected: 's',
+                found: 't'
+            })
+        );
+        assert_eq!(Resume::Foreign.position(), None);
+        assert_eq!(Resume::From(7).position(), Some(7));
+    }
+}

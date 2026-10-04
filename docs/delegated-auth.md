@@ -71,7 +71,7 @@ homeserver_secret = "<matrix-secret>"
 
 ## MAS's side
 
-The corresponding fragment of MAS's `config.yaml`. MAS requires the
+The corresponding fragment of MAS's `config.yaml`. MAS needs the
 `client_id` to be a ULID (26 characters, Crockford base32) — zero-pad
 your way there.
 
@@ -88,6 +88,26 @@ clients:
     client_secret: "<introspection-secret>"
 ```
 
+### In place of Synapse's `matrix_authentication_service`
+
+Element Server Suite sets up Synapse with the stable
+`matrix_authentication_service:` section. In that setup, Synapse has no
+client of its own at MAS. To introspect, Synapse sends `matrix.secret` as
+a bearer token. Spindle does the same when you leave out `client_id` and
+`client_secret`. Thus MAS needs no change when Spindle replaces Synapse:
+
+```toml
+[auth.delegated]
+issuer = "https://auth.example.org/"
+introspection_endpoint = "http://mas.internal:8080/oauth2/introspect"
+homeserver_secret = "<matrix-secret>"   # MAS's matrix.secret
+```
+
+The MAS `matrix.kind` stays `synapse_modern`, and `matrix.endpoint`
+changes to Spindle. For a rehearsal of this setup with MAS 1.23 and a
+restore of a production MAS database, see
+[evidence/mas-cutover-rehearsal.md](evidence/mas-cutover-rehearsal.md).
+
 Then the usual MAS lifecycle applies: `mas-cli config check`,
 `mas-cli database migrate`, `mas-cli config sync`, run the server.
 `mas-cli manage register-user` will check the localpart with Spindle
@@ -99,7 +119,7 @@ first.
 
 - **Suspension.** MAS's locked-but-not-deactivated state has no Spindle
   counterpart; `query_user` always answers `is_suspended: false`, and a
-  suspended user's tokens simply stop introspecting as active.
+  suspended user's tokens stop introspecting as active.
 - **Email addresses.** `provision_user` accepts `set_emails` and
   ignores it — there is nowhere to put them, and refusing would fail
   every provision.
@@ -119,7 +139,7 @@ $ curl -H "Authorization: Bearer mct_…" \
 ```
 
 If `auth_metadata` answers 404 `M_UNRECOGNIZED`, delegation is not
-configured. If `whoami` answers `M_UNKNOWN_TOKEN` for a token MAS just
+configured. If `whoami` answers `M_UNKNOWN_TOKEN` for a token that MAS
 issued, check the introspection client credentials first — from the
 caller's side, "provider unreachable", "wrong client secret" and
 "revoked token" are deliberately the same answer.
@@ -129,7 +149,7 @@ caller's side, "provider unreachable", "wrong client secret" and
 MSC3861-native clients — Element X natively, Element Web behind
 `feature_oidc_native_flow` — log in through an OAuth 2.0 provider or
 not at all. Running MAS buys the full identity stack, but it also
-costs a second service and the PostgreSQL it requires, which is a lot
+costs a second service and the PostgreSQL it needs, which is a lot
 of ceremony for a single-node server whose accounts already live in
 Spindle. The other answer:
 

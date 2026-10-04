@@ -1,0 +1,292 @@
+{
+  "label": "rollback",
+  "rooms": {
+    "encrypted-v10": {
+      "A": {
+        "newest_event": "$mGCJ-z48rI2hu3PpwayqEm5zvf0a74Y2JJuFeCDw9TU",
+        "state": {
+          "m.room.create|": "$XA99zfsOb4ROTkLWCsdlVXKVTO1rTNh3A2AKNZ-uaTI",
+          "m.room.encryption|": "$R7MGXq9Gj0gGsb9jOZT_J7Epb-Ne23fUOICroppupfM",
+          "m.room.guest_access|": "$PHyz9Iz0W6NX_sWbXvmQZR9fCFPyTj9xQENZN5Psh-Y",
+          "m.room.history_visibility|": "$TnS81xkMIOGTLezs5b-Y6o2cJNItUxnXrs9rJ8VRbag",
+          "m.room.join_rules|": "$dsWalc4rX_NYrrzYKbCsphxnoZO_a9sN2zYjz14Kbok",
+          "m.room.member|@drill-b1:reilly.asia": "$akEv9tz2L1gjaWDI3UCIk6a3-FS-qt0KTLyWpgt2VKc",
+          "m.room.member|@witness:witness.lab": "$Ff-CT3LfCQDdnOlJOXk8wxtWAdCp7bau75XDkEYq_WY",
+          "m.room.name|": "$Wj-fsqqapz_UNhb4Md-aldUGR-JA0CYeclnq1n5P2Jw",
+          "m.room.power_levels|": "$T5pxR7HHgUkvth34Lq1mBJyWfPTJT-eT2qayFovVuFE"
+        },
+        "state_events": 9
+      },
+      "A_equals_B_state": true,
+      "B": {
+        "newest_event": "$mGCJ-z48rI2hu3PpwayqEm5zvf0a74Y2JJuFeCDw9TU",
+        "state": {
+          "m.room.create|": "$XA99zfsOb4ROTkLWCsdlVXKVTO1rTNh3A2AKNZ-uaTI",
+          "m.room.encryption|": "$R7MGXq9Gj0gGsb9jOZT_J7Epb-Ne23fUOICroppupfM",
+          "m.room.guest_access|": "$PHyz9Iz0W6NX_sWbXvmQZR9fCFPyTj9xQENZN5Psh-Y",
+          "m.room.history_visibility|": "$TnS81xkMIOGTLezs5b-Y6o2cJNItUxnXrs9rJ8VRbag",
+          "m.room.join_rules|": "$dsWalc4rX_NYrrzYKbCsphxnoZO_a9sN2zYjz14Kbok",
+          "m.room.member|@drill-b1:reilly.asia": "$akEv9tz2L1gjaWDI3UCIk6a3-FS-qt0KTLyWpgt2VKc",
+          "m.room.member|@witness:witness.lab": "$Ff-CT3LfCQDdnOlJOXk8wxtWAdCp7bau75XDkEYq_WY",
+          "m.room.name|": "$Wj-fsqqapz_UNhb4Md-aldUGR-JA0CYeclnq1n5P2Jw",
+          "m.room.power_levels|": "$T5pxR7HHgUkvth34Lq1mBJyWfPTJT-eT2qayFovVuFE"
+        },
+        "state_events": 9
+      }
+    },
+    "fork-v10": {
+      "A": {
+        "newest_event": "$PKyNwm01M_8MB24UoqaTv4m8ppZ-4tz2NK-CqSi3BVs",
+        "state": {
+          "m.room.create|": "$jubG7LJgpKXAb75v_oo1QqEBVqjw0ALKireC47aGGJc",
+          "m.room.guest_access|": "$Oe2AKyosYB9FYx_5BqGz1WIctbuj-BX4ELL40O3b0bs",
+          "m.room.history_visibility|": "$YERRQfM9OxlYv9QT9pv3zqRJRScsiRyZGax7WxGZQ0o",
+          "m.room.join_rules|": "$mxneMN2lcHT8BiUK5kL0KeuCsQPItLCU-8WLFSGpZHY",
+          "m.room.member|@drill-b1:reilly.asia": "$74ENegKsGsKAc-O55VlFEkehtCXVsWZK-lP_ni8qsHM",
+          "m.room.member|@drill-b2:reilly.asia": "$NsgTzelpYTT2IWDBHjffWkwQcxbxZpyvJg6KguM58_U",
+          "m.room.member|@wit2:witness.lab": "$c1PhGXXmlms0jt7mYgEhO8RUnE4Ajhb6u8hvKq9v_uE",
+          "m.room.member|@witness:witness.lab": "$gYRmuDE-SRw9jsVd3PbP6z055jFFL_LGYOT0__kWQ4Q",
+          "m.room.name|": "$czVbp4KzK2gyPYx3JcVmQI24qBmUiel1mqsrQAOYQiI",
+          "m.room.power_levels|": "$dtW0EXcs3jErLLycyf9n_wjY1yr40FRTJdcQ5IlZoKE",
+          "m.room.topic|": "$c_Q4AICH67jEVSf6PS6UC28hdoCX1QIuhcTUTaGbcH4"
+        },
+        "state_events": 11
+      },
+      "A_equals_B_state": true,
+      "B": {
+        "newest_event": "$PKyNwm01M_8MB24UoqaTv4m8ppZ-4tz2NK-CqSi3BVs",
+        "state": {
+          "m.room.create|": "$jubG7LJgpKXAb75v_oo1QqEBVqjw0ALKireC47aGGJc",
+          "m.room.guest_access|": "$Oe2AKyosYB9FYx_5BqGz1WIctbuj-BX4ELL40O3b0bs",
+          "m.room.history_visibility|": "$YERRQfM9OxlYv9QT9pv3zqRJRScsiRyZGax7WxGZQ0o",
+          "m.room.join_rules|": "$mxneMN2lcHT8BiUK5kL0KeuCsQPItLCU-8WLFSGpZHY",
+          "m.room.member|@drill-b1:reilly.asia": "$74ENegKsGsKAc-O55VlFEkehtCXVsWZK-lP_ni8qsHM",
+          "m.room.member|@drill-b2:reilly.asia": "$NsgTzelpYTT2IWDBHjffWkwQcxbxZpyvJg6KguM58_U",
+          "m.room.member|@wit2:witness.lab": "$c1PhGXXmlms0jt7mYgEhO8RUnE4Ajhb6u8hvKq9v_uE",
+          "m.room.member|@witness:witness.lab": "$gYRmuDE-SRw9jsVd3PbP6z055jFFL_LGYOT0__kWQ4Q",
+          "m.room.name|": "$czVbp4KzK2gyPYx3JcVmQI24qBmUiel1mqsrQAOYQiI",
+          "m.room.power_levels|": "$dtW0EXcs3jErLLycyf9n_wjY1yr40FRTJdcQ5IlZoKE",
+          "m.room.topic|": "$c_Q4AICH67jEVSf6PS6UC28hdoCX1QIuhcTUTaGbcH4"
+        },
+        "state_events": 11
+      }
+    },
+    "history-v10": {
+      "A": {
+        "newest_event": "$m9sUzT21QHoNj4_iBgl5zNd7KDxlM_2KKzVqzFSSeCQ",
+        "state": {
+          "m.room.create|": "$RC-NcrNcGZ4zlyh5J_HujNLyF9tWvjMEJ9hJzGx6CX0",
+          "m.room.guest_access|": "$_2ZhQELviZSAtd8UqaMCRNmRJQMalVhhzjLua1Yl2fc",
+          "m.room.history_visibility|": "$53EWFV4A_RzKvwWLpaKrco_JWwukGPFUOf_q92uAlBY",
+          "m.room.join_rules|": "$OX9ys11VDnXeI4j9XmzMdqLfwj-hoyd6727Ij1e2OLg",
+          "m.room.member|@drill-b1:reilly.asia": "$C_spenOI79CVHLG9b6lYI512wDhh_yX-5IU0iBNHS80",
+          "m.room.member|@drill-b2:reilly.asia": "$h82qUB-HupL138mt48s_hbk5_OezkJQRlKTBq7NjxS8",
+          "m.room.member|@wit2:witness.lab": "$Mmm0y1yTzovJd-b3kkR8YICMJDcl4Ml_Nj24AoUolGw",
+          "m.room.member|@witness:witness.lab": "$RQAgtrvKTwRUX4v6O5udt0y9NgDOmY9TFsaooVznflU",
+          "m.room.name|": "$lvBQhxXAs-bG2k2vMPmq4mnQtJ_dM_aY-Xsz_VSxc7Q",
+          "m.room.power_levels|": "$BuoSdUA74gsUaI_XeuBlY4jT01xoxIb3b5G_JxL-wqE",
+          "m.room.topic|": "$iLR2x1uhpX8L6SA0ITVxMH3AUnpGUOkZf2pCT4AuZcg"
+        },
+        "state_events": 11
+      },
+      "A_equals_B_state": true,
+      "B": {
+        "newest_event": "$m9sUzT21QHoNj4_iBgl5zNd7KDxlM_2KKzVqzFSSeCQ",
+        "state": {
+          "m.room.create|": "$RC-NcrNcGZ4zlyh5J_HujNLyF9tWvjMEJ9hJzGx6CX0",
+          "m.room.guest_access|": "$_2ZhQELviZSAtd8UqaMCRNmRJQMalVhhzjLua1Yl2fc",
+          "m.room.history_visibility|": "$53EWFV4A_RzKvwWLpaKrco_JWwukGPFUOf_q92uAlBY",
+          "m.room.join_rules|": "$OX9ys11VDnXeI4j9XmzMdqLfwj-hoyd6727Ij1e2OLg",
+          "m.room.member|@drill-b1:reilly.asia": "$C_spenOI79CVHLG9b6lYI512wDhh_yX-5IU0iBNHS80",
+          "m.room.member|@drill-b2:reilly.asia": "$h82qUB-HupL138mt48s_hbk5_OezkJQRlKTBq7NjxS8",
+          "m.room.member|@wit2:witness.lab": "$Mmm0y1yTzovJd-b3kkR8YICMJDcl4Ml_Nj24AoUolGw",
+          "m.room.member|@witness:witness.lab": "$RQAgtrvKTwRUX4v6O5udt0y9NgDOmY9TFsaooVznflU",
+          "m.room.name|": "$lvBQhxXAs-bG2k2vMPmq4mnQtJ_dM_aY-Xsz_VSxc7Q",
+          "m.room.power_levels|": "$BuoSdUA74gsUaI_XeuBlY4jT01xoxIb3b5G_JxL-wqE",
+          "m.room.topic|": "$iLR2x1uhpX8L6SA0ITVxMH3AUnpGUOkZf2pCT4AuZcg"
+        },
+        "state_events": 11
+      }
+    },
+    "v1": {
+      "A": {
+        "newest_event": "$17910653985ofbGY:witness.lab",
+        "state": {
+          "m.room.create|": "$17910618210BYiOV:reilly.asia",
+          "m.room.guest_access|": "$17910618225unjgE:reilly.asia",
+          "m.room.history_visibility|": "$17910618224IVAKd:reilly.asia",
+          "m.room.join_rules|": "$17910618223ApLqB:reilly.asia",
+          "m.room.member|@drill-b1:reilly.asia": "$17910618211WCxkT:reilly.asia",
+          "m.room.member|@drill-b2:reilly.asia": "$179106182211esGOk:reilly.asia",
+          "m.room.member|@witness:witness.lab": "$17910618220FYDMA:witness.lab",
+          "m.room.name|": "$17910618226KCvcz:reilly.asia",
+          "m.room.power_levels|": "$17910618222mGuaf:reilly.asia",
+          "m.room.topic|": "$17910618227COyzP:reilly.asia"
+        },
+        "state_events": 10
+      },
+      "A_equals_B_state": true,
+      "B": {
+        "newest_event": "$17910653985ofbGY:witness.lab",
+        "state": {
+          "m.room.create|": "$17910618210BYiOV:reilly.asia",
+          "m.room.guest_access|": "$17910618225unjgE:reilly.asia",
+          "m.room.history_visibility|": "$17910618224IVAKd:reilly.asia",
+          "m.room.join_rules|": "$17910618223ApLqB:reilly.asia",
+          "m.room.member|@drill-b1:reilly.asia": "$17910618211WCxkT:reilly.asia",
+          "m.room.member|@drill-b2:reilly.asia": "$179106182211esGOk:reilly.asia",
+          "m.room.member|@witness:witness.lab": "$17910618220FYDMA:witness.lab",
+          "m.room.name|": "$17910618226KCvcz:reilly.asia",
+          "m.room.power_levels|": "$17910618222mGuaf:reilly.asia",
+          "m.room.topic|": "$17910618227COyzP:reilly.asia"
+        },
+        "state_events": 10
+      }
+    },
+    "v10-general": {
+      "A": {
+        "newest_event": "$YlE9xrJjoAbqRQn3lWd36RFKNsO435vS3qrWYCoHZu4",
+        "state": {
+          "m.room.create|": "$QUWe3WtiiiluAgAWcuK3BiSTKVNpj6kQy7loojK7qu4",
+          "m.room.guest_access|": "$RSvdj8I9UI9cFl2M_rppefqIwTYqWc2lxRNqM8j8Gz0",
+          "m.room.history_visibility|": "$o0RNVhrFKNTUlIuKVF0gDvJo6j7fgc54XvcxS7sAT0s",
+          "m.room.join_rules|": "$s4ohdxcqlV3V19gZp_stHjYbV8EdbcyZUk0ELeKDLRg",
+          "m.room.member|@drill-b1:reilly.asia": "$ZbR37cs0iTiEDvcn9QryrctWm_uS4LlYKMbT_2mBjtE",
+          "m.room.member|@drill-b2:reilly.asia": "$W6F4frN5oDRGcWUuObpJREI0Hnh2BTvMPAZQr5Shv5s",
+          "m.room.member|@wit2:witness.lab": "$LIoialfHIGlrDNZFj2gk03uJxcEv3xKYQlq1O9Qu9ps",
+          "m.room.member|@witness:witness.lab": "$JHHKPAgSh13gyJ_e9zny1qTFaflOXqGJt5z7IVoV4kY",
+          "m.room.name|": "$WzZvRmOEZE9OqiPE0Qf91Q5-xLDPTQw0JVug7RFJvO8",
+          "m.room.power_levels|": "$BTw5sFGPOygCSixh3cZmCzU2LbTbO4qH8vP6QmbPQP0",
+          "m.room.topic|": "$-QuQYSBx-IWb0hb3lEhk9pgU7Ld_6XzWJe8qyFn3Ylo"
+        },
+        "state_events": 11
+      },
+      "A_equals_B_state": true,
+      "B": {
+        "newest_event": "$YlE9xrJjoAbqRQn3lWd36RFKNsO435vS3qrWYCoHZu4",
+        "state": {
+          "m.room.create|": "$QUWe3WtiiiluAgAWcuK3BiSTKVNpj6kQy7loojK7qu4",
+          "m.room.guest_access|": "$RSvdj8I9UI9cFl2M_rppefqIwTYqWc2lxRNqM8j8Gz0",
+          "m.room.history_visibility|": "$o0RNVhrFKNTUlIuKVF0gDvJo6j7fgc54XvcxS7sAT0s",
+          "m.room.join_rules|": "$s4ohdxcqlV3V19gZp_stHjYbV8EdbcyZUk0ELeKDLRg",
+          "m.room.member|@drill-b1:reilly.asia": "$ZbR37cs0iTiEDvcn9QryrctWm_uS4LlYKMbT_2mBjtE",
+          "m.room.member|@drill-b2:reilly.asia": "$W6F4frN5oDRGcWUuObpJREI0Hnh2BTvMPAZQr5Shv5s",
+          "m.room.member|@wit2:witness.lab": "$LIoialfHIGlrDNZFj2gk03uJxcEv3xKYQlq1O9Qu9ps",
+          "m.room.member|@witness:witness.lab": "$JHHKPAgSh13gyJ_e9zny1qTFaflOXqGJt5z7IVoV4kY",
+          "m.room.name|": "$WzZvRmOEZE9OqiPE0Qf91Q5-xLDPTQw0JVug7RFJvO8",
+          "m.room.power_levels|": "$BTw5sFGPOygCSixh3cZmCzU2LbTbO4qH8vP6QmbPQP0",
+          "m.room.topic|": "$-QuQYSBx-IWb0hb3lEhk9pgU7Ld_6XzWJe8qyFn3Ylo"
+        },
+        "state_events": 11
+      }
+    },
+    "v12-witness-created": {
+      "A": {
+        "newest_event": "$88JOm1k2ki0_k_htrvqdl4FNV-TLrboXEmGvKG9JZDA",
+        "state": {
+          "m.room.create|": "$yQ1SqzDiKYxp7_hzwIb62xffSR822Ao6IWuCwgsOdLI",
+          "m.room.guest_access|": "$R7gBHUCIgAEuVYgofz_3cbVo8jPbiFKxGvJ8zF5_2Mo",
+          "m.room.history_visibility|": "$q2OSGh76bqTHwCN33Z3Pz3N7gRIzaTLZqYi65NeyGSI",
+          "m.room.join_rules|": "$HaHrjfdfn-XBr87NPnIHH_gMoreJ2IoGchBKO72LGl8",
+          "m.room.member|@drill-b1:reilly.asia": "$oOGMcOc7mwcRGP7FIx-zHRbH7SjTnsnfzxsC_PI_tD4",
+          "m.room.member|@drill-b2:reilly.asia": "$aBnYvf4Yn2y91w-5NFOkjpprJc9s_T2IaFouW4dYdHA",
+          "m.room.member|@wit2:witness.lab": "$w4npWToiB_xu7KpH2Kb6VJAX-ftTsbOi-F1U-d0OROA",
+          "m.room.member|@witness:witness.lab": "$MAoYzbVQ_4SZ0CYIvKUe_udML4Tqz1mFPJNgqTlhQko",
+          "m.room.name|": "$QBZbpaTrFsjSG5GXopXTvwzpnBryY3zr6y3uJE4Tl8M",
+          "m.room.power_levels|": "$nzsS5EpCAZ94bat-HfIJPcJMnc0VPYK4w_Mdbj2tX2A",
+          "m.room.topic|": "$xeSc8FwxnwG4UPYyZmlGgZEz7YZ08XJqkC9mztfPTXM"
+        },
+        "state_events": 11
+      },
+      "A_equals_B_state": true,
+      "B": {
+        "newest_event": "$88JOm1k2ki0_k_htrvqdl4FNV-TLrboXEmGvKG9JZDA",
+        "state": {
+          "m.room.create|": "$yQ1SqzDiKYxp7_hzwIb62xffSR822Ao6IWuCwgsOdLI",
+          "m.room.guest_access|": "$R7gBHUCIgAEuVYgofz_3cbVo8jPbiFKxGvJ8zF5_2Mo",
+          "m.room.history_visibility|": "$q2OSGh76bqTHwCN33Z3Pz3N7gRIzaTLZqYi65NeyGSI",
+          "m.room.join_rules|": "$HaHrjfdfn-XBr87NPnIHH_gMoreJ2IoGchBKO72LGl8",
+          "m.room.member|@drill-b1:reilly.asia": "$oOGMcOc7mwcRGP7FIx-zHRbH7SjTnsnfzxsC_PI_tD4",
+          "m.room.member|@drill-b2:reilly.asia": "$aBnYvf4Yn2y91w-5NFOkjpprJc9s_T2IaFouW4dYdHA",
+          "m.room.member|@wit2:witness.lab": "$w4npWToiB_xu7KpH2Kb6VJAX-ftTsbOi-F1U-d0OROA",
+          "m.room.member|@witness:witness.lab": "$MAoYzbVQ_4SZ0CYIvKUe_udML4Tqz1mFPJNgqTlhQko",
+          "m.room.name|": "$QBZbpaTrFsjSG5GXopXTvwzpnBryY3zr6y3uJE4Tl8M",
+          "m.room.power_levels|": "$nzsS5EpCAZ94bat-HfIJPcJMnc0VPYK4w_Mdbj2tX2A",
+          "m.room.topic|": "$xeSc8FwxnwG4UPYyZmlGgZEz7YZ08XJqkC9mztfPTXM"
+        },
+        "state_events": 11
+      }
+    },
+    "v6": {
+      "A": {
+        "newest_event": "$6xEjXvVCITifmeQxhQMyByq0npubFwoQjj9maUjW8kM",
+        "state": {
+          "m.room.create|": "$k1WnyB8wnhJQp_fiUxXnBAVvUfBUr5_1T4kjHMFLboE",
+          "m.room.guest_access|": "$ZyRYYmZgn-_ThcTT0X991tZNlyzQAgG623dBiythk3s",
+          "m.room.history_visibility|": "$wrq108l_gbF_RDFfzZ4isAwZ660zGX46loDKv4mV8A8",
+          "m.room.join_rules|": "$ln-8us31fZpKs9rYIX9qOvx3qOL56IfWPFiabNKaGZA",
+          "m.room.member|@drill-b1:reilly.asia": "$Qn6l6P_p3lfC3V55nmKZn49KajrwrEOvJmnVDaJ14H4",
+          "m.room.member|@drill-b2:reilly.asia": "$UqmgXH97_bz1tmRdD3aSIfapRfwHoeHfpulzNzRzrNk",
+          "m.room.member|@witness:witness.lab": "$2IfcHVdC-wVdaxn4Mmxncmszy-JA1k-5g_8cHoe1o9E",
+          "m.room.name|": "$QuDeF8tAp89-iP-hhWYTC5y8SviOjjbjYuc5DxrKnH4",
+          "m.room.power_levels|": "$ghqt3o0UFzS221v-WYmABCGnOYzq7ZYGRAGpcGNJosw",
+          "m.room.topic|": "$S5dA1YZntus_Fbcd5hpWtx-UWS0W918wTOUiWW4HqVg"
+        },
+        "state_events": 10
+      },
+      "A_equals_B_state": true,
+      "B": {
+        "newest_event": "$6xEjXvVCITifmeQxhQMyByq0npubFwoQjj9maUjW8kM",
+        "state": {
+          "m.room.create|": "$k1WnyB8wnhJQp_fiUxXnBAVvUfBUr5_1T4kjHMFLboE",
+          "m.room.guest_access|": "$ZyRYYmZgn-_ThcTT0X991tZNlyzQAgG623dBiythk3s",
+          "m.room.history_visibility|": "$wrq108l_gbF_RDFfzZ4isAwZ660zGX46loDKv4mV8A8",
+          "m.room.join_rules|": "$ln-8us31fZpKs9rYIX9qOvx3qOL56IfWPFiabNKaGZA",
+          "m.room.member|@drill-b1:reilly.asia": "$Qn6l6P_p3lfC3V55nmKZn49KajrwrEOvJmnVDaJ14H4",
+          "m.room.member|@drill-b2:reilly.asia": "$UqmgXH97_bz1tmRdD3aSIfapRfwHoeHfpulzNzRzrNk",
+          "m.room.member|@witness:witness.lab": "$2IfcHVdC-wVdaxn4Mmxncmszy-JA1k-5g_8cHoe1o9E",
+          "m.room.name|": "$QuDeF8tAp89-iP-hhWYTC5y8SviOjjbjYuc5DxrKnH4",
+          "m.room.power_levels|": "$ghqt3o0UFzS221v-WYmABCGnOYzq7ZYGRAGpcGNJosw",
+          "m.room.topic|": "$S5dA1YZntus_Fbcd5hpWtx-UWS0W918wTOUiWW4HqVg"
+        },
+        "state_events": 10
+      }
+    },
+    "v9": {
+      "A": {
+        "newest_event": "$8Tg4E_Ica8QM3zj-1ks0Y6eTfqNwxyLkublIoCcyEuo",
+        "state": {
+          "m.room.create|": "$0nsb-ywcU_K9vei-GsWa7NcKQSACqLhye0ZvKTV4x2A",
+          "m.room.guest_access|": "$BE-Tra-SeuluUy045QUNZm4aPUvb7YvjmOz1VLyt53Y",
+          "m.room.history_visibility|": "$bJ0w0ERJ_pVKCaFUdf5W8fK0hNEtYL_t2_gd9VKG4bA",
+          "m.room.join_rules|": "$-t6dVt7Ho6Z87m8rGJ8IpRQT4Gfet_JsSassSU1UEyc",
+          "m.room.member|@drill-b1:reilly.asia": "$40kxqIy9DRKQuSPw26DySeDZsrXoYH4s5RTLSlC0Bjg",
+          "m.room.member|@drill-b2:reilly.asia": "$Hh9EcLhMH7tNgySz7hBqF-sdUyynm9gyiZzXbRn7b9E",
+          "m.room.member|@witness:witness.lab": "$PiyG0rGHtDvO-Uhau0jNC_it0po6v56ybRXfDUE4knE",
+          "m.room.name|": "$oQWwKHoaKKN43pAiidZ97klcINuOpc2yuI2awXmoqos",
+          "m.room.power_levels|": "$OkmzNrWnvZoXB26-QeZaE7NSMuv2GY3yWuCHTb6R9wg",
+          "m.room.topic|": "$J8rbOa4VK5MIQdjuLIm9VSBZl4-qCuH3Zoj2jAGRXd0"
+        },
+        "state_events": 10
+      },
+      "A_equals_B_state": true,
+      "B": {
+        "newest_event": "$8Tg4E_Ica8QM3zj-1ks0Y6eTfqNwxyLkublIoCcyEuo",
+        "state": {
+          "m.room.create|": "$0nsb-ywcU_K9vei-GsWa7NcKQSACqLhye0ZvKTV4x2A",
+          "m.room.guest_access|": "$BE-Tra-SeuluUy045QUNZm4aPUvb7YvjmOz1VLyt53Y",
+          "m.room.history_visibility|": "$bJ0w0ERJ_pVKCaFUdf5W8fK0hNEtYL_t2_gd9VKG4bA",
+          "m.room.join_rules|": "$-t6dVt7Ho6Z87m8rGJ8IpRQT4Gfet_JsSassSU1UEyc",
+          "m.room.member|@drill-b1:reilly.asia": "$40kxqIy9DRKQuSPw26DySeDZsrXoYH4s5RTLSlC0Bjg",
+          "m.room.member|@drill-b2:reilly.asia": "$Hh9EcLhMH7tNgySz7hBqF-sdUyynm9gyiZzXbRn7b9E",
+          "m.room.member|@witness:witness.lab": "$PiyG0rGHtDvO-Uhau0jNC_it0po6v56ybRXfDUE4knE",
+          "m.room.name|": "$oQWwKHoaKKN43pAiidZ97klcINuOpc2yuI2awXmoqos",
+          "m.room.power_levels|": "$OkmzNrWnvZoXB26-QeZaE7NSMuv2GY3yWuCHTb6R9wg",
+          "m.room.topic|": "$J8rbOa4VK5MIQdjuLIm9VSBZl4-qCuH3Zoj2jAGRXd0"
+        },
+        "state_events": 10
+      }
+    }
+  },
+  "taken_at": "2026-10-03T22:10:14Z"
+}

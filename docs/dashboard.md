@@ -26,12 +26,12 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**224 routes implemented; 0 known gaps in scope.**
+**226 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
 
-### Admin & moderation — 55 implemented, 0 planned
+### Admin & moderation — 56 implemented, 0 planned
 
 - `GET /_spindle/admin/v1/audit`
 - `GET /_spindle/admin/v1/event_reports`
@@ -62,6 +62,7 @@ neither implemented nor counted.
 - `GET /_synapse/admin/v1/event_reports`
 - `GET /_synapse/admin/v1/event_reports/{report_id}`
 - `POST /_synapse/admin/v1/purge_history/{room_id}`
+- `GET/POST /_synapse/admin/v1/register`
 - `GET /_synapse/admin/v1/registration_tokens`
 - `POST /_synapse/admin/v1/registration_tokens/new`
 - `GET/PUT/DELETE /_synapse/admin/v1/registration_tokens/{token}`
@@ -115,10 +116,11 @@ neither implemented nor counted.
 
 - `POST /_matrix/client/v1/appservice/{appservice_id}/ping`
 
-### VoIP & MatrixRTC — 8 implemented, 0 planned
+### VoIP & MatrixRTC — 9 implemented, 0 planned
 
 - `GET /_matrix/client/unstable/org.matrix.msc4140/delayed_events`
 - `POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}`
+- `POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}`
 - `GET /_matrix/client/unstable/org.matrix.msc4143/rtc/transports`
 - `GET /_matrix/client/v1/rtc/transports`
 - `POST /_matrix/client/v3/user/{user_id}/openid/request_token`

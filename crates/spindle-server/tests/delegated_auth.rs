@@ -105,6 +105,16 @@ struct Instance {
 impl Instance {
     /// `provider` of `None` starts a plain local-auth instance.
     async fn start(provider: Option<&str>) -> Instance {
+        Self::start_with(
+            provider,
+            "client_id = \"spindle\"\nclient_secret = \"hush\"\n",
+        )
+        .await
+    }
+
+    /// As [`Self::start`], with `credentials` as the `[auth.delegated]`
+    /// lines that say how introspection authenticates.
+    async fn start_with(provider: Option<&str>, credentials: &str) -> Instance {
         let reg_dir = TempDir::new().unwrap();
         let reg_path = reg_dir.path().join("bridge.yaml");
         std::fs::write(
@@ -123,8 +133,7 @@ impl Instance {
         let auth = provider.map_or(String::new(), |url| {
             format!(
                 "[auth.delegated]\nissuer = \"{url}\"\n\
-                 introspection_endpoint = \"{url}/oauth2/introspect\"\n\
-                 client_id = \"spindle\"\nclient_secret = \"hush\"\n"
+                 introspection_endpoint = \"{url}/oauth2/introspect\"\n{credentials}"
             )
         });
         let config = spindle_server::Config::parse(&format!(
@@ -370,4 +379,48 @@ async fn legacy_auth_is_the_providers_business_now() {
         )
         .await;
     assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+async fn introspection_can_present_the_homeserver_secret_the_way_synapse_does() {
+    // Synapse's `matrix_authentication_service` section has no client of
+    // its own at MAS: it introspects with the shared `matrix.secret` as a
+    // bearer token, and MAS accepts that from its homeserver. A MAS set up
+    // that way (Element Server Suite's default) must work unchanged.
+    let (provider, url) = Provider::serve().await;
+    let server =
+        Instance::start_with(Some(&url), "homeserver_secret = \"shared-matrix-secret\"\n").await;
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(MAS_TOKEN),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["device_id"], "MASDEV1", "{body}");
+    let introspections = provider.introspections();
+    assert_eq!(introspections.len(), 1);
+    assert_eq!(introspections[0].0, "Bearer shared-matrix-secret");
+}
+
+#[test]
+fn introspection_needs_some_credential() {
+    let base = "[server]\nname = \"example.org\"\n[auth.delegated]\n\
+                issuer = \"http://mas/\"\nintrospection_endpoint = \"http://mas/oauth2/introspect\"\n";
+    // Neither a client pair nor the homeserver secret: nothing to present.
+    assert!(spindle_server::Config::parse(base).is_err());
+    // Half a client pair is a typo, not a choice.
+    assert!(
+        spindle_server::Config::parse(&format!(
+            "{base}client_id = \"x\"\nhomeserver_secret = \"s\"\n"
+        ))
+        .is_err()
+    );
+    assert!(spindle_server::Config::parse(&format!("{base}homeserver_secret = \"s\"\n")).is_ok());
+    assert!(
+        spindle_server::Config::parse(&format!("{base}client_id = \"x\"\nclient_secret = \"y\"\n"))
+            .is_ok()
+    );
 }

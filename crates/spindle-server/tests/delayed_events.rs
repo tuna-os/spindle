@@ -1153,3 +1153,82 @@ async fn a_filter_can_turn_the_report_off() {
         "the filter said no: {filtered}"
     );
 }
+
+/// The current MSC4140 shape, with the action in the path and no access
+/// token: `POST .../delayed_events/{delay_id}/{action}`. This is what
+/// lk-jwt-service (Element Server Suite's `MatrixRTC` authorisation service)
+/// calls for a client that delegated its leave event to it
+/// (`/delegate_delayed_leave`): `restart` while the participant is still
+/// connected to the SFU, `send` when they drop. The service holds none of
+/// the client's credentials; the delay ID is the capability.
+async fn act_by_id(harness: &Harness, delay_id: &str, action: &str) -> (StatusCode, Value) {
+    harness
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}"
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn a_delegate_restarts_and_sends_with_only_the_delay_id() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.create_room(&alice).await;
+    let delay_id = harness.delay_message(&room, &alice, 60_000, "left").await;
+    let started_at = harness.pending(&alice).await[0]["running_since"]
+        .as_u64()
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (status, body) = act_by_id(&harness, &delay_id, "restart").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let after = harness.pending(&alice).await;
+    assert_eq!(after.len(), 1);
+    assert!(
+        after[0]["running_since"].as_u64().unwrap() > started_at,
+        "a token-less restart did not restart: {after:?}"
+    );
+
+    let (status, body) = act_by_id(&harness, &delay_id, "send").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        harness
+            .timeline_bodies(&room, &alice)
+            .await
+            .contains(&"left".to_owned()),
+        "the delegate's send did not send it, as alice"
+    );
+    // Sent once: a second send finds nothing, which lk-jwt-service reads
+    // as "already sent".
+    let (status, _) = act_by_id(&harness, &delay_id, "send").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_token_less_action_on_an_unknown_delay_or_verb_is_refused() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.create_room(&alice).await;
+    let delay_id = harness.delay_message(&room, &alice, 60_000, "kept").await;
+
+    let (status, body) = act_by_id(&harness, "00000000000000000000000000000000", "cancel").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) = act_by_id(&harness, &delay_id, "explode").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        harness.pending(&alice).await.len(),
+        1,
+        "nothing was acted on"
+    );
+
+    let (status, body) = act_by_id(&harness, &delay_id, "cancel").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(harness.pending(&alice).await.is_empty());
+}

@@ -1,0 +1,60 @@
+{
+  "all_ok": false,
+  "at": "2026-10-03T22:48:53Z",
+  "label": "cutover2",
+  "rooms": {
+    "encrypted-v10": {
+      "A_to_B_event": "$LH5scLDMf5-K7LfiJuwk5CAD0jtY65j2V2HSiNYBekY",
+      "A_to_B_s": 0.5,
+      "B_to_A_event": "$t7Xj9AfyaFFr-V2JhCVyNYqfaf-B7LnGIsnDwlkOHPk",
+      "B_to_A_s": 0.51,
+      "ok": true
+    },
+    "fork-v10": {
+      "A_to_B_event": "$T75rKXhUwDBCwMCmJPMp95e1XKw9MBrqH-UTpk-vWUk",
+      "A_to_B_s": null,
+      "B_to_A_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such room'}",
+      "ok": false
+    },
+    "history-v10": {
+      "A_to_B_event": "$As-jRepRWj1MXBsGCVQcDiCx_IIPPZddGvd21kEqTuA",
+      "A_to_B_s": 0.5,
+      "B_to_A_event": "$icfDjCqgBjLVRgZYVw8t0Tw_I_XL-zvQ33xLS3iSwJs",
+      "B_to_A_s": 0.51,
+      "ok": true
+    },
+    "v1": {
+      "A_to_B_event": "$17910678559MKtAh:witness.lab",
+      "A_to_B_s": null,
+      "B_to_A_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such room'}",
+      "ok": false
+    },
+    "v10-general": {
+      "A_to_B_event": "$iCTn2YE0HlhVeCU-eVmvNSsm6Sn9KhqyWSgkKCVwalM",
+      "A_to_B_s": 0.5,
+      "B_to_A_event": "$UbieVPbC7KgpHpUDLE8DnKNCVdizqRcr3_n2v75l4bM",
+      "B_to_A_s": 1.03,
+      "ok": true
+    },
+    "v12-witness-created": {
+      "A_to_B_event": "$klRc9saOvcW2kw56eHytY-wo1234oPrC3vebuqDTcrs",
+      "A_to_B_s": null,
+      "B_to_A_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such event'}",
+      "ok": false
+    },
+    "v6": {
+      "A_to_B_event": "$hsorQOSqqBpcQ2BTw6z3HkHA_5F5zQVDtrZ9gBRuZwg",
+      "A_to_B_s": 0.5,
+      "B_to_A_event": "$KjVNlc5oRKmhcggpFJRNkqZXBTRqINY5Dqw9xEcWQ_s",
+      "B_to_A_s": 0.51,
+      "ok": true
+    },
+    "v9": {
+      "A_to_B_event": "$QfHJInAyk_lAH5G5vr0zaNq0W16gvcshTc63ryekkIo",
+      "A_to_B_s": 0.5,
+      "B_to_A_event": "$xKzt7txEmLaLFvemOtt9RZAMo4pc5vcAAKNmls1Qqlc",
+      "B_to_A_s": 0.51,
+      "ok": true
+    }
+  }
+}

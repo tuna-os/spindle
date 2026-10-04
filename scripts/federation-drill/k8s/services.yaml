@@ -1,0 +1,42 @@
+# Fixed ClusterIPs, because the private resolver hands these out and each
+# netwatch allows exactly the peer's address. Port 443 is the TLS front
+# (federation and .well-known); 8008 is the client API for the drill client.
+# The selectors pick the pod by app label, so the cut-over from Synapse B
+# to Spindle B keeps the address, as the production ingress would.
+apiVersion: v1
+kind: Service
+metadata:
+  name: drill-a
+  labels: {app: drill-a, part-of: federation-drill}
+spec:
+  type: ClusterIP
+  clusterIP: 10.111.63.11
+  selector: {app: drill-a}
+  ports:
+  - {name: https, port: 443, targetPort: 8443}
+  - {name: client, port: 8008, targetPort: 8008}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: drill-b
+  labels: {app: drill-b, part-of: federation-drill}
+spec:
+  type: ClusterIP
+  clusterIP: 10.111.63.12
+  selector: {app: drill-b}
+  ports:
+  - {name: https, port: 443, targetPort: 8443}
+  - {name: client, port: 8008, targetPort: 8008}
+---
+# Synapse B's media store, Spindle B's store and the seal backups.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: drill-b-data
+  labels: {part-of: federation-drill}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests: {storage: 4Gi}
