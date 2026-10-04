@@ -30,6 +30,7 @@ pub mod livekit;
 pub mod mas;
 pub mod media;
 pub mod metrics;
+pub mod moderation_routes;
 pub mod netguard;
 pub mod oidc;
 pub mod openid;
