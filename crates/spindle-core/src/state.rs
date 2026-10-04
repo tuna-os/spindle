@@ -723,6 +723,67 @@ impl StateSnapshot {
             len,
         })
     }
+
+    /// Read one persisted state slot without materializing the other slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RehydrateError`] for missing, malformed or incorrectly addressed nodes.
+    pub fn get_persisted(
+        mut root: StateRoot,
+        key: &StateKey,
+        load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+    ) -> Result<Option<String>, RehydrateError> {
+        if root == Self::new().root() {
+            return Ok(None);
+        }
+        let digest = key.digest();
+        for depth in 0..=MAX_DEPTH {
+            let bytes = load(&root).ok_or(RehydrateError::MissingNode)?;
+            match bytes.first().copied() {
+                Some(TAG_LEAF) => {
+                    let leaf = rebuild(&root, &mut |_| Some(bytes.clone()), depth)?;
+                    return Ok(leaf.get(key, &digest, depth).map(str::to_owned));
+                }
+                Some(TAG_BRANCH) => {
+                    if depth == MAX_DEPTH {
+                        return Err(RehydrateError::Malformed);
+                    }
+                    let mut at = 1;
+                    let bitmap = u32::from_be_bytes(take_array::<4>(&bytes, &mut at)?);
+                    let count = take_count(&bytes, &mut at, 32)?;
+                    if count != bitmap.count_ones() as usize {
+                        return Err(RehydrateError::Malformed);
+                    }
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(HAMT_BRANCH_TAG);
+                    hasher.update(&bitmap.to_be_bytes());
+                    let bit = 1_u32 << digest_slot(&digest, depth);
+                    let selected = (bitmap & (bit - 1)).count_ones() as usize;
+                    let mut next = None;
+                    for index in 0..count {
+                        let address = take_array::<32>(&bytes, &mut at)?;
+                        hasher.update(&address);
+                        if bitmap & bit != 0 && index == selected {
+                            next = Some(StateRoot(address));
+                        }
+                    }
+                    if at != bytes.len() {
+                        return Err(RehydrateError::Malformed);
+                    }
+                    if hasher.finalize().as_bytes() != root.as_bytes() {
+                        return Err(RehydrateError::HashMismatch);
+                    }
+                    let Some(next) = next else {
+                        return Ok(None);
+                    };
+                    root = next;
+                }
+                _ => return Err(RehydrateError::Malformed),
+            }
+        }
+        Err(RehydrateError::Malformed)
+    }
 }
 
 /// Emit the nodes `new` has that `old` did not, descending only where they
