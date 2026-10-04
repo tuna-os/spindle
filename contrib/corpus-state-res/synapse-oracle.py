@@ -20,11 +20,18 @@ async def replay(path):
     version = KNOWN_ROOM_VERSIONS[create["content"].get("room_version", "1")]
     rejected = set(fixture["rejected"])
     events = {}
+    missing_auth = set()
     for event_id, body in bodies.items():
-        body = dict(body, event_id=event_id, room_id=fixture["room_id"])
+        body = dict(body, room_id=fixture["room_id"])
+        if version.event_format == 1:
+            body["event_id"] = event_id
+        else:
+            body.pop("event_id", None)
         events[event_id] = make_event_from_dict(
             body, version, rejected_reason="auth_error" if event_id in rejected else None
         )
+        if events[event_id].event_id != event_id:
+            raise ValueError("Fixture event ID does not match its original signed PDU")
 
     class Clock:
         async def sleep(self, duration):
@@ -52,7 +59,11 @@ async def replay(path):
                     seen.add(event_id)
                     event = events.get(event_id)
                     if event is None:
-                        raise ValueError("Fixture lacks an auth-chain event")
+                        # Synapse can retain references to historical PDUs it
+                        # does not have. Keep the referenced ID in the chain,
+                        # and report this limitation instead of fabricating it.
+                        missing_auth.add(event_id)
+                        continue
                     pending.extend(event.auth_event_ids())
                 chains.append(seen)
             difference = set.union(*chains) - set.intersection(*chains)
@@ -79,6 +90,7 @@ async def replay(path):
         "synapse_differs_from_source": differences(fixture["expected"]),
         "synapse_differs_from_live": differences(fixture["live"]),
         "masked_own_slot": ignore is not None,
+        "unavailable_auth_pdus": len(missing_auth),
     }))
 
 
