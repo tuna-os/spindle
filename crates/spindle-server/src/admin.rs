@@ -292,6 +292,31 @@ impl FromRequestParts<AppState> for AdminActor {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+        let token = crate::auth::bearer(parts).ok_or_else(MatrixError::missing_token)?;
+        if let Some(delegated) = &state.delegated
+            && accounts
+                .identify(&token)
+                .map_err(|error| MatrixError::internal(&error.to_string()))?
+                .is_none()
+            && state.appservices.by_token(&token).is_none()
+        {
+            let identity = delegated
+                .identify_admin(state.store.as_ref(), &state.config.server.name, &token)
+                .await?;
+            let localpart = local_localpart(state, &identity.user_id)
+                .ok_or_else(|| MatrixError::forbidden("only local accounts can be admins"))?;
+            if accounts
+                .account(&localpart)
+                .map_err(|error| MatrixError::internal(&error.to_string()))?
+                .is_none_or(|account| account.deactivated || account.locked || account.suspended)
+            {
+                return Err(MatrixError::forbidden(
+                    "account cannot administer the server",
+                ));
+            }
+            return Ok(Self(identity));
+        }
         let Authenticated(identity) = Authenticated::from_request_parts(parts, state).await?;
         let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
         let localpart = local_localpart(state, &identity.user_id)

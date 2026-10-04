@@ -168,7 +168,7 @@ impl FromRequestParts<AppState> for MaybeAuthenticated {
 /// The `?access_token=` query parameter is the deprecated alternative and is
 /// deliberately not read: it lands in access logs, proxy logs and browser
 /// history, which is exactly what a bearer credential must not do.
-fn bearer(parts: &Parts) -> Option<String> {
+pub(crate) fn bearer(parts: &Parts) -> Option<String> {
     let value = parts.headers.get(AUTHORIZATION)?.to_str().ok()?;
     value
         .strip_prefix("Bearer ")

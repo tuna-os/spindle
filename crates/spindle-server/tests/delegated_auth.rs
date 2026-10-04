@@ -70,7 +70,21 @@ impl Provider {
                             .lock()
                             .unwrap()
                             .push((authorization, body.clone()));
-                        if body.contains(&format!("token={MAS_TOKEN}")) {
+                        let token = form_urlencoded::parse(body.as_bytes())
+                            .find(|(key, _)| key == "token").map(|(_, value)| value.into_owned()).unwrap_or_default();
+                        let scopes = match token.as_str() {
+                            "mat_admin_access_token" => Some("urn:matrix:org.matrix.msc2967.client:api:* urn:synapse:admin:* urn:mas:admin"),
+                            "mat_stable_access_token" => Some("urn:matrix:client:api:* urn:matrix:client:device:STABLEDEV"),
+                            "mat_multiple_devices" => Some("urn:matrix:client:api:* urn:matrix:client:device:ONE urn:matrix:client:device:TWO"),
+                            "mat_mas_admin_only" => Some("urn:matrix:client:api:* urn:mas:admin"),
+                            "mat_empty_device" => Some("urn:matrix:client:api:* urn:matrix:client:device:"),
+                            _ => None,
+                        };
+                        if token == "mat_compatibility_access_token" {
+                            axum::Json(json!({ "active": true, "username": "alice", "scope": "urn:matrix:client:api:*", "device_id": "COMPATDEV" }))
+                        } else if let Some(scope) = scopes {
+                            axum::Json(json!({ "active": true, "username": "alice", "scope": scope }))
+                        } else if token == MAS_TOKEN {
                             axum::Json(json!({
                                 "active": true,
                                 "username": "alice",
@@ -99,6 +113,7 @@ struct Instance {
     _dir: TempDir,
     _reg_dir: TempDir,
     name: String,
+    store: Arc<FjallStore>,
     client: reqwest::Client,
 }
 
@@ -142,7 +157,7 @@ impl Instance {
             reg_path.display()
         ))
         .unwrap();
-        let app = spindle_server::app(config, store).expect("the app builds");
+        let app = spindle_server::app(config, store.clone()).expect("the app builds");
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -150,6 +165,7 @@ impl Instance {
             _dir: dir,
             _reg_dir: reg_dir,
             name,
+            store,
             client: reqwest::Client::new(),
         }
     }
@@ -423,4 +439,126 @@ fn introspection_needs_some_credential() {
         spindle_server::Config::parse(&format!("{base}client_id = \"x\"\nclient_secret = \"y\"\n"))
             .is_ok()
     );
+}
+
+#[tokio::test]
+async fn delegated_admin_scope_is_a_token_capability_without_a_device() {
+    let (provider, url) = Provider::serve().await;
+    let server = Instance::start(Some(&url)).await;
+    let admin = "mat_admin_access_token";
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/server_version",
+            Some(admin),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let accounts = spindle_server::accounts::Accounts::new(server.store.as_ref(), &server.name);
+    assert!(!accounts.account("alice").unwrap().unwrap().admin);
+    assert!(accounts.devices_of("alice").unwrap().is_empty());
+    // Reusing the cached verdict on a client endpoint cannot invent a device.
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/keys/upload",
+            Some(admin),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 401, "{body}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/server_version",
+            Some(admin),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(provider.introspections().len(), 1);
+    // A different token for this same user cannot inherit the first token's scope.
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(MAS_TOKEN),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/server_version",
+            Some(MAS_TOKEN),
+            None,
+        )
+        .await;
+    assert_eq!(status, 403, "{body}");
+    assert!(!accounts.account("alice").unwrap().unwrap().admin);
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v2/users",
+            Some(admin),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    accounts.set_locked("alice", true).unwrap();
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/server_version",
+            Some(admin),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 403,
+        "account hold applies to a cached admin token: {body}"
+    );
+}
+
+#[tokio::test]
+async fn delegated_scopes_accept_stable_names_and_reject_ambiguous_devices() {
+    let (_provider, url) = Provider::serve().await;
+    let server = Instance::start(Some(&url)).await;
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some("mat_stable_access_token"),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["device_id"], "STABLEDEV");
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some("mat_compatibility_access_token"),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["device_id"], "COMPATDEV");
+    for token in [
+        "mat_multiple_devices",
+        "mat_empty_device",
+        "mat_mas_admin_only",
+    ] {
+        let (status, body) = server
+            .request(
+                reqwest::Method::GET,
+                "/_synapse/admin/v1/server_version",
+                Some(token),
+                None,
+            )
+            .await;
+        assert_eq!(status, 401, "{token}: {body}");
+    }
 }
