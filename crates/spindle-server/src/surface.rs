@@ -147,6 +147,8 @@ pub const ROOM_VERSION_REQUIRES: &[&str] = &[
 
 /// Unstable features. Same rule: nothing here that is not built.
 pub const UNSTABLE_FEATURES: &[(&str, bool)] = &[
+    // MSC4108 rendezvous for linking a new device through MAS.
+    ("org.matrix.msc4108", true),
     // MSC3266's room summary. Advertised because the endpoint is served under
     // the unstable prefix as well as at `/v1/room_summary`, and a client that
     // checks this flag before probing the unstable path is doing the right

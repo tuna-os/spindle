@@ -117,6 +117,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::admin::routes())
         .merge(crate::oidc::routes())
         .merge(crate::openid::routes())
+        .merge(crate::rendezvous::routes())
         .merge(crate::livekit::routes())
         // SPEC: an endpoint the server does not recognize answers 404
         // M_UNRECOGNIZED — a JSON verdict, not a bare status. Clients (and
@@ -251,7 +252,9 @@ async fn cors(
     );
     headers.insert(
         "access-control-allow-headers",
-        axum::http::HeaderValue::from_static("X-Requested-With, Content-Type, Authorization"),
+        axum::http::HeaderValue::from_static(
+            "X-Requested-With, Content-Type, Authorization, If-Match, If-None-Match",
+        ),
     );
     response
 }

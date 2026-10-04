@@ -42,6 +42,7 @@ pub mod push_rules;
 pub mod pushers;
 pub mod ratelimit;
 pub mod registration_tokens;
+pub mod rendezvous;
 pub mod rooms;
 pub mod routes;
 pub mod s3;
@@ -101,6 +102,7 @@ pub struct AppState {
     /// Single-use challenges for Synapse-compatible shared-secret account
     /// creation. Process-local because a restart invalidates them.
     pub registration_nonces: Arc<shared_secret_registration::RegistrationNonces>,
+    pub rendezvous: Arc<rendezvous::Rendezvous>,
 }
 
 /// Why the application cannot be built. Both are startup-fatal on purpose:
@@ -265,6 +267,7 @@ pub fn app_with_metrics(
         )),
         push,
         registration_nonces: Arc::new(shared_secret_registration::RegistrationNonces::new()),
+        rendezvous: Arc::new(rendezvous::Rendezvous::new()),
         metrics,
     };
     spawn_delivery_loops(&state);
