@@ -109,6 +109,16 @@ locally built binary through `SPINDLE_BIN`, its runtime image must support
 that binary's libc version. The verifier uses its own Python image and does
 not require Python in the server image.
 
+The report verifier and driver ordering tests run without a cluster:
+
+```sh
+python3 scripts/federation-drill/test_verify_import.py
+python3 scripts/federation-drill/test_drill_driver.py
+shellcheck scripts/federation-drill/drill.sh
+```
+
+CI runs both Python suites and checks the driver's shell syntax.
+
 `fedcheck.py` runs inside the `synapse` container of `drill-a`, with the
 script on standard input. It uses the resolver, trust store, server key
 and database of A. It checks events with the event code of Synapse.

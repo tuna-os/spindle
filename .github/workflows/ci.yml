@@ -127,6 +127,12 @@ jobs:
       - name: Check the Synapse fixture builder
         run: python3 scripts/synapse-fixture-test.py
 
+      - name: Check federation drill import and cutover refusals
+        run: |
+          python3 scripts/federation-drill/test_verify_import.py
+          python3 scripts/federation-drill/test_drill_driver.py
+          bash -n scripts/federation-drill/drill.sh
+
       # The alert rules and the dashboard under deploy/ rot silently: a
       # renamed metric leaves a rule that never fires and a panel that
       # draws nothing. This holds every metric they name to metrics.rs and

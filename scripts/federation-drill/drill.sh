@@ -70,6 +70,7 @@ verify_import() {
   [ -n "$ROOMS" ] && [ -n "$USERS" ] || { echo 'missing expected fixture IDs' >&2; return 1; }
   $K create configmap drill-import-proof --from-file=verify-import.py="$HERE/verify-import.py" \
     --dry-run=client -o yaml | $K apply -f -
+  $K label cm drill-import-proof part-of=federation-drill --overwrite >/dev/null
   $K delete pod drill-import-proof --ignore-not-found --wait >/dev/null
   proof_pod=$(python3 - "$ROOMS" "$USERS" <<'PY'
 import json,sys
