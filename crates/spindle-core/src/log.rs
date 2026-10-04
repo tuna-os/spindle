@@ -244,16 +244,16 @@ impl StateResolver for Strict {
             return Ok(StateSnapshot::new());
         };
         for other in rest {
-            if let Some(difference) = first.diff(other).into_iter().next() {
+            if let Some((key, _, _)) = first.diff(other).into_iter().next() {
                 let candidates = states
                     .iter()
-                    .filter_map(|state| state.get(&difference.key))
+                    .filter_map(|state| state.get(key))
                     .map(EventId::new)
                     .collect::<BTreeSet<_>>()
                     .into_iter()
                     .collect();
                 return Err(AppendError::NeedsStateResolution {
-                    key: difference.key,
+                    key: key.clone(),
                     candidates,
                 });
             }
@@ -626,6 +626,18 @@ impl RoomLog {
     #[must_use]
     pub fn entries(&self) -> impl DoubleEndedIterator<Item = &LogEntry> + ExactSizeIterator {
         self.entries.values()
+    }
+
+    /// The entries whose linear index falls in `range`, oldest first.
+    ///
+    /// A `BTreeMap` range probe, so a page that starts deep in a room's
+    /// history does not first walk past everything on the other side of
+    /// it: `entries().filter(..)` reads the same rows and drops most.
+    pub fn entries_in(
+        &self,
+        range: impl std::ops::RangeBounds<i64>,
+    ) -> impl DoubleEndedIterator<Item = &LogEntry> {
+        self.entries.range(range).map(|(_, entry)| entry)
     }
 
     #[must_use]

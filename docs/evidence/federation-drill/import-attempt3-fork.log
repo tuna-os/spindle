@@ -1,0 +1,3 @@
+room !UpTFCotHHetkcMTxeM:reilly.asia: room_events=26
+room !WpvjQmNLGeVSCrQGXP:reilly.asia: room_events=3275
+spindle: room rehearsal failed for !XQcGaGIqHToDSLojtJ:reilly.asia: !XQcGaGIqHToDSLojtJ:reilly.asia: the log refused $WTF_Yul9-xHrCbtio657_95NCJvXQEzsIjTKNnYq9l8: NeedsStateResolution { key: StateKey { event_type: EventType("m.room.power_levels"), state_key: "" }, candidates: [EventId("$cLboU6epLcboMbG0ulQgrJiJGNVyOrYurMtAN1GX9gE"), EventId("$dtW0EXcs3jErLLycyf9n_wjY1yr40FRTJdcQ5IlZoKE")] }

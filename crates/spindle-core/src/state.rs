@@ -185,6 +185,25 @@ impl StateSnapshot {
         }
     }
 
+    /// Visit every state slot in deterministic key order.
+    /// Visit every entry, **in key order**.
+    ///
+    /// The order is part of the contract, not an accident of the walk: the
+    /// trie places entries by digest, so an unsorted walk would return the
+    /// same state in an order that shifts with the key set. Callers that
+    /// render state to a client compare successive responses, and a set that
+    /// reorders itself looks like a set that changed.
+    pub fn for_each(&self, mut visitor: impl FnMut(&StateKey, &str)) {
+        let mut entries = Vec::with_capacity(self.len);
+        if let Some(root) = &self.root {
+            root.collect(&mut entries);
+        }
+        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        for (key, event_id) in entries {
+            visitor(key, event_id);
+        }
+    }
+
     /// Return a new snapshot without `key`, or an unchanged clone when the
     /// key is absent.
     ///
@@ -210,107 +229,113 @@ impl StateSnapshot {
         }
     }
 
-    /// Every slot whose value differs between `self` and `other`, as
-    /// `(key, ours, theirs)`, in key order.
+    /// Every slot where `self` and `other` disagree, in key order, as
+    /// `(key, ours, theirs)`. A slot only one side holds has `None` on the
+    /// other.
     ///
-    /// Proportional to the difference, not to the state: content addressing
-    /// means a subtree with the same hash on both sides is the same subtree,
-    /// and the walk does not enter it. Two snapshots that share all but a
-    /// few paths -- two branches of a fork, or a state and the one an event
-    /// moved it to -- compare in `O(changed x log n)`.
+    /// Two snapshots that share history share most of their trie: path
+    /// copying keeps an untouched subtree at the same content address, so
+    /// the walk skips every subtree whose hash matches and visits only the
+    /// paths that changed. Diffing two states of a large room that differ
+    /// in a few slots costs those few paths, not a pass over every member --
+    /// which is what a fork merge or a state comparison needs.
     #[must_use]
-    pub fn diff(&self, other: &Self) -> Vec<StateDifference> {
+    pub fn diff<'a>(
+        &'a self,
+        other: &'a Self,
+    ) -> Vec<(&'a StateKey, Option<&'a str>, Option<&'a str>)> {
         let mut out = Vec::new();
         diff_nodes(self.root.as_deref(), other.root.as_deref(), &mut out);
-        out.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+        out.sort_unstable_by(|(left, ..), (right, ..)| left.cmp(right));
         out
     }
-
-    /// Visit every state slot in deterministic key order.
-    /// Visit every entry, **in key order**.
-    ///
-    /// The order is part of the contract, not an accident of the walk: the
-    /// trie places entries by digest, so an unsorted walk would return the
-    /// same state in an order that shifts with the key set. Callers that
-    /// render state to a client compare successive responses, and a set that
-    /// reorders itself looks like a set that changed.
-    pub fn for_each(&self, mut visitor: impl FnMut(&StateKey, &str)) {
-        let mut entries = Vec::with_capacity(self.len);
-        if let Some(root) = &self.root {
-            root.collect(&mut entries);
-        }
-        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-        for (key, event_id) in entries {
-            visitor(key, event_id);
-        }
-    }
 }
 
-/// One slot two snapshots disagree on, from [`StateSnapshot::diff`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StateDifference {
-    pub key: StateKey,
-    /// The value in the snapshot `diff` was called on.
-    pub ours: Option<Box<str>>,
-    /// The value in the snapshot passed to `diff`.
-    pub theirs: Option<Box<str>>,
-}
+type SlotDiff<'a> = (&'a StateKey, Option<&'a str>, Option<&'a str>);
 
-/// Collect the slots `left` and `right` disagree on.
+/// Descend two tries in step, skipping subtrees with equal hashes.
 ///
-/// Equal hashes end the descent. Two branches recurse slot by slot; any
-/// other pairing -- a leaf against a branch, two leaves, one side absent --
-/// is small on at least one side, and is compared by collecting both.
-fn diff_nodes(left: Option<&Node>, right: Option<&Node>, out: &mut Vec<StateDifference>) {
+/// Both tries place a key by the same digest bits, so a branch slot on one
+/// side can only hold keys that the same slot holds on the other. Where the
+/// shapes differ at a level (a leaf on one side, a branch on the other), the
+/// two subtrees are small by construction -- a leaf sits where its slot has
+/// one digest -- and are compared entry by entry.
+fn diff_nodes<'a>(left: Option<&'a Node>, right: Option<&'a Node>, out: &mut Vec<SlotDiff<'a>>) {
     match (left, right) {
         (None, None) => {}
         (Some(left), Some(right)) if left.hash() == right.hash() => {}
         (
             Some(Node::Branch {
-                bitmap: left_bits, ..
+                bitmap: left_bitmap,
+                children: left_children,
+                ..
             }),
             Some(Node::Branch {
-                bitmap: right_bits, ..
+                bitmap: right_bitmap,
+                children: right_children,
+                ..
             }),
         ) => {
-            let (Some(left), Some(right)) = (left, right) else {
-                return;
+            let child = |bitmap: u32, children: &'a [Arc<Node>], bit: u32| -> Option<&'a Node> {
+                if bitmap & bit == 0 {
+                    return None;
+                }
+                let index = (bitmap & (bit - 1)).count_ones() as usize;
+                children.get(index).map(AsRef::as_ref)
             };
-            let mut slots = left_bits | right_bits;
+            let mut slots = left_bitmap | right_bitmap;
             while slots != 0 {
-                let slot = slots.trailing_zeros();
-                slots &= slots - 1;
-                diff_nodes(child_at_slot(left, slot), child_at_slot(right, slot), out);
+                let bit = slots & slots.wrapping_neg();
+                slots &= !bit;
+                diff_nodes(
+                    child(*left_bitmap, left_children, bit),
+                    child(*right_bitmap, right_children, bit),
+                    out,
+                );
             }
         }
         (left, right) => {
             let mut ours = Vec::new();
             let mut theirs = Vec::new();
-            if let Some(left) = left {
-                left.collect(&mut ours);
+            if let Some(node) = left {
+                node.collect(&mut ours);
             }
-            if let Some(right) = right {
-                right.collect(&mut theirs);
+            if let Some(node) = right {
+                node.collect(&mut theirs);
             }
-            let ours: std::collections::BTreeMap<&StateKey, &str> = ours.into_iter().collect();
-            let theirs: std::collections::BTreeMap<&StateKey, &str> = theirs.into_iter().collect();
-            for (key, value) in &ours {
-                let other = theirs.get(key).copied();
-                if other != Some(*value) {
-                    out.push(StateDifference {
-                        key: (*key).clone(),
-                        ours: Some((*value).into()),
-                        theirs: other.map(Into::into),
-                    });
-                }
-            }
-            for (key, value) in &theirs {
-                if !ours.contains_key(key) {
-                    out.push(StateDifference {
-                        key: (*key).clone(),
-                        ours: None,
-                        theirs: Some((*value).into()),
-                    });
+            ours.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+            theirs.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+            let (mut i, mut j) = (0, 0);
+            loop {
+                match (ours.get(i), theirs.get(j)) {
+                    (None, None) => break,
+                    (Some((key, value)), None) => {
+                        out.push((*key, Some(*value), None));
+                        i += 1;
+                    }
+                    (None, Some((key, value))) => {
+                        out.push((*key, None, Some(*value)));
+                        j += 1;
+                    }
+                    (Some((left_key, left_value)), Some((right_key, right_value))) => {
+                        match left_key.cmp(right_key) {
+                            Ordering::Less => {
+                                out.push((*left_key, Some(*left_value), None));
+                                i += 1;
+                            }
+                            Ordering::Greater => {
+                                out.push((*right_key, None, Some(*right_value)));
+                                j += 1;
+                            }
+                            Ordering::Equal => {
+                                if left_value != right_value {
+                                    out.push((*left_key, Some(*left_value), Some(*right_value)));
+                                }
+                                i += 1;
+                                j += 1;
+                            }
+                        }
+                    }
                 }
             }
         }

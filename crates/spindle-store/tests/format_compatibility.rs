@@ -200,6 +200,9 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::LoginToken, 0x39),
         (Keyspace::RegistrationToken, 0x3a),
         (Keyspace::ServerNoticeRoom, 0x3b),
+        (Keyspace::AccountDataStream, 0x3c),
+        (Keyspace::SynapsePosition, 0x3e),
+        (Keyspace::SynapseTopologicalPosition, 0x3f),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(

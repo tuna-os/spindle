@@ -212,6 +212,26 @@ pub trait ReadView {
         start: &[u8],
         end: &[u8],
     ) -> Result<Vec<Record>, StoreError>;
+
+    /// The last entry whose key starts with `prefix` and sorts *before*
+    /// `end`, or `None` when there is none.
+    ///
+    /// The nearest-at-or-below lookup: "which stored position is the last
+    /// one at or before this point". Reading the whole range with
+    /// [`Self::scan_until`] and keeping its last row costs every row below
+    /// the point, which for a position near the end of a large room is the
+    /// room. The default does exactly that, for a backend with no reverse
+    /// iteration; the Fjall store walks one step back from `end`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the read fails.
+    fn last_before(&self, prefix: &[u8], end: &[u8]) -> Result<Option<Record>, StoreError> {
+        if end <= prefix {
+            return Ok(None);
+        }
+        Ok(self.scan_until(prefix, prefix, end)?.pop())
+    }
 }
 
 pub trait Store: ReadView {
@@ -783,6 +803,17 @@ const MARKER_VERSION: u8 = 2;
 /// The three-byte marker, still readable. See [`SchemaMarker::decode`].
 const MARKER_V1: u8 = 1;
 
+fn prefix_ceiling(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut ceiling = prefix.to_vec();
+    while let Some(last) = ceiling.pop() {
+        if last != u8::MAX {
+            ceiling.push(last + 1);
+            return Some(ceiling);
+        }
+    }
+    None
+}
+
 impl ReadView for FjallStore {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         self.reads.fetch_add(1, Ordering::Relaxed);
@@ -834,6 +865,22 @@ impl ReadView for FjallStore {
         }
         self.scanned.fetch_add(out.len() as u64, Ordering::Relaxed);
         Ok(out)
+    }
+
+    fn last_before(&self, prefix: &[u8], end: &[u8]) -> Result<Option<Record>, StoreError> {
+        if end <= prefix {
+            return Ok(None);
+        }
+        let end = prefix_ceiling(prefix)
+            .map_or_else(|| end.to_vec(), |ceiling| ceiling.min(end.to_vec()));
+        let Some(pair) = self.partition.range(prefix.to_vec()..end).next_back() else {
+            return Ok(None);
+        };
+        let (key, value) = pair.into_inner()?;
+        self.scanned.fetch_add(1, Ordering::Relaxed);
+        Ok(key
+            .starts_with(prefix)
+            .then(|| (key.to_vec(), value.to_vec())))
     }
 }
 
@@ -897,6 +944,23 @@ impl ReadView for FjallCheckpoint {
             out.push((key.to_vec(), value.to_vec()));
         }
         Ok(out)
+    }
+
+    fn last_before(&self, prefix: &[u8], end: &[u8]) -> Result<Option<Record>, StoreError> {
+        if end <= prefix {
+            return Ok(None);
+        }
+        let end = prefix_ceiling(prefix)
+            .map_or_else(|| end.to_vec(), |ceiling| ceiling.min(end.to_vec()));
+        let Some(pair) = self.0.range(&self.1, prefix.to_vec()..end).next_back() else {
+            return Ok(None);
+        };
+        let (key, value) = pair
+            .into_inner()
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        Ok(key
+            .starts_with(prefix)
+            .then(|| (key.to_vec(), value.to_vec())))
     }
 }
 

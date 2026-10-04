@@ -58,9 +58,9 @@ impl StateResolver for Recording {
         self.calls += 1;
         let mut out = states.first().cloned().unwrap_or_default();
         for other in states.iter().skip(1) {
-            for difference in out.clone().diff(other) {
-                if let Some(theirs) = difference.theirs {
-                    out = out.apply(difference.key, theirs);
+            for (key, _, theirs) in out.clone().diff(other) {
+                if let Some(theirs) = theirs {
+                    out = out.apply(key.clone(), theirs);
                 }
             }
         }

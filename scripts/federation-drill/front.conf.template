@@ -1,0 +1,38 @@
+# TLS front for one lab server, in the place ESS's ingress and HAProxy hold
+# in production: it serves /.well-known/matrix/server for the bare server
+# name and passes federation to the homeserver. The same front stays in
+# place while Synapse B is replaced by Spindle B, as the production ingress
+# would. Rendered by the nginx image's envsubst from:
+#   SERVER_NAME   e.g. reilly.asia
+#   FED_HOST      the delegated host, e.g. matrix.reilly.asia
+#   FED_UPSTREAM  where federation goes inside the pod, e.g. 127.0.0.1:8009
+server {
+    listen 8443 ssl;
+    server_name ${SERVER_NAME} ${FED_HOST};
+    ssl_certificate     /tls/tls.chain.crt;
+    ssl_certificate_key /tls/tls.key;
+    access_log /dev/stdout;
+    client_max_body_size 50m;
+
+    location = /.well-known/matrix/server {
+        default_type application/json;
+        return 200 '{"m.server": "${FED_HOST}:443"}';
+    }
+    location /_matrix/federation/ {
+        if (-f /tmp/partition) { return 503; }
+        proxy_pass http://${FED_UPSTREAM};
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 120s;
+    }
+    location /_matrix/key/ {
+        proxy_pass http://${FED_UPSTREAM};
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+    location / {
+        return 404;
+    }
+}

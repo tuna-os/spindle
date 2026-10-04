@@ -50,7 +50,7 @@ type Key = (String, String);
 #[derive(Clone)]
 struct Room {
     version: RoomVersionId,
-    room_id: String,
+    id: String,
     bodies: HashMap<String, Value>,
     depth: HashMap<String, u64>,
     state: BTreeMap<Key, String>,
@@ -62,8 +62,8 @@ struct Room {
 impl Room {
     fn new(version: RoomVersionId) -> Self {
         let mut room = Self {
-            version: version.clone(),
-            room_id: String::new(),
+            version,
+            id: String::new(),
             bodies: HashMap::new(),
             depth: HashMap::new(),
             state: BTreeMap::new(),
@@ -72,12 +72,12 @@ impl Room {
             label: String::new(),
         };
         let v12 = room.rules().authorization.room_create_event_id_as_room_id;
-        room.room_id = if v12 {
+        room.id = if v12 {
             "!create".to_owned()
         } else {
             "!room:example.org".to_owned()
         };
-        let mut create = json!({ "room_version": version.as_str() });
+        let mut create = json!({ "room_version": room.version.as_str() });
         if !v12 {
             create["creator"] = json!(ALICE);
         }
@@ -203,7 +203,7 @@ impl Room {
         ts: u64,
     ) -> String {
         self.counter += 1;
-        let id = if kind == "m.room.create" && self.room_id == "!create" {
+        let id = if kind == "m.room.create" && self.id == "!create" {
             "$create".to_owned()
         } else if self.names_by_origin() {
             format!("$e{}{}:example.org", self.counter, self.label)
@@ -226,8 +226,8 @@ impl Room {
             "prev_events": prev.iter().map(|id| self.reference(id)).collect::<Vec<_>>(),
             "auth_events": auth.iter().map(|id| self.reference(id)).collect::<Vec<_>>(),
         });
-        if !(kind == "m.room.create" && self.room_id == "!create") {
-            body["room_id"] = json!(self.room_id);
+        if !(kind == "m.room.create" && self.id == "!create") {
+            body["room_id"] = json!(self.id);
         }
         if let Some(state_key) = state_key {
             body["state_key"] = json!(state_key);
@@ -272,7 +272,7 @@ impl Room {
     }
 
     fn stored(&self, id: &str) -> Option<StoredEvent> {
-        StoredEvent::parse_in(id, &self.room_id, self.bodies.get(id)?).ok()
+        StoredEvent::parse_in(id, &self.id, self.bodies.get(id)?).ok()
     }
 
     fn auth_of(&self, id: &str) -> Vec<String> {
@@ -478,7 +478,7 @@ fn check(version: &RoomVersionId, seed: u64) {
     for index in 0..branch_count {
         let mut branch = base.fork(&format!("b{index}"));
         let mut branch_clock = clock + rng.below(30);
-        for _ in 0..(1 + rng.below(4)) {
+        for _ in 0..=rng.below(4) {
             operate(&mut branch, &mut rng, &mut branch_clock);
         }
         clock += 5;
@@ -507,7 +507,7 @@ fn check(version: &RoomVersionId, seed: u64) {
     if distinct.len() < 2 {
         return;
     }
-    let mut resolver = RoomResolver::new(&rules, &graph.room_id, &log, &body, &auth_graph, &cache);
+    let mut resolver = RoomResolver::new(&rules, &graph.id, &log, &body, &auth_graph, &cache);
     let actual = resolver.resolve(&distinct).expect("our resolver resolves");
     assert_eq!(
         ours(&actual),
@@ -572,7 +572,7 @@ fn the_auth_difference_walk_equals_full_chains() {
             let mut clock = 100;
             for index in 0..2 {
                 let mut branch = base.fork(&format!("b{index}"));
-                for _ in 0..(1 + rng.below(4)) {
+                for _ in 0..=rng.below(4) {
                     operate(&mut branch, &mut rng, &mut clock);
                 }
                 branches.push(branch);

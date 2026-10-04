@@ -4592,22 +4592,19 @@ async fn room_members(
     axum::extract::Path(room_id): axum::extract::Path<String>,
     axum::extract::Query(query): axum::extract::Query<MembersQuery>,
 ) -> Result<Json<Value>, MatrixError> {
-    let at = query
-        .at
-        .as_deref()
-        .map(|token| {
-            token
-                .parse::<crate::tokens::Sync>()
-                .map(|token| token.0)
-                .map_err(|error| {
-                    MatrixError::new(
-                        StatusCode::BAD_REQUEST,
-                        "M_INVALID_PARAM",
-                        error.to_string(),
-                    )
-                })
-        })
-        .transpose()?;
+    // A Synapse stream token kept across the migration (Element Web keeps
+    // its sync accumulator's tokens) asks about a point this server cannot
+    // place; the members as they are now is the honest nearest answer, and
+    // a 400 would leave the room's member list empty (#568).
+    let at = crate::tokens::Sync::resume(query.at.as_deref())
+        .map_err(|error| {
+            MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                error.to_string(),
+            )
+        })?
+        .position();
     let reader = state
         .rooms
         .reader(&identity.user_id, &room_id)
@@ -5978,16 +5975,18 @@ async fn key_changes(
     Authenticated(identity): Authenticated,
     axum::extract::Query(query): axum::extract::Query<KeyChangesQuery>,
 ) -> Result<Json<Value>, MatrixError> {
-    let from = query
-        .from
-        .parse::<crate::tokens::Sync>()
-        .map_err(|error| MatrixError::bad_json(error.to_string()))?
-        .0;
-    let to = query
-        .to
-        .parse::<crate::tokens::Sync>()
-        .map_err(|error| MatrixError::bad_json(error.to_string()))?
-        .0;
+    // A Synapse token from before the migration is a point this server
+    // cannot place: as `from` it widens the window to everything, which
+    // costs the client a few key downloads and loses no change; as `to` it
+    // is now (#568).
+    let resume = |token: &str| {
+        crate::tokens::Sync::resume(Some(token))
+            .map_err(|error| MatrixError::bad_json(error.to_string()))
+    };
+    let from = resume(&query.from)?.position().unwrap_or(0);
+    let to = resume(&query.to)?
+        .position()
+        .unwrap_or_else(|| state.rooms.stream_position());
     let changed = visible_device_changes(&state, &identity, from, to)?;
     Ok(Json(json!({ "changed": changed, "left": [] })))
 }
@@ -8028,14 +8027,10 @@ fn relations(
     // reads as much of a private room as `/messages` does.
     may_read_room(state, user_id, room_id)?;
     // The same `t`-tagged pagination token `/messages` uses, because it is the
-    // same thing: a position in this room's linear index.
+    // same thing: a position in this room's linear index. A Synapse token
+    // this room cannot place starts again from the newest (#568).
     let from = match query.from.as_deref() {
-        Some(token) => Some(
-            token
-                .parse::<crate::tokens::Pagination>()
-                .map_err(|error| MatrixError::bad_json(error.to_string()))?
-                .0,
-        ),
+        Some(token) => room_page_token(state, room_id, token)?,
         None => None,
     };
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
@@ -8537,14 +8532,19 @@ async fn room_threads(
         }
     };
     // The same `t`-tagged token the rest of the room's pagination uses: this
-    // is a position in the same linear index.
+    // is a position in the same linear index. Synapse's `/threads` tokens
+    // are `{depth}_{stream}`; one kept across the migration starts the
+    // list again from the newest thread rather than failing (#568).
+    let synapse_threads_token = |token: &str| {
+        token.split_once('_').is_some_and(|(depth, stream)| {
+            [depth, stream]
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        })
+    };
     let from = match query.from.as_deref() {
-        Some(token) => Some(
-            token
-                .parse::<crate::tokens::Pagination>()
-                .map_err(|error| MatrixError::bad_json(error.to_string()))?
-                .0,
-        ),
+        Some(token) if synapse_threads_token(token) => None,
+        Some(token) => room_page_token(&state, &room_id, token)?,
         None => None,
     };
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
@@ -9026,7 +9026,41 @@ async fn send_event(
 #[derive(Debug, Deserialize)]
 struct MessagesQuery {
     from: Option<String>,
+    to: Option<String>,
+    dir: Option<String>,
     limit: Option<usize>,
+}
+
+/// What a room-pagination token names, as a gap in `room_id`'s linear
+/// index: ours directly, a Synapse one through the positions the importer
+/// recorded (#568).
+///
+/// `Ok(None)` is a Synapse token this room has no positions for -- a room
+/// that was not imported, or one imported before positions were kept. The
+/// caller decides what that falls back to; it is not a 400, because the
+/// client kept the token honestly, and refusing it leaves the client unable
+/// to scroll past what it had cached, every time it tries.
+fn room_page_token(
+    state: &AppState,
+    room_id: &str,
+    token: &str,
+) -> Result<Option<i64>, MatrixError> {
+    match crate::tokens::Pagination::resume(token)
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?
+    {
+        crate::tokens::PageFrom::Ours(position) => Ok(Some(position)),
+        crate::tokens::PageFrom::Synapse(position) => {
+            match state
+                .rooms
+                .synapse_gap(room_id, position)
+                .map_err(room_error)?
+            {
+                Some(crate::rooms::SynapseGap::At(gap)) => Ok(Some(gap)),
+                Some(crate::rooms::SynapseGap::BeforeAll) => Ok(Some(i64::MIN)),
+                None => Ok(None),
+            }
+        }
+    }
 }
 
 /// `GET /_matrix/client/v3/rooms/{room_id}/messages`
@@ -9034,6 +9068,13 @@ struct MessagesQuery {
 /// The pagination token is the linear index, which is what SPEC 10.2's
 /// "tokens are opaque to clients" buys: the ordering already exists, so there
 /// is nothing to sort at read time and nothing to maintain alongside.
+///
+/// A token is a gap: `t{p}` sits just below the entry at `p`. `dir=b` pages
+/// down from it and `dir=f` up from it, so `/context`'s `end` and a forward
+/// page's `end` are where the next forward page starts, and the two
+/// directions agree on what one token means. Forward paging is what a
+/// client does from a permalink, a reply, a search hit or a notification:
+/// Element X's focused timeline is `/context` and then `dir=f` (#568).
 async fn room_messages(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
@@ -9044,18 +9085,53 @@ async fn room_messages(
         .rooms
         .reader(&identity.user_id, &room_id)
         .map_err(room_error)?;
+    // The spec requires `dir`; a request without one is still read as
+    // backward, which is what every caller that left it out meant.
+    let direction = match query.dir.as_deref() {
+        Some("f") => crate::rooms::Direction::Forward,
+        Some("b") | None => crate::rooms::Direction::Backward,
+        Some(other) => {
+            return Err(MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                format!("dir must be 'f' or 'b', not {other:?}"),
+            ));
+        }
+    };
     let from = match query.from.as_deref() {
-        Some(token) => Some(
-            token
-                .parse::<crate::tokens::Pagination>()
-                .map_err(|error| MatrixError::bad_json(error.to_string()))?
-                .0,
-        ),
+        Some(token) => match room_page_token(&state, &room_id, token)? {
+            Some(position) => Some(position),
+            // A Synapse token with no recorded position. Going back, page
+            // from the head: the client is handed events it may already
+            // hold, drops them, and carries on with our `end` from there
+            // -- a longer scroll, never a lost one. Going forward, there
+            // is no telling where it was, so the page is empty and says
+            // it has reached the live end, which a forward walk then
+            // follows from `/sync`.
+            None => match direction {
+                crate::rooms::Direction::Backward => None,
+                crate::rooms::Direction::Forward => Some(i64::MAX),
+            },
+        },
+        None => None,
+    };
+    // `to` bounds the page; one this room cannot place bounds nothing.
+    let to = match query.to.as_deref() {
+        Some(token) => room_page_token(&state, &room_id, token)?,
         None => None,
     };
     let limit = query.limit.unwrap_or(10).clamp(1, 100);
 
-    let (events, next) = reader.messages(from, limit).map_err(room_error)?;
+    let (events, next) = reader
+        .page(
+            crate::rooms::Page {
+                from,
+                to,
+                direction,
+            },
+            limit,
+        )
+        .map_err(room_error)?;
 
     let chunk: Vec<Value> = events
         .iter()
@@ -9072,13 +9148,21 @@ async fn room_messages(
     body.insert("chunk".to_owned(), Value::Array(chunk));
     // Where this chunk began. Without a `from` that is the room's head, which
     // is one past the newest event -- not the literal string "end", which is
-    // what this sent before and which no client could page from.
-    let start =
-        from.unwrap_or_else(|| events.first().map_or(0, |event| event.li.saturating_add(1)));
-    body.insert(
-        "start".to_owned(),
-        json!(crate::tokens::Pagination(start).to_string()),
-    );
+    // what this sent before and which no client could page from. Forward,
+    // it is the room's beginning. With a `from`, it is that token as the
+    // client sent it, which the spec asks for and which keeps a Synapse
+    // token the client's own.
+    let start = match query.from {
+        Some(token) => token,
+        None => crate::tokens::Pagination(match direction {
+            crate::rooms::Direction::Backward => {
+                events.first().map_or(0, |event| event.li.saturating_add(1))
+            }
+            crate::rooms::Direction::Forward => events.first().map_or(0, |event| event.li),
+        })
+        .to_string(),
+    };
+    body.insert("start".to_owned(), json!(start));
     // Absent when there is nothing more, which is how a client knows to stop.
     if let Some(next) = next {
         body.insert(

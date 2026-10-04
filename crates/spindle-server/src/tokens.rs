@@ -149,6 +149,85 @@ impl Sync {
     }
 }
 
+/// Where a `/messages` (or `/relations`, `/threads`) token says to page
+/// from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PageFrom {
+    /// One of ours: a gap in this room's linear index.
+    Ours(i64),
+    /// A position Synapse minted before a migration (#568). Clients keep
+    /// these with the gaps in their cached timelines -- Element X's event
+    /// cache stores them in `SQLite` -- and send them back after the switch.
+    Synapse(SynapsePosition),
+}
+
+/// The room-stream part of a Synapse pagination token.
+///
+/// Synapse orders a room by `(topological_ordering, stream_ordering)`,
+/// where the topological ordering is the event's depth and the stream
+/// ordering a server-wide counter. A `/messages` or `/context` token is
+/// `t{depth}-{stream}`; a `/sync` `prev_batch` is a stream token whose
+/// first part is `s{stream}` or `t{depth}-{stream}`, followed by the
+/// other streams' positions (`_59480933_…`). With several event writers
+/// the room part is `m{stream}~{writer}.{position}~…`, whose first number
+/// is the position every writer has passed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SynapsePosition {
+    /// The depth, for a topological token.
+    pub topological: Option<i64>,
+    /// The stream ordering the token sits at.
+    pub stream: i64,
+}
+
+impl Pagination {
+    /// Read a `from`/`to` pagination token, ours or Synapse's.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::WrongKind`] for one of our sync tokens, and
+    /// [`TokenError::Malformed`] for anything that is neither ours nor
+    /// shaped like Synapse's.
+    pub fn resume(token: &str) -> Result<PageFrom, TokenError> {
+        match token.parse::<Self>() {
+            Ok(Self(position)) => Ok(PageFrom::Ours(position)),
+            Err(error) => synapse_position(token).map(PageFrom::Synapse).ok_or(error),
+        }
+    }
+}
+
+/// The room position in a Synapse pagination or stream token, if `token`
+/// is shaped like one. Ours are a tag and digits only (`t17`, `s42`); a
+/// Synapse token always has a `-`, `_` or `~` after its first number,
+/// which is what tells the two apart.
+fn synapse_position(token: &str) -> Option<SynapsePosition> {
+    let number = |text: &str| -> Option<i64> {
+        let digits = text.strip_prefix('-').unwrap_or(text);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        text.parse().ok()
+    };
+    if !token.contains(['-', '_', '~']) {
+        return None;
+    }
+    let room = token.split('_').next()?;
+    let position = match room.as_bytes().first()? {
+        b't' => {
+            let (depth, stream) = room[1..].split_once('-')?;
+            SynapsePosition {
+                topological: Some(number(depth)?),
+                stream: number(stream.split('~').next()?)?,
+            }
+        }
+        b's' | b'm' => SynapsePosition {
+            topological: None,
+            stream: number(room[1..].split('~').next()?)?,
+        },
+        _ => return None,
+    };
+    Some(position)
+}
+
 /// Whether `token` has the shape of a Synapse stream token: a `/sync`
 /// `since` (`s1600473_59519903_…`, or `m…~…_…` with several writers), a
 /// sliding sync `pos` (the same behind a connection position, `20489/…`),
@@ -173,7 +252,51 @@ fn synapse_shaped(token: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Resume, Sync, TokenError};
+    use super::{PageFrom, Pagination, Resume, SynapsePosition, Sync, TokenError};
+
+    #[test]
+    fn pagination_reads_our_tokens_and_synapse_positions() {
+        assert_eq!(Pagination::resume("t17"), Ok(PageFrom::Ours(17)));
+        assert_eq!(Pagination::resume("t-3"), Ok(PageFrom::Ours(-3)));
+        let synapse = |topological, stream| {
+            Ok(PageFrom::Synapse(SynapsePosition {
+                topological,
+                stream,
+            }))
+        };
+        // `/messages` and `/context` tokens, and `/sync` `prev_batch`es.
+        assert_eq!(
+            Pagination::resume("t426-2633508"),
+            synapse(Some(426), 2_633_508)
+        );
+        assert_eq!(
+            Pagination::resume(
+                "t16750-1590636_59480933_23_1472883_8005_125_9029_4969314_0_165_2_1_1"
+            ),
+            synapse(Some(16750), 1_590_636)
+        );
+        assert_eq!(
+            Pagination::resume("s1600473_59519903_23_1472883_8005_125_9029_4969314_0_165_2_1_1"),
+            synapse(None, 1_600_473)
+        );
+        assert_eq!(
+            Pagination::resume("m1600473~1.1600470~2.1600473_59519903_23_1472883"),
+            synapse(None, 1_600_473)
+        );
+        // Backfilled events have negative stream orderings.
+        assert_eq!(Pagination::resume("t12--40"), synapse(Some(12), -40));
+        // Ours on the wrong endpoint, and garbage, are still refused.
+        assert_eq!(
+            Pagination::resume("s42"),
+            Err(TokenError::WrongKind {
+                expected: 't',
+                found: 's'
+            })
+        );
+        for garbage in ["banana", "", "t", "t1-", "t-", "x1_2", "t1-2x_3", "s_1"] {
+            assert!(Pagination::resume(garbage).is_err(), "{garbage}");
+        }
+    }
 
     #[test]
     fn resume_reads_our_tokens_and_names_foreign_ones() {

@@ -36,7 +36,6 @@ pub use log::{
 };
 pub use pdu::{Pdu, PduError};
 pub use state::{
-    CONTENT_DIGEST_VERSION, EventType, RehydrateError, StateDifference, StateKey, StateRoot,
-    StateSnapshot,
+    CONTENT_DIGEST_VERSION, EventType, RehydrateError, StateKey, StateRoot, StateSnapshot,
 };
 pub use version::{STATE_DAG_V12, VersionError, is_state_dag, rules_of};
