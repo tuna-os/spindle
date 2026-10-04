@@ -628,7 +628,9 @@ impl Rooms {
                 log.append_seeded(step.input.clone(), state, step.depth)
                     .map_err(refused)?
                     .clone()
-            } else if let Some(settled) = source.settled(event_id) {
+            } else if let Some(settled) = source.read_settled(event_id).map_err(|why| {
+                RoomError::Append(format!("{event_id}: cannot read replayed state: {why}"))
+            })? {
                 // The replay derived this event's state (the room version's
                 // resolver, the head over the forward extremities, or
                 // Synapse's state at a gap) and found the log's fold is not it.

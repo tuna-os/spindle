@@ -44,6 +44,7 @@ use spindle_store::{FjallStore, ReadView, Store};
 
 use super::ReadError;
 use super::postgres::Snapshot;
+use super::replay_spool::ReplaySpool;
 use super::resolve::RoomResolver;
 use super::signatures::{KeyRing, Verdict};
 use crate::import::{
@@ -368,13 +369,21 @@ struct SnapshotSource<'a, 'snapshot> {
     states: &'a mut HashMap<String, StateMap>,
     /// The room version's resolver, for the replay.
     resolver: Option<&'a mut RoomResolver>,
-    /// The states the replay settled, for the write.
-    settled: Option<&'a HashMap<String, Settled>>,
+    /// Temporary supplied state; kept on disk until the room is verified.
+    spool: &'a mut ReplaySpool,
     /// Each event's state group, and each group's `prev_state_group`.
     groups: Option<&'a super::postgres::StateGroupGraph>,
 }
 
 impl SourceState for SnapshotSource<'_, '_> {
+    fn begin_replay_pass(&mut self) -> Result<(), String> {
+        self.spool.begin_pass()
+    }
+
+    fn retain_settled(&mut self, event_id: &str, state: &Settled) -> Result<bool, String> {
+        self.spool.save(event_id, state)?;
+        Ok(false)
+    }
     fn state_after(&mut self, event_id: &str) -> Result<StateMap, String> {
         if let Some(state) = self.states.get(event_id) {
             return Ok(state.clone());
@@ -447,8 +456,8 @@ impl SynapseSource for SnapshotSource<'_, '_> {
             .remove(event_id)
     }
 
-    fn settled(&mut self, event_id: &str) -> Option<Settled> {
-        self.settled?.get(event_id).cloned()
+    fn read_settled(&mut self, event_id: &str) -> Result<Option<Settled>, String> {
+        self.spool.load(event_id)
     }
 }
 
@@ -1604,10 +1613,16 @@ impl Run<'_, '_> {
             ..RoomReport::default()
         };
 
-        // Replay first, with no bodies and nothing written: a room whose
-        // state would diverge is reported and never persisted. The replay
-        // derives every event's state, with the room version's resolver at
-        // each fork; the states it settled are kept for the write.
+        // Replay before touching the destination. Supplied snapshots go to a
+        // private disposable store; retaining every historical version of a
+        // 50,000-member state in RAM exhausted the real migration's reserve.
+        let spool_parent = self
+            .options
+            .checkpoint
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut spool = ReplaySpool::new(spool_parent).map_err(write_error)?;
         let mut auth_engine = match RoomResolver::load(self.snapshot, room_id, &version) {
             Ok(resolver) => resolver,
             Err(error) => {
@@ -1628,7 +1643,7 @@ impl Run<'_, '_> {
                 bodies: HashMap::new(),
                 states: &mut states,
                 resolver: Some(&mut auth_engine),
-                settled: None,
+                spool: &mut spool,
                 groups: Some(&groups),
             };
             replay_resolving(&source, &mut lookup, false)
@@ -1670,7 +1685,7 @@ impl Run<'_, '_> {
                 ));
             }
         }
-        let settled = resolved.settled;
+        debug_assert!(resolved.settled.is_empty());
         let outcome = resolved.outcome;
         for excluded in &outcome.excluded {
             match excluded {
@@ -1815,7 +1830,7 @@ impl Run<'_, '_> {
                     bodies,
                     states: &mut states,
                     resolver: None,
-                    settled: Some(&settled),
+                    spool: &mut spool,
                     groups: None,
                 };
                 let (appended, _) = self

@@ -633,6 +633,27 @@ pub trait SourceState {
     /// Report bounded replay progress while large rooms are still being derived.
     fn replay_progress(&mut self, _position: usize, _total: usize) {}
 
+    /// Start a new fixed-point pass. A disk-backed source must stop exposing
+    /// the previous pass's supplied states before deriving this pass's states.
+    ///
+    /// # Errors
+    ///
+    /// A failure to initialize temporary state storage.
+    fn begin_replay_pass(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Save a supplied state outside the returned map when needed. `true`
+    /// retains it in the outcome; `false` means the source saved it and will
+    /// provide it through `SynapseSource::read_settled` during the write.
+    ///
+    /// # Errors
+    ///
+    /// A failed save. Replay must fail before the room is written.
+    fn retain_settled(&mut self, _event_id: &str, _state: &Settled) -> Result<bool, String> {
+        Ok(true)
+    }
+
     /// How the source arrived at the state of `event_id`: from its
     /// parents, or from somewhere else. A source that cannot tell says
     /// [`Continuity::Derived`], and the import trusts the derivation.
@@ -931,6 +952,10 @@ fn replay_pass(
         why,
     };
 
+    source
+        .begin_replay_pass()
+        .map_err(|why| no_state("", why))?;
+
     // The state after each event, derived independently of the log, kept
     // while a later step still names the event as a parent, or while it is
     // a forward extremity (which the head resolves).
@@ -1198,14 +1223,17 @@ fn replay_pass(
             let state = want.state.clone().unwrap_or_default();
             let reason = want.reason.unwrap_or(RESOLVED_REASON);
             from_source.push((event_id.to_owned(), reason.to_owned()));
-            settled.insert(
-                event_id.to_owned(),
-                Settled {
-                    state: state.clone(),
-                    slots: want.slots.clone().unwrap_or_default(),
-                    reason: reason.to_owned(),
-                },
-            );
+            let supplied = Settled {
+                state: state.clone(),
+                slots: want.slots.clone().unwrap_or_default(),
+                reason: reason.to_owned(),
+            };
+            if source
+                .retain_settled(event_id, &supplied)
+                .map_err(|why| no_state(event_id, why))?
+            {
+                settled.insert(event_id.to_owned(), supplied);
+            }
             seed_with(&mut log, state)?
         } else if let Some(state) = want.state.clone() {
             // The log may fold this event itself; check that it reaches the
@@ -1565,6 +1593,16 @@ pub trait SynapseSource: SourceState {
     /// written with a supplied state rather than the log's fold.
     fn settled(&mut self, _event_id: &str) -> Option<Settled> {
         None
+    }
+
+    /// Read a supplied state without turning failed disk reads into absence.
+    /// Absence allows the ordinary fold; a failed read must refuse that write.
+    ///
+    /// # Errors
+    ///
+    /// A failed or corrupt supplied-state read.
+    fn read_settled(&mut self, event_id: &str) -> Result<Option<Settled>, String> {
+        Ok(self.settled(event_id))
     }
 }
 

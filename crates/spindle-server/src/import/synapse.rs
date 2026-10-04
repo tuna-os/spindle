@@ -37,6 +37,7 @@ use super::{SourceEvent, SourceRoom, StateMap};
 pub mod full;
 pub mod postgres;
 pub mod recovery;
+mod replay_spool;
 pub mod resolve;
 pub mod signatures;
 
