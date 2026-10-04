@@ -308,7 +308,11 @@ fn a_rejected_event_changes_no_state_and_no_extremity() {
         .unwrap();
     let head = room.forward_extremities().iter().next().unwrap().clone();
     let before = room
-        .resolve_parents(&[head.clone()], &mut Recording::default(), &mut no_store)
+        .resolve_parents(
+            std::slice::from_ref(&head),
+            &mut Recording::default(),
+            &mut no_store,
+        )
         .unwrap();
     room.sideline(
         EventInput::new("$bad", vec![head.clone()]).with_state_key(topic.clone()),
@@ -365,7 +369,11 @@ fn a_soft_failed_event_keeps_its_state_for_its_children() {
         .unwrap();
     let head = room.forward_extremities().iter().next().unwrap().clone();
     let before = room
-        .resolve_parents(&[head.clone()], &mut Recording::default(), &mut no_store)
+        .resolve_parents(
+            std::slice::from_ref(&head),
+            &mut Recording::default(),
+            &mut no_store,
+        )
         .unwrap();
     let sidelined = room
         .sideline(

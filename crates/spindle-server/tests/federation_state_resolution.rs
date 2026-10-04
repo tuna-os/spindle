@@ -18,6 +18,7 @@
 //! `state-resolution-interop` CI job).
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -114,9 +115,9 @@ impl Net {
                     continue;
                 }
                 let port = proxies[&(index, to)].local_addr().unwrap().port();
-                config.push_str(&format!(
-                    "[federation.peers.\"{name}\"]\nurl = \"http://127.0.0.1:{port}\"\nmax_backoff_ms = 300\n"
-                ));
+                writeln!(config,
+                    "[federation.peers.\"{name}\"]\nurl = \"http://127.0.0.1:{port}\"\nmax_backoff_ms = 300"
+                ).unwrap();
             }
             let dir = TempDir::new().unwrap();
             let store = Arc::new(FjallStore::open(dir.path()).unwrap());
@@ -339,18 +340,17 @@ async fn room_across(
     let expected = members.len();
     for (index, token, _) in &members {
         let server = &net.servers[*index];
+        let mut seen = BTreeMap::new();
         assert!(
             eventually(async || {
-                server
-                    .state(&room, token)
-                    .await
-                    .iter()
-                    .filter(|((kind, _), _)| kind == "m.room.member")
+                seen = server.state(&room, token).await;
+                seen.keys()
+                    .filter(|(kind, _)| kind == "m.room.member")
                     .count()
                     == expected
             })
             .await,
-            "{} never saw every member join",
+            "{} never saw every member join in {room}: {seen:?}",
             server.name
         );
     }
@@ -422,9 +422,9 @@ async fn converge(
     }
     let mut report = String::new();
     for (index, view) in views.iter().enumerate() {
-        report.push_str(&format!("\n{}:", net.servers[index].name));
+        write!(report, "\n{}:", net.servers[index].name).unwrap();
         for (key, id) in view {
-            report.push_str(&format!("\n  {key:?} = {id}"));
+            write!(report, "\n  {key:?} = {id}").unwrap();
         }
     }
     panic!("the servers never converged on one state:{report}");

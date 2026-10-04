@@ -700,11 +700,10 @@ async fn a_fork_of_two_messages_costs_no_resolution() {
     }
 }
 
-/// Each branch writes a state slot the other never held: SPEC §9.2 case 2.
+/// Each branch writes a state slot the other never held.
 ///
-/// This is the fork the whole design rests on — the one Spindle claims to
-/// merge without running state resolution, and the one
-/// `state_res_comparison` benchmarks. Here it arrives over the wire.
+/// A value and an absent slot disagree under Matrix's rules. Both writes
+/// must survive the room-version resolver and the room must stay writable.
 #[tokio::test]
 #[allow(
     clippy::await_holding_lock,
@@ -753,25 +752,9 @@ async fn a_fork_on_new_slots_uses_room_version_resolution() {
     assert!(state.contains_key("m.room.name/"), "{state:?}");
 }
 
-/// Both branches write the *same* slot: SPEC §9.2 case 3.
-///
-/// This is the expensive case, and today it is not resolved: bounded
-/// resolution exists in `spindle-core` but is not yet wired into ingest
-/// (#16). What the server does instead is the subject of this test.
-///
-/// Before #225 the merge was refused, and because every later local append
-/// named the same two extremities, refused *permanently*: one concurrent
-/// edit from a peer made the room unwritable for every local user, with no
-/// path out. The server must not wedge on a fork it cannot fold. It keeps
-/// authoring on its linear head, sets the contested branch aside for the
-/// resolver, and says so: the case-3 counter moves exactly once for the
-/// fork -- not once per send while it stays open -- because §18.3's target
-/// is meaningless if the expensive path can be taken without being counted,
-/// and equally meaningless if one fork is counted as many.
-///
-/// What must hold either way: the room is not corrupted. Whichever branch
-/// survives, the room still reads a consistent state and still holds one of
-/// the two topics rather than neither.
+/// Both branches write the same slot. The room-version resolver picks
+/// one authorized value and keeps the room writable, while the contested
+/// counter records the merge once. Every read must agree with that result.
 #[tokio::test]
 #[allow(
     clippy::await_holding_lock,
@@ -856,9 +839,8 @@ async fn a_fork_on_the_same_slot_is_counted_once_and_leaves_the_room_writable() 
 ///
 /// The same fork as the test above — our branch writes the topic, theirs
 /// writes the name — with one difference: both slots already had a value at
-/// the fork point. Nothing is in conflict either way. Matrix's own state
-/// resolution builds its conflicted set from events that differ from the
-/// base, so a key only one branch moved is unconflicted there too.
+/// the fork point. The parent states disagree on both slots, so Matrix's
+/// resolver examines both candidates and preserves each authorized write.
 ///
 /// `merge_states` used to disagree, because it unioned the parents' *full*
 /// snapshots: the branch that left the topic alone still contributed the old
