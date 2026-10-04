@@ -1,0 +1,14 @@
+{
+  "by_label_outcome": {
+    "pre-A:decrypted": 15,
+    "pre-B:decrypted": 15
+  },
+  "device": "DEVD07C631E9ADB6A90",
+  "events": 30,
+  "failures": [],
+  "homeserver": "http://drill-b:8008/",
+  "how": "new device, keys from backup",
+  "pass": true,
+  "room": "!jJwQBRazJPYfrvvkys:reilly.asia",
+  "user": "@drill-b1:reilly.asia"
+}

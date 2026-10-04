@@ -1,0 +1,15 @@
+Every query the lab resolver answered (CoreDNS log, whole run).
+
+  488  AAAA IN matrix.reilly.asia.
+  488  A IN matrix.reilly.asia.
+   58  AAAA IN matrix.witness.lab.
+   58  A IN matrix.witness.lab.
+   10  AAAA IN reilly.asia.
+   10  A IN reilly.asia.
+    5  A IN witness.lab.
+    5  AAAA IN witness.lab.
+    2  AAAA IN drill-b.
+    2  AAAA IN example.com.
+    2  A IN example.com.
+
+REFUSED answers: 6

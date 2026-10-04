@@ -1,0 +1,8 @@
+Synapse A (witness) WARNING/ERROR lines, 2026-10-03 21:23Z to 2026-10-04 00:16Z, grouped.
+Earlier lines were rotated out of the container log.
+
+   12  synapse.handlers.message - 1628 - WARNING - # - Denying new event <Event event_id=$EVENT, type=m.room.topic, state_key=> because 403: You don't have permission to post that to the room. user_level (0) < send_level (50)
+   11  synapse.federation.sender.transaction_manager - 197 - WARNING - federation_transaction_transmission_# - TX [reilly.asia] # Remote returned error for $EVENT {'error': 'the body of $EVENT is missing'}
+   10  synapse.federation.sender.transaction_manager - 197 - WARNING - federation_transaction_transmission_# - TX [reilly.asia] # Remote returned error for $EVENT {'error': 'no such room: !XQcGaGIqHToDSLojtJ:reilly.asia'}
+    3  synapse.http.server - 853 - WARNING - # - Not sending response to request <SynapseRequest at # method='GET' uri='…' clientproto='HTTP/1.1' site='8008'>, already disconnected.
+    3  synapse.federation.sender.transaction_manager - 197 - WARNING - federation_transaction_transmission_# - TX [reilly.asia] # Remote returned error for $EVENT {'error': 'InvalidField("prev_events")'}
