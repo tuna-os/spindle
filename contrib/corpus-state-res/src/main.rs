@@ -11,7 +11,9 @@
 //!    federation transaction reaches: state resolution over the parents, the
 //!    receipt checks, the append -- and
 //! 4. compares the state Spindle resolved before the event
-//!    (`Rooms::state_before_event`) with Synapse's state before it.
+//!    (`Rooms::state_before_event`) with Synapse's state after it, excluding
+//!    a state event's own slot: the database does not retain that slot before
+//!    the overwrite. Compression ancestors are not semantic before-states.
 //!
 //! The database is opened read-only. Usage:
 //!
@@ -49,6 +51,7 @@ struct Tally {
     merges: usize,
     skipped_outside_history: usize,
     compared: usize,
+    masked_own_slot: usize,
     agree: usize,
     disagree: usize,
     conflicted: usize,
@@ -115,6 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "merges": tally.merges,
                 "skipped_parent_outside_history": tally.skipped_outside_history,
                 "compared": tally.compared,
+                "masked_own_slot": tally.masked_own_slot,
                 "agree": tally.agree,
                 "disagree": tally.disagree,
                 "conflicted": tally.conflicted,
@@ -133,6 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         total.merges += tally.merges;
         total.skipped_outside_history += tally.skipped_outside_history;
         total.compared += tally.compared;
+        total.masked_own_slot += tally.masked_own_slot;
         total.agree += tally.agree;
         total.disagree += tally.disagree;
         total.conflicted += tally.conflicted;
@@ -149,6 +154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "merges": total.merges,
             "skipped_parent_outside_history": total.skipped_outside_history,
             "compared": total.compared,
+            "masked_own_slot": total.masked_own_slot,
             "agree": total.agree,
             "disagree": total.disagree,
             "conflicted": total.conflicted,
@@ -197,8 +203,7 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
         return Ok(tally);
     }
 
-    // Every group a comparison reads, and the before-group of each merge's
-    // own group (its edge), which for a state event is the state before it.
+    // Parent after-states and the merge after-state used for comparison.
     let mut needed: HashSet<i64> = HashSet::new();
     for merge in &merges {
         needed.extend(
@@ -210,17 +215,6 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
         );
         needed.extend(merge.own_group);
     }
-    let own_groups: Vec<i64> = merges.iter().filter_map(|merge| merge.own_group).collect();
-    let before_of: HashMap<i64, i64> = db
-        .query(
-            "SELECT state_group, prev_state_group FROM state_group_edges WHERE state_group = ANY($1)",
-            &[&own_groups],
-        )?
-        .iter()
-        .map(|row| (row.get(0), row.get(1)))
-        .collect();
-    needed.extend(before_of.values().copied());
-
     // The delta closure: every ancestor group along state_group_edges.
     let needed_list: Vec<i64> = needed.iter().copied().collect();
     let closure: Vec<(i64, Option<i64>)> = db
@@ -252,8 +246,6 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
     // order, sharing structure: a delta group is its parent plus its rows,
     // and a full snapshot is rebuilt against the last group built.
     let mut snaps: HashMap<i64, StateSnapshot> = HashMap::new();
-    let mut own_deltas: HashMap<i64, Vec<(StateKey, String)>> = HashMap::new();
-    let own_set: HashSet<i64> = own_groups.iter().copied().collect();
     let mut last: StateSnapshot = StateSnapshot::new();
     {
         let mut rows = db.query_raw(
@@ -316,9 +308,6 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
                     snapshot
                 }
             };
-            if own_set.contains(group) {
-                own_deltas.insert(*group, delta);
-            }
             last = snapshot.clone();
             if needed.contains(group) || children.get(group).is_some_and(|left| *left > 0) {
                 snaps.insert(*group, snapshot);
@@ -448,9 +437,9 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
             }
         };
 
-        // Synapse's state before the event: the merge's own group, or for a
-        // state event the group its own group was built on when that delta
-        // is the event alone; otherwise the own group minus the event's slot.
+        // The group's compression ancestor is not necessarily the event's
+        // before-state, even when its delta changes just the event's own slot.
+        // Compare the after-state while masking that overwritten slot.
         let own_key: Option<StateKey> = body["state_key"]
             .as_str()
             .map(|state_key| StateKey::new(body["type"].as_str().unwrap_or_default(), state_key));
@@ -458,25 +447,14 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
             tally.errors += 1;
             continue;
         };
-        let (expected, ignore) = match &own_key {
-            None => (snaps.get(&own_group), None),
-            Some(key) => {
-                let exact = before_of.get(&own_group).filter(|_| {
-                    own_deltas
-                        .get(&own_group)
-                        .is_some_and(|delta| delta.len() == 1 && delta[0].0 == *key)
-                });
-                match exact {
-                    Some(before) => (snaps.get(before), None),
-                    None => (snaps.get(&own_group), Some(key.clone())),
-                }
-            }
-        };
+        let expected = snaps.get(&own_group);
+        let ignore = own_key;
         let Some(expected) = expected else {
             tally.errors += 1;
             continue;
         };
         tally.compared += 1;
+        tally.masked_own_slot += usize::from(ignore.is_some());
         let differences: Vec<_> = ours
             .diff(expected)
             .into_iter()
@@ -492,6 +470,35 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
             }
         } else {
             tally.disagree += 1;
+            if let Some(path) = std::env::var_os("CORPUS_SYNAPSE_FIXTURE") {
+                if !std::path::Path::new(&path).exists() {
+                    let rows = |snapshot: &StateSnapshot| {
+                        let mut rows = Vec::new();
+                        snapshot.for_each(|key, id| {
+                            rows.push(json!([key.event_type().as_str(), key.state_key(), id]))
+                        });
+                        rows
+                    };
+                    let fixture = json!({
+                        "room_id": room_id, "event_id": merge.event_id,
+                        "parents": parents.iter().map(|state| rows(state)).collect::<Vec<_>>(),
+                        "expected": rows(expected), "live": rows(&ours),
+                        "ignore": ignore.as_ref().map(|key| json!([
+                            key.event_type().as_str(), key.state_key()
+                        ])),
+                        "bodies": bodies, "rejected": rejected,
+                    });
+                    use std::io::Write;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(path)?;
+                    file.write_all(&serde_json::to_vec(&fixture)?)?;
+                }
+            }
+
             if tally.examples.len() < 20 {
                 let shown: Vec<Value> = differences
                     .iter()
