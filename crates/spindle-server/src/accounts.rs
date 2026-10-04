@@ -21,6 +21,12 @@ use serde::{Deserialize, Serialize};
 use spindle_core::keys::{self, Keyspace, room_prefix};
 use spindle_store::{Store, StoreError};
 
+static ERASURE_POLICY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn erasure_policy_key() -> Vec<u8> {
+    room_prefix(Keyspace::ErasurePolicy, "")
+}
+
 /// How many bytes of entropy an access token carries.
 ///
 /// 32 bytes is 256 bits, which is not guessable by anyone, ever. The token is
@@ -251,13 +257,51 @@ impl<'a, S: Store> Accounts<'a, S> {
     ///
     /// Returns a storage or decoding error.
     pub fn set_erased(&self, localpart: &str, erased: bool) -> Result<(), AccountError> {
+        let _guard = ERASURE_POLICY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(mut account) = self.account(localpart)? else {
             return Ok(());
         };
         account.erased = erased;
+        let mut writes = vec![(account_key(localpart), encode(&account)?)];
+        if erased {
+            writes.push((erasure_policy_key(), vec![1]));
+        }
         self.store
-            .put(&account_key(localpart), &encode(&account)?)?;
+            .commit(&writes, spindle_store::Durability::Group)?;
         Ok(())
+    }
+
+    /// Whether client events may need erasure filtering. Once true, this
+    /// marker stays true; each sender's current account flag still decides.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or account decoding error.
+    pub fn erasure_active(&self) -> Result<bool, AccountError> {
+        let key = erasure_policy_key();
+        if let Some(value) = self.store.get(&key)? {
+            return Ok(value != [0]);
+        }
+        let _guard = ERASURE_POLICY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(value) = self.store.get(&key)? {
+            return Ok(value != [0]);
+        }
+        // Upgrade stores written before the marker existed. The same lock
+        // protects erasure writes so initialization cannot overwrite one.
+        let prefix = [keys::KEY_SCHEMA_VERSION, Keyspace::Account as u8];
+        let mut active = false;
+        for (_, bytes) in self.store.scan_prefix(&prefix)? {
+            if decode::<Account>(&bytes)?.erased {
+                active = true;
+                break;
+            }
+        }
+        self.store.put(&key, &[u8::from(active)])?;
+        Ok(active)
     }
 
     /// # Errors
@@ -789,4 +833,63 @@ pub fn hash_password(password: &str) -> Result<String, AccountError> {
         .hash_password_with_salt(password.as_bytes(), &salt)
         .map_err(|error| AccountError::Hashing(error.to_string()))?
         .to_string())
+}
+
+#[cfg(test)]
+mod erasure_policy_tests {
+    use super::*;
+    use spindle_store::{FjallStore, ReadView};
+
+    fn put_account(store: &FjallStore, localpart: &str, erased: bool) {
+        let account: Account = serde_json::from_value(serde_json::json!({
+            "localpart":localpart,"password_hash":"unused","erased":erased
+        }))
+        .unwrap();
+        store
+            .put(&account_key(localpart), &encode(&account).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn an_upgraded_store_discovers_existing_erased_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        put_account(&store, "alice", false);
+        put_account(&store, "bob", true);
+        let accounts = Accounts::new(&store, "example.org");
+        assert!(accounts.erasure_active().unwrap());
+        assert_eq!(store.get(&erasure_policy_key()).unwrap(), Some(vec![1]));
+    }
+
+    #[test]
+    fn erasure_sets_a_durable_marker_without_clearing_it_on_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = FjallStore::open(dir.path()).unwrap();
+            put_account(&store, "alice", false);
+            let accounts = Accounts::new(&store, "example.org");
+            assert!(!accounts.erasure_active().unwrap());
+            accounts.set_erased("alice", true).unwrap();
+            assert!(accounts.erasure_active().unwrap());
+            assert!(accounts.account("alice").unwrap().unwrap().erased);
+            accounts.set_erased("alice", false).unwrap();
+            assert!(accounts.erasure_active().unwrap());
+            assert!(!accounts.account("alice").unwrap().unwrap().erased);
+        }
+        let store = FjallStore::open(dir.path()).unwrap();
+        assert!(
+            Accounts::new(&store, "example.org")
+                .erasure_active()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn setting_an_unknown_account_does_not_activate_erasure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        let accounts = Accounts::new(&store, "example.org");
+        accounts.set_erased("missing", true).unwrap();
+        assert!(!accounts.erasure_active().unwrap());
+    }
 }

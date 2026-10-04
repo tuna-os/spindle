@@ -416,6 +416,8 @@ pub enum Keyspace {
     SynapsePosition = 0x3e,
     /// Imported Synapse room order, keyed by depth and stream.
     SynapseTopologicalPosition = 0x3f,
+    /// Global marker: accounts may carry an erasure policy.
+    ErasurePolicy = 0x40,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
