@@ -8,8 +8,6 @@
 use axum::Router;
 use crate::AppState;
 
-mod routes_legacy;
-
 // Phase 1: Establish module structure (this file)
 // Phase 2: Extract submodules one at a time
 //   - routes/accounts.rs (account + device endpoints)
