@@ -39,7 +39,7 @@ use crate::AppState;
 pub fn router(state: AppState) -> Router {
     // Phase 1: Delegate to original routes.rs implementation.
     // Phase 2 will replace this with merging of extracted domain modules.
-    routes_legacy::router(state)
+    crate::routes_legacy::router(state)
 }
 
 /// List of all Matrix spec endpoints for documentation and testing.
