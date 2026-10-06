@@ -1207,6 +1207,29 @@ fn replay_pass(
             }
         }
 
+        // An explicitly requested final head represents the source room's
+        // current state, not the historical state after this PDU. Keep the
+        // historical derivation/checks above intact; override only this last
+        // entry after extremity resolution, and persist it as a supplied seed.
+        if position == last_position && step.head && !step.seed {
+            let base = want.state.as_ref().or(previous.as_ref());
+            let (state, mut slots) = snapshot_over(base, &room.current_state);
+            // Keep body references already supplied by historical comparison
+            // or fork resolution, but only if the authoritative head retains them.
+            if let Some(prior) = want.slots.take() {
+                slots.extend(
+                    prior
+                        .into_iter()
+                        .filter(|(key, value)| room.current_state.get(key) == Some(value)),
+                );
+            }
+            want = Want {
+                state: Some(state),
+                reason: Some(HEAD_REASON),
+                slots: Some(slots),
+            };
+        }
+
         // 3. Append: seeded where the state is supplied, folded otherwise.
         let seed_with = |log: &mut RoomLog, state: StateSnapshot| {
             log.append_seeded(step.input.clone(), state, step.depth)
@@ -1866,5 +1889,267 @@ mod seed_sharing_tests {
             "removal needs no replacement event bodies"
         );
         assert!(seed.delta_nodes(Some(&base)).len() <= 52);
+    }
+}
+
+#[cfg(test)]
+mod head_source_tests {
+    use super::*;
+    const REMOTE: &str = "@remote:example.invalid";
+    const HISTORICAL: &str = "@historical:example.invalid";
+    struct FixtureSource {
+        historical_merge: StateMap,
+        full_compare_last: bool,
+        resolver_calls: usize,
+        read_snapshots: Vec<StateMap>,
+    }
+    impl SourceState for FixtureSource {
+        fn state_after(&mut self, event: &str) -> Result<StateMap, String> {
+            if event != "$merge" {
+                return Err("fixture only holds historical merge state".into());
+            }
+            let historical = self.historical_merge.clone();
+            self.read_snapshots.push(historical.clone());
+            Ok(historical)
+        }
+        fn state_after_keys(
+            &mut self,
+            event: &str,
+            keys: &[(String, String)],
+        ) -> Result<StateMap, String> {
+            let mut historical = self.state_after(event)?;
+            historical.retain(|key, _| keys.contains(key));
+            Ok(historical)
+        }
+        fn resolve(&mut self, sets: &[&StateSnapshot]) -> Option<Result<Resolution, String>> {
+            self.resolver_calls += 1;
+            assert_eq!(sets.len(), 2);
+            assert_eq!(
+                sets[0].get(&StateKey::new("m.room.topic", "")),
+                Some("$topic_a")
+            );
+            assert_eq!(
+                sets[1].get(&StateKey::new("m.room.topic", "")),
+                Some("$topic_b")
+            );
+            for set in sets {
+                assert_eq!(
+                    set.len(),
+                    2,
+                    "historical parent is create+its own topic only"
+                );
+                assert!(set.get(&StateKey::new("m.room.member", REMOTE)).is_none());
+                assert!(
+                    set.get(&StateKey::new("m.room.member", HISTORICAL))
+                        .is_none()
+                );
+            }
+            Some(Ok(Resolution {
+                contested: vec![StateKey::new("m.room.topic", "")],
+                slots: vec![(
+                    StateKey::new("m.room.topic", ""),
+                    Some("$topic_a".to_owned()),
+                )],
+            }))
+        }
+        fn continuity(&mut self, event: &str, _parents: &[EventId], _is_state: bool) -> Continuity {
+            if self.full_compare_last && event == "$merge" {
+                Continuity::Unknown
+            } else {
+                Continuity::Derived
+            }
+        }
+    }
+    fn event(
+        id: &str,
+        kind: &str,
+        state_key: Option<&str>,
+        parents: &[&str],
+        depth: u64,
+    ) -> SourceEvent {
+        SourceEvent {
+            event_id: id.into(),
+            event_type: kind.into(),
+            state_key: state_key.map(str::to_owned),
+            prev_events: parents.iter().map(|s| s.to_string()).collect(),
+            depth,
+            stream_ordering: depth as i64,
+            outlier: false,
+            rejected: false,
+        }
+    }
+    fn fixture(full_compare: bool) -> (SourceRoom, FixtureSource) {
+        let mut historical = StateMap::from([
+            (("m.room.create".into(), "".into()), "$create".into()),
+            (("m.room.topic".into(), "".into()), "$topic_a".into()),
+        ]);
+        if full_compare {
+            historical.insert(
+                ("m.room.member".into(), HISTORICAL.into()),
+                "$historical_member".into(),
+            );
+        }
+        let mut current = historical.clone();
+        current.insert(
+            ("m.room.member".into(), REMOTE.into()),
+            "$current_only_outlier".into(),
+        );
+        let mut events = vec![
+            event("$create", "m.room.create", Some(""), &[], 1),
+            event("$topic_a", "m.room.topic", Some(""), &["$create"], 2),
+            event("$topic_b", "m.room.topic", Some(""), &["$create"], 3),
+            event(
+                "$merge",
+                "m.room.message",
+                None,
+                &["$topic_a", "$topic_b"],
+                4,
+            ),
+        ];
+        let mut outlier = event(
+            "$current_only_outlier",
+            "m.room.member",
+            Some(REMOTE),
+            &["$create"],
+            5,
+        );
+        outlier.outlier = true;
+        events.push(outlier);
+        if full_compare {
+            let mut old = event(
+                "$historical_member",
+                "m.room.member",
+                Some(HISTORICAL),
+                &["$create"],
+                6,
+            );
+            old.outlier = true;
+            events.push(old);
+        }
+        (
+            SourceRoom {
+                room_id: "!head-regression:example.invalid".into(),
+                events,
+                current_state: current,
+                state_after_root: None,
+                forward_extremities: vec!["$merge".into()],
+            },
+            FixtureSource {
+                historical_merge: historical,
+                full_compare_last: full_compare,
+                resolver_calls: 0,
+                read_snapshots: Vec::new(),
+            },
+        )
+    }
+    fn check(full_compare: bool) {
+        let (room, mut source) = fixture(full_compare);
+        let historical_before = source.state_after("$merge").expect("historical getter");
+        assert!(!historical_before.contains_key(&("m.room.member".to_owned(), REMOTE.to_owned())));
+        let plan_before = plan_resolving(&room).expect("plan");
+        let parents_before: Vec<_> = plan_before
+            .steps
+            .iter()
+            .map(|s| s.input.prev_events.clone())
+            .collect();
+        let old = replay_resolving(&room, &mut source, false).expect("natural replay");
+        assert!(!old.outcome.clean());
+        assert_eq!(old.outcome.divergence.len(), 1);
+        let repaired = replay_resolving(&room, &mut source, true).expect("forced head replay");
+        assert!(repaired.outcome.clean());
+        assert_eq!(repaired.outcome.imported, 4);
+        assert!(
+            repaired
+                .outcome
+                .excluded
+                .iter()
+                .any(|e| matches!(e,Excluded::Outlier(id) if id=="$current_only_outlier"))
+        );
+        let seed = repaired
+            .settled
+            .get("$merge")
+            .expect("head must be saved for persistence");
+        assert_eq!(seed.reason, HEAD_REASON);
+        assert_eq!(
+            seed.slots
+                .get(&("m.room.member".to_owned(), REMOTE.to_owned()))
+                .map(String::as_str),
+            Some("$current_only_outlier")
+        );
+        if full_compare {
+            assert_eq!(
+                seed.slots
+                    .get(&("m.room.member".to_owned(), HISTORICAL.to_owned()))
+                    .map(String::as_str),
+                Some("$historical_member")
+            );
+            assert_eq!(
+                seed.slots.len(),
+                2,
+                "keep historical supplied body AND new current-only body"
+            );
+        } else {
+            assert_eq!(seed.slots.len(), 1);
+        }
+        for ((kind, key), value) in &room.current_state {
+            assert_eq!(
+                seed.state.get(&StateKey::new(kind.clone(), key.clone())),
+                Some(value.as_str())
+            );
+        }
+        assert_eq!(
+            repaired.from_source,
+            vec![("$merge".to_owned(), HEAD_REASON.to_owned())]
+        );
+        let historical_after = source
+            .state_after("$merge")
+            .expect("historical getter after replay");
+        assert_eq!(
+            historical_after, historical_before,
+            "getter semantics never mutated into room.current_state"
+        );
+        assert!(
+            source
+                .read_snapshots
+                .iter()
+                .all(|s| s == &historical_before)
+        );
+        assert_eq!(source.historical_merge, historical_before);
+        let plan_after = plan_resolving(&room).expect("unchanged plan");
+        assert_eq!(
+            parents_before,
+            plan_after
+                .steps
+                .iter()
+                .map(|s| s.input.prev_events.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+    #[test]
+    fn derived_historical_merge_is_preserved_and_current_only_outlier_stays_out_of_timeline() {
+        check(false);
+    }
+    #[test]
+    fn unknown_historical_merge_keeps_supplied_historical_and_current_only_body_deltas() {
+        check(true);
+    }
+
+    #[test]
+    fn singleton_first_seed_with_unpersisted_current_only_state_stays_divergent() {
+        let (mut room, mut source) = fixture(false);
+        room.events
+            .retain(|event| event.event_id == "$create" || event.outlier);
+        room.forward_extremities = vec!["$create".to_owned()];
+        room.current_state
+            .remove(&("m.room.topic".to_owned(), "".to_owned()));
+        let result = replay_resolving(&room, &mut source, true).expect("root replay");
+        assert!(
+            !result.outcome.clean(),
+            "first seed uses root persistence, not settled head persistence"
+        );
+        assert_eq!(result.outcome.imported, 1);
+        assert!(result.settled.is_empty());
+        assert!(result.from_source.is_empty());
+        assert_eq!(result.outcome.divergence.len(), 1);
     }
 }

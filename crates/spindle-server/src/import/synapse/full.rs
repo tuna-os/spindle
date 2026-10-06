@@ -1653,13 +1653,7 @@ impl Run<'_, '_> {
         // Synapse's current state, and the replay is checked again.
         if let Ok(first) = &resolved
             && !first.outcome.clean()
-            && let Ok(plan) = plan_resolving(&source)
-            && let Some(last) = plan.steps.last()
         {
-            states.insert(
-                last.input.event_id.as_str().to_owned(),
-                source.current_state.clone(),
-            );
             let mut lookup = SnapshotSource {
                 snapshot: &mut *self.snapshot,
                 room_id,
