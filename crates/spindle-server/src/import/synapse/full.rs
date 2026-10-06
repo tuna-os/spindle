@@ -62,6 +62,22 @@ const REJECTION_POLICY_VERSION: u32 = 3;
 /// How many events a room report samples for the body comparison.
 const SAMPLES_PER_ROOM: usize = 5;
 
+/// A source-current accepted outlier is outside the retained timeline. Seed
+/// the explicit head immediately rather than replaying a known-divergent head
+/// first. Historical derivation and all body/authentication checks still run.
+fn current_head_needs_source(source: &SourceRoom) -> bool {
+    let outliers: BTreeSet<&str> = source
+        .events
+        .iter()
+        .filter(|event| event.outlier && !event.rejected)
+        .map(|event| event.event_id.as_str())
+        .collect();
+    source
+        .current_state
+        .values()
+        .any(|event| outliers.contains(event.as_str()))
+}
+
 /// What to import and where.
 pub struct Options {
     pub server_name: String,
@@ -1636,6 +1652,10 @@ impl Run<'_, '_> {
         };
         let groups = self.snapshot.state_group_graph(room_id)?;
         let mut states = HashMap::new();
+        let source_head = current_head_needs_source(&source);
+        if source_head {
+            eprintln!("replay: room={room_id} source_head=accepted_current_outlier");
+        }
         let mut resolved = {
             let mut lookup = SnapshotSource {
                 snapshot: &mut *self.snapshot,
@@ -1646,12 +1666,13 @@ impl Run<'_, '_> {
                 spool: &mut spool,
                 groups: Some(&groups),
             };
-            replay_resolving(&source, &mut lookup, false)
+            replay_resolving(&source, &mut lookup, source_head)
         };
         // Synapse's current state resolves every forward extremity; a log's
         // is its last entry's. When they differ, the last entry takes
         // Synapse's current state, and the replay is checked again.
-        if let Ok(first) = &resolved
+        if !source_head
+            && let Ok(first) = &resolved
             && !first.outcome.clean()
         {
             let mut lookup = SnapshotSource {
@@ -3060,6 +3081,42 @@ mod tests {
         assert!(!is_local("@a:notreilly.asia", "reilly.asia"));
         assert!(!is_local("@a:reilly.asia.evil", "reilly.asia"));
         assert_eq!(localpart("@a:reilly.asia"), "a");
+    }
+
+    #[test]
+    fn only_an_accepted_current_outlier_requests_the_source_head_upfront() {
+        let mut source = SourceRoom {
+            room_id: "!source-head:example.org".to_owned(),
+            events: vec![crate::import::SourceEvent {
+                event_id: "$membership".to_owned(),
+                event_type: "m.room.member".to_owned(),
+                state_key: Some("@remote:example.org".to_owned()),
+                prev_events: Vec::new(),
+                depth: 1,
+                stream_ordering: 1,
+                outlier: false,
+                rejected: false,
+            }],
+            current_state: StateMap::from([(
+                ("m.room.member".to_owned(), "@remote:example.org".to_owned()),
+                "$membership".to_owned(),
+            )]),
+            state_after_root: None,
+            forward_extremities: Vec::new(),
+        };
+        assert!(!current_head_needs_source(&source));
+        source.events[0].outlier = true;
+        assert!(current_head_needs_source(&source));
+        source.events[0].rejected = true;
+        assert!(!current_head_needs_source(&source));
+        source.events[0].rejected = false;
+        source.current_state.clear();
+        assert!(!current_head_needs_source(&source));
+        source.current_state.insert(
+            ("m.room.member".to_owned(), "@remote:example.org".to_owned()),
+            "$unknown".to_owned(),
+        );
+        assert!(!current_head_needs_source(&source));
     }
 
     #[test]
