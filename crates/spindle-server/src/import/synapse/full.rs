@@ -1636,7 +1636,7 @@ impl Run<'_, '_> {
         };
         let groups = self.snapshot.state_group_graph(room_id)?;
         let mut states = HashMap::new();
-        let resolved = {
+        let mut resolved = {
             let mut lookup = SnapshotSource {
                 snapshot: &mut *self.snapshot,
                 room_id,
@@ -1648,6 +1648,29 @@ impl Run<'_, '_> {
             };
             replay_resolving(&source, &mut lookup, false)
         };
+        // Synapse's current state resolves every forward extremity; a log's
+        // is its last entry's. When they differ, the last entry takes
+        // Synapse's current state, and the replay is checked again.
+        if let Ok(first) = &resolved
+            && !first.outcome.clean()
+            && let Ok(plan) = plan_resolving(&source)
+            && let Some(last) = plan.steps.last()
+        {
+            states.insert(
+                last.input.event_id.as_str().to_owned(),
+                source.current_state.clone(),
+            );
+            let mut lookup = SnapshotSource {
+                snapshot: &mut *self.snapshot,
+                room_id,
+                bodies: HashMap::new(),
+                states: &mut states,
+                resolver: Some(&mut auth_engine),
+                spool: &mut spool,
+                groups: Some(&groups),
+            };
+            resolved = replay_resolving(&source, &mut lookup, true);
+        }
         room_report.compat_user_ids = auth_engine.stand_ins.iter().cloned().collect();
         drop(auth_engine);
         let resolved = match resolved {
