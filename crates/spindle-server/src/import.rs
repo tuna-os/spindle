@@ -890,7 +890,19 @@ pub fn replay_resolving(
     let mut passes = 0;
     loop {
         passes += 1;
+        eprintln!(
+            "replay-pass start: room={} pass={passes} head_from_source={head_from_source} retained_marks={}",
+            room.room_id,
+            marks.len()
+        );
         let (mut result, new_marks) = replay_pass(room, &plan, source, &marks)?;
+        eprintln!(
+            "replay-pass end: room={} pass={passes} head_from_source={head_from_source} new_marks={} retained_marks={} divergence={}",
+            room.room_id,
+            new_marks.len(),
+            marks.len(),
+            result.outcome.divergence.len()
+        );
         // A fold that disagreed downstream of a fold that was already wrong
         // may be a knock-on effect, so a pass is repeated with every mark so
         // far until no new one appears.
