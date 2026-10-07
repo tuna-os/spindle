@@ -1261,10 +1261,12 @@ impl Federation {
                     })?,
                 );
             } else {
+                let enforce = spindle_core::rules_of(version)
+                    .is_some_and(|rules| rules.enforce_key_validity);
                 key_map.extend(
                     self.peer_keys(signer)
                         .await?
-                        .map_for(event["origin_server_ts"].as_u64()),
+                        .map_for(event["origin_server_ts"].as_u64(), enforce),
                 );
             }
         }
