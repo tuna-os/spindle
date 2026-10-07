@@ -42,6 +42,7 @@ pub mod push_rules;
 pub mod pushers;
 pub mod ratelimit;
 pub mod registration_tokens;
+pub mod rendezvous;
 pub mod rooms;
 pub mod routes;
 pub mod s3;
@@ -50,6 +51,7 @@ pub mod server_notices;
 pub mod shared_secret_registration;
 pub mod signing;
 pub mod sliding;
+pub mod state_res_v1;
 pub mod stream;
 pub mod surface;
 pub mod telemetry;
@@ -100,6 +102,7 @@ pub struct AppState {
     /// Single-use challenges for Synapse-compatible shared-secret account
     /// creation. Process-local because a restart invalidates them.
     pub registration_nonces: Arc<shared_secret_registration::RegistrationNonces>,
+    pub rendezvous: Arc<rendezvous::Rendezvous>,
 }
 
 /// Why the application cannot be built. Both are startup-fatal on purpose:
@@ -221,6 +224,7 @@ pub fn app_with_metrics(
         )
         .map_err(|error| AppError::FederationConfig(error.to_string()))?
         .with_peers(&config.federation.peers)
+        .with_enabled(config.federation.enabled)
         .with_metrics(Arc::clone(&metrics)),
     );
     let delegated = config
@@ -263,6 +267,7 @@ pub fn app_with_metrics(
         )),
         push,
         registration_nonces: Arc::new(shared_secret_registration::RegistrationNonces::new()),
+        rendezvous: Arc::new(rendezvous::Rendezvous::new()),
         metrics,
     };
     spawn_delivery_loops(&state);
@@ -300,11 +305,15 @@ fn spawn_delivery_loops(state: &AppState) {
         Arc::downgrade(&state.key),
         std::time::Duration::from_secs(1),
     ));
-    tokio::spawn(federation::drain_outbox(
-        Arc::downgrade(&state.store),
-        Arc::downgrade(&state.federation),
-        std::time::Duration::from_millis(state.config.federation.retry_base_ms),
-    ));
+    // Disabled federation leaves queued rows in the outbox and never starts
+    // the drain that would only be refused, row by row.
+    if state.config.federation.enabled {
+        tokio::spawn(federation::drain_outbox(
+            Arc::downgrade(&state.store),
+            Arc::downgrade(&state.federation),
+            std::time::Duration::from_millis(state.config.federation.retry_base_ms),
+        ));
+    }
     // Push delivery shares the outbox's retry base for the same reason
     // the appservice push does, below.
     if state.config.push.enabled {
@@ -340,3 +349,5 @@ fn spawn_delivery_loops(state: &AppState) {
         ));
     }
 }
+
+mod passwords;

@@ -788,8 +788,8 @@ MSC3706 as planned, and this paragraph is the design it will be built to.
 
 | Version | Support | Notes |
 |---|---|---|
-| 1–5 | Read-only interop | Legacy event ID format; joinable, not creatable |
-| 6–10 | Full | Full DAG semantics with the class-D path |
+| 1–5 | Full | v1/v2 events carry `$opaque:server` IDs and link parents by `[id, {"sha256": hash}]` pairs; v1 resolves forks with the original algorithm (`state_res_v1`, ruma has none); v1/v2 same-server redaction rule; v3 standard-base64 IDs (escaped in federation paths); v5 key validity enforced from v5 on |
+| 6–10 | Full | Served at their own rules: two-server join, event exchange and redaction tested per version; v7 knocks, v8/v9 restricted joins, v1–v9 string power levels |
 | **11** | **Full** | `MSC3820` cleanups: no top-level `origin` (MSC3989), no `creator` in create content (MSC2175), `redacts` in content (MSC2174), updated redaction algorithm (MSC2176/MSC3821) |
 | **12** | **Full; default candidate — see below** | Current stable version; supported by Ruma 0.16 and by both surveyed Rust homeservers |
 | `org.matrix.msc3995.v1` | Experimental | LM room version with hub-assigned `prev_event` (§12.4) |

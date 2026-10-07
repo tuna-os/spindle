@@ -418,15 +418,45 @@ pub struct DelegatedAuthConfig {
     /// The OAuth 2.0 token introspection endpoint. MAS serves it at
     /// `{issuer}/oauth2/introspect`.
     pub introspection_endpoint: String,
-    /// Client credentials this server presents when introspecting.
-    pub client_id: String,
-    pub client_secret: String,
+    /// Client credentials this server presents when introspecting, for a
+    /// provider that has a client registered for it.
+    ///
+    /// Both absent, introspection presents `homeserver_secret` as a bearer
+    /// token instead. That is how Synapse's `matrix_authentication_service`
+    /// section introspects, so a MAS configured for Synapse that way (no
+    /// client of its own for the homeserver, as Element Server Suite
+    /// deploys it) answers this server unchanged.
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub client_secret: Option<String>,
     /// The token the provider presents when calling *us* — MAS's
     /// `matrix.secret`, guarding the `/_synapse/mas/*` provisioning
     /// surface. Absent, that surface answers 404 and the provider
     /// cannot manage accounts here.
     #[serde(default)]
     pub homeserver_secret: Option<String>,
+}
+
+impl DelegatedAuthConfig {
+    /// Introspection has to present something. Half a client pair is a
+    /// typo that would otherwise surface as every token being refused.
+    fn validate(&self) -> Result<(), ConfigError> {
+        match (&self.client_id, &self.client_secret) {
+            (Some(_), Some(_)) => Ok(()),
+            (None, None) if self.homeserver_secret.is_some() => Ok(()),
+            (None, None) => Err(ConfigError::Invalid {
+                field: "auth.delegated",
+                message: "introspection needs client_id and client_secret, or \
+                          homeserver_secret (MAS's matrix.secret) to present instead"
+                    .to_owned(),
+            }),
+            _ => Err(ConfigError::Invalid {
+                field: "auth.delegated.client_id",
+                message: "client_id and client_secret go together".to_owned(),
+            }),
+        }
+    }
 }
 
 /// Which appservice registration files to load at startup.
@@ -529,6 +559,18 @@ const fn default_true() -> bool {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FederationConfig {
+    /// Federate at all. Off makes this server an island: every outbound
+    /// federation request (transactions, key fetches, joins, queries,
+    /// media) is refused in-process before a name is resolved or a socket
+    /// is opened, the outbox is not drained, the federation listener does
+    /// not start, and `/_matrix/federation/*` and `/_matrix/key/*` answer
+    /// `404 M_UNRECOGNIZED`.
+    ///
+    /// For a dark copy of a live server -- a migration rehearsal that runs
+    /// with the production `server_name` and signing key -- which must
+    /// never speak for that server to the rest of the federation.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// Fetch peer keys and send requests over plain http instead of https.
     ///
     /// For test rigs whose "servers" are loopback stubs. A production
@@ -588,6 +630,7 @@ fn default_retry_base_ms() -> u64 {
 impl Default for FederationConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             insecure_http: false,
             allow_internal: Vec::new(),
             retry_base_ms: default_retry_base_ms(),
@@ -743,6 +786,9 @@ impl Config {
             message: error.to_string(),
         })?;
         config.validate()?;
+        if let Some(delegated) = &config.auth.delegated {
+            delegated.validate()?;
+        }
         Ok(config)
     }
 
@@ -761,9 +807,18 @@ impl Config {
         Self::parse(&text)
     }
 
-    /// `[federation] peers`: each URL is a scheme, host and port, and a
-    /// patience cap is never shorter than the base it caps.
+    /// `[federation]`: no listener on a server told not to federate, each
+    /// peer URL is a scheme, host and port, and a patience cap is never
+    /// shorter than the base it caps.
     fn validate_peers(&self) -> Result<(), ConfigError> {
+        // A federation listener with `enabled = false` is a contradiction;
+        // refusing it is safer than guessing which was meant.
+        if !self.federation.enabled && self.federation.bind.is_some() {
+            return Err(ConfigError::Invalid {
+                field: "federation.bind",
+                message: "must be unset while federation.enabled = false".to_owned(),
+            });
+        }
         for (name, peer) in &self.federation.peers {
             let url = reqwest::Url::parse(&peer.url).map_err(|error| ConfigError::Invalid {
                 field: "federation.peers.url",

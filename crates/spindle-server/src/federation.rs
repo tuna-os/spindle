@@ -41,6 +41,24 @@ pub struct RemoteBackfill {
     pub auth_chain: Vec<Value>,
 }
 
+/// How long a server's `.well-known/matrix/server` answer is used when the
+/// response does not say (SPEC: server discovery, step 3: "24 hours is
+/// recommended"), and the bounds a `Cache-Control: max-age` is held to.
+const WELL_KNOWN_DEFAULT: Duration = Duration::from_secs(24 * 3600);
+const WELL_KNOWN_MIN: Duration = Duration::from_secs(5 * 60);
+const WELL_KNOWN_MAX: Duration = Duration::from_secs(48 * 3600);
+
+/// How long a server whose `.well-known` could not be had is reached at
+/// `name:8448` before its `.well-known` is asked again. Short, because a
+/// peer whose web server was briefly down would otherwise be addressed at
+/// a port nothing listens on for as long as this says; finite, because
+/// every name a stranger puts in a room is one more fetch.
+const WELL_KNOWN_FAILURE: Duration = Duration::from_secs(5 * 60);
+
+/// The most of a `.well-known/matrix/server` body read. The document is
+/// one short JSON object; anything larger is not one.
+const WELL_KNOWN_MAX_BYTES: usize = 64 * 1024;
+
 pub struct Federation {
     store: Arc<FjallStore>,
     server_name: String,
@@ -69,6 +87,15 @@ pub struct Federation {
     /// retried — stale typing redelivered late is a lie about the present,
     /// and whoever is still typing says so again within seconds.
     edu_queue: std::sync::Mutex<std::collections::HashMap<String, Vec<Value>>>,
+    /// `[federation] enabled`. Off refuses every outbound request in
+    /// [`Federation::base_url`], the one place each of them is addressed.
+    enabled: bool,
+    /// What each server name's `.well-known/matrix/server` said; shared
+    /// with every [`Discovery`] handed out, so one fetch serves them all.
+    delegations: Arc<Delegations>,
+    /// The port `.well-known` is fetched from: 443, as the spec says. Tests
+    /// that cannot bind 443 move it with [`Federation::with_well_known_port`].
+    well_known_port: u16,
 }
 
 #[derive(Debug)]
@@ -101,6 +128,156 @@ pub enum FederationError {
 struct Peer {
     url: String,
     max_backoff: Option<Duration>,
+}
+
+/// What each server name's `.well-known/matrix/server` said, and until
+/// when to believe it: `Some(base URL)` for a delegation, `None` for no
+/// usable answer (the name is then reached at `name:8448`).
+type Delegations = std::sync::Mutex<HashMap<String, (Option<String>, Instant)>>;
+
+/// Where one request goes: see [`Federation::address`].
+enum Address {
+    /// Known without asking the network: a configured peer, a name with
+    /// an explicit port, or an IP literal.
+    Fixed(String),
+    /// A bare hostname: its `.well-known` decides, and `fallback`
+    /// (`name:8448`) is used when it has none.
+    Discover {
+        name: String,
+        fallback: String,
+        discovery: Discovery,
+    },
+}
+
+impl Address {
+    /// The base URL, asking `.well-known` if the name needs it.
+    async fn resolve(self) -> Result<String, FederationError> {
+        match self {
+            Self::Fixed(url) => Ok(url),
+            Self::Discover {
+                name,
+                fallback,
+                discovery,
+            } => Ok(discovery.delegation(&name).await.unwrap_or(fallback)),
+        }
+    }
+}
+
+/// Server discovery, with what it needs and nothing else: no store, so it
+/// can be held across the `.well-known` fetch by a task that must not keep
+/// the store open (the outbox drain).
+#[derive(Clone)]
+struct Discovery {
+    client: reqwest::Client,
+    insecure_http: bool,
+    allowed: Vec<Cidr>,
+    delegations: Arc<Delegations>,
+    well_known_port: u16,
+}
+
+impl Discovery {
+    /// `base_url(name)`, with a literal address judged like a resolved one.
+    fn vetted_url(&self, name: &str) -> Result<String, FederationError> {
+        let url = base_url(name, self.insecure_http)?;
+        if let Ok(server) = ruma::OwnedServerName::try_from(name)
+            && let Ok(literal) = server.host().trim_matches(['[', ']']).parse::<IpAddr>()
+            && !permits(&self.allowed, literal)
+        {
+            return Err(FederationError::Refused(format!(
+                "{name} is not an address this server reaches"
+            )));
+        }
+        Ok(url)
+    }
+
+    /// Where `name` delegated its federation traffic, if it did.
+    ///
+    /// The answer is cached for as long as the response allows (24 h by
+    /// default, held between 5 min and 48 h), and a failure for
+    /// [`WELL_KNOWN_FAILURE`], so a busy destination costs one fetch per
+    /// period, not one per request.
+    async fn delegation(&self, name: &str) -> Option<String> {
+        let now = Instant::now();
+        if let Some((delegated, until)) = self
+            .delegations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            && *until > now
+        {
+            return delegated.clone();
+        }
+        let (delegated, ttl) = match self.fetch_well_known(name).await {
+            Ok((server, ttl)) => match self.vetted_url(&server) {
+                Ok(url) => (Some(url), ttl),
+                Err(error) => {
+                    tracing::debug!(%name, %server, %error, "unusable federation delegation");
+                    (None, WELL_KNOWN_FAILURE)
+                }
+            },
+            Err(error) => {
+                tracing::debug!(%name, %error, "no federation delegation; using port 8448");
+                (None, WELL_KNOWN_FAILURE)
+            }
+        };
+        let mut delegations = self
+            .delegations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Bounded: a stranger can name any number of servers, and each
+        // one is an entry.
+        if delegations.len() > 10_000 {
+            delegations.retain(|_, (_, until)| *until > now);
+        }
+        delegations.insert(name.to_owned(), (delegated.clone(), now + ttl));
+        delegated
+    }
+
+    /// GET `https://<name>/.well-known/matrix/server` and return the
+    /// delegated server name and how long to believe it.
+    ///
+    /// The fetch goes through the same vetting resolver and redirect
+    /// policy as every other federation request, so a name that resolves
+    /// inward, or a redirect into a private range, is refused here too.
+    async fn fetch_well_known(&self, name: &str) -> Result<(String, Duration), FederationError> {
+        let scheme = if self.insecure_http { "http" } else { "https" };
+        let url = if self.well_known_port == 443 && !self.insecure_http {
+            format!("{scheme}://{name}/.well-known/matrix/server")
+        } else {
+            format!(
+                "{scheme}://{name}:{}/.well-known/matrix/server",
+                self.well_known_port
+            )
+        };
+        let response = self
+            .client
+            .get(&url)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|error| FederationError::Refused(format!("well-known: {error}")))?;
+        if !response.status().is_success() {
+            return Err(FederationError::Refused(format!(
+                "well-known: {}",
+                response.status()
+            )));
+        }
+        let ttl = well_known_ttl(response.headers().get(reqwest::header::CACHE_CONTROL));
+        if response
+            .content_length()
+            .is_some_and(|length| length > WELL_KNOWN_MAX_BYTES as u64)
+        {
+            return Err(FederationError::Refused("well-known: too large".to_owned()));
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| FederationError::Refused(format!("well-known body: {error}")))?;
+        if body.len() > WELL_KNOWN_MAX_BYTES {
+            return Err(FederationError::Refused("well-known: too large".to_owned()));
+        }
+        Ok((parse_well_known(&body)?, ttl))
+    }
 }
 
 impl std::fmt::Display for FederationError {
@@ -183,7 +360,35 @@ impl Federation {
             allowed,
             negative: std::sync::Mutex::new(HashMap::new()),
             edu_queue: std::sync::Mutex::new(std::collections::HashMap::new()),
+            enabled: true,
+            delegations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            well_known_port: 443,
         })
+    }
+
+    /// Fetch `.well-known/matrix/server` from `port` instead of 443.
+    ///
+    /// For tests, which cannot bind 443; with `insecure_http` the fetch is
+    /// plain http as well. A deployment has no reason to set this.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_well_known_port(mut self, port: u16) -> Self {
+        self.well_known_port = port;
+        self
+    }
+
+    /// Federate or not (`[federation] enabled`). Disabled, every outbound
+    /// request is refused before its destination is resolved.
+    #[must_use]
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Whether this server federates at all.
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled
     }
 
     /// Record into `metrics` rather than a registry of this client's own.
@@ -228,11 +433,28 @@ impl Federation {
     }
 
     /// The URL a request to `name` goes to, or a refusal.
+    async fn base_url(&self, name: &str) -> Result<String, FederationError> {
+        self.address(name)?.resolve().await
+    }
+
+    /// Where a request to `name` goes, as far as can be said without the
+    /// network: a refusal, a fixed URL, or a name whose `.well-known` must
+    /// be asked first ([`Address::resolve`]).
     ///
     /// Grammar first (#286), then, for a name that is a literal address,
     /// the same judgement the resolver applies to a hostname: a literal
     /// never touches DNS, so this is the only place it can be vetted.
-    fn base_url(&self, name: &str) -> Result<String, FederationError> {
+    /// Synchronous and free of the store, so the outbox can address a
+    /// transaction while it plans and resolve it after it lets go.
+    fn address(&self, name: &str) -> Result<Address, FederationError> {
+        // Every outbound request is addressed here, so this is the one
+        // switch that keeps a dark copy of a live server off the network:
+        // refused before a name is resolved or a socket opened.
+        if !self.enabled {
+            return Err(FederationError::Refused(format!(
+                "federation is disabled on this server; not contacting {name}"
+            )));
+        }
         // A configured peer goes where the operator said, and its host is
         // judged the same way a name's would be: a literal here, a hostname
         // by the resolver when the connection is made.
@@ -247,18 +469,40 @@ impl Federation {
                     "{name} is configured at an address this server does not reach"
                 )));
             }
-            return Ok(peer.url.clone());
+            return Ok(Address::Fixed(peer.url.clone()));
         }
-        let url = base_url(name, self.insecure_http)?;
-        if let Ok(server) = ruma::OwnedServerName::try_from(name)
-            && let Ok(literal) = server.host().trim_matches(['[', ']']).parse::<IpAddr>()
-            && !permits(&self.allowed, literal)
+        let discovery = self.discovery();
+        let url = discovery.vetted_url(name)?;
+        // Server discovery (SPEC: server-server API, "Resolving server
+        // names"): a hostname with no port may have delegated its
+        // federation traffic with `.well-known/matrix/server`. An IP
+        // literal or an explicit port is used as it is.
+        //
+        // A test rig on plain http has nothing on 443 to ask, so it skips
+        // discovery unless a test moved the port.
+        let discover = !self.insecure_http || self.well_known_port != 443;
+        if discover
+            && let Ok(server) = ruma::OwnedServerName::try_from(name)
+            && server.port().is_none()
+            && !server.is_ip_literal()
         {
-            return Err(FederationError::Refused(format!(
-                "{name} is not an address this server reaches"
-            )));
+            return Ok(Address::Discover {
+                name: name.to_owned(),
+                fallback: url,
+                discovery,
+            });
         }
-        Ok(url)
+        Ok(Address::Fixed(url))
+    }
+
+    fn discovery(&self) -> Discovery {
+        Discovery {
+            client: self.client.clone(),
+            insecure_http: self.insecure_http,
+            allowed: self.allowed.clone(),
+            delegations: Arc::clone(&self.delegations),
+            well_known_port: self.well_known_port,
+        }
     }
 
     /// Queue one EDU for `destination`'s next transaction.
@@ -413,7 +657,9 @@ impl Federation {
             .ok_or_else(|| FederationError::Refused(format!("no keys for {origin}")))?;
         let cached: Value = serde_json::from_slice(&bytes)
             .map_err(|error| FederationError::Storage(error.to_string()))?;
-        PeerKeys::from_document(origin, &cached["document"])
+        let mut keys = PeerKeys::from_document(origin, &cached["document"])?;
+        keys.valid_until = cached["fetched_valid_until"].as_u64();
+        Ok(keys)
     }
 
     /// The origin's key document as it published it, from cache or
@@ -497,11 +743,11 @@ impl Federation {
 impl Federation {
     /// GET a peer's key document and check it vouches for itself.
     ///
-    /// Delegation (.well-known, SRV) is not resolved yet — the server name
-    /// is used as the host directly, which the federation test rig
-    /// satisfies and docs/dashboard record as a gap.
+    /// The name is resolved like every other destination
+    /// ([`Federation::base_url`]): `.well-known` delegation first, then
+    /// `name:8448`.
     async fn fetch_key_document(&self, origin: &str) -> Result<Value, FederationError> {
-        let url = format!("{}/_matrix/key/v2/server", self.base_url(origin)?);
+        let url = format!("{}/_matrix/key/v2/server", self.base_url(origin).await?);
         let document: Value = self
             .client
             .get(&url)
@@ -559,7 +805,7 @@ impl Federation {
         let authorization = self.sign_request("GET", &uri, destination, None)?;
         let response = self
             .client
-            .get(format!("{}{uri}", self.base_url(destination)?))
+            .get(format!("{}{uri}", self.base_url(destination).await?))
             .header("authorization", authorization)
             .timeout(Duration::from_secs(30))
             .send()
@@ -609,7 +855,7 @@ impl Federation {
         let authorization = self.sign_request("GET", &uri, destination, None)?;
         let response = self
             .client
-            .get(format!("{}{uri}", self.base_url(destination)?))
+            .get(format!("{}{uri}", self.base_url(destination).await?))
             .header("authorization", authorization)
             .timeout(Duration::from_secs(30))
             .send()
@@ -650,11 +896,14 @@ impl Federation {
         event_id: &str,
         knock: &Value,
     ) -> Result<Value, FederationError> {
-        let uri = format!("/_matrix/federation/v1/send_knock/{room_id}/{event_id}");
+        let uri = format!(
+            "/_matrix/federation/v1/send_knock/{room_id}/{}",
+            path_segment(event_id)
+        );
         let authorization = self.sign_request("PUT", &uri, destination, Some(knock))?;
         let response = self
             .client
-            .put(format!("{}{uri}", self.base_url(destination)?))
+            .put(format!("{}{uri}", self.base_url(destination).await?))
             .header("authorization", authorization)
             .header("content-type", "application/json")
             .timeout(Duration::from_secs(60))
@@ -693,7 +942,7 @@ impl Federation {
     ) -> Result<Value, FederationError> {
         let method = if body.is_some() { "POST" } else { "GET" };
         let authorization = self.sign_request(method, uri, destination, body)?;
-        let endpoint = format!("{}{uri}", self.base_url(destination)?);
+        let endpoint = format!("{}{uri}", self.base_url(destination).await?);
         let request = match body {
             Some(body) => self
                 .client
@@ -797,7 +1046,7 @@ impl Federation {
         let authorization = self.sign_request("GET", &uri, destination, None)?;
         let response = self
             .client
-            .get(format!("{}{uri}", self.base_url(destination)?))
+            .get(format!("{}{uri}", self.base_url(destination).await?))
             .header("authorization", authorization)
             .timeout(Duration::from_secs(10))
             .send()
@@ -837,7 +1086,7 @@ impl Federation {
         let authorization = self.sign_request("GET", &uri, destination, None)?;
         let response = self
             .client
-            .get(format!("{}{uri}", self.base_url(destination)?))
+            .get(format!("{}{uri}", self.base_url(destination).await?))
             .header("authorization", authorization)
             .timeout(Duration::from_secs(10))
             .send()
@@ -873,11 +1122,14 @@ impl Federation {
         event_id: &str,
         join: &Value,
     ) -> Result<Value, FederationError> {
-        let uri = format!("/_matrix/federation/v2/send_join/{room_id}/{event_id}");
+        let uri = format!(
+            "/_matrix/federation/v2/send_join/{room_id}/{}",
+            path_segment(event_id)
+        );
         let authorization = self.sign_request("PUT", &uri, destination, Some(join))?;
         let response = self
             .client
-            .put(format!("{}{uri}", self.base_url(destination)?))
+            .put(format!("{}{uri}", self.base_url(destination).await?))
             .header("authorization", authorization)
             .header("content-type", "application/json")
             .timeout(Duration::from_secs(60))
@@ -1049,11 +1301,14 @@ impl Federation {
         event_id: &str,
         body: &Value,
     ) -> Result<Value, FederationError> {
-        let uri = format!("/_matrix/federation/v2/invite/{room_id}/{event_id}");
+        let uri = format!(
+            "/_matrix/federation/v2/invite/{room_id}/{}",
+            path_segment(event_id)
+        );
         let authorization = self.sign_request("PUT", &uri, destination, Some(body))?;
         let response = self
             .client
-            .put(format!("{}{uri}", self.base_url(destination)?))
+            .put(format!("{}{uri}", self.base_url(destination).await?))
             .header("authorization", authorization)
             .header("content-type", "application/json")
             .timeout(Duration::from_secs(30))
@@ -1095,7 +1350,7 @@ impl Federation {
         let authorization = self.sign_request("GET", &uri, destination, None)?;
         let response = self
             .client
-            .get(format!("{}{uri}", self.base_url(destination)?))
+            .get(format!("{}{uri}", self.base_url(destination).await?))
             .header("authorization", authorization)
             .timeout(Duration::from_secs(30))
             .send()
@@ -1131,11 +1386,14 @@ impl Federation {
         event_id: &str,
         leave: &Value,
     ) -> Result<(), FederationError> {
-        let uri = format!("/_matrix/federation/v2/send_leave/{room_id}/{event_id}");
+        let uri = format!(
+            "/_matrix/federation/v2/send_leave/{room_id}/{}",
+            path_segment(event_id)
+        );
         let authorization = self.sign_request("PUT", &uri, destination, Some(leave))?;
         let response = self
             .client
-            .put(format!("{}{uri}", self.base_url(destination)?))
+            .put(format!("{}{uri}", self.base_url(destination).await?))
             .header("authorization", authorization)
             .header("content-type", "application/json")
             .timeout(Duration::from_secs(30))
@@ -1174,7 +1432,7 @@ impl Federation {
         let authorization = self.sign_request("GET", &uri, destination, None)?;
         let response = self
             .client
-            .get(format!("{}{uri}", self.base_url(destination)?))
+            .get(format!("{}{uri}", self.base_url(destination).await?))
             .header("authorization", authorization)
             .timeout(Duration::from_secs(60))
             .send()
@@ -1214,7 +1472,7 @@ impl Federation {
         // peers predating authenticated media; a 404 there is final.
         let legacy = format!(
             "{}/_matrix/media/v3/download/{destination}/{media_id}?allow_redirect=false",
-            self.base_url(destination)?
+            self.base_url(destination).await?
         );
         let response = self
             .client
@@ -1271,8 +1529,9 @@ impl Federation {
     /// Split from the send so the outbox drain can build every request of
     /// a pass while it holds the store and the federation strongly, and
     /// send them once it has let go: what the builder carries is a client
-    /// handle, a signature and the body, none of which the store's close
-    /// waits on.
+    /// handle, the destination's address, a signature and the body, none of
+    /// which the store's close waits on. A destination that must be looked
+    /// up in its `.well-known` is looked up at send time.
     ///
     /// # Errors
     ///
@@ -1283,25 +1542,40 @@ impl Federation {
         destination: &str,
         txn_id: &str,
         body: &Value,
-    ) -> Result<reqwest::RequestBuilder, FederationError> {
+    ) -> Result<PreparedTransaction, FederationError> {
         let uri = format!("/_matrix/federation/v1/send/{txn_id}");
         let authorization = self.sign_request("PUT", &uri, destination, Some(body))?;
-        Ok(self
-            .client
-            .put(format!("{}{uri}", self.base_url(destination)?))
-            .header("authorization", authorization)
-            .header("content-type", "application/json")
-            .timeout(Duration::from_secs(30))
-            .body(body.to_string()))
+        Ok(PreparedTransaction {
+            client: self.client.clone(),
+            address: self.address(destination)?,
+            uri,
+            authorization,
+            body: body.to_string(),
+        })
     }
 }
 
+/// One signed transaction, addressed but not yet resolved: the
+/// destination's `.well-known` is asked (if it must be) when it is sent,
+/// after the outbox has let go of the store.
+struct PreparedTransaction {
+    client: reqwest::Client,
+    address: Address,
+    uri: String,
+    authorization: String,
+    body: String,
+}
+
 /// Send one built transaction and read the peer's verdict.
-async fn deliver(
-    request: reqwest::RequestBuilder,
-    destination: &str,
-) -> Result<(), FederationError> {
-    let response = request
+async fn deliver(prepared: PreparedTransaction, destination: &str) -> Result<(), FederationError> {
+    let base = prepared.address.resolve().await?;
+    let response = prepared
+        .client
+        .put(format!("{base}{}", prepared.uri))
+        .header("authorization", prepared.authorization)
+        .header("content-type", "application/json")
+        .timeout(Duration::from_secs(30))
+        .body(prepared.body)
         .send()
         .await
         .map_err(|error| FederationError::Refused(format!("send: {error}")))?;
@@ -1323,7 +1597,7 @@ type OutboxRow = (Vec<u8>, Vec<u8>);
 struct OutboundTransaction {
     destination: String,
     keys: Vec<Vec<u8>>,
-    request: Result<reqwest::RequestBuilder, FederationError>,
+    request: Result<PreparedTransaction, FederationError>,
 }
 
 /// Drain the outbound queue, forever.
@@ -1565,6 +1839,10 @@ pub struct PeerKeys {
     /// Keys of *other* servers that must also verify the event -- the
     /// countersignature on a restricted join is ours, not the peer's.
     vouched: ruma::signatures::PublicKeyMap,
+    /// How long the current keys answer for an event, for the versions
+    /// that enforce it (v5+): the document's `valid_until_ts` capped at
+    /// seven days after the fetch. `None` when unknown.
+    valid_until: Option<u64>,
 }
 
 impl PeerKeys {
@@ -1597,10 +1875,28 @@ impl PeerKeys {
     /// at `origin_server_ts`: every current key, plus each retired key whose
     /// expiry is after that moment. An event with no timestamp gets current
     /// keys only.
+    ///
+    /// `enforce_key_validity` is room version 5's rule, kept by every later
+    /// version: a current key answers only for events signed no later than
+    /// the document's `valid_until_ts` (capped at seven days after it was
+    /// fetched, which is what the cache stores). Versions 1 to 4 do not
+    /// have the rule, and an old event there still verifies with a key
+    /// whose document has lapsed.
     #[must_use]
-    pub fn map_for(&self, origin_server_ts: Option<u64>) -> ruma::signatures::PublicKeyMap {
+    pub fn map_for(
+        &self,
+        origin_server_ts: Option<u64>,
+        enforce_key_validity: bool,
+    ) -> ruma::signatures::PublicKeyMap {
         let at = origin_server_ts.unwrap_or(u64::MAX);
-        let mut set: ruma::signatures::PublicKeySet = self.current.clone();
+        let lapsed = enforce_key_validity
+            && origin_server_ts.is_some()
+            && self.valid_until.is_some_and(|until| at > until);
+        let mut set: ruma::signatures::PublicKeySet = if lapsed {
+            ruma::signatures::PublicKeySet::new()
+        } else {
+            self.current.clone()
+        };
         for (key_id, (key, expired_ts)) in &self.retired {
             if at < *expired_ts {
                 set.entry(key_id.clone()).or_insert_with(|| key.clone());
@@ -1615,6 +1911,28 @@ impl PeerKeys {
     pub fn vouch(&mut self, server: String, key_id: String, key: ruma::serde::Base64) {
         self.vouched.entry(server).or_default().insert(key_id, key);
     }
+}
+
+/// An identifier as one path segment of a federation URL.
+///
+/// A room v3 event ID is standard base64 and may contain `/`, which would
+/// otherwise split the segment and send the request to a route that does
+/// not exist. Only the characters that change a path's meaning are
+/// escaped, so every ID from v4 on (URL-safe) and every v1/v2 ID goes out
+/// byte for byte as it always did -- the request signature covers the URI,
+/// and a needless change to it is a change both sides must agree on.
+pub(crate) fn path_segment(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    for character in id.chars() {
+        match character {
+            '/' => out.push_str("%2F"),
+            '?' => out.push_str("%3F"),
+            '#' => out.push_str("%23"),
+            '%' => out.push_str("%25"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn parse_key(key: &str) -> Result<ruma::serde::Base64, FederationError> {
@@ -1650,8 +1968,8 @@ fn verify_self_signed(origin: &str, document: &Value) -> Result<(), FederationEr
 ///
 /// A name with no explicit port speaks federation on 8448 (SPEC: server
 /// discovery's final fallback), not 443 — `https://hs1/` would knock on a
-/// door nothing is behind. Delegation (.well-known, SRV) is still not
-/// resolved; the name is the host, which docs/dashboard records as a gap.
+/// door nothing is behind. `.well-known` delegation is resolved before this
+/// is reached ([`Federation::base_url`]); SRV records are not.
 /// Where requests to `name` go, refusing anything that is not a server name.
 ///
 /// The name is never this server's own. It comes from a peer's X-Matrix
@@ -1677,6 +1995,47 @@ fn base_url(name: &str, insecure_http: bool) -> Result<String, FederationError> 
         Some(_) => format!("{scheme}://{name}"),
         None => format!("{scheme}://{name}:8448"),
     })
+}
+
+/// The delegated server name in a `.well-known/matrix/server` body.
+///
+/// The value must itself be a server name (hostname or IP literal, with
+/// an optional port): it becomes the host and port of every request that
+/// follows, so it gets the same grammar check as a name from a header.
+fn parse_well_known(body: &[u8]) -> Result<String, FederationError> {
+    let document: Value = serde_json::from_slice(body)
+        .map_err(|error| FederationError::Refused(format!("well-known: {error}")))?;
+    let server = document["m.server"]
+        .as_str()
+        .ok_or_else(|| FederationError::Refused("well-known has no m.server".to_owned()))?;
+    ruma::OwnedServerName::try_from(server)
+        .map(|server| server.to_string())
+        .map_err(|error| {
+            FederationError::Refused(format!("well-known m.server {server:?}: {error}"))
+        })
+}
+
+/// How long to believe a `.well-known` answer, from its `Cache-Control`.
+///
+/// `max-age` is honoured within [`WELL_KNOWN_MIN`]..[`WELL_KNOWN_MAX`];
+/// `no-store`/`no-cache` mean the minimum; anything else the default.
+fn well_known_ttl(cache_control: Option<&reqwest::header::HeaderValue>) -> Duration {
+    let Some(value) = cache_control.and_then(|value| value.to_str().ok()) else {
+        return WELL_KNOWN_DEFAULT;
+    };
+    for directive in value.split(',').map(str::trim) {
+        let directive = directive.to_ascii_lowercase();
+        if directive == "no-store" || directive == "no-cache" {
+            return WELL_KNOWN_MIN;
+        }
+        if let Some(seconds) = directive
+            .strip_prefix("max-age=")
+            .and_then(|seconds| seconds.trim_matches('"').parse::<u64>().ok())
+        {
+            return Duration::from_secs(seconds).clamp(WELL_KNOWN_MIN, WELL_KNOWN_MAX);
+        }
+    }
+    WELL_KNOWN_DEFAULT
 }
 
 /// Pull `filename="..."` (or bare filename=) out of a Content-Disposition.
@@ -1915,5 +2274,98 @@ mod backoff_tests {
         assert_eq!(backoff_delay(base, 12, Some(hour)), hour);
         // Past the cap, the cap; and a huge failure count cannot overflow.
         assert_eq!(backoff_delay(base, u32::MAX, Some(hour)), hour);
+    }
+}
+
+#[cfg(test)]
+mod well_known_tests {
+    use super::{
+        WELL_KNOWN_DEFAULT, WELL_KNOWN_MAX, WELL_KNOWN_MIN, parse_well_known, well_known_ttl,
+    };
+    use std::time::Duration;
+
+    fn ttl(header: &str) -> Duration {
+        well_known_ttl(Some(
+            &reqwest::header::HeaderValue::from_str(header).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn the_delegated_name_is_read_and_checked() {
+        assert_eq!(
+            parse_well_known(br#"{"m.server": "matrix.reilly.asia:443"}"#).unwrap(),
+            "matrix.reilly.asia:443"
+        );
+        assert_eq!(
+            parse_well_known(br#"{"m.server": "matrix-federation.matrix.org"}"#).unwrap(),
+            "matrix-federation.matrix.org"
+        );
+        for bad in [
+            &br"{}"[..],
+            br#"{"m.server": 443}"#,
+            br#"{"m.server": "evil host"}"#,
+            br#"{"m.server": "a:1/../admin"}"#,
+            br"not json",
+        ] {
+            assert!(
+                parse_well_known(bad).is_err(),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    #[test]
+    fn the_cache_time_follows_cache_control_within_bounds() {
+        assert_eq!(well_known_ttl(None), WELL_KNOWN_DEFAULT);
+        assert_eq!(ttl("public, max-age=7200"), Duration::from_secs(7200));
+        assert_eq!(ttl("max-age=1"), WELL_KNOWN_MIN);
+        assert_eq!(ttl("max-age=99999999"), WELL_KNOWN_MAX);
+        assert_eq!(ttl("no-store"), WELL_KNOWN_MIN);
+        assert_eq!(ttl("private"), WELL_KNOWN_DEFAULT);
+    }
+}
+
+#[cfg(test)]
+mod key_validity_tests {
+    use super::PeerKeys;
+    use serde_json::json;
+
+    fn keys() -> PeerKeys {
+        let document = json!({
+            "verify_keys": { "ed25519:new": { "key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" } },
+            "old_verify_keys": {
+                "ed25519:old": {
+                    "key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+                    "expired_ts": 500,
+                },
+            },
+        });
+        let mut keys = PeerKeys::from_document("peer.example", &document).unwrap();
+        keys.valid_until = Some(1_000);
+        keys
+    }
+
+    fn held(keys: &PeerKeys, ts: u64, enforce: bool) -> Vec<String> {
+        keys.map_for(Some(ts), enforce)["peer.example"]
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Room version 5's rule: a current key answers only for events signed
+    /// before its document's `valid_until_ts`. Versions 1–4 do not have it.
+    #[test]
+    fn a_lapsed_document_answers_only_where_the_version_does_not_enforce_validity() {
+        let keys = keys();
+        assert_eq!(held(&keys, 900, true), ["ed25519:new"]);
+        assert!(
+            held(&keys, 1_001, true).is_empty(),
+            "v5+ refuses a lapsed key"
+        );
+        assert_eq!(held(&keys, 1_001, false), ["ed25519:new"], "v1–v4 do not");
+        // A retired key is bounded by its own `expired_ts` in every version.
+        assert_eq!(held(&keys, 400, true), ["ed25519:new", "ed25519:old"]);
+        assert_eq!(held(&keys, 600, false), ["ed25519:new"]);
     }
 }

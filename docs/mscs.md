@@ -38,9 +38,9 @@ what became of each proposal.
 | [MSC3983](https://github.com/matrix-org/matrix-spec-proposals/pull/3983) | Appservices claim one-time keys | — | — | `appservice_key_proxy.rs` |  |
 | [MSC3984](https://github.com/matrix-org/matrix-spec-proposals/pull/3984) | Appservices answer key queries | — | — | `appservice_key_proxy.rs` |  |
 | [MSC4075](https://github.com/matrix-org/matrix-spec-proposals/pull/4075) | MatrixRTC ringing (m.rtc.notification) | — | — | `push_delivery.rs`, `rate-limits.md` | Rings are pushed and budgeted per sender (rings_per_minute). |
-| [MSC4140](https://github.com/matrix-org/matrix-spec-proposals/pull/4140) | Delayed events | — | `org.matrix.msc4140` | `delayed_events.rs`, `rtc_membership.rs` | All four endpoints; the dead-man's switch MatrixRTC members rely on. |
+| [MSC4140](https://github.com/matrix-org/matrix-spec-proposals/pull/4140) | Delayed events | — | `org.matrix.msc4140` | `delayed_events.rs`, `rtc_membership.rs` | All four endpoints, plus the token-less `/delayed_events/{delay_id}/{action}` form lk-jwt-service uses for delegated leave events; the dead-man's switch MatrixRTC members rely on. |
 | [MSC4143](https://github.com/matrix-org/matrix-spec-proposals/pull/4143) | MatrixRTC transport discovery (rtc/transports) | — | `org.matrix.msc4143` | `rtc_transports.rs`, `matrix-rtc.md` | Served under the unstable and the v1 path; answers an empty list when no backend is configured. Absorbed MSC4158. |
-| [MSC4186](https://github.com/matrix-org/matrix-spec-proposals/pull/4186) | Simplified sliding sync | merged, unreleased | — | `sliding_sync.rs` | Lists, room subscriptions, required_state, timeline, extensions, invites in the list, heroes and bump_stamp. What Element X syncs with. |
+| [MSC4186](https://github.com/matrix-org/matrix-spec-proposals/pull/4186) | Simplified sliding sync | merged, unreleased | `org.matrix.simplified_msc3575` | `sliding_sync.rs` | Lists, room subscriptions, required_state, timeline, extensions, invites in the list, heroes and bump_stamp. What Element X syncs with. |
 | [MSC4190](https://github.com/matrix-org/matrix-spec-proposals/pull/4190) | Appservice device management | merged, unreleased | — | `appservice_devices.rs`, `appservice_transactions.rs` |  |
 | [MSC4195](https://github.com/matrix-org/matrix-spec-proposals/pull/4195) | LiveKit as a MatrixRTC transport | — | — | `livekit_jwt.rs`, `matrix-rtc.md` | The built-in JWT service, or the OpenID round trip for an external one. |
 | [MSC4196](https://github.com/matrix-org/matrix-spec-proposals/pull/4196) | Push rule defaults | — | — | `push_rules.rs` |  |
@@ -51,6 +51,12 @@ what became of each proposal.
 | [MSC4309](https://github.com/matrix-org/matrix-spec-proposals/pull/4309) | Finalised delayed events in sync | — | — | `delayed_events.rs` | The org.matrix.msc4140.finalised_delayed_events sync section. |
 | [MSC4310](https://github.com/matrix-org/matrix-spec-proposals/pull/4310) | MatrixRTC ring decline | — | — | `push_delivery.rs` |  |
 | [MSC4354](https://github.com/matrix-org/matrix-spec-proposals/pull/4354) | Sticky events | — | `org.matrix.msc4354` | `sticky_events.rs`, `rtc_membership.rs` | sticky_duration_ms on a send, the key on the event, the sync section, federation push, and delayed+sticky. What MatrixRTC 2.0 makes m.rtc.member. |
+
+## Partly served
+
+| MSC | Title | Stable in | Flags | Evidence | Notes |
+|---|---|---|---|---|---|
+| [MSC4108](https://github.com/matrix-org/matrix-spec-proposals/pull/4108) | QR code login | — | `org.matrix.msc4108` | `rendezvous.rs` | Homeserver rendezvous mailbox with conditional reads and writes, expiry and capacity limits. OAuth device authorization and secure-channel negotiation belong to MAS and the clients; their integrated rehearsal is pending. |
 
 ## Planned
 

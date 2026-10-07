@@ -22,6 +22,9 @@ pub struct MatrixError {
     /// `M_USER_LOCKED` carries `soft_logout: true`: the session is kept,
     /// the client is to stop using it until the lock lifts.
     pub soft_logout: bool,
+    /// `M_INCOMPATIBLE_ROOM_VERSION` names the version the asker would have
+    /// needed (federation `make_join`/`make_knock`).
+    pub room_version: Option<String>,
 }
 
 impl MatrixError {
@@ -33,6 +36,7 @@ impl MatrixError {
             error: error.into(),
             retry_after_ms: None,
             soft_logout: false,
+            room_version: None,
         }
     }
 
@@ -46,6 +50,21 @@ impl MatrixError {
             error: "this account is locked".to_owned(),
             retry_after_ms: None,
             soft_logout: true,
+            room_version: None,
+        }
+    }
+
+    /// `M_INCOMPATIBLE_ROOM_VERSION`, naming the room's version as the spec
+    /// requires for that code.
+    #[must_use]
+    pub fn incompatible_room_version(version: &str) -> Self {
+        Self {
+            room_version: Some(version.to_owned()),
+            ..Self::new(
+                StatusCode::BAD_REQUEST,
+                "M_INCOMPATIBLE_ROOM_VERSION",
+                format!("this room is version {version}"),
+            )
         }
     }
 
@@ -103,6 +122,7 @@ impl MatrixError {
             error: format!("too many requests; retry in {retry_after_ms}ms"),
             retry_after_ms: Some(retry_after_ms),
             soft_logout: false,
+            room_version: None,
         }
     }
 
@@ -148,6 +168,9 @@ impl IntoResponse for MatrixError {
         }
         if self.soft_logout {
             body.insert("soft_logout".to_owned(), json!(true));
+        }
+        if let Some(version) = self.room_version {
+            body.insert("room_version".to_owned(), json!(version));
         }
         (self.status, Json(serde_json::Value::Object(body))).into_response()
     }

@@ -169,32 +169,98 @@ async fn a_room_requested_at_an_advertised_version_is_created_at_it() {
     assert_eq!(create["content"]["room_version"], json!("12"));
 }
 
-/// An unadvertised version is still substituted, and that is not endorsed.
+/// An unserved version is refused, not substituted.
 ///
-/// This pins today's behaviour so a change to it is visible, not because
-/// it is right. Asking for v9 and receiving v11 with a 200 is the same
-/// class of lie as the test above; it stays for now because refusing it
-/// would drop 30 allowlisted Complement tests that create rooms at
-/// v7/v8/v9 to reach knock and restricted-join features. Which versions
-/// this server carries is #178's question, not this test's.
+/// Asking for v13 and receiving v11 with a 200 is a lie the client cannot
+/// detect until something that depends on the version fails. The spec's
+/// answer is `400 M_UNSUPPORTED_ROOM_VERSION`, and so is an unknown name.
 #[tokio::test]
-async fn an_unadvertised_version_is_substituted_rather_than_refused_for_now() {
+async fn an_unserved_version_is_refused_rather_than_substituted() {
     let harness = Harness::new();
     let token = harness.register().await;
 
-    let (status, body) = harness
-        .post(
-            "/_matrix/client/v3/createRoom",
-            &token,
-            &json!({ "room_version": "9" }),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let room_id = body["room_id"].as_str().unwrap().to_owned();
-    assert!(
-        room_id.ends_with(":example.org"),
-        "the substitute is a v11 room: {room_id}",
-    );
+    for version in ["13", "not-a-version"] {
+        assert!(!spindle_server::surface::supports_room_version(version));
+        let (status, body) = harness
+            .post(
+                "/_matrix/client/v3/createRoom",
+                &token,
+                &json!({ "room_version": version }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "v{version}: {body}");
+        assert_eq!(body["errcode"], "M_UNSUPPORTED_ROOM_VERSION", "{body}");
+    }
+}
+
+/// Every served legacy version creates a room of exactly that version.
+#[tokio::test]
+async fn each_served_legacy_version_creates_that_version() {
+    let harness = Harness::new();
+    let token = harness.register().await;
+
+    for version in ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"] {
+        let (status, body) = harness
+            .post(
+                "/_matrix/client/v3/createRoom",
+                &token,
+                &json!({ "room_version": version }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "v{version}: {body}");
+        let room_id = body["room_id"].as_str().unwrap().to_owned();
+        let (status, create) = harness
+            .get(
+                &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.create"),
+                &token,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{create}");
+        assert_eq!(create["room_version"], json!(version), "{create}");
+        assert_eq!(create["creator"], json!("@alice:example.org"), "{create}");
+    }
+}
+
+/// Power levels written as strings are legal up to v9 and illegal from v10
+/// (the version's own auth rules decide; this server must not substitute
+/// one version's answer for another's).
+#[tokio::test]
+async fn string_power_levels_are_a_v9_room_s_business_and_not_a_v10_room_s() {
+    let harness = Harness::new();
+    let token = harness.register().await;
+
+    for (version, accepted) in [("6", true), ("9", true), ("10", false)] {
+        let (status, body) = harness
+            .post(
+                "/_matrix/client/v3/createRoom",
+                &token,
+                &json!({ "room_version": version }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let room_id = body["room_id"].as_str().unwrap().to_owned();
+        let (status, body) = harness
+            .put(
+                &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.power_levels"),
+                &token,
+                &json!({ "users": { "@alice:example.org": "100" }, "state_default": "50" }),
+            )
+            .await;
+        if accepted {
+            assert_eq!(status, StatusCode::OK, "v{version}: {body}");
+            // And the string level is the level: alice still holds 100.
+            let (status, body) = harness
+                .put(
+                    &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.topic"),
+                    &token,
+                    &json!({ "topic": "still in charge" }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "v{version}: {body}");
+        } else {
+            assert_eq!(status, StatusCode::FORBIDDEN, "v{version}: {body}");
+        }
+    }
 }
 
 #[tokio::test]

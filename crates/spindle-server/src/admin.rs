@@ -292,6 +292,31 @@ impl FromRequestParts<AppState> for AdminActor {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+        let token = crate::auth::bearer(parts).ok_or_else(MatrixError::missing_token)?;
+        if let Some(delegated) = &state.delegated
+            && accounts
+                .identify(&token)
+                .map_err(|error| MatrixError::internal(&error.to_string()))?
+                .is_none()
+            && state.appservices.by_token(&token).is_none()
+        {
+            let identity = delegated
+                .identify_admin(state.store.as_ref(), &state.config.server.name, &token)
+                .await?;
+            let localpart = local_localpart(state, &identity.user_id)
+                .ok_or_else(|| MatrixError::forbidden("only local accounts can be admins"))?;
+            if accounts
+                .account(&localpart)
+                .map_err(|error| MatrixError::internal(&error.to_string()))?
+                .is_none_or(|account| account.deactivated || account.locked || account.suspended)
+            {
+                return Err(MatrixError::forbidden(
+                    "account cannot administer the server",
+                ));
+            }
+            return Ok(Self(identity));
+        }
         let Authenticated(identity) = Authenticated::from_request_parts(parts, state).await?;
         let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
         let localpart = local_localpart(state, &identity.user_id)
@@ -1306,11 +1331,12 @@ async fn make_room_admin(
         .admin(&actor)
         .state_event(&room_id, "m.room.power_levels", "")
         .unwrap_or_else(|_| json!({}));
-    let users_default = levels["users_default"].as_i64().unwrap_or(0);
-    let level_of = |user: &str| -> i64 { levels["users"][user].as_i64().unwrap_or(users_default) };
-    let required = levels["events"]["m.room.power_levels"]
-        .as_i64()
-        .or_else(|| levels["state_default"].as_i64())
+    // Room versions before 10 allow a level written as a string.
+    let parse = crate::rooms::power_level;
+    let users_default = parse(&levels["users_default"]).unwrap_or(0);
+    let level_of = |user: &str| -> i64 { parse(&levels["users"][user]).unwrap_or(users_default) };
+    let required = parse(&levels["events"]["m.room.power_levels"])
+        .or_else(|| parse(&levels["state_default"]))
         .unwrap_or(50);
 
     let local_suffix = format!(":{}", state.config.server.name);

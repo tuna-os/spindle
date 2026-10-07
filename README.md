@@ -50,8 +50,8 @@ curl -XPOST localhost:8008/_matrix/client/v3/register \
 ```
 
 Point Element, Element X, Cinny, Nheko or FluffyChat at `http://localhost:8008`
-and it works unmodified — Spindle serves ordinary room version 11 and 12 rooms,
-so there is no client capability to negotiate.
+and it works unmodified — Spindle serves ordinary rooms of room versions 1 to
+12, so there is no client capability to negotiate.
 
 [`spindle.example.toml`](spindle.example.toml) documents every setting, and a
 CI gate fails if a config field exists in the code and not in that file.
@@ -115,7 +115,7 @@ impossible and the exception path is dead code.
 | **M6** Differentiators | Not started | Hub mode, MLS |
 | **M7** MatrixRTC | Server side served | **MSC4140 delayed events** — the dead-man's switch that stops calls accumulating ghost participants, which no other Rust homeserver has — plus MSC4354 sticky events, MSC4143 transport discovery, a built-in LiveKit JWT service or the OpenID round trip for an external one, ringing and decline. Element Call's own Playwright suite runs with Spindle in Synapse's seat: thirteen specs pass, among them a two-party call with video through LiveKit and MatrixRTC 2.0 sticky-event membership with a rejoin after an improper leave. Ringing, churn, a restart mid-call and the federated call are what remains of the gate |
 
-**225 routes** and a **310-test Complement ratchet** in CI, over a workspace of
+**228 routes** and a **310-test Complement ratchet** in CI, over a workspace of
 100+ test suites. The first two are gated — the [dashboard](docs/dashboard.md)
 is parsed from the router and CI fails on drift, and the ratchet is a file every
 entry of which must pass — so what they say matches `main` rather than matching

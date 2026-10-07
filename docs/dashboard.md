@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**225 routes implemented; 0 known gaps in scope.**
+**228 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -116,10 +116,11 @@ neither implemented nor counted.
 
 - `POST /_matrix/client/v1/appservice/{appservice_id}/ping`
 
-### VoIP & MatrixRTC — 8 implemented, 0 planned
+### VoIP & MatrixRTC — 9 implemented, 0 planned
 
 - `GET /_matrix/client/unstable/org.matrix.msc4140/delayed_events`
 - `POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}`
+- `POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}`
 - `GET /_matrix/client/unstable/org.matrix.msc4143/rtc/transports`
 - `GET /_matrix/client/v1/rtc/transports`
 - `POST /_matrix/client/v3/user/{user_id}/openid/request_token`
@@ -271,13 +272,14 @@ neither implemented nor counted.
 - `POST /_matrix/client/v3/register`
 - `GET /_matrix/client/v3/register/available`
 
-### Server, discovery & operations — 27 implemented, 0 planned
+### Server, discovery & operations — 29 implemented, 0 planned
 
 - `GET /.well-known/matrix/client`
 - `GET /.well-known/matrix/server`
 - `GET /.well-known/matrix/support`
 - `GET/PUT/DELETE /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device`
 - `POST /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device/{device_id}/events`
+- `POST /_matrix/client/unstable/org.matrix.msc4108/rendezvous`
 - `GET/PUT /_matrix/client/v1/admin/lock/{user_id}`
 - `GET/PUT /_matrix/client/v1/admin/suspend/{user_id}`
 - `POST /_matrix/client/v1/login/get_token`
@@ -298,6 +300,7 @@ neither implemented nor counted.
 - `GET /_matrix/key/v2/query/{server_name}`
 - `GET /_matrix/key/v2/server`
 - `POST /_matrix/media/v1/create`
+- `GET/PUT/DELETE /_synapse/client/rendezvous/{session_id}`
 - `GET /health`
 - `GET /ready`
 

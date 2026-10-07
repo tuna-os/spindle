@@ -70,7 +70,21 @@ impl Provider {
                             .lock()
                             .unwrap()
                             .push((authorization, body.clone()));
-                        if body.contains(&format!("token={MAS_TOKEN}")) {
+                        let token = form_urlencoded::parse(body.as_bytes())
+                            .find(|(key, _)| key == "token").map(|(_, value)| value.into_owned()).unwrap_or_default();
+                        let scopes = match token.as_str() {
+                            "mat_admin_access_token" => Some("urn:matrix:org.matrix.msc2967.client:api:* urn:synapse:admin:* urn:mas:admin"),
+                            "mat_stable_access_token" => Some("urn:matrix:client:api:* urn:matrix:client:device:STABLEDEV"),
+                            "mat_multiple_devices" => Some("urn:matrix:client:api:* urn:matrix:client:device:ONE urn:matrix:client:device:TWO"),
+                            "mat_mas_admin_only" => Some("urn:matrix:client:api:* urn:mas:admin"),
+                            "mat_empty_device" => Some("urn:matrix:client:api:* urn:matrix:client:device:"),
+                            _ => None,
+                        };
+                        if token == "mat_compatibility_access_token" {
+                            axum::Json(json!({ "active": true, "username": "alice", "scope": "urn:matrix:client:api:*", "device_id": "COMPATDEV" }))
+                        } else if let Some(scope) = scopes {
+                            axum::Json(json!({ "active": true, "username": "alice", "scope": scope }))
+                        } else if token == MAS_TOKEN {
                             axum::Json(json!({
                                 "active": true,
                                 "username": "alice",
@@ -99,12 +113,23 @@ struct Instance {
     _dir: TempDir,
     _reg_dir: TempDir,
     name: String,
+    store: Arc<FjallStore>,
     client: reqwest::Client,
 }
 
 impl Instance {
     /// `provider` of `None` starts a plain local-auth instance.
     async fn start(provider: Option<&str>) -> Instance {
+        Self::start_with(
+            provider,
+            "client_id = \"spindle\"\nclient_secret = \"hush\"\n",
+        )
+        .await
+    }
+
+    /// As [`Self::start`], with `credentials` as the `[auth.delegated]`
+    /// lines that say how introspection authenticates.
+    async fn start_with(provider: Option<&str>, credentials: &str) -> Instance {
         let reg_dir = TempDir::new().unwrap();
         let reg_path = reg_dir.path().join("bridge.yaml");
         std::fs::write(
@@ -123,8 +148,7 @@ impl Instance {
         let auth = provider.map_or(String::new(), |url| {
             format!(
                 "[auth.delegated]\nissuer = \"{url}\"\n\
-                 introspection_endpoint = \"{url}/oauth2/introspect\"\n\
-                 client_id = \"spindle\"\nclient_secret = \"hush\"\n"
+                 introspection_endpoint = \"{url}/oauth2/introspect\"\n{credentials}"
             )
         });
         let config = spindle_server::Config::parse(&format!(
@@ -133,7 +157,7 @@ impl Instance {
             reg_path.display()
         ))
         .unwrap();
-        let app = spindle_server::app(config, store).expect("the app builds");
+        let app = spindle_server::app(config, store.clone()).expect("the app builds");
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -141,6 +165,7 @@ impl Instance {
             _dir: dir,
             _reg_dir: reg_dir,
             name,
+            store,
             client: reqwest::Client::new(),
         }
     }
@@ -370,4 +395,170 @@ async fn legacy_auth_is_the_providers_business_now() {
         )
         .await;
     assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+async fn introspection_can_present_the_homeserver_secret_the_way_synapse_does() {
+    // Synapse's `matrix_authentication_service` section has no client of
+    // its own at MAS: it introspects with the shared `matrix.secret` as a
+    // bearer token, and MAS accepts that from its homeserver. A MAS set up
+    // that way (Element Server Suite's default) must work unchanged.
+    let (provider, url) = Provider::serve().await;
+    let server =
+        Instance::start_with(Some(&url), "homeserver_secret = \"shared-matrix-secret\"\n").await;
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(MAS_TOKEN),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["device_id"], "MASDEV1", "{body}");
+    let introspections = provider.introspections();
+    assert_eq!(introspections.len(), 1);
+    assert_eq!(introspections[0].0, "Bearer shared-matrix-secret");
+}
+
+#[test]
+fn introspection_needs_some_credential() {
+    let base = "[server]\nname = \"example.org\"\n[auth.delegated]\n\
+                issuer = \"http://mas/\"\nintrospection_endpoint = \"http://mas/oauth2/introspect\"\n";
+    // Neither a client pair nor the homeserver secret: nothing to present.
+    assert!(spindle_server::Config::parse(base).is_err());
+    // Half a client pair is a typo, not a choice.
+    assert!(
+        spindle_server::Config::parse(&format!(
+            "{base}client_id = \"x\"\nhomeserver_secret = \"s\"\n"
+        ))
+        .is_err()
+    );
+    assert!(spindle_server::Config::parse(&format!("{base}homeserver_secret = \"s\"\n")).is_ok());
+    assert!(
+        spindle_server::Config::parse(&format!("{base}client_id = \"x\"\nclient_secret = \"y\"\n"))
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn delegated_admin_scope_is_a_token_capability_without_a_device() {
+    let (provider, url) = Provider::serve().await;
+    let server = Instance::start(Some(&url)).await;
+    let admin = "mat_admin_access_token";
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/server_version",
+            Some(admin),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let accounts = spindle_server::accounts::Accounts::new(server.store.as_ref(), &server.name);
+    assert!(!accounts.account("alice").unwrap().unwrap().admin);
+    assert!(accounts.devices_of("alice").unwrap().is_empty());
+    // Reusing the cached verdict on a client endpoint cannot invent a device.
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/keys/upload",
+            Some(admin),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 401, "{body}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/server_version",
+            Some(admin),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(provider.introspections().len(), 1);
+    // A different token for this same user cannot inherit the first token's scope.
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(MAS_TOKEN),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/server_version",
+            Some(MAS_TOKEN),
+            None,
+        )
+        .await;
+    assert_eq!(status, 403, "{body}");
+    assert!(!accounts.account("alice").unwrap().unwrap().admin);
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v2/users",
+            Some(admin),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    accounts.set_locked("alice", true).unwrap();
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/server_version",
+            Some(admin),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 403,
+        "account hold applies to a cached admin token: {body}"
+    );
+}
+
+#[tokio::test]
+async fn delegated_scopes_accept_stable_names_and_reject_ambiguous_devices() {
+    let (_provider, url) = Provider::serve().await;
+    let server = Instance::start(Some(&url)).await;
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some("mat_stable_access_token"),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["device_id"], "STABLEDEV");
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some("mat_compatibility_access_token"),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["device_id"], "COMPATDEV");
+    for token in [
+        "mat_multiple_devices",
+        "mat_empty_device",
+        "mat_mas_admin_only",
+    ] {
+        let (status, body) = server
+            .request(
+                reqwest::Method::GET,
+                "/_synapse/admin/v1/server_version",
+                Some(token),
+                None,
+            )
+            .await;
+        assert_eq!(status, 401, "{token}: {body}");
+    }
 }

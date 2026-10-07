@@ -89,7 +89,7 @@ title = "Delayed events"
 status = "served"
 unstable = ["org.matrix.msc4140"]
 evidence = ["crates/spindle-server/tests/delayed_events.rs", "crates/spindle-server/tests/rtc_membership.rs"]
-notes = "All four endpoints; the dead-man's switch MatrixRTC members rely on."
+notes = "All four endpoints, plus the token-less `/delayed_events/{delay_id}/{action}` form lk-jwt-service uses for delegated leave events; the dead-man's switch MatrixRTC members rely on."
 
 [[msc]]
 number = 4309
@@ -161,6 +161,7 @@ number = 4186
 title = "Simplified sliding sync"
 status = "served"
 merged = true
+unstable = ["org.matrix.simplified_msc3575"]
 evidence = ["crates/spindle-server/tests/sliding_sync.rs"]
 notes = "Lists, room subscriptions, required_state, timeline, extensions, invites in the list, heroes and bump_stamp. What Element X syncs with."
 
@@ -378,3 +379,12 @@ unstable = ["org.matrix.msc3881"]
 evidence = ["crates/spindle-server/tests/pushers.rs"]
 notes = "Pushers carry `enabled` and `device_id` under the unstable and the plain names; a disabled pusher stays registered and receives nothing."
 
+
+
+[[msc]]
+number = 4108
+title = "QR code login"
+status = "partial"
+unstable = ["org.matrix.msc4108"]
+evidence = ["crates/spindle-server/tests/rendezvous.rs"]
+notes = "Homeserver rendezvous mailbox with conditional reads and writes, expiry and capacity limits. OAuth device authorization and secure-channel negotiation belong to MAS and the clients; their integrated rehearsal is pending."
