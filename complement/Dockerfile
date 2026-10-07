@@ -17,19 +17,25 @@ WORKDIR /src
 # and without this split that recompiles everything — measured at 2m11s
 # for a one-line edit, against 22s with it.
 #
-# Adding a crate without adding it here is not a correctness problem: the
-# placeholder build simply will not cover it and the real build compiles
-# it from scratch. The failure mode is a slower build, not a wrong one.
+# Adding a *dependency* without touching this list is not a correctness
+# problem: the placeholder build simply will not cover it and the real
+# build compiles it from scratch — a slower build, not a wrong one. A new
+# *workspace member* is different: the root Cargo.toml names every member,
+# and cargo refuses to parse a workspace whose member manifest is missing,
+# so each member crate must be copied and stubbed below.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/spindle-core/Cargo.toml crates/spindle-core/
 COPY crates/spindle-store/Cargo.toml crates/spindle-store/
 COPY crates/spindle-server/Cargo.toml crates/spindle-server/
+COPY crates/spindle-operator/Cargo.toml crates/spindle-operator/
 RUN mkdir -p crates/spindle-core/src crates/spindle-store/src \
-             crates/spindle-server/src \
+             crates/spindle-server/src crates/spindle-operator/src \
     && touch crates/spindle-core/src/lib.rs \
              crates/spindle-store/src/lib.rs \
              crates/spindle-server/src/lib.rs \
+             crates/spindle-operator/src/lib.rs \
     && echo 'fn main() {}' > crates/spindle-server/src/main.rs \
+    && echo 'fn main() {}' > crates/spindle-operator/src/main.rs \
     # Benches are declared explicitly in these manifests, and cargo refuses
     # to parse one whose named target has no file — even for a build that
     # would never compile them. Read the names out of the manifest rather
