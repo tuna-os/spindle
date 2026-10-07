@@ -1,24 +1,28 @@
 # ESS/Kubernetes operation driver
 
 `scripts/ess-kubernetes-driver.py` is the deployment driver for the
-Synapse-to-Spindle one-writer boundary. It is usable directly while the
-standalone operator API is being assembled; its JSON plan and checkpoint are
-the same durable evidence the migration workspace consumes.
+Synapse-to-Spindle one-writer boundary. You can use it directly before the
+standalone operator API is complete. Its JSON plan and checkpoint are the
+same durable evidence that the migration workspace consumes.
 
 The driver does not infer an installation from names. Pass an explicit
 `ess-v1` topology, a kubeconfig, and a context. Discovery lists both workload
-kinds under the topology's deployment selector and refuses to continue if a
-selected workload is omitted or a declared workload is absent. It also
-requires exactly one Synapse, federation sender, sliding-sync, MAS,
-PostgreSQL, Element Call, and LiveKit workload, one or more media workloads,
-and at least one unambiguous ingress path. This deliberately rejects unknown
-ESS layouts until another profile describes them.
+kinds under the topology's deployment selector. It refuses to continue if
+the cluster omits a selected workload or if a declared workload is absent.
+The driver also needs:
+
+- exactly one workload for each of Synapse, the federation sender,
+  `sliding-sync`, MAS, PostgreSQL, Element Call, and LiveKit
+- one or more media workloads
+- at least one ingress path that is not ambiguous
+
+The driver rejects an unknown ESS layout until another profile describes it.
 
 Start from [`deploy/operator/ess-topology.example.json`](../deploy/operator/ess-topology.example.json).
 The deployment selector should identify only one ESS installation. The
-PostgreSQL pod selector must identify exactly one running pod from which
-`psql` can inspect `pg_stat_activity`; authentication should come from that
-pod's existing environment or local socket, never from this file.
+PostgreSQL pod selector must identify exactly one live pod. In that pod,
+`psql` must be able to inspect `pg_stat_activity`. Credentials must come from
+that pod's own environment or local socket, never from this file.
 
 ## Plan and discovery
 
@@ -50,14 +54,15 @@ python3 scripts/ess-kubernetes-driver.py switch $COMMON \
   --validation /var/lib/spindle-operator/assessment-42.json
 ```
 
-Quiesce fences MAS, sliding sync, the federation sender, and Synapse in that
+Quiesce fences MAS, `sliding-sync`, the federation sender, and Synapse in that
 order. Every scale uses a JSON-patch resource-version precondition, waits for
 desired/current/ready replicas to reach zero, then waits for relevant database
-sessions to drain. A process restart observes an already-applied mutation and
-checkpoints it instead of submitting it twice. Every actual mutation records
-its before and resulting resource versions.
+sessions to drain. After a restart, the driver detects a mutation that it
+already applied and checkpoints it. It does not submit the mutation twice.
+Every actual mutation records the resource version before and after the
+change.
 
-Switch requires fresh, redacted validation evidence:
+Switch needs fresh, redacted validation evidence:
 
 ```json
 {
@@ -68,20 +73,20 @@ Switch requires fresh, redacted validation evidence:
 }
 ```
 
-Only those four fields enter the checkpoint. The driver re-proves source
-fencing and zero database sessions immediately before changing ingress. Each
-configured host/path must still resolve to exactly one recognized source or
-target service, and the driver reads until the changed backend is observed.
-A conflict or convergence timeout blocks the operation; retrying resumes from
-the checkpoint.
+Only those four fields enter the checkpoint. Immediately before it changes
+ingress, the driver proves again that the fence holds on the source and that
+zero database sessions remain. Each configured host/path must still resolve
+to one service that the driver knows as source or target. The driver reads
+until it observes the changed backend. A conflict or convergence timeout
+blocks the operation; a retry resumes from the checkpoint.
 
 `rollback` restores every ingress path and writer replica count to its precise
-discovery value while the source is sealed but traffic switching has not begun.
-Starting `switch` closes that ordinary rollback boundary *before* the first
-ingress mutation: a request may reach Spindle as soon as Kubernetes accepts the
-patch, before an observer can prove whether it wrote. A failed or partial switch
-therefore requires the separate post-write recovery procedure rather than an
-unsafe guess that Synapse can be restored.
+discovery value. It applies while the seal holds on the source and before the
+traffic switch starts. The start of `switch` closes that ordinary rollback
+boundary *before* the first ingress mutation. A request may reach Spindle as
+soon as Kubernetes accepts the patch, before an observer can prove whether it
+wrote. A failed or partial switch then needs the post-write recovery
+procedure. Do not guess that Synapse can safely return to service.
 
 ## Permissions and checkpoint custody
 
@@ -91,7 +96,7 @@ namespace. If PostgreSQL is elsewhere, put only the pod `get`, `list`, and
 `pods/exec` rules in a Role in that namespace and bind the same service
 account. Do not grant Secret reads.
 
-Checkpoint files are atomically replaced with mode `0600`. They contain
-resource metadata, selectors, health, route service names, validation identity,
-and mutation versions—never environment variables, Secret values, SQL rows,
-access tokens, or private signing material.
+The driver replaces checkpoint files atomically, with mode `0600`. They
+contain resource metadata, selectors, health, route service names, validation
+identity, and mutation versions. They never contain environment variables,
+Secret values, SQL rows, access tokens, or private signature material.
