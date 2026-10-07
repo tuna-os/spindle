@@ -4,6 +4,7 @@
 //! cursor share one atomic strict commit. Once complete, its highwater never
 //! changes: checkpoint recovery cannot swallow events appended by a live server.
 
+use std::fmt::Write as _;
 use std::io::Read as _;
 
 use serde::{Deserialize, Serialize};
@@ -109,9 +110,13 @@ pub fn begin(
     std::fs::File::open("/dev/urandom")
         .and_then(|mut file| file.read_exact(&mut entropy))
         .map_err(write_error)?;
+    let mut import_id = String::with_capacity(64);
+    for byte in entropy {
+        write!(import_id, "{byte:02x}").map_err(write_error)?;
+    }
     let proof = Proof {
         version: 1,
-        import_id: entropy.iter().map(|byte| format!("{byte:02x}")).collect(),
+        import_id,
         scope_sha256: scope_sha256.to_owned(),
         high_water: None,
     };
