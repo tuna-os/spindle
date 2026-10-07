@@ -55,6 +55,7 @@ pub mod registration_tokens;
 pub mod rendezvous;
 pub mod rooms;
 pub mod routes;
+pub mod routes_legacy;
 pub mod s3;
 pub mod secrets;
 pub mod server_notices;
