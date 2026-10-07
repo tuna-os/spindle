@@ -750,9 +750,10 @@ impl VerifiedNodeCache {
     }
 
     fn insert(&mut self, key: (StateRoot, usize), rebuilt: &RebuiltNode) {
-        // Conservative per-entry allowance for the lookup/order indexes and
-        // Weak allocation framing; no Arc graph ownership is held here.
-        let charge = 256;
+        // Weak retains the dropped Arc's allocation until eviction. Charge its
+        // full Node plus conservative lookup/order index and allocation framing;
+        // no live subtree graph ownership is held here.
+        let charge = std::mem::size_of::<Node>() + 512;
         if charge > self.budget {
             return;
         }
