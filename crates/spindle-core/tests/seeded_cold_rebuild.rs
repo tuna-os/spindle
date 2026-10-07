@@ -179,7 +179,7 @@ fn production_shaped_varied_roots_cold_rebuild() {
     let mut random = 17_u64;
     for root in 0..ROOTS {
         let before = state.clone();
-        for change in 0..(1 + root % 16) {
+        for change in 0..=(root % 16) {
             random = random
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1);
