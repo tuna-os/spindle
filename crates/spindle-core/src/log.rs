@@ -1510,9 +1510,12 @@ impl RoomLog {
             if !exhaustive && !selected.contains(&li) {
                 continue;
             }
-            let state =
-                StateSnapshot::rehydrate_cached(entry.state_root, load_node, &mut verified_nodes)
-                    .map_err(|_| RestoreError::UnreadableState(li))?;
+            let state = StateSnapshot::rehydrate_cached(
+                entry.state_root,
+                &mut |root: &StateRoot| load_node(root),
+                &mut verified_nodes,
+            )
+            .map_err(|_| RestoreError::UnreadableState(li))?;
             if selected.contains(&li) {
                 log.resident.insert(li, state.clone());
             }
