@@ -1,7 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 
 /// How the content addresses in this module are derived.
@@ -686,12 +686,9 @@ pub enum RehydrateError {
 }
 
 /// Verified immutable nodes, scoped to one cold log rebuild. A key includes
-/// depth: a verified subtree cannot bypass the decoder's recursion bound when
-/// referenced at another depth. Only successful, content-verified reads enter.
-///
-/// Estimated charges include each node's entire reachable subtree plus index overhead;
-/// shared descendants are deliberately charged repeatedly. The bound limits
-/// cache ownership, not snapshots the caller independently keeps resident.
+/// depth so a verified subtree cannot bypass the decoder's recursion bound.
+/// Weak references share nodes already retained by the caller's snapshots;
+/// the cache owns only a bounded index, never additional subtree graphs.
 pub(crate) struct VerifiedNodeCache {
     nodes: HashMap<(StateRoot, usize), CachedNode>,
     order: BTreeMap<u64, (StateRoot, usize)>,
@@ -704,11 +701,11 @@ pub(crate) struct VerifiedNodeCache {
 struct RebuiltNode {
     node: Arc<Node>,
     len: usize,
-    retained_bytes: usize,
 }
 
 struct CachedNode {
-    rebuilt: RebuiltNode,
+    node: Weak<Node>,
+    len: usize,
     stamp: u64,
     charge: usize,
 }
@@ -737,16 +734,25 @@ impl VerifiedNodeCache {
     fn get(&mut self, key: (StateRoot, usize)) -> Option<RebuiltNode> {
         self.tick();
         let cached = self.nodes.get_mut(&key)?;
+        let Some(node) = cached.node.upgrade() else {
+            self.order.remove(&cached.stamp);
+            self.bytes = self.bytes.saturating_sub(cached.charge);
+            self.nodes.remove(&key);
+            return None;
+        };
         self.order.remove(&cached.stamp);
         cached.stamp = self.clock;
         self.order.insert(self.clock, key);
-        Some(cached.rebuilt.clone())
+        Some(RebuiltNode {
+            node,
+            len: cached.len,
+        })
     }
 
-    fn insert(&mut self, key: (StateRoot, usize), rebuilt: RebuiltNode) {
-        // Conservative allowance for both lookup/order indexes and allocation
-        // framing, in addition to the complete retained subtree's charge.
-        let charge = rebuilt.retained_bytes.saturating_add(256);
+    fn insert(&mut self, key: (StateRoot, usize), rebuilt: &RebuiltNode) {
+        // Conservative per-entry allowance for the lookup/order indexes and
+        // Weak allocation framing; no Arc graph ownership is held here.
+        let charge = 256;
         if charge > self.budget {
             return;
         }
@@ -759,8 +765,6 @@ impl VerifiedNodeCache {
                 self.bytes = self.bytes.saturating_sub(removed.charge);
             }
         }
-        // A node can be reinserted only after eviction; successful lookups
-        // already return before decoding. Still account for replacement.
         if let Some(previous) = self.nodes.remove(&key) {
             self.order.remove(&previous.stamp);
             self.bytes = self.bytes.saturating_sub(previous.charge);
@@ -769,7 +773,8 @@ impl VerifiedNodeCache {
         self.nodes.insert(
             key,
             CachedNode {
-                rebuilt,
+                node: Arc::downgrade(&rebuilt.node),
+                len: rebuilt.len,
                 stamp: self.clock,
                 charge,
             },
@@ -1017,53 +1022,37 @@ fn rebuild_verified(
     let mut at = 0_usize;
     let tag = *bytes.first().ok_or(RehydrateError::Malformed)?;
     at += 1;
-    let overhead = std::mem::size_of::<Node>() + 128;
 
-    let (node, len, retained_bytes) = match tag {
+    let (node, len) = match tag {
         TAG_LEAF => {
             let digest = take_array::<32>(&bytes, &mut at)?;
             let count = take_count(&bytes, &mut at, 3 * 4)?;
             let mut entries = Vec::with_capacity(count);
-            let mut retained_bytes = overhead;
             for _ in 0..count {
                 let event_type = take_string(&bytes, &mut at)?;
                 let state_key = take_string(&bytes, &mut at)?;
                 let event_id = take_string(&bytes, &mut at)?;
-                retained_bytes = retained_bytes.saturating_add(
-                    std::mem::size_of::<(StateKey, Box<str>)>()
-                        + 128
-                        + event_type.len()
-                        + state_key.len()
-                        + event_id.len(),
-                );
                 entries.push((
                     StateKey::new(event_type, state_key),
                     event_id.into_boxed_str(),
                 ));
             }
-            (
-                Node::leaf_from_entries(digest, entries),
-                count,
-                retained_bytes,
-            )
+            (Node::leaf_from_entries(digest, entries), count)
         }
         TAG_BRANCH => {
             let bitmap = u32::from_be_bytes(take_array::<4>(&bytes, &mut at)?);
             let count = take_count(&bytes, &mut at, 32)?;
             let mut children = Vec::with_capacity(count);
             let mut len = 0_usize;
-            let mut retained_bytes =
-                overhead.saturating_add(count * std::mem::size_of::<Arc<Node>>());
             for _ in 0..count {
                 let child = StateRoot(take_array::<32>(&bytes, &mut at)?);
                 let rebuilt = rebuild_verified(&child, load, depth + 1, cache.as_deref_mut())?;
                 len = len
                     .checked_add(rebuilt.len)
                     .ok_or(RehydrateError::Malformed)?;
-                retained_bytes = retained_bytes.saturating_add(rebuilt.retained_bytes);
                 children.push(rebuilt.node);
             }
-            (Node::branch(bitmap, children), len, retained_bytes)
+            (Node::branch(bitmap, children), len)
         }
         _ => return Err(RehydrateError::Malformed),
     };
@@ -1075,10 +1064,9 @@ fn rebuild_verified(
     let rebuilt = RebuiltNode {
         node: Arc::new(node),
         len,
-        retained_bytes,
     };
     if let Some(cache) = cache {
-        cache.insert(key, rebuilt.clone());
+        cache.insert(key, &rebuilt);
     }
     Ok(rebuilt)
 }
@@ -1377,6 +1365,32 @@ mod cached_rehydrate_tests {
     }
 
     #[test]
+    fn expired_nodes_are_reloaded_and_verified_without_cache_graph_ownership() {
+        let expected = state(1);
+        let stored = nodes(&expected);
+        let mut cache = VerifiedNodeCache::new(4096);
+        let held = StateSnapshot::rehydrate_cached(
+            expected.root(),
+            &mut |root| stored.get(root).cloned(),
+            &mut cache,
+        )
+        .expect("first read");
+        assert_eq!(Arc::strong_count(held.root.as_ref().expect("root")), 1);
+        drop(held);
+        let mut corrupt = stored.get(&expected.root()).expect("leaf").clone();
+        corrupt[1] ^= 1;
+        assert!(matches!(
+            StateSnapshot::rehydrate_cached(
+                expected.root(),
+                &mut |_| Some(corrupt.clone()),
+                &mut cache
+            ),
+            Err(RehydrateError::HashMismatch)
+        ));
+        assert!(cache.nodes.is_empty());
+    }
+
+    #[test]
     fn cached_nodes_cannot_bypass_recursion_depth_bound() {
         let expected = state(1);
         let stored = nodes(&expected);
@@ -1453,6 +1467,7 @@ mod cached_rehydrate_tests {
         let mut cache = VerifiedNodeCache::new(64 * 1024 * 1024);
         let full_walk_nodes = stored.len();
         let mut reads = 0;
+        let mut previous_held = None;
         for index in 0..100 {
             let before = expected.clone();
             expected = expected.apply(
@@ -1472,7 +1487,9 @@ mod cached_rehydrate_tests {
             assert_eq!(held.root(), expected.root());
             assert_eq!(held.len(), 51_200);
             assert!(cache.bytes <= cache.budget);
+            previous_held = Some(held);
         }
+        assert!(previous_held.is_some());
         assert!(
             reads < full_walk_nodes * 10,
             "{reads} reads should be below ten full walks for one hundred roots"
