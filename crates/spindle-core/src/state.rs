@@ -1,4 +1,8 @@
-use std::{cmp::Ordering, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 /// How the content addresses in this module are derived.
 ///
@@ -681,6 +685,99 @@ pub enum RehydrateError {
     Malformed,
 }
 
+/// Verified immutable nodes, scoped to one cold log rebuild. A key includes
+/// depth: a verified subtree cannot bypass the decoder's recursion bound when
+/// referenced at another depth. Only successful, content-verified reads enter.
+///
+/// Estimated charges include each node's entire reachable subtree plus index overhead;
+/// shared descendants are deliberately charged repeatedly. The bound limits
+/// cache ownership, not snapshots the caller independently keeps resident.
+pub(crate) struct VerifiedNodeCache {
+    nodes: HashMap<(StateRoot, usize), CachedNode>,
+    order: BTreeMap<u64, (StateRoot, usize)>,
+    clock: u64,
+    bytes: usize,
+    budget: usize,
+}
+
+#[derive(Clone)]
+struct RebuiltNode {
+    node: Arc<Node>,
+    len: usize,
+    retained_bytes: usize,
+}
+
+struct CachedNode {
+    rebuilt: RebuiltNode,
+    stamp: u64,
+    charge: usize,
+}
+
+impl VerifiedNodeCache {
+    pub(crate) fn new(budget: usize) -> Self {
+        Self {
+            nodes: HashMap::new(),
+            order: BTreeMap::new(),
+            clock: 0,
+            bytes: 0,
+            budget,
+        }
+    }
+
+    fn tick(&mut self) {
+        if self.clock == u64::MAX {
+            self.nodes.clear();
+            self.order.clear();
+            self.bytes = 0;
+            self.clock = 0;
+        }
+        self.clock += 1;
+    }
+
+    fn get(&mut self, key: (StateRoot, usize)) -> Option<RebuiltNode> {
+        self.tick();
+        let cached = self.nodes.get_mut(&key)?;
+        self.order.remove(&cached.stamp);
+        cached.stamp = self.clock;
+        self.order.insert(self.clock, key);
+        Some(cached.rebuilt.clone())
+    }
+
+    fn insert(&mut self, key: (StateRoot, usize), rebuilt: RebuiltNode) {
+        // Conservative allowance for both lookup/order indexes and allocation
+        // framing, in addition to the complete retained subtree's charge.
+        let charge = rebuilt.retained_bytes.saturating_add(256);
+        if charge > self.budget {
+            return;
+        }
+        self.tick();
+        while self.bytes.saturating_add(charge) > self.budget {
+            let Some((_, oldest)) = self.order.pop_first() else {
+                return;
+            };
+            if let Some(removed) = self.nodes.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(removed.charge);
+            }
+        }
+        // A node can be reinserted only after eviction; successful lookups
+        // already return before decoding. Still account for replacement.
+        if let Some(previous) = self.nodes.remove(&key) {
+            self.order.remove(&previous.stamp);
+            self.bytes = self.bytes.saturating_sub(previous.charge);
+        }
+        self.bytes += charge;
+        self.nodes.insert(
+            key,
+            CachedNode {
+                rebuilt,
+                stamp: self.clock,
+                charge,
+            },
+        );
+        self.order.insert(self.clock, key);
+    }
+}
+
 impl StateSnapshot {
     /// Every node reachable from this snapshot that `previous` does not already
     /// contain, encoded and addressed by hash.
@@ -716,11 +813,28 @@ impl StateSnapshot {
         if root == Self::new().root() {
             return Ok(Self::new());
         }
-        let node = rebuild(&root, load, 0)?;
-        let len = count_entries(&node);
+        let rebuilt = rebuild_verified(&root, load, 0, None)?;
         Ok(Self {
-            root: Some(node),
-            len,
+            root: Some(rebuilt.node),
+            len: rebuilt.len,
+        })
+    }
+
+    /// Rehydrate with nodes already verified during this immutable log read.
+    /// Shared subtrees retain their Arcs and cached entry counts, so a new root
+    /// costs its changed paths rather than a walk of every membership slot.
+    pub(crate) fn rehydrate_cached(
+        root: StateRoot,
+        load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+        cache: &mut VerifiedNodeCache,
+    ) -> Result<Self, RehydrateError> {
+        if root == Self::new().root() {
+            return Ok(Self::new());
+        }
+        let rebuilt = rebuild_verified(&root, load, 0, Some(cache))?;
+        Ok(Self {
+            root: Some(rebuilt.node),
+            len: rebuilt.len,
         })
     }
 
@@ -883,50 +997,90 @@ fn rebuild(
     load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
     depth: usize,
 ) -> Result<Arc<Node>, RehydrateError> {
+    Ok(rebuild_verified(address, load, depth, None)?.node)
+}
+
+fn rebuild_verified(
+    address: &StateRoot,
+    load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+    depth: usize,
+    mut cache: Option<&mut VerifiedNodeCache>,
+) -> Result<RebuiltNode, RehydrateError> {
     if depth > MAX_DEPTH {
         return Err(RehydrateError::Malformed);
+    }
+    let key = (*address, depth);
+    if let Some(cached) = cache.as_deref_mut().and_then(|cache| cache.get(key)) {
+        return Ok(cached);
     }
     let bytes = load(address).ok_or(RehydrateError::MissingNode)?;
     let mut at = 0_usize;
     let tag = *bytes.first().ok_or(RehydrateError::Malformed)?;
     at += 1;
+    let overhead = std::mem::size_of::<Node>() + 128;
 
-    let node = match tag {
+    let (node, len, retained_bytes) = match tag {
         TAG_LEAF => {
             let digest = take_array::<32>(&bytes, &mut at)?;
-            // Three length-prefixed fields per entry, so four bytes each at
-            // the very least.
             let count = take_count(&bytes, &mut at, 3 * 4)?;
             let mut entries = Vec::with_capacity(count);
+            let mut retained_bytes = overhead;
             for _ in 0..count {
                 let event_type = take_string(&bytes, &mut at)?;
                 let state_key = take_string(&bytes, &mut at)?;
                 let event_id = take_string(&bytes, &mut at)?;
+                retained_bytes = retained_bytes.saturating_add(
+                    std::mem::size_of::<(StateKey, Box<str>)>()
+                        + 128
+                        + event_type.len()
+                        + state_key.len()
+                        + event_id.len(),
+                );
                 entries.push((
                     StateKey::new(event_type, state_key),
                     event_id.into_boxed_str(),
                 ));
             }
-            Node::leaf_from_entries(digest, entries)
+            (
+                Node::leaf_from_entries(digest, entries),
+                count,
+                retained_bytes,
+            )
         }
         TAG_BRANCH => {
             let bitmap = u32::from_be_bytes(take_array::<4>(&bytes, &mut at)?);
             let count = take_count(&bytes, &mut at, 32)?;
             let mut children = Vec::with_capacity(count);
+            let mut len = 0_usize;
+            let mut retained_bytes =
+                overhead.saturating_add(count * std::mem::size_of::<Arc<Node>>());
             for _ in 0..count {
                 let child = StateRoot(take_array::<32>(&bytes, &mut at)?);
-                children.push(rebuild(&child, load, depth + 1)?);
+                let rebuilt = rebuild_verified(&child, load, depth + 1, cache.as_deref_mut())?;
+                len = len
+                    .checked_add(rebuilt.len)
+                    .ok_or(RehydrateError::Malformed)?;
+                retained_bytes = retained_bytes.saturating_add(rebuilt.retained_bytes);
+                children.push(rebuilt.node);
             }
-            Node::branch(bitmap, children)
+            (Node::branch(bitmap, children), len, retained_bytes)
         }
         _ => return Err(RehydrateError::Malformed),
     };
 
-    // Content addressing is only worth anything if it is checked.
+    // Never cache a partially decoded or incorrectly addressed node.
     if node.hash() != *address.as_bytes() {
         return Err(RehydrateError::HashMismatch);
     }
-    Ok(Arc::new(node))
+    let rebuilt = RebuiltNode {
+        node: Arc::new(node),
+        len,
+        retained_bytes,
+    };
+    if let Some(cache) = cache {
+        cache.insert(key, rebuilt.clone());
+    }
+    Ok(rebuilt)
 }
 
 fn take_array<const N: usize>(bytes: &[u8], at: &mut usize) -> Result<[u8; N], RehydrateError> {
@@ -971,13 +1125,6 @@ fn take_string(bytes: &[u8], at: &mut usize) -> Result<String, RehydrateError> {
     let slice = bytes.get(*at..end).ok_or(RehydrateError::Malformed)?;
     *at = end;
     String::from_utf8(slice.to_vec()).map_err(|_| RehydrateError::Malformed)
-}
-
-fn count_entries(node: &Node) -> usize {
-    match node {
-        Node::Leaf { entries, .. } => entries.len(),
-        Node::Branch { children, .. } => children.iter().map(|child| count_entries(child)).sum(),
-    }
 }
 
 #[cfg(test)]
@@ -1041,6 +1188,326 @@ mod digest_version_tests {
             for right in &DOMAIN_TAGS[i + 1..] {
                 assert_ne!(left, right, "two digests share a domain tag");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cached_rehydrate_tests {
+    use super::*;
+
+    fn state(count: usize) -> StateSnapshot {
+        let mut state = StateSnapshot::new();
+        for index in 0..count {
+            state = state.apply(
+                StateKey::new("m.room.member", format!("@u{index}:test")),
+                format!("$e{index}"),
+            );
+        }
+        state
+    }
+
+    fn nodes(state: &StateSnapshot) -> HashMap<StateRoot, Vec<u8>> {
+        state.delta_nodes(None).into_iter().collect()
+    }
+
+    #[test]
+    fn same_root_reuses_verified_arc_and_entry_count_without_storage_reads() {
+        let expected = state(512);
+        let stored = nodes(&expected);
+        let mut cache = VerifiedNodeCache::new(4 * 1024 * 1024);
+        let first = StateSnapshot::rehydrate_cached(
+            expected.root(),
+            &mut |root| stored.get(root).cloned(),
+            &mut cache,
+        )
+        .expect("verified first read");
+        let second = StateSnapshot::rehydrate_cached(
+            expected.root(),
+            &mut |_| panic!("same verified root must not reload"),
+            &mut cache,
+        )
+        .expect("cached root");
+        assert_eq!(second.root(), expected.root());
+        assert_eq!(second.len(), 512);
+        assert!(Arc::ptr_eq(
+            first.root.as_ref().expect("first root"),
+            second.root.as_ref().expect("second root")
+        ));
+    }
+
+    #[test]
+    fn changed_root_loads_only_changed_paths_and_shares_unchanged_subtrees() {
+        let before = state(512);
+        let after = before.apply(StateKey::new("m.room.member", "@u1:test"), "$updated");
+        let changed = after.delta_nodes(Some(&before));
+        let mut stored = nodes(&before);
+        stored.extend(changed.iter().cloned());
+        let mut cache = VerifiedNodeCache::new(4 * 1024 * 1024);
+        let first = StateSnapshot::rehydrate_cached(
+            before.root(),
+            &mut |root| stored.get(root).cloned(),
+            &mut cache,
+        )
+        .expect("before");
+        let mut reads = 0;
+        let second = StateSnapshot::rehydrate_cached(
+            after.root(),
+            &mut |root| {
+                reads += 1;
+                stored.get(root).cloned()
+            },
+            &mut cache,
+        )
+        .expect("after");
+        assert_eq!(reads, changed.len());
+        assert_eq!(second.root(), after.root());
+        assert_eq!(second.len(), after.len());
+        assert_eq!(
+            second.get(&StateKey::new("m.room.member", "@u1:test")),
+            Some("$updated")
+        );
+        if let (Some(left), Some(right)) = (&first.root, &second.root) {
+            if let (
+                Node::Branch { children: left, .. },
+                Node::Branch {
+                    children: right, ..
+                },
+            ) = (left.as_ref(), right.as_ref())
+            {
+                assert!(
+                    left.iter()
+                        .any(|old| right.iter().any(|new| Arc::ptr_eq(old, new)))
+                );
+            } else {
+                panic!("fixture must have branch roots");
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_nodes_never_enter_cache_and_a_fresh_read_still_detects_corruption() {
+        let expected = state(1);
+        let stored = nodes(&expected);
+        let mut bytes = stored.get(&expected.root()).expect("leaf bytes").clone();
+        bytes[1] ^= 1;
+        let mut cache = VerifiedNodeCache::new(4096);
+        assert!(matches!(
+            StateSnapshot::rehydrate_cached(
+                expected.root(),
+                &mut |_| Some(bytes.clone()),
+                &mut cache
+            ),
+            Err(RehydrateError::HashMismatch)
+        ));
+        assert!(cache.nodes.is_empty());
+        let _verified = StateSnapshot::rehydrate_cached(
+            expected.root(),
+            &mut |root| stored.get(root).cloned(),
+            &mut cache,
+        )
+        .expect("valid read");
+        let mut independent = VerifiedNodeCache::new(4096);
+        assert!(matches!(
+            StateSnapshot::rehydrate_cached(
+                expected.root(),
+                &mut |_| Some(bytes.clone()),
+                &mut independent
+            ),
+            Err(RehydrateError::HashMismatch)
+        ));
+    }
+
+    #[test]
+    fn missing_and_malformed_nodes_keep_original_error_semantics() {
+        let expected = state(1);
+        let mut cache = VerifiedNodeCache::new(4096);
+        assert!(matches!(
+            StateSnapshot::rehydrate_cached(expected.root(), &mut |_| None, &mut cache),
+            Err(RehydrateError::MissingNode)
+        ));
+        let mut encoded = nodes(&expected)
+            .remove(&expected.root())
+            .expect("leaf bytes");
+        encoded[33..37].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(matches!(
+            StateSnapshot::rehydrate_cached(
+                expected.root(),
+                &mut |_| Some(encoded.clone()),
+                &mut cache
+            ),
+            Err(RehydrateError::Malformed)
+        ));
+        assert!(cache.nodes.is_empty());
+    }
+
+    #[test]
+    fn missing_descendant_cannot_publish_a_successful_cached_parent() {
+        let expected = state(128);
+        let stored = nodes(&expected);
+        let missing = *stored
+            .iter()
+            .find(|(_, bytes)| bytes.first() == Some(&TAG_LEAF))
+            .expect("leaf")
+            .0;
+        let mut cache = VerifiedNodeCache::new(4 * 1024 * 1024);
+        assert!(matches!(
+            StateSnapshot::rehydrate_cached(
+                expected.root(),
+                &mut |root| {
+                    if *root == missing {
+                        None
+                    } else {
+                        stored.get(root).cloned()
+                    }
+                },
+                &mut cache
+            ),
+            Err(RehydrateError::MissingNode)
+        ));
+        assert!(!cache.nodes.contains_key(&(expected.root(), 0)));
+        let recovered = StateSnapshot::rehydrate_cached(
+            expected.root(),
+            &mut |root| stored.get(root).cloned(),
+            &mut cache,
+        )
+        .expect("complete source read");
+        assert_eq!(recovered.root(), expected.root());
+        assert_eq!(recovered.len(), 128);
+    }
+
+    #[test]
+    fn cached_nodes_cannot_bypass_recursion_depth_bound() {
+        let expected = state(1);
+        let stored = nodes(&expected);
+        let mut cache = VerifiedNodeCache::new(4096);
+        rebuild_verified(
+            &expected.root(),
+            &mut |root| stored.get(root).cloned(),
+            MAX_DEPTH,
+            Some(&mut cache),
+        )
+        .expect("leaf at depth limit");
+        assert!(matches!(
+            rebuild_verified(
+                &expected.root(),
+                &mut |_| panic!("reject before loader"),
+                MAX_DEPTH + 1,
+                Some(&mut cache)
+            ),
+            Err(RehydrateError::Malformed)
+        ));
+        let mut reads = 0;
+        rebuild_verified(
+            &expected.root(),
+            &mut |root| {
+                reads += 1;
+                stored.get(root).cloned()
+            },
+            0,
+            Some(&mut cache),
+        )
+        .expect("same address at distinct depth must verify separately");
+        assert_eq!(reads, 1);
+    }
+
+    #[test]
+    fn collision_leaf_preserves_all_entries_and_canonical_root() {
+        // Collision buckets intentionally have several keys under one digest;
+        // use the internal constructor to exercise that otherwise rare shape.
+        let leaf = Arc::new(Node::leaf_from_entries(
+            [7; 32],
+            vec![
+                (StateKey::new("m.room.member", "@a:test"), "$a".into()),
+                (StateKey::new("m.room.member", "@b:test"), "$b".into()),
+            ],
+        ));
+        let expected = StateSnapshot {
+            root: Some(leaf),
+            len: 2,
+        };
+        let stored = nodes(&expected);
+        let mut cache = VerifiedNodeCache::new(4096);
+        let plain =
+            StateSnapshot::rehydrate(expected.root(), &mut |root| stored.get(root).cloned())
+                .expect("plain collision");
+        let cached = StateSnapshot::rehydrate_cached(
+            expected.root(),
+            &mut |root| stored.get(root).cloned(),
+            &mut cache,
+        )
+        .expect("cached collision");
+        let mut plain_rows = Vec::new();
+        plain.for_each(|key, event| plain_rows.push((key.clone(), event.to_owned())));
+        let mut cached_rows = Vec::new();
+        cached.for_each(|key, event| cached_rows.push((key.clone(), event.to_owned())));
+        assert_eq!(plain_rows, cached_rows);
+        assert_eq!(cached.len(), 2);
+        assert_eq!(cached.root(), expected.root());
+    }
+
+    #[test]
+    fn large_seeded_roots_reuse_subtrees_with_the_runtime_budget() {
+        let mut expected = state(51_200);
+        let mut stored = nodes(&expected);
+        let mut cache = VerifiedNodeCache::new(64 * 1024 * 1024);
+        let full_walk_nodes = stored.len();
+        let mut reads = 0;
+        for index in 0..100 {
+            let before = expected.clone();
+            expected = expected.apply(
+                StateKey::new("m.room.member", "@u1:test"),
+                format!("$version{index}"),
+            );
+            stored.extend(expected.delta_nodes(Some(&before)));
+            let held = StateSnapshot::rehydrate_cached(
+                expected.root(),
+                &mut |root| {
+                    reads += 1;
+                    stored.get(root).cloned()
+                },
+                &mut cache,
+            )
+            .expect("large seeded read");
+            assert_eq!(held.root(), expected.root());
+            assert_eq!(held.len(), 51_200);
+            assert!(cache.bytes <= cache.budget);
+        }
+        assert!(
+            reads < full_walk_nodes * 10,
+            "{reads} reads should be below ten full walks for one hundred roots"
+        );
+    }
+
+    #[test]
+    fn cache_ownership_and_order_indexes_remain_bounded_after_eviction() {
+        let mut expected = state(128);
+        let mut stored = nodes(&expected);
+        let mut cache = VerifiedNodeCache::new(32 * 1024);
+        for index in 0..200 {
+            expected = expected.apply(
+                StateKey::new("m.room.member", "@u1:test"),
+                format!("$version{index}"),
+            );
+            stored.extend(expected.delta_nodes(None));
+            let held = StateSnapshot::rehydrate_cached(
+                expected.root(),
+                &mut |root| stored.get(root).cloned(),
+                &mut cache,
+            )
+            .expect("bounded read");
+            assert_eq!(held.root(), expected.root());
+            assert_eq!(held.len(), 128);
+            assert!(cache.bytes <= cache.budget);
+            assert_eq!(cache.nodes.len(), cache.order.len());
+            assert_eq!(
+                cache.bytes,
+                cache
+                    .nodes
+                    .values()
+                    .map(|entry| entry.charge)
+                    .sum::<usize>()
+            );
         }
     }
 }

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use crate::state::VerifiedNodeCache;
 use crate::{StateKey, StateRoot, StateSnapshot};
 
 /// Matrix caps `prev_events` at 20 references per event.
@@ -1369,6 +1370,9 @@ impl RoomLog {
         let mut unverified = Vec::new();
         let mut broken_chain = Vec::new();
         let mut previous: Option<i64> = None;
+        // A cache belongs to this immutable rebuild only. Never carry verified
+        // nodes across stores or across independent reads after disk changes.
+        let mut verified_nodes = VerifiedNodeCache::new(64 * 1024 * 1024);
 
         for restored in entries {
             let li = restored.li.get();
@@ -1415,10 +1419,9 @@ impl RoomLog {
                 // `/state_ids`, not from parents this log holds, so only the
                 // stored trie can supply it.
                 let stored = StateRoot::from_bytes(restored.expected_state_root);
-                if let Some(state) = load_node
-                    .as_mut()
-                    .and_then(|load| StateSnapshot::rehydrate(stored, load).ok())
-                {
+                if let Some(state) = load_node.as_mut().and_then(|load| {
+                    StateSnapshot::rehydrate_cached(stored, load, &mut verified_nodes).ok()
+                }) {
                     state
                 } else {
                     unverified.push(restored.li);
