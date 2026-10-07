@@ -190,6 +190,7 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::Pusher, 0x2f),
         (Keyspace::MemberHistory, 0x30),
         (Keyspace::PushCursor, 0x31),
+        (Keyspace::ImportNotificationFence, 0x43),
         (Keyspace::PendingKnock, 0x32),
         (Keyspace::OpenIdToken, 0x33),
         (Keyspace::Sticky, 0x34),

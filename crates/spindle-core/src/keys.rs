@@ -410,6 +410,8 @@ pub enum Keyspace {
     HistoricalRejection = 0x41,
     /// Imported auth PDUs retained outside the accepted client timeline.
     ImportedAuthOnly = 0x42,
+    /// Fresh offline-import notification boundary, separate from the live cursor.
+    ImportNotificationFence = 0x43,
     /// `(room_id, synapse_stream_ordering)` -> the linear index the
     /// importer gave that event (#568). Lets a Synapse pagination token
     /// a client kept across the migration name a place in this room.
@@ -441,6 +443,12 @@ pub fn profile(user_id: &str) -> Vec<u8> {
 #[must_use]
 pub fn push_cursor() -> Vec<u8> {
     vec![KEY_SCHEMA_VERSION, Keyspace::PushCursor as u8]
+}
+
+/// The durable proof that a fresh offline import owns its notification boundary.
+#[must_use]
+pub fn import_notification_fence() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::ImportNotificationFence as u8]
 }
 
 /// One `OpenID` token's row: its expiry, then the digest of the token.

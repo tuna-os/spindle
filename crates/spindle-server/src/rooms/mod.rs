@@ -6692,7 +6692,18 @@ fn highest_stream_id(store: &FjallStore, from_stream: u64) -> u64 {
             })
             .max()
             .unwrap_or(0);
+    // A completed fresh import fences historical notifications at this durable
+    // global position. Pending side-stream rows can later be consumed/deleted;
+    // restarting below the push cursor would assign new events old IDs and
+    // silently suppress their notifications. Malformed rows retain the same
+    // ignore policy as the other counter drawers above.
+    let from_push_cursor = spindle_store::ReadView::get(store, &spindle_core::keys::push_cursor())
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_slice().try_into().map(u64::from_be_bytes).ok())
+        .unwrap_or(0);
     from_stream
+        .max(from_push_cursor)
         .max(from_to_device)
         .max(from_device_lists)
         .max(from_pending_invites)

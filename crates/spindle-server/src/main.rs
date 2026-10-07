@@ -346,6 +346,7 @@ fn import_synapse(arguments: &[String]) -> ExitCode {
         only_users,
         exclude_rooms,
         dry_run,
+        allow_nonempty,
         signing_key,
         password_for: Box::new(move |localpart| {
             let dir = password_dir.as_ref()?;

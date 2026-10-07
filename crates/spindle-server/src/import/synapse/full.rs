@@ -93,6 +93,8 @@ pub struct Options {
     pub exclude_rooms: BTreeMap<String, String>,
     /// Read, plan and compare everything, and write nothing.
     pub dry_run: bool,
+    /// Supplementary imports never establish a fresh notification boundary.
+    pub allow_nonempty: bool,
     /// Synapse's signing key file contents, `ed25519 <version> <seed>`.
     pub signing_key: Option<String>,
     /// A known login password for a localpart (the E2EE rig's users).
@@ -231,6 +233,10 @@ pub struct Report {
     pub not_migrated: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation: Option<Validation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_boundary: Option<super::notifications::Proof>,
+    #[serde(default)]
+    pub notification_boundary_mode: super::notifications::Mode,
 }
 
 impl Report {
@@ -243,6 +249,8 @@ impl Report {
             self.rooms.clear();
             self.excluded_rooms.clear();
             self.validation = None;
+            self.notification_boundary = None;
+            self.notification_boundary_mode = super::notifications::Mode::DryRun;
         }
         self.dry_run = dry_run;
     }
@@ -302,7 +310,7 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-fn write_error(error: impl std::fmt::Display) -> Error {
+pub(super) fn write_error(error: impl std::fmt::Display) -> Error {
     Error::Write(error.to_string())
 }
 
@@ -504,6 +512,41 @@ pub fn run(
     blobs: crate::blobs::Blobs,
     previous: Option<Report>,
 ) -> Result<Report, Error> {
+    let resuming = previous.as_ref().is_some_and(|report| !report.dry_run);
+    let mut report = previous.unwrap_or_default();
+    if !report.server_name.is_empty() && report.server_name != options.server_name {
+        return Err(Error::Checkpoint(
+            "checkpoint belongs to another server name".to_owned(),
+        ));
+    }
+    report.prepare_mode(options.dry_run);
+    if !options.dry_run {
+        if report.notification_boundary_mode == super::notifications::Mode::ManagedFresh
+            && report.notification_boundary.is_none()
+            && !options.allow_nonempty
+        {
+            return Err(Error::Checkpoint(
+                "managed notification boundary proof missing".to_owned(),
+            ));
+        }
+        report.notification_boundary = super::notifications::begin(
+            store,
+            &notification_scope(options)?,
+            report.notification_boundary.as_ref(),
+            resuming,
+            options.allow_nonempty,
+        )?;
+        report.notification_boundary_mode = if report.notification_boundary.is_some() {
+            super::notifications::Mode::ManagedFresh
+        } else if options.allow_nonempty {
+            super::notifications::Mode::UnmanagedSupplementary
+        } else {
+            super::notifications::Mode::UnmanagedLegacy
+        };
+        report.server_name.clone_from(&options.server_name);
+        // Persist eligibility before any target service or import phase writes.
+        save_checkpoint(&options.checkpoint, &report)?;
+    }
     let target = Target {
         store: Arc::clone(store),
         rooms: crate::rooms::Rooms::new(Arc::clone(store), &options.server_name),
@@ -515,14 +558,10 @@ pub fn run(
         directory: crate::directory::Directory::new(Arc::clone(store), &options.server_name),
         media: crate::media::Media::new(Arc::clone(store), blobs, &options.server_name),
     };
-    let mut report = previous.unwrap_or_default();
-    if !report.server_name.is_empty() && report.server_name != options.server_name {
-        return Err(Error::Checkpoint(
-            "checkpoint belongs to another server name".to_owned(),
-        ));
-    }
     report.server_name.clone_from(&options.server_name);
-    report.prepare_mode(options.dry_run);
+    if options.dry_run {
+        report.notification_boundary_mode = super::notifications::Mode::DryRun;
+    }
     report.runs += 1;
     report
         .rooms
@@ -587,6 +626,13 @@ pub fn run(
     run.report.seconds = earlier_seconds + run.started.elapsed().as_secs_f64();
     if !options.dry_run {
         run.sync()?;
+        if let Some(proof) = &run.report.notification_boundary {
+            run.report.notification_boundary = Some(super::notifications::complete(
+                store,
+                proof,
+                run.target.rooms.stream_position(),
+            )?);
+        }
     }
     save_checkpoint(&options.checkpoint, &run.report)?;
     Ok(run.report)
@@ -2331,6 +2377,21 @@ pub fn validate(
     report: &mut Report,
 ) -> Result<(), Error> {
     let started = Instant::now();
+    if let Some(proof) = &report.notification_boundary {
+        if options.allow_nonempty
+            || proof.scope_sha256 != notification_scope(options)?
+            || report.notification_boundary_mode != super::notifications::Mode::ManagedFresh
+        {
+            return Err(Error::Checkpoint(
+                "notification boundary mode or scope differs".to_owned(),
+            ));
+        }
+        super::notifications::validate(store, proof)?;
+    } else if report.notification_boundary_mode == super::notifications::Mode::ManagedFresh {
+        return Err(Error::Checkpoint(
+            "managed notification boundary proof missing".to_owned(),
+        ));
+    }
     let rooms = crate::rooms::Rooms::new(Arc::clone(store), &options.server_name);
     let mut validation = Validation::default();
     let mut historical_rejections = Check::default();
@@ -2891,6 +2952,19 @@ pub fn validate(
     save_checkpoint(&options.checkpoint, report)
 }
 
+fn notification_scope(options: &Options) -> Result<String, Error> {
+    use sha2::Digest as _;
+    let scope = serde_json::to_vec(&(
+        &options.server_name,
+        &options.only_rooms,
+        &options.only_users,
+        &options.exclude_rooms,
+        false, // preserve_local_history is not supported by this joined-only candidate.
+        REJECTION_POLICY_VERSION,
+    ))?;
+    Ok(hex_lower(&sha2::Sha256::digest(&scope)))
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -3018,6 +3092,50 @@ fn split_rule_id(rule_id: &str) -> Option<(&'static str, &str)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_report_is_explicitly_unmanaged_and_not_a_completed_fence() {
+        let mut value = serde_json::to_value(super::Report::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("notification_boundary_mode");
+        object.remove("notification_boundary");
+        let report: super::Report = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            report.notification_boundary_mode,
+            super::super::notifications::Mode::UnmanagedLegacy
+        );
+        assert!(report.notification_boundary.is_none());
+    }
+
+    #[test]
+    fn notification_scope_binds_server_room_user_and_exclusion_policy() {
+        let mut options = super::Options {
+            server_name: "fixture.example".to_owned(),
+            checkpoint: std::path::PathBuf::from("unused-fixture-checkpoint"),
+            media_root: None,
+            only_rooms: None,
+            only_users: None,
+            exclude_rooms: std::collections::BTreeMap::new(),
+            dry_run: false,
+            allow_nonempty: false,
+            signing_key: None,
+            password_for: Box::new(|_| None),
+        };
+        let original = super::notification_scope(&options).unwrap();
+        options.only_rooms = Some(["!one:fixture.example".to_owned()].into());
+        assert_ne!(super::notification_scope(&options).unwrap(), original);
+        options.only_rooms = None;
+        options.only_users = Some(["@one:fixture.example".to_owned()].into());
+        assert_ne!(super::notification_scope(&options).unwrap(), original);
+        options.only_users = None;
+        options
+            .exclude_rooms
+            .insert("!one:fixture.example".to_owned(), "operator".to_owned());
+        assert_ne!(super::notification_scope(&options).unwrap(), original);
+        options.exclude_rooms.clear();
+        options.server_name = "other.example".to_owned();
+        assert_ne!(super::notification_scope(&options).unwrap(), original);
+    }
+
     use super::*;
 
     #[test]
