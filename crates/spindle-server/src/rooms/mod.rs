@@ -4596,11 +4596,35 @@ impl Rooms {
     /// other one, in rooms they had nothing to do with. Now the map is a
     /// lookup and the *room* is the thing contended.
     ///
-    /// The miss path takes the registry exclusively and re-checks, because
-    /// two requests for the same cold room would otherwise both load it and
-    /// the second would replace the first -- handing two callers different
-    /// locks for one room, which is the same as no lock at all.
+    /// Cold readers may load the same room concurrently, but publication
+    /// rechecks the registry and returns its canonical lock without replacing
+    /// a room another reader or writer has already published.
     fn room(&self, room_id: &str) -> Result<Arc<RwLock<RoomLog>>, RoomError> {
+        self.room_or_load(room_id, || {
+            let restored = RoomStore::new(self.store.as_ref(), room_id)
+                .load_runtime()?
+                .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
+            let mut log = restored.log;
+            if !log.current_is_settled() {
+                match self.resolve_in(&log, room_id, |log, resolver, load| {
+                    log.resolve_current(resolver, load)
+                }) {
+                    Ok(current) => log.set_current(current),
+                    Err(error) => tracing::warn!(
+                        room = room_id,
+                        "cannot resolve the reopened room's forward extremities: {error}"
+                    ),
+                }
+            }
+            Ok(log)
+        })
+    }
+
+    fn room_or_load(
+        &self,
+        room_id: &str,
+        load: impl FnOnce() -> Result<RoomLog, RoomError>,
+    ) -> Result<Arc<RwLock<RoomLog>>, RoomError> {
         {
             self.metrics.record_registry_lock(false);
             let open = self
@@ -4611,35 +4635,16 @@ impl Rooms {
                 return Ok(Arc::clone(room));
             }
         }
+        // Cold I/O and resolution never hold the registry. Duplicate read-only
+        // loads are allowed; entry-or-insert preserves the canonical lock and
+        // any append performed after another caller first published the room.
+        let room = Arc::new(RwLock::new(load()?));
         self.metrics.record_registry_lock(true);
         let mut open = self
             .open
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(room) = open.get(room_id) {
-            return Ok(Arc::clone(room));
-        }
-        let restored = RoomStore::new(self.store.as_ref(), room_id)
-            .load()?
-            .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
-        let mut log = restored.log;
-        // A room closed with a fork open reopens with several extremities
-        // and no recorded resolution: resolve it now, once, so every reader
-        // after this sees the room's current state rather than one branch's.
-        if !log.current_is_settled() {
-            match self.resolve_in(&log, room_id, |log, resolver, load| {
-                log.resolve_current(resolver, load)
-            }) {
-                Ok(current) => log.set_current(current),
-                Err(error) => tracing::warn!(
-                    room = room_id,
-                    "cannot resolve the reopened room's forward extremities: {error}"
-                ),
-            }
-        }
-        let room = Arc::new(RwLock::new(log));
-        open.insert(room_id.to_owned(), Arc::clone(&room));
-        Ok(room)
+        Ok(Arc::clone(open.entry(room_id.to_owned()).or_insert(room)))
     }
 
     /// [`Self::with_room`] for work that only *reads* the log.
@@ -7494,4 +7499,92 @@ fn power_levels_content(
         }
     }
     Ok(content)
+}
+
+#[cfg(test)]
+mod cold_registry_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn rooms() -> (tempfile::TempDir, Arc<Rooms>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let rooms = Arc::new(Rooms::new(store, "test"));
+        (dir, rooms)
+    }
+
+    #[test]
+    fn blocked_cold_load_does_not_block_an_unrelated_warm_room() {
+        let (_dir, rooms) = rooms();
+        rooms
+            .room_or_load("!warm:test", || Ok(RoomLog::new()))
+            .unwrap();
+        let (entered, inside) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let cold = Arc::clone(&rooms);
+        let thread = std::thread::spawn(move || {
+            cold.room_or_load("!cold:test", || {
+                entered.send(()).unwrap();
+                held.recv().unwrap();
+                Ok(RoomLog::new())
+            })
+            .unwrap()
+        });
+        inside.recv_timeout(Duration::from_secs(2)).unwrap();
+        let warm = Arc::clone(&rooms);
+        let (done, result) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            warm.room("!warm:test").unwrap();
+            done.send(()).unwrap();
+        });
+        let progressed = result.recv_timeout(Duration::from_secs(2));
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        reader.join().unwrap();
+        assert!(
+            progressed.is_ok(),
+            "warm room blocked behind unrelated cold I/O"
+        );
+    }
+
+    #[test]
+    fn duplicate_cold_load_returns_canonical_arc_and_preserves_new_append() {
+        let (_dir, rooms) = rooms();
+        let (entered, inside) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let first = Arc::clone(&rooms);
+        let thread = std::thread::spawn(move || {
+            first
+                .room_or_load("!same:test", || {
+                    entered.send(()).unwrap();
+                    held.recv().unwrap();
+                    Ok(RoomLog::new())
+                })
+                .unwrap()
+        });
+        inside.recv_timeout(Duration::from_secs(2)).unwrap();
+        let published = rooms
+            .room_or_load("!same:test", || Ok(RoomLog::new()))
+            .unwrap();
+        published
+            .write()
+            .unwrap()
+            .append_local("$new", None)
+            .unwrap();
+        release.send(()).unwrap();
+        let late = thread.join().unwrap();
+        assert!(Arc::ptr_eq(&published, &late));
+        assert_eq!(late.read().unwrap().len(), 1);
+        assert_eq!(
+            late.read()
+                .unwrap()
+                .entries()
+                .next_back()
+                .unwrap()
+                .event_id
+                .as_str(),
+            "$new"
+        );
+    }
 }

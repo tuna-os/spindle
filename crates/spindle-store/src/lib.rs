@@ -40,7 +40,8 @@ use fjall::{
     KeyspaceCreateOptions as PartitionCreateOptions, PersistMode, Readable,
 };
 use spindle_core::{
-    CONTENT_DIGEST_VERSION, EventId, RestoreError, RestoredEntry, RestoredLog, RoomLog, StateRoot,
+    CONTENT_DIGEST_VERSION, EventId, RestoreError, RestoredEntry, RestoredLog, RoomLog,
+    RuntimeRestoredLog, StateRoot,
     keys::{KEY_SCHEMA_VERSION, Keyspace, content_addressed, room_li, room_prefix, store_marker},
 };
 
@@ -1383,6 +1384,23 @@ impl<'a, S: Store> RoomStore<'a, S> {
         Ok(())
     }
 
+    fn restore_sidelined_checked(&self, log: &mut RoomLog) -> Result<(), StoreError> {
+        let prefix = room_prefix(Keyspace::Sidelined, &self.room_id);
+        let mut load_node = |address: &StateRoot| {
+            self.store
+                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
+                .ok()
+                .flatten()
+        };
+        for (_, value) in self.store.scan_prefix(&prefix)? {
+            let entry = SidelinedRecord::decode(&value)?.to_entry()?;
+            let state = spindle_core::StateSnapshot::rehydrate(entry.state_root, &mut load_node)
+                .map_err(|_| RestoreError::UnreadableSidelined(entry.event_id.clone()))?;
+            log.restore_sidelined(entry, state);
+        }
+        Ok(())
+    }
+
     /// Commit imported historical rejection decisions and their PDU records.
     ///
     /// The markers never become timeline entries. In-memory decisions are
@@ -1559,6 +1577,64 @@ impl<'a, S: Store> RoomStore<'a, S> {
             });
         }
         Ok(Some((meta, entries)))
+    }
+
+    /// Runtime restoration checks all ordered metadata/chain and selected
+    /// roots only. Older roots are checked on demand, not declared verified.
+    ///
+    /// # Errors
+    /// Returns an error for unreadable records, chain, tips or selected roots.
+    pub fn load_runtime(&self) -> Result<Option<RuntimeRestoredLog>, StoreError> {
+        let Some((meta, entries)) = self.read_records()? else {
+            return Ok(None);
+        };
+        let mut load_node = |address: &StateRoot| {
+            self.store
+                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
+                .ok()
+                .flatten()
+        };
+        let mut restored = RoomLog::restore_runtime(
+            entries,
+            meta.next_forward,
+            meta.next_backward,
+            meta.forward_extremities
+                .into_iter()
+                .map(|id| EventId::new(id.as_str())),
+            &mut load_node,
+        )?;
+        self.restore_sidelined_checked(&mut restored.log)?;
+        self.restore_historical_rejections(&mut restored.log)?;
+        Ok(Some(restored))
+    }
+
+    /// Validate every persisted root and chain, including historical roots
+    /// that runtime restoration deliberately leaves unmaterialized.
+    ///
+    /// # Errors
+    /// Returns an error for unreadable records, chain, tips or any state root.
+    pub fn load_exhaustive(&self) -> Result<Option<RestoredLog>, StoreError> {
+        let Some((meta, entries)) = self.read_records()? else {
+            return Ok(None);
+        };
+        let mut load_node = |address: &StateRoot| {
+            self.store
+                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
+                .ok()
+                .flatten()
+        };
+        let mut restored = RoomLog::restore_exhaustive(
+            entries,
+            meta.next_forward,
+            meta.next_backward,
+            meta.forward_extremities
+                .into_iter()
+                .map(|id| EventId::new(id.as_str())),
+            &mut load_node,
+        )?;
+        self.restore_sidelined_checked(&mut restored.log)?;
+        self.restore_historical_rejections(&mut restored.log)?;
+        Ok(Some(restored))
     }
 
     /// Rebuild the log from storage.

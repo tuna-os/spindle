@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use crate::state::VerifiedNodeCache;
 use crate::{StateKey, StateRoot, StateSnapshot};
@@ -1256,6 +1256,14 @@ pub struct RestoredEntry {
     pub chain: Option<[u8; 32]>,
 }
 
+/// A runtime log whose selected resident roots and complete chain were checked.
+/// Older state roots remain recorded and are verified when requested; this is
+/// deliberately distinct from an exhaustive restoration result.
+#[derive(Clone, Debug)]
+pub struct RuntimeRestoredLog {
+    pub log: RoomLog,
+}
+
 /// A log rebuilt from storage, plus whichever entries could not be verified.
 #[derive(Clone, Debug)]
 pub struct RestoredLog {
@@ -1288,6 +1296,21 @@ pub enum RestoreError {
     OutOfOrder { expected_after: i64, found: i64 },
     /// Two entries claim the same index.
     DuplicateIndex(i64),
+    /// Two positions cannot identify the same event.
+    DuplicateEvent(EventId),
+    /// A next-position counter would collide with an existing index.
+    InvalidCounters {
+        next_forward: i64,
+        next_backward: i64,
+    },
+    /// A selected persisted root could not be completely read and hash-verified.
+    UnreadableState(i64),
+    /// A restored sidelined event has an unreadable persisted state root.
+    UnreadableSidelined(EventId),
+    /// The recorded attestation disagreed with the ordered event history.
+    BrokenChain(i64),
+    /// Metadata names a tip that is not present in the accepted log.
+    MissingExtremity(EventId),
 }
 
 impl RoomLog {
@@ -1342,6 +1365,165 @@ impl RoomLog {
             forward_extremities,
             Some(load_node),
         )
+    }
+
+    /// Restore the complete ordered index and chain, hydrating only the last
+    /// resident window and every forward extremity. Historical root addresses
+    /// are preserved; `state_after_any` verifies older state on demand.
+    ///
+    /// # Errors
+    /// Returns an error for unordered records, broken chains, missing tips,
+    /// or selected roots that cannot be completely read and verified.
+    pub fn restore_runtime(
+        entries: impl IntoIterator<Item = RestoredEntry>,
+        next_forward: i64,
+        next_backward: i64,
+        forward_extremities: impl IntoIterator<Item = EventId>,
+        load_node: NodeLoader<'_>,
+    ) -> Result<RuntimeRestoredLog, RestoreError> {
+        Self::restore_stored_roots(
+            entries,
+            next_forward,
+            next_backward,
+            forward_extremities,
+            load_node,
+            false,
+        )
+        .map(|log| RuntimeRestoredLog { log })
+    }
+
+    /// Explicitly verify every persisted root and every chain attestation.
+    /// Unlike runtime restore, an unreadable root at any age fails this check.
+    ///
+    /// # Errors
+    /// Returns an error for invalid order, chain, tip, or any persisted root.
+    pub fn restore_exhaustive(
+        entries: impl IntoIterator<Item = RestoredEntry>,
+        next_forward: i64,
+        next_backward: i64,
+        forward_extremities: impl IntoIterator<Item = EventId>,
+        load_node: NodeLoader<'_>,
+    ) -> Result<RestoredLog, RestoreError> {
+        Self::restore_stored_roots(
+            entries,
+            next_forward,
+            next_backward,
+            forward_extremities,
+            load_node,
+            true,
+        )
+        .map(|log| RestoredLog {
+            log,
+            broken_chain: Vec::new(),
+            unverified: Vec::new(),
+        })
+    }
+
+    fn restore_stored_roots(
+        entries: impl IntoIterator<Item = RestoredEntry>,
+        next_forward: i64,
+        next_backward: i64,
+        forward_extremities: impl IntoIterator<Item = EventId>,
+        load_node: NodeLoader<'_>,
+        exhaustive: bool,
+    ) -> Result<Self, RestoreError> {
+        let mut log = Self {
+            next_forward,
+            next_backward,
+            forward_extremities: forward_extremities.into_iter().collect(),
+            ..Self::default()
+        };
+        let mut previous = None;
+        for restored in entries {
+            let li = restored.li.get();
+            if let Some(previous) = previous {
+                if li == previous {
+                    return Err(RestoreError::DuplicateIndex(li));
+                }
+                if li < previous {
+                    return Err(RestoreError::OutOfOrder {
+                        expected_after: previous,
+                        found: li,
+                    });
+                }
+            }
+            previous = Some(li);
+            let chain = match restored.chain {
+                Some(stored) => {
+                    let recomputed = log.head_chain.extend(&restored.event_id);
+                    if *recomputed.as_bytes() != stored {
+                        return Err(RestoreError::BrokenChain(li));
+                    }
+                    log.head_chain = recomputed;
+                    Some(recomputed)
+                }
+                None => None,
+            };
+            let entry = LogEntry {
+                li: restored.li,
+                event_id: restored.event_id,
+                prev_events: restored.prev_events,
+                depth: restored.depth,
+                state_key: restored.state_key,
+                chain,
+                state_root: StateRoot::from_bytes(restored.expected_state_root),
+            };
+            if log.positions.insert(entry.event_id.clone(), li).is_some() {
+                return Err(RestoreError::DuplicateEvent(entry.event_id));
+            }
+            log.entries.insert(li, entry);
+        }
+        if log
+            .entries
+            .last_key_value()
+            .is_some_and(|(&li, _)| li >= next_forward)
+            || log
+                .entries
+                .first_key_value()
+                .is_some_and(|(&li, _)| li <= next_backward)
+        {
+            return Err(RestoreError::InvalidCounters {
+                next_forward,
+                next_backward,
+            });
+        }
+        let mut selected: BTreeSet<i64> = log
+            .entries
+            .keys()
+            .rev()
+            .take(DEFAULT_RESIDENT_WINDOW)
+            .copied()
+            .collect();
+        for tip in &log.forward_extremities {
+            let li = log
+                .positions
+                .get(tip)
+                .ok_or_else(|| RestoreError::MissingExtremity(tip.clone()))?;
+            selected.insert(*li);
+        }
+        let mut verified_nodes = VerifiedNodeCache::new(64 * 1024 * 1024);
+        // Weak cache entries need live owners during an exhaustive traversal.
+        // The processing window is independent of the final resident indexes:
+        // old roots share subtrees even before the selected head window starts.
+        let mut processing = VecDeque::new();
+        for (&li, entry) in &log.entries {
+            if !exhaustive && !selected.contains(&li) {
+                continue;
+            }
+            let state =
+                StateSnapshot::rehydrate_cached(entry.state_root, load_node, &mut verified_nodes)
+                    .map_err(|_| RestoreError::UnreadableState(li))?;
+            if selected.contains(&li) {
+                log.resident.insert(li, state.clone());
+            }
+            if exhaustive {
+                processing.push_back(state);
+                if processing.len() > DEFAULT_RESIDENT_WINDOW {
+                    processing.pop_front();
+                }
+            }
+        }
+        Ok(log)
     }
 
     fn rebuild(

@@ -2399,6 +2399,12 @@ pub fn validate(
 
     let room_ids: Vec<String> = report.rooms.keys().cloned().collect();
     for room_id in &room_ids {
+        // Serving uses lazy historical roots; validation must independently
+        // verify every persisted root/chain before reporting a passing room.
+        spindle_store::RoomStore::new(store.as_ref(), room_id)
+            .load_exhaustive()
+            .map_err(write_error)?
+            .ok_or_else(|| Error::Checkpoint("validated room has no native metadata".to_owned()))?;
         validation.rooms_checked += 1;
         let target: BTreeMap<(String, String), String> = rooms
             .state(room_id)
