@@ -176,6 +176,15 @@ registrations = []
 # mutually exclusive with `[auth.delegated]`. See docs/delegated-auth.md
 # for both options.
 # builtin_oidc = false
+#
+# The built-in provider's issuer, when it should not be the client base URL
+# (#609) -- e.g. the issuer a retired MAS used, so clients that stored it
+# keep working. An origin only (scheme, host, optional port, optional
+# trailing slash): discovery, `auth_metadata` and every endpoint URL are
+# built on it, and the endpoints are served at the root of whichever host
+# reaches Spindle, so point that host's proxy at Spindle too. Requires
+# builtin_oidc = true.
+# oidc_issuer = "https://auth.example.org/"
 
 # MSC3861 delegation: an external OIDC provider (typically the Matrix
 # Authentication Service) owns identity, and this server validates its

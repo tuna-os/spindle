@@ -20,14 +20,19 @@ struct Instance {
 
 impl Instance {
     async fn start(builtin: bool) -> Instance {
+        Self::start_with(builtin, "").await
+    }
+
+    /// As [`Instance::start`], with more `[auth]` keys appended.
+    async fn start_with(builtin: bool, extra_auth: &str) -> Instance {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
         let auth = if builtin {
-            "[auth]\nbuiltin_oidc = true\n"
+            format!("[auth]\nbuiltin_oidc = true\n{extra_auth}")
         } else {
-            ""
+            String::new()
         };
         let config = spindle_server::Config::parse(&format!(
             "[server]\nname = \"{name}\"\npublic_base_url = \"http://{name}\"\n\
@@ -493,5 +498,76 @@ async fn the_well_known_names_the_issuer() {
         body["org.matrix.msc2965.authentication"]["issuer"],
         format!("http://{}/", server.name),
         "{body}"
+    );
+}
+
+/// #609: an issuer on its own host (the one a retired MAS used, say)
+/// moves every advertised URL with it — discovery, both `auth_metadata`
+/// spellings and the client well-known agree — while the server itself
+/// keeps answering on its own address.
+#[tokio::test]
+async fn a_configured_issuer_moves_every_advertised_url() {
+    let server = Instance::start_with(true, "oidc_issuer = \"https://auth.example.test/\"\n").await;
+    let discovery: Value = read_json(
+        server
+            .client
+            .get(format!(
+                "http://{}/.well-known/openid-configuration",
+                server.name
+            ))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        discovery["issuer"], "https://auth.example.test/",
+        "{discovery}"
+    );
+    for (field, path) in [
+        ("authorization_endpoint", "/oauth2/authorize"),
+        ("token_endpoint", "/oauth2/token"),
+        ("registration_endpoint", "/oauth2/registration"),
+        ("revocation_endpoint", "/oauth2/revoke"),
+    ] {
+        assert_eq!(
+            discovery[field],
+            format!("https://auth.example.test{path}"),
+            "{discovery}"
+        );
+    }
+    for path in [
+        "/_matrix/client/v1/auth_metadata",
+        "/_matrix/client/unstable/org.matrix.msc2965/auth_metadata",
+    ] {
+        let relayed: Value = read_json(
+            server
+                .client
+                .get(format!("http://{}{path}", server.name))
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(relayed, discovery, "{path}");
+    }
+    let well_known: Value = read_json(
+        server
+            .client
+            .get(format!("http://{}/.well-known/matrix/client", server.name))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        well_known["org.matrix.msc2965.authentication"]["issuer"], "https://auth.example.test/",
+        "{well_known}"
+    );
+    // The Matrix base URL is not the issuer and does not move.
+    assert_eq!(
+        well_known["m.homeserver"]["base_url"],
+        format!("http://{}", server.name),
+        "{well_known}"
     );
 }
