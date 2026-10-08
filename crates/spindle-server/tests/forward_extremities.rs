@@ -673,3 +673,100 @@ async fn a_dummy_event_is_nobodys_unread_message() {
     assert_eq!(harness.unread(&room, "@carol:example.org"), 3);
     assert_eq!(harness.badge(&room, &carol).await, 3);
 }
+
+/// The sliding-sync room list for `token`: the room IDs in `range`, newest
+/// first, with each room's entry.
+async fn sliding(harness: &Harness, token: &str, range: [u64; 2]) -> Value {
+    let (status, body) = harness
+        .send(
+            "POST",
+            "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync",
+            token,
+            &json!({
+                "lists": {
+                    "main": {
+                        "ranges": [range],
+                        "required_state": [["m.room.name", ""]],
+                        "timeline_limit": 1,
+                    }
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+/// A quiet room that receives a dummy event keeps its place in the room
+/// list (#626): its bump stamp is still its last real event's, whether the
+/// key is cached, read from the resident log or read cold from the store,
+/// and the one-event preview is that event, not the dummy.
+#[tokio::test]
+async fn a_dummy_event_does_not_bump_a_quiet_room() {
+    let peer = Peer::start().await;
+    let harness = Harness::new("max_forward_extremities = 2\n");
+    let (quiet, alice, fork_point) = harness.shared_room(&peer).await;
+    let mut last = String::new();
+    for index in 0..3 {
+        let pdu = harness.message(&peer, &quiet, &fork_point, &format!("branch {index}"));
+        last = harness.inject(&peer, &format!("b{index}"), pdu).await;
+    }
+    let quiet_stamp = harness.state.rooms.last_activity(&quiet).unwrap();
+    let last_ts = harness.state.rooms.pdu(&quiet, &last).unwrap()["origin_server_ts"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(quiet_stamp, last_ts);
+
+    // A busier room speaks after the quiet one last did.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let (_, body) = harness
+        .send("POST", "/_matrix/client/v3/createRoom", &alice, &json!({}))
+        .await;
+    let busy = body["room_id"].as_str().unwrap().to_owned();
+    let (status, _) = harness
+        .send(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{busy}/send/m.room.message/hi"),
+            &alice,
+            &json!({ "msgtype": "m.text", "body": "hi" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let busy_stamp = harness.state.rooms.last_activity(&busy).unwrap();
+    assert!(busy_stamp > quiet_stamp);
+
+    // Then the quiet room is merged, by an event newer than both.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let pass = harness.merge();
+    assert_eq!(pass.merged.len(), 1, "{pass:?}");
+    let dummy = &pass.merged[0].1;
+    let dummy_ts = harness.state.rooms.pdu(&quiet, dummy).unwrap()["origin_server_ts"]
+        .as_i64()
+        .unwrap();
+    assert!(dummy_ts > busy_stamp);
+
+    // The cached key, and the list built from it.
+    assert_eq!(
+        harness.state.rooms.last_activity(&quiet).unwrap(),
+        quiet_stamp
+    );
+    let top = sliding(&harness, &alice, [0, 0]).await;
+    let rooms: Vec<&String> = top["rooms"].as_object().unwrap().keys().collect();
+    assert_eq!(rooms, vec![&busy], "the dummy event bumped the quiet room");
+    let both = sliding(&harness, &alice, [0, 1]).await;
+    let entry = &both["rooms"][&quiet];
+    assert_eq!(entry["bump_stamp"], json!(quiet_stamp), "{entry}");
+    let preview = entry["timeline"].as_array().unwrap();
+    assert_eq!(preview.len(), 1, "{entry}");
+    assert_eq!(preview[0]["event_id"], json!(last), "{entry}");
+
+    // The key read cold: another registry over the same store, which holds
+    // neither the cache nor the room, walks back past the dummy event.
+    let cold = spindle_server::rooms::Rooms::new(harness.store.clone(), "example.org");
+    assert!(!cold.is_resident(&quiet));
+    assert_eq!(cold.last_activity(&quiet).unwrap(), quiet_stamp);
+    // And read from a resident log with no cached key.
+    let warm = spindle_server::rooms::Rooms::new(harness.store.clone(), "example.org");
+    warm.warm(&quiet).unwrap();
+    assert_eq!(warm.last_activity(&quiet).unwrap(), quiet_stamp);
+}
