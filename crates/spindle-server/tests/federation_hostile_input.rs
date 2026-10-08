@@ -16,6 +16,9 @@
 //! a stranger's choosing, from inside its own network. The sentinel below
 //! is that host, and it must never hear the doorbell.
 
+#[path = "support/federation_auth.rs"]
+mod federation_auth;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -151,6 +154,7 @@ fn now_millis() -> u64 {
 struct Harness {
     _dir: TempDir,
     app: axum::Router,
+    store: Arc<FjallStore>,
 }
 
 impl Harness {
@@ -162,8 +166,12 @@ impl Harness {
              [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n",
         )
         .unwrap();
-        let app = spindle_server::app(config, store).expect("the app builds");
-        Self { _dir: dir, app }
+        let app = spindle_server::app(config, store.clone()).expect("the app builds");
+        Self {
+            _dir: dir,
+            app,
+            store,
+        }
     }
 
     async fn call(&self, request: Request<Body>) -> (StatusCode, Value) {
@@ -292,18 +300,21 @@ impl Harness {
     }
 }
 
-fn join_event(peer: &Peer, room: &str, prev: &str) -> Value {
-    peer.event(json!({
-        "type": "m.room.member",
-        "state_key": peer.user(),
-        "sender": peer.user(),
-        "room_id": room,
-        "content": { "membership": "join" },
-        "origin_server_ts": now_millis(),
-        "depth": 10,
-        "prev_events": [prev],
-        "auth_events": [],
-    }))
+fn join_event(store: &Arc<FjallStore>, peer: &Peer, room: &str, prev: &str) -> Value {
+    peer.event(federation_auth::with_auth_events(
+        store,
+        json!({
+            "type": "m.room.member",
+            "state_key": peer.user(),
+            "sender": peer.user(),
+            "room_id": room,
+            "content": { "membership": "join" },
+            "origin_server_ts": now_millis(),
+            "depth": 10,
+            "prev_events": [prev],
+            "auth_events": [],
+        }),
+    ))
 }
 
 // -- the finding ----------------------------------------------------------
@@ -478,7 +489,7 @@ async fn arbitrary_pdus_in_signed_transactions_are_answered_not_fatal() {
 
     // A real join first, so later events are judged against a room the
     // peer is actually in and the authorization rules have state to read.
-    let join = join_event(&peer, &room, &head);
+    let join = join_event(&harness.store, &peer, &room, &head);
     let (status, body) = harness
         .deliver(&peer, "join", vec![join.clone()], Vec::new())
         .await;
@@ -524,16 +535,19 @@ async fn arbitrary_pdus_in_signed_transactions_are_answered_not_fatal() {
 
     // Still standing, and still a server: the honest peer's next message
     // lands after every hostile one.
-    let message = peer.event(json!({
-        "type": "m.room.message",
-        "sender": peer.user(),
-        "room_id": room,
-        "content": { "msgtype": "m.text", "body": "still here" },
-        "origin_server_ts": now_millis(),
-        "depth": 11,
-        "prev_events": [honest_event_id(&harness, &alice, &room).await],
-        "auth_events": [],
-    }));
+    let message = peer.event(federation_auth::with_auth_events(
+        &harness.store,
+        json!({
+            "type": "m.room.message",
+            "sender": peer.user(),
+            "room_id": room,
+            "content": { "msgtype": "m.text", "body": "still here" },
+            "origin_server_ts": now_millis(),
+            "depth": 11,
+            "prev_events": [honest_event_id(&harness, &alice, &room).await],
+            "auth_events": [],
+        }),
+    ));
     let (status, body) = harness
         .deliver(&peer, "after", vec![message], Vec::new())
         .await;

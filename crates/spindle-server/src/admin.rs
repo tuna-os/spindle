@@ -53,6 +53,14 @@ pub fn routes() -> Router<AppState> {
                 &format!("{prefix}/users/{{user_id}}/reset_password"),
                 post(reset_password),
             )
+            .route(
+                &format!("{prefix}/users/{{user_id}}/password_hash"),
+                post(set_password_hash),
+            )
+            .route(
+                &format!("{prefix}/users/{{user_id}}/reset_link"),
+                post(issue_reset_link),
+            )
             .route(&format!("{prefix}/users/{{user_id}}/devices"), get(devices))
             .route(
                 &format!("{prefix}/users/{{user_id}}/devices/{{device_id}}"),
@@ -705,6 +713,113 @@ async fn reset_password(
         &json!({ "logout_devices": logout }),
     )?;
     Ok(Json(json!({})))
+}
+
+#[derive(Deserialize)]
+struct SetPasswordHash {
+    password_hash: String,
+    /// Off by default, unlike `reset_password`: importing the hash a user
+    /// already signs in with elsewhere changes nothing they know, and
+    /// signing every migrated user out would be the migration's only
+    /// visible effect.
+    #[serde(default)]
+    logout_devices: bool,
+}
+
+/// `POST /users/{userId}/password_hash` (#611)
+///
+/// Store an Argon2 PHC hash computed elsewhere — a Matrix Authentication
+/// Service's `user_passwords.hashed_password`, typically — so its user
+/// signs in here with the password they already have. The hash is
+/// validated (`accounts::validate_password_hash`) and refused with
+/// `M_INVALID_PARAM` when it cannot verify. Works while authentication is
+/// still delegated, which is the point: hashes land before the cutover.
+/// Neither the hash nor any part of it reaches the audit log.
+async fn set_password_hash(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path(user_id): Path<String>,
+    Json(request): Json<SetPasswordHash>,
+) -> Result<Json<Value>, MatrixError> {
+    let (localpart, _) = target_account(&state, &user_id)?;
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    accounts
+        .set_password_hash(&localpart, &request.password_hash)
+        .map_err(|error| match error {
+            crate::accounts::AccountError::InvalidHash(why) => {
+                MatrixError::new(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", why)
+            }
+            other => MatrixError::internal(&other.to_string()),
+        })?;
+    if request.logout_devices {
+        accounts
+            .logout_everywhere(&localpart)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    }
+    let algorithm = request
+        .password_hash
+        .split('$')
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    audit(
+        &state,
+        &actor.identity().user_id,
+        "set_password_hash",
+        &user_id,
+        &json!({ "algorithm": algorithm, "logout_devices": request.logout_devices }),
+    )?;
+    Ok(Json(json!({})))
+}
+
+#[derive(Default, Deserialize)]
+struct ResetLinkRequest {
+    /// How long the link works, as `24h`, `30m`, `2d` or seconds; a day
+    /// when absent, a week at most.
+    ttl: Option<String>,
+}
+
+/// `POST /users/{userId}/reset_link` — a password-reset link for a user
+/// who cannot sign in, issued by an administrator rather than mailed: the
+/// recovery path for a server without SMTP. The URL is in the response
+/// and nowhere else — it is the only time the token exists in clear — and
+/// opens the same page a mailed link does, which signs every device out.
+/// Single-use, expiring, newest-only. The audit log records the issuance
+/// and its lifetime, never the token.
+async fn issue_reset_link(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path(user_id): Path<String>,
+    body: Option<Json<ResetLinkRequest>>,
+) -> Result<Json<Value>, MatrixError> {
+    if state.oidc.is_none() {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_UNRECOGNIZED",
+            "reset links open the built-in provider's pages, and it is not enabled",
+        ));
+    }
+    let (localpart, _) = target_account(&state, &user_id)?;
+    let request = body.map(|Json(request)| request).unwrap_or_default();
+    let ttl_ms = match request.ttl.as_deref() {
+        Some(text) => crate::email::parse_ttl(text)
+            .map_err(|why| MatrixError::new(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", why))?,
+        None => crate::email::DEFAULT_RESET_LINK_TTL_MS,
+    };
+    let (url, expires_at_ms) =
+        crate::email::issue_reset_link(state.store.as_ref(), &state.config, &localpart, ttl_ms)
+            .map_err(|why| MatrixError::new(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", why))?;
+    state.metrics.record_reset_link_issued();
+    audit(
+        &state,
+        &actor.identity().user_id,
+        "issue_reset_link",
+        &user_id,
+        &json!({ "ttl_ms": ttl_ms }),
+    )?;
+    Ok(Json(
+        json!({ "reset_url": url, "expires_at_ms": expires_at_ms }),
+    ))
 }
 
 /// `GET /users/{userId}/devices`

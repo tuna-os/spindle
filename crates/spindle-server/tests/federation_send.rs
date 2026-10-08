@@ -8,6 +8,9 @@
 //! soft-fails alone without poisoning its batch; and a retried
 //! transaction answers what the first delivery answered, exactly once.
 
+#[path = "support/federation_auth.rs"]
+mod federation_auth;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -140,6 +143,7 @@ fn now_millis() -> u64 {
 struct Harness {
     _dir: TempDir,
     app: axum::Router,
+    store: Arc<FjallStore>,
 }
 
 impl Harness {
@@ -151,8 +155,12 @@ impl Harness {
              [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n",
         )
         .unwrap();
-        let app = spindle_server::app(config, store).expect("the app builds");
-        Self { _dir: dir, app }
+        let app = spindle_server::app(config, store.clone()).expect("the app builds");
+        Self {
+            _dir: dir,
+            app,
+            store,
+        }
     }
 
     async fn call(&self, request: Request<Body>) -> (StatusCode, Value) {
@@ -273,31 +281,118 @@ impl Harness {
     }
 }
 
-fn join_event(peer: &Peer, room: &str, prev: &str) -> Value {
-    peer.event(json!({
-        "type": "m.room.member",
-        "state_key": peer.user(),
-        "sender": peer.user(),
-        "room_id": room,
-        "content": { "membership": "join" },
-        "origin_server_ts": now_millis(),
-        "depth": 10,
-        "prev_events": [prev],
-        "auth_events": [],
-    }))
+fn join_event(store: &Arc<FjallStore>, peer: &Peer, room: &str, prev: &str) -> Value {
+    peer.event(federation_auth::with_auth_events(
+        store,
+        json!({
+            "type": "m.room.member",
+            "state_key": peer.user(),
+            "sender": peer.user(),
+            "room_id": room,
+            "content": { "membership": "join" },
+            "origin_server_ts": now_millis(),
+            "depth": 10,
+            "prev_events": [prev],
+            "auth_events": [],
+        }),
+    ))
 }
 
-fn message_event(peer: &Peer, room: &str, prev: &str, text: &str) -> Value {
-    peer.event(json!({
-        "type": "m.room.message",
-        "sender": peer.user(),
-        "room_id": room,
-        "content": { "msgtype": "m.text", "body": text },
-        "origin_server_ts": now_millis(),
-        "depth": 11,
-        "prev_events": [prev],
-        "auth_events": [],
-    }))
+fn message_event(
+    store: &Arc<FjallStore>,
+    peer: &Peer,
+    room: &str,
+    prev: &str,
+    text: &str,
+) -> Value {
+    peer.event(federation_auth::with_auth_events(
+        store,
+        json!({
+            "type": "m.room.message",
+            "sender": peer.user(),
+            "room_id": room,
+            "content": { "msgtype": "m.text", "body": text },
+            "origin_server_ts": now_millis(),
+            "depth": 11,
+            "prev_events": [prev],
+            "auth_events": [],
+        }),
+    ))
+}
+
+#[tokio::test]
+async fn known_invalid_auth_before_a_missing_entry_preserves_valid_descendants() {
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
+    let join = join_event(&harness.store, &peer, &room, &head);
+    let (_, joined) = harness.deliver(&peer, "auth-order-join", vec![join]).await;
+    assert!(
+        joined["pdus"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|v| v == &json!({}))
+    );
+    let head = harness.head_event(&room, &alice).await;
+    let rooms = spindle_server::rooms::Rooms::new(harness.store.clone(), "example.org");
+    let join_rules = rooms
+        .state(&room)
+        .unwrap()
+        .into_iter()
+        .find(|event| event["type"] == "m.room.join_rules")
+        .unwrap();
+    let mut invalid = message_event(&harness.store, &peer, &room, &head, "invalid auth list");
+    let auth = invalid["auth_events"].as_array_mut().unwrap();
+    auth.insert(0, join_rules["event_id"].clone());
+    auth.push(json!("$missing-auth-event"));
+    let invalid = peer.event(invalid);
+    let canonical = serde_json::from_value(invalid.clone()).unwrap();
+    let invalid_id = format!(
+        "${}",
+        ruma::signatures::reference_hash(&canonical, &RoomVersionId::V11.rules().unwrap(),)
+            .unwrap()
+    );
+    let (_, rejected) = harness
+        .deliver(&peer, "auth-order-invalid", vec![invalid])
+        .await;
+    assert!(
+        rejected["pdus"][&invalid_id]["error"]
+            .as_str()
+            .unwrap()
+            .contains("unexpected auth event"),
+        "{rejected}"
+    );
+    let sentinel = message_event(
+        &harness.store,
+        &peer,
+        &room,
+        &invalid_id,
+        "valid descendant",
+    );
+    let (_, accepted) = harness
+        .deliver(&peer, "auth-order-sentinel", vec![sentinel])
+        .await;
+    assert!(
+        accepted["pdus"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|v| v == &json!({})),
+        "{accepted}"
+    );
+    let (_, event) = harness
+        .send(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room}/event/{invalid_id}"),
+            &alice,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(event["errcode"], "M_NOT_FOUND");
+    let last = harness.head_event(&room, &alice).await;
+    assert_ne!(last, invalid_id);
 }
 
 #[tokio::test]
@@ -307,7 +402,7 @@ async fn a_remote_join_and_message_land_and_read_back_over_the_cs_api() {
     let alice = harness.register("alice").await;
     let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
 
-    let join = join_event(&peer, &room, &head);
+    let join = join_event(&harness.store, &peer, &room, &head);
     let (status, body) = harness.deliver(&peer, "t1", vec![join]).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let join_result = body["pdus"].as_object().unwrap();
@@ -328,7 +423,7 @@ async fn a_remote_join_and_message_land_and_read_back_over_the_cs_api() {
 
     // And a message from them reads back like any local event.
     let head = harness.head_event(&room, &alice).await;
-    let message = message_event(&peer, &room, &head, "hello from over there");
+    let message = message_event(&harness.store, &peer, &room, &head, "hello from over there");
     let (status, body) = harness.deliver(&peer, "t2", vec![message]).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
@@ -361,16 +456,16 @@ async fn bad_pdus_soft_fail_alone_and_good_neighbours_still_land() {
     let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
 
     // An unauthorized event: a message from a user who never joined.
-    let uninvited = message_event(&peer, &room, &head, "should not land");
+    let uninvited = message_event(&harness.store, &peer, &room, &head, "should not land");
     // A signature broken after signing.
-    let mut tampered = join_event(&peer, &room, &head);
+    let mut tampered = join_event(&harness.store, &peer, &room, &head);
     tampered["content"]["membership"] = json!("join "); // changes the hash
     // A room this server does not have.
-    let wrong_room = join_event(&peer, "!nowhere:example.org", &head);
+    let wrong_room = join_event(&harness.store, &peer, "!nowhere:example.org", &head);
     // A parent this server has never seen.
-    let orphan = join_event(&peer, &room, "$unknown:elsewhere");
+    let orphan = join_event(&harness.store, &peer, &room, "$unknown:elsewhere");
     // And one good event.
-    let good = join_event(&peer, &room, &head);
+    let good = join_event(&harness.store, &peer, &room, &head);
 
     let (status, body) = harness
         .deliver(
@@ -436,11 +531,15 @@ async fn a_retried_transaction_answers_once_and_applies_once() {
     let alice = harness.register("alice").await;
     let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
     harness
-        .deliver(&peer, "t1", vec![join_event(&peer, &room, &head)])
+        .deliver(
+            &peer,
+            "t1",
+            vec![join_event(&harness.store, &peer, &room, &head)],
+        )
         .await;
 
     let head = harness.head_event(&room, &alice).await;
-    let message = message_event(&peer, &room, &head, "exactly once");
+    let message = message_event(&harness.store, &peer, &room, &head, "exactly once");
     let (_, first) = harness.deliver(&peer, "t2", vec![message.clone()]).await;
     let (_, second) = harness.deliver(&peer, "t2", vec![message]).await;
     assert_eq!(
@@ -474,7 +573,7 @@ async fn the_transaction_signature_binds_method_and_body() {
     let harness = Harness::new();
     let alice = harness.register("alice").await;
     let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
-    let join = join_event(&peer, &room, &head);
+    let join = join_event(&harness.store, &peer, &room, &head);
     let body = json!({ "origin": peer.name, "origin_server_ts": now_millis(), "pdus": [join] });
 
     // Signed over a different body than the one sent: 401 before any PDU
@@ -508,7 +607,7 @@ async fn a_replayed_transaction_answers_from_history_even_when_the_world_changed
     let harness = Harness::new();
     let alice = harness.register("alice").await;
     let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
-    let join = join_event(&peer, &room, &head);
+    let join = join_event(&harness.store, &peer, &room, &head);
     let ruma::CanonicalJsonValue::Object(canonical) =
         ruma::CanonicalJsonValue::try_from(join.clone()).unwrap()
     else {
@@ -520,7 +619,24 @@ async fn a_replayed_transaction_answers_from_history_even_when_the_world_changed
     );
 
     // A message whose parent (the join) has not arrived yet: refused.
-    let early = message_event(&peer, &room, &join_id, "too early");
+    let mut early = message_event(&harness.store, &peer, &room, &join_id, "too early");
+    // Bind to the pending join's state so a fresh retry can succeed once it lands.
+    let rooms = spindle_server::rooms::Rooms::new(harness.store.clone(), "example.org");
+    let mut auth: Vec<_> = join["auth_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|id| {
+            matches!(
+                rooms.pdu(&room, id.as_str().unwrap()).unwrap()["type"].as_str(),
+                Some("m.room.create" | "m.room.power_levels")
+            )
+        })
+        .cloned()
+        .collect();
+    auth.push(json!(join_id));
+    early["auth_events"] = json!(auth);
+    early = peer.event(early);
     let (_, first) = harness.deliver(&peer, "t-early", vec![early.clone()]).await;
     let outcome = first["pdus"].as_object().unwrap().values().next().unwrap();
     assert!(outcome.get("error").is_some(), "{first}");
@@ -534,7 +650,7 @@ async fn a_replayed_transaction_answers_from_history_even_when_the_world_changed
 
     // Replaying the early transaction returns the recorded refusal — not a
     // fresh attempt that would now succeed.
-    let (_, replayed) = harness.deliver(&peer, "t-early", vec![early]).await;
+    let (_, replayed) = harness.deliver(&peer, "t-early", vec![early.clone()]).await;
     assert_eq!(first, replayed, "the recorded outcome stands");
     let (_, messages) = harness
         .call(
@@ -555,6 +671,18 @@ async fn a_replayed_transaction_answers_from_history_even_when_the_world_changed
             .any(|event| event["content"]["body"] == json!("too early")),
         "{messages}"
     );
+    // A new transaction retries against the history that is now available.
+    let (_, retried) = harness.deliver(&peer, "t-after-join", vec![early]).await;
+    assert_eq!(
+        retried["pdus"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap(),
+        &json!({}),
+        "a missing parent must not permanently reject an otherwise valid event: {retried}"
+    );
 }
 
 #[tokio::test]
@@ -563,7 +691,7 @@ async fn the_same_event_in_two_transactions_lands_once_and_upsets_nobody() {
     let harness = Harness::new();
     let alice = harness.register("alice").await;
     let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
-    let join = join_event(&peer, &room, &head);
+    let join = join_event(&harness.store, &peer, &room, &head);
 
     let (_, first) = harness.deliver(&peer, "t1", vec![join.clone()]).await;
     assert_eq!(
@@ -591,11 +719,15 @@ async fn a_message_edited_after_signing_is_refused_by_the_hash_alone() {
     let alice = harness.register("alice").await;
     let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
     harness
-        .deliver(&peer, "t-join", vec![join_event(&peer, &room, &head)])
+        .deliver(
+            &peer,
+            "t-join",
+            vec![join_event(&harness.store, &peer, &room, &head)],
+        )
         .await;
 
     let head = harness.head_event(&room, &alice).await;
-    let mut edited = message_event(&peer, &room, &head, "what was signed");
+    let mut edited = message_event(&harness.store, &peer, &room, &head, "what was signed");
     edited["content"]["body"] = json!("what an attacker wrote");
     let (status, body) = harness.deliver(&peer, "t-msg", vec![edited]).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -652,7 +784,7 @@ async fn a_typing_edu_is_applied_for_the_origins_own_joined_user_only() {
     let harness = Harness::new();
     let alice = harness.register("alice").await;
     let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
-    let join = join_event(&peer, &room, &head);
+    let join = join_event(&harness.store, &peer, &room, &head);
     let (status, _) = harness.deliver(&peer, "t1", vec![join]).await;
     assert_eq!(status, StatusCode::OK);
 

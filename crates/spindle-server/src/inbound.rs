@@ -25,6 +25,14 @@ use crate::accounts::Accounts;
 use crate::errors::MatrixError;
 use crate::routes::{MAX_TXN_ID_LEN, record_invite, room_error};
 
+mod backfill;
+mod gap;
+mod recovery;
+
+pub(crate) use backfill::run as run_backfill;
+pub use backfill::{GapBackfill, Settings as BackfillSettings, Sources as BackfillSources};
+pub use recovery::RecoveryGate;
+
 /// Say that a peer's event was refused, and name what it was refused over.
 ///
 /// Otherwise this is silent. The transaction still answers 200 -- one bad
@@ -57,19 +65,16 @@ pub(crate) fn report_refused_pdu(origin: &str, event_id: &str, pdu: &Value, reas
 /// membership event the origin relays on behalf of a user elsewhere (a join,
 /// knock or leave it brokered), that user's own server -- see
 /// [`relayed_membership_signer`].
-pub(crate) fn receive_one_pdu(
+pub(crate) fn receive_brokered_pdu(
     state: &AppState,
     signer: &str,
     keys: Option<&crate::federation::PeerKeys>,
     pdu: &Value,
-    delivery: Delivery,
 ) -> (String, Result<(), String>) {
     use ruma::CanonicalJsonValue;
 
-    // The same acceptance either way; only who fans the event out differs.
-    let receive = |room_id: &str, event_id: &str, json: &Value| match delivery {
-        Delivery::Transaction => state.rooms.receive_remote(room_id, event_id, json),
-        Delivery::Brokered => state.rooms.receive_brokered(room_id, event_id, json),
+    let receive = |room_id: &str, event_id: &str, json: &Value| {
+        state.rooms.receive_brokered(room_id, event_id, json)
     };
 
     let Ok(CanonicalJsonValue::Object(canonical)) = CanonicalJsonValue::try_from(pdu.clone())
@@ -114,7 +119,16 @@ pub(crate) fn receive_one_pdu(
         // verifies nothing claimed after that moment (#296).
         let enforce =
             spindle_core::rules_of(&version).is_some_and(|rules| rules.enforce_key_validity);
-        let key_map = keys.map_for(pdu["origin_server_ts"].as_u64(), enforce);
+        let mut key_map = keys.map_for(pdu["origin_server_ts"].as_u64(), enforce);
+        // A restricted join can already carry our countersignature, which
+        // its own server's published keys cannot verify.
+        key_map
+            .entry(state.config.server.name.clone())
+            .or_default()
+            .insert(
+                state.key.key_id(),
+                ruma::serde::Base64::new(state.key.pair().public_key().to_vec()),
+            );
         match spindle_core::version::verify(&key_map, &canonical, &version) {
             Ok(ruma::signatures::Verified::All) => {}
             // The signature holds but the content hash does not: someone
@@ -138,7 +152,20 @@ pub(crate) fn receive_one_pdu(
                     Err(error) => (event_id, Err(error.to_string())),
                 };
             }
-            Err(error) => return (event_id, Err(format!("signature: {error}"))),
+            Err(error) => {
+                let error = error.to_string();
+                let reason = crate::federation::Federation::classify_signature_failure(
+                    Some(keys),
+                    Some(signer),
+                    pdu,
+                    &error,
+                );
+                state.metrics.record_signature_failure(reason);
+                return (
+                    event_id,
+                    Err(format!("signature: {}: {error}", reason.label())),
+                );
+            }
         }
     }
 
@@ -220,9 +247,7 @@ async fn receive_pdus(
         }
         let (event_id, outcome) = match &relayed {
             Some(domain) => match relayed_keys.get(domain).and_then(Option::as_ref) {
-                Some(keys) => {
-                    receive_one_pdu(state, domain, Some(keys), pdu, Delivery::Transaction)
-                }
+                Some(keys) => recovery::receive(state, origin, domain, Some(keys), pdu).await,
                 None => (
                     "$unverifiable".to_owned(),
                     Err(format!(
@@ -230,7 +255,7 @@ async fn receive_pdus(
                     )),
                 ),
             },
-            None => receive_one_pdu(state, origin, key_map, pdu, Delivery::Transaction),
+            None => recovery::receive(state, origin, origin, key_map, pdu).await,
         };
         let result = match outcome {
             Ok(()) => json!({}),
@@ -265,20 +290,6 @@ fn relayed_membership_signer(origin: &str, pdu: &Value) -> Option<String> {
     }
     let (_, domain) = sender.split_once(':')?;
     (domain != origin).then(|| domain.to_owned())
-}
-
-/// How a PDU reached this server, which decides who fans it out.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Delivery {
-    /// In a `/send` transaction from a server in the room: the origin fans
-    /// its own events out, and forwarding it again would deliver everything
-    /// twice.
-    Transaction,
-    /// Handed back through a `send_join`/`send_knock`/`send_leave`
-    /// handshake by a server that is not in the room and cannot reach the
-    /// servers that are, so this one does it for them
-    /// (`Rooms::receive_brokered`).
-    Brokered,
 }
 
 /// Finish a membership template: stamp a timestamp if the resident server
@@ -501,7 +512,20 @@ pub(crate) async fn send_transaction(
         })?)
     };
 
-    let results = receive_pdus(&state, &origin, key_map.as_ref(), &pdus).await;
+    // Off the async workers: ingesting a backlog into a large room is
+    // seconds of synchronous work per PDU -- cold loads, state resolution
+    // -- and #614's liveness failures were four of these at once holding
+    // all four workers while `/health` waited to be polled.
+    let results = {
+        let state = state.clone();
+        let origin = origin.clone();
+        crate::blocking::offload_async(
+            std::sync::Arc::clone(&state.metrics),
+            crate::metrics::BlockingTask::FederationSend,
+            move || async move { receive_pdus(&state, &origin, key_map.as_ref(), &pdus).await },
+        )
+        .await?
+    };
 
     // EDUs after PDUs, so a join and the typing that follows it land in
     // order within one transaction. `m.typing` only, and only about the
@@ -905,8 +929,7 @@ pub(crate) async fn send_knock(
             "the origin's keys cannot be verified".to_owned(),
         )
     })?;
-    let (computed_id, outcome) =
-        receive_one_pdu(&state, &origin, Some(&key_map), &knock, Delivery::Brokered);
+    let (computed_id, outcome) = receive_brokered_pdu(&state, &origin, Some(&key_map), &knock);
     if computed_id != event_id {
         return Err(MatrixError::bad_json(format!(
             "the event hashes to {computed_id}, not {event_id}"
@@ -1219,8 +1242,7 @@ pub(crate) async fn send_leave_common(
             "the origin's keys cannot be verified".to_owned(),
         )
     })?;
-    let (computed_id, outcome) =
-        receive_one_pdu(&state, &origin, Some(&key_map), &leave, Delivery::Brokered);
+    let (computed_id, outcome) = receive_brokered_pdu(&state, &origin, Some(&key_map), &leave);
     if computed_id != event_id {
         return Err(MatrixError::bad_json(format!(
             "the event hashes to {computed_id}, not {event_id}"
@@ -1301,8 +1323,7 @@ pub(crate) async fn send_join_common(
         // -- a nomination this server did not make is not one it endorses.
         _ => join,
     };
-    let (computed_id, outcome) =
-        receive_one_pdu(&state, &origin, Some(&key_map), &join, Delivery::Brokered);
+    let (computed_id, outcome) = receive_brokered_pdu(&state, &origin, Some(&key_map), &join);
     // The path names the event the peer computed; disagreement means one
     // side hashed a different event than the other signed.
     if computed_id != event_id {

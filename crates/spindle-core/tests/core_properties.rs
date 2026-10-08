@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use spindle_core::{
-    AppendError, EventId, EventInput, ForkWindowError, RoomLog, SetAside, StateKey, StateSnapshot,
+    AppendError, EventId, EventInput, ForkWindowError, RoomLog, Sideline, StateKey, StateResolver,
+    StateSnapshot,
 };
 
 #[test]
@@ -43,20 +44,60 @@ fn conflicting_state_fork_requires_the_matrix_resolver() {
     ));
 }
 
-/// A fork on disjoint slots merges even when both slots already had a value.
+/// A resolver for the log's own tests: counts its calls and answers with
+/// the union of the states, later ones winning. Not any room version's
+/// algorithm -- the core does not know one -- which is the point: these
+/// tests are about *when* the log asks and what it does with the answer.
+#[derive(Default)]
+struct Recording {
+    calls: usize,
+}
+
+impl StateResolver for Recording {
+    fn resolve(&mut self, states: &[StateSnapshot]) -> Result<StateSnapshot, AppendError> {
+        self.calls += 1;
+        let mut out = states.first().cloned().unwrap_or_default();
+        for other in states.iter().skip(1) {
+            for (key, _, theirs) in out.clone().diff(other) {
+                if let Some(theirs) = theirs {
+                    out = out.apply(key.clone(), theirs);
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn no_store(_: &spindle_core::StateRoot) -> Option<Vec<u8>> {
+    panic!("the state of a recent event is resident")
+}
+
+/// Append through the server's path: resolve the parents, then append.
+fn append_resolved(
+    room: &mut RoomLog,
+    resolver: &mut Recording,
+    input: EventInput,
+) -> Result<(), AppendError> {
+    let before = room.resolve_parents(&input.prev_events, resolver, &mut no_store)?;
+    room.append_resolved(input, before)?;
+    if room.forward_extremities().len() > 1 {
+        let current = room.resolve_current(resolver, &mut no_store)?;
+        room.set_current(current);
+    }
+    Ok(())
+}
+
+/// Parents that disagree on any slot are the resolver's, whether or not
+/// the slot held a value at the fork.
 ///
-/// The regression behind #225. A parent's snapshot describes all of that
-/// branch's state, not the part it changed, so for a key one branch wrote and
-/// the other left alone the two parents disagree on paper — one carries the
-/// new event, the other the value both inherited. Reading that as a conflict
-/// refused a merge with an empty conflicted set, and since every later local
-/// append names all forward extremities, refused it permanently.
-///
-/// The distinction lives entirely in whether the slots held a value at the
-/// fork point, so both arrangements are asserted here together; testing only
-/// the unset one is what let the bug stand.
+/// SPEC 9.2 used to merge a fork whose branches moved different slots
+/// without asking (#225), on the claim that it equals state resolution.
+/// It does not in general -- a branch that banned the sender of the other
+/// branch's write, or clocks that order two writes against their causal
+/// order, both change the answer (ADR 0005) -- so the log no longer
+/// decides: the strict form refuses, and a resolver is asked.
 #[test]
-fn a_disjoint_fork_merges_whether_or_not_the_slots_were_already_set() {
+fn a_disjoint_fork_is_the_resolvers_whether_or_not_the_slots_were_already_set() {
     for preset in [false, true] {
         let mut room = RoomLog::new();
         room.append_local("$create", Some(StateKey::new("m.room.create", "")))
@@ -78,18 +119,26 @@ fn a_disjoint_fork_merges_whether_or_not_the_slots_were_already_set() {
         .unwrap();
         assert_eq!(room.forward_extremities().len(), 2);
 
-        room.append_local("$merge", None)
-            .unwrap_or_else(|error| panic!("preset={preset}: {error:?}"));
-
-        // Both branches' writes survive. Taking either parent wholesale keeps
-        // one and drops the other, which is the mistake a merge that merely
-        // stopped erroring would make.
-        let state = room.state_after_event(&EventId::new("$merge")).unwrap();
-        assert_eq!(
-            state.get(&StateKey::new("m.room.topic", "")),
-            Some("$topic-ours"),
-            "preset={preset}"
+        assert!(
+            matches!(
+                room.clone().append_local("$merge", None),
+                Err(AppendError::NeedsStateResolution { .. })
+            ),
+            "preset={preset}: the strict form must not merge differing states"
         );
+
+        let mut resolver = Recording::default();
+        let prev: Vec<EventId> = room.authoring_extremities().cloned().collect();
+        let tips: Vec<StateSnapshot> = prev
+            .iter()
+            .map(|tip| room.state_after_event(tip).unwrap().clone())
+            .collect();
+        append_resolved(&mut room, &mut resolver, EventInput::new("$merge", prev)).unwrap();
+        assert!(resolver.calls >= 1, "preset={preset}");
+        // Whatever the resolver said is the merge's state, exactly.
+        let expected = Recording::default().resolve(&tips).unwrap();
+        let state = room.state_after_event(&EventId::new("$merge")).unwrap();
+        assert_eq!(state.root(), expected.root(), "preset={preset}");
         assert_eq!(
             state.get(&StateKey::new("m.room.name", "")),
             Some("$name-theirs"),
@@ -98,17 +147,34 @@ fn a_disjoint_fork_merges_whether_or_not_the_slots_were_already_set() {
     }
 }
 
-/// The state before an event is the fold of its parents, not the state
-/// after whichever entry happens to precede it in linear order.
-///
-/// The two are the same thing in a linear room, which is how the
-/// federation `/state_ids` read got away with the second for as long as it
-/// did. After a fork they part: the entry before the merge event belongs
-/// to one branch, and its state has that branch's write and not the
-/// other's, while the merge event was authorized against both. Asked at
-/// the merge event, a peer was told a state this server never held there.
+/// Parents holding the same state are never resolved: the one case the
+/// old fork merge provably shares with every room version's algorithm.
 #[test]
-fn the_state_before_a_merge_event_is_the_fold_of_both_branches() {
+fn parents_that_agree_cost_no_resolution() {
+    let mut room = RoomLog::new();
+    room.append_local("$create", Some(StateKey::new("m.room.create", "")))
+        .unwrap();
+    let base = room.forward_extremities().iter().next().unwrap().clone();
+    room.append_local("$ours", None).unwrap();
+    room.append_remote(EventInput::new("$theirs", vec![base]))
+        .unwrap();
+    assert_eq!(room.forward_extremities().len(), 2);
+
+    let mut resolver = Recording::default();
+    let prev: Vec<EventId> = room.authoring_extremities().cloned().collect();
+    append_resolved(&mut room, &mut resolver, EventInput::new("$merge", prev)).unwrap();
+    assert_eq!(resolver.calls, 0, "two messages on one state need nothing");
+    assert_eq!(room.forward_extremities().len(), 1);
+}
+
+/// The state before an event is its parents' states resolved, not the
+/// state after whichever entry happens to precede it in linear order.
+///
+/// The two are the same thing in a linear room. After a fork they part:
+/// the entry before the merge event belongs to one branch, while the merge
+/// event was authorized against the resolution of both.
+#[test]
+fn the_state_before_a_merge_event_is_the_resolution_of_both_branches() {
     let mut room = RoomLog::new();
     room.append_local("$create", Some(StateKey::new("m.room.create", "")))
         .unwrap();
@@ -120,15 +186,12 @@ fn the_state_before_a_merge_event_is_the_fold_of_both_branches() {
             .with_state_key(StateKey::new("m.room.name", "")),
     )
     .unwrap();
-    room.append_local("$merge", None).unwrap();
+    let mut resolver = Recording::default();
+    let prev: Vec<EventId> = room.authoring_extremities().cloned().collect();
+    append_resolved(&mut room, &mut resolver, EventInput::new("$merge", prev)).unwrap();
 
-    // Nothing is evicted in a room this small, so the loader must never be
-    // asked; a snapshot rehydrated here would be one the window still held.
-    let mut load = |_: &spindle_core::StateRoot| -> Option<Vec<u8>> {
-        panic!("the state before a recent event is resident")
-    };
     let before = room
-        .state_before(&EventId::new("$merge"), &mut load)
+        .state_before(&EventId::new("$merge"), &mut resolver, &mut no_store)
         .unwrap();
     assert_eq!(
         before.get(&StateKey::new("m.room.topic", "")),
@@ -148,32 +211,30 @@ fn the_state_before_a_merge_event_is_the_fold_of_both_branches() {
         "a message changes nothing, so before and after it agree"
     );
 
-    // In the linear stretch the fold is the one parent: the state before
-    // the topic write is the base, without the topic.
+    // In the linear stretch the state before is the one parent's.
+    let calls = resolver.calls;
     let before = room
-        .state_before(&EventId::new("$topic-ours"), &mut load)
+        .state_before(&EventId::new("$topic-ours"), &mut resolver, &mut no_store)
         .unwrap();
+    assert_eq!(resolver.calls, calls, "one parent is never resolved");
     assert_eq!(before.get(&StateKey::new("m.room.topic", "")), None);
     assert_eq!(before.root(), room.state_after_event(&base).unwrap().root());
 
     // And before the create event there is no state at all.
     let before = room
-        .state_before(&EventId::new("$create"), &mut load)
+        .state_before(&EventId::new("$create"), &mut resolver, &mut no_store)
         .unwrap();
     assert!(before.is_empty());
 
     assert_eq!(
-        room.state_before(&EventId::new("$nowhere"), &mut load)
+        room.state_before(&EventId::new("$nowhere"), &mut resolver, &mut no_store)
             .unwrap_err(),
         AppendError::UnknownPredecessor(EventId::new("$nowhere"))
     );
 }
 
-/// The same slot on both branches stays case 3, preset or not.
-///
-/// The counterpart to the test above, and the reason the fix is a rule about
-/// the *base* rather than a loosening: a key both branches moved away from
-/// what they inherited is a real conflict and must still reach the resolver.
+/// The same slot on both branches is refused by the strict form, preset
+/// or not.
 #[test]
 fn a_same_slot_fork_still_needs_the_resolver_when_the_slot_was_already_set() {
     let mut room = RoomLog::new();
@@ -196,132 +257,156 @@ fn a_same_slot_fork_still_needs_the_resolver_when_the_slot_was_already_set() {
     ));
 }
 
-/// A contested fork is stepped around, not tripped over: the room keeps
-/// taking local appends on its linear head (#225).
-///
-/// What is set aside is the tip that claims the contested key other than
-/// the head, the head being the entry the linear order puts last, whichever
-/// branch it belongs to. The tip set aside stays a forward extremity -- the
-/// resolver will want it -- but no local append names it, and a second call
-/// finds nothing left to set aside, which is what keeps one open fork from
-/// being counted on every send.
+/// The room's current state is the one extremity's state, or -- with a
+/// fork open -- the resolution recorded for the extremities, never simply
+/// the newest entry's.
 #[test]
-fn a_contested_fork_is_set_aside_and_local_appends_continue_on_the_head() {
+fn the_current_state_is_the_resolution_of_the_forward_extremities() {
     let topic = StateKey::new("m.room.topic", "");
     let mut room = RoomLog::new();
     room.append_local("$create", Some(StateKey::new("m.room.create", "")))
         .unwrap();
-    room.append_local("$topic0", Some(topic.clone())).unwrap();
     let base = room.forward_extremities().iter().next().unwrap().clone();
-
     room.append_local("$topic-ours", Some(topic.clone()))
         .unwrap();
-    // Theirs lands last, so it is the linear head.
-    room.append_remote(EventInput::new("$topic-theirs", vec![base]).with_state_key(topic.clone()))
-        .unwrap();
-    assert!(matches!(
-        room.append_local("$merge", None),
-        Err(AppendError::NeedsStateResolution { .. })
-    ));
-
-    let set_aside = room.set_aside_contested().unwrap();
+    assert!(room.current_is_settled());
     assert_eq!(
-        set_aside,
-        vec![SetAside {
-            extremity: EventId::new("$topic-ours"),
-            key: topic.clone(),
-        }]
-    );
-    assert!(
-        room.set_aside_contested().unwrap().is_empty(),
-        "one fork is set aside once"
+        room.current_state().unwrap().get(&topic),
+        Some("$topic-ours")
     );
 
-    let merge = room.append_local("$merge", None).unwrap();
-    assert_eq!(merge.prev_events, vec![EventId::new("$topic-theirs")]);
-    let state = room.state_after_event(&EventId::new("$merge")).unwrap();
-    assert_eq!(state.get(&topic), Some("$topic-theirs"));
-
-    // Still a tip of the DAG, still resident, just not authored on.
-    let ours = EventId::new("$topic-ours");
-    assert!(room.forward_extremities().contains(&ours));
-    assert!(room.set_aside_extremities().contains(&ours));
-    assert!(room.state_after_event(&ours).is_some());
-    assert_eq!(room.authoring_extremities().count(), 1);
-}
-
-/// A three-way fork loses only the branch that disagrees.
-///
-/// A tip that merely inherited the contested key made no claim on it, and
-/// setting it aside would drop a branch that would have merged for free.
-#[test]
-fn set_aside_keeps_a_tip_that_only_inherited_the_contested_key() {
-    let topic = StateKey::new("m.room.topic", "");
-    let mut room = RoomLog::new();
-    room.append_local("$create", Some(StateKey::new("m.room.create", "")))
-        .unwrap();
-    room.append_local("$topic0", Some(topic.clone())).unwrap();
-    let base = room.forward_extremities().iter().next().unwrap().clone();
-
-    room.append_remote(EventInput::new("$message", vec![base.clone()]))
-        .unwrap();
-    room.append_remote(
-        EventInput::new("$topic-a", vec![base.clone()]).with_state_key(topic.clone()),
+    let mut resolver = Recording::default();
+    append_resolved(
+        &mut room,
+        &mut resolver,
+        EventInput::new("$name-theirs", vec![base])
+            .with_state_key(StateKey::new("m.room.name", "")),
     )
     .unwrap();
-    room.append_remote(EventInput::new("$topic-b", vec![base]).with_state_key(topic.clone()))
-        .unwrap();
-    assert_eq!(room.forward_extremities().len(), 3);
-
-    let set_aside = room.set_aside_contested().unwrap();
-    assert_eq!(set_aside.len(), 1, "{set_aside:?}");
-    assert_eq!(set_aside[0].extremity, EventId::new("$topic-a"));
-
-    let merge = room.append_local("$merge", None).unwrap();
-    assert_eq!(merge.prev_events.len(), 2, "{:?}", merge.prev_events);
-    assert!(merge.prev_events.contains(&EventId::new("$message")));
-    assert!(merge.prev_events.contains(&EventId::new("$topic-b")));
-    let state = room.state_after_event(&EventId::new("$merge")).unwrap();
-    assert_eq!(state.get(&topic), Some("$topic-b"));
+    assert_eq!(room.forward_extremities().len(), 2);
+    assert!(room.current_is_settled());
+    let current = room.current_state().unwrap();
+    assert_eq!(
+        current.get(&topic),
+        Some("$topic-ours"),
+        "the newest entry is their branch, which never set a topic"
+    );
+    assert_eq!(
+        current.get(&StateKey::new("m.room.name", "")),
+        Some("$name-theirs")
+    );
 }
 
-/// Whatever builds on a set-aside tip is a fresh tip, judged afresh.
-///
-/// The set-aside mark is about a tip, not a branch. A peer that extends the
-/// branch this server stepped around produces a new extremity, which the
-/// next local append considers on its own merits -- and, since it still
-/// contests the key, sets aside in turn. That second decision is a second
-/// fork for the counter, which is right: the peer produced a second tip
-/// this server cannot fold.
+/// A rejected event is held for the DAG and changes nothing: no state, no
+/// extremity, no place in the timeline. A child that names it sits on the
+/// state before it.
 #[test]
-fn a_tip_built_on_a_set_aside_tip_is_judged_afresh() {
+fn a_rejected_event_changes_no_state_and_no_extremity() {
     let topic = StateKey::new("m.room.topic", "");
     let mut room = RoomLog::new();
     room.append_local("$create", Some(StateKey::new("m.room.create", "")))
         .unwrap();
-    room.append_local("$topic0", Some(topic.clone())).unwrap();
-    let base = room.forward_extremities().iter().next().unwrap().clone();
-    room.append_local("$topic-ours", Some(topic.clone()))
+    let head = room.forward_extremities().iter().next().unwrap().clone();
+    let before = room
+        .resolve_parents(
+            std::slice::from_ref(&head),
+            &mut Recording::default(),
+            &mut no_store,
+        )
         .unwrap();
-    room.append_remote(EventInput::new("$topic-theirs", vec![base]).with_state_key(topic.clone()))
-        .unwrap();
-    assert_eq!(room.set_aside_contested().unwrap().len(), 1);
-    room.append_local("$merge", None).unwrap();
+    room.sideline(
+        EventInput::new("$bad", vec![head.clone()]).with_state_key(topic.clone()),
+        before.clone(),
+        Sideline::Rejected,
+    )
+    .unwrap();
 
-    room.append_remote(EventInput::new("$more", vec![EventId::new("$topic-ours")]))
-        .unwrap();
+    assert!(room.holds(&EventId::new("$bad")));
     assert!(
-        room.set_aside_extremities().is_empty(),
-        "the tip built on is no tip, and no longer set aside"
+        room.get(&EventId::new("$bad")).is_none(),
+        "not in the timeline"
     );
-    assert_eq!(room.authoring_extremities().count(), 2);
+    assert_eq!(room.len(), 1);
+    assert_eq!(
+        room.forward_extremities().iter().collect::<Vec<_>>(),
+        vec![&head]
+    );
+    let after = room
+        .state_after_any(&EventId::new("$bad"), &mut no_store)
+        .unwrap();
+    assert_eq!(
+        after.root(),
+        before.root(),
+        "a rejected event moves no state"
+    );
 
-    let set_aside = room.set_aside_contested().unwrap();
-    assert_eq!(set_aside.len(), 1, "{set_aside:?}");
-    // `$more` is the linear head now, so it is `$merge` that steps aside.
-    assert_eq!(set_aside[0].extremity, EventId::new("$merge"));
-    let next = room.append_local("$next", None).unwrap();
-    assert_eq!(next.prev_events, vec![EventId::new("$more")]);
+    // A child naming it sits on the state before it.
+    let mut resolver = Recording::default();
+    append_resolved(
+        &mut room,
+        &mut resolver,
+        EventInput::new("$child", vec![EventId::new("$bad")]),
+    )
+    .unwrap();
+    assert_eq!(
+        room.state_after_event(&EventId::new("$child"))
+            .unwrap()
+            .get(&topic),
+        None
+    );
+    // The child is a new tip; the rejected event never was one, so the
+    // create event stays a tip beside it.
+    assert_eq!(room.forward_extremities().len(), 2);
+}
+
+/// A soft-failed event is kept from the timeline and the extremities, but
+/// its state is real: a child that names it inherits its write.
+#[test]
+fn a_soft_failed_event_keeps_its_state_for_its_children() {
+    let topic = StateKey::new("m.room.topic", "");
+    let mut room = RoomLog::new();
+    room.append_local("$create", Some(StateKey::new("m.room.create", "")))
+        .unwrap();
+    let head = room.forward_extremities().iter().next().unwrap().clone();
+    let before = room
+        .resolve_parents(
+            std::slice::from_ref(&head),
+            &mut Recording::default(),
+            &mut no_store,
+        )
+        .unwrap();
+    let sidelined = room
+        .sideline(
+            EventInput::new("$soft", vec![head.clone()]).with_state_key(topic.clone()),
+            before,
+            Sideline::SoftFailed,
+        )
+        .unwrap()
+        .clone();
+    assert_eq!(sidelined.kind, Sideline::SoftFailed);
+    assert_eq!(
+        room.forward_extremities().iter().collect::<Vec<_>>(),
+        vec![&head]
+    );
+    assert_eq!(
+        room.current_state().unwrap().get(&topic),
+        None,
+        "the room's current state does not take a soft-failed write"
+    );
+
+    let mut resolver = Recording::default();
+    append_resolved(
+        &mut room,
+        &mut resolver,
+        EventInput::new("$child", vec![EventId::new("$soft")]),
+    )
+    .unwrap();
+    assert_eq!(
+        room.state_after_event(&EventId::new("$child"))
+            .unwrap()
+            .get(&topic),
+        Some("$soft")
+    );
 }
 
 #[test]

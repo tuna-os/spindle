@@ -1,9 +1,9 @@
 //! The delivery loops do not own what they read (#292).
 //!
-//! `spindle_server::app` spawns four loops that run for the life of the
+//! `spindle_server::app` spawns five loops that run for the life of the
 //! process: delayed-event firing, the federation outbox drain, the
-//! appservice push and push-gateway delivery. A runtime tears its tasks down
-//! as it shuts down, and a task dropped that way is the wrong place for the store to close: fjall's
+//! appservice push, push-gateway delivery and the federation gap
+//! backfill. A runtime tears its tasks down as it shuts down, and a task dropped that way is the wrong place for the store to close: fjall's
 //! close joins its worker threads, and #292 caught it waiting forever there,
 //! in a test whose assertions had all passed. So the loops hold their
 //! sources weakly: the store closes where its last owner -- the router --
@@ -27,7 +27,7 @@ use spindle_store::{FjallStore, Store};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-/// A router with all four loops running and its peers on loopback. The
+/// A router with all five loops running and its peers on loopback. The
 /// appservice push only starts for a registration with a URL, so one is
 /// supplied; the federation and push settings let the outbox and the
 /// push loop reach a loopback stub.
@@ -119,12 +119,12 @@ async fn dropping_the_router_closes_the_store_and_ends_every_loop() {
     // Nothing listens on port 9, and nothing is ever queued for it.
     let app = app_with_every_loop(&dir, store, "http://127.0.0.1:9");
     let tasks = tokio::runtime::Handle::current().metrics();
-    assert_eq!(tasks.num_alive_tasks(), 4, "the four delivery loops");
+    assert_eq!(tasks.num_alive_tasks(), 5, "the five delivery loops");
 
     // Every loop has taken at least one pass with the router alive, which
     // is where a loop that upgraded once and kept the result would show.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
-    assert_eq!(tasks.num_alive_tasks(), 4, "the loops outlive a pass");
+    assert_eq!(tasks.num_alive_tasks(), 5, "the loops outlive a pass");
 
     drop(app);
     assert!(

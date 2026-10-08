@@ -10,13 +10,12 @@ and the diff is the work the release brought.
 
 ## Client-Server API
 
-134 of 166 operations served.
+135 of 166 operations served.
 
 ### Not served, in the spec since before v1.1
 
 8 of these are deprecated upstream and can stay unserved.
 
-- `GET /_matrix/client/v3/account/3pid` — `administrative_contact.yaml`
 - `POST /_matrix/client/v3/account/3pid` *(deprecated)* — `administrative_contact.yaml`
 - `POST /_matrix/client/v3/account/3pid/add` — `administrative_contact.yaml`
 - `POST /_matrix/client/v3/account/3pid/bind` — `administrative_contact.yaml`
@@ -72,7 +71,7 @@ and the diff is the work the release brought.
 
 ## Served beyond the spec at this pin
 
-91 routes the pinned spec does not define: MSC surfaces under
+109 routes the pinned spec does not define: MSC surfaces under
 `unstable/`, the admin and MAS-compatibility APIs, and stable spellings
 newer than the pin. Each MSC route must be accounted for in
 `contrib/msc/ledger.toml`; `scripts/msc-ledger.py --check` enforces that.
@@ -114,6 +113,8 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_spindle/admin/v1/users/{}/devices`
 - `/_spindle/admin/v1/users/{}/devices/{}`
 - `/_spindle/admin/v1/users/{}/joined_rooms`
+- `/_spindle/admin/v1/users/{}/password_hash`
+- `/_spindle/admin/v1/users/{}/reset_link`
 - `/_spindle/admin/v1/users/{}/reset_password`
 - `/_spindle/admin/v1/whois/{}`
 - `/_spindle/rtc/livekit/sfu/get`
@@ -143,6 +144,8 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_synapse/admin/v1/users/{}/devices`
 - `/_synapse/admin/v1/users/{}/devices/{}`
 - `/_synapse/admin/v1/users/{}/joined_rooms`
+- `/_synapse/admin/v1/users/{}/password_hash`
+- `/_synapse/admin/v1/users/{}/reset_link`
 - `/_synapse/admin/v1/users/{}/reset_password`
 - `/_synapse/admin/v1/whois/{}`
 - `/_synapse/admin/v2/users`
@@ -162,6 +165,20 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_synapse/mas/unset_displayname`
 - `/_synapse/mas/update_device_display_name`
 - `/_synapse/mas/upsert_device`
+- `/account`
+- `/account/deactivate`
+- `/account/emails/add`
+- `/account/emails/remove`
+- `/account/emails/verify`
+- `/account/login`
+- `/account/logout`
+- `/account/password`
+- `/account/password/forgot`
+- `/account/password/reset`
+- `/account/profile`
+- `/account/recover`
+- `/account/recovery/generate`
+- `/account/sessions/end`
 - `/health`
 - `/oauth2/authorize`
 - `/oauth2/registration`

@@ -23,7 +23,10 @@ use ruma::room_version_rules::RoomVersionRules;
 use ruma::signatures::Ed25519KeyPair;
 use ruma::{CanonicalJsonObject, CanonicalJsonValue, RoomVersionId};
 use serde_json::{Map, Value};
-use spindle_core::{EventId, EventInput, LogEntry, Pdu, RoomLog, StateKey, is_state_dag};
+use spindle_core::{
+    AppendError, EventId, EventInput, LogEntry, Pdu, RoomLog, Sideline, StateKey, StateResolver,
+    StateRoot, StateSnapshot, is_state_dag,
+};
 use spindle_store::{Durability, FjallStore, RoomStore, StoreError};
 
 /// Native rooms are v11 (SPEC §11.6).
@@ -140,7 +143,9 @@ pub struct Hero {
 type Destinations = ([u8; 32], Arc<Vec<String>>);
 
 mod admin;
+mod erasure;
 mod federation;
+mod gaps;
 mod read;
 mod synapse_positions;
 mod unread;
@@ -152,6 +157,8 @@ pub use synapse_positions::SynapseGap;
 pub use unread::{Receipt, Scored, Unread, Unscored};
 use unread::{ScoreTally, UnreadIndex};
 
+pub use gaps::{GapChunk, GapChunkOutcome, GapProgress};
+
 pub struct Rooms {
     store: Arc<FjallStore>,
     server_name: String,
@@ -159,6 +166,11 @@ pub struct Rooms {
     /// server's one registry, shared with everything else that records.
     metrics: Arc<crate::metrics::Metrics>,
     open: RwLock<HashMap<String, Arc<RwLock<RoomLog>>>>,
+    /// Cold loads in flight, one per room: every other caller for a room
+    /// being loaded waits for that load rather than starting its own
+    /// ([`Self::room_or_load`]). Taken on its own, briefly, and never held
+    /// across a load.
+    loading: Mutex<HashMap<String, Arc<ColdLoad>>>,
     /// Lock order: `open` before `unread_index`, always. The fast path takes
     /// only `unread_index`; the build and append paths already hold `open`.
     unread_index: Mutex<HashMap<String, UnreadIndex>>,
@@ -246,6 +258,13 @@ pub struct Rooms {
     /// paths while warm; a room not in the map is recomputed on demand.
     /// Rooms of stock versions never appear here.
     state_heads: Mutex<HashMap<String, BTreeSet<String>>>,
+    /// Each room's auth DAG, built as state resolution needs it and kept
+    /// while the server runs (`state_res::AuthGraph`). A state event's auth
+    /// edges are part of its signed body, so nothing here goes stale.
+    auth_graphs: Mutex<HashMap<String, Arc<Mutex<crate::state_res::AuthGraph>>>>,
+    /// Resolutions already computed, keyed by the roots of the states they
+    /// resolved (`state_res::ResolutionCache`).
+    resolutions: crate::state_res::ResolutionCache,
     /// The server-global order `/sync` needs (SPEC §10.2). The linear index
     /// orders events within one room; nothing orders them across rooms, so
     /// this is the one counter that exists purely because a per-room order is
@@ -450,6 +469,7 @@ impl Rooms {
             server_name: server_name.into(),
             metrics,
             open: RwLock::new(HashMap::new()),
+            loading: Mutex::new(HashMap::new()),
             unread_index: Mutex::new(HashMap::new()),
             highlights: Mutex::new(HashMap::new()),
             last_activity: Mutex::new(HashMap::new()),
@@ -459,6 +479,8 @@ impl Rooms {
             destinations: Mutex::new(HashMap::new()),
             room_versions: Mutex::new(HashMap::new()),
             state_heads: Mutex::new(HashMap::new()),
+            auth_graphs: Mutex::new(HashMap::new()),
+            resolutions: crate::state_res::ResolutionCache::default(),
             // Resumed, not reset. A counter that restarted at zero would
             // re-issue stream ids already on disk, overwriting the entries
             // they point at -- the same shape of bug as a room registry that
@@ -470,6 +492,493 @@ impl Rooms {
             )),
             appended: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Persist one fully validated Synapse replay.
+    ///
+    /// Validation and state comparison happen in `import::persist_rehearsal`
+    /// before this method writes anything. This method deliberately skips
+    /// authorization and federation fan-out: Synapse already accepted these
+    /// signed historical events, and replaying a migration must not resend
+    /// them to remote homeservers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the target room is not empty, an event body is
+    /// missing, replay append fails, or storage cannot be written.
+    #[cfg(feature = "synapse-import")]
+    pub(crate) fn persist_synapse_plan(
+        &self,
+        plan: &crate::import::Plan,
+        state_after_root: Option<&crate::import::StateMap>,
+        bodies: &std::collections::BTreeMap<String, Value>,
+    ) -> Result<(), RoomError> {
+        /// The rehearsal path: bodies in memory, no source state.
+        struct Bodies<'a>(&'a std::collections::BTreeMap<String, Value>);
+        impl crate::import::SourceState for Bodies<'_> {
+            fn state_after(&mut self, event_id: &str) -> Result<crate::import::StateMap, String> {
+                Err(format!(
+                    "the rehearsal path has no source state for {event_id}"
+                ))
+            }
+        }
+        impl crate::import::SynapseSource for Bodies<'_> {
+            fn body(&mut self, event_id: &str) -> Option<Value> {
+                self.0.get(event_id).cloned()
+            }
+        }
+
+        if RoomStore::new(self.store.as_ref(), &plan.room_id)
+            .load()?
+            .is_some()
+        {
+            return Err(RoomError::Append(
+                "the rehearsal target room is not empty".to_owned(),
+            ));
+        }
+        let mut source = Bodies(bodies);
+        self.persist_synapse_steps(&plan.room_id, &plan.steps, state_after_root, &mut source)?;
+        let redactions =
+            crate::import::redactions_in(&plan.steps, &|event_id| bodies.get(event_id));
+        self.finish_synapse_room(&plan.room_id, &redactions)?;
+        Ok(())
+    }
+
+    /// Append a run of planned Synapse events to a room, resuming where an
+    /// earlier run stopped.
+    ///
+    /// The import calls this once per chunk of the plan, so the bodies of a
+    /// room with a million events never have to be in memory together. Each
+    /// event lands in one batch with its body and indexes, so after a crash
+    /// an event is either wholly present or absent. A step whose event the
+    /// log already holds is skipped, which makes a repeated call a no-op and
+    /// an interrupted import resumable without a purge.
+    ///
+    /// A step marked `gap`, and a step the log refuses because it would need
+    /// the Matrix state resolver or a parent's state it does not hold, is
+    /// appended with the state Synapse resolved for it (`source`), the way a
+    /// room joined over federation is seeded. The state such a seed names
+    /// can include events outside the timeline (Synapse holds them as
+    /// outliers); their bodies are stored too, because a state lookup would
+    /// otherwise find a slot whose event the room does not have.
+    ///
+    /// Returns how many events this call appended, and the events that took
+    /// Synapse's state with the reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if a body is missing, the log refuses an event
+    /// for any other reason, or storage cannot be written.
+    #[cfg(feature = "synapse-import")]
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn persist_synapse_steps(
+        &self,
+        room_id: &str,
+        steps: &[crate::import::Step],
+        state_after_root: Option<&crate::import::StateMap>,
+        source: &mut dyn crate::import::SynapseSource,
+    ) -> Result<(usize, Vec<(String, String)>), RoomError> {
+        let room = {
+            let mut open = self
+                .open
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(room) = open.get(room_id) {
+                Arc::clone(room)
+            } else {
+                let log = RoomStore::new(self.store.as_ref(), room_id)
+                    .load()?
+                    .map_or_else(RoomLog::new, |restored| restored.log);
+                let room = Arc::new(RwLock::new(log));
+                open.insert(room_id.to_owned(), Arc::clone(&room));
+                room
+            }
+        };
+        let mut log = room
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut appended = 0;
+        let mut from_source = Vec::new();
+        for step in steps {
+            let event_id = step.input.event_id.as_str();
+            if let Some(held) = log.get(&step.input.event_id) {
+                // A resumed run: the seed may have landed without the
+                // state rows that follow it in a separate commit.
+                if step.seed
+                    && let Some(state) = state_after_root
+                {
+                    let li = held.li.get();
+                    self.persist_seeded_state(&log, room_id, event_id, li, state, source, true)?;
+                }
+                continue;
+            }
+            let body = source
+                .body(event_id)
+                .ok_or_else(|| RoomError::MissingBody(event_id.to_owned()))?;
+            let refused = |error: spindle_core::AppendError| {
+                RoomError::Append(format!("{event_id}: {error:?}"))
+            };
+            let seeded_state: Option<crate::import::StateMap>;
+            let first_seed = step.seed && log.entries().next().is_none();
+            let entry = if first_seed {
+                let state = state_after_root.map_or_else(
+                    || {
+                        step.input
+                            .state_key
+                            .clone()
+                            .map_or_else(StateSnapshot::new, |key| {
+                                StateSnapshot::new().apply(key, event_id.to_owned())
+                            })
+                    },
+                    crate::import::snapshot_from,
+                );
+                seeded_state = state_after_root.cloned();
+                log.append_seeded(step.input.clone(), state, step.depth)
+                    .map_err(refused)?
+                    .clone()
+            } else if let Some(settled) = source.read_settled(event_id).map_err(|why| {
+                RoomError::Append(format!("{event_id}: cannot read replayed state: {why}"))
+            })? {
+                // The replay derived this event's state (the room version's
+                // resolver, the head over the forward extremities, or
+                // Synapse's state at a gap) and found the log's fold is not it.
+                from_source.push((event_id.to_owned(), settled.reason.clone()));
+                let entry = log
+                    .append_seeded(step.input.clone(), settled.state, step.depth)
+                    .map_err(refused)?
+                    .clone();
+                seeded_state = Some(settled.slots);
+                entry
+            } else {
+                let reason = if step.head {
+                    Some(crate::import::HEAD_REASON.to_owned())
+                } else if step.gap {
+                    Some("a parent is outside the retained history".to_owned())
+                } else {
+                    match log.append_remote(step.input.clone()).cloned() {
+                        Ok(entry) => {
+                            self.persist_synapse_entry(&mut log, room_id, &entry, event_id, &body)?;
+                            appended += 1;
+                            continue;
+                        }
+                        Err(error) if crate::import::takes_source_state(&error) => {
+                            Some(format!("{error:?}"))
+                        }
+                        Err(error) => return Err(refused(error)),
+                    }
+                };
+                let state = source.state_after(event_id).map_err(|why| {
+                    RoomError::Append(format!("{event_id}: no Synapse state: {why}"))
+                })?;
+                if let Some(reason) = reason {
+                    from_source.push((event_id.to_owned(), reason));
+                }
+                let entry = log
+                    .append_seeded(
+                        step.input.clone(),
+                        crate::import::snapshot_from(&state),
+                        step.depth,
+                    )
+                    .map_err(refused)?
+                    .clone();
+                seeded_state = Some(state);
+                entry
+            };
+            self.persist_synapse_entry(&mut log, room_id, &entry, event_id, &body)?;
+            appended += 1;
+            if let Some(state) = &seeded_state {
+                // A mid-log seed resumes semantics: only bodies not yet
+                // stored, and only memberships the seed's state still names.
+                let resuming = !first_seed;
+                self.persist_seeded_state(
+                    &log,
+                    room_id,
+                    event_id,
+                    entry.li.get(),
+                    state,
+                    source,
+                    resuming,
+                )?;
+            }
+        }
+        Ok((appended, from_source))
+    }
+
+    /// Persist one appended Synapse event with its body and indexes.
+    #[cfg(feature = "synapse-import")]
+    fn persist_synapse_entry(
+        &self,
+        log: &mut RoomLog,
+        room_id: &str,
+        entry: &LogEntry,
+        event_id: &str,
+        body: &Value,
+    ) -> Result<(), RoomError> {
+        let event_type = body["type"].as_str().unwrap_or_default();
+        let state_key = body.get("state_key").and_then(Value::as_str);
+        let sender = body["sender"].as_str().unwrap_or_default();
+        self.persist_entry(
+            log,
+            room_id,
+            entry,
+            event_id,
+            &PersistInput {
+                event_type,
+                state_key,
+                sender,
+                content: &body["content"],
+                json: body,
+            },
+        )
+    }
+
+    /// Store the bodies of the state a seed names, and index its memberships
+    /// at the seed's position.
+    ///
+    /// When `resuming` (a resumed run, or a seed in the middle of the log), a
+    /// body already stored is left alone, and a membership is indexed only
+    /// while the room's current state still names the seeded event: a later
+    /// membership in the log has already written the newer fact, and the
+    /// older one must not overwrite it.
+    #[cfg(feature = "synapse-import")]
+    #[allow(clippy::too_many_arguments)]
+    fn persist_seeded_state(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        seed_id: &str,
+        li: i64,
+        state: &crate::import::StateMap,
+        source: &mut dyn crate::import::SynapseSource,
+        resuming: bool,
+    ) -> Result<(), RoomError> {
+        for ((event_type, state_key), state_event_id) in state {
+            if state_event_id == seed_id {
+                continue;
+            }
+            if resuming
+                && spindle_store::ReadView::get(
+                    self.store.as_ref(),
+                    &event_body_key(room_id, state_event_id),
+                )?
+                .is_some()
+            {
+                continue;
+            }
+            let body = source
+                .body(state_event_id)
+                .ok_or_else(|| RoomError::MissingBody(state_event_id.clone()))?;
+            spindle_store::Store::commit(
+                self.store.as_ref(),
+                &[
+                    (
+                        event_body_key(room_id, state_event_id),
+                        serde_json::to_vec(&body)?,
+                    ),
+                    (
+                        spindle_core::keys::event_room(state_event_id),
+                        room_id.as_bytes().to_vec(),
+                    ),
+                ],
+                Durability::Group,
+            )?;
+            let key = StateKey::new(event_type.as_str(), state_key.as_str());
+            if event_type == "m.room.member"
+                && (!resuming
+                    || current_state_id(log, &key).as_deref() == Some(state_event_id.as_str()))
+            {
+                self.index_membership(room_id, Some(state_key), &body["content"], li)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Retain source auth context without adding timeline or relation entries.
+    /// Existing bodies are left intact, including redactions from a resumed run.
+    #[cfg(feature = "synapse-import")]
+    pub(crate) fn persist_imported_auth_pdus(
+        &self,
+        room_id: &str,
+        bodies: &std::collections::HashMap<String, Value>,
+    ) -> Result<usize, RoomError> {
+        self.with_room(room_id, |rooms, log| {
+            let mut writes = Vec::new();
+            let mut retained = 0;
+            for (id, body) in bodies {
+                if log.get(&EventId::new(id.as_str())).is_some() {
+                    continue;
+                }
+                let key = event_body_key(room_id, id);
+                if spindle_store::ReadView::get(rooms.store.as_ref(), &key)?.is_none() {
+                    writes.push((key, serde_json::to_vec(body)?));
+                }
+                writes.push((spindle_core::keys::imported_auth_only(room_id, id), vec![1]));
+                writes.push((
+                    spindle_core::keys::event_room(id),
+                    room_id.as_bytes().to_vec(),
+                ));
+                retained += 1;
+            }
+            spindle_store::Store::commit(rooms.store.as_ref(), &writes, Durability::Group)?;
+            Ok(retained)
+        })
+    }
+
+    /// Keep source rejection decisions and their original PDUs outside the timeline.
+    /// Markers and bodies land atomically; repeating a chunk is safe.
+    #[cfg(feature = "synapse-import")]
+    pub(crate) fn preserve_imported_rejections(
+        &self,
+        room_id: &str,
+        ids: &[String],
+        bodies: &std::collections::HashMap<String, Value>,
+    ) -> Result<usize, RoomError> {
+        self.with_room(room_id, |rooms, log| {
+            let mut writes = Vec::with_capacity(ids.len() * 2);
+            let mut markers = Vec::with_capacity(ids.len());
+            for id in ids {
+                let body = bodies
+                    .get(id)
+                    .ok_or_else(|| RoomError::MissingBody(id.clone()))?;
+                writes.push((event_body_key(room_id, id), serde_json::to_vec(body)?));
+                writes.push((
+                    spindle_core::keys::event_room(id),
+                    room_id.as_bytes().to_vec(),
+                ));
+                markers.push(EventId::new(id.as_str()));
+            }
+            RoomStore::new(rooms.store.as_ref(), room_id).commit_historical_rejections(
+                log,
+                &markers,
+                &writes,
+                Durability::Group,
+            )?;
+            Ok(markers.len())
+        })
+    }
+
+    /// Apply the imported redactions, re-index memberships from the final
+    /// state, and make the room durable.
+    ///
+    /// Synapse keeps a redacted event's original JSON in `event_json` and
+    /// applies the redaction when the event is read, so the bodies copied in
+    /// still hold what their senders deleted. Each target is rewritten the
+    /// way a redaction arriving over federation would be, after every event
+    /// is in, so a redaction stored before its target still takes effect.
+    /// A target the import left out stays absent. Re-applying a redaction
+    /// to a body that is already redacted gives the same body, so a resumed
+    /// import may call this again.
+    ///
+    /// The membership index is written per appended event, in the import's
+    /// order. Where branches of a fork interleave, the last one written need
+    /// not be the one the room's state settled on, so each member's row is
+    /// written once more from the final state.
+    ///
+    /// Returns how many targets were redacted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if a target cannot be read or rewritten.
+    #[cfg(feature = "synapse-import")]
+    pub(crate) fn finish_synapse_room(
+        &self,
+        room_id: &str,
+        redactions: &[(String, String)],
+    ) -> Result<usize, RoomError> {
+        type Members = Vec<(String, String, i64)>;
+        let (present, members): (Vec<&(String, String)>, Members) =
+            self.with_room_read(room_id, |_, log| {
+                let present = redactions
+                    .iter()
+                    .filter_map(|pair @ (target, _)| {
+                        if log.historically_rejected(&EventId::new(target.as_str())) {
+                            return None;
+                        }
+                        match spindle_store::ReadView::get(
+                            self.store.as_ref(),
+                            &event_body_key(room_id, target),
+                        ) {
+                            Ok(Some(_)) => Some(Ok(pair)),
+                            Ok(None) => None,
+                            Err(error) => Some(Err(RoomError::Storage(error))),
+                        }
+                    })
+                    .collect::<Result<_, RoomError>>()?;
+                let members = current_state(log)
+                    .into_iter()
+                    .filter(|(key, _)| key.event_type().as_str() == "m.room.member")
+                    .map(|(key, event_id)| {
+                        let li = log
+                            .get(&EventId::new(event_id.as_str()))
+                            .map_or(0, |entry| entry.li.get());
+                        (key.state_key().to_owned(), event_id, li)
+                    })
+                    .collect();
+                Ok((present, members))
+            })?;
+        for (target, redaction_id) in &present {
+            self.apply_redaction(room_id, target, redaction_id)?;
+        }
+        for (user_id, event_id, li) in members {
+            let body = self.read_event(room_id, &EventId::new(event_id.as_str()))?;
+            self.index_membership(room_id, Some(&user_id), &body["content"], li)?;
+        }
+        spindle_store::Store::sync(self.store.as_ref(), Durability::Group)?;
+        Ok(present.len())
+    }
+
+    /// Drop a room's in-memory log after an import has written it.
+    ///
+    /// A full import walks every room once; keeping each log resident
+    /// would hold the whole server's history in memory by the end.
+    #[cfg(feature = "synapse-import")]
+    pub(crate) fn release_imported_room(&self, room_id: &str) {
+        self.open
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(room_id);
+    }
+
+    /// Install a room's in-memory log as built elsewhere, replacing any open
+    /// one, and store event bodies under it.
+    ///
+    /// For the corpus replay (`contrib/corpus-state-res`) only: it seeds a
+    /// log with a fork's parents at the states Synapse recorded for them,
+    /// then hands the merge event to [`Self::receive_remote`] -- the live
+    /// path -- and compares what it resolves with Synapse's answer. Behind
+    /// a feature so no server build can reach it.
+    #[cfg(feature = "corpus-replay")]
+    #[doc(hidden)]
+    pub fn install_replay_log(&self, room_id: &str, log: RoomLog) {
+        self.open
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(room_id.to_owned(), Arc::new(RwLock::new(log)));
+    }
+
+    /// Store event bodies for [`Self::install_replay_log`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the store cannot be written.
+    #[cfg(feature = "corpus-replay")]
+    #[doc(hidden)]
+    pub fn store_replay_bodies(
+        &self,
+        room_id: &str,
+        bodies: &[(String, Value)],
+    ) -> Result<(), RoomError> {
+        let mut writes = Vec::with_capacity(bodies.len() * 2);
+        for (event_id, body) in bodies {
+            writes.push((event_body_key(room_id, event_id), serde_json::to_vec(body)?));
+            writes.push((
+                spindle_core::keys::event_room(event_id),
+                room_id.as_bytes().to_vec(),
+            ));
+        }
+        spindle_store::Store::commit(self.store.as_ref(), &writes, Durability::Group)?;
+        Ok(())
     }
 
     /// Create a room and return its ID.
@@ -556,7 +1065,7 @@ impl Rooms {
         // identity being established.
         let (create_id, create_json, room_id) = self.birth(creator, key, &create_content)?;
         let mut log = RoomLog::new();
-        self.authorize(&log, &room_id, &create_id, &create_json)?;
+        self.authorize(&log, &room_id, &create_id, &create_json, None)?;
         self.commit_event(
             &mut log,
             &room_id,
@@ -1070,7 +1579,7 @@ impl Rooms {
             .iter()
             .any(|event| event.get("state_key").is_some());
         let current = state_after || !state_in_window;
-        if state_block == StateBlock::Deferred && current {
+        if state_block == StateBlock::Deferred && current && !self.erasure_active()? {
             // Nothing to do: the caller serves the cached render.
             return Ok((Vec::new(), true));
         }
@@ -1184,11 +1693,7 @@ impl Rooms {
     /// Returns [`RoomError`] if the room is unknown or a body is missing.
     fn state_serialized(&self, room_id: &str) -> Result<Arc<String>, RoomError> {
         let root = self.with_room_read(room_id, |_, log| {
-            Ok(log
-                .entries()
-                .next_back()
-                .and_then(|head| log.state_after(head.li))
-                .map(|state| *state.root().as_bytes()))
+            Ok(log.current_state().map(|state| *state.root().as_bytes()))
         })?;
         let Some(root) = root else {
             // A room with no state renders as the empty array; not worth a
@@ -1414,11 +1919,7 @@ impl Rooms {
         // ID makes the choice reproducible. `for_each` yields state keys in
         // order, so taking the first is exactly that.
         let mut fallback = None;
-        let Some(state) = log
-            .entries()
-            .next_back()
-            .and_then(|head| log.state_after(head.li))
-        else {
+        let Some(state) = log.current_state() else {
             return Ok(None);
         };
         state.for_each(|key, _| {
@@ -1478,9 +1979,8 @@ impl Rooms {
         content: &Value,
         room_id: Option<&str>,
     ) -> Result<(String, Value), RoomError> {
-        let empty = RoomLog::new();
         let auth = auth_events_for(
-            &empty,
+            None,
             &rules_of(&version_in(content)?)?.authorization,
             creator,
             "m.room.create",
@@ -1640,12 +2140,7 @@ impl Rooms {
     /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
     pub fn roster(&self, room_id: &str) -> Result<Arc<Roster>, RoomError> {
         let (root, members) = self.with_room_read(room_id, |_, log| {
-            let root = log
-                .entries()
-                .next_back()
-                .map(|entry| entry.li)
-                .and_then(|li| log.state_after(li))
-                .map(|state| *state.root().as_bytes());
+            let root = log.current_state().map(|state| *state.root().as_bytes());
             let members = current_state(log)
                 .into_iter()
                 .filter(|(key, _)| key.event_type().as_str() == "m.room.member")
@@ -1865,7 +2360,25 @@ impl Rooms {
         // The room has to exist before its events can be looked up, or an
         // unknown room would answer "no such event" and a client could not
         // tell the two apart.
-        self.with_room_read(room_id, |_, _| Ok(()))?;
+        // A soft-failed or rejected event is held for the DAG only; the spec
+        // keeps it from clients, so here it is as absent as one never sent.
+        self.with_room_read(room_id, |_, log| {
+            if log.sidelined(&EventId::new(event_id)).is_some()
+                || log.historically_rejected(&EventId::new(event_id))
+            {
+                return Err(RoomError::MissingBody(event_id.to_owned()));
+            }
+            if log.get(&EventId::new(event_id)).is_none()
+                && spindle_store::ReadView::get(
+                    self.store.as_ref(),
+                    &spindle_core::keys::imported_auth_only(room_id, event_id),
+                )?
+                .is_some()
+            {
+                return Err(RoomError::MissingBody(event_id.to_owned()));
+            }
+            Ok(())
+        })?;
         let mut event = self.read_event(room_id, &EventId::new(event_id))?;
         if let Some(object) = event.as_object_mut() {
             object.insert("event_id".to_owned(), Value::String(event_id.to_owned()));
@@ -1927,7 +2440,7 @@ impl Rooms {
         // federate that nothing to every peer.
         let known = self.with_room_read(room_id, |_, log| {
             Ok(log.get(&EventId::new(target)).is_some())
-        })?;
+        })? || self.gap_position(room_id, target)?.is_some();
         if !known {
             return Err(RoomError::MissingBody(target.to_owned()));
         }
@@ -1968,31 +2481,15 @@ impl Rooms {
         redaction_id: &str,
     ) -> Result<(), RoomError> {
         let stored = self.read_event(room_id, &EventId::new(target))?;
-        let object = CanonicalJsonValue::try_from(stored)
-            .map_err(|error| RoomError::Build(error.to_string()))?;
-        let CanonicalJsonValue::Object(object) = object else {
-            return Err(RoomError::Build(
-                "a stored event is not an object".to_owned(),
-            ));
-        };
 
         // The room's own rules, not this build's default. Redaction is where
         // the versions differ most visibly -- which keys survive a redaction
         // changed in v11 -- so applying ours to someone else's room would
-        // strip fields the room's own version keeps.
+        // strip fields the room's own version keeps. `redacted_because`
+        // goes in `unsigned`, which is not covered by the event ID -- so a
+        // client can see why without the ID changing.
         let version = self.room_version(room_id)?;
-        let redacted = spindle_core::version::redact(&object, &version)
-            .map_err(|error| RoomError::Build(format!("cannot redact: {error}")))?;
-
-        let mut json = canonical_to_json(&redacted);
-        // `redacted_because` goes in `unsigned`, which is not covered by the
-        // event ID -- so a client can see why without the ID changing.
-        if let Some(map) = json.as_object_mut() {
-            map.insert(
-                "unsigned".to_owned(),
-                serde_json::json!({ "redacted_because": { "event_id": redaction_id } }),
-            );
-        }
+        let json = Self::redacted_body(&version, &stored, redaction_id)?;
 
         spindle_store::Store::put(
             self.store.as_ref(),
@@ -2134,6 +2631,11 @@ impl Rooms {
                 Err(RoomError::MissingBody(_)) => continue,
                 Err(error) => return Err(error),
             };
+            let reply = if self.erasure_active()? {
+                self.prune_erased_event(viewer, room_id, reply)?
+            } else {
+                reply
+            };
             let Some((_, root)) = relates_to(&reply["content"]) else {
                 continue;
             };
@@ -2250,7 +2752,68 @@ impl Rooms {
         after_limit: usize,
         visible: &(dyn Fn(i64) -> bool + Sync),
     ) -> Result<Context, RoomError> {
-        let found = self.with_room_read(room_id, |_, log| {
+        let spans = self.gap_spans(room_id)?;
+        let found = if spans.is_empty() {
+            self.context_log(room_id, event_id, before_limit, after_limit, visible)?
+        } else {
+            self.stitched_context(
+                room_id,
+                event_id,
+                before_limit,
+                after_limit,
+                visible,
+                &spans,
+            )?
+            .map(|window| {
+                (
+                    window.before,
+                    window.after,
+                    window.start,
+                    window.end,
+                    window.root,
+                )
+            })
+        };
+
+        let Some((before, after, start, end, state_root)) = found else {
+            return Err(RoomError::MissingBody(event_id.to_owned()));
+        };
+
+        let mut events_before = Vec::with_capacity(before.len());
+        for id in before {
+            events_before.push(self.event(room_id, &id)?);
+        }
+        let mut events_after = Vec::with_capacity(after.len());
+        for id in after {
+            events_after.push(self.event(room_id, &id)?);
+        }
+
+        Ok(Context {
+            event: self.event(room_id, event_id)?,
+            events_before,
+            events_after,
+            state: self.state_at(room_id, state_root)?,
+            start,
+            end,
+        })
+    }
+
+    /// The `/context` window from the log alone, for a room with no filled
+    /// gap: see [`Self::context_visible`].
+    #[allow(
+        clippy::type_complexity,
+        reason = "the window's two halves, its tokens and its state, as the caller wants them"
+    )]
+    fn context_log(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        before_limit: usize,
+        after_limit: usize,
+        visible: &(dyn Fn(i64) -> bool + Sync),
+    ) -> Result<Option<(Vec<String>, Vec<String>, i64, i64, spindle_core::StateRoot)>, RoomError>
+    {
+        self.with_room_read(room_id, |_, log| {
             let Some(entry) = log.get(&EventId::new(event_id)) else {
                 return Ok(None);
             };
@@ -2294,28 +2857,6 @@ impl Rooms {
                 })
                 .saturating_add(1);
             Ok(Some((before, after, start, end, state_root)))
-        })?;
-
-        let Some((before, after, start, end, state_root)) = found else {
-            return Err(RoomError::MissingBody(event_id.to_owned()));
-        };
-
-        let mut events_before = Vec::with_capacity(before.len());
-        for id in before {
-            events_before.push(self.event(room_id, &id)?);
-        }
-        let mut events_after = Vec::with_capacity(after.len());
-        for id in after {
-            events_after.push(self.event(room_id, &id)?);
-        }
-
-        Ok(Context {
-            event: self.event(room_id, event_id)?,
-            events_before,
-            events_after,
-            state: self.state_at(room_id, state_root)?,
-            start,
-            end,
         })
     }
 
@@ -2389,7 +2930,10 @@ impl Rooms {
         snapshot.for_each(|_, event_id| ids.push(event_id.to_owned()));
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            let event = self.event(room_id, &id)?;
+            // Federation state must carry the signed PDU. A client event
+            // adds event_id; hashing it at the joining server changes the
+            // reference hash and breaks later auth-event lookups.
+            let event = self.pdu(room_id, &id)?;
             out.push((id, event));
         }
         Ok(out)
@@ -2703,13 +3247,91 @@ impl Rooms {
             to,
             direction,
         } = page;
+        // A room with a filled federation gap pages in stitched order, the
+        // gap's segment spliced in below the event accepted across it
+        // (`gaps`). Every other room takes the plain range scan below.
+        let spans = self.gap_spans(room_id)?;
+        let wanted = if spans.is_empty() {
+            self.page_log(room_id, from, to, direction, limit, visible)?
+        } else {
+            self.with_room_read(room_id, |rooms, log| {
+                let stitch = gaps::Stitch {
+                    rooms,
+                    room_id,
+                    log,
+                    spans: &spans,
+                    visible,
+                };
+                let mut wanted: Vec<(i64, String)> = Vec::new();
+                let mut next = None;
+                match direction {
+                    Direction::Backward => stitch.backward(from, to, &mut |item| {
+                        if wanted.len() == limit {
+                            next = Some(stitch.above(item.position));
+                            return Ok(false);
+                        }
+                        wanted.push((item.position, item.event_id));
+                        Ok(true)
+                    })?,
+                    Direction::Forward => {
+                        stitch.forward(from, to, &mut |item| {
+                            if wanted.len() == limit {
+                                next = Some(item.position);
+                                return Ok(false);
+                            }
+                            wanted.push((item.position, item.event_id));
+                            Ok(true)
+                        })?;
+                        if next.is_none() {
+                            next = wanted.last().map(|(position, _)| stitch.above(*position));
+                        }
+                    }
+                }
+                Ok((wanted, next))
+            })?
+        };
+
+        let (wanted, next) = wanted;
+        let watermark = self.purge_watermark(room_id)?;
+        let mut out = Vec::with_capacity(wanted.len());
+        for (li, event_id) in wanted {
+            let json = match self.read_event(room_id, &EventId::new(event_id.as_str())) {
+                Ok(json) => json,
+                // SPEC/#83 §3: a purged entry is a marker, not a hole —
+                // the client can tell "deleted on purpose" from "never
+                // existed", which is the property purge preserves.
+                Err(RoomError::MissingBody(_)) if watermark.is_some_and(|mark| li < mark) => {
+                    purged_marker()
+                }
+                Err(error) => return Err(error),
+            };
+            out.push(TimelineEvent { event_id, li, json });
+        }
+        Ok((out, next))
+    }
+
+    /// The plain `/messages` scan over the log alone, for a room with no
+    /// filled gap: see [`Self::page_visible`].
+    #[allow(
+        clippy::type_complexity,
+        reason = "the page's IDs and the token after it, as the caller wants them"
+    )]
+    fn page_log(
+        &self,
+        room_id: &str,
+        from: Option<i64>,
+        to: Option<i64>,
+        direction: Direction,
+        limit: usize,
+        visible: &(dyn Fn(i64) -> bool + Sync),
+    ) -> Result<(Vec<(i64, String)>, Option<i64>), RoomError> {
         // Against the open log, not a fresh `load()`. Reloading rebuilt the
         // whole `RoomLog` from storage on every page, which made the one
         // endpoint SPEC §10.4 calls "a reverse range scan ... that is the
         // whole implementation" cost `O(room)` per request instead. The API
         // benchmark caught it: `/messages` grew 2.47x between a 10-event room
         // and a 500-event one, and `/sync` 4.79x, while `send` stayed flat.
-        let wanted = self.with_room_read(room_id, |_, log| {
+        self.with_room_read(room_id, |_, log| {
             let mut wanted = Vec::new();
             let mut next = None;
             let mut take = |entry: &spindle_core::LogEntry, gap_after: i64| {
@@ -2761,25 +3383,7 @@ impl Rooms {
                 }
             }
             Ok((wanted, next))
-        })?;
-
-        let (wanted, next) = wanted;
-        let watermark = self.purge_watermark(room_id)?;
-        let mut out = Vec::with_capacity(wanted.len());
-        for (li, event_id) in wanted {
-            let json = match self.read_event(room_id, &EventId::new(event_id.as_str())) {
-                Ok(json) => json,
-                // SPEC/#83 §3: a purged entry is a marker, not a hole —
-                // the client can tell "deleted on purpose" from "never
-                // existed", which is the property purge preserves.
-                Err(RoomError::MissingBody(_)) if watermark.is_some_and(|mark| li < mark) => {
-                    purged_marker()
-                }
-                Err(error) => return Err(error),
-            };
-            out.push(TimelineEvent { event_id, li, json });
-        }
-        Ok((out, next))
+        })
     }
 
     /// Events in `room_id` that `matches` accepts, newest first, starting
@@ -2800,6 +3404,7 @@ impl Rooms {
     /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
     fn search(
         &self,
+        user_id: &str,
         room_id: &str,
         from: Option<i64>,
         limit: usize,
@@ -2815,6 +3420,7 @@ impl Rooms {
                 .collect())
         })?;
         let watermark = self.purge_watermark(room_id)?;
+        let erasure_active = self.erasure_active()?;
         let mut hits = Vec::new();
         for (li, event_id) in candidates {
             if hits.len() == limit {
@@ -2828,6 +3434,12 @@ impl Rooms {
                     continue;
                 }
                 Err(error) => return Err(error),
+            };
+            let json = stamp(json, &event_id);
+            let json = if erasure_active {
+                self.prune_erased_event(user_id, room_id, json)?
+            } else {
+                json
             };
             if matches(&json) {
                 hits.push(TimelineEvent { event_id, li, json });
@@ -3214,7 +3826,21 @@ impl Rooms {
             });
         }
 
-        let left = self.left_rooms(user_id, since, range)?;
+        let mut left = self.left_rooms(user_id, since, range)?;
+        if self.erasure_active()? {
+            for room in rooms.iter_mut().chain(left.iter_mut()) {
+                room.events = self.prune_erased_events(
+                    user_id,
+                    &room.room_id,
+                    std::mem::take(&mut room.events),
+                )?;
+                room.state = self.prune_erased_events(
+                    user_id,
+                    &room.room_id,
+                    std::mem::take(&mut room.state),
+                )?;
+            }
+        }
 
         // How stale was the freshest thing we just handed over? A client
         // keeping up sees milliseconds; a server falling behind sees this
@@ -3847,6 +4473,11 @@ impl Rooms {
                 Err(RoomError::MissingBody(_)) => continue,
                 Err(error) => return Err(error),
             };
+            let event = if self.erasure_active()? {
+                self.prune_erased_event(viewer, room_id, event)?
+            } else {
+                event
+            };
             // Redacted: the relation is gone from the content, so it is gone
             // from the aggregate.
             if relates_to(&event["content"]).is_none() {
@@ -3942,22 +4573,93 @@ impl Rooms {
         {
             return Ok(cached);
         }
-        let head = self.with_room_read(room_id, |_, log| {
-            Ok(log
-                .entries()
-                .next_back()
-                .map(|entry| entry.event_id.as_str().to_owned()))
-        })?;
-        let Some(event_id) = head else {
-            return Ok(0);
+        // A sort key must not cost a room load (#614). A resident room
+        // answers from its log in memory, as it always did; a cold one
+        // answers from the store -- the last row of its log and that
+        // event's body, two point reads -- and stays cold. Loading every
+        // joined room just to read one timestamp from each was what made
+        // the first sliding sync after a restart take 105 s for an account
+        // in a room of a million events.
+        // A resident room whose lock is busy -- an ingest working through
+        // a backlog holds it for as long as that takes -- is read from the
+        // store too: the store holds every entry the log does, and the sort
+        // key is not worth queueing behind an ingest for.
+        let in_memory = self
+            .resident(room_id)
+            .and_then(|room| match room.try_read() {
+                Ok(log) => Some(Self::head_in_memory(&log)),
+                Err(std::sync::TryLockError::Poisoned(log)) => {
+                    Some(Self::head_in_memory(&log.into_inner()))
+                }
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            });
+        let head = match in_memory {
+            Some(head) => head,
+            None => self.head_in_store(room_id)?,
         };
-        let event = self.event(room_id, &event_id)?;
-        let activity = event["origin_server_ts"].as_i64().unwrap_or(0);
-        self.last_activity
+        let activity = match head {
+            None => 0,
+            Some((event_id, rejected)) => {
+                if rejected {
+                    return Err(RoomError::MissingBody(event_id));
+                }
+                self.read_event(room_id, &EventId::new(event_id.as_str()))?["origin_server_ts"]
+                    .as_i64()
+                    .unwrap_or(0)
+            }
+        };
+        // Filled only if still empty: an append that landed while this was
+        // reading has already stored a fresher key, and must not be
+        // overwritten by the older one read before it.
+        Ok(*self
+            .last_activity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(room_id.to_owned(), activity);
-        Ok(activity)
+            .entry(room_id.to_owned())
+            .or_insert(activity))
+    }
+
+    /// The head entry of a resident log: its event id, and whether that
+    /// event is historically rejected (and so has no body to show).
+    fn head_in_memory(log: &RoomLog) -> Option<(String, bool)> {
+        log.entries().next_back().map(|entry| {
+            (
+                entry.event_id.as_str().to_owned(),
+                log.historically_rejected(&entry.event_id),
+            )
+        })
+    }
+
+    /// [`Self::head_in_memory`] for a room that is not resident, read from
+    /// the store without restoring the room.
+    ///
+    /// The log keyspace is ordered by linear index -- the encoding is
+    /// order-preserving across the sign boundary, which is what lets a
+    /// restore scan it straight into a log -- so the room's last row is the
+    /// entry a restored log would hold at its head.
+    fn head_in_store(&self, room_id: &str) -> Result<Option<(String, bool)>, RoomError> {
+        let store = self.store.as_ref();
+        let prefix = spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::Log, room_id);
+        let mut end = prefix.clone();
+        end.extend_from_slice(&[0xff; 9]);
+        let Some((_, value)) = spindle_store::ReadView::last_before(store, &prefix, &end)? else {
+            // No entries: an empty room, or no room at all -- which a load
+            // would have told apart by the room's metadata, so this does too.
+            let meta =
+                spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::RoomMeta, room_id);
+            return if spindle_store::ReadView::get(store, &meta)?.is_some() {
+                Ok(None)
+            } else {
+                Err(RoomError::UnknownRoom(room_id.to_owned()))
+            };
+        };
+        let record = spindle_store::codec::EntryRecord::decode(&value).map_err(StoreError::from)?;
+        let rejected = spindle_store::ReadView::get(
+            store,
+            &spindle_core::keys::historical_rejection(room_id, &record.event_id),
+        )?
+        .is_some();
+        Ok(Some((record.event_id, rejected)))
     }
 
     /// Which of `rooms` had at least one event in the stream range
@@ -4057,35 +4759,343 @@ impl Rooms {
     /// other one, in rooms they had nothing to do with. Now the map is a
     /// lookup and the *room* is the thing contended.
     ///
-    /// The miss path takes the registry exclusively and re-checks, because
-    /// two requests for the same cold room would otherwise both load it and
-    /// the second would replace the first -- handing two callers different
-    /// locks for one room, which is the same as no lock at all.
+    /// A cold room is loaded by one caller at a time; any other caller for
+    /// it waits for that load ([`Self::room_or_load`]), and publication
+    /// returns the registry's canonical lock without replacing a room
+    /// another path has already published.
     fn room(&self, room_id: &str) -> Result<Arc<RwLock<RoomLog>>, RoomError> {
-        {
-            self.metrics.record_registry_lock(false);
-            let open = self
-                .open
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(room) = open.get(room_id) {
-                return Ok(Arc::clone(room));
+        self.room_or_load(room_id, || {
+            // A cold load runs for as long as the room is big -- minutes,
+            // for a room of a million events -- so it is marked blocking:
+            // the worker it started on hands its other tasks on rather than
+            // stalling them for the duration (#614).
+            crate::blocking::section(
+                &self.metrics,
+                crate::metrics::BlockingTask::ColdLoad,
+                || self.load_cold(room_id),
+            )
+        })
+    }
+
+    /// Restore one room from the store, timing it by the room's size.
+    ///
+    /// A slow one is logged with where its time went -- reading and
+    /// checking the log rows, verifying the resident roots, the sidelined
+    /// events, the imported rejections, resolving an open fork -- so a
+    /// slow cold load in production says which part to look at.
+    fn load_cold(&self, room_id: &str) -> Result<RoomLog, RoomError> {
+        let started = std::time::Instant::now();
+        let (log, profile, resolving) = self.restore_room(room_id)?;
+        let elapsed = started.elapsed();
+        let size = crate::metrics::RoomSize::of(log.len());
+        self.metrics.observe_cold_load(size, elapsed);
+        if elapsed > std::time::Duration::from_secs(1) {
+            let ms = |duration: std::time::Duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            };
+            tracing::info!(
+                room = room_id,
+                entries = log.len(),
+                elapsed_ms = ms(elapsed),
+                rows = profile.rows,
+                row_mib = profile.row_bytes >> 20,
+                records_ms = ms(profile.records),
+                roots_ms = ms(profile.roots),
+                sidelined_ms = ms(profile.sidelined),
+                rejections_ms = ms(profile.rejections),
+                resolve_ms = ms(resolving),
+                "loaded a cold room"
+            );
+        }
+        Ok(log)
+    }
+
+    fn restore_room(
+        &self,
+        room_id: &str,
+    ) -> Result<(RoomLog, spindle_store::RestoreProfile, std::time::Duration), RoomError> {
+        let (restored, profile) = RoomStore::new(self.store.as_ref(), room_id)
+            .load_runtime_profiled()?
+            .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
+        let mut log = restored.log;
+        let started = std::time::Instant::now();
+        if !log.current_is_settled() {
+            match self.resolve_in(&log, room_id, |log, resolver, load| {
+                log.resolve_current(resolver, load)
+            }) {
+                Ok(current) => log.set_current(current),
+                Err(error) => tracing::warn!(
+                    room = room_id,
+                    "cannot resolve the reopened room's forward extremities: {error}"
+                ),
             }
         }
+        Ok((log, profile, started.elapsed()))
+    }
+
+    /// The room's lock if this process holds it open, without loading it.
+    fn resident(&self, room_id: &str) -> Option<Arc<RwLock<RoomLog>>> {
+        self.registry_read().get(room_id).map(Arc::clone)
+    }
+
+    /// A room's lock, loading the room if need be, for tests that must hold
+    /// it -- to stand in for an ingest that holds a room for a backlog.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room cannot be restored.
+    #[doc(hidden)]
+    pub fn lock_for_test(&self, room_id: &str) -> Result<Arc<RwLock<RoomLog>>, RoomError> {
+        self.room(room_id)
+    }
+
+    /// Whether this process holds the room open: loaded, and kept.
+    #[must_use]
+    pub fn is_resident(&self, room_id: &str) -> bool {
+        self.resident(room_id).is_some()
+    }
+
+    /// How many rooms are resident, or `None` if the registry is busy --
+    /// a scrape must not queue behind an admission.
+    #[must_use]
+    pub fn resident_count(&self) -> Option<u64> {
+        match self.open.try_read() {
+            Ok(open) => Some(open.len() as u64),
+            Err(std::sync::TryLockError::Poisoned(open)) => Some(open.into_inner().len() as u64),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// Load a room if it is not resident, so the first request for it after
+    /// a restart does not pay for the load. What the startup warm-up calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room cannot be restored.
+    pub fn warm(&self, room_id: &str) -> Result<(), RoomError> {
+        self.room(room_id).map(drop)
+    }
+
+    /// Load each of `rooms` that is not resident, up to `parallelism` at a
+    /// time, on scoped threads of this call's own. A room that cannot be
+    /// loaded is skipped: the caller that needs it will meet the error
+    /// itself, where it can say what it means.
+    pub fn warm_all(&self, rooms: &[String], parallelism: usize) {
+        let cold: Vec<&String> = rooms
+            .iter()
+            .filter(|room| !self.is_resident(room))
+            .collect();
+        match cold.as_slice() {
+            [] => {}
+            [room] => {
+                let _ = self.warm(room);
+            }
+            _ => {
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                std::thread::scope(|scope| {
+                    for _ in 0..parallelism.clamp(1, cold.len()) {
+                        scope.spawn(|| {
+                            while let Some(room) =
+                                cold.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                            {
+                                let _ = self.warm(room);
+                            }
+                        });
+                    }
+                });
+            }
+        }
+    }
+
+    /// The rooms worth warming after a restart: every room a local user is
+    /// joined to that is not already resident, newest activity first, so
+    /// the rooms at the top of a client's list are the first to be ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the membership index cannot be read.
+    pub fn warm_candidates(&self) -> Result<Vec<String>, RoomError> {
+        let probe = spindle_core::keys::user_prefix(spindle_core::keys::Keyspace::Membership, "");
+        let keyspace = probe.get(..2).unwrap_or_default();
+        let suffix = format!(":{}", self.server_name);
+        let mut rooms: HashSet<String> = HashSet::new();
+        for (key, membership) in
+            spindle_store::ReadView::scan_prefix(self.store.as_ref(), keyspace)?
+        {
+            if membership.as_slice() != JOIN {
+                continue;
+            }
+            let Some((user_id, room_id)) = split_user_room(&key) else {
+                continue;
+            };
+            if user_id.ends_with(&suffix) && !self.is_resident(&room_id) {
+                rooms.insert(room_id);
+            }
+        }
+        let mut ordered: Vec<(String, i64)> = rooms
+            .into_iter()
+            .map(|room_id| {
+                let activity = self.last_activity(&room_id).unwrap_or(0);
+                (room_id, activity)
+            })
+            .collect();
+        ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(ordered.into_iter().map(|(room_id, _)| room_id).collect())
+    }
+
+    /// The registry, shared, with the wait timed.
+    fn registry_read(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, HashMap<String, Arc<RwLock<RoomLog>>>> {
+        self.metrics.record_registry_lock(false);
+        let started = std::time::Instant::now();
+        let open = self
+            .open
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.metrics.observe_lock_wait(
+            crate::metrics::LockKind::Registry,
+            false,
+            started.elapsed(),
+        );
+        open
+    }
+
+    /// One room's lock, shared. Uncontended, it is taken at once; contended
+    /// -- an ingest holding the room for a backlog, say -- the wait is
+    /// marked blocking so it parks this thread and not a whole worker.
+    fn read_room<'a>(&self, room: &'a RwLock<RoomLog>) -> std::sync::RwLockReadGuard<'a, RoomLog> {
+        self.metrics.record_room_lock(false);
+        let started = std::time::Instant::now();
+        let guard = match room.try_read() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(guard)) => guard.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => crate::blocking::section(
+                &self.metrics,
+                crate::metrics::BlockingTask::LockWait,
+                || {
+                    room.read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                },
+            ),
+        };
+        self.metrics
+            .observe_lock_wait(crate::metrics::LockKind::Room, false, started.elapsed());
+        guard
+    }
+
+    /// [`Self::read_room`], exclusive.
+    fn write_room<'a>(
+        &self,
+        room: &'a RwLock<RoomLog>,
+    ) -> std::sync::RwLockWriteGuard<'a, RoomLog> {
+        self.metrics.record_room_lock(true);
+        let started = std::time::Instant::now();
+        let guard = match room.try_write() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(guard)) => guard.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => crate::blocking::section(
+                &self.metrics,
+                crate::metrics::BlockingTask::LockWait,
+                || {
+                    room.write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                },
+            ),
+        };
+        self.metrics
+            .observe_lock_wait(crate::metrics::LockKind::Room, true, started.elapsed());
+        guard
+    }
+
+    /// The room's canonical lock, loading it with `load` if no one holds it
+    /// open -- and if someone is already loading it, waiting for theirs.
+    ///
+    /// One load per room at a time. A cold room of a million events costs
+    /// seconds of CPU and hundreds of megabytes while it loads, and after a
+    /// restart it was routinely loaded several times at once: by the
+    /// warm-up, by the sliding sync whose window held it, and by that
+    /// client's retries of the request that was waiting for it -- each a
+    /// full, independent load competing for the same cores, every one but
+    /// the first thrown away on publication. Now the first caller loads and
+    /// the rest wait for its result (as a blocking section: a wait for
+    /// someone else's load is a lock wait). If that load fails, a waiter
+    /// tries its own, so an error is still met by the caller that can say
+    /// what it means.
+    ///
+    /// Cold I/O and resolution never hold the registry, and a load of one
+    /// room never delays a caller for another. Publication rechecks the
+    /// registry and keeps any lock already there, so the canonical lock and
+    /// anything appended through it survive.
+    fn room_or_load(
+        &self,
+        room_id: &str,
+        load: impl FnOnce() -> Result<RoomLog, RoomError>,
+    ) -> Result<Arc<RwLock<RoomLog>>, RoomError> {
+        let slot = loop {
+            match self.claim_load(room_id) {
+                Claim::Resident(room) => return Ok(room),
+                Claim::Lead(slot) => break slot,
+                Claim::Follow(slot) => {
+                    let outcome = crate::blocking::section(
+                        &self.metrics,
+                        crate::metrics::BlockingTask::LockWait,
+                        || slot.wait(),
+                    );
+                    if let Some(room) = outcome {
+                        return Ok(room);
+                    }
+                    // The leader's load failed: claim again, which loads
+                    // here unless another waiter got there first.
+                }
+            }
+        };
+        // Retires the slot however this ends -- an error or a panic in
+        // `load` included -- so no waiter is left waiting for a load that
+        // is no longer running.
+        let mut leader = Lead {
+            rooms: self,
+            room_id,
+            slot,
+            outcome: None,
+        };
+        let room = Arc::new(RwLock::new(load()?));
         self.metrics.record_registry_lock(true);
+        let started = std::time::Instant::now();
         let mut open = self
             .open
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(room) = open.get(room_id) {
-            return Ok(Arc::clone(room));
-        }
-        let restored = RoomStore::new(self.store.as_ref(), room_id)
-            .load()?
-            .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
-        let room = Arc::new(RwLock::new(restored.log));
-        open.insert(room_id.to_owned(), Arc::clone(&room));
+        self.metrics
+            .observe_lock_wait(crate::metrics::LockKind::Registry, true, started.elapsed());
+        let room = Arc::clone(open.entry(room_id.to_owned()).or_insert(room));
+        drop(open);
+        leader.outcome = Some(Arc::clone(&room));
         Ok(room)
+    }
+
+    /// Who loads `room_id`: nobody, because it is resident; this caller,
+    /// because nobody else is; or whoever already is.
+    fn claim_load(&self, room_id: &str) -> Claim {
+        if let Some(room) = self.resident(room_id) {
+            return Claim::Resident(room);
+        }
+        let mut loading = self
+            .loading
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(slot) = loading.get(room_id) {
+            return Claim::Follow(Arc::clone(slot));
+        }
+        // Checked again under `loading`: a leader publishes the room before
+        // it retires its slot, so a room in neither place is being loaded
+        // by nobody, and one that was published meanwhile is found here.
+        if let Some(room) = self.resident(room_id) {
+            return Claim::Resident(room);
+        }
+        let slot = Arc::new(ColdLoad::default());
+        loading.insert(room_id.to_owned(), Arc::clone(&slot));
+        Claim::Lead(slot)
     }
 
     /// [`Self::with_room`] for work that only *reads* the log.
@@ -4103,10 +5113,7 @@ impl Rooms {
         work: impl FnOnce(&Self, &RoomLog) -> Result<T, RoomError>,
     ) -> Result<T, RoomError> {
         let room = self.room(room_id)?;
-        self.metrics.record_room_lock(false);
-        let log = room
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let log = self.read_room(&room);
         work(self, &log)
     }
 
@@ -4118,10 +5125,7 @@ impl Rooms {
         let before = self.store.journalled();
         let room = self.room(room_id)?;
         let done = {
-            self.metrics.record_room_lock(true);
-            let mut log = room
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut log = self.write_room(&room);
             work(self, &mut log)
         };
         // The guard is gone by here, so the barrier below is not holding
@@ -4154,19 +5158,20 @@ impl Rooms {
         content: &Value,
         sticky_ms: Option<u64>,
     ) -> Result<(String, Value), RoomError> {
-        // Before `prev` is read, so the event names only tips that fold.
-        self.set_aside_contested(log, room_id)?;
         let depth = log
             .entries()
             .next_back()
             .map_or(0, |entry| entry.depth.saturating_add(1));
-        let prev: Vec<String> = log
-            .authoring_extremities()
-            .map(|id| id.as_str().to_owned())
-            .collect();
+        let parents: Vec<EventId> = log.authoring_extremities().cloned().collect();
+        let prev: Vec<String> = parents.iter().map(|id| id.as_str().to_owned()).collect();
+        // The state the event sits on: its parents' states, resolved by the
+        // room version's algorithm when a fork left them different. That is
+        // what it is authorized against and what its auth events cite --
+        // the room's current state, whenever it names every extremity.
+        let (state_before, _) = self.state_for_parents(log, room_id, &parents)?;
 
         let auth = auth_events_for(
-            log,
+            Some(&state_before),
             &self.rules_in(log, room_id)?.authorization,
             sender,
             event_type,
@@ -4257,7 +5262,9 @@ impl Rooms {
         // client; storing all three gives every client-facing read path the
         // same complete event without making timeline reads reopen state.
         if let Some(state_key) = state_key
-            && let Some(previous_id) = current_state_id(log, &StateKey::new(event_type, state_key))
+            && let Some(previous_id) = state_before
+                .get(&StateKey::new(event_type, state_key))
+                .map(str::to_owned)
             && let Ok(previous) = self.read_event(room_id, &EventId::new(previous_id.as_str()))
             && let Some(object) = json.as_object_mut()
         {
@@ -4275,7 +5282,7 @@ impl Rooms {
         // holds materialized. Signing first costs a wasted signature on a
         // refused event and buys something worth more: what gets authorized is
         // exactly the bytes a peer would receive, event ID included.
-        self.authorize(log, room_id, &event_id, &json)?;
+        self.authorize(log, room_id, &event_id, &json, Some(&state_before))?;
         Ok((event_id, json))
     }
 
@@ -4320,35 +5327,201 @@ impl Rooms {
         Ok(())
     }
 
-    /// Step around a fork this server cannot fold, and say so.
+    /// The state an event naming `parents` sits on, and whether producing
+    /// it took a resolution (the parents held different states).
     ///
-    /// SPEC §9.2 case 3 reaches here with no resolver behind it (#16). The
-    /// core sets the contesting tip aside so that what remains folds
-    /// (`RoomLog::set_aside_contested`); this is where that decision is
-    /// counted and logged. Once per tip, not once per send: the tip stays
-    /// set aside until something builds on it, so a later send finds
-    /// nothing to set aside and costs one fold. A count that moved on every
-    /// send while one fork stayed open would make §18.3's ratio a measure
-    /// of how chatty the local users are rather than of forks.
-    ///
-    /// The log line is the anomaly record SPEC §9.1 asks for. It spells the
-    /// key the way `/state_ids` does and names the tip set aside, which is
-    /// what an operator needs to find the branch this server is not
-    /// showing.
-    fn set_aside_contested(&self, log: &mut RoomLog, room_id: &str) -> Result<(), RoomError> {
-        let set_aside = log
-            .set_aside_contested()
-            .map_err(|error| RoomError::Append(format!("{error:?}")))?;
-        for spindle_core::SetAside { extremity, key } in set_aside {
-            self.metrics.record_contested_state();
-            let key = format!("{}/{}", key.event_type().as_str(), key.state_key());
-            tracing::warn!(
+    /// One parent, or parents that agree, cost nothing; anything else is
+    /// the room version's resolver (`state_res`), whose results are cached
+    /// by the roots they resolved.
+    fn state_for_parents(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        parents: &[EventId],
+    ) -> Result<(StateSnapshot, bool), RoomError> {
+        let mut roots = BTreeSet::new();
+        for parent in parents {
+            if let Some(entry) = log.get(parent) {
+                roots.insert(*entry.state_root.as_bytes());
+            } else if let Some(sidelined) = log.sidelined(parent) {
+                roots.insert(*sidelined.state_root.as_bytes());
+            } else {
+                return Err(RoomError::Append(format!(
+                    "{:?}",
+                    AppendError::UnknownPredecessor(parent.clone())
+                )));
+            }
+        }
+        if roots.len() <= 1 {
+            let mut load = |root: &StateRoot| self.load_node(root);
+            let state = log
+                .resolve_parents(parents, &mut spindle_core::Strict, &mut load)
+                .map_err(|error| self.append_error(&error))?;
+            return Ok((state, false));
+        }
+        let state = self.resolve_in(log, room_id, |log, resolver, load| {
+            log.resolve_parents(parents, resolver, load)
+        })?;
+        Ok((state, true))
+    }
+
+    /// Run `work` with this room's resolver: the room version's algorithm
+    /// over the room's bodies, auth DAG and the shared resolution cache.
+    fn resolve_in<T>(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        work: impl FnOnce(
+            &RoomLog,
+            &mut dyn StateResolver,
+            &mut dyn FnMut(&StateRoot) -> Option<Vec<u8>>,
+        ) -> Result<T, AppendError>,
+    ) -> Result<T, RoomError> {
+        let rules = self.rules_in(log, room_id)?;
+        let graph = self.auth_graph(room_id);
+        let body = |id: &str| self.read_event(room_id, &EventId::new(id)).ok();
+        let mut resolver = crate::state_res::RoomResolver::new(
+            &rules,
+            room_id,
+            log,
+            &body,
+            &graph,
+            &self.resolutions,
+        );
+        let mut load = |root: &StateRoot| self.load_node(root);
+        let started = std::time::Instant::now();
+        let result = work(log, &mut resolver, &mut load);
+        let stats = resolver.stats;
+        if stats.resolutions > 0 {
+            tracing::info!(
                 room = room_id,
-                extremity = extremity.as_str(),
-                key = key.as_str(),
-                "a federated fork contests a state key this server cannot resolve yet (#16); \
-                 the branch is set aside and local events are authored without it"
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                auth_graph = graph
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+                "resolved a fork's state with the room version's algorithm"
             );
+        }
+        result.map_err(|error| self.append_error(&error))
+    }
+
+    /// The room's auth DAG, created empty on first use.
+    fn auth_graph(&self, room_id: &str) -> Arc<Mutex<crate::state_res::AuthGraph>> {
+        Arc::clone(
+            self.auth_graphs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(room_id.to_owned())
+                .or_default(),
+        )
+    }
+
+    /// One stored state-trie node, by its content address.
+    fn load_node(&self, root: &StateRoot) -> Option<Vec<u8>> {
+        spindle_store::ReadView::get(
+            self.store.as_ref(),
+            &spindle_core::keys::content_addressed(
+                spindle_core::keys::Keyspace::StateNode,
+                root.as_bytes(),
+            ),
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// An append failure as a room error, naming a resolution failure as
+    /// what it is.
+    fn append_error(&self, error: &AppendError) -> RoomError {
+        match error {
+            AppendError::NeedsStateResolution { key, .. } => {
+                self.metrics.record_contested_state();
+                RoomError::Contested {
+                    // The `type/state_key` spelling `/state_ids` uses, so an
+                    // operator can match this against what the room reports.
+                    key: format!("{}/{}", key.event_type().as_str(), key.state_key()),
+                }
+            }
+            AppendError::ResolutionFailed(why) => {
+                RoomError::Append(format!("state resolution failed: {why}"))
+            }
+            other => RoomError::Append(format!("{other:?}")),
+        }
+    }
+
+    /// Bring the room's current state up to date after an append, and the
+    /// membership index with it.
+    ///
+    /// With one forward extremity the current state is that event's state
+    /// and there is nothing to do. With several it is their resolution,
+    /// computed here. When the append was not the plain linear case -- one
+    /// tip, built on by one event -- the current state may have moved by
+    /// more than the event itself, so every membership it moved is
+    /// re-indexed from the resolved state rather than from the event.
+    fn settle(
+        &self,
+        log: &mut RoomLog,
+        room_id: &str,
+        entry: Option<&LogEntry>,
+        previous_current: Option<StateSnapshot>,
+        previous_tips: &BTreeSet<EventId>,
+    ) -> Result<(), RoomError> {
+        if log.forward_extremities().len() > 1 {
+            match self.resolve_in(log, room_id, |log, resolver, load| {
+                log.resolve_current(resolver, load)
+            }) {
+                Ok(current) => log.set_current(current),
+                Err(error) => {
+                    tracing::warn!(
+                        room = room_id,
+                        "cannot resolve the room's current state over its forward                          extremities: {error}"
+                    );
+                }
+            }
+        }
+        let linear = entry.is_some_and(|entry| {
+            previous_tips.len() == 1
+                && entry.prev_events.len() == 1
+                && entry
+                    .prev_events
+                    .first()
+                    .is_some_and(|parent| previous_tips.contains(parent))
+        }) && log.forward_extremities().len() == 1;
+        if linear {
+            return Ok(());
+        }
+        let Some(after) = log.current_state().cloned() else {
+            return Ok(());
+        };
+        let mut keys: BTreeSet<StateKey> = previous_current
+            .map(|before| {
+                before
+                    .diff(&after)
+                    .into_iter()
+                    .map(|(key, _, _)| key.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(key) = entry.and_then(|entry| entry.state_key.clone()) {
+            keys.insert(key);
+        }
+        for key in keys {
+            if key.event_type().as_str() != "m.room.member" {
+                continue;
+            }
+            let (content, li) = match after.get(&key) {
+                Some(id) => {
+                    let id = EventId::new(id);
+                    let body = self.read_event(room_id, &id)?;
+                    let li = log.get(&id).or(entry).map_or(0, |entry| entry.li.get());
+                    (body["content"].clone(), li)
+                }
+                None => (
+                    serde_json::json!({ "membership": "leave" }),
+                    entry.map_or(0, |entry| entry.li.get()),
+                ),
+            };
+            self.index_membership(room_id, Some(key.state_key()), &content, li)?;
         }
         Ok(())
     }
@@ -4419,36 +5592,26 @@ impl Rooms {
             .map(EventId::new)
             .collect();
 
+        // Resolved again rather than carried over from `build_event`: the
+        // two are the same question, so this is a cache hit, and for an
+        // event built before the log moved it is the right answer anyway.
+        let (state_before, resolved) = self.state_for_parents(log, room_id, &prev)?;
         let input = EventInput::new(event_id.clone(), prev);
         let input = match state_key {
             Some(state_key) => input.with_state_key(StateKey::new(event_type, state_key)),
             None => input,
         };
 
+        let previous_current = log.current_state().cloned();
+        let previous_tips = log.forward_extremities().clone();
         let entry = log
-            .append_remote(input)
-            .map_err(|error| {
-                // §9.2 case 3: the key is contested inside the window, so
-                // this append needs the resolver. `build_event` set the
-                // contesting tips aside before naming any, so this is
-                // reached only when the fork landed between building and
-                // committing -- the invite handshake leaves that gap open.
-                // Counted where the decision is made (#166), whether it
-                // is then resolved or — as today — refused.
-                if let spindle_core::AppendError::NeedsStateResolution { key, .. } = &error {
-                    self.metrics.record_contested_state();
-                    return RoomError::Contested {
-                        // The `type/state_key` spelling `/state_ids` uses,
-                        // so an operator can match this against what the
-                        // room actually reports holding.
-                        key: format!("{}/{}", key.event_type().as_str(), key.state_key()),
-                    };
-                }
-                RoomError::Append(format!("{error:?}"))
-            })?
+            .append_resolved(input, state_before)
+            .map_err(|error| self.append_error(&error))?
             .clone();
-        self.metrics
-            .record_append(crate::metrics::Origin::Local, case_of(state_key.is_some()));
+        self.metrics.record_append(
+            crate::metrics::Origin::Local,
+            case_of(state_key.is_some(), resolved),
+        );
 
         self.persist_entry(
             log,
@@ -4463,6 +5626,7 @@ impl Rooms {
                 json: &json,
             },
         )?;
+        self.settle(log, room_id, Some(&entry), previous_current, &previous_tips)?;
         self.enqueue_outbound(log, room_id, &json)?;
         Ok(event_id)
     }
@@ -4522,12 +5686,7 @@ impl Rooms {
     /// reentrant. Same rule as [`Self::rules_in`], and the same deadlock if
     /// it is broken.
     fn destinations_in(&self, log: &RoomLog, room_id: &str) -> Result<Arc<Vec<String>>, RoomError> {
-        let Some(state) = log
-            .entries()
-            .next_back()
-            .map(|entry| entry.li)
-            .and_then(|li| log.state_after(li))
-        else {
+        let Some(state) = log.current_state() else {
             return Ok(Arc::new(Vec::new()));
         };
         let root = *state.root().as_bytes();
@@ -4597,9 +5756,30 @@ impl Rooms {
             == Some(JOIN_STR.as_bytes()))
     }
 
-    /// The shared back half of receiving a complete, signed event: dedupe,
-    /// authorize, append, persist — and fan out only when this server is the
-    /// event's origin, because each server fans out its own events.
+    /// The shared back half of receiving a complete, signed event: the
+    /// spec's checks on receipt of a PDU, then append and persist -- and
+    /// fan out only when this server is the event's origin, because each
+    /// server fans out its own events.
+    ///
+    /// The checks, in the spec's order
+    /// (<https://spec.matrix.org/v1.16/server-server-api/#checks-performed-on-receipt-of-a-pdu>):
+    ///
+    /// 1. against the event's own auth events -- the state-independent rules
+    ///    on the list itself, then the rules against the state it names;
+    /// 2. against the state before the event: its parents' states, resolved
+    ///    by the room version's algorithm when they differ;
+    /// 3. against the room's current state, unless the event's parents are
+    ///    exactly the forward extremities (then the two are the same state).
+    ///
+    /// Failing 1 or 2 rejects the event; failing only 3 soft-fails it. Both
+    /// are kept, outside the timeline (`Sideline`): a later event may name
+    /// either as a parent, and its state is computed through them. An event
+    /// that passes is appended with the state before it, and the room's
+    /// current state is re-resolved over the new forward extremities.
+    ///
+    /// Parents or auth events this server does not hold are refused without
+    /// keeping anything: that is a gap to fill, not a verdict.
+    #[allow(clippy::too_many_lines, reason = "the receipt checks, in order")]
     fn ingest(
         &self,
         log: &mut RoomLog,
@@ -4609,63 +5789,93 @@ impl Rooms {
         fan_out: bool,
     ) -> Result<(), RoomError> {
         // Redelivery is not an error: transactions retry, and the event
-        // is already exactly where it would go.
+        // is already exactly where it would go. A redelivered event that
+        // was refused is refused again, with the same verdict.
         if log.get(&EventId::new(event_id)).is_some() {
             return Ok(());
         }
+        if log.historically_rejected(&EventId::new(event_id)) {
+            return Err(RoomError::Forbidden(format!(
+                "rejected: {event_id} was rejected before migration"
+            )));
+        }
+        if let Some(sidelined) = log.sidelined(&EventId::new(event_id)) {
+            return Err(RoomError::Forbidden(match sidelined.kind {
+                Sideline::SoftFailed => format!("{event_id} was soft-failed"),
+                Sideline::Rejected => format!("{event_id} was rejected"),
+            }));
+        }
         self.check_state_parents(log, room_id, json)?;
-        self.authorize(log, room_id, event_id, json)?;
 
         let event_type = json["type"].as_str().unwrap_or_default().to_owned();
         let state_key = json["state_key"].as_str().map(str::to_owned);
         let sender = json["sender"].as_str().unwrap_or_default().to_owned();
-        let redaction_target = if event_type == "m.room.redaction" {
-            let version = self.version_in_log(log, room_id)?;
-            let rules = rules_of(&version)?;
-            let target = if rules.redaction.content_field_redacts {
-                json["content"]["redacts"].as_str()
-            } else {
-                json["redacts"].as_str()
-            }
-            .ok_or_else(|| {
-                RoomError::Build(format!(
-                    "a room v{version} redaction has no target in the version's required field"
-                ))
-            })?;
-            Some(target.to_owned())
-        } else {
-            None
-        };
         let prev: Vec<EventId> = edge_ids(&json["prev_events"])
             .into_iter()
             .map(EventId::new)
             .collect();
+        if prev.is_empty() {
+            return Err(RoomError::Append(format!(
+                "{:?}",
+                AppendError::MissingPredecessor
+            )));
+        }
+        let (state_before, resolved) = self.state_for_parents(log, room_id, &prev)?;
+        let verdict =
+            self.receipt_checks(log, room_id, event_id, json, &state_before, &prev, None)?;
 
-        let input = EventInput::new(event_id, prev);
+        let input = EventInput::new(event_id, prev.clone());
         let input = match &state_key {
             Some(state_key) => {
                 input.with_state_key(StateKey::new(event_type.as_str(), state_key.as_str()))
             }
             None => input,
         };
+
+        if let Some((kind, reason)) = verdict {
+            let entry = log
+                .sideline(input, state_before, kind)
+                .map_err(|error| self.append_error(&error))?
+                .clone();
+            let state = log
+                .sidelined_state(&entry.event_id)
+                .cloned()
+                .unwrap_or_default();
+            let mut load = |root: &StateRoot| self.load_node(root);
+            let previous = prev
+                .first()
+                .and_then(|parent| log.state_after_any(parent, &mut load).ok());
+            RoomStore::new(self.store.as_ref(), room_id).journal_sidelined(
+                &entry,
+                &state,
+                previous.as_ref(),
+                log,
+                &[
+                    (event_body_key(room_id, event_id), serde_json::to_vec(json)?),
+                    (
+                        spindle_core::keys::event_room(event_id),
+                        room_id.as_bytes().to_vec(),
+                    ),
+                ],
+            )?;
+            self.metrics.record_sidelined(kind == Sideline::Rejected);
+            return Err(RoomError::Forbidden(match kind {
+                Sideline::SoftFailed => format!("soft-failed against the current state: {reason}"),
+                Sideline::Rejected => format!("rejected: {reason}"),
+            }));
+        }
+
+        let redaction_target = self.redaction_target(log, room_id, json)?;
+
+        let previous_current = log.current_state().cloned();
+        let previous_tips = log.forward_extremities().clone();
         let entry = log
-            .append_remote(input)
-            .map_err(|error| {
-                if let spindle_core::AppendError::NeedsStateResolution { key, .. } = &error {
-                    self.metrics.record_contested_state();
-                    return RoomError::Contested {
-                        // The `type/state_key` spelling `/state_ids` uses,
-                        // so an operator can match this against what the
-                        // room actually reports holding.
-                        key: format!("{}/{}", key.event_type().as_str(), key.state_key()),
-                    };
-                }
-                RoomError::Append(format!("{error:?}"))
-            })?
+            .append_resolved(input, state_before)
+            .map_err(|error| self.append_error(&error))?
             .clone();
         self.metrics.record_append(
             crate::metrics::Origin::Federated,
-            case_of(state_key.is_some()),
+            case_of(state_key.is_some(), resolved),
         );
 
         let content = json["content"].clone();
@@ -4682,21 +5892,194 @@ impl Rooms {
                 json,
             },
         )?;
+        self.settle(log, room_id, Some(&entry), previous_current, &previous_tips)?;
         // A federated redaction has the same effect as one authored here.
         // The target's location changed in v11, so it was resolved above
         // under this room's rules rather than by looking in both places and
         // accepting an ambiguous event. A target that has not arrived yet is
         // left untouched; normal transaction order and the predecessor edge
         // make the already-present case the common one.
-        if let Some(target) = redaction_target
-            && log.get(&EventId::new(target.as_str())).is_some()
-        {
-            self.apply_redaction(room_id, &target, event_id)?;
+        // A target backfilled into a gap's segment is held too; one not held
+        // anywhere, in a room whose gap is still being filled, waits for
+        // backfill to bring it in (`gaps::note_unheld_redaction`).
+        if let Some(target) = redaction_target {
+            if log.get(&EventId::new(target.as_str())).is_some()
+                || self.gap_position(room_id, &target)?.is_some()
+            {
+                self.apply_redaction(room_id, &target, event_id)?;
+            } else {
+                self.note_unheld_redaction(log, room_id, &target, event_id, json)?;
+            }
         }
         if fan_out {
             self.enqueue_outbound(log, room_id, json)?;
         }
         Ok(())
+    }
+
+    /// The event a received redaction targets, read from the field the
+    /// room version puts it in; `None` for any other event.
+    ///
+    /// Resolved under this room's rules rather than by looking in both
+    /// places, so an ambiguous event is refused instead of guessed at.
+    fn redaction_target(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        json: &Value,
+    ) -> Result<Option<String>, RoomError> {
+        if json["type"].as_str() != Some("m.room.redaction") {
+            return Ok(None);
+        }
+        let version = self.version_in_log(log, room_id)?;
+        let rules = rules_of(&version)?;
+        let target = if rules.redaction.content_field_redacts {
+            json["content"]["redacts"].as_str()
+        } else {
+            json["redacts"].as_str()
+        }
+        .ok_or_else(|| {
+            RoomError::Build(format!(
+                "a room v{version} redaction has no target in the version's required field"
+            ))
+        })?;
+        Ok(Some(target.to_owned()))
+    }
+
+    /// The spec's checks on receipt of a PDU, past signatures and hashes:
+    /// `None` to accept, or the verdict and the rule that refused.
+    ///
+    /// A malformed event, or one whose auth events this server does not
+    /// hold, is an error rather than a verdict -- nothing is kept for it.
+    ///
+    /// `current` stands in for the room's current state in check 3 when
+    /// given: an event accepted across a gap is soft-fail checked against
+    /// the resolution of our extremities and the state it was sent in,
+    /// because our own current state is exactly what a gap makes stale.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the checks' inputs, each one named by the spec"
+    )]
+    fn receipt_checks(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        event_id: &str,
+        json: &Value,
+        state_before: &StateSnapshot,
+        prev: &[EventId],
+        current: Option<&StateSnapshot>,
+    ) -> Result<Option<(Sideline, String)>, RoomError> {
+        use ruma::state_res::events::Event as _;
+
+        let candidate = StoredEvent::parse_in(event_id, room_id, json).map_err(|error| {
+            RoomError::Build(format!("cannot authorize a malformed event: {error}"))
+        })?;
+        let rules = self.rules_in(log, room_id)?;
+        let fetch =
+            |id: &ruma::EventId| -> Option<StoredEvent> {
+                let body = self.read_event(room_id, &EventId::new(id.as_str())).ok()?;
+                let event = StoredEvent::parse_auth_in(id.as_str(), room_id, &body).ok()?;
+                let rejected = log
+                    .sidelined(&EventId::new(id.as_str()))
+                    .is_some_and(|entry| entry.kind == Sideline::Rejected);
+                Some(event.with_rejected(rejected).with_preserved_rejection(
+                    log.historically_rejected(&EventId::new(id.as_str())),
+                ))
+            };
+
+        // 1. The auth events. A state-DAG room (MSC4242) carries none: its
+        // events are authorized by the state DAG, which 2 checks.
+        let version = self.version_in_log(log, room_id)?;
+        if !is_state_dag(&version) {
+            let missing = std::cell::Cell::new(false);
+            if let Err(why) = ruma::state_res::check_state_independent_auth_rules(
+                &rules.authorization,
+                candidate.clone(),
+                |id| {
+                    let event = fetch(id);
+                    if event.is_none() {
+                        missing.set(true);
+                    }
+                    event
+                },
+            ) {
+                // A known invalid auth entry is already a verdict, even if
+                // later entries are absent. Preserve its predecessor state
+                // so valid descendants can follow it. An actual missing
+                // dependency stays retryable and receives no stored verdict.
+                if missing.get() {
+                    return Err(RoomError::Append(format!("auth events: {why}")));
+                }
+                return Ok(Some((Sideline::Rejected, format!("auth events: {why}"))));
+            }
+            let mut named: HashMap<(ruma::events::StateEventType, String), StoredEvent> =
+                HashMap::new();
+            for id in candidate.auth_event_ids() {
+                let Some(event) = fetch(id) else {
+                    return Err(RoomError::Append(format!(
+                        "auth event {id} of {event_id} is not held here"
+                    )));
+                };
+                if let Some(key) = event.state_key() {
+                    named.insert(
+                        (
+                            ruma::events::StateEventType::from(event.event_type().to_string()),
+                            key.to_owned(),
+                        ),
+                        event,
+                    );
+                }
+            }
+            if rules.authorization.room_create_event_id_as_room_id
+                && let Some(hash) = room_id.strip_prefix('!')
+                && let Ok(create_id) = ruma::OwnedEventId::try_from(format!("${hash}"))
+                && let Some(create) = fetch(&create_id)
+            {
+                named.insert(
+                    (ruma::events::StateEventType::RoomCreate, String::new()),
+                    create,
+                );
+            }
+            if let Err(why) =
+                crate::authorize::authorize(&rules.authorization, &candidate, |kind, key| {
+                    named
+                        .get(&(kind.clone(), key.to_owned()))
+                        .filter(|event| !event.rejected())
+                        .cloned()
+                })
+            {
+                return Ok(Some((Sideline::Rejected, format!("auth events: {why}"))));
+            }
+        }
+
+        // 2. The state before the event.
+        let by_state = |state: &StateSnapshot, kind: &ruma::events::StateEventType, key: &str| {
+            let id = state.get(&StateKey::new(kind.to_string().as_str(), key))?;
+            fetch(&ruma::OwnedEventId::try_from(id).ok()?).filter(|event| !event.rejected())
+        };
+        if let Err(why) =
+            crate::authorize::authorize(&rules.authorization, &candidate, |kind, key| {
+                by_state(state_before, kind, key)
+            })
+        {
+            return Ok(Some((Sideline::Rejected, why)));
+        }
+
+        // 3. The room's current state -- skipped when the parents are the
+        // forward extremities, because then it is the state before.
+        let tips: BTreeSet<&EventId> = log.forward_extremities().iter().collect();
+        let parents: BTreeSet<&EventId> = prev.iter().collect();
+        if tips != parents
+            && let Some(current) = current.or_else(|| log.current_state())
+            && let Err(why) =
+                crate::authorize::authorize(&rules.authorization, &candidate, |kind, key| {
+                    by_state(current, kind, key)
+                })
+        {
+            return Ok(Some((Sideline::SoftFailed, why)));
+        }
+        Ok(None)
     }
 
     /// Everything an appended entry writes beside itself, shared by the
@@ -4931,22 +6314,23 @@ impl Rooms {
         room_id: &str,
         event_id: &str,
         json: &Value,
+        state: Option<&StateSnapshot>,
     ) -> Result<(), RoomError> {
         let candidate = StoredEvent::parse_in(event_id, room_id, json).map_err(|error| {
             RoomError::Build(format!("cannot authorize a malformed event: {error}"))
         })?;
 
-        // Nothing is resident before the create event, and the create event is
-        // the one the rules check without any state at all.
-        let state = log
-            .entries()
-            .next_back()
-            .map(|entry| entry.li)
-            .and_then(|li| log.state_after(li));
-
+        // `state` is what the event sits on: the state before it, which for
+        // an event naming every forward extremity is the current state.
+        // `None` only for the create event, which the rules check without
+        // any state at all.
         let load = |id: &str| -> Option<StoredEvent> {
             let body = self.read_event(room_id, &EventId::new(id)).ok()?;
-            StoredEvent::parse_in(id, room_id, &body).ok()
+            StoredEvent::parse_auth_in(id, room_id, &body)
+                .ok()
+                .map(|event| {
+                    event.with_preserved_rejection(log.historically_rejected(&EventId::new(id)))
+                })
         };
 
         // Per-room, for the same reason as redaction above and with more at
@@ -5062,6 +6446,115 @@ impl Rooms {
         )?
         .ok_or_else(|| RoomError::MissingBody(event_id.as_str().to_owned()))?;
         Ok(serde_json::from_slice(&raw)?)
+    }
+
+    /// The `sender` of a stored event, as [`Self::read_event`] followed by
+    /// `["sender"].as_str().unwrap_or("")` would give it, without building
+    /// the rest of the body. The unread index reads this for every event it
+    /// indexes and nothing else, and the event's content is most of its
+    /// size.
+    fn read_sender(&self, room_id: &str, event_id: &EventId) -> Result<String, RoomError> {
+        #[derive(serde::Deserialize)]
+        struct Sender<'a> {
+            #[serde(borrow, default)]
+            sender: Option<std::borrow::Cow<'a, str>>,
+        }
+        let raw = spindle_store::ReadView::get(
+            self.store.as_ref(),
+            &event_body_key(room_id, event_id.as_str()),
+        )?
+        .ok_or_else(|| RoomError::MissingBody(event_id.as_str().to_owned()))?;
+        if let Ok(Sender { sender }) = serde_json::from_slice::<Sender<'_>>(&raw) {
+            return Ok(sender.map(std::borrow::Cow::into_owned).unwrap_or_default());
+        }
+        // Whatever the narrow read refuses -- a sender that is not a
+        // string, a repeated key -- is answered the way the whole-body
+        // read answers it, errors included.
+        let event: Value = serde_json::from_slice(&raw)?;
+        Ok(event["sender"].as_str().unwrap_or("").to_owned())
+    }
+}
+
+/// One cold load in flight ([`Rooms::room_or_load`]): its outcome once it
+/// has one, and the waiters waiting for it.
+#[derive(Default)]
+struct ColdLoad {
+    outcome: Mutex<LoadOutcome>,
+    finished: std::sync::Condvar,
+}
+
+/// Where a [`ColdLoad`] has got to.
+#[derive(Default)]
+enum LoadOutcome {
+    #[default]
+    Loading,
+    Published(Arc<RwLock<RoomLog>>),
+    Failed,
+}
+
+impl ColdLoad {
+    /// Wait for the load to finish: the room it published, or `None` if it
+    /// failed.
+    fn wait(&self) -> Option<Arc<RwLock<RoomLog>>> {
+        let mut outcome = self
+            .outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            match &*outcome {
+                LoadOutcome::Loading => {}
+                LoadOutcome::Published(room) => return Some(Arc::clone(room)),
+                LoadOutcome::Failed => return None,
+            }
+            outcome = self
+                .finished
+                .wait(outcome)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+/// See [`Rooms::claim_load`].
+enum Claim {
+    Resident(Arc<RwLock<RoomLog>>),
+    Lead(Arc<ColdLoad>),
+    Follow(Arc<ColdLoad>),
+}
+
+/// The caller performing a room's cold load. Dropping it -- on success,
+/// error or unwind alike -- records the outcome, wakes every waiter and
+/// retires the slot, so the next caller after a failure loads afresh.
+struct Lead<'a> {
+    rooms: &'a Rooms,
+    room_id: &'a str,
+    slot: Arc<ColdLoad>,
+    outcome: Option<Arc<RwLock<RoomLog>>>,
+}
+
+impl Drop for Lead<'_> {
+    fn drop(&mut self) {
+        {
+            let mut loading = self
+                .rooms
+                .loading
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if loading
+                .get(self.room_id)
+                .is_some_and(|slot| Arc::ptr_eq(slot, &self.slot))
+            {
+                loading.remove(self.room_id);
+            }
+        }
+        *self
+            .slot
+            .outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = match self.outcome.take() {
+            Some(room) => LoadOutcome::Published(room),
+            None => LoadOutcome::Failed,
+        };
+        self.slot.finished.notify_all();
     }
 }
 
@@ -5208,22 +6701,16 @@ fn rules_of(version: &RoomVersionId) -> Result<RoomVersionRules, RoomError> {
         .ok_or_else(|| RoomError::Build(format!("no rules for room version {version}")))
 }
 
+/// One slot of the room's current state: the forward extremities' states,
+/// resolved when a fork left several (`RoomLog::current_state`).
 fn current_state_id(log: &RoomLog, wanted: &StateKey) -> Option<String> {
-    log.entries()
-        .next_back()
-        .map(|entry| entry.li)
-        .and_then(|li| log.state_after(li))
+    log.current_state()
         .and_then(|state| state.get(wanted).map(str::to_owned))
 }
 
 /// The room's current state, as `(key, event_id)` pairs.
 fn current_state(log: &RoomLog) -> Vec<(StateKey, String)> {
-    let Some(state) = log
-        .entries()
-        .next_back()
-        .map(|entry| entry.li)
-        .and_then(|li| log.state_after(li))
-    else {
+    let Some(state) = log.current_state() else {
         return Vec::new();
     };
     let mut out = Vec::with_capacity(state.len());
@@ -5235,12 +6722,13 @@ fn current_state(log: &RoomLog) -> Vec<(StateKey, String)> {
     out
 }
 
-/// Which of SPEC §9.2's cheap cases an append took.
-///
-/// Case 3 is never returned here: a contested key does not reach a
-/// successful append, so it is counted at the error instead.
-fn case_of(is_state: bool) -> crate::metrics::ForkCase {
-    if is_state {
+/// Which of SPEC §9.2's cases an append took: whether its parents' states
+/// had to be resolved (case 3, now the room version's algorithm), and
+/// otherwise whether it was a state event.
+fn case_of(is_state: bool, resolved: bool) -> crate::metrics::ForkCase {
+    if resolved {
+        crate::metrics::ForkCase::StateContested
+    } else if is_state {
         crate::metrics::ForkCase::StateUncontested
     } else {
         crate::metrics::ForkCase::NonState
@@ -5258,6 +6746,15 @@ fn purged_marker() -> Value {
         "type": "org.spindle.purged",
         "content": {},
     })
+}
+
+/// The `(user_id, room_id)` a membership-index key names: a schema byte,
+/// a keyspace byte, the user's big-endian length and bytes, then the room.
+fn split_user_room(key: &[u8]) -> Option<(String, String)> {
+    let length = usize::from(u16::from_be_bytes([*key.get(2)?, *key.get(3)?]));
+    let user = std::str::from_utf8(key.get(4..4 + length)?).ok()?;
+    let room = std::str::from_utf8(key.get(4 + length..)?).ok()?;
+    Some((user.to_owned(), room.to_owned()))
 }
 
 /// Event bodies live beside the log, keyed by room and event ID.
@@ -5319,7 +6816,7 @@ fn sanitized_member_content(event_type: &str, content: &Value) -> Value {
 }
 
 fn auth_events_for(
-    log: &RoomLog,
+    state: Option<&StateSnapshot>,
     rules: &ruma::room_version_rules::AuthorizationRules,
     sender: &str,
     event_type: &str,
@@ -5329,14 +6826,9 @@ fn auth_events_for(
     if event_type == "m.room.create" {
         return Ok(Vec::new());
     }
-    let head = log
-        .entries()
-        .next_back()
-        .map(|entry| entry.li)
+    let state = state
+        .filter(|state| !state.is_empty())
         .ok_or_else(|| RoomError::StateUnavailable("the room has no events".to_owned()))?;
-    let state = log.state_after(head).ok_or_else(|| {
-        RoomError::StateUnavailable(format!("the state after li {} is not resident", head.get()))
-    })?;
 
     let mut auth = Vec::new();
     let mut cite = |kind: &str, key: &str| {
@@ -5344,7 +6836,11 @@ fn auth_events_for(
             auth.push(id.to_owned());
         }
     };
-    cite("m.room.create", "");
+    // v12 derives the create event from the room ID and forbids it in
+    // auth_events. Earlier versions require an explicit reference.
+    if !rules.room_create_event_id_as_room_id {
+        cite("m.room.create", "");
+    }
     cite("m.room.power_levels", "");
     cite("m.room.member", sender);
     if event_type == "m.room.member" {
@@ -5795,7 +7291,18 @@ fn highest_stream_id(store: &FjallStore, from_stream: u64) -> u64 {
             })
             .max()
             .unwrap_or(0);
+    // A completed fresh import fences historical notifications at this durable
+    // global position. Pending side-stream rows can later be consumed/deleted;
+    // restarting below the push cursor would assign new events old IDs and
+    // silently suppress their notifications. Malformed rows retain the same
+    // ignore policy as the other counter drawers above.
+    let from_push_cursor = spindle_store::ReadView::get(store, &spindle_core::keys::push_cursor())
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_slice().try_into().map(u64::from_be_bytes).ok())
+        .unwrap_or(0);
     from_stream
+        .max(from_push_cursor)
         .max(from_to_device)
         .max(from_device_lists)
         .max(from_pending_invites)
@@ -6586,4 +8093,190 @@ fn power_levels_content(
         }
     }
     Ok(content)
+}
+
+#[cfg(test)]
+mod cold_registry_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn rooms() -> (tempfile::TempDir, Arc<Rooms>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let rooms = Arc::new(Rooms::new(store, "test"));
+        (dir, rooms)
+    }
+
+    #[test]
+    fn blocked_cold_load_does_not_block_an_unrelated_warm_room() {
+        let (_dir, rooms) = rooms();
+        rooms
+            .room_or_load("!warm:test", || Ok(RoomLog::new()))
+            .unwrap();
+        let (entered, inside) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let cold = Arc::clone(&rooms);
+        let thread = std::thread::spawn(move || {
+            cold.room_or_load("!cold:test", || {
+                entered.send(()).unwrap();
+                held.recv().unwrap();
+                Ok(RoomLog::new())
+            })
+            .unwrap()
+        });
+        inside.recv_timeout(Duration::from_secs(2)).unwrap();
+        let warm = Arc::clone(&rooms);
+        let (done, result) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            warm.room("!warm:test").unwrap();
+            done.send(()).unwrap();
+        });
+        let progressed = result.recv_timeout(Duration::from_secs(2));
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        reader.join().unwrap();
+        assert!(
+            progressed.is_ok(),
+            "warm room blocked behind unrelated cold I/O"
+        );
+    }
+
+    /// A cold room is loaded once however many callers want it at once:
+    /// the second waits for the first's load and is handed the same lock.
+    #[test]
+    fn concurrent_cold_loads_of_one_room_share_one_load() {
+        let (_dir, rooms) = rooms();
+        let (entered, inside) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let first = Arc::clone(&rooms);
+        let leader = std::thread::spawn(move || {
+            first
+                .room_or_load("!same:test", || {
+                    entered.send(()).unwrap();
+                    held.recv().unwrap();
+                    Ok(RoomLog::new())
+                })
+                .unwrap()
+        });
+        inside.recv_timeout(Duration::from_secs(2)).unwrap();
+        let second_loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (done, finished) = mpsc::channel();
+        let second = Arc::clone(&rooms);
+        let counted = Arc::clone(&second_loads);
+        let follower = std::thread::spawn(move || {
+            let room = second
+                .room_or_load("!same:test", || {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(RoomLog::new())
+                })
+                .unwrap();
+            done.send(()).unwrap();
+            room
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the second caller waits for the load in flight"
+        );
+        release.send(()).unwrap();
+        let first_room = leader.join().unwrap();
+        let second_room = follower.join().unwrap();
+        assert!(Arc::ptr_eq(&first_room, &second_room));
+        assert_eq!(
+            second_loads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the room was loaded once"
+        );
+        assert!(rooms.loading.lock().unwrap().is_empty());
+    }
+
+    /// A load that fails, or panics, releases its waiters to load for
+    /// themselves rather than handing them its failure or stranding them.
+    #[test]
+    fn a_failed_or_panicked_cold_load_lets_a_waiter_load() {
+        for panics in [false, true] {
+            let (_dir, rooms) = rooms();
+            let (entered, inside) = mpsc::channel();
+            let (release, held) = mpsc::channel::<()>();
+            let first = Arc::clone(&rooms);
+            let leader = std::thread::spawn(move || {
+                first.room_or_load("!flaky:test", || {
+                    entered.send(()).unwrap();
+                    held.recv().unwrap();
+                    assert!(!panics, "the leader's load panicked");
+                    Err(RoomError::UnknownRoom("!flaky:test".to_owned()))
+                })
+            });
+            inside.recv_timeout(Duration::from_secs(2)).unwrap();
+            let second = Arc::clone(&rooms);
+            let follower = std::thread::spawn(move || {
+                second.room_or_load("!flaky:test", || {
+                    let mut log = RoomLog::new();
+                    log.append_local("$second", None).unwrap();
+                    Ok(log)
+                })
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            release.send(()).unwrap();
+            let first_outcome = leader.join();
+            if panics {
+                assert!(first_outcome.is_err());
+            } else {
+                assert!(matches!(
+                    first_outcome.unwrap(),
+                    Err(RoomError::UnknownRoom(_))
+                ));
+            }
+            let room = follower.join().unwrap().unwrap();
+            assert_eq!(room.read().unwrap().len(), 1);
+            assert!(Arc::ptr_eq(&room, &rooms.resident("!flaky:test").unwrap()));
+            assert!(rooms.loading.lock().unwrap().is_empty());
+        }
+    }
+
+    /// Publication never replaces a lock already in the registry: a room
+    /// another path installed while this load ran keeps its lock and what
+    /// was appended through it.
+    #[test]
+    fn cold_load_publication_keeps_the_canonical_arc_and_its_appends() {
+        let (_dir, rooms) = rooms();
+        let (entered, inside) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let first = Arc::clone(&rooms);
+        let thread = std::thread::spawn(move || {
+            first
+                .room_or_load("!same:test", || {
+                    entered.send(()).unwrap();
+                    held.recv().unwrap();
+                    Ok(RoomLog::new())
+                })
+                .unwrap()
+        });
+        inside.recv_timeout(Duration::from_secs(2)).unwrap();
+        let published = Arc::new(RwLock::new(RoomLog::new()));
+        rooms
+            .open
+            .write()
+            .unwrap()
+            .insert("!same:test".to_owned(), Arc::clone(&published));
+        published
+            .write()
+            .unwrap()
+            .append_local("$new", None)
+            .unwrap();
+        release.send(()).unwrap();
+        let late = thread.join().unwrap();
+        assert!(Arc::ptr_eq(&published, &late));
+        assert_eq!(late.read().unwrap().len(), 1);
+        assert_eq!(
+            late.read()
+                .unwrap()
+                .entries()
+                .next_back()
+                .unwrap()
+                .event_id
+                .as_str(),
+            "$new"
+        );
+    }
 }

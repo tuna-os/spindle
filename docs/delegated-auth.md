@@ -167,7 +167,24 @@ public_base_url = "https://matrix.example.org"
 
 [auth]
 builtin_oidc = true
+# Optional (#609): an issuer on a host of its own. Omitted, the issuer is
+# the client base URL above.
+# oidc_issuer = "https://auth.example.org/"
 ```
+
+`oidc_issuer` lets Spindle replace a MAS in place. Clients remember the
+issuer they logged in against, and MAS lives on its own host.
+
+Set
+`oidc_issuer` to the origin of that host, and point the reverse proxy of
+that host at Spindle. Then each advertised URL stays on the issuer that
+the clients already know. This covers the discovery document,
+`/_matrix/client/v1/auth_metadata` and its MSC2965 unstable alias, the
+`/.well-known/matrix/client` authentication block, and each endpoint.
+
+The value must be an origin. Spindle serves the provider routes at the root
+of each host that gets to it, so a path would advertise URLs that nothing
+serves. The server does not start with a path.
 
 With that, Spindle itself serves the small provider surface those
 clients need — discovery (`/.well-known/openid-configuration`, relayed
@@ -185,10 +202,153 @@ machinery, no signing keys to rotate, and nothing new to back up.
 Password login and registration stay on: the provider is a second door
 into the same accounts, not a second set of accounts.
 
-It is the floor, not a MAS replacement: no upstream identity providers,
-no SSO, no email flows, no account-management UI. When you need those,
-deploy MAS — `builtin_oidc` and `[auth.delegated]` refuse to be
-configured together, because one identity authority is the point.
+### Account management (#607)
+
+An OIDC-native client has no account settings of its own, so the provider
+serves them, as MAS does. They are server-rendered pages (plain HTML
+forms, no script) at `{issuer}/account/`. The discovery document and
+`auth_metadata` advertise them as MSC4191's `account_management_uri`. They also
+appear as `account` in the `/.well-known/matrix/client` authentication block.
+
+| Page | Deep link (`?action=`) | What it does |
+|---|---|---|
+| Profile | `org.matrix.profile` (and any unknown action) | Display name and avatar (`mxc://`), propagated into every joined room's member event, as `PUT /profile` does. |
+| Password | `password` | Change it: current password required; by default also signs out every device and every other browser. |
+| Devices | `org.matrix.sessions_list` / `org.matrix.devices_list` | List devices; `org.matrix.session_view` / `org.matrix.device_view` and `org.matrix.session_end` / `org.matrix.device_delete` with `device_id=` show one, with a sign-out button. Signing out removes the device, its tokens and E2EE material and announces the device-list change, as `DELETE /devices/{id}` does. |
+| Deactivate | `org.matrix.account_deactivate` | Password plus an explicit confirmation; optionally erases the profile. Leaves every room, then the same deactivation the admin API performs. |
+| Cross-signing reset | `org.matrix.cross_signing_reset` | Spindle demands no approval for replacing cross-signing keys, and the page says so rather than inventing a step. |
+| Email | `emails` | With `[email]`: confirmed addresses, add (password required, confirmed by a mailed link) and remove. |
+
+The pages sit behind a **browser session**. A sign-in on the
+authorization page or at `/account/login` sets an `HttpOnly`,
+`SameSite=Lax` cookie that lasts a week (`Secure` when the issuer is
+https). The server keeps only its BLAKE3 digest. With it, a second client's
+authorization shows "Continue as @you" instead of the password form;
+`prompt=login` forces the password.
+
+Security properties, all tested in `tests/account_management.rs`:
+
+- each POST carries a CSRF token, compared in constant time. After
+  sign-in it is the session's own secret; before, a double-submit cookie;
+- a password change, a new address and a deactivation each check the
+  current password again. Each password check, on each page, spends the
+  budget of the client API's `/login`. That is 5/min per account and
+  30/min per source. A guesser gets nothing from a change of door;
+- pages send `Content-Security-Policy` with `frame-ancestors 'none'`,
+  `X-Frame-Options: DENY`, `Cache-Control: no-store` and
+  `Referrer-Policy: no-referrer`;
+- the redirect after sign-in (`next`) is always a `/account` path on
+  this server. The OAuth redirect is always a URI that the client
+  registered, as before.
+
+### Email and password reset (#608)
+
+Configure an SMTP relay with `[email]` (see `spindle.example.toml`:
+`from`, `smtp_host`, `tls` = `starttls`|`tls`|`none`, `smtp_port`,
+`username`, `password` or `password_file`). Then:
+
+- **Addresses.** On the Email page a user adds an address (with their
+  password). The server mails a link to it. The address binds only when
+  the user pushes the confirmation button of the link. A visit to the link
+  (as mail scanners do) binds nothing. An address belongs to one account
+  at most. A claim on a taken address looks the same as a claim on a free
+  one, and mails nobody. Deactivation releases the account's addresses.
+- **Forgotten password.** The sign-in pages link to
+  `/account/password/forgot`. Its answer is the same page, status and
+  work for each input. The lookup, the token and the mail happen after
+  the response, in their own task. Thus the page and its timing do not
+  show if an address has an account. The link works once, for an hour.
+  Only the newest link works. A user who follows it and sets a new
+  password signs out each device and browser.
+- Links carry 256 random bits; the server keeps only their digests. The
+  server limits requests per source (5 per 15 min). It also limits them
+  per address (3 per hour), for an address with no account too. It limits confirmation
+  mails per account (5 per hour).
+- `GET /_matrix/client/v3/account/3pid` lists the confirmed addresses.
+  The server does not serve the client API calls that add and remove them
+  (`requestToken` and friends); use the account pages. Under
+  `[auth.delegated]` the endpoint stays absent, as before.
+- Nothing logs an address, a token or a link. The log records a delivery
+  failure only by class (permanent, transient, connection).
+
+[metrics.md](metrics.md) has the metrics for all of this. They count
+sign-ins by door and result, token grants, resets requested and completed,
+mail sent and failed, and account actions.
+
+### Password recovery without email
+
+`[email]` is optional, and a server without it is not stuck when a user
+forgets their password. Two ways back need no mail at all:
+
+- **Recovery codes.** The account pages' *Recovery codes* section
+  (`?action=recovery`) makes a set of ten codes, behind the current
+  password. Each code works one time. The page shows them once; a new set
+  retires the old one. The sign-in pages link to *Use a recovery code*
+  (`/account/recover`): username, one code and a new password. This uses up
+  the code. The password changes, and each device and browser signs out.
+  Each code is 80 random bits. The server keeps a per-code salt and
+  `BLAKE3(salt ‖ code)`, not Argon2. A slow hash is for secrets that a
+  person can guess. With any hash, a person cannot guess 80 random bits.
+  And ten Argon2 runs per try would let anyone who can post the form burn
+  CPU and memory. Tries spend the same per-account and per-source budget
+  as a password (5 and 30 a minute). An unknown user and a wrong code get
+  the same answer.
+- **An administrator's reset link.** Two commands return a URL on the
+  issuer, once. `spindle issue-reset-link <config> <localpart> [--ttl 24h]`
+  works offline, like `set-password-hash`. For a live server, use
+  `POST /_spindle/admin/v1/users/{user_id}/reset_link` with an optional
+  `{"ttl": "2h"}`. Give the URL to the user by a channel you trust. It is the same link
+  that a mailed reset sends. It works one time, for a day by default and
+  a week at most. The server keeps only its digest, and a newer link
+  replaces it. It opens the same *choose a new password* page, which signs
+  each device out. The
+  admin API records the issuance and its lifetime in the audit log, never
+  the token.
+
+Without `[email]` the sign-in pages show only *Use a recovery code*, and
+there is no Email page or forgotten-password form; with it, both ways
+appear. Metrics: `spindle_password_recoveries_total{method,result}` and
+`spindle_reset_links_issued_total` ([metrics.md](metrics.md)).
+
+### Moving from MAS to the built-in provider
+
+What carries over, and how:
+
+1. **The issuer.** Set `oidc_issuer` to MAS's public origin and point that
+   host's reverse proxy at Spindle. The stored issuer and endpoints of
+   each client then continue to resolve (above).
+2. **Passwords.** MAS keeps Argon2id hashes in PHC form (`user_passwords`); import
+   them with `POST /_spindle/admin/v1/users/{user_id}/password_hash` or the
+   offline `spindle set-password-hash` (see [lifecycle.md](lifecycle.md)).
+   Both validate the hash and work while authentication is still
+   delegated, so hashes can land before the switch. A MAS scheme with a
+   `secret` (pepper) makes hashes that look ordinary. They never verify
+   here.
+3. **Sessions do not carry over.** The access and refresh tokens
+   of MAS stay with MAS. After the switch, clients sign in again. They do
+   this once, because the browser session then covers the rest.
+4. **Email addresses** do not carry over yet: users add them again on
+   the Email page.
+5. **Upstream identity providers** (MAS `upstream_oauth2`) are not
+   supported. A user who only signed in through one has no password here.
+   Give that user an administrator's reset link (above), with or without
+   mail.
+
+### Upstream identity providers (#610): not yet
+
+Sign-in through another OIDC provider is the next step. It is not in
+this release.
+
+The design hook is the authorization page. `authorize` in
+`oidc.rs` finds *who* signs in (today: a password, or a browser session)
+and then mints a code. An upstream provider becomes a third way to find
+the localpart. It adds a redirect to the upstream with its own PKCE and
+state. It adds a callback that validates the ID token and maps the
+subject to a localpart.
+
+That map is a link table with issuer and subject as its key, beside the `BrowserSession` and `EmailOwner` keyspaces. After
+that come the same browser session and code issue as a password sign-in.
+Nothing downstream of the localpart changes.
 
 The proof it works — Element Web completing the whole OIDC-native flow
 against a lone Spindle process, with nothing else running — is
