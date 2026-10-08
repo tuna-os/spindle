@@ -840,3 +840,66 @@ async fn a_rotation_seen_here_keeps_the_old_document_for_history() {
     assert!(metrics.key_fetch_count(KeySource::Cache, KeyFetchResult::Hit) >= 1);
     assert!(!harness.joined(&alice, &room, &user).await);
 }
+
+#[tokio::test]
+async fn an_event_for_a_room_this_server_does_not_hold_is_refused_as_such() {
+    // Production: zoft.chat's member events for a matrix.org room this
+    // server was never in were judged under a guessed room version and
+    // reported as bad signatures. Signed correctly under v10, with the
+    // top-level `origin` v10 keeps and v11 drops, the event must be
+    // refused for the room, not for its signature -- and cost no key fetch
+    // beyond the transaction's own.
+    let notary = Notary::start(false).await;
+    let server = KeyServer::start().await;
+    let key = pair("k");
+    server.serve(key_document(
+        &server.name,
+        &[&key],
+        &[],
+        now_millis() + 600_000,
+        &key,
+    ));
+    let harness = Harness::trusting(&notary);
+    let user = format!("@zoftty:{}", server.name);
+    let event = json!({
+        "type": "m.room.member",
+        "state_key": user,
+        "sender": user,
+        "room_id": "!WkXpJtuGLWMIyiLsvY:matrix.org",
+        "origin": server.name,
+        "content": { "membership": "join" },
+        "origin_server_ts": now_millis(),
+        "depth": 10,
+        "prev_events": ["$RU3YeeQg1OrOy4EOFLVkG3B-cCzMJmZeks2LgZBnxqg"],
+        "auth_events": ["$TkE8rLdzybM4iYdTBB-v-S7oOjObeccOc-oe602mi-U"],
+    });
+    let ruma::CanonicalJsonValue::Object(mut canonical) =
+        ruma::CanonicalJsonValue::try_from(event).unwrap()
+    else {
+        unreachable!()
+    };
+    let rules = RoomVersionId::V10.rules().unwrap();
+    hash_and_sign_event(&server.name, &key, &mut canonical, &rules.redaction).unwrap();
+    let event = serde_json::to_value(&canonical).unwrap();
+
+    let result = harness.deliver(&server.name, &key, "t1", vec![event]).await;
+    let error = result["error"].as_str().unwrap_or_default();
+    assert!(error.contains("unknown room"), "{result}");
+    assert!(!error.contains("signature"), "{result}");
+    let metrics = &harness.metrics;
+    for reason in [
+        SignatureFailure::NoKey,
+        SignatureFailure::ExpiredKey,
+        SignatureFailure::BadSignature,
+        SignatureFailure::MissingSignature,
+        SignatureFailure::Malformed,
+    ] {
+        assert_eq!(metrics.signature_failure_count(reason), 0, "{reason:?}");
+    }
+    assert_eq!(notary.queries.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        server.fetches.load(Ordering::SeqCst),
+        1,
+        "the request's own"
+    );
+}

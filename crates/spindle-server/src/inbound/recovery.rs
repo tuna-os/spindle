@@ -471,6 +471,34 @@ pub(super) async fn receive(
     (id, result)
 }
 
+/// The version to judge an event for a room this server does not hold
+/// under, if it is one this server should judge at all: a leave or ban of
+/// one of our users whose invite there is still pending
+/// (`Rooms::receive_remote` clears it). The version is the one the invite's
+/// stripped `m.room.create` names, or else read off the event's shape.
+fn unheld_room_version(state: &AppState, room_id: &str, pdu: &Value) -> Option<RoomVersionId> {
+    if pdu["type"].as_str() != Some("m.room.member")
+        || !matches!(pdu["content"]["membership"].as_str(), Some("leave" | "ban"))
+    {
+        return None;
+    }
+    let target = pdu["state_key"].as_str()?;
+    if target.split_once(':').map(|(_, domain)| domain) != Some(state.config.server.name.as_str()) {
+        return None;
+    }
+    let pending = state.rooms.pending_invite(target, room_id).ok()??;
+    let stated = pending["invite_state"]
+        .as_array()
+        .and_then(|events| {
+            events
+                .iter()
+                .find(|event| event["type"].as_str() == Some("m.room.create"))
+        })
+        .filter(|create| create["content"]["room_version"].is_string())
+        .and_then(|create| crate::rooms::version_in(&create["content"]).ok());
+    Some(stated.unwrap_or_else(|| super::room_version_of(state, pdu)))
+}
+
 async fn judge(
     state: &AppState,
     origin: &str,
@@ -497,10 +525,26 @@ async fn judge(
             Err("no room_id".to_owned()),
         );
     };
-    let version = state
-        .rooms
-        .room_version(room_id)
-        .unwrap_or_else(|_| super::room_version_of(state, pdu));
+    let version = match state.rooms.room_version(room_id) {
+        Ok(version) => version,
+        // A room this server does not hold has no version to judge the
+        // event under, and judging it under a guess turns a version
+        // mismatch into "bad signature" -- what production logged for
+        // zoft.chat's events in a room it was never in. The one thing such
+        // an event may say is that our user's pending invite there ended;
+        // anything else is refused here, before a key is fetched.
+        Err(RoomError::UnknownRoom(_)) => match unheld_room_version(state, room_id, pdu) {
+            Some(version) => version,
+            None => {
+                return (
+                    "$unknown-room".to_owned(),
+                    PduOutcome::Refused,
+                    Err(format!("unknown room: this server does not hold {room_id}")),
+                );
+            }
+        },
+        Err(_) => super::room_version_of(state, pdu),
+    };
     let mut keys = HashMap::new();
     if let Some(provided) = provided_keys {
         keys.insert(signer.to_owned(), provided.clone());
