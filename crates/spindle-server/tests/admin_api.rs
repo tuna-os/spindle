@@ -154,6 +154,10 @@ fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
                 format!("{prefix}/users/{user}/reset_password"),
             ),
             (
+                reqwest::Method::POST,
+                format!("{prefix}/users/{user}/password_hash"),
+            ),
+            (
                 reqwest::Method::GET,
                 format!("{prefix}/users/{user}/devices"),
             ),
@@ -1732,4 +1736,93 @@ async fn synapse_spellings_reach_the_same_handlers() {
         )
         .await;
     assert_eq!(user["deactivated"], true, "{user}");
+}
+
+/// #611: an Argon2 hash computed elsewhere (here, exactly as MAS writes
+/// one) becomes the account's password; an unusable one is refused with
+/// the account untouched; the audit log records the act, never the hash.
+#[tokio::test]
+async fn an_imported_password_hash_signs_the_user_in() {
+    const MAS_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$bWFzLW1pZ3JhdGlvbi0xNg$CEd7EMaeQK2QDHVNURFc/tH0y2Ja5MduCcmz5Gs8uIo";
+    let server = Instance::start().await;
+    let admin_token = server.register("root").await;
+    server.promote("root");
+    let victim_token = server.register("migrated").await;
+    let victim = server.user("migrated");
+    let path = format!("/_spindle/admin/v1/users/{victim}/password_hash");
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &path,
+            Some(&admin_token),
+            Some(&json!({ "password_hash": "$2b$12$notargon" })),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["errcode"], "M_INVALID_PARAM", "{body}");
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &path,
+            Some(&admin_token),
+            Some(&json!({ "password_hash": MAS_HASH })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let login = |password: &'static str| {
+        json!({
+            "type": "m.login.password",
+            "identifier": { "type": "m.id.user", "user": "migrated" },
+            "password": password,
+        })
+    };
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/login",
+            None,
+            Some(&login("correct horse battery staple")),
+        )
+        .await;
+    assert_eq!(status, 200, "the MAS password signs in: {body}");
+    let (status, _) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/login",
+            None,
+            Some(&login("hunter2hunter2")),
+        )
+        .await;
+    assert_eq!(status, 403, "the old password is gone");
+    // Sessions survive by default: a migration is not a sign-out.
+    let (status, _) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(&victim_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    let (_, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_spindle/admin/v1/audit?action=set_password_hash",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(body["total"], 1, "{body}");
+    assert_eq!(
+        body["entries"][0]["detail"]["algorithm"], "argon2id",
+        "{body}"
+    );
+    assert!(
+        !body.to_string().contains("CEd7EMae") && !body.to_string().contains("bWFzLW1p"),
+        "the hash leaked into the audit log: {body}"
+    );
 }

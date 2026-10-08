@@ -51,6 +51,37 @@ that came back smaller. Exits non-zero when anything is absent, and names the
 media IDs rather than only the content hashes: the hash is what the backend
 calls it, the ID is what you have to look for in your other copy.
 
+## Importing password hashes
+
+```
+spindle set-password-hash <config> <localpart> < hash
+spindle set-password-hash <config> < hashes
+```
+
+Stores Argon2 PHC hashes computed elsewhere (#611) — a Matrix
+Authentication Service's `user_passwords.hashed_password`, typically — so
+those users sign in to Spindle with the passwords they already have. The
+hashes come from stdin, never the command line, so they do not land in a
+process listing or shell history. With a localpart, stdin is that one
+account's hash; without, each line is `<localpart> <hash>` (`@user:server`
+works too; blank lines and `#` comments are skipped).
+
+Each hash is validated before it is written: `argon2id`, `argon2i` or
+`argon2d`, version 16 or 19, exactly the `m`/`t`/`p` parameters, with
+`m` at most 256 MiB and `t`, `p` at most 16. Anything else — bcrypt,
+pbkdf2, a keyed `keyid=`/`data=` hash — is refused, because a stored hash
+this server cannot verify is an account nobody can enter. A hash made with
+a pepper that is *not* recorded in the string (MAS's per-scheme `secret`)
+looks ordinary, is accepted, and never verifies: check your MAS
+`passwords.schemes` before importing. Accounts must already exist (the
+Synapse importer creates them); a refused line is named by line number
+and localpart, never with its hash, and the command exits non-zero while
+anything was refused. Offline like every command here; the running
+server's equivalent is `POST /_spindle/admin/v1/users/{user_id}/password_hash`
+with `{"password_hash": "...", "logout_devices": false}`, which also works
+while authentication is still delegated, so hashes can land before a
+cutover.
+
 ## Migration
 
 ```
