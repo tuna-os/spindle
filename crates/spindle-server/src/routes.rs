@@ -4338,8 +4338,6 @@ async fn join_remote(
     room_id: &str,
     servers: &[String],
 ) -> Result<Json<Value>, MatrixError> {
-    const INITIAL_HISTORY_LIMIT: usize = 50;
-
     let candidates = join_candidates(
         &state.config.server.name,
         room_id,
@@ -4481,6 +4479,7 @@ async fn fetch_initial_history(
     join_id: &str,
     version: &ruma::RoomVersionId,
 ) {
+    const INITIAL_HISTORY_LIMIT: usize = 50;
     match state
         .federation
         .remote_backfill(server, room_id, join_id, INITIAL_HISTORY_LIMIT, version)
