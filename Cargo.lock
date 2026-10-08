@@ -3250,6 +3250,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "spindle-operator"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "form_urlencoded",
+ "futures-util",
+ "rand 0.10.3",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "spindle-server"
 version = "0.1.0"
 dependencies = [
