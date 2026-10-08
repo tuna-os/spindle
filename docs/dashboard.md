@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**248 routes implemented; 0 known gaps in scope.**
+**256 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -116,15 +116,17 @@ neither implemented nor counted.
 - `POST /oauth2/revoke`
 - `POST /oauth2/token`
 
-### Appservices — 1 implemented, 0 planned
+### Appservices — 2 implemented, 0 planned
 
+- `POST /_matrix/client/v1/appservice/fed_proxy`
 - `POST /_matrix/client/v1/appservice/{appservice_id}/ping`
 
-### VoIP & MatrixRTC — 9 implemented, 0 planned
+### VoIP & MatrixRTC — 10 implemented, 0 planned
 
 - `GET /_matrix/client/unstable/org.matrix.msc4140/delayed_events`
-- `POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}`
+- `POST/GET /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}`
 - `POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}`
+- `PUT /_matrix/client/unstable/org.matrix.msc4140/rooms/{room_id}/delayed_event/{event_type}/{txn_id}`
 - `GET /_matrix/client/unstable/org.matrix.msc4143/rtc/transports`
 - `GET /_matrix/client/v1/rtc/transports`
 - `POST /_matrix/client/v3/user/{user_id}/openid/request_token`
@@ -225,7 +227,7 @@ neither implemented nor counted.
 - `PUT /_matrix/client/v3/rooms/{room_id}/typing/{user_id}`
 - `POST /_matrix/client/v3/search`
 
-### Rooms & membership — 25 implemented, 0 planned
+### Rooms & membership — 27 implemented, 0 planned
 
 - `GET /_matrix/client/unstable/im.nheko.summary/rooms/{room_id_or_alias}/summary`
 - `GET /_matrix/client/v1/room_summary/{room_id_or_alias}`
@@ -237,8 +239,10 @@ neither implemented nor counted.
 - `POST /_matrix/client/v3/knock/{room_id_or_alias}`
 - `GET /_matrix/client/v3/rooms/{room_id}/aliases`
 - `POST /_matrix/client/v3/rooms/{room_id}/ban`
+- `PUT /_matrix/client/v3/rooms/{room_id}/delayed_event/{event_type}/{txn_id}`
 - `POST /_matrix/client/v3/rooms/{room_id}/forget`
 - `POST /_matrix/client/v3/rooms/{room_id}/invite`
+- `GET /_matrix/client/v3/rooms/{room_id}/is_joined`
 - `POST /_matrix/client/v3/rooms/{room_id}/join`
 - `GET /_matrix/client/v3/rooms/{room_id}/joined_members`
 - `POST /_matrix/client/v3/rooms/{room_id}/kick`
@@ -277,16 +281,20 @@ neither implemented nor counted.
 - `POST /_matrix/client/v3/register`
 - `GET /_matrix/client/v3/register/available`
 
-### Server, discovery & operations — 44 implemented, 0 planned
+### Server, discovery & operations — 48 implemented, 0 planned
 
 - `GET /.well-known/matrix/client`
 - `GET /.well-known/matrix/server`
 - `GET /.well-known/matrix/support`
+- `GET /_matrix/client/unstable/io.element.msc4502/rooms/{room_id}/is_joined`
+- `POST /_matrix/client/unstable/io.element.msc4512/appservice/fed_proxy`
 - `GET/PUT/DELETE /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device`
 - `POST /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device/{device_id}/events`
 - `POST /_matrix/client/unstable/org.matrix.msc4108/rendezvous`
 - `GET/PUT /_matrix/client/v1/admin/lock/{user_id}`
 - `GET/PUT /_matrix/client/v1/admin/suspend/{user_id}`
+- `GET /_matrix/client/v1/delayed_events/{delay_id}`
+- `POST /_matrix/client/v1/delayed_events/{delay_id}/{action}`
 - `POST /_matrix/client/v1/login/get_token`
 - `GET /_matrix/client/v1/mutual_rooms`
 - `GET /_matrix/client/v1/register/m.login.registration_token/validity`
