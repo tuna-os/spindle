@@ -167,7 +167,21 @@ public_base_url = "https://matrix.example.org"
 
 [auth]
 builtin_oidc = true
+# Optional (#609): an issuer on a host of its own. Omitted, the issuer is
+# the client base URL above.
+# oidc_issuer = "https://auth.example.org/"
 ```
+
+`oidc_issuer` exists for replacing a MAS in place. Clients remember the
+issuer they logged in against, and MAS lives on its own host; setting
+`oidc_issuer` to that host's origin (and pointing the host's reverse proxy
+at Spindle) keeps every advertised URL — the discovery document,
+`/_matrix/client/v1/auth_metadata` and its MSC2965 unstable alias, the
+`/.well-known/matrix/client` authentication block, and each endpoint —
+on the issuer the clients already know. It must be an origin: the
+provider's routes are served at the root of whichever host reaches
+Spindle, so a path would advertise URLs nothing serves, and the server
+refuses to start with one.
 
 With that, Spindle itself serves the small provider surface those
 clients need — discovery (`/.well-known/openid-configuration`, relayed

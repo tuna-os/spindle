@@ -447,3 +447,62 @@ fn disabled_federation_with_a_federation_listener_is_refused() {
     .expect_err("a federation listener on a server that does not federate");
     assert!(error.to_string().contains("federation.bind"), "{error}");
 }
+
+#[test]
+fn the_builtin_issuer_defaults_to_the_client_base_url() {
+    let config = parse(
+        r#"
+        [server]
+        name = "example.org"
+        public_base_url = "https://matrix.example.org/"
+        [auth]
+        builtin_oidc = true
+        "#,
+    )
+    .unwrap();
+    assert_eq!(config.oidc_issuer_base(), "https://matrix.example.org");
+}
+
+#[test]
+fn the_builtin_issuer_can_live_on_its_own_host() {
+    for issuer in ["https://auth.example.org/", "https://auth.example.org"] {
+        let config = parse(&format!(
+            "[server]\nname = \"example.org\"\n[auth]\nbuiltin_oidc = true\noidc_issuer = \"{issuer}\"\n"
+        ))
+        .unwrap();
+        assert_eq!(config.oidc_issuer_base(), "https://auth.example.org");
+    }
+}
+
+#[test]
+fn a_builtin_issuer_must_be_an_origin_of_an_enabled_provider() {
+    for (auth, why) in [
+        (
+            "oidc_issuer = \"https://auth.example.org/\"\n",
+            "without builtin_oidc",
+        ),
+        (
+            "builtin_oidc = true\noidc_issuer = \"auth.example.org\"\n",
+            "not a URL",
+        ),
+        (
+            "builtin_oidc = true\noidc_issuer = \"https://example.org/auth/\"\n",
+            "a path",
+        ),
+        (
+            "builtin_oidc = true\noidc_issuer = \"https://example.org/?x=1\"\n",
+            "a query",
+        ),
+        (
+            "builtin_oidc = true\noidc_issuer = \"https://user@example.org/\"\n",
+            "credentials",
+        ),
+    ] {
+        let error =
+            parse(&format!("[server]\nname = \"example.org\"\n[auth]\n{auth}")).expect_err(why);
+        assert!(
+            format!("{error}").contains("auth.oidc_issuer"),
+            "{why}: {error}"
+        );
+    }
+}

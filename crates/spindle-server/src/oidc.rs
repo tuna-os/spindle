@@ -164,14 +164,14 @@ fn provider(state: &AppState) -> Result<&BuiltinOidc, MatrixError> {
     })
 }
 
-/// Where this provider says it lives — the client-facing base URL.
+/// Where this provider says it lives, without the trailing slash:
+/// `auth.oidc_issuer` when configured (#609), the client-facing base URL
+/// otherwise. Every URL the discovery document advertises is built on
+/// this, so a deployment that moves the issuer to its own host moves
+/// every endpoint with it.
 #[must_use]
 pub fn issuer(state: &AppState) -> String {
-    state
-        .config
-        .client_base_url()
-        .trim_end_matches('/')
-        .to_owned()
+    state.config.oidc_issuer_base()
 }
 
 /// The discovery document, served at the well-known path and relayed

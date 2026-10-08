@@ -406,6 +406,15 @@ pub struct AuthConfig {
     /// `[auth.delegated]` and a real MAS are for.
     #[serde(default)]
     pub builtin_oidc: bool,
+    /// The built-in provider's issuer, when it should differ from the
+    /// client base URL (#609) — e.g. `https://auth.example.org/` to keep
+    /// the issuer a retired MAS used, so clients that stored it keep
+    /// working. An origin only: the provider's routes are served at the
+    /// root of whichever host reaches this process, so a path here would
+    /// advertise endpoints nothing serves. Absent, the issuer is the
+    /// client base URL, as before.
+    #[serde(default)]
+    pub oidc_issuer: Option<String>,
 }
 
 /// The delegated provider, named explicitly rather than discovered at
@@ -1173,15 +1182,7 @@ impl Config {
                 message: format!("{:?} is not an address:port", self.server.bind),
             });
         }
-        // One identity authority is the point of both modes; a server
-        // with two would mint accounts nobody can say who owns.
-        if self.auth.builtin_oidc && self.auth.delegated.is_some() {
-            return Err(ConfigError::Invalid {
-                field: "auth.builtin_oidc",
-                message: "cannot be combined with auth.delegated — pick one identity authority"
-                    .to_owned(),
-            });
-        }
+        self.validate_builtin_oidc()?;
         // Two credential schemes would mean the server picks one silently,
         // and an operator who configured both has already told us they are
         // unsure which their relay speaks. Refusing is the only answer that
@@ -1289,6 +1290,70 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// The built-in provider's settings: never beside delegation, and
+    /// `auth.oidc_issuer` meaningful only with the provider and an http(s)
+    /// origin with nothing after the host.
+    fn validate_builtin_oidc(&self) -> Result<(), ConfigError> {
+        // One identity authority is the point of both modes; a server
+        // with two would mint accounts nobody can say who owns.
+        if self.auth.builtin_oidc && self.auth.delegated.is_some() {
+            return Err(ConfigError::Invalid {
+                field: "auth.builtin_oidc",
+                message: "cannot be combined with auth.delegated — pick one identity authority"
+                    .to_owned(),
+            });
+        }
+        let Some(issuer) = self.auth.oidc_issuer.as_deref() else {
+            return Ok(());
+        };
+        if !self.auth.builtin_oidc {
+            return Err(ConfigError::Invalid {
+                field: "auth.oidc_issuer",
+                message: "names the built-in provider's issuer and needs \
+                          auth.builtin_oidc = true (a delegated provider's issuer is \
+                          auth.delegated.issuer)"
+                    .to_owned(),
+            });
+        }
+        let rest = issuer
+            .strip_prefix("https://")
+            .or_else(|| issuer.strip_prefix("http://"));
+        let Some(rest) = rest else {
+            return Err(ConfigError::Invalid {
+                field: "auth.oidc_issuer",
+                message: format!("{issuer:?} is not an http(s) URL"),
+            });
+        };
+        let host = rest.strip_suffix('/').unwrap_or(rest);
+        if host.is_empty()
+            || host.contains(['/', '?', '#', '@', ' ', '\\'])
+            || host.chars().any(char::is_control)
+        {
+            return Err(ConfigError::Invalid {
+                field: "auth.oidc_issuer",
+                message: format!(
+                    "{issuer:?} must be an origin such as \"https://auth.example.org/\" — \
+                     the provider's endpoints live at the root of the host, so a path, \
+                     query or credentials here would advertise URLs nothing serves"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// The built-in provider's issuer without its trailing slash: the
+    /// base every advertised endpoint URL is built on. `auth.oidc_issuer`
+    /// when set, the client base URL otherwise.
+    #[must_use]
+    pub fn oidc_issuer_base(&self) -> String {
+        self.auth
+            .oidc_issuer
+            .clone()
+            .unwrap_or_else(|| self.client_base_url())
+            .trim_end_matches('/')
+            .to_owned()
     }
 
     /// What clients should be told to connect to.
