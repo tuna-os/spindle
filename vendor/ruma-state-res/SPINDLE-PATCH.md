@@ -13,6 +13,13 @@ Its predicate can skip a candidate during iterative auth checks.
 The patch preserves the event order and the rules for auth dependencies.
 The usual `resolve` function uses a predicate that always returns true.
 
+A second change (#626) concerns the iterative auth checks. A candidate that fails
+the authentication check is logged at DEBUG instead of WARN. Such a failure is an
+expected part of resolution, not a fault. The patch also counts each failure in a
+per-thread counter. `take_auth_rejections` reads the count and resets it. A
+resolution runs on the thread that asked for it, so Spindle reads the counter
+after each resolution and exports it as `spindle_state_res_rejections_total`.
+
 Spindle uses the extension to preserve Synapse's rejection decisions for
 imported history. The operator chose this policy.
 For new events, the resolver keeps Ruma's usual behavior.

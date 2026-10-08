@@ -410,7 +410,9 @@ impl Rooms {
                         if entry.state_key.is_some() {
                             continue;
                         }
-                        below.push((entry.li.get(), rooms.read_sender(room_id, &entry.event_id)?));
+                        if let Some(sender) = rooms.read_sender(room_id, &entry.event_id)? {
+                            below.push((entry.li.get(), sender));
+                        }
                     }
                 }
                 let mut cache = rooms
@@ -479,7 +481,9 @@ impl Rooms {
         for (li, event_id) in pending.iter().rev() {
             match self.read_event(room_id, &EventId::new(event_id.as_str())) {
                 Ok(json) => {
-                    if json["sender"] != user_id {
+                    // A dummy event (#626) is not something to read, so no
+                    // rule of the reader's may make it notify.
+                    if json["sender"] != user_id && !super::extremities::is_dummy_event(&json) {
                         events.push((*li, json));
                     }
                 }

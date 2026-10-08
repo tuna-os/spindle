@@ -358,6 +358,39 @@ pub struct Metrics {
     auth: AuthCounters,
     /// Federation EDUs in and out, and inbound receipts by result.
     edus: EduMetrics,
+    /// State resolution's work and the forks that cause it (#626).
+    state_res: StateResMetrics,
+}
+
+/// State resolution, and the forward extremities that make it necessary.
+#[derive(Debug, Default)]
+struct StateResMetrics {
+    /// Resolutions computed, and answered from the cache.
+    resolutions: AtomicU64,
+    cache_hits: AtomicU64,
+    /// Candidates the iterative auth checks refused inside a resolution.
+    rejections: AtomicU64,
+    /// `org.matrix.dummy_event`s authored to merge extremities, `[sent,
+    /// failed]`.
+    dummy_events: [AtomicU64; 2],
+    /// Resident rooms by forward-extremity count, by
+    /// [`EXTREMITY_BUCKETS`], as the last census found them.
+    extremity_buckets: [AtomicU64; 4],
+}
+
+/// The labels of `spindle_rooms_by_forward_extremities`, in index order.
+pub const EXTREMITY_BUCKETS: [&str; 4] = ["1", "2-5", "6-10", ">10"];
+
+/// Which [`EXTREMITY_BUCKETS`] entry `count` extremities fall in. A room
+/// with none (empty) is counted with the rooms that have one.
+#[must_use]
+pub fn extremity_bucket(count: usize) -> usize {
+    match count {
+        0..=1 => 0,
+        2..=5 => 1,
+        6..=10 => 2,
+        _ => 3,
+    }
 }
 
 impl Default for Metrics {
@@ -397,6 +430,7 @@ impl Default for Metrics {
             keys: KeyMetrics::default(),
             auth: AuthCounters::default(),
             edus: EduMetrics::default(),
+            state_res: StateResMetrics::default(),
         }
     }
 }
@@ -838,12 +872,63 @@ impl Metrics {
         self.sidelined[usize::from(rejected)].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record what one batch of state resolution did: resolutions computed,
+    /// answered from the cache, and candidates refused by the auth checks.
+    pub fn record_state_res(&self, resolutions: u64, cache_hits: u64, rejections: u64) {
+        let counters = &self.state_res;
+        counters
+            .resolutions
+            .fetch_add(resolutions, Ordering::Relaxed);
+        counters.cache_hits.fetch_add(cache_hits, Ordering::Relaxed);
+        counters.rejections.fetch_add(rejections, Ordering::Relaxed);
+    }
+
+    /// `(resolutions, cache hits, rejections)` so far, for tests.
+    #[must_use]
+    pub fn state_res_counts(&self) -> (u64, u64, u64) {
+        let counters = &self.state_res;
+        (
+            counters.resolutions.load(Ordering::Relaxed),
+            counters.cache_hits.load(Ordering::Relaxed),
+            counters.rejections.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Record one attempt to author an `org.matrix.dummy_event`.
+    pub fn record_dummy_event(&self, sent: bool) {
+        self.state_res.dummy_events[usize::from(!sent)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(sent, failed)` dummy events so far, for tests.
+    #[must_use]
+    pub fn dummy_event_counts(&self) -> (u64, u64) {
+        (
+            self.state_res.dummy_events[0].load(Ordering::Relaxed),
+            self.state_res.dummy_events[1].load(Ordering::Relaxed),
+        )
+    }
+
+    /// Replace the forward-extremity census, indexed as
+    /// [`EXTREMITY_BUCKETS`].
+    pub fn set_extremity_buckets(&self, buckets: [u64; 4]) {
+        for (slot, value) in self.state_res.extremity_buckets.iter().zip(buckets) {
+            slot.store(value, Ordering::Relaxed);
+        }
+    }
+
+    /// The forward-extremity census, for tests.
+    #[must_use]
+    pub fn extremity_buckets(&self) -> [u64; 4] {
+        std::array::from_fn(|index| self.state_res.extremity_buckets[index].load(Ordering::Relaxed))
+    }
+
     /// The exposition, in the Prometheus text format.
     #[must_use]
     pub fn render(&self) -> String {
         let mut out = String::with_capacity(2048);
         render_build_info(&mut out);
         self.render_appends(&mut out);
+        self.render_state_res(&mut out);
         self.render_room_locks(&mut out);
         self.render_http(&mut out);
         self.render_federation(&mut out);
@@ -929,6 +1014,61 @@ impl Metrics {
                     &format!("durability=\"{}\"", escape(durability)),
                 );
             }
+        }
+    }
+
+    /// State resolution's work, and the forks that cause it (#626).
+    fn render_state_res(&self, out: &mut String) {
+        let counters = &self.state_res;
+        out.push_str(
+            "# HELP spindle_state_res_resolutions_total State resolutions, by whether \
+             the resolution cache answered.\n\
+             # TYPE spindle_state_res_resolutions_total counter\n",
+        );
+        for (cached, counter) in [
+            ("false", &counters.resolutions),
+            ("true", &counters.cache_hits),
+        ] {
+            let _ = writeln!(
+                out,
+                "spindle_state_res_resolutions_total{{cached=\"{cached}\"}} {}",
+                counter.load(Ordering::Relaxed)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_state_res_rejections_total Events refused by the auth \
+             checks inside state resolution. Expected; a steady rate means a fork \
+             is being resolved again and again.\n\
+             # TYPE spindle_state_res_rejections_total counter\n",
+        );
+        let _ = writeln!(
+            out,
+            "spindle_state_res_rejections_total {}",
+            counters.rejections.load(Ordering::Relaxed)
+        );
+        out.push_str(
+            "# HELP spindle_dummy_events_total org.matrix.dummy_event sends that \
+             merge a room's forward extremities, by result.\n\
+             # TYPE spindle_dummy_events_total counter\n",
+        );
+        for (index, result) in ["sent", "failed"].into_iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "spindle_dummy_events_total{{result=\"{result}\"}} {}",
+                counters.dummy_events[index].load(Ordering::Relaxed)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_rooms_by_forward_extremities Resident rooms by how many \
+             forward extremities they have, at the last census.\n\
+             # TYPE spindle_rooms_by_forward_extremities gauge\n",
+        );
+        for (index, bucket) in EXTREMITY_BUCKETS.into_iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "spindle_rooms_by_forward_extremities{{extremities=\"{bucket}\"}} {}",
+                counters.extremity_buckets[index].load(Ordering::Relaxed)
+            );
         }
     }
 
@@ -2852,6 +2992,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rooms_are_bucketed_by_forward_extremities() {
+        let buckets: Vec<usize> = [0, 1, 2, 5, 6, 10, 11, 500]
+            .into_iter()
+            .map(extremity_bucket)
+            .collect();
+        assert_eq!(buckets, [0, 0, 1, 1, 2, 2, 3, 3]);
+        let metrics = Metrics::new();
+        metrics.set_extremity_buckets([4, 3, 2, 1]);
+        metrics.record_state_res(2, 5, 7);
+        metrics.record_dummy_event(true);
+        metrics.record_dummy_event(false);
+        metrics.record_dummy_event(true);
+        let text = metrics.render();
+        for line in [
+            "spindle_rooms_by_forward_extremities{extremities=\"1\"} 4",
+            "spindle_rooms_by_forward_extremities{extremities=\"2-5\"} 3",
+            "spindle_rooms_by_forward_extremities{extremities=\"6-10\"} 2",
+            "spindle_rooms_by_forward_extremities{extremities=\">10\"} 1",
+            "spindle_state_res_resolutions_total{cached=\"false\"} 2",
+            "spindle_state_res_resolutions_total{cached=\"true\"} 5",
+            "spindle_state_res_rejections_total 7",
+            "spindle_dummy_events_total{result=\"sent\"} 2",
+            "spindle_dummy_events_total{result=\"failed\"} 1",
+        ] {
+            assert!(text.contains(line), "{line} missing from {text}");
+        }
+    }
+
     /// The exposition is the contract, so it is asserted rather than eyeballed.
     #[test]
     fn the_exposition_is_well_formed() {
@@ -2860,6 +3029,10 @@ mod tests {
             "spindle_build_info",
             "spindle_events_appended_total",
             "spindle_fork_resolutions_total",
+            "spindle_state_res_resolutions_total",
+            "spindle_state_res_rejections_total",
+            "spindle_dummy_events_total",
+            "spindle_rooms_by_forward_extremities",
         ] {
             assert!(text.contains(&format!("# HELP {name} ")), "{text}");
             assert!(text.contains(&format!("# TYPE {name} ")), "{text}");

@@ -144,6 +144,7 @@ type Destinations = ([u8; 32], Arc<Vec<String>>);
 
 mod admin;
 mod erasure;
+pub mod extremities;
 mod federation;
 mod gaps;
 mod read;
@@ -269,6 +270,9 @@ pub struct Rooms {
     /// Resolutions already computed, keyed by the roots of the states they
     /// resolved (`state_res::ResolutionCache`).
     resolutions: crate::state_res::ResolutionCache,
+    /// Extremity merging's bookkeeping (`extremities`): rooms an append left
+    /// forked since the last pass, and when each room was last merged.
+    extremities: extremities::Tracker,
     /// The server-global order `/sync` needs (SPEC §10.2). The linear index
     /// orders events within one room; nothing orders them across rooms, so
     /// this is the one counter that exists purely because a per-room order is
@@ -485,6 +489,7 @@ impl Rooms {
             state_heads: Mutex::new(HashMap::new()),
             auth_graphs: Mutex::new(HashMap::new()),
             resolutions: crate::state_res::ResolutionCache::default(),
+            extremities: extremities::Tracker::default(),
             // Resumed, not reset. A counter that restarted at zero would
             // re-issue stream ids already on disk, overwriting the entries
             // they point at -- the same shape of bug as a room registry that
@@ -5429,10 +5434,14 @@ impl Rooms {
         let started = std::time::Instant::now();
         let result = work(log, &mut resolver, &mut load);
         let stats = resolver.stats;
+        self.metrics
+            .record_state_res(stats.resolutions, stats.cache_hits, stats.rejections);
         if stats.resolutions > 0 {
             tracing::info!(
                 room = room_id,
                 elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                rejected = stats.rejections,
+                forward_extremities = log.forward_extremities().len(),
                 auth_graph = graph
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5504,6 +5513,11 @@ impl Rooms {
         previous_tips: &BTreeSet<EventId>,
     ) -> Result<(), RoomError> {
         if log.forward_extremities().len() > 1 {
+            // Every append to a forked room re-resolves its current state
+            // over every extremity. A fork no peer's event merges -- tips this
+            // server holds that no remote event cites -- costs that on every
+            // append for good, so it is noted for the merge pass (#626).
+            self.extremities.note_forked(room_id);
             match self.resolve_in(log, room_id, |log, resolver, load| {
                 log.resolve_current(resolver, load)
             }) {
@@ -6133,7 +6147,8 @@ impl Rooms {
         // Keep the unread index current while it is warm. Only if cached:
         // a cold room's index is built from the log on first use, so there
         // is nothing to maintain until someone asks.
-        if input.state_key.is_none() {
+        // A dummy event is not something to read (#626): it never counts.
+        if input.state_key.is_none() && input.event_type != extremities::DUMMY_EVENT_TYPE {
             let mut cache = self
                 .unread_index
                 .lock()
@@ -6490,25 +6505,38 @@ impl Rooms {
     /// the rest of the body. The unread index reads this for every event it
     /// indexes and nothing else, and the event's content is most of its
     /// size.
-    fn read_sender(&self, room_id: &str, event_id: &EventId) -> Result<String, RoomError> {
+    ///
+    /// `None` for an `org.matrix.dummy_event`, which the unread index leaves
+    /// out (#626).
+    fn read_sender(&self, room_id: &str, event_id: &EventId) -> Result<Option<String>, RoomError> {
         #[derive(serde::Deserialize)]
         struct Sender<'a> {
             #[serde(borrow, default)]
             sender: Option<std::borrow::Cow<'a, str>>,
+            #[serde(borrow, default, rename = "type")]
+            kind: Option<std::borrow::Cow<'a, str>>,
         }
         let raw = spindle_store::ReadView::get(
             self.store.as_ref(),
             &event_body_key(room_id, event_id.as_str()),
         )?
         .ok_or_else(|| RoomError::MissingBody(event_id.as_str().to_owned()))?;
-        if let Ok(Sender { sender }) = serde_json::from_slice::<Sender<'_>>(&raw) {
-            return Ok(sender.map(std::borrow::Cow::into_owned).unwrap_or_default());
+        if let Ok(Sender { sender, kind }) = serde_json::from_slice::<Sender<'_>>(&raw) {
+            if kind.as_deref() == Some(extremities::DUMMY_EVENT_TYPE) {
+                return Ok(None);
+            }
+            return Ok(Some(
+                sender.map(std::borrow::Cow::into_owned).unwrap_or_default(),
+            ));
         }
         // Whatever the narrow read refuses -- a sender that is not a
         // string, a repeated key -- is answered the way the whole-body
         // read answers it, errors included.
         let event: Value = serde_json::from_slice(&raw)?;
-        Ok(event["sender"].as_str().unwrap_or("").to_owned())
+        if extremities::is_dummy_event(&event) {
+            return Ok(None);
+        }
+        Ok(Some(event["sender"].as_str().unwrap_or("").to_owned()))
     }
 }
 

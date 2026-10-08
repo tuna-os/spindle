@@ -312,6 +312,35 @@ fn a_zero_ring_budget_is_refused_and_the_default_is_ten() {
     assert_eq!(config.ratelimit.rings_per_minute, 10);
 }
 
+/// `[rooms]` (#626): Synapse's defaults without the section, and a
+/// threshold that would merge every fork refused at startup.
+#[test]
+fn rooms_merge_forks_by_default_and_refuse_a_threshold_below_two() {
+    let config = parse("[server]\nname = \"example.org\"\n").expect("no section is fine");
+    assert!(config.rooms.dummy_events);
+    assert_eq!(config.rooms.max_forward_extremities, 10);
+    assert_eq!(config.rooms.stale_forward_extremity_secs, 3_600);
+    assert_eq!(config.rooms.dummy_event_interval_secs, 300);
+    let config = parse(
+        "[server]\nname = \"example.org\"\n[rooms]\ndummy_events = false\n\
+         max_forward_extremities = 20\nstale_forward_extremity_secs = 60\n\
+         dummy_event_interval_secs = 30\n",
+    )
+    .expect("every field");
+    assert!(!config.rooms.dummy_events);
+    assert_eq!(config.rooms.max_forward_extremities, 20);
+    assert_eq!(config.rooms.stale_forward_extremity_secs, 60);
+    assert_eq!(config.rooms.dummy_event_interval_secs, 30);
+    let error = parse("[server]\nname = \"example.org\"\n[rooms]\nmax_forward_extremities = 1\n")
+        .expect_err("a threshold of one must not start the server");
+    assert!(
+        error.to_string().contains("rooms.max_forward_extremities"),
+        "{error}"
+    );
+    parse("[server]\nname = \"example.org\"\n[rooms]\nunknown = 1\n")
+        .expect_err("an unknown field is a typo, not a default");
+}
+
 /// `[federation] peers` names a peer's URL and, optionally, how patient
 /// to be with it; a URL that is not one, or a cap shorter than the base
 /// it caps, is refused at startup.
