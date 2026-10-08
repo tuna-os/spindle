@@ -495,8 +495,18 @@ async fn measure(client: &Client, size: usize) -> Row {
     writes.sort_unstable();
     visible.sort_unstable();
 
+    // Every participant has heartbeat at least once, however quick the
+    // churn was, so the heartbeat column is a sample of the whole call.
+    wait_until("a heartbeat from everyone", || {
+        heartbeats.lock().unwrap().len() >= size
+    })
+    .await;
     beating.store(false, Ordering::Relaxed);
     stop.store(true, Ordering::Relaxed);
+    // Let every long-poll and heartbeat see the flag and finish, so none is
+    // still in flight against the server when the next size -- or the
+    // process's exit -- begins.
+    tokio::time::sleep(HEARTBEAT + Duration::from_secs(2)).await;
     let mut heartbeats = heartbeats.lock().unwrap().clone();
     heartbeats.sort_unstable();
     Row {

@@ -202,7 +202,10 @@ def measure_firing(base: str, size: int, window_ms: int, lead_ms: int) -> dict:
     with watcher.lock:
         missing = [key for key in deadlines if key not in watcher.seen]
         if missing:
-            raise Failed(f"{len(missing)} delays never arrived")
+            # Not a partial result to average: the server could not keep up,
+            # and that is the finding. Recorded as such, with no lateness
+            # figures that would leave out exactly the delays that were worst.
+            return {"n": size, "incomplete": True, "arrived": size - len(missing), "give_up_s": 120}
         late = [(watcher.seen[key] - deadline) * 1000 for key, deadline in deadlines.items()]
     if min(late) < -50:
         raise Failed(f"a delay fired {-min(late):.0f} ms early")

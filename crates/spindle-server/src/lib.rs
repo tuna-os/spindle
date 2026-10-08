@@ -527,14 +527,17 @@ fn spawn_delivery_loops(state: &AppState) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
     }
-    // A second is far below any heartbeat a client would set and far above
-    // the cost of the tick: when nothing is due it reads one row, because
-    // the rows are ordered by when they fire.
+    // A tenth of a second, the push loop's tick, so a call's departure and
+    // its ring land with the same delay. It was a second until #36's
+    // comparison against Synapse measured what that cost: a delay landed
+    // half a second late at the median, where Synapse's timer landed it in
+    // sixty milliseconds. The idle tick reads one row (#350), so ten of
+    // them a second cost microseconds.
     tokio::spawn(delayed::fire_loop(
         Arc::downgrade(&state.delayed),
         Arc::downgrade(&state.rooms),
         Arc::downgrade(&state.key),
-        std::time::Duration::from_secs(1),
+        std::time::Duration::from_millis(100),
     ));
     // Disabled federation leaves queued rows in the outbox and never starts
     // the drain that would only be refused, row by row.

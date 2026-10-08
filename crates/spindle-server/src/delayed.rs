@@ -1140,9 +1140,9 @@ impl Drop for Delayed {
 /// Polls rather than sleeping until the next deadline, because the deadline
 /// moves: a `restart` from any request handler can pull one earlier or push
 /// it later, and a task parked on a timer would have to be woken by every
-/// one of them. At one tick a second the cost is a single row read when
-/// nothing is due, and a heartbeat's whole point is that a second of
-/// imprecision does not matter.
+/// one of them. At ten ticks a second the cost is a single row read when
+/// nothing is due (#350), and a delay lands within a tenth of a second of
+/// its deadline.
 ///
 /// **Nothing here recovers a missed firing specially, because there is
 /// nothing to recover.** A row is due at a wall-clock time; a server that was
