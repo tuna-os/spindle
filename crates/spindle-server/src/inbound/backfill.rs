@@ -39,7 +39,7 @@
 //! **Ownership.** Like the delivery loops (#292), this holds what it reads
 //! weakly and ends once the router is gone; a pass upgrades for one chunk.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -47,7 +47,7 @@ use ruma::{CanonicalJsonValue, RoomVersionId};
 use serde_json::Value;
 
 use super::recovery::{Endpoint, Failure, Peers, RecoveryGate, verify};
-use crate::federation::{Federation, PeerKeys};
+use crate::federation::{Federation, FederationError, PeerKeys};
 use crate::metrics::{BackfillChunk, BackfillEvent, Metrics};
 use crate::rooms::{GapChunk, GapChunkOutcome, GapProgress, RoomError, Rooms};
 use crate::signing::ServerKey;
@@ -71,6 +71,9 @@ const MAX_INVALID_ATTEMPTS: u32 = 10;
 const PARTICIPANTS_TTL: Duration = Duration::from_secs(300);
 /// Verifications between two yields to the runtime.
 const VERIFY_BATCH: usize = 16;
+/// How long a peer that had nothing for a frontier is not asked about that
+/// same frontier again.
+const UNPRODUCTIVE_COOLDOWN: Duration = Duration::from_secs(600);
 /// The longest an idle loop sleeps before checking its router is alive.
 const IDLE_TICK: Duration = Duration::from_secs(1);
 
@@ -84,12 +87,141 @@ pub struct GapBackfill {
     /// Ranked participants per room, reused for a few minutes: ranking
     /// reads every member event of the room.
     participants: Mutex<HashMap<String, (Instant, Vec<String>)>>,
+    /// What each peer was last asked about each room's gap and how it went,
+    /// so the same question is not put to it again and again: a peer
+    /// refuses repeats ("Too many duplicate requests"), and one that had
+    /// nothing for a frontier has nothing for it a minute later.
+    asked: Mutex<HashMap<(String, String), Asked>>,
+    /// Per room, the fullest page a peer served for a frontier without the
+    /// frontier in it: what stepping over the missing events is made from.
+    stuck: Mutex<HashMap<String, StuckPage>>,
+}
+
+/// A `/backfill` page that lacked the frontier it was asked for.
+#[derive(Debug)]
+struct StuckPage {
+    digest: u64,
+    peer: String,
+    offered: HashMap<String, Value>,
+    at: Instant,
+}
+
+/// The last unanswered question put to one peer about one room's gap.
+#[derive(Debug)]
+struct Asked {
+    /// [`digest_of`] the frontier asked about.
+    digest: u64,
+    at: Instant,
+    /// The peer answered and had nothing for it.
+    unproductive: bool,
+    /// Consecutive 429s for this frontier.
+    rate_limited: u32,
 }
 
 impl GapBackfill {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn note(&self, room_id: &str, peer: &str, digest: u64, record: impl FnOnce(&mut Asked)) {
+        let mut asked = self
+            .asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        asked.retain(|_, entry| entry.at.elapsed() < UNPRODUCTIVE_COOLDOWN);
+        let entry = asked
+            .entry((room_id.to_owned(), peer.to_owned()))
+            .or_insert(Asked {
+                digest,
+                at: Instant::now(),
+                unproductive: false,
+                rate_limited: 0,
+            });
+        if entry.digest != digest {
+            *entry = Asked {
+                digest,
+                at: Instant::now(),
+                unproductive: false,
+                rate_limited: 0,
+            };
+        }
+        entry.at = Instant::now();
+        record(entry);
+    }
+
+    /// `peer` answered about this frontier and had nothing for it.
+    fn note_unproductive(&self, room_id: &str, peer: &str, digest: u64) {
+        self.note(room_id, peer, digest, |entry| entry.unproductive = true);
+    }
+
+    /// `peer` answered 429 about this frontier; how many times before.
+    fn note_rate_limited(&self, room_id: &str, peer: &str, digest: u64) -> u32 {
+        let mut streak = 0;
+        self.note(room_id, peer, digest, |entry| {
+            streak = entry.rate_limited;
+            entry.rate_limited = entry.rate_limited.saturating_add(1);
+        });
+        streak
+    }
+
+    /// `peer` moved the walk on: its slate is clean.
+    fn forget(&self, room_id: &str, peer: &str) {
+        self.asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(room_id.to_owned(), peer.to_owned()));
+    }
+
+    /// Whether `peer` already said it has nothing for this frontier.
+    fn exhausted(&self, room_id: &str, peer: &str, digest: u64) -> bool {
+        self.asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(room_id.to_owned(), peer.to_owned()))
+            .is_some_and(|entry| {
+                entry.digest == digest
+                    && entry.unproductive
+                    && entry.at.elapsed() < UNPRODUCTIVE_COOLDOWN
+            })
+    }
+
+    /// Keep the fullest page that lacked this frontier.
+    fn keep_stuck(&self, room_id: &str, digest: u64, peer: &str, offered: &HashMap<String, Value>) {
+        let mut stuck = self
+            .stuck
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stuck.retain(|_, page| page.at.elapsed() < UNPRODUCTIVE_COOLDOWN);
+        let keep = stuck
+            .get(room_id)
+            .is_none_or(|page| page.digest != digest || page.offered.len() < offered.len());
+        if keep {
+            stuck.insert(
+                room_id.to_owned(),
+                StuckPage {
+                    digest,
+                    peer: peer.to_owned(),
+                    offered: offered.clone(),
+                    at: Instant::now(),
+                },
+            );
+        }
+    }
+
+    /// The kept page for this frontier, if there is one.
+    fn take_stuck(&self, room_id: &str, digest: u64) -> Option<(String, HashMap<String, Value>)> {
+        let mut stuck = self
+            .stuck
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if stuck
+            .get(room_id)
+            .is_some_and(|page| page.digest == digest && page.at.elapsed() < UNPRODUCTIVE_COOLDOWN)
+        {
+            return stuck.remove(room_id).map(|page| (page.peer, page.offered));
+        }
+        None
     }
 
     /// A client paged into `room_id`'s gap: fill it next, and now.
@@ -396,6 +528,10 @@ fn record_failure(
 }
 
 /// Fetch, verify and store the next chunk of one gap.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the peer ladder for one chunk, then the step over what none of them serves"
+)]
 async fn fill(
     peers: &Peers<'_>,
     backfill: &GapBackfill,
@@ -424,6 +560,8 @@ async fn fill(
                 events: &[],
                 state_before: &[],
                 frontier: Vec::new(),
+                bounds: BTreeMap::new(),
+                skipped: Vec::new(),
             },
         );
     }
@@ -437,63 +575,242 @@ async fn fill(
         )));
     }
 
-    let candidates = candidates(peers, backfill, room_id, &due.marker, anchor_event);
-    if candidates.is_empty() {
-        return Err(Failure::Peer {
-            message: "every participating server is cooling down".to_owned(),
-            rate_limited: Some(Duration::ZERO),
-            forbidden: false,
-        });
-    }
+    // Where the walk may go when it has to step over an event nobody
+    // serves: below the newest event that named it, above the history this
+    // server held before the gap.
+    let anchor_depth = peers
+        .rooms
+        .pdu(room_id, anchor_event)
+        .ok()
+        .and_then(|event| event["depth"].as_u64())
+        .unwrap_or(u64::MAX);
+    let bounds: HashMap<String, u64> = frontier
+        .iter()
+        .map(|id| {
+            (
+                id.clone(),
+                progress.bounds.get(id).copied().unwrap_or(anchor_depth),
+            )
+        })
+        .collect();
+    let floor = due.marker["li"]
+        .as_i64()
+        .map_or(Ok(0), |anchor| peers.rooms.gap_depth_floor(room_id, anchor))?;
+    let digest = digest_of(&frontier);
+
+    let candidates = candidates(peers, backfill, room_id, &due.marker, anchor_event, digest);
     let mut keys = HashMap::new();
-    let mut last = None;
+    let mut last = candidates.is_empty().then(|| Failure::Peer {
+        message: format!(
+            "every participating server is cooling down, or already said it has nothing \
+             for the frontier at {}",
+            frontier[0]
+        ),
+        rate_limited: Some(Duration::ZERO),
+        forbidden: false,
+    });
+    let mut errored = false;
+    // The fullest page from a peer that answered without the frontier
+    // itself: what a bridge over the missing events is made from.
+    let mut stuck: Option<(String, HashMap<String, Value>)> = None;
     for peer in candidates {
-        match Box::pin(fetch_chunk(
-            peers, &peer, room_id, &version, &frontier, settings, &mut keys,
+        let attempt = Box::pin(fetch_page(
+            peers, &peer, room_id, &version, &frontier, &bounds, settings,
         ))
-        .await
-        {
-            Ok(fetched) => {
-                tokio::task::yield_now().await;
-                let outcome = commit(
+        .await;
+        let (walk, offered) = match attempt {
+            Ok(page) => page,
+            Err(failure) => {
+                errored = true;
+                note_failure(
                     peers,
+                    backfill,
                     room_id,
-                    &GapChunk {
-                        anchor_event,
-                        events: &fetched.events,
-                        state_before: &fetched.state_before,
-                        frontier: fetched.frontier,
-                    },
+                    &peer,
+                    digest,
+                    &failure,
+                    anchor_event,
                 );
-                tokio::task::yield_now().await;
-                return outcome;
+                last = Some(failure);
+                continue;
+            }
+        };
+        if walk.taken.is_empty() {
+            // It answered, and had nothing the walk asked for: asking it the
+            // same question again is the duplicate request a peer refuses.
+            backfill.note_unproductive(room_id, &peer, digest);
+            tracing::info!(
+                room = room_id,
+                event_id = anchor_event,
+                peer = %peer,
+                frontier = %frontier[0],
+                frontier_len = frontier.len(),
+                page = offered.len(),
+                "a peer served none of the gap's frontier"
+            );
+            last = Some(Failure::peer(format!(
+                "{peer} served none of the frontier at {}",
+                frontier[0]
+            )));
+            if stuck
+                .as_ref()
+                .is_none_or(|(_, held)| held.len() < offered.len())
+            {
+                stuck = Some((peer, offered));
+            }
+            continue;
+        }
+        match Box::pin(finish(peers, &peer, room_id, &version, walk, &mut keys)).await {
+            Ok(fetched) => {
+                backfill.forget(room_id, &peer);
+                return store(peers, room_id, anchor_event, fetched, Vec::new()).await;
             }
             Err(failure) => {
-                match &failure {
-                    Failure::Peer {
-                        rate_limited: Some(wait),
-                        ..
-                    } => peers
-                        .recovery
-                        .cool(room_id, &peer, Endpoint::Backfill, *wait),
-                    Failure::Peer {
-                        forbidden: true, ..
-                    } => peers.recovery.shun(room_id, &peer),
-                    Failure::Budget(_) => return Err(failure),
-                    _ => {}
-                }
-                tracing::info!(
-                    room = room_id,
-                    event_id = anchor_event,
-                    peer = %peer,
-                    "a gap backfill chunk failed against a peer: {}",
-                    failure.message()
+                errored = true;
+                note_failure(
+                    peers,
+                    backfill,
+                    room_id,
+                    &peer,
+                    digest,
+                    &failure,
+                    anchor_event,
                 );
                 last = Some(failure);
             }
         }
     }
+
+    // No server served the frontier itself -- a peer leaves out of
+    // `/backfill` an event it rejected, and may not serve it over `/event`
+    // either -- but one served what lies below it. Step over the missing
+    // events onto that, once every peer asked has had its say (or the gap
+    // has already failed this way before), rather than ask the same
+    // question forever.
+    //
+    // The page is kept between attempts, so stepping over does not cost
+    // asking a peer the same question twice.
+    if let Some((peer, offered)) = stuck.take() {
+        backfill.keep_stuck(room_id, digest, &peer, &offered);
+    }
+    let bridge_now = !errored || progress.attempts > 0;
+    if let Some((peer, mut offered)) = bridge_now
+        .then(|| backfill.take_stuck(room_id, digest))
+        .flatten()
+    {
+        let mut walk = Walk::new(&frontier, &bounds);
+        let skipped = walk.bridge(peers.rooms, room_id, &offered, floor)?;
+        if !skipped.is_empty() {
+            walk.take(peers.rooms, room_id, &mut offered, settings.chunk)?;
+        }
+        if !walk.taken.is_empty() {
+            tracing::warn!(
+                room = room_id,
+                event_id = anchor_event,
+                peer = %peer,
+                skipped = ?skipped,
+                "no server serves these gap events; walking on below them"
+            );
+            peers.metrics.record_backfill_events(
+                BackfillEvent::Skipped,
+                u64::try_from(skipped.len()).unwrap_or(u64::MAX),
+            );
+            match Box::pin(finish(peers, &peer, room_id, &version, walk, &mut keys)).await {
+                Ok(fetched) => {
+                    backfill.forget(room_id, &peer);
+                    return store(peers, room_id, anchor_event, fetched, skipped).await;
+                }
+                Err(failure) => {
+                    note_failure(
+                        peers,
+                        backfill,
+                        room_id,
+                        &peer,
+                        digest,
+                        &failure,
+                        anchor_event,
+                    );
+                    last = Some(failure);
+                }
+            }
+        }
+    }
     Err(last.unwrap_or_else(|| Failure::peer("no participating server could be asked")))
+}
+
+/// Commit a fetched chunk, yielding to the runtime on either side of the
+/// synchronous write.
+async fn store(
+    peers: &Peers<'_>,
+    room_id: &str,
+    anchor_event: &str,
+    fetched: Fetched,
+    skipped: Vec<String>,
+) -> Result<GapChunkOutcome, Failure> {
+    tokio::task::yield_now().await;
+    let outcome = commit(
+        peers,
+        room_id,
+        &GapChunk {
+            anchor_event,
+            events: &fetched.events,
+            state_before: &fetched.state_before,
+            frontier: fetched.frontier,
+            bounds: fetched.bounds,
+            skipped,
+        },
+    );
+    tokio::task::yield_now().await;
+    outcome
+}
+
+/// What a failed request to one peer means for asking it again: a 429
+/// cools it down -- longer each time it refuses the same frontier -- a
+/// 403 shuns it for the room, and a 404 marks this frontier as one it has
+/// nothing for.
+fn note_failure(
+    peers: &Peers<'_>,
+    backfill: &GapBackfill,
+    room_id: &str,
+    peer: &str,
+    digest: u64,
+    failure: &Failure,
+    anchor_event: &str,
+) {
+    match failure {
+        Failure::Peer {
+            rate_limited: Some(wait),
+            ..
+        } => {
+            let streak = backfill.note_rate_limited(room_id, peer, digest);
+            let wait = wait.saturating_mul(2_u32.saturating_pow(streak.min(8)));
+            peers.recovery.cool(room_id, peer, Endpoint::Backfill, wait);
+        }
+        Failure::Peer {
+            forbidden: true, ..
+        } => peers.recovery.shun(room_id, peer),
+        Failure::Peer { message, .. } if message.contains("answered 404") => {
+            backfill.note_unproductive(room_id, peer, digest);
+        }
+        _ => {}
+    }
+    tracing::info!(
+        room = room_id,
+        event_id = anchor_event,
+        peer = %peer,
+        "a gap backfill chunk failed against a peer: {}",
+        failure.message()
+    );
+}
+
+/// A stable digest of a frontier, for "asked this peer this before".
+fn digest_of(frontier: &[String]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut sorted: Vec<&String> = frontier.iter().collect();
+    sorted.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sorted.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Store a checked chunk. A refusal by the room is a refusal of what the
@@ -511,14 +828,16 @@ fn commit(
 
 /// The servers to ask, in order: whoever served the gap event's state,
 /// the gap event's own server, then the servers with the most members
-/// joined (#620), leaving out this server and any peer still cooling down
-/// from a 429 or a 403 for this room.
+/// joined (#620), leaving out this server, any peer still cooling down
+/// from a 429 or a 403 for this room, and any that already said it has
+/// nothing for this exact frontier.
 fn candidates(
     peers: &Peers<'_>,
     backfill: &GapBackfill,
     room_id: &str,
     marker: &Value,
     anchor_event: &str,
+    digest: u64,
 ) -> Vec<String> {
     let mut ordered: Vec<String> = Vec::new();
     if let Some(from) = marker["state_from"].as_str() {
@@ -538,6 +857,7 @@ fn candidates(
                 && seen.insert(peer.clone())
                 && !peers.recovery.cooling(room_id, peer, Endpoint::Backfill)
                 && !peers.recovery.cooling(room_id, peer, Endpoint::StateIds)
+                && !backfill.exhausted(room_id, peer, digest)
         })
         .take(MAX_PEERS)
         .collect()
@@ -564,6 +884,7 @@ struct Fetched {
     events: Vec<(String, Value)>,
     state_before: Vec<String>,
     frontier: Vec<String>,
+    bounds: BTreeMap<String, u64>,
 }
 
 /// The walk over one peer's answer: which events it asked for, and which
@@ -572,14 +893,17 @@ struct Walk {
     wanted: BTreeSet<String>,
     taken: Vec<(String, Value)>,
     seen: HashSet<String>,
+    /// For each wanted event, the depth of the newest event naming it.
+    bounds: HashMap<String, u64>,
 }
 
 impl Walk {
-    fn new(frontier: &[String]) -> Self {
+    fn new(frontier: &[String], bounds: &HashMap<String, u64>) -> Self {
         Self {
             wanted: frontier.iter().cloned().collect(),
             taken: Vec::new(),
             seen: HashSet::new(),
+            bounds: bounds.clone(),
         }
     }
 
@@ -611,11 +935,15 @@ impl Walk {
             for (id, body) in found {
                 self.wanted.remove(&id);
                 self.seen.insert(id.clone());
-                parents.extend(
-                    crate::rooms::edge_ids(&body["prev_events"])
-                        .into_iter()
-                        .filter(|parent| !self.seen.contains(parent)),
-                );
+                let depth = body["depth"].as_u64().unwrap_or(0);
+                for parent in crate::rooms::edge_ids(&body["prev_events"]) {
+                    if self.seen.contains(&parent) {
+                        continue;
+                    }
+                    let bound = self.bounds.entry(parent.clone()).or_insert(depth);
+                    *bound = (*bound).max(depth);
+                    parents.push(parent);
+                }
                 self.taken.push((id, body));
             }
             parents.sort();
@@ -626,6 +954,66 @@ impl Walk {
                 }
             }
         }
+    }
+
+    /// Step over wanted events no server serves, onto what the peer's page
+    /// holds below them: the page's heads -- events no other event in it
+    /// names -- deeper than the history held before the gap and shallower
+    /// than the newest event that named a missing one. A peer that leaves a
+    /// rejected event out of `/backfill` still walks on through it, so its
+    /// page starts with exactly that event's predecessors.
+    ///
+    /// What is taken from the page is verified and checked like any other
+    /// event; the depth window keeps a page that ignored the request (the
+    /// peer's newest events, or its oldest) from being stitched in.
+    /// Returns the events stepped over; empty when the page offers nothing
+    /// to step onto, and then nothing changed.
+    fn bridge(
+        &mut self,
+        rooms: &Rooms,
+        room_id: &str,
+        offered: &HashMap<String, Value>,
+        floor: u64,
+    ) -> Result<Vec<String>, RoomError> {
+        let missing: Vec<String> = self
+            .wanted
+            .iter()
+            .filter(|id| !offered.contains_key(*id))
+            .cloned()
+            .collect();
+        let Some(ceiling) = missing
+            .iter()
+            .filter_map(|id| self.bounds.get(id).copied())
+            .max()
+        else {
+            return Ok(Vec::new());
+        };
+        let named: HashSet<String> = offered
+            .values()
+            .flat_map(|body| crate::rooms::edge_ids(&body["prev_events"]))
+            .collect();
+        let mut heads: Vec<String> = offered
+            .iter()
+            .filter(|(id, body)| {
+                let depth = body["depth"].as_u64().unwrap_or(0);
+                !named.contains(*id) && !self.seen.contains(*id) && depth > floor && depth < ceiling
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        heads.sort();
+        let heads = rooms.gap_unheld(room_id, &heads)?;
+        if heads.is_empty() {
+            return Ok(Vec::new());
+        }
+        for id in &missing {
+            self.wanted.remove(id);
+            self.seen.insert(id.clone());
+        }
+        for head in heads {
+            self.bounds.insert(head.clone(), ceiling);
+            self.wanted.insert(head);
+        }
+        Ok(missing)
     }
 }
 
@@ -645,57 +1033,79 @@ fn by_id(version: &RoomVersionId, pdus: Vec<Value>) -> HashMap<String, Value> {
     out
 }
 
-/// One chunk from one peer: the page, verified, with its auth events and
-/// the state before its oldest event retained.
-#[allow(
-    clippy::too_many_lines,
-    reason = "one chunk's fetch, verification and state, in the order SPEC §6.5 gives"
-)]
-async fn fetch_chunk(
+/// One `/backfill` page from one peer, walked: what the walk took from it,
+/// and the rest of the page. A page without the frontier itself is tried
+/// once more with the frontier events fetched one by one; a peer that has
+/// none of them answers with an empty walk, not an error -- a 404 is an
+/// answer about one event, not about the peer.
+async fn fetch_page(
     peers: &Peers<'_>,
     peer: &str,
     room_id: &str,
     version: &RoomVersionId,
     frontier: &[String],
+    bounds: &HashMap<String, u64>,
     settings: Settings,
-    keys: &mut HashMap<String, PeerKeys>,
-) -> Result<Fetched, Failure> {
+) -> Result<(Walk, HashMap<String, Value>), Failure> {
     let from: Vec<String> = frontier.iter().take(MAX_FROM).cloned().collect();
-    let pdus = peers
+    let pdus = match peers
         .federation
         .remote_backfill(peer, room_id, &from, settings.chunk)
         .await
-        .map_err(|error| Failure::from_peer(&error))?;
+    {
+        Ok(pdus) => pdus,
+        Err(FederationError::Answered { status: 404, .. }) => Vec::new(),
+        Err(error) => {
+            return Err(Failure::from_peer_doing(
+                &format!("/backfill from {}", from[0]),
+                &error,
+            ));
+        }
+    };
     peers.metrics.record_backfill_events(
         BackfillEvent::Fetched,
         u64::try_from(pdus.len()).unwrap_or(u64::MAX),
     );
     let mut offered = by_id(version, pdus);
-    let mut walk = Walk::new(frontier);
+    let mut walk = Walk::new(frontier, bounds);
     walk.take(peers.rooms, room_id, &mut offered, settings.chunk)?;
     if walk.taken.is_empty() {
-        // A peer whose `/backfill` served nothing the walk asked for --
-        // some answer only from their own extremities -- may still serve
-        // the events themselves.
+        // A peer whose `/backfill` served nothing the walk asked for may
+        // still serve the events themselves. Each one on its own: a 404
+        // for one is no reason not to ask for the next.
         for id in frontier.iter().take(FALLBACK_EVENTS) {
-            let body = peers
-                .federation
-                .remote_event(peer, id)
-                .await
-                .map_err(|error| Failure::from_peer(&error))?;
-            peers
-                .metrics
-                .record_backfill_events(BackfillEvent::Fetched, 1);
-            offered.insert(id.clone(), body);
+            match peers.federation.remote_event(peer, id).await {
+                Ok(body) => {
+                    peers
+                        .metrics
+                        .record_backfill_events(BackfillEvent::Fetched, 1);
+                    offered.insert(id.clone(), body);
+                }
+                Err(FederationError::Answered { status: 404, .. }) => {}
+                Err(error) => {
+                    return Err(Failure::from_peer_doing(&format!("/event {id}"), &error));
+                }
+            }
         }
         walk.take(peers.rooms, room_id, &mut offered, settings.chunk)?;
     }
-    if walk.taken.is_empty() {
-        return Err(Failure::peer(format!(
-            "{peer} served none of the gap's missing history"
-        )));
-    }
+    Ok((walk, offered))
+}
 
+/// Finish a walked page: verify every event taken, fetch the auth events
+/// it lacks, and the state once at its oldest event.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one chunk's verification and state, in the order SPEC §6.5 gives"
+)]
+async fn finish(
+    peers: &Peers<'_>,
+    peer: &str,
+    room_id: &str,
+    version: &RoomVersionId,
+    walk: Walk,
+    keys: &mut HashMap<String, PeerKeys>,
+) -> Result<Fetched, Failure> {
     // Every event the walk took: hash, signatures, and that the body is
     // the event it was asked for. One forged event refuses the chunk.
     let mut events = Vec::with_capacity(walk.taken.len());
@@ -750,7 +1160,7 @@ async fn fetch_chunk(
             response
         }
         Err(error) => {
-            let failure = Failure::from_peer(&error);
+            let failure = Failure::from_peer_doing(&format!("/state_ids at {oldest}"), &error);
             if let Failure::Peer {
                 rate_limited: Some(wait),
                 ..
@@ -796,10 +1206,16 @@ async fn fetch_chunk(
     .await?;
     retain(peers, room_id, fetched)?;
 
+    let frontier: Vec<String> = walk.wanted.into_iter().collect();
+    let bounds = frontier
+        .iter()
+        .filter_map(|id| Some((id.clone(), walk.bounds.get(id).copied()?)))
+        .collect();
     Ok(Fetched {
         events,
         state_before,
-        frontier: walk.wanted.into_iter().collect(),
+        frontier,
+        bounds,
     })
 }
 

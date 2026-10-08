@@ -266,6 +266,17 @@ impl Failure {
         }
     }
 
+    /// [`Self::from_peer`], naming the request that failed, so a log line
+    /// says which endpoint and which event a peer refused rather than only
+    /// what it said.
+    pub(super) fn from_peer_doing(what: &str, error: &FederationError) -> Self {
+        let mut failure = Self::from_peer(error);
+        if let Self::Peer { message, .. } = &mut failure {
+            *message = format!("{what}: {message}");
+        }
+        failure
+    }
+
     /// A peer failure for a reason of this server's own, not an answer.
     pub(super) fn peer(message: impl Into<String>) -> Self {
         Self::Peer {
