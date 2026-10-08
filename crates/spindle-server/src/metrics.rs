@@ -1106,10 +1106,6 @@ struct Histogram {
 }
 
 impl Histogram {
-    fn new() -> Self {
-        Self::with_bounds(&BUCKETS)
-    }
-
     fn with_bounds(bounds: &'static [f64]) -> Self {
         Self {
             bounds,
