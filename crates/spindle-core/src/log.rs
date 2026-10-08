@@ -1386,6 +1386,229 @@ pub enum RestoreError {
     MissingExtremity(EventId),
 }
 
+/// The most entries a restore reserves index space for up front.
+///
+/// The hint comes from the room's counters, which are read from disk: a
+/// corrupt counter must not become a multi-gigabyte allocation, so the
+/// reservation is capped and a larger room simply grows past it.
+const MAX_RESTORE_RESERVATION: usize = 1 << 21;
+
+/// [`RoomLog::restore_runtime`] and [`RoomLog::restore_exhaustive`], fed
+/// one record at a time.
+///
+/// The batch forms take an iterator, which forces a store to materialize
+/// every record before the first is checked -- for a room of a million
+/// events, a second full copy of its log held only to be walked once.
+/// This lets the store decode each row straight out of its own scan and
+/// hand it over, with every check the batch forms make applied in the same
+/// order: ascending unique positions, unique events, the recomputed chain,
+/// and, in [`Self::finish_runtime`], the counters, the tips and the
+/// selected roots.
+#[derive(Debug)]
+pub struct LogRestore {
+    log: RoomLog,
+    /// The accepted entries, in ascending order, until [`Self::finish`]
+    /// builds the log's map from them in one pass. Inserting a million
+    /// ascending keys one at a time splits every node at its middle and
+    /// leaves the map half empty; building it from the sorted run packs
+    /// each node full, which is most of the memory the log's index costs
+    /// and a good part of the time.
+    entries: Vec<(i64, LogEntry)>,
+    previous: Option<i64>,
+}
+
+impl LogRestore {
+    /// Begin a restore. `expected_entries` only sizes the event index; it
+    /// is a hint, and any count of entries may follow.
+    #[must_use]
+    pub fn new(
+        next_forward: i64,
+        next_backward: i64,
+        forward_extremities: impl IntoIterator<Item = EventId>,
+        expected_entries: usize,
+    ) -> Self {
+        let mut log = RoomLog {
+            next_forward,
+            next_backward,
+            forward_extremities: forward_extremities.into_iter().collect(),
+            ..RoomLog::default()
+        };
+        let reserve = expected_entries.min(MAX_RESTORE_RESERVATION);
+        log.positions.reserve(reserve);
+        Self {
+            log,
+            entries: Vec::with_capacity(reserve),
+            previous: None,
+        }
+    }
+
+    /// Accept the next record, which must sort after every one before it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a record out of order, a repeated position or
+    /// event, or a chain value that disagrees with the history before it.
+    pub fn push(&mut self, restored: RestoredEntry) -> Result<(), RestoreError> {
+        let log = &mut self.log;
+        let li = restored.li.get();
+        if let Some(previous) = self.previous {
+            if li == previous {
+                return Err(RestoreError::DuplicateIndex(li));
+            }
+            if li < previous {
+                return Err(RestoreError::OutOfOrder {
+                    expected_after: previous,
+                    found: li,
+                });
+            }
+        }
+        self.previous = Some(li);
+        let chain = match restored.chain {
+            Some(stored) => {
+                let recomputed = log.head_chain.extend(&restored.event_id);
+                if *recomputed.as_bytes() != stored {
+                    return Err(RestoreError::BrokenChain(li));
+                }
+                log.head_chain = recomputed;
+                Some(recomputed)
+            }
+            None => None,
+        };
+        let entry = LogEntry {
+            li: restored.li,
+            event_id: restored.event_id,
+            prev_events: restored.prev_events,
+            depth: restored.depth,
+            state_key: restored.state_key,
+            chain,
+            state_root: StateRoot::from_bytes(restored.expected_state_root),
+        };
+        if log.positions.insert(entry.event_id.clone(), li).is_some() {
+            return Err(RestoreError::DuplicateEvent(entry.event_id));
+        }
+        self.entries.push((li, entry));
+        Ok(())
+    }
+
+    /// How many records have been accepted.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no record has been accepted yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Finish as [`RoomLog::restore_runtime`] does: counters and tips
+    /// checked, the resident window and every tip hydrated and verified.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for counters that collide with the log, a tip the
+    /// log does not hold, or a selected root that cannot be read and
+    /// verified completely.
+    pub fn finish_runtime(
+        self,
+        load_node: NodeLoader<'_>,
+    ) -> Result<RuntimeRestoredLog, RestoreError> {
+        self.finish(load_node, false)
+            .map(|log| RuntimeRestoredLog { log })
+    }
+
+    /// Finish as [`RoomLog::restore_exhaustive`] does: every persisted root
+    /// read and verified, at any age.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::finish_runtime`], for any root rather than the selected.
+    pub fn finish_exhaustive(self, load_node: NodeLoader<'_>) -> Result<RestoredLog, RestoreError> {
+        self.finish(load_node, true).map(|log| RestoredLog {
+            log,
+            broken_chain: Vec::new(),
+            unverified: Vec::new(),
+        })
+    }
+
+    fn finish(self, load_node: NodeLoader<'_>, exhaustive: bool) -> Result<RoomLog, RestoreError> {
+        let mut log = self.log;
+        // Already strictly ascending -- `push` refused anything else -- so
+        // the sort inside `collect` is one linear pass that finds a single
+        // run, and the map is bulk-built from it.
+        log.entries = self.entries.into_iter().collect();
+        let (next_forward, next_backward) = (log.next_forward, log.next_backward);
+        if log
+            .entries
+            .last_key_value()
+            .is_some_and(|(&li, _)| li >= next_forward)
+            || log
+                .entries
+                .first_key_value()
+                .is_some_and(|(&li, _)| li <= next_backward)
+        {
+            return Err(RestoreError::InvalidCounters {
+                next_forward,
+                next_backward,
+            });
+        }
+        let mut selected: BTreeSet<i64> = log
+            .entries
+            .keys()
+            .rev()
+            .take(DEFAULT_RESIDENT_WINDOW)
+            .copied()
+            .collect();
+        for tip in &log.forward_extremities {
+            let li = log
+                .positions
+                .get(tip)
+                .ok_or_else(|| RestoreError::MissingExtremity(tip.clone()))?;
+            selected.insert(*li);
+        }
+        let mut verified_nodes = VerifiedNodeCache::new(64 * 1024 * 1024);
+        let mut hydrate = |root: StateRoot, li: i64, cache: &mut VerifiedNodeCache| {
+            StateSnapshot::rehydrate_cached(root, &mut |root: &StateRoot| load_node(root), cache)
+                .map_err(|_| RestoreError::UnreadableState(li))
+        };
+        if exhaustive {
+            // Weak cache entries need live owners during an exhaustive
+            // traversal. The processing window is independent of the final
+            // resident indexes: old roots share subtrees even before the
+            // selected head window starts.
+            let mut processing = VecDeque::new();
+            let mut resident = Vec::with_capacity(selected.len());
+            for (&li, entry) in &log.entries {
+                let state = hydrate(entry.state_root, li, &mut verified_nodes)?;
+                if selected.contains(&li) {
+                    resident.push((li, state.clone()));
+                }
+                processing.push_back(state);
+                if processing.len() > DEFAULT_RESIDENT_WINDOW {
+                    processing.pop_front();
+                }
+            }
+            log.resident.extend(resident);
+        } else {
+            // Only the selected positions, in ascending order so shared
+            // subtrees are verified once. Walking every entry to skip all
+            // but these was a set probe per entry -- a million of them in
+            // the rooms this path exists for.
+            for li in selected {
+                let root = log
+                    .entries
+                    .get(&li)
+                    .map(|entry| entry.state_root)
+                    .ok_or(RestoreError::UnreadableState(li))?;
+                let state = hydrate(root, li, &mut verified_nodes)?;
+                log.resident.insert(li, state);
+            }
+        }
+        Ok(log)
+    }
+}
+
 impl RoomLog {
     /// Rebuild a log from durable records, supplied in ascending `li` order.
     ///
@@ -1500,106 +1723,17 @@ impl RoomLog {
         load_node: NodeLoader<'_>,
         exhaustive: bool,
     ) -> Result<Self, RestoreError> {
-        let mut log = Self {
+        let entries = entries.into_iter();
+        let mut restore = LogRestore::new(
             next_forward,
             next_backward,
-            forward_extremities: forward_extremities.into_iter().collect(),
-            ..Self::default()
-        };
-        let mut previous = None;
+            forward_extremities,
+            entries.size_hint().0,
+        );
         for restored in entries {
-            let li = restored.li.get();
-            if let Some(previous) = previous {
-                if li == previous {
-                    return Err(RestoreError::DuplicateIndex(li));
-                }
-                if li < previous {
-                    return Err(RestoreError::OutOfOrder {
-                        expected_after: previous,
-                        found: li,
-                    });
-                }
-            }
-            previous = Some(li);
-            let chain = match restored.chain {
-                Some(stored) => {
-                    let recomputed = log.head_chain.extend(&restored.event_id);
-                    if *recomputed.as_bytes() != stored {
-                        return Err(RestoreError::BrokenChain(li));
-                    }
-                    log.head_chain = recomputed;
-                    Some(recomputed)
-                }
-                None => None,
-            };
-            let entry = LogEntry {
-                li: restored.li,
-                event_id: restored.event_id,
-                prev_events: restored.prev_events,
-                depth: restored.depth,
-                state_key: restored.state_key,
-                chain,
-                state_root: StateRoot::from_bytes(restored.expected_state_root),
-            };
-            if log.positions.insert(entry.event_id.clone(), li).is_some() {
-                return Err(RestoreError::DuplicateEvent(entry.event_id));
-            }
-            log.entries.insert(li, entry);
+            restore.push(restored)?;
         }
-        if log
-            .entries
-            .last_key_value()
-            .is_some_and(|(&li, _)| li >= next_forward)
-            || log
-                .entries
-                .first_key_value()
-                .is_some_and(|(&li, _)| li <= next_backward)
-        {
-            return Err(RestoreError::InvalidCounters {
-                next_forward,
-                next_backward,
-            });
-        }
-        let mut selected: BTreeSet<i64> = log
-            .entries
-            .keys()
-            .rev()
-            .take(DEFAULT_RESIDENT_WINDOW)
-            .copied()
-            .collect();
-        for tip in &log.forward_extremities {
-            let li = log
-                .positions
-                .get(tip)
-                .ok_or_else(|| RestoreError::MissingExtremity(tip.clone()))?;
-            selected.insert(*li);
-        }
-        let mut verified_nodes = VerifiedNodeCache::new(64 * 1024 * 1024);
-        // Weak cache entries need live owners during an exhaustive traversal.
-        // The processing window is independent of the final resident indexes:
-        // old roots share subtrees even before the selected head window starts.
-        let mut processing = VecDeque::new();
-        for (&li, entry) in &log.entries {
-            if !exhaustive && !selected.contains(&li) {
-                continue;
-            }
-            let state = StateSnapshot::rehydrate_cached(
-                entry.state_root,
-                &mut |root: &StateRoot| load_node(root),
-                &mut verified_nodes,
-            )
-            .map_err(|_| RestoreError::UnreadableState(li))?;
-            if selected.contains(&li) {
-                log.resident.insert(li, state.clone());
-            }
-            if exhaustive {
-                processing.push_back(state);
-                if processing.len() > DEFAULT_RESIDENT_WINDOW {
-                    processing.pop_front();
-                }
-            }
-        }
-        Ok(log)
+        restore.finish(load_node, exhaustive)
     }
 
     fn rebuild(

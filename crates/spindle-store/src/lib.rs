@@ -40,7 +40,7 @@ use fjall::{
     KeyspaceCreateOptions as PartitionCreateOptions, PersistMode, Readable,
 };
 use spindle_core::{
-    CONTENT_DIGEST_VERSION, EventId, RestoreError, RestoredEntry, RestoredLog, RoomLog,
+    CONTENT_DIGEST_VERSION, EventId, LogRestore, RestoreError, RestoredEntry, RestoredLog, RoomLog,
     RuntimeRestoredLog, StateRoot,
     keys::{KEY_SCHEMA_VERSION, Keyspace, content_addressed, room_li, room_prefix, store_marker},
 };
@@ -153,6 +153,10 @@ mod durability_tests {
 /// One key and its value, as read back from a scan.
 pub type Record = (Vec<u8>, Vec<u8>);
 
+/// What [`ReadView::visit_prefix`] calls with each key and value; an error
+/// stops the scan and is returned from it.
+pub type RowVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> Result<(), StoreError> + 'a;
+
 /// The ordered key-value operations the log needs.
 ///
 /// Narrow on purpose: every hot operation is a point lookup or a sorted range
@@ -170,6 +174,28 @@ pub trait ReadView {
     ///
     /// Returns a backend error if the scan fails.
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<Record>, StoreError>;
+
+    /// Visit every entry whose key starts with `prefix`, in key order,
+    /// without collecting them.
+    ///
+    /// [`Self::scan_prefix`] copies the whole range into memory before the
+    /// caller sees its first row. For a room restore that is the room's
+    /// entire log, held twice -- once as rows, once decoded -- at the
+    /// moment memory is scarcest. A visitor sees each row while the backend
+    /// still owns it and stops the scan by returning an error.
+    ///
+    /// The default collects through [`Self::scan_prefix`], so a backend
+    /// gets the semantics for free and the memory saving by overriding it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the scan fails, or the visitor's error.
+    fn visit_prefix(&self, prefix: &[u8], visit: &mut RowVisitor<'_>) -> Result<(), StoreError> {
+        for (key, value) in self.scan_prefix(prefix)? {
+            visit(&key, &value)?;
+        }
+        Ok(())
+    }
 
     /// Entries whose key starts with `prefix` *and* sorts at or after
     /// `start`, in key order.
@@ -831,6 +857,17 @@ impl ReadView for FjallStore {
         Ok(out)
     }
 
+    fn visit_prefix(&self, prefix: &[u8], visit: &mut RowVisitor<'_>) -> Result<(), StoreError> {
+        let mut visited = 0_u64;
+        let result = self.partition.prefix(prefix).try_for_each(|pair| {
+            let (key, value) = pair.into_inner()?;
+            visited += 1;
+            visit(&key, &value)
+        });
+        self.scanned.fetch_add(visited, Ordering::Relaxed);
+        result
+    }
+
     fn scan_from(&self, prefix: &[u8], start: &[u8]) -> Result<Vec<Record>, StoreError> {
         let mut out = Vec::new();
         for pair in self.partition.range(start.to_vec()..) {
@@ -912,6 +949,15 @@ impl ReadView for FjallCheckpoint {
             out.push((key.to_vec(), value.to_vec()));
         }
         Ok(out)
+    }
+
+    fn visit_prefix(&self, prefix: &[u8], visit: &mut RowVisitor<'_>) -> Result<(), StoreError> {
+        self.0.prefix(&self.1, prefix).try_for_each(|pair| {
+            let (key, value) = pair
+                .into_inner()
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+            visit(&key, &value)
+        })
     }
 
     fn scan_from(&self, prefix: &[u8], start: &[u8]) -> Result<Vec<Record>, StoreError> {
@@ -1203,6 +1249,93 @@ mod group_commit_tests {
             .unwrap();
         assert!(ran, "the next writer must fsync rather than inherit an Ok");
     }
+}
+
+/// Rows above which a restore reads and checks on two threads.
+const PIPELINE_ROWS: usize = 16_384;
+
+/// Rows handed from the reading thread to the checking one at a time.
+const PIPELINE_BATCH: usize = 4_096;
+
+/// Stream `prefix` into `restore` on two threads: this one reads and
+/// decodes rows, a scoped worker checks and accepts them, in order.
+///
+/// Reading a row (the store's iteration, the decode, the allocations) and
+/// accepting it (the chain hash, the event index) cost about the same, and
+/// on a large room each is most of a second, so overlapping them is most of
+/// the remaining win. Nothing about the checks changes: every row still
+/// passes through [`LogRestore::push`], one at a time, in ascending order,
+/// on one thread. Bounded: at most a few batches are in flight.
+///
+/// The error reported is the one a single-threaded restore would report.
+/// A row is only decoded after every row before it was, and every decoded
+/// row is handed over before the scan's own error is: so a check failing
+/// on an earlier row wins over a decode failing on a later one.
+fn pipelined(
+    view: &dyn ReadView,
+    prefix: &[u8],
+    restore: LogRestore,
+    profile: &mut RestoreProfile,
+) -> Result<LogRestore, StoreError> {
+    std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::sync_channel::<Vec<RestoredEntry>>(4);
+        let worker = std::thread::Builder::new()
+            .name("spindle-restore".to_owned())
+            .spawn_scoped(scope, move || {
+                let mut restore = restore;
+                for batch in receive {
+                    for entry in batch {
+                        restore.push(entry)?;
+                    }
+                }
+                Ok::<_, RestoreError>(restore)
+            })
+            .map_err(|error| StoreError::Backend(format!("cannot start a restore: {error}")))?;
+        let mut batch = Vec::with_capacity(PIPELINE_BATCH);
+        let scanned = view.visit_prefix(prefix, &mut |_, value| {
+            profile.row_bytes += value.len() as u64;
+            batch.push(EntryRecord::decode_restored(value)?);
+            if batch.len() == PIPELINE_BATCH {
+                let full = std::mem::replace(&mut batch, Vec::with_capacity(PIPELINE_BATCH));
+                // The worker has stopped on an error of its own, which is
+                // reported below; there is no point reading further.
+                send.send(full)
+                    .map_err(|_| StoreError::Backend("restore stopped".to_owned()))?;
+            }
+            Ok(())
+        });
+        if !batch.is_empty() {
+            let _ = send.send(batch);
+        }
+        drop(send);
+        let checked = match worker.join() {
+            Ok(checked) => checked,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        let restore = checked?;
+        scanned?;
+        Ok(restore)
+    })
+}
+
+/// Where one room restore spent its time ([`RoomStore::load_runtime_profiled`]).
+///
+/// Reported by the server for slow cold loads, so a slow one says which
+/// part was slow instead of only that it was.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RestoreProfile {
+    /// Log rows read.
+    pub rows: usize,
+    /// Their encoded size, in bytes.
+    pub row_bytes: u64,
+    /// Reading, decoding and checking every row: order, uniqueness, chain.
+    pub records: std::time::Duration,
+    /// Hydrating and verifying the resident window's and every tip's state.
+    pub roots: std::time::Duration,
+    /// Restoring soft-failed and rejected events with their states.
+    pub sidelined: std::time::Duration,
+    /// Restoring imported historical rejection markers.
+    pub rejections: std::time::Duration,
 }
 
 /// Persist a room's log, and read it back.
@@ -1579,13 +1712,71 @@ impl<'a, S: Store> RoomStore<'a, S> {
         Ok(Some((meta, entries)))
     }
 
+    /// Read the room's metadata and stream its log into a [`LogRestore`],
+    /// through one frozen view (see [`Self::read_records`] for why one).
+    ///
+    /// Each row is decoded as the scan reaches it and handed straight to
+    /// the restore, which checks its order, its uniqueness and its chain
+    /// link before the next row is read. Nothing holds the room's rows as
+    /// rows: the only copy of the log this builds is the log.
+    fn stream_records(&self) -> Result<Option<(LogRestore, RestoreProfile)>, StoreError> {
+        let started = std::time::Instant::now();
+        let snapshot = self.store.snapshot();
+        let view: &dyn ReadView = snapshot.as_deref().unwrap_or(self.store);
+        let Some(raw_meta) = view.get(&room_prefix(Keyspace::RoomMeta, &self.room_id))? else {
+            return Ok(None);
+        };
+        let meta = RoomRecord::decode(&raw_meta)?;
+        // The occupied positions are contiguous, so the counters bound the
+        // row count. Only a reservation hint: `LogRestore` caps it.
+        let expected = usize::try_from(
+            meta.next_forward
+                .saturating_sub(meta.next_backward)
+                .saturating_sub(1),
+        )
+        .unwrap_or(0);
+        let mut restore = LogRestore::new(
+            meta.next_forward,
+            meta.next_backward,
+            meta.forward_extremities
+                .into_iter()
+                .map(|id| EventId::new(id.as_str())),
+            expected,
+        );
+        let mut profile = RestoreProfile::default();
+        let prefix = room_prefix(Keyspace::Log, &self.room_id);
+        let restore = if expected >= PIPELINE_ROWS {
+            pipelined(view, &prefix, restore, &mut profile)?
+        } else {
+            view.visit_prefix(&prefix, &mut |_, value| {
+                profile.row_bytes += value.len() as u64;
+                restore.push(EntryRecord::decode_restored(value)?)?;
+                Ok(())
+            })?;
+            restore
+        };
+        profile.rows = restore.len();
+        profile.records = started.elapsed();
+        Ok(Some((restore, profile)))
+    }
+
     /// Runtime restoration checks all ordered metadata/chain and selected
     /// roots only. Older roots are checked on demand, not declared verified.
     ///
     /// # Errors
     /// Returns an error for unreadable records, chain, tips or selected roots.
     pub fn load_runtime(&self) -> Result<Option<RuntimeRestoredLog>, StoreError> {
-        let Some((meta, entries)) = self.read_records()? else {
+        Ok(self.load_runtime_profiled()?.map(|(restored, _)| restored))
+    }
+
+    /// [`Self::load_runtime`], reporting where the time went.
+    ///
+    /// # Errors
+    /// As [`Self::load_runtime`].
+    pub fn load_runtime_profiled(
+        &self,
+    ) -> Result<Option<(RuntimeRestoredLog, RestoreProfile)>, StoreError> {
+        let Some((restore, mut profile)) = self.stream_records()? else {
             return Ok(None);
         };
         let mut load_node = |address: &StateRoot| {
@@ -1594,18 +1785,16 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 .ok()
                 .flatten()
         };
-        let mut restored = RoomLog::restore_runtime(
-            entries,
-            meta.next_forward,
-            meta.next_backward,
-            meta.forward_extremities
-                .into_iter()
-                .map(|id| EventId::new(id.as_str())),
-            &mut load_node,
-        )?;
+        let started = std::time::Instant::now();
+        let mut restored = restore.finish_runtime(&mut load_node)?;
+        profile.roots = started.elapsed();
+        let started = std::time::Instant::now();
         self.restore_sidelined_checked(&mut restored.log)?;
+        profile.sidelined = started.elapsed();
+        let started = std::time::Instant::now();
         self.restore_historical_rejections(&mut restored.log)?;
-        Ok(Some(restored))
+        profile.rejections = started.elapsed();
+        Ok(Some((restored, profile)))
     }
 
     /// Validate every persisted root and chain, including historical roots
@@ -1614,7 +1803,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
     /// # Errors
     /// Returns an error for unreadable records, chain, tips or any state root.
     pub fn load_exhaustive(&self) -> Result<Option<RestoredLog>, StoreError> {
-        let Some((meta, entries)) = self.read_records()? else {
+        let Some((restore, _)) = self.stream_records()? else {
             return Ok(None);
         };
         let mut load_node = |address: &StateRoot| {
@@ -1623,15 +1812,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 .ok()
                 .flatten()
         };
-        let mut restored = RoomLog::restore_exhaustive(
-            entries,
-            meta.next_forward,
-            meta.next_backward,
-            meta.forward_extremities
-                .into_iter()
-                .map(|id| EventId::new(id.as_str())),
-            &mut load_node,
-        )?;
+        let mut restored = restore.finish_exhaustive(&mut load_node)?;
         self.restore_sidelined_checked(&mut restored.log)?;
         self.restore_historical_rejections(&mut restored.log)?;
         Ok(Some(restored))

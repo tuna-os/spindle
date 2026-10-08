@@ -149,6 +149,59 @@ impl EntryRecord {
     }
 }
 
+impl EntryRecord {
+    /// Decode a stored row straight into the form a restore consumes.
+    ///
+    /// Exactly [`Self::decode`]'s format and checks, without the
+    /// intermediate record: every string is validated in place and copied
+    /// once, into the type the log keeps, where `decode` followed by the
+    /// conversions copies each twice. On the restore of a room of a million
+    /// events that is several million allocations nobody needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] for an unknown version or a truncated or
+    /// malformed record, as [`Self::decode`] does.
+    pub fn decode_restored(bytes: &[u8]) -> Result<spindle_core::RestoredEntry, CodecError> {
+        let mut cursor = Cursor { bytes, at: 0 };
+        let version = cursor.byte()?;
+        if version != RECORD_VERSION {
+            return Err(CodecError::UnsupportedVersion(version));
+        }
+        let li = spindle_core::keys::from_order_preserving(cursor.array::<8>()?);
+        let depth = u64::from_be_bytes(cursor.array::<8>()?);
+        let expected_state_root = cursor.array::<32>()?;
+        let event_id = EventId::new(cursor.str()?);
+        let parent_count = cursor.count()?;
+        let mut prev_events = Vec::with_capacity(parent_count);
+        for _ in 0..parent_count {
+            prev_events.push(EventId::new(cursor.str()?));
+        }
+        let state_key = match cursor.byte()? {
+            0 => None,
+            1 => {
+                let event_type = cursor.str()?;
+                Some(StateKey::new(event_type, cursor.str()?))
+            }
+            other => return Err(CodecError::Malformed(other)),
+        };
+        let chain = match cursor.byte()? {
+            0 => None,
+            1 => Some(cursor.array::<32>()?),
+            other => return Err(CodecError::Malformed(other)),
+        };
+        Ok(spindle_core::RestoredEntry {
+            li: LinearIndex::from_raw(li),
+            event_id,
+            prev_events,
+            depth,
+            state_key,
+            expected_state_root,
+            chain,
+        })
+    }
+}
+
 /// A soft-failed or rejected event held outside the timeline
 /// (`spindle_core::SidelinedEntry`).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -330,10 +383,11 @@ struct Cursor<'a> {
     at: usize,
 }
 
-impl Cursor<'_> {
-    fn take(&mut self, count: usize) -> Result<&[u8], CodecError> {
+impl<'a> Cursor<'a> {
+    fn take(&mut self, count: usize) -> Result<&'a [u8], CodecError> {
         let end = self.at.checked_add(count).ok_or(CodecError::Truncated)?;
-        let slice = self.bytes.get(self.at..end).ok_or(CodecError::Truncated)?;
+        let bytes: &'a [u8] = self.bytes;
+        let slice = bytes.get(self.at..end).ok_or(CodecError::Truncated)?;
         self.at = end;
         Ok(slice)
     }
@@ -381,9 +435,14 @@ impl Cursor<'_> {
     }
 
     fn string(&mut self) -> Result<String, CodecError> {
+        self.str().map(str::to_owned)
+    }
+
+    /// A framed string, validated in place and borrowed from the record.
+    fn str(&mut self) -> Result<&'a str, CodecError> {
         let len = self.len()?;
         let bytes = self.take(len)?;
-        String::from_utf8(bytes.to_vec()).map_err(|_| CodecError::NotUtf8)
+        std::str::from_utf8(bytes).map_err(|_| CodecError::NotUtf8)
     }
 }
 

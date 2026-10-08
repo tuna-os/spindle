@@ -394,3 +394,113 @@ async fn first_request_latency_by_room_size() {
         );
     }
 }
+
+/// After a restart, a reader who keeps up costs the first unread count a
+/// handful of reads, not one per event the room ever held -- and a reader
+/// far behind still gets the exact count, by extending the index down to
+/// where they are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_unread_count_after_a_restart_reads_only_what_is_unread() {
+    const BOB: &str = "@bob:example.org";
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+    let key = spindle_server::signing::ServerKey::load_or_create(store.as_ref()).unwrap();
+    let room = {
+        let rooms = spindle_server::rooms::Rooms::new(Arc::clone(&store), SERVER);
+        let room = rooms
+            .create(
+                ALICE,
+                key.pair(),
+                Some("busy"),
+                None,
+                Some("public_chat"),
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                &serde_json::Map::new(),
+            )
+            .unwrap();
+        rooms
+            .set_membership(&room, BOB, BOB, "join", None, key.pair())
+            .unwrap();
+        let mut read_up_to = String::new();
+        for n in 0..300 {
+            let sender = if n % 30 == 0 { BOB } else { ALICE };
+            let id = rooms
+                .send(
+                    &room,
+                    sender,
+                    key.pair(),
+                    "m.room.message",
+                    &json!({ "msgtype": "m.text", "body": format!("{n}") }),
+                )
+                .unwrap();
+            if n == 289 {
+                read_up_to = id;
+            }
+        }
+        rooms
+            .set_receipt(&room, ALICE, "m.read", &read_up_to, None)
+            .unwrap();
+        room
+    };
+
+    let server = Restarted::over(&store);
+    server.state.rooms.warm(&room).unwrap();
+    let before = store.reads();
+    let alice = server.state.rooms.unread(&room, ALICE).unwrap();
+    let reads = store.reads() - before;
+    // Messages 290..299 are unread to alice, none of them bob's.
+    assert_eq!(alice.notification_count, 0);
+    assert!(
+        reads < 40,
+        "a reader ten events behind read {reads} rows, not the room's 300"
+    );
+    // Bob has no receipt: everything alice said since he joined is unread.
+    let bob = server.state.rooms.unread(&room, BOB).unwrap();
+    assert_eq!(bob.notification_count, 290);
+    // Both are now answered from the extended index, and an append keeps
+    // it current for both.
+    let before = store.reads();
+    assert_eq!(
+        server
+            .state
+            .rooms
+            .unread(&room, ALICE)
+            .unwrap()
+            .notification_count,
+        0
+    );
+    assert!(store.reads() - before < 40);
+    server
+        .state
+        .rooms
+        .send(
+            &room,
+            BOB,
+            key.pair(),
+            "m.room.message",
+            &json!({ "msgtype": "m.text", "body": "new" }),
+        )
+        .unwrap();
+    assert_eq!(
+        server
+            .state
+            .rooms
+            .unread(&room, ALICE)
+            .unwrap()
+            .notification_count,
+        1
+    );
+    assert_eq!(
+        server
+            .state
+            .rooms
+            .unread(&room, BOB)
+            .unwrap()
+            .notification_count,
+        290
+    );
+}

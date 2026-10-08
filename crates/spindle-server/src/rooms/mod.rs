@@ -166,6 +166,11 @@ pub struct Rooms {
     /// server's one registry, shared with everything else that records.
     metrics: Arc<crate::metrics::Metrics>,
     open: RwLock<HashMap<String, Arc<RwLock<RoomLog>>>>,
+    /// Cold loads in flight, one per room: every other caller for a room
+    /// being loaded waits for that load rather than starting its own
+    /// ([`Self::room_or_load`]). Taken on its own, briefly, and never held
+    /// across a load.
+    loading: Mutex<HashMap<String, Arc<ColdLoad>>>,
     /// Lock order: `open` before `unread_index`, always. The fast path takes
     /// only `unread_index`; the build and append paths already hold `open`.
     unread_index: Mutex<HashMap<String, UnreadIndex>>,
@@ -464,6 +469,7 @@ impl Rooms {
             server_name: server_name.into(),
             metrics,
             open: RwLock::new(HashMap::new()),
+            loading: Mutex::new(HashMap::new()),
             unread_index: Mutex::new(HashMap::new()),
             highlights: Mutex::new(HashMap::new()),
             last_activity: Mutex::new(HashMap::new()),
@@ -4753,9 +4759,10 @@ impl Rooms {
     /// other one, in rooms they had nothing to do with. Now the map is a
     /// lookup and the *room* is the thing contended.
     ///
-    /// Cold readers may load the same room concurrently, but publication
-    /// rechecks the registry and returns its canonical lock without replacing
-    /// a room another reader or writer has already published.
+    /// A cold room is loaded by one caller at a time; any other caller for
+    /// it waits for that load ([`Self::room_or_load`]), and publication
+    /// returns the registry's canonical lock without replacing a room
+    /// another path has already published.
     fn room(&self, room_id: &str) -> Result<Arc<RwLock<RoomLog>>, RoomError> {
         self.room_or_load(room_id, || {
             // A cold load runs for as long as the room is big -- minutes,
@@ -4771,28 +4778,47 @@ impl Rooms {
     }
 
     /// Restore one room from the store, timing it by the room's size.
+    ///
+    /// A slow one is logged with where its time went -- reading and
+    /// checking the log rows, verifying the resident roots, the sidelined
+    /// events, the imported rejections, resolving an open fork -- so a
+    /// slow cold load in production says which part to look at.
     fn load_cold(&self, room_id: &str) -> Result<RoomLog, RoomError> {
         let started = std::time::Instant::now();
-        let log = self.restore_room(room_id)?;
+        let (log, profile, resolving) = self.restore_room(room_id)?;
         let elapsed = started.elapsed();
         let size = crate::metrics::RoomSize::of(log.len());
         self.metrics.observe_cold_load(size, elapsed);
         if elapsed > std::time::Duration::from_secs(1) {
+            let ms = |duration: std::time::Duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            };
             tracing::info!(
                 room = room_id,
                 entries = log.len(),
-                elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                elapsed_ms = ms(elapsed),
+                rows = profile.rows,
+                row_mib = profile.row_bytes >> 20,
+                records_ms = ms(profile.records),
+                roots_ms = ms(profile.roots),
+                sidelined_ms = ms(profile.sidelined),
+                rejections_ms = ms(profile.rejections),
+                resolve_ms = ms(resolving),
                 "loaded a cold room"
             );
         }
         Ok(log)
     }
 
-    fn restore_room(&self, room_id: &str) -> Result<RoomLog, RoomError> {
-        let restored = RoomStore::new(self.store.as_ref(), room_id)
-            .load_runtime()?
+    fn restore_room(
+        &self,
+        room_id: &str,
+    ) -> Result<(RoomLog, spindle_store::RestoreProfile, std::time::Duration), RoomError> {
+        let (restored, profile) = RoomStore::new(self.store.as_ref(), room_id)
+            .load_runtime_profiled()?
             .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
         let mut log = restored.log;
+        let started = std::time::Instant::now();
         if !log.current_is_settled() {
             match self.resolve_in(&log, room_id, |log, resolver, load| {
                 log.resolve_current(resolver, load)
@@ -4804,7 +4830,7 @@ impl Rooms {
                 ),
             }
         }
-        Ok(log)
+        Ok((log, profile, started.elapsed()))
     }
 
     /// The room's lock if this process holds it open, without loading it.
@@ -4982,17 +5008,57 @@ impl Rooms {
         guard
     }
 
+    /// The room's canonical lock, loading it with `load` if no one holds it
+    /// open -- and if someone is already loading it, waiting for theirs.
+    ///
+    /// One load per room at a time. A cold room of a million events costs
+    /// seconds of CPU and hundreds of megabytes while it loads, and after a
+    /// restart it was routinely loaded several times at once: by the
+    /// warm-up, by the sliding sync whose window held it, and by that
+    /// client's retries of the request that was waiting for it -- each a
+    /// full, independent load competing for the same cores, every one but
+    /// the first thrown away on publication. Now the first caller loads and
+    /// the rest wait for its result (as a blocking section: a wait for
+    /// someone else's load is a lock wait). If that load fails, a waiter
+    /// tries its own, so an error is still met by the caller that can say
+    /// what it means.
+    ///
+    /// Cold I/O and resolution never hold the registry, and a load of one
+    /// room never delays a caller for another. Publication rechecks the
+    /// registry and keeps any lock already there, so the canonical lock and
+    /// anything appended through it survive.
     fn room_or_load(
         &self,
         room_id: &str,
         load: impl FnOnce() -> Result<RoomLog, RoomError>,
     ) -> Result<Arc<RwLock<RoomLog>>, RoomError> {
-        if let Some(room) = self.resident(room_id) {
-            return Ok(room);
-        }
-        // Cold I/O and resolution never hold the registry. Duplicate read-only
-        // loads are allowed; entry-or-insert preserves the canonical lock and
-        // any append performed after another caller first published the room.
+        let slot = loop {
+            match self.claim_load(room_id) {
+                Claim::Resident(room) => return Ok(room),
+                Claim::Lead(slot) => break slot,
+                Claim::Follow(slot) => {
+                    let outcome = crate::blocking::section(
+                        &self.metrics,
+                        crate::metrics::BlockingTask::LockWait,
+                        || slot.wait(),
+                    );
+                    if let Some(room) = outcome {
+                        return Ok(room);
+                    }
+                    // The leader's load failed: claim again, which loads
+                    // here unless another waiter got there first.
+                }
+            }
+        };
+        // Retires the slot however this ends -- an error or a panic in
+        // `load` included -- so no waiter is left waiting for a load that
+        // is no longer running.
+        let mut leader = Lead {
+            rooms: self,
+            room_id,
+            slot,
+            outcome: None,
+        };
         let room = Arc::new(RwLock::new(load()?));
         self.metrics.record_registry_lock(true);
         let started = std::time::Instant::now();
@@ -5002,7 +5068,34 @@ impl Rooms {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.metrics
             .observe_lock_wait(crate::metrics::LockKind::Registry, true, started.elapsed());
-        Ok(Arc::clone(open.entry(room_id.to_owned()).or_insert(room)))
+        let room = Arc::clone(open.entry(room_id.to_owned()).or_insert(room));
+        drop(open);
+        leader.outcome = Some(Arc::clone(&room));
+        Ok(room)
+    }
+
+    /// Who loads `room_id`: nobody, because it is resident; this caller,
+    /// because nobody else is; or whoever already is.
+    fn claim_load(&self, room_id: &str) -> Claim {
+        if let Some(room) = self.resident(room_id) {
+            return Claim::Resident(room);
+        }
+        let mut loading = self
+            .loading
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(slot) = loading.get(room_id) {
+            return Claim::Follow(Arc::clone(slot));
+        }
+        // Checked again under `loading`: a leader publishes the room before
+        // it retires its slot, so a room in neither place is being loaded
+        // by nobody, and one that was published meanwhile is found here.
+        if let Some(room) = self.resident(room_id) {
+            return Claim::Resident(room);
+        }
+        let slot = Arc::new(ColdLoad::default());
+        loading.insert(room_id.to_owned(), Arc::clone(&slot));
+        Claim::Lead(slot)
     }
 
     /// [`Self::with_room`] for work that only *reads* the log.
@@ -6353,6 +6446,115 @@ impl Rooms {
         )?
         .ok_or_else(|| RoomError::MissingBody(event_id.as_str().to_owned()))?;
         Ok(serde_json::from_slice(&raw)?)
+    }
+
+    /// The `sender` of a stored event, as [`Self::read_event`] followed by
+    /// `["sender"].as_str().unwrap_or("")` would give it, without building
+    /// the rest of the body. The unread index reads this for every event it
+    /// indexes and nothing else, and the event's content is most of its
+    /// size.
+    fn read_sender(&self, room_id: &str, event_id: &EventId) -> Result<String, RoomError> {
+        #[derive(serde::Deserialize)]
+        struct Sender<'a> {
+            #[serde(borrow, default)]
+            sender: Option<std::borrow::Cow<'a, str>>,
+        }
+        let raw = spindle_store::ReadView::get(
+            self.store.as_ref(),
+            &event_body_key(room_id, event_id.as_str()),
+        )?
+        .ok_or_else(|| RoomError::MissingBody(event_id.as_str().to_owned()))?;
+        if let Ok(Sender { sender }) = serde_json::from_slice::<Sender<'_>>(&raw) {
+            return Ok(sender.map(std::borrow::Cow::into_owned).unwrap_or_default());
+        }
+        // Whatever the narrow read refuses -- a sender that is not a
+        // string, a repeated key -- is answered the way the whole-body
+        // read answers it, errors included.
+        let event: Value = serde_json::from_slice(&raw)?;
+        Ok(event["sender"].as_str().unwrap_or("").to_owned())
+    }
+}
+
+/// One cold load in flight ([`Rooms::room_or_load`]): its outcome once it
+/// has one, and the waiters waiting for it.
+#[derive(Default)]
+struct ColdLoad {
+    outcome: Mutex<LoadOutcome>,
+    finished: std::sync::Condvar,
+}
+
+/// Where a [`ColdLoad`] has got to.
+#[derive(Default)]
+enum LoadOutcome {
+    #[default]
+    Loading,
+    Published(Arc<RwLock<RoomLog>>),
+    Failed,
+}
+
+impl ColdLoad {
+    /// Wait for the load to finish: the room it published, or `None` if it
+    /// failed.
+    fn wait(&self) -> Option<Arc<RwLock<RoomLog>>> {
+        let mut outcome = self
+            .outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            match &*outcome {
+                LoadOutcome::Loading => {}
+                LoadOutcome::Published(room) => return Some(Arc::clone(room)),
+                LoadOutcome::Failed => return None,
+            }
+            outcome = self
+                .finished
+                .wait(outcome)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+/// See [`Rooms::claim_load`].
+enum Claim {
+    Resident(Arc<RwLock<RoomLog>>),
+    Lead(Arc<ColdLoad>),
+    Follow(Arc<ColdLoad>),
+}
+
+/// The caller performing a room's cold load. Dropping it -- on success,
+/// error or unwind alike -- records the outcome, wakes every waiter and
+/// retires the slot, so the next caller after a failure loads afresh.
+struct Lead<'a> {
+    rooms: &'a Rooms,
+    room_id: &'a str,
+    slot: Arc<ColdLoad>,
+    outcome: Option<Arc<RwLock<RoomLog>>>,
+}
+
+impl Drop for Lead<'_> {
+    fn drop(&mut self) {
+        {
+            let mut loading = self
+                .rooms
+                .loading
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if loading
+                .get(self.room_id)
+                .is_some_and(|slot| Arc::ptr_eq(slot, &self.slot))
+            {
+                loading.remove(self.room_id);
+            }
+        }
+        *self
+            .slot
+            .outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = match self.outcome.take() {
+            Some(room) => LoadOutcome::Published(room),
+            None => LoadOutcome::Failed,
+        };
+        self.slot.finished.notify_all();
     }
 }
 
@@ -7940,8 +8142,103 @@ mod cold_registry_tests {
         );
     }
 
+    /// A cold room is loaded once however many callers want it at once:
+    /// the second waits for the first's load and is handed the same lock.
     #[test]
-    fn duplicate_cold_load_returns_canonical_arc_and_preserves_new_append() {
+    fn concurrent_cold_loads_of_one_room_share_one_load() {
+        let (_dir, rooms) = rooms();
+        let (entered, inside) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let first = Arc::clone(&rooms);
+        let leader = std::thread::spawn(move || {
+            first
+                .room_or_load("!same:test", || {
+                    entered.send(()).unwrap();
+                    held.recv().unwrap();
+                    Ok(RoomLog::new())
+                })
+                .unwrap()
+        });
+        inside.recv_timeout(Duration::from_secs(2)).unwrap();
+        let second_loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (done, finished) = mpsc::channel();
+        let second = Arc::clone(&rooms);
+        let counted = Arc::clone(&second_loads);
+        let follower = std::thread::spawn(move || {
+            let room = second
+                .room_or_load("!same:test", || {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(RoomLog::new())
+                })
+                .unwrap();
+            done.send(()).unwrap();
+            room
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the second caller waits for the load in flight"
+        );
+        release.send(()).unwrap();
+        let first_room = leader.join().unwrap();
+        let second_room = follower.join().unwrap();
+        assert!(Arc::ptr_eq(&first_room, &second_room));
+        assert_eq!(
+            second_loads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the room was loaded once"
+        );
+        assert!(rooms.loading.lock().unwrap().is_empty());
+    }
+
+    /// A load that fails, or panics, releases its waiters to load for
+    /// themselves rather than handing them its failure or stranding them.
+    #[test]
+    fn a_failed_or_panicked_cold_load_lets_a_waiter_load() {
+        for panics in [false, true] {
+            let (_dir, rooms) = rooms();
+            let (entered, inside) = mpsc::channel();
+            let (release, held) = mpsc::channel::<()>();
+            let first = Arc::clone(&rooms);
+            let leader = std::thread::spawn(move || {
+                first.room_or_load("!flaky:test", || {
+                    entered.send(()).unwrap();
+                    held.recv().unwrap();
+                    assert!(!panics, "the leader's load panicked");
+                    Err(RoomError::UnknownRoom("!flaky:test".to_owned()))
+                })
+            });
+            inside.recv_timeout(Duration::from_secs(2)).unwrap();
+            let second = Arc::clone(&rooms);
+            let follower = std::thread::spawn(move || {
+                second.room_or_load("!flaky:test", || {
+                    let mut log = RoomLog::new();
+                    log.append_local("$second", None).unwrap();
+                    Ok(log)
+                })
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            release.send(()).unwrap();
+            let first_outcome = leader.join();
+            if panics {
+                assert!(first_outcome.is_err());
+            } else {
+                assert!(matches!(
+                    first_outcome.unwrap(),
+                    Err(RoomError::UnknownRoom(_))
+                ));
+            }
+            let room = follower.join().unwrap().unwrap();
+            assert_eq!(room.read().unwrap().len(), 1);
+            assert!(Arc::ptr_eq(&room, &rooms.resident("!flaky:test").unwrap()));
+            assert!(rooms.loading.lock().unwrap().is_empty());
+        }
+    }
+
+    /// Publication never replaces a lock already in the registry: a room
+    /// another path installed while this load ran keeps its lock and what
+    /// was appended through it.
+    #[test]
+    fn cold_load_publication_keeps_the_canonical_arc_and_its_appends() {
         let (_dir, rooms) = rooms();
         let (entered, inside) = mpsc::channel();
         let (release, held) = mpsc::channel();
@@ -7956,9 +8253,12 @@ mod cold_registry_tests {
                 .unwrap()
         });
         inside.recv_timeout(Duration::from_secs(2)).unwrap();
-        let published = rooms
-            .room_or_load("!same:test", || Ok(RoomLog::new()))
-            .unwrap();
+        let published = Arc::new(RwLock::new(RoomLog::new()));
+        rooms
+            .open
+            .write()
+            .unwrap()
+            .insert("!same:test".to_owned(), Arc::clone(&published));
         published
             .write()
             .unwrap()
