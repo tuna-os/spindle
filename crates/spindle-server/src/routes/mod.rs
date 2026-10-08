@@ -11,6 +11,7 @@ use axum::Router;
 pub mod routes_legacy;
 
 // Re-export items that were previously at crate::routes level
+pub use routes_legacy::MOUNTED;
 pub(crate) use routes_legacy::{MAX_TXN_ID_LEN, record_invite, room_error};
 
 // Phase 1: Establish module structure (this file)
