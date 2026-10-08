@@ -272,7 +272,7 @@ Worth being blunt, because the project's name invites the opposite assumption:
 **A default build has no MSC3995 protocol code.** What it implements is
 linear *storage*, which peers cannot observe — Spindle emits ordinary room
 v11 PDUs and federates as a normal homeserver. Linearized Matrix hub mode is
-#22, milestone M6. Its first slice is behind the `hub-mode` Cargo feature,
+#22, milestone M6. It is behind the `hub-mode` Cargo feature,
 which is off by default and off in production. It works only between
 Spindle servers that turn it on, and a server without it sees an ordinary
 room. SPEC §12.6 has the design, and `hub_mode_disabled.rs` is the test that

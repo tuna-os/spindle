@@ -30,7 +30,7 @@ number = 3995
 title = "Linearized Matrix"
 status = "partial"
 evidence = ["SPEC.md", "docs/divergence.md", "crates/spindle-server/tests/hub_mode.rs", "crates/spindle-server/tests/hub_mode_disabled.rs"]
-notes = "The design basis: an append-only per-room log with materialized state and no state resolution on the hot path. Hub mode is opt-in per room, behind the off-by-default hub-mode Cargo feature: hub designation, compare-and-append ordering and signed chain attestations between Spindle peers, in ordinary room versions. Handoff, failover, checkpoints and the MSC's own room version are designed only. The MSC is a WIP that has not changed since 2023, and its IETF draft has expired. SPEC.md section 12 records where Spindle follows each text."
+notes = "The design basis: an append-only per-room log with materialized state and no state resolution on the hot path. Hub mode is opt-in per room, behind the off-by-default hub-mode Cargo feature, between Spindle peers in ordinary room versions: compare-and-append ordering, signed chain attestations and checkpoints, epochs with co-signed handoff and backup failover that cannot truncate an attested prefix, and equivocation and truncation proofs. The MSC's own LM room version and relayed delivery are designed only. The MSC is a WIP that has not changed since 2023, and its IETF draft has expired. SPEC.md section 12 records where Spindle follows each text."
 
 [[msc]]
 number = 4242

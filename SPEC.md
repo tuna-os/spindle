@@ -950,18 +950,18 @@ event's content under its own namespace:
   "sender": "@admin:hub.example.org",
   "content": {
     "org.spindle.epoch": 7,
-    "org.spindle.prev_epoch_final_li": 10432,
-    "org.spindle.prev_epoch_final_chain": "base64(chain[10432])"
+    "org.spindle.prev_hub_event": "$the m.room.hub of epoch 6",
+    "org.spindle.prev_epoch_final": {"li": 10432, "event_id": "$...", "chain": "base64(chain[10432])"},
+    "org.spindle.backups": ["backup.example.org"]
   }
 }
 ```
 
 The hub is still the `sender`'s server, so a peer that knows only the MSC
-reads the same hub from this event. The epoch is monotonic and, together with
-the chain commitment, prevents a deposed hub from continuing to serialize a
-divergent branch: an event signed by the hub of epoch `n` is invalid once the
-log contains an `m.room.hub` at epoch `n+1`, and the new epoch's first event
-must chain from the declared final entry of the previous epoch. A deposed hub
+reads the same hub from this event. The epoch is monotonic, and the stated
+final entry commits the new epoch to everything the old hub attested: no
+new epoch may start below an entry that a participant holds an attestation
+for (§13.2). §12.6 has the full rules as built. A deposed hub
 that is down cannot co-sign its own replacement, so failover (§13.2) is a
 departure from the MSC's auth rule and works only between Spindle peers.
 
@@ -1055,12 +1055,12 @@ the MSC sees ordinary LM events with extra, ignorable keys.
 
 | Extension | Where | Why the proposal is not enough |
 |---|---|---|
-| Epochs and `prev_epoch_final_*` on `m.room.hub` | §12.1 | The MSC has no answer for a transfer away from a hub that is down |
+| Epochs, `prev_hub_event`, `prev_epoch_final` and `backups` on `m.room.hub` (**built**, §12.6) | §12.1 | The MSC has no answer for a transfer away from a hub that is down |
 | Chain attestation: the hub signs `(room_id, hub, epoch, li, event_id, chain[li])` and sends it in an `org.spindle.msc3995.attestations` EDU to hub-mode peers only (**built**, §12.6) | §13.3 | The MSC's "participants don't know what they don't know" problem has "no current solutions"; a signed chain makes withheld or reordered history provable |
 | Capability probe `GET /_matrix/federation/unstable/org.spindle.msc3995/capabilities` (**built**, §12.6) | §12.6 | The MSC's `m.linearized` flag means "not DAG-capable", which Spindle is not |
 | Compare-and-append submission `POST .../org.spindle.msc3995/submit/{roomId}` (**built**, §12.6) | §12.6 | The MSC's LPDU needs its own room version; this works in any room version |
-| `m.room.checkpoint`, renamed `org.spindle.checkpoint` | §13.3 | No equivalent |
-| Failover election at `epoch + 1` without the outgoing hub's signature | §13.2 | Contradicts the MSC's dual-signature rule, so it only works between Spindle peers |
+| Checkpoints: signed `(li, chain[li], state_root)` in the attestation EDU (**built**, §12.6) | §13.3 | No equivalent |
+| Failover at `epoch + 1` by the first listed backup, without the outgoing hub's signature (**built**, §13.2) | §13.2 | Contradicts the MSC's dual-signature rule, so it only works between Spindle peers |
 
 An earlier draft of this section put the attestation in the PDU's
 `unsigned`. The built slice sends it in an EDU instead: `unsigned` is part
@@ -1070,20 +1070,53 @@ own signature, so it needs no PDU to vouch for it.
 
 ### 12.6 What is built: hub mode in an ordinary room version (#22)
 
-The first slice is behind the `hub-mode` Cargo feature (off by default) and
+Hub mode is behind the `hub-mode` Cargo feature (off by default) and
 then behind `[federation.hub] enabled` (off by default). It works in **any
 ordinary room version**, so a room can have a hub and Synapse members at the
 same time. That is the requirement for a room that is still a normal Matrix
 room. The MSC's own room version (§12.4) is still designed only.
 
-**Designation.** A room has a hub when its current `m.room.hub` state event
-was sent by a user on the server that sent `m.room.create`. As in the MSC,
-the hub is the server of the sender. The MSC rule that the current hub must
-sign the event is enforced by the overlay, because an ordinary room version
-does not enforce it. In its narrowest form: no handoff exists yet, so an
-`m.room.hub` from any other server makes the room ordinary again. A room with
-no `m.room.hub` is ordinary. That is a change from the MSC, where the creator
+**Designation and epochs.** As in the MSC, the hub is the server of the
+sender of the room's current `m.room.hub` state event. A room with no
+`m.room.hub` is ordinary. That is a change from the MSC, where the creator
 is the hub by default: in an ordinary room version, hub mode is opt-in.
+
+The first `m.room.hub` opens epoch 0 and must come from the server that
+sent `m.room.create`. Each later one opens the next epoch, and its content
+has these keys:
+
+```json
+{
+  "org.spindle.epoch": 1,
+  "org.spindle.prev_hub_event": "$the m.room.hub of epoch 0",
+  "org.spindle.prev_epoch_final": {"li": 41, "event_id": "$...", "chain": "base64"},
+  "org.spindle.backups": ["backup.example.org"],
+  "org.spindle.failover": true
+}
+```
+
+`prev_epoch_final` is the outgoing hub's last attested entry, or `null` if
+it attested none. `backups` names the servers that may claim the epoch after
+this one if this hub fails; only the first may. `failover` is present on a
+failover claim only. A server reads the chain of `m.room.hub` events back
+to epoch 0 and accepts each step only if it is one of the following:
+
+- **A handoff.** The outgoing hub co-signed the event. This is the MSC rule
+  that the current hub signs a hub change. A client on the incoming hub's
+  server sends `m.room.hub`. Its server adds the epoch keys and
+  `POST`s the event to
+  `/_matrix/federation/unstable/org.spindle.msc3995/handoff/{roomId}`. The
+  outgoing hub attests everything up to its head. Then it checks, under the
+  room lock, that the event names its head and that `prev_epoch_final` is
+  its last entry. It co-signs the event, sequences it, and answers with the
+  co-signed event (or `409` with the head or with the correct final entry).
+- **A failover claim.** It has `failover: true` and comes from the first
+  backup of the outgoing epoch (§13.2).
+
+Each step must also keep the attested prefix (§13.2). If any step fails,
+the room is ordinary on that server: a server never follows a hub that it
+cannot trust. Power is the room's ordinary business: `m.room.hub` is a
+state event, and the auth rules decide who can send one.
 
 **Discovery.** A peer is asked
 `GET /_matrix/federation/unstable/org.spindle.msc3995/capabilities`. A
@@ -1121,6 +1154,9 @@ needs relayed-PDU acceptance and the LM room version. It is designed only.
 
 **Attestations.** After every event it sequences, local or submitted, the
 hub signs `{room_id, hub, epoch, li, event_id, chain}` for each new entry.
+An epoch's attestations start at that epoch's `m.room.hub` event. A
+participant keeps them by `(room, epoch, li)`. It accepts an attestation
+only from the hub of the epoch that the attestation names.
 It sends these in an `org.spindle.msc3995.attestations` EDU to the
 hub-mode servers in the room, and to no other server. It attests events
 from servers without hub mode as well, because it vouches for its order
@@ -1151,12 +1187,40 @@ is the opposite of the MSC's trade (§13.1), and it is correct here.
 | The capability probe | The MSC has no advertisement for a DAG-capable hub |
 | The submit endpoint and its `409` | An ordinary room version cannot carry an LPDU |
 | The attestation EDU and its format | Neither text has attestations |
-| `org.spindle.epoch` in `m.room.hub` content | Read into attestations; failover that would advance it is designed only |
+| The epoch keys in `m.room.hub` content, and the handoff endpoint | The MSC has no transport for the dual signature, and no answer for a hub that is down |
+| `GET .../attested/{roomId}?epoch=N` and `GET .../checkpoint/{roomId}` | A backup collects the highest attestation in the room; a new participant gets an anchor |
+| Checkpoints in the attestation EDU | Neither text has them |
 
-Designed only, with TODOs in `crates/spindle-server/src/hub.rs`: handoff and
-failover (§13.2), the rule that failover cannot truncate an attested prefix,
-checkpoints, the LM room version (§12.4), relayed delivery, and hub metrics
-on `/metrics`.
+**Checkpoints.** Every `checkpoint_interval` entries (default 1000), the hub
+also signs a checkpoint: the attestation's fields plus `state_root`, the
+content address of the room state after the entry (§6.1). A participant
+that holds nothing for the current epoch first asks the hub for a fresh
+checkpoint of its head and anchors on it. Every later attestation chains
+from the anchor, so it does not have to replay the room to check the chain.
+Where the participant sequenced the same entry itself, it compares the
+state root with its own. A mismatch is logged and counted, because the
+two servers disagree about the room's state.
+
+**Metrics.** These counters are on `/metrics`, and each label takes one of
+a small, fixed set of words. No room, server or event becomes a label:
+
+- `spindle_hub_submissions_total{result}`
+- `spindle_hub_sequenced_total{result}`
+- `spindle_hub_attestations_total{result}`
+- `spindle_hub_proofs_total{kind}`
+- `spindle_hub_checkpoints_total{result}`
+- `spindle_hub_handoffs_total{result}`
+- `spindle_hub_failovers_total{result}`
+
+**Interop.** The `hub-mode-interop` job in `compliance.yml` runs nightly and
+on demand. It builds the Complement image with `SPINDLE_FEATURES=hub-mode`
+and `SPINDLE_HUB_MODE=1` and runs `TestHubModeRoomStaysOrdinary` in two
+pairings: beside a second hub-mode Spindle, and beside Element's Synapse
+image. Both runs must pass.
+
+Still designed only: the LM room version and LPDUs (§12.4), relayed (star)
+delivery, publishing proofs to the room, and backups after the first
+(only the first listed backup can claim, in this version).
 
 ---
 
@@ -1185,20 +1249,40 @@ event as an ordinary event, and gives up only the hub's ordering of it.
 
 ### 13.2 Hub failover
 
-If the hub is unreachable for `hub_failover_timeout` (default 60s), a room
-admin on a participant server may make that server the hub by sending an
-`m.room.hub` event at `epoch + 1` — the hub is the sender's server (§12.1) —
-authorized by the ordinary power-level rules (default: PL 100 required).
-Ties are broken by `(epoch, lexicographically smallest server_name)`. The new hub
-must include `org.spindle.prev_epoch_final_li` and the chain commitment it is
-continuing from; participants reject an epoch transition that would truncate entries they
-already hold attestations for.
+Built (§12.6). The rule is conservative so that a spec can state it:
 
-Because a partition can produce two candidate hubs, the epoch rule guarantees
-that at most one branch survives: the branch whose `m.room.hub` event wins the
-ordinary auth/state rules. Events serialized on the losing branch are re-proposed
-by their originators, which is the same recovery a client already performs on a
-failed send.
+1. **Who may claim.** Only the first server in the outgoing epoch's
+   `org.spindle.backups`. That list is set by the person who set the
+   outgoing hub, before any failure. No election takes place and no tie can
+   occur. A room with no backups has no failover: it stays live as an
+   ordinary room until its hub returns.
+2. **When.** The backup's own sends to the hub must have failed with no
+   answer for `failover_after_ms` (default 60 s). Other servers cannot
+   check this. The real checks are point 3 and the auth rules.
+3. **From where.** Before the backup claims, it asks every hub-mode server
+   in the room for the highest attestation of the outgoing epoch that it
+   holds (`GET .../attested/{roomId}?epoch=N`). It verifies each answer
+   against the outgoing hub's key and takes the highest. It fetches that
+   entry if it does not have it. Then it sends `m.room.hub` with
+   `failover: true` and that entry as `prev_epoch_final`. The claim is an
+   ordinary state event from one of the backup's users, so the room's power
+   levels decide whether it can be sent at all.
+4. **The invariant: failover cannot truncate an attested prefix.** Every
+   server checks every new epoch against the outgoing epoch's highest
+   attestation that it holds. When it was the outgoing hub itself, it uses
+   its own last attested entry. If `prev_epoch_final` is lower, or names a
+   different entry at the same position, the server refuses the epoch. It
+   also stores the claim and the attestation together as a proof:
+   `{"kind": "org.spindle.msc3995.truncation", "room_id", "hub", "epoch",
+   "li", "claim": <the m.room.hub event>, "attestation": <the outgoing hub's
+   signed attestation>}`. The proof is portable. The claim carries its
+   sender server's signature, the attestation carries the outgoing hub's
+   signature, and the two positions show the drop. For that server the room
+   is then ordinary.
+
+The events in a dropped tail are not lost. They are ordinary events in the
+DAG, and they merge like any fork. What failover must not do is take back
+an order that a hub has already attested.
 
 The MSC's auth rule requires the current hub to sign `m.room.hub`, and a hub
 that is down cannot. Failover therefore relaxes that rule, only between Spindle
@@ -1218,11 +1302,12 @@ Built (§12.6): a participant stores such a pair as
 "attestations": [a, b]}`. Anybody with the hub's public key can verify it.
 Publishing the proof to the room, and acting on it, is designed only.
 
-Spindle additionally supports periodic `org.spindle.checkpoint` state events carrying
-`chain[li]` and the current `StateRoot`. Because the state root is a hash of the
-materialized state, a checkpoint lets a participant verify not only ordering but
-the resulting *state* — something DAG Matrix cannot offer without recomputing
-state resolution.
+Spindle additionally signs periodic checkpoints carrying `chain[li]` and the
+`StateRoot` after it (built, §12.6; sent in the attestation EDU, not as
+state events). Because the state root is a hash of the materialized state, a
+checkpoint lets a participant verify not only ordering but the resulting
+*state* — something DAG Matrix cannot offer without recomputing state
+resolution.
 
 ### 13.4 General hardening
 
