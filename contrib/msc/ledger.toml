@@ -345,22 +345,22 @@ notes = "SPEC.md says partial-state joins are accepted on the receive side; noth
 
 [[msc]]
 number = 4244
-title = "MLS over Matrix"
+title = "RFC 9420 MLS for Matrix"
 status = "planned"
-evidence = ["SPEC.md", "ROADMAP.md"]
-notes = "Milestone M6, behind a feature flag, deliberately last. The linear index is epoch order for free."
+evidence = ["SPEC.md", "ROADMAP.md", "docs/mls.md"]
+notes = "Milestone M6, behind a feature flag, deliberately last. The linear index is commit order for free. No-go until a stable MSC, a maintained client and hub mode (#22): docs/mls.md."
 
 [[msc]]
 number = 4256
-title = "MLS mode with deterministic epochs"
+title = "RFC 9420 MLS mode Matrix"
 status = "planned"
-evidence = ["SPEC.md", "ROADMAP.md"]
+evidence = ["SPEC.md", "ROADMAP.md", "docs/mls.md"]
 
 [[msc]]
 number = 4038
 title = "Key backup for MLS"
 status = "planned"
-evidence = ["SPEC.md"]
+evidence = ["SPEC.md", "docs/mls.md"]
 
 [[msc]]
 number = 3771

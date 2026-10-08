@@ -64,9 +64,9 @@ what became of each proposal.
 | MSC | Title | Stable in | Flags | Evidence | Notes |
 |---|---|---|---|---|---|
 | [MSC3706](https://github.com/matrix-org/matrix-spec-proposals/pull/3706) | Faster joins: partial state on send_join | — | — | `SPEC.md` | SPEC.md says partial-state joins are accepted on the receive side; nothing in the code or the tests handles members_omitted, so this ledger does not repeat the claim. Not started. |
-| [MSC4038](https://github.com/matrix-org/matrix-spec-proposals/pull/4038) | Key backup for MLS | — | — | `SPEC.md` |  |
-| [MSC4244](https://github.com/matrix-org/matrix-spec-proposals/pull/4244) | MLS over Matrix | — | — | `SPEC.md`, `ROADMAP.md` | Milestone M6, behind a feature flag, deliberately last. The linear index is epoch order for free. |
-| [MSC4256](https://github.com/matrix-org/matrix-spec-proposals/pull/4256) | MLS mode with deterministic epochs | — | — | `SPEC.md`, `ROADMAP.md` |  |
+| [MSC4038](https://github.com/matrix-org/matrix-spec-proposals/pull/4038) | Key backup for MLS | — | — | `SPEC.md`, `mls.md` |  |
+| [MSC4244](https://github.com/matrix-org/matrix-spec-proposals/pull/4244) | RFC 9420 MLS for Matrix | — | — | `SPEC.md`, `ROADMAP.md`, `mls.md` | Milestone M6, behind a feature flag, deliberately last. The linear index is commit order for free. No-go until a stable MSC, a maintained client and hub mode (#22): docs/mls.md. |
+| [MSC4256](https://github.com/matrix-org/matrix-spec-proposals/pull/4256) | RFC 9420 MLS mode Matrix | — | — | `SPEC.md`, `ROADMAP.md`, `mls.md` |  |
 | [MSC4428](https://github.com/matrix-org/matrix-spec-proposals/pull/4428) | Hydra: stable member identifiers | — | — | `mesh-federation.md` | Named with MSC4242 as the phase-2 set; not started. |
 | [MSC4430](https://github.com/matrix-org/matrix-spec-proposals/pull/4430) | Hydra: member keys | — | — | `mesh-federation.md` | Named with MSC4242 as the phase-2 set; not started. |
 

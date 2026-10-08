@@ -1102,14 +1102,21 @@ Commits fork the TreeKEM epoch and desynchronize the group. This is the same
 requirement Spindle's log already satisfies structurally.
 
 The hub is a natural MLS Delivery Service: it already assigns a total order, and
-`li` order *is* epoch order. MSC4244 (MLS over linearized rooms) fits with no
-additional coordination mechanism; MSC4256 (MLS mode with deterministic epoch
-progression under enterprise auth rules) is an alternative profile.
+`li` order *is* commit order. Both live proposals put commit ordering on one
+server per room. MSC4244 (plain RFC 9420) makes one homeserver the Delivery
+Service for commits while every other event stays on the full mesh; MSC4256
+(MLS mode Matrix) is a new room version in which a `federation.powers` list
+names the servers allowed to commit, and the current commit is an
+`m.mls.commit` state event that later events cite in their auth events.
+Neither defines an epoch state event; the epoch lives in the MLS group state.
 
-Spindle's v2 plan is to implement MLS behind `unstable-msc4244` once the MSC
-stabilizes, with `m.room.mls_epoch` state carrying the epoch and the hub
-rejecting Commits that do not build on the current epoch — a single trie lookup.
-Key backup for MLS follows MSC4038.
+Spindle's v2 plan is to implement MLS behind `unstable-msc4244` or
+`unstable-msc4256` once one of them stabilizes, with the ordering server
+rejecting Commits that do not build on the current commit — a single trie
+lookup. Key backup for MLS would follow MSC4038, which was written for the
+decentralised variant (MSC2883); MSC4256 forbids key backup outright.
+[docs/mls.md](docs/mls.md) is the go/no-go review: the gates, the state of
+each proposal and implementation, and what reopens the question.
 
 This is deliberately *not* v1 work. The MSCs are unstable, no shipping client
 implements them, and G1 (unmodified existing clients) forbids depending on them.
