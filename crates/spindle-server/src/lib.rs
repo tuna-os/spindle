@@ -6,6 +6,7 @@
 //! table that builds the router, so claiming something unbuilt is a
 //! compile-or-test failure rather than a documentation drift.
 
+pub mod account;
 pub mod account_data;
 pub mod accounts;
 pub mod admin;
@@ -59,6 +60,7 @@ pub mod surface;
 pub mod telemetry;
 pub mod tokens;
 pub mod typing;
+pub mod web;
 
 use std::sync::Arc;
 

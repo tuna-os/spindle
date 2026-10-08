@@ -42,6 +42,11 @@ the incident it was supposed to explain.
 | `spindle_federation_backfill_duration_seconds` | histogram | `result` | Time one backfill chunk took: the page, its auth events, its `/state_ids` and the write. |
 | `spindle_federation_key_fetches_total` | counter | `source` = `direct`\|`notary`\|`cache`, `result` = `ok`\|`error`\|`invalid`\|`throttled` (direct, notary), `hit`\|`miss` (cache) | Lookups of a peer's signing keys. `notary` `ok` climbing means peers this server cannot reach are being verified through `[federation] trusted_key_servers`; `invalid` is a document that failed its signature checks and was refused. |
 | `spindle_federation_signature_failures_total` | counter | `reason` = `no_key`\|`expired_key`\|`bad_signature`\|`missing_signature`\|`malformed` | Received events refused for their signatures. `bad_signature` means a key under the right ID did not verify the bytes judged; each one logs the redacted form it checked. |
+| `spindle_auth_logins_total` | counter | `method` = `password`\|`oidc`\|`oidc_session`\|`account`, `result` = `success`\|`bad_password`\|`rate_limited`\|`error` | Sign-in attempts: the client API's password login, the built-in provider's authorization page (with a password, or continuing a browser session), and the account pages. An unknown user counts as `bad_password`, as everywhere else. |
+| `spindle_oauth_token_grants_total` | counter | `grant` = `authorization_code`\|`refresh_token`, `result` = `success`\|`invalid_grant`\|`invalid_request`\|`error` | Built-in provider token-endpoint grants. A climbing `invalid_grant` on `refresh_token` is clients holding rotated-away tokens. |
+| `spindle_password_resets_total` | counter | `stage` = `requested`\|`completed` | Forgot-password requests (counted per submission, whether or not the address is known) and resets completed with a valid emailed link. |
+| `spindle_emails_sent_total` | counter | `kind` = `password_reset`\|`verification`, `result` = `sent`\|`failed` | Mail handed to the SMTP transport. `failed` is the relay refusing or unreachable. |
+| `spindle_account_actions_total` | counter | `action` = `profile`\|`password_change`\|`session_end`\|`deactivate`\|`email_add`\|`email_verify`\|`email_remove`\|`cross_signing_reset` | Changes made through the account-management pages. |
 
 ## Alert rules, a scrape target and a dashboard
 
