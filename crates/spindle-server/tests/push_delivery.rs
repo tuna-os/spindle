@@ -177,7 +177,7 @@ impl Instance {
             axum::serve(listener, app).await.unwrap();
         });
         #[cfg(not(feature = "synapse-import"))]
-        let _ = server;
+        drop(server);
         Instance {
             _dir: dir,
             name,

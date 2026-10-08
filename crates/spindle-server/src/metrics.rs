@@ -179,16 +179,25 @@ pub enum GapResult {
     /// The state, an event in it, or the event itself failed verification
     /// or authorization: refused, fail closed.
     Invalid,
+    /// Not attempted: the room has had its window's worth of gap
+    /// acceptances (the amplification guard, `[federation]
+    /// gap_acceptances_per_room`).
+    CappedRoom,
+    /// Not attempted: the origin has had its window's worth of gap
+    /// acceptances across all rooms (`gap_acceptances_per_origin`).
+    CappedOrigin,
 }
 
 impl GapResult {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 8] = [
         Self::Accepted,
         Self::BudgetExceeded,
         Self::PeerError,
         Self::RateLimited,
         Self::Timeout,
         Self::Invalid,
+        Self::CappedRoom,
+        Self::CappedOrigin,
     ];
 
     fn label(self) -> &'static str {
@@ -199,6 +208,73 @@ impl GapResult {
             Self::RateLimited => "rate_limited",
             Self::Timeout => "timeout",
             Self::Invalid => "invalid",
+            Self::CappedRoom => "capped_room",
+            Self::CappedOrigin => "capped_origin",
+        }
+    }
+}
+
+/// How one backfill chunk for a recorded federation gap ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackfillChunk {
+    /// Events were verified, checked and stored below the gap event.
+    Filled,
+    /// The walk met history this server holds: the gap is closed and its
+    /// marker removed.
+    Completed,
+    /// No participating server answered usefully.
+    PeerError,
+    /// Every candidate answered 429 or was cooling down from one.
+    RateLimited,
+    /// An event, its auth chain or the state the peer named failed
+    /// verification or authorization: nothing from the chunk was stored.
+    Invalid,
+    /// The gap outgrew the backfill budget and was left truncated.
+    Truncated,
+}
+
+impl BackfillChunk {
+    const ALL: [Self; 6] = [
+        Self::Filled,
+        Self::Completed,
+        Self::PeerError,
+        Self::RateLimited,
+        Self::Invalid,
+        Self::Truncated,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Filled => "filled",
+            Self::Completed => "completed",
+            Self::PeerError => "peer_error",
+            Self::RateLimited => "rate_limited",
+            Self::Invalid => "invalid",
+            Self::Truncated => "truncated",
+        }
+    }
+}
+
+/// What became of one event a gap backfill handled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackfillEvent {
+    /// Fetched from a peer as part of a gap's history (before any check).
+    Fetched,
+    /// Stored into the gap's segment of the timeline.
+    Inserted,
+    /// Walked through but kept out of the timeline: it failed its auth
+    /// events or the state before it.
+    Rejected,
+}
+
+impl BackfillEvent {
+    const ALL: [Self; 3] = [Self::Fetched, Self::Inserted, Self::Rejected];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fetched => "fetched",
+            Self::Inserted => "inserted",
+            Self::Rejected => "rejected",
         }
     }
 }
@@ -266,6 +342,13 @@ pub struct Metrics {
     /// Rooms the startup warm-up has still to load, and has loaded.
     warmup_pending: AtomicU64,
     warmup_loaded: AtomicU64,
+    /// Gap backfill chunks by result ([`BackfillChunk`]).
+    backfill_chunks: [AtomicU64; BackfillChunk::ALL.len()],
+    backfill_latency: Family,
+    /// Events a gap backfill handled, by what became of them.
+    backfill_events: [AtomicU64; BackfillEvent::ALL.len()],
+    /// Recorded federation gaps not yet filled (a gauge).
+    gaps_remaining: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -298,6 +381,10 @@ impl Default for Metrics {
             outbound_txn_latency: std::array::from_fn(|_| Histogram::with_bounds(&SLOW_BUCKETS)),
             warmup_pending: AtomicU64::new(0),
             warmup_loaded: AtomicU64::new(0),
+            backfill_chunks: Default::default(),
+            backfill_latency: Family::default(),
+            backfill_events: Default::default(),
+            gaps_remaining: AtomicU64::new(0),
         }
     }
 }
@@ -1327,6 +1414,46 @@ impl Metrics {
         observe_in_buckets(&self.state_ids_latency, result, elapsed, &SLOW_BUCKETS);
     }
 
+    /// Record one gap backfill chunk, and how long it took.
+    pub fn record_backfill_chunk(&self, result: BackfillChunk, elapsed: Duration) {
+        self.backfill_chunks[slot(&BackfillChunk::ALL, result)].fetch_add(1, Ordering::Relaxed);
+        observe_in_buckets(
+            &self.backfill_latency,
+            result.label(),
+            elapsed,
+            &SLOW_BUCKETS,
+        );
+    }
+
+    /// Record events a gap backfill fetched, inserted or kept out.
+    pub fn record_backfill_events(&self, kind: BackfillEvent, count: u64) {
+        self.backfill_events[slot(&BackfillEvent::ALL, kind)].fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Set the number of recorded gaps not yet filled. A gauge: the
+    /// backfill loop counts the markers and says how many there are.
+    pub fn set_gaps_remaining(&self, gaps: u64) {
+        self.gaps_remaining.store(gaps, Ordering::Relaxed);
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn backfill_chunk_count(&self, result: BackfillChunk) -> u64 {
+        self.backfill_chunks[slot(&BackfillChunk::ALL, result)].load(Ordering::Relaxed)
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn backfill_event_count(&self, kind: BackfillEvent) -> u64 {
+        self.backfill_events[slot(&BackfillEvent::ALL, kind)].load(Ordering::Relaxed)
+    }
+
+    /// Read the gauge, for tests that assert it moved.
+    #[must_use]
+    pub fn gaps_remaining(&self) -> u64 {
+        self.gaps_remaining.load(Ordering::Relaxed)
+    }
+
     /// Read one counter, for tests that assert a metric actually moved.
     #[must_use]
     pub fn pdu_count(&self, outcome: PduOutcome) -> u64 {
@@ -1431,6 +1558,61 @@ impl Metrics {
                 histogram.render_into(
                     out,
                     "spindle_federation_state_ids_duration_seconds",
+                    &format!("result=\"{}\"", escape(result)),
+                );
+            }
+        }
+        self.render_backfill(out);
+    }
+
+    /// Gap backfill: chunks, events, the gaps still open, chunk duration.
+    fn render_backfill(&self, out: &mut String) {
+        out.push_str(
+            "# HELP spindle_federation_backfill_chunks_total Gap backfill chunks, \
+         by result.\n\
+         # TYPE spindle_federation_backfill_chunks_total counter\n",
+        );
+        for result in BackfillChunk::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_backfill_chunks_total{{result=\"{}\"}} {}",
+                result.label(),
+                self.backfill_chunk_count(result)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_federation_backfill_events_total Events a gap backfill \
+         fetched, inserted, or kept out of the timeline.\n\
+         # TYPE spindle_federation_backfill_events_total counter\n",
+        );
+        for kind in BackfillEvent::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_backfill_events_total{{result=\"{}\"}} {}",
+                kind.label(),
+                self.backfill_event_count(kind)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_federation_gaps_remaining Recorded federation gaps \
+         whose history is not yet backfilled.\n\
+         # TYPE spindle_federation_gaps_remaining gauge\n",
+        );
+        let _ = writeln!(
+            out,
+            "spindle_federation_gaps_remaining {}",
+            self.gaps_remaining()
+        );
+        out.push_str(
+            "# HELP spindle_federation_backfill_duration_seconds Time one gap \
+         backfill chunk took, by result.\n\
+         # TYPE spindle_federation_backfill_duration_seconds histogram\n",
+        );
+        if let Ok(read) = self.backfill_latency.read() {
+            for (result, histogram) in read.iter() {
+                histogram.render_into(
+                    out,
+                    "spindle_federation_backfill_duration_seconds",
                     &format!("result=\"{}\"", escape(result)),
                 );
             }

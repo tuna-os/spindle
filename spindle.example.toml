@@ -165,6 +165,34 @@ retry_base_ms = 1000
 # tls_cert = "/etc/spindle/fullchain.pem"
 # tls_key = "/etc/spindle/privkey.pem"
 
+# Fill recorded federation gaps in the background. After an outage longer
+# than dependency recovery can span, a peer's new event is accepted across
+# a gap in the room's history; this fetches that history with /backfill
+# (one /state_ids per chunk), verifies every event, and stores it so
+# /messages and /context serve it. Backfilled events never notify, never
+# change the room's current state and are never sent on.
+gap_backfill = true
+# Events per /backfill request, and so per chunk.
+gap_backfill_chunk = 100
+# Pause between chunks, in milliseconds: a 10k-event gap fills over
+# minutes rather than competing with request handling.
+gap_backfill_interval_ms = 1000
+# How often an idle loop looks for gaps, in milliseconds. A client paging
+# into a gap wakes it at once.
+gap_backfill_idle_ms = 30000
+# Base delay before retrying a gap whose last chunk failed, in
+# milliseconds; doubles per consecutive failure, up to an hour.
+gap_backfill_retry_ms = 30000
+# Events one gap may backfill before it is left truncated.
+gap_backfill_max_events = 100000
+
+# Amplification guard: one gap acceptance can fetch up to 20k state and
+# auth events, so at most this many per room, and per origin across rooms,
+# within each window.
+gap_acceptances_per_room = 10
+gap_acceptances_per_origin = 30
+gap_acceptance_window_secs = 600
+
 [appservices]
 # Paths to appservice registration files, in the spec's YAML shape. Every
 # file must load and validate or the server refuses to start: a bridge

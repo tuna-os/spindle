@@ -25,9 +25,12 @@ use crate::accounts::Accounts;
 use crate::errors::MatrixError;
 use crate::routes::{MAX_TXN_ID_LEN, record_invite, room_error};
 
+mod backfill;
 mod gap;
 mod recovery;
 
+pub(crate) use backfill::run as run_backfill;
+pub use backfill::{GapBackfill, Settings as BackfillSettings, Sources as BackfillSources};
 pub use recovery::RecoveryGate;
 
 /// Say that a peer's event was refused, and name what it was refused over.

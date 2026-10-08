@@ -623,10 +623,82 @@ pub struct FederationConfig {
     /// PEM private key for `tls_cert`.
     #[serde(default)]
     pub tls_key: Option<std::path::PathBuf>,
+    /// Fill recorded federation gaps in the background (SPEC §6.5): the
+    /// history between this server's old head and an event it accepted
+    /// across a gap is fetched with `/backfill`, verified and stored so
+    /// `/messages` and `/context` serve it. Off leaves the gaps recorded.
+    #[serde(default = "default_true")]
+    pub gap_backfill: bool,
+    /// Events asked for per `/backfill` request, and so the most one chunk
+    /// stores. One `/state_ids` round trip is made per chunk.
+    #[serde(default = "default_gap_backfill_chunk")]
+    pub gap_backfill_chunk: usize,
+    /// Pause between two backfill chunks, milliseconds. What keeps a
+    /// 10k-event gap filling over minutes instead of competing with
+    /// request handling for the store and the peer's patience.
+    #[serde(default = "default_gap_backfill_interval_ms")]
+    pub gap_backfill_interval_ms: u64,
+    /// How often an idle backfill loop looks for gaps, milliseconds. A
+    /// client paging into a gap wakes it at once.
+    #[serde(default = "default_gap_backfill_idle_ms")]
+    pub gap_backfill_idle_ms: u64,
+    /// Base delay before a gap whose last chunk failed is tried again,
+    /// milliseconds. Doubles per consecutive failure, up to an hour.
+    #[serde(default = "default_gap_backfill_retry_ms")]
+    pub gap_backfill_retry_ms: u64,
+    /// Events one gap may backfill before it is left truncated. Bounds
+    /// what a gap whose history never meets ours can make this server
+    /// fetch and store.
+    #[serde(default = "default_gap_backfill_max_events")]
+    pub gap_backfill_max_events: usize,
+    /// Gap acceptances one room may make per window
+    /// (`gap_acceptance_window_secs`). A gap acceptance can fetch up to
+    /// 20k state and auth events, so this caps what one room's PDUs can
+    /// make this server fetch.
+    #[serde(default = "default_gap_acceptances_per_room")]
+    pub gap_acceptances_per_room: usize,
+    /// Gap acceptances one origin may trigger per window, across rooms.
+    #[serde(default = "default_gap_acceptances_per_origin")]
+    pub gap_acceptances_per_origin: usize,
+    /// The window both gap acceptance caps count over, seconds.
+    #[serde(default = "default_gap_acceptance_window_secs")]
+    pub gap_acceptance_window_secs: u64,
 }
 
 fn default_retry_base_ms() -> u64 {
     1000
+}
+
+const fn default_gap_backfill_chunk() -> usize {
+    100
+}
+
+const fn default_gap_backfill_interval_ms() -> u64 {
+    1000
+}
+
+const fn default_gap_backfill_idle_ms() -> u64 {
+    30_000
+}
+
+const fn default_gap_backfill_retry_ms() -> u64 {
+    30_000
+}
+
+const fn default_gap_backfill_max_events() -> usize {
+    100_000
+}
+
+const fn default_gap_acceptances_per_room() -> usize {
+    10
+}
+
+const fn default_gap_acceptances_per_origin() -> usize {
+    30
+}
+
+const fn default_gap_acceptance_window_secs() -> u64 {
+    600
 }
 
 impl Default for FederationConfig {
@@ -640,6 +712,15 @@ impl Default for FederationConfig {
             bind: None,
             tls_cert: None,
             tls_key: None,
+            gap_backfill: true,
+            gap_backfill_chunk: default_gap_backfill_chunk(),
+            gap_backfill_interval_ms: default_gap_backfill_interval_ms(),
+            gap_backfill_idle_ms: default_gap_backfill_idle_ms(),
+            gap_backfill_retry_ms: default_gap_backfill_retry_ms(),
+            gap_backfill_max_events: default_gap_backfill_max_events(),
+            gap_acceptances_per_room: default_gap_acceptances_per_room(),
+            gap_acceptances_per_origin: default_gap_acceptances_per_origin(),
+            gap_acceptance_window_secs: default_gap_acceptance_window_secs(),
         }
     }
 }

@@ -36,6 +36,10 @@ the incident it was supposed to explain.
 | `spindle_sync_lag_seconds` | histogram | — | Age of the newest event a `/sync` delivered. |
 | `spindle_room_registry_acquisitions_total` | counter | `mode` = `exclusive`\|`shared` | Acquisitions of the registry that hands rooms out. |
 | `spindle_room_lock_acquisitions_total` | counter | `mode` = `exclusive`\|`shared` | Acquisitions of a room's own lock: `exclusive` is the write path. |
+| `spindle_federation_gaps_remaining` | gauge | — | Recorded federation gaps whose history is not backfilled yet (SPEC §6.6). Should fall to `0` within minutes of a gap acceptance. |
+| `spindle_federation_backfill_chunks_total` | counter | `result` = `filled`\|`completed`\|`peer_error`\|`rate_limited`\|`invalid`\|`truncated` | Gap backfill chunks. `invalid` is a peer serving history that failed verification; nothing of that chunk was stored. |
+| `spindle_federation_backfill_events_total` | counter | `result` = `fetched`\|`inserted`\|`rejected` | Events a gap backfill fetched, stored, or kept out of the timeline for failing its auth checks. |
+| `spindle_federation_backfill_duration_seconds` | histogram | `result` | Time one backfill chunk took: the page, its auth events, its `/state_ids` and the write. |
 
 ## Alert rules, a scrape target and a dashboard
 

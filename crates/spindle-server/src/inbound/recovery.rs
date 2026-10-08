@@ -18,7 +18,7 @@
 //! tries the ordinary path first, which is usually enough: the event before
 //! it was just placed.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -26,9 +26,10 @@ use ruma::{CanonicalJsonValue, RoomVersionId};
 use serde_json::{Value, json};
 
 use crate::AppState;
-use crate::federation::{FederationError, PeerKeys};
-use crate::metrics::{FetchKind, GapResult, PduOutcome, RecoveryResult};
-use crate::rooms::RoomError;
+use crate::federation::{Federation, FederationError, PeerKeys};
+use crate::metrics::{FetchKind, GapResult, Metrics, PduOutcome, RecoveryResult};
+use crate::rooms::{RoomError, Rooms};
+use crate::signing::ServerKey;
 
 const MAX_RECOVERED_EVENTS: usize = 512;
 const MAX_RECOVERED_BYTES: usize = 16 * 1024 * 1024;
@@ -48,7 +49,7 @@ const RECOVERY_WAIT: Duration = Duration::from_secs(60);
 /// hammered again at once.
 const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 const MIN_COOLDOWN: Duration = Duration::from_secs(5);
-const MAX_COOLDOWN: Duration = Duration::from_secs(600);
+pub(super) const MAX_COOLDOWN: Duration = Duration::from_secs(600);
 
 /// The requests a 429 cools down, separately: a peer limiting duplicate
 /// `get_missing_events` calls has said nothing about `/state_ids`.
@@ -58,6 +59,60 @@ pub(super) enum Endpoint {
     Recovery,
     /// `/state_ids` and the `/event` fetches for its bodies.
     StateIds,
+    /// `/backfill` for a recorded gap (`super::backfill`).
+    Backfill,
+}
+
+/// What talking to peers about a room needs, borrowed: a request handler
+/// lends it from its [`AppState`], and the backfill loop from the sources
+/// it upgraded for one pass -- which is why this is not `AppState` itself:
+/// the loop holds those weakly (#292) and has no `AppState` to lend.
+pub(super) struct Peers<'a> {
+    pub(super) rooms: &'a Rooms,
+    pub(super) federation: &'a Arc<Federation>,
+    pub(super) key: &'a ServerKey,
+    pub(super) server_name: &'a str,
+    pub(super) metrics: &'a Metrics,
+    pub(super) recovery: &'a RecoveryGate,
+}
+
+impl<'a> Peers<'a> {
+    pub(super) fn of(state: &'a AppState) -> Self {
+        Self {
+            rooms: &state.rooms,
+            federation: &state.federation,
+            key: &state.key,
+            server_name: &state.config.server.name,
+            metrics: &state.metrics,
+            recovery: &state.recovery,
+        }
+    }
+}
+
+/// The amplification guard on gap acceptances (#620): how many one room,
+/// and one origin across rooms, may make per window.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct GapCaps {
+    pub(super) per_room: usize,
+    pub(super) per_origin: usize,
+    pub(super) window: Duration,
+}
+
+impl GapCaps {
+    pub(super) fn of(config: &crate::config::FederationConfig) -> Self {
+        Self {
+            per_room: config.gap_acceptances_per_room,
+            per_origin: config.gap_acceptances_per_origin,
+            window: Duration::from_secs(config.gap_acceptance_window_secs),
+        }
+    }
+}
+
+/// Whose gap acceptances a window counts.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum GapScope {
+    Room(String),
+    Origin(String),
 }
 
 type CooldownKey = (String, String, Endpoint);
@@ -74,6 +129,9 @@ pub struct RecoveryGate {
     rooms: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     /// `(room, peer, endpoint)` -> not before.
     cooldowns: Mutex<HashMap<CooldownKey, Instant>>,
+    /// When each room and each origin was last admitted to a gap
+    /// acceptance, within the cap's window.
+    gap_admissions: Mutex<HashMap<GapScope, VecDeque<Instant>>>,
 }
 
 impl RecoveryGate {
@@ -124,6 +182,52 @@ impl RecoveryGate {
             now + wait.clamp(MIN_COOLDOWN, MAX_COOLDOWN),
         );
     }
+
+    /// Leave a peer that said it is not in the room (403) alone for this
+    /// room, for every kind of request, for the longest cooldown: it has
+    /// nothing to give, and asking again is a wasted round trip on the
+    /// path that is supposed to unfreeze the room (#620).
+    pub(super) fn shun(&self, room_id: &str, peer: &str) {
+        for endpoint in [Endpoint::Recovery, Endpoint::StateIds, Endpoint::Backfill] {
+            self.cool(room_id, peer, endpoint, MAX_COOLDOWN);
+        }
+    }
+
+    /// Admit one gap acceptance for `room_id` from `origin`, or say which
+    /// cap refuses it. Admission is counted only when both caps allow it,
+    /// so a refusal by one does not use up the other.
+    pub(super) fn admit_gap(
+        &self,
+        room_id: &str,
+        origin: &str,
+        caps: GapCaps,
+    ) -> Result<(), GapResult> {
+        let now = Instant::now();
+        let mut admissions = self
+            .gap_admissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        admissions.retain(|_, times| {
+            while times
+                .front()
+                .is_some_and(|at| now.saturating_duration_since(*at) >= caps.window)
+            {
+                times.pop_front();
+            }
+            !times.is_empty()
+        });
+        let room = GapScope::Room(room_id.to_owned());
+        let from = GapScope::Origin(origin.to_owned());
+        if admissions.get(&room).map_or(0, VecDeque::len) >= caps.per_room {
+            return Err(GapResult::CappedRoom);
+        }
+        if admissions.get(&from).map_or(0, VecDeque::len) >= caps.per_origin {
+            return Err(GapResult::CappedOrigin);
+        }
+        admissions.entry(room).or_default().push_back(now);
+        admissions.entry(from).or_default().push_back(now);
+        Ok(())
+    }
 }
 
 /// Why a recovery or gap attempt stopped short.
@@ -136,6 +240,8 @@ pub(super) enum Failure {
     Peer {
         message: String,
         rate_limited: Option<Duration>,
+        /// It answered 403: it is not in the room, and has nothing to give.
+        forbidden: bool,
     },
     /// What a peer sent failed verification or authorization. Fail closed.
     Invalid(String),
@@ -156,10 +262,20 @@ impl Failure {
         Self::Peer {
             message: error.to_string(),
             rate_limited,
+            forbidden: matches!(error, FederationError::Answered { status: 403, .. }),
         }
     }
 
-    fn message(&self) -> String {
+    /// A peer failure for a reason of this server's own, not an answer.
+    pub(super) fn peer(message: impl Into<String>) -> Self {
+        Self::Peer {
+            message: message.into(),
+            rate_limited: None,
+            forbidden: false,
+        }
+    }
+
+    pub(super) fn message(&self) -> String {
         match self {
             Self::Budget(why) | Self::Invalid(why) | Self::Peer { message: why, .. } => why.clone(),
             Self::Verdict(error) => error.to_string(),
@@ -190,7 +306,7 @@ pub(super) struct VerifiedPdu {
 /// Gather precisely the signers the room version requires, including a
 /// restricted join's authorizer and a v1/v2 event ID's server.
 pub(super) async fn verify(
-    state: &AppState,
+    peers: &Peers<'_>,
     room_id: &str,
     version: &RoomVersionId,
     body: &Value,
@@ -220,19 +336,19 @@ pub(super) async fn verify(
     let mut public_keys = ruma::signatures::PublicKeyMap::new();
     for server in required {
         let server = server.as_str();
-        if server == state.config.server.name {
+        if server == peers.server_name {
             public_keys.insert(
                 server.to_owned(),
                 BTreeMap::from([(
-                    state.key.key_id(),
-                    ruma::serde::Base64::parse(state.key.public_key_base64())
+                    peers.key.key_id(),
+                    ruma::serde::Base64::parse(peers.key.public_key_base64())
                         .map_err(|error| error.to_string())?,
                 )]),
             );
             continue;
         }
         if !keys.contains_key(server) {
-            let fetched = state
+            let fetched = peers
                 .federation
                 .peer_keys(server)
                 .await
@@ -309,7 +425,7 @@ async fn judge(
     if let Some(provided) = provided_keys {
         keys.insert(signer.to_owned(), provided.clone());
     }
-    let event = match verify(state, room_id, &version, pdu, None, &mut keys).await {
+    let event = match verify(&Peers::of(state), room_id, &version, pdu, None, &mut keys).await {
         Ok(event) => event,
         Err(error) => {
             let id = CanonicalJsonValue::try_from(pdu.clone())
@@ -442,7 +558,11 @@ async fn resolve(
             Ok(Err(Failure::Peer {
                 message,
                 rate_limited,
+                forbidden,
             })) => {
+                if forbidden {
+                    state.recovery.shun(room_id, &peer);
+                }
                 if let Some(wait) = rate_limited {
                     state
                         .recovery
@@ -489,6 +609,30 @@ async fn resolve(
         }
     }
 
+    // The amplification guard (#620): one gap acceptance can fetch tens of
+    // thousands of events, so a room, and an origin across rooms, get only
+    // so many per window. Past the cap the PDU is refused as before gap
+    // acceptance existed, and the sender's retry is judged again later.
+    if let Err(capped) =
+        state
+            .recovery
+            .admit_gap(room_id, origin, GapCaps::of(&state.config.federation))
+    {
+        state.metrics.record_gap(capped);
+        tracing::warn!(
+            room = room_id,
+            event_id = %event.id,
+            origin = %origin,
+            cap = ?capped,
+            "refused a gap acceptance: the cap for this window is reached"
+        );
+        return (
+            PduOutcome::RefusedMissingDeps,
+            Err(format!(
+                "dependency recovery failed ({last}); gap acceptance is capped for now"
+            )),
+        );
+    }
     let attempt = tokio::time::timeout(
         GAP_TIMEOUT,
         super::gap::accept(state, origin, room_id, version, event, keys),
@@ -543,8 +687,10 @@ async fn resolve(
     )
 }
 
-/// The peers to ask for missing predecessors: the origin, then one other
-/// server in the room, leaving out any still cooling down from a 429.
+/// The peers to ask for missing predecessors: the origin, then the server
+/// with the most members joined to the room (#620: a server whose users
+/// have all left answers 403, and alphabetical order once picked exactly
+/// that one), leaving out any still cooling down from a 429 or a 403.
 fn recovery_peers(state: &AppState, origin: &str, room_id: &str) -> Vec<String> {
     let mut peers = Vec::with_capacity(2);
     if state.recovery.cooling(room_id, origin, Endpoint::Recovery) {
@@ -556,7 +702,7 @@ fn recovery_peers(state: &AppState, origin: &str, room_id: &str) -> Vec<String> 
     }
     if let Some(other) = state
         .rooms
-        .remote_domains(room_id)
+        .participating_servers(room_id)
         .unwrap_or_default()
         .into_iter()
         .find(|domain| {
@@ -631,7 +777,7 @@ async fn recover(
                 .map_err(|error| Failure::from_peer(&error))?,
         };
         charge(&body, &mut bytes, MAX_RECOVERED_BYTES)?;
-        let event = verify(state, room_id, version, &body, Some(&id), keys)
+        let event = verify(&Peers::of(state), room_id, version, &body, Some(&id), keys)
             .await
             .map_err(Failure::Invalid)?;
         if event.id != id {
@@ -744,7 +890,7 @@ async fn recover_auth(
                 .map_err(|error| Failure::from_peer(&error))?,
         };
         charge(&body, bytes, MAX_RECOVERED_BYTES)?;
-        let event = verify(state, room_id, version, &body, Some(&id), keys)
+        let event = verify(&Peers::of(state), room_id, version, &body, Some(&id), keys)
             .await
             .map_err(Failure::Invalid)?;
         if event.id != id {

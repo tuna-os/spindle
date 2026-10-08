@@ -314,6 +314,27 @@ impl RoomAdmin<'_> {
             &spindle_core::keys::purge_watermark(room_id),
             &mark.to_be_bytes(),
         )?;
+        // A filled federation gap's segment sits just below its anchor, so
+        // a cutoff at or above the anchor takes the segment's bodies too.
+        let mut victims = victims;
+        for (anchor, (lo, hi)) in self.rooms.gap_spans(room_id)? {
+            if anchor > before_li {
+                continue;
+            }
+            for event_id in self.rooms.gap_segment_ids(room_id, anchor, lo, hi)? {
+                let body = match self
+                    .rooms
+                    .read_event(room_id, &EventId::new(event_id.as_str()))
+                {
+                    Ok(body) => body,
+                    Err(RoomError::MissingBody(_)) => continue,
+                    Err(error) => return Err(error),
+                };
+                if body.get("state_key").is_none() {
+                    victims.push(event_id);
+                }
+            }
+        }
         let mut purged = 0;
         for event_id in &victims {
             let key = event_body_key(room_id, event_id);
