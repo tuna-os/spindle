@@ -41,7 +41,7 @@ outward as a federation profile:
    one event copies ~3 nodes. State at an arbitrary historical point is a single
    pointer lookup.
 3. **State resolution is an exception path.** It runs only when a legacy DAG
-   peer actually forks and the branches' states differ, it is the room
+   peer forks and the branches' states differ, it is the room
    version's own algorithm when it does (§9, ADR 0005), and in a non-federated
    room it never runs at all.
 4. **Wire format is unchanged.** Native Spindle rooms are ordinary **room
@@ -744,7 +744,7 @@ a server restart degrades to a re-initial-sync rather than a wrong answer.
 `t{li}`. That is the whole implementation.
 
 This is worth stating plainly because it is the endpoint that most visibly
-misbehaves on DAG servers: back-paginating a large room requires topological
+misbehaves on DAG servers: back-paginating a large room needs topological
 ordering over a graph that may need backfilling mid-scan. Here, ordering was
 decided at write time, and a gap in history is a contiguous `li` range that is
 either present or not.
@@ -933,7 +933,7 @@ exactly as it already does for any event requiring remote authorization.
 
 A hub emits ordinary room-version-11 PDUs. A legacy homeserver in the room
 consumes them as a normal DAG and is unaware of the hub. An LM-only participant
-consumes the same PDUs as a linked list and never implements state resolution.
+consumes the same PDUs as a linked list and never does state resolution.
 This is MSC3995's dual-representation property, and it is what allows a room to
 contain both kinds of peer simultaneously — at the cost of readmitting the
 class-D fork path, which is why `m.room.hub` rooms with legacy members are class
@@ -1064,7 +1064,7 @@ operator toil.
 - **Horizontal scale-out** is a v2 concern (§21). The design admits it — rooms
   are independent and the shard key is the room — but v1 targets vertical scale
   on a single node, which is where the interesting comparison lies anyway: the
-  point is to make one node do what currently requires a worker fleet.
+  point is to make one node do what now needs a worker fleet.
 
 Implementation language is **Rust**, on the `ruma` crate family for spec types:
 `ruma-events`, `ruma-client-api`, `ruma-federation-api`, `ruma-common`,
