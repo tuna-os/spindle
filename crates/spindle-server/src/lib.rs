@@ -104,6 +104,9 @@ pub struct AppState {
     /// creation. Process-local because a restart invalidates them.
     pub registration_nonces: Arc<shared_secret_registration::RegistrationNonces>,
     pub rendezvous: Arc<rendezvous::Rendezvous>,
+    /// One dependency recovery per room at a time, and the peers resting
+    /// after a 429 (`inbound::recovery`).
+    pub recovery: Arc<inbound::RecoveryGate>,
 }
 
 /// Why the application cannot be built. Both are startup-fatal on purpose:
@@ -268,6 +271,7 @@ pub fn app_with_metrics(
         push,
         registration_nonces: Arc::new(shared_secret_registration::RegistrationNonces::new()),
         rendezvous: Arc::new(rendezvous::Rendezvous::new()),
+        recovery: Arc::new(inbound::RecoveryGate::new()),
         metrics,
     };
     spawn_delivery_loops(&state);

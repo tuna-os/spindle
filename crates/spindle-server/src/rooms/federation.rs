@@ -302,6 +302,280 @@ impl Rooms {
         })
     }
 
+    /// Accept a verified remote event whose predecessors could not be
+    /// recovered, on the state before it that a participating server named
+    /// (`/state_ids`), as a forward event across a gap in this room's
+    /// history.
+    ///
+    /// The caller has already fetched, verified and retained (via
+    /// [`Self::retain_remote_auth`]) every state and auth-chain event that
+    /// `state_before` names; this step is synchronous, under the room lock,
+    /// and runs the same receipt checks as [`Self::receive_remote`] -- the
+    /// event's own auth events, then the state before it (here the peer's,
+    /// since its parents' states are not ours to compute), then the room's
+    /// current state -- before placing it with
+    /// [`RoomLog::append_across_gap`]. The room's existing head stays a
+    /// forward extremity beside the new event, and [`Self::settle`]
+    /// re-resolves the current state over both, so the peer's view of the
+    /// room never simply replaces ours: it is merged by the room version's
+    /// algorithm, as any fork is.
+    ///
+    /// Nothing is sidelined on a failed check: an event whose parents are
+    /// unknown has nowhere to be kept outside the timeline. It is refused,
+    /// and a redelivery is judged again.
+    ///
+    /// The gap itself -- the history between the predecessors this server
+    /// lacks and what it holds -- is not filled here. A marker is written
+    /// under [`spindle_core::keys::federation_gap`] naming the missing
+    /// predecessors, for a later backfill to start from.
+    ///
+    /// TODO(federation-gap-backfill): walk each marker's missing
+    /// predecessors back with `/backfill` (SPEC §6.5: one `/state_ids` per
+    /// chunk), prepend that history, and clear the marker once it meets the
+    /// history this server already holds.
+    ///
+    /// Returns the predecessors the event named that this server does not
+    /// hold, or `None` when nothing needed bridging -- the event was
+    /// already held, or its parents arrived meanwhile and it took the
+    /// ordinary path.
+    ///
+    /// # Errors
+    ///
+    /// [`RoomError::Forbidden`] when the state is malformed, names a
+    /// rejected event or another create event, or the event fails a receipt
+    /// check; [`RoomError::MissingBody`] for a state event the caller did
+    /// not retain; [`RoomError::Append`] for a state-DAG room, whose state
+    /// cannot be taken from `/state_ids`.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the receipt checks and placement of one event, in order"
+    )]
+    pub fn accept_across_gap(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        json: &Value,
+        state_before: &[String],
+        state_from: &str,
+    ) -> Result<Option<Vec<String>>, RoomError> {
+        use spindle_core::{Sideline, StateSnapshot};
+        use spindle_store::Store as _;
+
+        self.with_room(room_id, |rooms, log| {
+            let id = EventId::new(event_id);
+            if log.get(&id).is_some() {
+                return Ok(None);
+            }
+            if log.historically_rejected(&id) {
+                return Err(RoomError::Forbidden(format!(
+                    "rejected: {event_id} was rejected before migration"
+                )));
+            }
+            if let Some(sidelined) = log.sidelined(&id) {
+                return Err(RoomError::Forbidden(match sidelined.kind {
+                    Sideline::SoftFailed => format!("{event_id} was soft-failed"),
+                    Sideline::Rejected => format!("{event_id} was rejected"),
+                }));
+            }
+            let version = rooms.version_in_log(log, room_id)?;
+            if spindle_core::is_state_dag(&version) {
+                return Err(RoomError::Append(
+                    "a state-DAG room's state cannot be taken from /state_ids".to_owned(),
+                ));
+            }
+            let prev: Vec<EventId> = super::edge_ids(&json["prev_events"])
+                .into_iter()
+                .map(EventId::new)
+                .collect();
+            let missing: Vec<String> = prev
+                .iter()
+                .filter(|parent| !log.holds(parent))
+                .map(|parent| parent.as_str().to_owned())
+                .collect();
+            if missing.is_empty() {
+                // Recovery or another PDU filled the gap meanwhile: the
+                // ordinary path, with our own state, is the right one.
+                rooms.ingest(log, room_id, event_id, json, false)?;
+                return Ok(None);
+            }
+
+            // The peer's state before the event, keyed by what each named
+            // body says it is. Every body was verified and retained by the
+            // caller; a rejected or foreign one is refused, not skipped,
+            // because a state that silently loses entries is a different
+            // state from the one the peer vouched for.
+            let create_id = log
+                .current_state()
+                .and_then(|state| state.get(&StateKey::new("m.room.create", "")))
+                .ok_or_else(|| RoomError::Append("the room has no create event".to_owned()))?
+                .to_owned();
+            let mut state = StateSnapshot::new();
+            for state_id in state_before {
+                if state_id == event_id {
+                    continue;
+                }
+                let held = EventId::new(state_id.as_str());
+                if log.historically_rejected(&held)
+                    || log
+                        .sidelined(&held)
+                        .is_some_and(|entry| entry.kind == Sideline::Rejected)
+                {
+                    return Err(RoomError::Forbidden(format!(
+                        "the peer's state names {state_id}, which this room rejected"
+                    )));
+                }
+                let body = rooms.read_event(room_id, &held)?;
+                let (Some(kind), Some(state_key)) =
+                    (body["type"].as_str(), body["state_key"].as_str())
+                else {
+                    return Err(RoomError::Forbidden(format!(
+                        "the peer's state names {state_id}, which is not a state event"
+                    )));
+                };
+                if kind == "m.room.create" && state_id != &create_id {
+                    return Err(RoomError::Forbidden(
+                        "the peer's state names another create event".to_owned(),
+                    ));
+                }
+                let key = StateKey::new(kind, state_key);
+                if state.get(&key).is_some_and(|other| other != state_id) {
+                    return Err(RoomError::Forbidden(format!(
+                        "the peer's state names two events for {kind}/{state_key}"
+                    )));
+                }
+                state = state.apply(key, state_id.as_str());
+            }
+            if state
+                .get(&StateKey::new("m.room.create", ""))
+                .is_none_or(|named| named != create_id)
+            {
+                return Err(RoomError::Forbidden(
+                    "the peer's state does not name this room's create event".to_owned(),
+                ));
+            }
+
+            // Check 3's "current state", as Synapse computes it across a
+            // gap: our extremities' states resolved together with the
+            // peer's. Our own current state is stale by the length of the
+            // gap -- a member who joined in it is unknown to it -- while a
+            // ban that reached either side still lands in the resolution,
+            // so a gap manufactured to dodge one does not dodge it.
+            let tips: Vec<EventId> = log.forward_extremities().iter().cloned().collect();
+            let current = rooms.resolve_in(log, room_id, |log, resolver, load| {
+                let mut states: Vec<StateSnapshot> = Vec::with_capacity(tips.len() + 1);
+                for tip in &tips {
+                    let tip_state = log.state_after_any(tip, load)?;
+                    if !states.iter().any(|held| held.root() == tip_state.root()) {
+                        states.push(tip_state);
+                    }
+                }
+                if !states.iter().any(|held| held.root() == state.root()) {
+                    states.push(state.clone());
+                }
+                if states.len() == 1 {
+                    return Ok(states.pop().unwrap_or_default());
+                }
+                resolver.resolve(&states)
+            })?;
+            if let Some((kind, reason)) =
+                rooms.receipt_checks(log, room_id, event_id, json, &state, &prev, Some(&current))?
+            {
+                return Err(RoomError::Forbidden(match kind {
+                    Sideline::SoftFailed => {
+                        format!("soft-failed against the current state: {reason}")
+                    }
+                    Sideline::Rejected => format!("rejected: {reason}"),
+                }));
+            }
+            let redaction_target = rooms.redaction_target(log, room_id, json)?;
+
+            let event_type = json["type"].as_str().unwrap_or_default().to_owned();
+            let state_key = json["state_key"].as_str().map(str::to_owned);
+            let sender = json["sender"].as_str().unwrap_or_default().to_owned();
+            let input = EventInput::new(event_id, prev);
+            let input = match &state_key {
+                Some(state_key) => {
+                    input.with_state_key(StateKey::new(event_type.as_str(), state_key.as_str()))
+                }
+                None => input,
+            };
+            let previous_current = log.current_state().cloned();
+            let previous_tips = log.forward_extremities().clone();
+            let entry = log
+                .append_across_gap(input, state, json["depth"].as_u64().unwrap_or(0))
+                .map_err(|error| rooms.append_error(&error))?
+                .clone();
+            rooms.metrics.record_append(
+                crate::metrics::Origin::Federated,
+                super::case_of(state_key.is_some(), false),
+            );
+            let content = json["content"].clone();
+            rooms.persist_entry(
+                log,
+                room_id,
+                &entry,
+                event_id,
+                &PersistInput {
+                    event_type: &event_type,
+                    state_key: state_key.as_deref(),
+                    sender: &sender,
+                    content: &content,
+                    json,
+                },
+            )?;
+            // Two extremities now, ours and the peer's: their resolution is
+            // the room's current state, and every membership it moved is
+            // re-indexed from it.
+            rooms.settle(log, room_id, Some(&entry), previous_current, &previous_tips)?;
+            if let Some(target) = redaction_target
+                && log.get(&EventId::new(target.as_str())).is_some()
+            {
+                rooms.apply_redaction(room_id, &target, event_id)?;
+            }
+
+            // The marker is advisory -- the event is placed and durable
+            // whether or not it lands -- so a failed write is reported, not
+            // turned into a refusal of an event already in the timeline.
+            let marker = serde_json::json!({
+                "event_id": event_id,
+                "missing_prev_events": missing,
+                "state_from": state_from,
+                "li": entry.li.get(),
+                "accepted_ts": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)),
+            });
+            if let Err(error) = rooms.store.put(
+                &spindle_core::keys::federation_gap(room_id, event_id),
+                marker.to_string().as_bytes(),
+            ) {
+                tracing::warn!(
+                    room = room_id,
+                    event_id,
+                    "cannot record a federation gap marker: {error}"
+                );
+            }
+            Ok(Some(missing))
+        })
+    }
+
+    /// The federation gaps recorded in a room by
+    /// [`Self::accept_across_gap`] and not yet filled: one marker per
+    /// event accepted across a gap, naming the predecessors it lacked.
+    ///
+    /// # Errors
+    /// Returns [`RoomError`] if the markers cannot be read.
+    pub fn federation_gaps(&self, room_id: &str) -> Result<Vec<Value>, RoomError> {
+        let prefix =
+            spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::FederationGap, room_id);
+        Ok(
+            spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?
+                .into_iter()
+                .filter_map(|(_, value)| serde_json::from_slice(&value).ok())
+                .collect(),
+        )
+    }
+
     /// A join-event template for a remote user, for `make_join`.
     ///
     /// The template is everything but the signature: the caller's server

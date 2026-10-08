@@ -55,6 +55,161 @@ pub enum Origin {
     Federated,
 }
 
+/// What became of one PDU a peer pushed in a transaction.
+///
+/// Five outcomes are the receipt checks' own verdicts; `refused` is
+/// everything refused before them -- a bad signature, a foreign sender, an
+/// unknown room -- so the series add up to every PDU received.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PduOutcome {
+    /// Appended to the timeline through the ordinary receipt checks,
+    /// directly or after its predecessors were recovered.
+    Accepted,
+    /// Appended across a gap on a peer's `/state_ids` (see `inbound::gap`).
+    GapAccepted,
+    /// Kept out of the timeline: fails only against the current state.
+    SoftFailed,
+    /// Kept out of the timeline: fails against its auth events or the
+    /// state before it.
+    Rejected,
+    /// Its predecessors or auth events are missing and could neither be
+    /// recovered nor bridged.
+    RefusedMissingDeps,
+    /// Refused before any receipt check.
+    Refused,
+}
+
+impl PduOutcome {
+    const ALL: [Self; 6] = [
+        Self::Accepted,
+        Self::GapAccepted,
+        Self::SoftFailed,
+        Self::Rejected,
+        Self::RefusedMissingDeps,
+        Self::Refused,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::GapAccepted => "gap_accepted",
+            Self::SoftFailed => "soft_failed",
+            Self::Rejected => "rejected",
+            Self::RefusedMissingDeps => "refused_missing_deps",
+            Self::Refused => "refused",
+        }
+    }
+}
+
+/// How one predecessor recovery attempt against one peer ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryResult {
+    /// Every missing predecessor and auth event was recovered.
+    Recovered,
+    /// The gap is wider than the event or byte budget.
+    BudgetExceeded,
+    /// The peer failed to answer, or answered with an error.
+    PeerError,
+    /// The peer answered 429, or was still cooling down from one.
+    RateLimited,
+    /// The attempt ran out of time.
+    Timeout,
+    /// What the peer sent failed verification or authorization.
+    Invalid,
+}
+
+impl RecoveryResult {
+    const ALL: [Self; 6] = [
+        Self::Recovered,
+        Self::BudgetExceeded,
+        Self::PeerError,
+        Self::RateLimited,
+        Self::Timeout,
+        Self::Invalid,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Recovered => "recovered",
+            Self::BudgetExceeded => "budget_exceeded",
+            Self::PeerError => "peer_error",
+            Self::RateLimited => "rate_limited",
+            Self::Timeout => "timeout",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+/// Why an event body was fetched from a peer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FetchKind {
+    /// A missing predecessor (`get_missing_events` or `/event`).
+    Predecessor,
+    /// A missing auth event of a pushed or recovered event.
+    Auth,
+    /// A state or auth-chain event named by `/state_ids` for a gap.
+    GapState,
+}
+
+impl FetchKind {
+    const ALL: [Self; 3] = [Self::Predecessor, Self::Auth, Self::GapState];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Predecessor => "predecessor",
+            Self::Auth => "auth",
+            Self::GapState => "gap_state",
+        }
+    }
+}
+
+/// How one attempt to accept an event across a gap ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GapResult {
+    /// The event was appended on the peer's state.
+    Accepted,
+    /// The state or its auth chain exceeded the gap budget.
+    BudgetExceeded,
+    /// No participating server answered `/state_ids` usefully.
+    PeerError,
+    /// Every candidate answered 429 or was cooling down from one.
+    RateLimited,
+    /// The attempt ran out of time.
+    Timeout,
+    /// The state, an event in it, or the event itself failed verification
+    /// or authorization: refused, fail closed.
+    Invalid,
+}
+
+impl GapResult {
+    const ALL: [Self; 6] = [
+        Self::Accepted,
+        Self::BudgetExceeded,
+        Self::PeerError,
+        Self::RateLimited,
+        Self::Timeout,
+        Self::Invalid,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::BudgetExceeded => "budget_exceeded",
+            Self::PeerError => "peer_error",
+            Self::RateLimited => "rate_limited",
+            Self::Timeout => "timeout",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+/// Position of a label value in its `ALL` table, which is the counter's
+/// slot. A linear search over at most six values, and it cannot drift from
+/// the table the renderer walks.
+fn slot<T: PartialEq + Copy>(all: &[T], value: T) -> usize {
+    all.iter().position(|each| *each == value).unwrap_or(0)
+}
+
 /// Every counter, gauge and histogram this server exposes.
 ///
 /// One per server: `spindle_server::app` makes it and hands the same
@@ -80,6 +235,16 @@ pub struct Metrics {
     federation_queue: RwLock<Vec<(String, u64)>>,
     sync_subscribers: AtomicU64,
     sync_lag: Family,
+    /// Inbound PDUs by what became of them ([`PduOutcome`]).
+    pdu_outcomes: [AtomicU64; PduOutcome::ALL.len()],
+    /// Predecessor recovery attempts by result ([`RecoveryResult`]).
+    recovery_attempts: [AtomicU64; RecoveryResult::ALL.len()],
+    recovery_latency: Family,
+    /// Bodies fetched from peers by recovery or gap acceptance ([`FetchKind`]).
+    recovery_fetched: [AtomicU64; FetchKind::ALL.len()],
+    /// Gap acceptance attempts by result ([`GapResult`]).
+    gap_acceptances: [AtomicU64; GapResult::ALL.len()],
+    state_ids_latency: Family,
 }
 
 impl Metrics {
@@ -186,6 +351,7 @@ impl Metrics {
         self.render_room_locks(&mut out);
         self.render_http(&mut out);
         self.render_federation(&mut out);
+        self.render_inbound(&mut out);
         self.render_sync(&mut out);
         out
     }
@@ -382,6 +548,13 @@ const BUCKETS: [f64; 12] = [
     0.000_5, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
 ];
 
+/// Bucket bounds for the federation recovery paths, in seconds.
+///
+/// Those are network round trips and walks over many of them, bounded by
+/// timeouts of tens of seconds; the append buckets above would put every
+/// one of them in `+Inf` and answer nothing.
+const SLOW_BUCKETS: [f64; 11] = [0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0];
+
 /// A Prometheus histogram: per-bucket counts, a sum and a total.
 ///
 /// Counts are per-bucket here and made cumulative at render, which is
@@ -389,7 +562,8 @@ const BUCKETS: [f64; 12] = [
 /// touching every bucket above the observation on the hot path.
 #[derive(Debug)]
 struct Histogram {
-    buckets: [AtomicU64; BUCKETS.len()],
+    bounds: &'static [f64],
+    buckets: Box<[AtomicU64]>,
     /// Microseconds, so the sum needs no float atomic. Rendered as
     /// seconds, which is the unit the metric name promises.
     sum_micros: AtomicU64,
@@ -397,11 +571,10 @@ struct Histogram {
 }
 
 impl Histogram {
-    const fn new() -> Self {
-        #[allow(clippy::declare_interior_mutable_const)]
-        const ZERO: AtomicU64 = AtomicU64::new(0);
+    fn new(bounds: &'static [f64]) -> Self {
         Self {
-            buckets: [ZERO; BUCKETS.len()],
+            bounds,
+            buckets: bounds.iter().map(|_| AtomicU64::new(0)).collect(),
             sum_micros: AtomicU64::new(0),
             count: AtomicU64::new(0),
         }
@@ -412,10 +585,11 @@ impl Histogram {
     /// cast that has to be reasoned about.
     fn observe(&self, elapsed: Duration) {
         let seconds = elapsed.as_secs_f64();
-        let slot = BUCKETS
+        let slot = self
+            .bounds
             .iter()
             .position(|bound| seconds <= *bound)
-            .unwrap_or(BUCKETS.len());
+            .unwrap_or(self.bounds.len());
         if let Some(bucket) = self.buckets.get(slot) {
             bucket.fetch_add(1, Ordering::Relaxed);
         }
@@ -431,8 +605,8 @@ impl Histogram {
     fn render_into(&self, out: &mut String, name: &str, labels: &str) {
         let mut cumulative = 0;
         let separator = if labels.is_empty() { "" } else { "," };
-        for (index, bound) in BUCKETS.iter().enumerate() {
-            cumulative += self.buckets[index].load(Ordering::Relaxed);
+        for (bound, bucket) in self.bounds.iter().zip(self.buckets.iter()) {
+            cumulative += bucket.load(Ordering::Relaxed);
             let _ = writeln!(
                 out,
                 "{name}_bucket{{{labels}{separator}le=\"{bound}\"}} {cumulative}"
@@ -465,6 +639,10 @@ impl Histogram {
 type Family = RwLock<HashMap<String, Histogram>>;
 
 fn observe_in(family: &Family, key: &str, elapsed: Duration) {
+    observe_in_buckets(family, key, elapsed, &BUCKETS);
+}
+
+fn observe_in_buckets(family: &Family, key: &str, elapsed: Duration, bounds: &'static [f64]) {
     if let Ok(read) = family.read()
         && let Some(histogram) = read.get(key)
     {
@@ -474,7 +652,7 @@ fn observe_in(family: &Family, key: &str, elapsed: Duration) {
     if let Ok(mut write) = family.write() {
         write
             .entry(key.to_owned())
-            .or_insert_with(Histogram::new)
+            .or_insert_with(|| Histogram::new(bounds))
             .observe(elapsed);
     }
 }
@@ -581,6 +759,150 @@ impl Metrics {
     }
 }
 
+impl Metrics {
+    /// Record what became of one PDU a peer pushed.
+    pub fn record_pdu(&self, outcome: PduOutcome) {
+        self.pdu_outcomes[slot(&PduOutcome::ALL, outcome)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one predecessor recovery attempt against one peer, and how
+    /// long it took.
+    pub fn record_recovery(&self, result: RecoveryResult, elapsed: Duration) {
+        self.recovery_attempts[slot(&RecoveryResult::ALL, result)].fetch_add(1, Ordering::Relaxed);
+        observe_in_buckets(
+            &self.recovery_latency,
+            result.label(),
+            elapsed,
+            &SLOW_BUCKETS,
+        );
+    }
+
+    /// Record event bodies fetched from a peer by recovery or a gap.
+    pub fn record_fetched(&self, kind: FetchKind, count: u64) {
+        self.recovery_fetched[slot(&FetchKind::ALL, kind)].fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Record one attempt to accept an event across a gap.
+    pub fn record_gap(&self, result: GapResult) {
+        self.gap_acceptances[slot(&GapResult::ALL, result)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one `/state_ids` request, by `ok`, `rate_limited` or `error`.
+    pub fn observe_state_ids(&self, result: &'static str, elapsed: Duration) {
+        observe_in_buckets(&self.state_ids_latency, result, elapsed, &SLOW_BUCKETS);
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn pdu_count(&self, outcome: PduOutcome) -> u64 {
+        self.pdu_outcomes[slot(&PduOutcome::ALL, outcome)].load(Ordering::Relaxed)
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn recovery_count(&self, result: RecoveryResult) -> u64 {
+        self.recovery_attempts[slot(&RecoveryResult::ALL, result)].load(Ordering::Relaxed)
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn fetched_count(&self, kind: FetchKind) -> u64 {
+        self.recovery_fetched[slot(&FetchKind::ALL, kind)].load(Ordering::Relaxed)
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn gap_count(&self, result: GapResult) -> u64 {
+        self.gap_acceptances[slot(&GapResult::ALL, result)].load(Ordering::Relaxed)
+    }
+
+    /// Inbound federation: PDU outcomes, dependency recovery, gaps.
+    ///
+    /// Every label is a fixed enum value: no room, event or server name,
+    /// so a peer cannot mint series by sending us things.
+    fn render_inbound(&self, out: &mut String) {
+        out.push_str(
+            "# HELP spindle_federation_pdus_received_total PDUs peers pushed, by outcome.\n\
+         # TYPE spindle_federation_pdus_received_total counter\n",
+        );
+        for outcome in PduOutcome::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_pdus_received_total{{result=\"{}\"}} {}",
+                outcome.label(),
+                self.pdu_count(outcome)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_federation_recovery_attempts_total Missing-dependency \
+         recovery attempts against one peer, by result.\n\
+         # TYPE spindle_federation_recovery_attempts_total counter\n",
+        );
+        for result in RecoveryResult::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_recovery_attempts_total{{result=\"{}\"}} {}",
+                result.label(),
+                self.recovery_count(result)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_federation_recovery_duration_seconds Time one recovery \
+         attempt took, by result.\n\
+         # TYPE spindle_federation_recovery_duration_seconds histogram\n",
+        );
+        if let Ok(read) = self.recovery_latency.read() {
+            for (result, histogram) in read.iter() {
+                histogram.render_into(
+                    out,
+                    "spindle_federation_recovery_duration_seconds",
+                    &format!("result=\"{}\"", escape(result)),
+                );
+            }
+        }
+        out.push_str(
+            "# HELP spindle_federation_recovery_events_fetched_total Event bodies \
+         fetched from peers to fill missing dependencies, by kind.\n\
+         # TYPE spindle_federation_recovery_events_fetched_total counter\n",
+        );
+        for kind in FetchKind::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_recovery_events_fetched_total{{kind=\"{}\"}} {}",
+                kind.label(),
+                self.fetched_count(kind)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_federation_gap_acceptances_total Attempts to accept a PDU \
+         across a history gap on a peer's state, by result.\n\
+         # TYPE spindle_federation_gap_acceptances_total counter\n",
+        );
+        for result in GapResult::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_gap_acceptances_total{{result=\"{}\"}} {}",
+                result.label(),
+                self.gap_count(result)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_federation_state_ids_duration_seconds Time one /state_ids \
+         request took, by result.\n\
+         # TYPE spindle_federation_state_ids_duration_seconds histogram\n",
+        );
+        if let Ok(read) = self.state_ids_latency.read() {
+            for (result, histogram) in read.iter() {
+                histogram.render_into(
+                    out,
+                    "spindle_federation_state_ids_duration_seconds",
+                    &format!("result=\"{}\"", escape(result)),
+                );
+            }
+        }
+    }
+}
+
 /// Escape a label value per the exposition format.
 fn escape(value: &str) -> String {
     value
@@ -637,6 +959,68 @@ mod tests {
         // every client on earth as connected to this server.
         metrics.sync_waiter_finished();
         assert_eq!(metrics.sync_subscribers(), 0);
+    }
+
+    /// Each inbound federation counter moves on its own label, and the
+    /// exposition renders every label even at zero.
+    #[test]
+    fn inbound_federation_counters_move_and_render() {
+        let metrics = Metrics::new();
+        let text = metrics.render();
+        for outcome in PduOutcome::ALL {
+            assert!(
+                text.contains(&format!(
+                    "spindle_federation_pdus_received_total{{result=\"{}\"}} 0",
+                    outcome.label()
+                )),
+                "{text}"
+            );
+        }
+        for result in GapResult::ALL {
+            assert!(
+                text.contains(&format!(
+                    "spindle_federation_gap_acceptances_total{{result=\"{}\"}} 0",
+                    result.label()
+                )),
+                "{text}"
+            );
+        }
+
+        metrics.record_pdu(PduOutcome::GapAccepted);
+        metrics.record_pdu(PduOutcome::GapAccepted);
+        metrics.record_pdu(PduOutcome::RefusedMissingDeps);
+        metrics.record_recovery(RecoveryResult::RateLimited, Duration::from_millis(30));
+        metrics.record_recovery(RecoveryResult::BudgetExceeded, Duration::from_secs(12));
+        metrics.record_fetched(FetchKind::GapState, 7);
+        metrics.record_fetched(FetchKind::Predecessor, 2);
+        metrics.record_gap(GapResult::Accepted);
+        metrics.observe_state_ids("ok", Duration::from_millis(400));
+
+        assert_eq!(metrics.pdu_count(PduOutcome::GapAccepted), 2);
+        assert_eq!(metrics.pdu_count(PduOutcome::RefusedMissingDeps), 1);
+        assert_eq!(metrics.pdu_count(PduOutcome::Accepted), 0);
+        assert_eq!(metrics.recovery_count(RecoveryResult::RateLimited), 1);
+        assert_eq!(metrics.recovery_count(RecoveryResult::BudgetExceeded), 1);
+        assert_eq!(metrics.recovery_count(RecoveryResult::Recovered), 0);
+        assert_eq!(metrics.fetched_count(FetchKind::GapState), 7);
+        assert_eq!(metrics.fetched_count(FetchKind::Predecessor), 2);
+        assert_eq!(metrics.fetched_count(FetchKind::Auth), 0);
+        assert_eq!(metrics.gap_count(GapResult::Accepted), 1);
+
+        let text = metrics.render();
+        for line in [
+            "spindle_federation_pdus_received_total{result=\"gap_accepted\"} 2",
+            "spindle_federation_recovery_attempts_total{result=\"rate_limited\"} 1",
+            "spindle_federation_recovery_events_fetched_total{kind=\"gap_state\"} 7",
+            "spindle_federation_gap_acceptances_total{result=\"accepted\"} 1",
+            // Twelve seconds lands in the ten-to-thirty bucket, which the
+            // append buckets could not have told apart from an hour.
+            "spindle_federation_recovery_duration_seconds_bucket{result=\"budget_exceeded\",le=\"10\"} 0",
+            "spindle_federation_recovery_duration_seconds_bucket{result=\"budget_exceeded\",le=\"30\"} 1",
+            "spindle_federation_state_ids_duration_seconds_count{result=\"ok\"} 1",
+        ] {
+            assert!(text.contains(line), "missing {line:?} in {text}");
+        }
     }
 
     /// The exposition is the contract, so it is asserted rather than eyeballed.

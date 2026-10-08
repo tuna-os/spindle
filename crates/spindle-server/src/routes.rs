@@ -6669,6 +6669,10 @@ fn sync_resume(
 /// request carries its lists in full each time. The response sends a room in
 /// full (`initial: true`) on an initial request, and after that only the
 /// rooms the stream says changed — the one scan `changed_rooms` exists for.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the window-growth hotfix grew it past the line; split it with the next sliding change"
+)]
 async fn sliding_sync(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,

@@ -1983,17 +1983,17 @@ mod head_source_tests {
             event_id: id.into(),
             event_type: kind.into(),
             state_key: state_key.map(str::to_owned),
-            prev_events: parents.iter().map(|s| s.to_string()).collect(),
+            prev_events: parents.iter().copied().map(str::to_owned).collect(),
             depth,
-            stream_ordering: depth as i64,
+            stream_ordering: i64::try_from(depth).unwrap_or(i64::MAX),
             outlier: false,
             rejected: false,
         }
     }
     fn fixture(full_compare: bool) -> (SourceRoom, FixtureSource) {
         let mut historical = StateMap::from([
-            (("m.room.create".into(), "".into()), "$create".into()),
-            (("m.room.topic".into(), "".into()), "$topic_a".into()),
+            (("m.room.create".into(), String::new()), "$create".into()),
+            (("m.room.topic".into(), String::new()), "$topic_a".into()),
         ]);
         if full_compare {
             historical.insert(
@@ -2153,7 +2153,7 @@ mod head_source_tests {
             .retain(|event| event.event_id == "$create" || event.outlier);
         room.forward_extremities = vec!["$create".to_owned()];
         room.current_state
-            .remove(&("m.room.topic".to_owned(), "".to_owned()));
+            .remove(&("m.room.topic".to_owned(), String::new()));
         let result = replay_resolving(&room, &mut source, true).expect("root replay");
         assert!(
             !result.outcome.clean(),

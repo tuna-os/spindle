@@ -1014,6 +1014,79 @@ impl RoomLog {
         state_before: StateSnapshot,
     ) -> Result<&LogEntry, AppendError> {
         let depth = self.check_parents(&input)?;
+        self.place_forward(input, state_before, depth)
+    }
+
+    /// Append an accepted event whose predecessors this log does not all
+    /// hold, on the state before it that a participating server named
+    /// (`/state_ids`) and the receiver verified -- the forward half of
+    /// accepting a federation gap.
+    ///
+    /// A server that was offline longer than dependency recovery can span
+    /// still has to take the room's new events; refusing them freezes the
+    /// room forever, because every later event descends from the ones it
+    /// cannot place. So the event is placed as a forward event across the
+    /// gap: its `prev_events` are kept exactly as signed, the held ones stop
+    /// being forward extremities as on any append, and the unknown ones are
+    /// simply absent -- the gap between them and this log's history is
+    /// backfill's to fill later. Every other extremity stays one, unlike
+    /// [`Self::append_seeded`]: the room's own head and the new event are
+    /// both tips, and the next event authored here names both, which is
+    /// the merge that resolves their states.
+    ///
+    /// `depth` is the event's signed depth, raised above any held parent's
+    /// so the log's depth stays monotonic along the edges it can see.
+    ///
+    /// The entry carries a chain value: this server sequenced it live, which
+    /// is what the chain attests, unlike seeded or backfilled history.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppendError::DuplicateEvent`] for an event already held,
+    /// [`AppendError::MissingPredecessor`] for an event naming no parents,
+    /// [`AppendError::TooManyPredecessors`], [`AppendError::EmptyRoom`] when
+    /// there is no history to be beside, or
+    /// [`AppendError::IndexSpaceExhausted`].
+    pub fn append_across_gap(
+        &mut self,
+        input: EventInput,
+        state_before: StateSnapshot,
+        depth: u64,
+    ) -> Result<&LogEntry, AppendError> {
+        if self.holds(&input.event_id) {
+            return Err(AppendError::DuplicateEvent(input.event_id));
+        }
+        if input.prev_events.len() > MAX_PREV_EVENTS {
+            return Err(AppendError::TooManyPredecessors(input.prev_events.len()));
+        }
+        if input.prev_events.is_empty() {
+            return Err(AppendError::MissingPredecessor);
+        }
+        if self.entries.is_empty() {
+            return Err(AppendError::EmptyRoom);
+        }
+        let mut depth = depth;
+        for parent in &input.prev_events {
+            let held = self
+                .get(parent)
+                .map(|entry| entry.depth)
+                .or_else(|| self.sidelined.get(parent).map(|entry| entry.depth));
+            if let Some(parent_depth) = held {
+                depth = depth.max(parent_depth.saturating_add(1));
+            }
+        }
+        self.place_forward(input, state_before, depth)
+    }
+
+    /// The shared tail of a live append: index, chain, extremities and the
+    /// resident state after the event. Parents not held are no extremity,
+    /// so removing them is a no-op, which is what lets the gap path share it.
+    fn place_forward(
+        &mut self,
+        input: EventInput,
+        state_before: StateSnapshot,
+        depth: u64,
+    ) -> Result<&LogEntry, AppendError> {
         let mut state_after = state_before;
         let state_key = input.state_key;
         if let Some(state_key) = state_key.clone() {

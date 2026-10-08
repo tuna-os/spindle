@@ -5376,7 +5376,8 @@ impl Rooms {
             )));
         }
         let (state_before, resolved) = self.state_for_parents(log, room_id, &prev)?;
-        let verdict = self.receipt_checks(log, room_id, event_id, json, &state_before, &prev)?;
+        let verdict =
+            self.receipt_checks(log, room_id, event_id, json, &state_before, &prev, None)?;
 
         let input = EventInput::new(event_id, prev.clone());
         let input = match &state_key {
@@ -5419,23 +5420,7 @@ impl Rooms {
             }));
         }
 
-        let redaction_target = if event_type == "m.room.redaction" {
-            let version = self.version_in_log(log, room_id)?;
-            let rules = rules_of(&version)?;
-            let target = if rules.redaction.content_field_redacts {
-                json["content"]["redacts"].as_str()
-            } else {
-                json["redacts"].as_str()
-            }
-            .ok_or_else(|| {
-                RoomError::Build(format!(
-                    "a room v{version} redaction has no target in the version's required field"
-                ))
-            })?;
-            Some(target.to_owned())
-        } else {
-            None
-        };
+        let redaction_target = self.redaction_target(log, room_id, json)?;
 
         let previous_current = log.current_state().cloned();
         let previous_tips = log.forward_extremities().clone();
@@ -5480,11 +5465,49 @@ impl Rooms {
         Ok(())
     }
 
+    /// The event a received redaction targets, read from the field the
+    /// room version puts it in; `None` for any other event.
+    ///
+    /// Resolved under this room's rules rather than by looking in both
+    /// places, so an ambiguous event is refused instead of guessed at.
+    fn redaction_target(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        json: &Value,
+    ) -> Result<Option<String>, RoomError> {
+        if json["type"].as_str() != Some("m.room.redaction") {
+            return Ok(None);
+        }
+        let version = self.version_in_log(log, room_id)?;
+        let rules = rules_of(&version)?;
+        let target = if rules.redaction.content_field_redacts {
+            json["content"]["redacts"].as_str()
+        } else {
+            json["redacts"].as_str()
+        }
+        .ok_or_else(|| {
+            RoomError::Build(format!(
+                "a room v{version} redaction has no target in the version's required field"
+            ))
+        })?;
+        Ok(Some(target.to_owned()))
+    }
+
     /// The spec's checks on receipt of a PDU, past signatures and hashes:
     /// `None` to accept, or the verdict and the rule that refused.
     ///
     /// A malformed event, or one whose auth events this server does not
     /// hold, is an error rather than a verdict -- nothing is kept for it.
+    ///
+    /// `current` stands in for the room's current state in check 3 when
+    /// given: an event accepted across a gap is soft-fail checked against
+    /// the resolution of our extremities and the state it was sent in,
+    /// because our own current state is exactly what a gap makes stale.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the checks' inputs, each one named by the spec"
+    )]
     fn receipt_checks(
         &self,
         log: &RoomLog,
@@ -5493,6 +5516,7 @@ impl Rooms {
         json: &Value,
         state_before: &StateSnapshot,
         prev: &[EventId],
+        current: Option<&StateSnapshot>,
     ) -> Result<Option<(Sideline, String)>, RoomError> {
         use ruma::state_res::events::Event as _;
 
@@ -5595,7 +5619,7 @@ impl Rooms {
         let tips: BTreeSet<&EventId> = log.forward_extremities().iter().collect();
         let parents: BTreeSet<&EventId> = prev.iter().collect();
         if tips != parents
-            && let Some(current) = log.current_state()
+            && let Some(current) = current.or_else(|| log.current_state())
             && let Err(why) =
                 crate::authorize::authorize(&rules.authorization, &candidate, |kind, key| {
                     by_state(current, kind, key)

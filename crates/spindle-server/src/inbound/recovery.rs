@@ -1,27 +1,195 @@
 //! Recover a pushed PDU's dependencies before the ordinary room receipt checks.
 //! No room or store lock crosses an outbound request. Fetched bodies are
 //! individually named and verified; the peer's response is not a verdict.
+//!
+//! Recovery is bounded, and a server back from a long outage can be further
+//! behind than any bound: a busy room gains thousands of events a day. So
+//! when recovery cannot finish -- the gap is wider than the budget, the
+//! peer will not answer, or time runs out -- the event is accepted across
+//! the gap on a participating server's `/state_ids` instead ([`super::gap`]),
+//! as Synapse does, rather than refused forever. Recovery that succeeds
+//! keeps the full history and never takes that path.
+//!
+//! One room recovers one PDU at a time ([`RecoveryGate`]): a transaction of
+//! fifty PDUs naming the same unknown history otherwise asks the peer the
+//! same `get_missing_events` question fifty times, and the peer answers the
+//! duplicates 429 (production saw exactly this, `M_LIMIT_EXCEEDED: Too many
+//! duplicate requests`). A later PDU waits for the recovery in flight, then
+//! tries the ordinary path first, which is usually enough: the event before
+//! it was just placed.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use ruma::{CanonicalJsonValue, RoomVersionId};
 use serde_json::{Value, json};
 
 use crate::AppState;
-use crate::federation::PeerKeys;
+use crate::federation::{FederationError, PeerKeys};
+use crate::metrics::{FetchKind, GapResult, PduOutcome, RecoveryResult};
+use crate::rooms::RoomError;
 
 const MAX_RECOVERED_EVENTS: usize = 512;
 const MAX_RECOVERED_BYTES: usize = 16 * 1024 * 1024;
+/// One predecessor recovery attempt against one peer.
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// The whole of a gap acceptance: `/state_ids`, the missing bodies, and the
+/// append. Longer than a recovery, because its walk is wider and it is the
+/// last resort before refusing.
+const GAP_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long a PDU waits for another recovery in the same room to finish
+/// before it is refused as missing its dependencies, to be retried with the
+/// transaction.
+const RECOVERY_WAIT: Duration = Duration::from_secs(60);
+/// How long a peer that answered 429 is left alone for one room and one
+/// kind of request, when it does not say. Clamped to a sane range when it
+/// does, so a peer cannot switch recovery off for a day or ask to be
+/// hammered again at once.
+const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
+const MIN_COOLDOWN: Duration = Duration::from_secs(5);
+const MAX_COOLDOWN: Duration = Duration::from_secs(600);
 
-struct VerifiedPdu {
-    id: String,
-    body: Value,
+/// The requests a 429 cools down, separately: a peer limiting duplicate
+/// `get_missing_events` calls has said nothing about `/state_ids`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum Endpoint {
+    /// `get_missing_events` and the `/event` walk behind it.
+    Recovery,
+    /// `/state_ids` and the `/event` fetches for its bodies.
+    StateIds,
 }
 
+type CooldownKey = (String, String, Endpoint);
+
+/// Per-room single flight for dependency recovery, and the peers this
+/// server is leaving alone after they answered 429.
+///
+/// Process-local on purpose: both are about requests in flight right now.
+/// A restart forgets them, which costs at most one more request per peer.
+#[derive(Debug, Default)]
+pub struct RecoveryGate {
+    /// One async lock per room with a recovery in flight. Weak, so a room
+    /// nobody is recovering holds nothing; dead entries are swept on entry.
+    rooms: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    /// `(room, peer, endpoint)` -> not before.
+    cooldowns: Mutex<HashMap<CooldownKey, Instant>>,
+}
+
+impl RecoveryGate {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Wait for this room's turn to recover. The guard is the turn.
+    async fn enter(&self, room_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut rooms = self
+                .rooms
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            rooms.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = rooms.get(room_id).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                rooms.insert(room_id.to_owned(), Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
+    }
+
+    /// Whether `peer` asked to be left alone for this room and endpoint.
+    pub(super) fn cooling(&self, room_id: &str, peer: &str, endpoint: Endpoint) -> bool {
+        let now = Instant::now();
+        self.cooldowns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(room_id.to_owned(), peer.to_owned(), endpoint))
+            .is_some_and(|until| *until > now)
+    }
+
+    /// Leave `peer` alone for this room and endpoint for `wait`, clamped.
+    pub(super) fn cool(&self, room_id: &str, peer: &str, endpoint: Endpoint, wait: Duration) {
+        let now = Instant::now();
+        let mut cooldowns = self
+            .cooldowns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cooldowns.retain(|_, until| *until > now);
+        cooldowns.insert(
+            (room_id.to_owned(), peer.to_owned(), endpoint),
+            now + wait.clamp(MIN_COOLDOWN, MAX_COOLDOWN),
+        );
+    }
+}
+
+/// Why a recovery or gap attempt stopped short.
+#[derive(Debug)]
+pub(super) enum Failure {
+    /// The gap is wider than the budget. Another peer has the same gap.
+    Budget(String),
+    /// The peer did not answer usefully; `rate_limited` carries its
+    /// requested wait when it answered 429. Another peer may do better.
+    Peer {
+        message: String,
+        rate_limited: Option<Duration>,
+    },
+    /// What a peer sent failed verification or authorization. Fail closed.
+    Invalid(String),
+    /// The event itself was judged by the receipt checks and refused.
+    Verdict(RoomError),
+}
+
+impl Failure {
+    pub(super) fn from_peer(error: &FederationError) -> Self {
+        let rate_limited = match error {
+            FederationError::Answered { status: 429, body } => Some(
+                body["retry_after_ms"]
+                    .as_u64()
+                    .map_or(RATE_LIMIT_COOLDOWN, Duration::from_millis),
+            ),
+            _ => None,
+        };
+        Self::Peer {
+            message: error.to_string(),
+            rate_limited,
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::Budget(why) | Self::Invalid(why) | Self::Peer { message: why, .. } => why.clone(),
+            Self::Verdict(error) => error.to_string(),
+        }
+    }
+}
+
+impl From<RoomError> for Failure {
+    fn from(error: RoomError) -> Self {
+        Self::Invalid(error.to_string())
+    }
+}
+
+/// What a refusal from the room says about the PDU, for the outcome metric.
+fn classify(error: &RoomError) -> PduOutcome {
+    match error {
+        RoomError::Forbidden(why) if why.contains("soft-failed") => PduOutcome::SoftFailed,
+        RoomError::Forbidden(_) => PduOutcome::Rejected,
+        RoomError::Append(_) | RoomError::MissingBody(_) => PduOutcome::RefusedMissingDeps,
+        _ => PduOutcome::Refused,
+    }
+}
+
+pub(super) struct VerifiedPdu {
+    pub(super) id: String,
+    pub(super) body: Value,
+}
 /// Gather precisely the signers the room version requires, including a
 /// restricted join's authorizer and a v1/v2 event ID's server.
-async fn verify(
+pub(super) async fn verify(
     state: &AppState,
     room_id: &str,
     version: &RoomVersionId,
@@ -93,6 +261,8 @@ async fn verify(
     })
 }
 
+/// Judge one pushed PDU, recovering or bridging its dependencies when it
+/// names history this server lacks, and count what became of it.
 pub(super) async fn receive(
     state: &AppState,
     origin: &str,
@@ -100,6 +270,18 @@ pub(super) async fn receive(
     provided_keys: Option<&PeerKeys>,
     pdu: &Value,
 ) -> (String, Result<(), String>) {
+    let (id, outcome, result) = Box::pin(judge(state, origin, signer, provided_keys, pdu)).await;
+    state.metrics.record_pdu(outcome);
+    (id, result)
+}
+
+async fn judge(
+    state: &AppState,
+    origin: &str,
+    signer: &str,
+    provided_keys: Option<&PeerKeys>,
+    pdu: &Value,
+) -> (String, PduOutcome, Result<(), String>) {
     if pdu["sender"]
         .as_str()
         .and_then(|sender| sender.split_once(':'))
@@ -108,11 +290,16 @@ pub(super) async fn receive(
     {
         return (
             "$foreign-sender".to_owned(),
+            PduOutcome::Refused,
             Err("the sender does not live on the origin".to_owned()),
         );
     }
     let Some(room_id) = pdu["room_id"].as_str() else {
-        return ("$malformed".to_owned(), Err("no room_id".to_owned()));
+        return (
+            "$malformed".to_owned(),
+            PduOutcome::Refused,
+            Err("no room_id".to_owned()),
+        );
     };
     let version = state
         .rooms
@@ -136,47 +323,251 @@ pub(super) async fn receive(
                         .map(|event| event.event_id().as_str().to_owned())
                 })
                 .unwrap_or_else(|| "$malformed".to_owned());
-            return (id, Err(error));
+            return (id, PduOutcome::Refused, Err(error));
         }
     };
-    let first = state.rooms.receive_remote(room_id, &event.id, &event.body);
-    let Err(error) = first else {
-        return (event.id, Ok(()));
+    let error = match state.rooms.receive_remote(room_id, &event.id, &event.body) {
+        Ok(()) => return (event.id, PduOutcome::Accepted, Ok(())),
+        Err(error) => error,
     };
     // A rejection is already a verdict. Recovery fills an absent dependency;
     // it must not reconsider a stored historical or native rejection.
-    if !matches!(
-        error,
-        crate::rooms::RoomError::Append(_) | crate::rooms::RoomError::MissingBody(_)
-    ) {
-        return (event.id, Err(error.to_string()));
+    if !matches!(error, RoomError::Append(_) | RoomError::MissingBody(_)) {
+        return (event.id, classify(&error), Err(error.to_string()));
+    }
+    if !has_missing(state, room_id, &event.body) {
+        return (event.id, PduOutcome::Refused, Err(error.to_string()));
+    }
+    // Recovery asks a participating peer about a room we hold; no unsigned
+    // third-party name can trigger an arbitrary dependency fetch.
+    if !state.rooms.server_in_room(room_id, origin).unwrap_or(false) {
+        return (
+            event.id,
+            PduOutcome::RefusedMissingDeps,
+            Err(error.to_string()),
+        );
+    }
+
+    // The rest runs as its own task, so a sending server that gives up on
+    // the transaction does not cancel a recovery halfway: the work finishes,
+    // and the transaction's retry finds the event already placed. It holds
+    // the room's turn for as long as it runs.
+    let id = event.id.clone();
+    let task = {
+        let state = state.clone();
+        let origin = origin.to_owned();
+        let room_id = room_id.to_owned();
+        async move {
+            let Ok(turn) =
+                tokio::time::timeout(RECOVERY_WAIT, state.recovery.enter(&room_id)).await
+            else {
+                return (
+                    PduOutcome::RefusedMissingDeps,
+                    Err("another dependency recovery for this room is still running".to_owned()),
+                );
+            };
+            let outcome = resolve(&state, &origin, &room_id, &version, &event, &mut keys).await;
+            drop(turn);
+            outcome
+        }
+    };
+    match tokio::spawn(task).await {
+        Ok((outcome, result)) => (id, outcome, result),
+        Err(error) => (
+            id,
+            PduOutcome::RefusedMissingDeps,
+            Err(format!("dependency recovery failed: {error}")),
+        ),
+    }
+}
+
+/// Whether the event names a predecessor or auth event this room lacks.
+fn has_missing(state: &AppState, room_id: &str, body: &Value) -> bool {
+    state
+        .rooms
+        .missing_remote_dependencies(room_id, body)
+        .is_ok_and(|(predecessors, auth)| !predecessors.is_empty() || !auth.is_empty())
+}
+
+/// With the room's turn held: try the ordinary path again, then recovery
+/// against the origin and one other participant, then a gap acceptance.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the fallback ladder for one PDU, read top to bottom"
+)]
+async fn resolve(
+    state: &AppState,
+    origin: &str,
+    room_id: &str,
+    version: &RoomVersionId,
+    event: &VerifiedPdu,
+    keys: &mut HashMap<String, PeerKeys>,
+) -> (PduOutcome, Result<(), String>) {
+    // A recovery that held the turn before this one may have placed exactly
+    // what this event needs -- usually the event before it.
+    let error = match state.rooms.receive_remote(room_id, &event.id, &event.body) {
+        Ok(()) => return (PduOutcome::Accepted, Ok(())),
+        Err(error) => error,
+    };
+    if !matches!(error, RoomError::Append(_) | RoomError::MissingBody(_)) {
+        return (classify(&error), Err(error.to_string()));
     }
     let missing = match state
         .rooms
         .missing_remote_dependencies(room_id, &event.body)
     {
         Ok(missing) if !missing.0.is_empty() || !missing.1.is_empty() => missing,
-        _ => return (event.id, Err(error.to_string())),
+        _ => return (PduOutcome::Refused, Err(error.to_string())),
     };
-    // Recovery asks a participating peer about a room we hold; no unsigned
-    // third-party name can trigger an arbitrary dependency fetch.
-    if !state.rooms.server_in_room(room_id, origin).unwrap_or(false) {
-        return (event.id, Err(error.to_string()));
+
+    let mut last = error.to_string();
+    for peer in recovery_peers(state, origin, room_id) {
+        let started = Instant::now();
+        let attempt = tokio::time::timeout(
+            RECOVERY_TIMEOUT,
+            recover(state, &peer, room_id, version, event, missing.clone(), keys),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        match attempt {
+            Ok(Ok(())) => {
+                state
+                    .metrics
+                    .record_recovery(RecoveryResult::Recovered, elapsed);
+                return match state.rooms.receive_remote(room_id, &event.id, &event.body) {
+                    Ok(()) => (PduOutcome::Accepted, Ok(())),
+                    Err(error) => (classify(&error), Err(error.to_string())),
+                };
+            }
+            Ok(Err(Failure::Peer {
+                message,
+                rate_limited,
+            })) => {
+                if let Some(wait) = rate_limited {
+                    state
+                        .recovery
+                        .cool(room_id, &peer, Endpoint::Recovery, wait);
+                    state
+                        .metrics
+                        .record_recovery(RecoveryResult::RateLimited, elapsed);
+                } else {
+                    state
+                        .metrics
+                        .record_recovery(RecoveryResult::PeerError, elapsed);
+                }
+                tracing::info!(
+                    room = room_id,
+                    event_id = %event.id,
+                    peer = %peer,
+                    "dependency recovery failed against a peer: {message}"
+                );
+                last = message;
+            }
+            Ok(Err(Failure::Budget(why))) => {
+                // Every peer has the same gap; asking another is pointless.
+                state
+                    .metrics
+                    .record_recovery(RecoveryResult::BudgetExceeded, elapsed);
+                last = why;
+                break;
+            }
+            Ok(Err(failure @ (Failure::Invalid(_) | Failure::Verdict(_)))) => {
+                // A peer that sends forged or unauthorized history is not
+                // bridged around: refuse, as recovery always has.
+                state
+                    .metrics
+                    .record_recovery(RecoveryResult::Invalid, elapsed);
+                return (PduOutcome::RefusedMissingDeps, Err(failure.message()));
+            }
+            Err(_) => {
+                state
+                    .metrics
+                    .record_recovery(RecoveryResult::Timeout, elapsed);
+                "dependency recovery timed out".clone_into(&mut last);
+                break;
+            }
+        }
     }
-    let result = tokio::time::timeout(
-        Duration::from_secs(30),
-        recover(state, origin, room_id, &version, &event, missing, &mut keys),
+
+    let attempt = tokio::time::timeout(
+        GAP_TIMEOUT,
+        super::gap::accept(state, origin, room_id, version, event, keys),
     )
     .await;
-    let outcome = match result {
-        Ok(Ok(())) => state
-            .rooms
-            .receive_remote(room_id, &event.id, &event.body)
-            .map_err(|error| error.to_string()),
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err("dependency recovery timed out".to_owned()),
+    let failure = match attempt {
+        Ok(Ok(Some(missing))) => {
+            state.metrics.record_gap(GapResult::Accepted);
+            tracing::info!(
+                room = room_id,
+                event_id = %event.id,
+                origin = %origin,
+                missing_prev_events = ?missing,
+                "accepted a PDU across a federation gap after recovery failed ({last}); \
+                 the history between is missing until backfilled"
+            );
+            return (PduOutcome::GapAccepted, Ok(()));
+        }
+        // Its parents arrived while the state was fetched: an ordinary append.
+        Ok(Ok(None)) => {
+            state.metrics.record_gap(GapResult::Accepted);
+            return (PduOutcome::Accepted, Ok(()));
+        }
+        Ok(Err(failure)) => failure,
+        Err(_) => {
+            state.metrics.record_gap(GapResult::Timeout);
+            return (
+                PduOutcome::RefusedMissingDeps,
+                Err(format!(
+                    "dependency recovery failed ({last}) and gap acceptance timed out"
+                )),
+            );
+        }
     };
-    (event.id, outcome)
+    let (result, outcome) = match &failure {
+        Failure::Budget(_) => (GapResult::BudgetExceeded, PduOutcome::RefusedMissingDeps),
+        Failure::Peer {
+            rate_limited: Some(_),
+            ..
+        } => (GapResult::RateLimited, PduOutcome::RefusedMissingDeps),
+        Failure::Peer { .. } => (GapResult::PeerError, PduOutcome::RefusedMissingDeps),
+        Failure::Invalid(_) => (GapResult::Invalid, PduOutcome::RefusedMissingDeps),
+        Failure::Verdict(error) => (GapResult::Invalid, classify(error)),
+    };
+    state.metrics.record_gap(result);
+    (
+        outcome,
+        Err(format!(
+            "dependency recovery failed ({last}); gap acceptance failed: {}",
+            failure.message()
+        )),
+    )
+}
+
+/// The peers to ask for missing predecessors: the origin, then one other
+/// server in the room, leaving out any still cooling down from a 429.
+fn recovery_peers(state: &AppState, origin: &str, room_id: &str) -> Vec<String> {
+    let mut peers = Vec::with_capacity(2);
+    if state.recovery.cooling(room_id, origin, Endpoint::Recovery) {
+        state
+            .metrics
+            .record_recovery(RecoveryResult::RateLimited, Duration::ZERO);
+    } else {
+        peers.push(origin.to_owned());
+    }
+    if let Some(other) = state
+        .rooms
+        .remote_domains(room_id)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|domain| {
+            domain != origin
+                && *domain != state.config.server.name
+                && !state.recovery.cooling(room_id, domain, Endpoint::Recovery)
+        })
+    {
+        peers.push(other);
+    }
+    peers
 }
 
 #[allow(
@@ -186,40 +577,33 @@ pub(super) async fn receive(
 )]
 async fn recover(
     state: &AppState,
-    origin: &str,
+    peer: &str,
     room_id: &str,
     version: &RoomVersionId,
     latest: &VerifiedPdu,
     missing: (Vec<String>, Vec<String>),
     keys: &mut HashMap<String, PeerKeys>,
-) -> Result<(), String> {
+) -> Result<(), Failure> {
     let mut offered = BTreeMap::new();
     if !missing.0.is_empty() {
-        let heads = state
-            .rooms
-            .remote_recovery_heads(room_id)
-            .map_err(|error| error.to_string())?;
+        let heads = state.rooms.remote_recovery_heads(room_id)?;
         let events = state
             .federation
-            .remote_missing_events(
-                origin,
-                room_id,
-                &heads,
-                std::slice::from_ref(&latest.id),
-                100,
-            )
+            .remote_missing_events(peer, room_id, &heads, std::slice::from_ref(&latest.id), 100)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| Failure::from_peer(&error))?;
         for event in events {
             // Name the response before selecting the ancestors actually cited
             // by this event. Unrelated response events never reach storage.
-            let CanonicalJsonValue::Object(canonical) =
-                CanonicalJsonValue::try_from(event.clone()).map_err(|error| error.to_string())?
+            let CanonicalJsonValue::Object(canonical) = CanonicalJsonValue::try_from(event.clone())
+                .map_err(|error| Failure::Invalid(error.to_string()))?
             else {
-                return Err("missing-events response contains a non-object".to_owned());
+                return Err(Failure::Invalid(
+                    "missing-events response contains a non-object".to_owned(),
+                ));
             };
             let parsed = spindle_core::Pdu::from_remote(version.clone(), canonical)
-                .map_err(|error| format!("missing event: {error:?}"))?;
+                .map_err(|error| Failure::Invalid(format!("missing event: {error:?}")))?;
             offered.insert(parsed.event_id().as_str().to_owned(), event);
         }
     }
@@ -231,31 +615,42 @@ async fn recover(
             continue;
         }
         if predecessors.len() >= MAX_RECOVERED_EVENTS {
-            return Err("dependency recovery event budget exceeded".to_owned());
+            state
+                .metrics
+                .record_fetched(FetchKind::Predecessor, count(predecessors.len()));
+            return Err(Failure::Budget(
+                "dependency recovery event budget exceeded".to_owned(),
+            ));
         }
         let body = match offered.remove(&id) {
             Some(body) => body,
             None => state
                 .federation
-                .remote_event(origin, &id)
+                .remote_event(peer, &id)
                 .await
-                .map_err(|error| error.to_string())?,
+                .map_err(|error| Failure::from_peer(&error))?,
         };
-        charge(&body, &mut bytes)?;
-        let event = verify(state, room_id, version, &body, Some(&id), keys).await?;
+        charge(&body, &mut bytes, MAX_RECOVERED_BYTES)?;
+        let event = verify(state, room_id, version, &body, Some(&id), keys)
+            .await
+            .map_err(Failure::Invalid)?;
         if event.id != id {
-            return Err("recovered predecessor ID does not match the requested event".to_owned());
+            return Err(Failure::Invalid(
+                "recovered predecessor ID does not match the requested event".to_owned(),
+            ));
         }
         let (parents, _) = state
             .rooms
-            .missing_remote_dependencies(room_id, &event.body)
-            .map_err(|error| error.to_string())?;
+            .missing_remote_dependencies(room_id, &event.body)?;
         pending.extend(parents);
         predecessors.insert(id, event.body);
     }
+    state
+        .metrics
+        .record_fetched(FetchKind::Predecessor, count(predecessors.len()));
     recover_auth(
         state,
-        origin,
+        peer,
         room_id,
         version,
         latest,
@@ -271,8 +666,7 @@ async fn recover(
         for (id, body) in &predecessors {
             if state
                 .rooms
-                .missing_remote_dependencies(room_id, body)
-                .map_err(|error| error.to_string())?
+                .missing_remote_dependencies(room_id, body)?
                 .0
                 .is_empty()
             {
@@ -280,7 +674,9 @@ async fn recover(
             }
         }
         if ready.is_empty() {
-            return Err("recovered predecessor graph is incomplete or cyclic".to_owned());
+            return Err(Failure::Invalid(
+                "recovered predecessor graph is incomplete or cyclic".to_owned(),
+            ));
         }
         for id in ready {
             let body = predecessors
@@ -289,19 +685,21 @@ async fn recover(
             if let Err(error) = state.rooms.receive_remote(room_id, &id, &body)
                 && predecessor_missing(state, room_id, &id)?
             {
-                return Err(format!("recovered predecessor refused: {error}"));
+                return Err(Failure::Invalid(format!(
+                    "recovered predecessor refused: {error}"
+                )));
             }
         }
     }
     Ok(())
 }
 
-fn predecessor_missing(state: &AppState, room_id: &str, id: &str) -> Result<bool, String> {
-    state
+fn predecessor_missing(state: &AppState, room_id: &str, id: &str) -> Result<bool, Failure> {
+    Ok(!state
         .rooms
-        .missing_remote_dependencies(room_id, &json!({"prev_events":[id]}))
-        .map(|missing| !missing.0.is_empty())
-        .map_err(|error| error.to_string())
+        .missing_remote_dependencies(room_id, &json!({"prev_events":[id]}))?
+        .0
+        .is_empty())
 }
 
 #[allow(
@@ -310,23 +708,17 @@ fn predecessor_missing(state: &AppState, room_id: &str, id: &str) -> Result<bool
 )]
 async fn recover_auth(
     state: &AppState,
-    origin: &str,
+    peer: &str,
     room_id: &str,
     version: &RoomVersionId,
     latest: &VerifiedPdu,
     predecessors: &BTreeMap<String, Value>,
     bytes: &mut usize,
     keys: &mut HashMap<String, PeerKeys>,
-) -> Result<(), String> {
+) -> Result<(), Failure> {
     let mut pending = BTreeSet::new();
     for body in predecessors.values().chain(std::iter::once(&latest.body)) {
-        pending.extend(
-            state
-                .rooms
-                .missing_remote_dependencies(room_id, body)
-                .map_err(|error| error.to_string())?
-                .1,
-        );
+        pending.extend(state.rooms.missing_remote_dependencies(room_id, body)?.1);
     }
     let mut auth = BTreeMap::new();
     while let Some(id) = pending.pop_first() {
@@ -335,50 +727,65 @@ async fn recover_auth(
         }
         match state.rooms.pdu(room_id, &id) {
             Ok(_) => continue,
-            Err(crate::rooms::RoomError::MissingBody(_)) => {}
-            Err(error) => return Err(error.to_string()),
+            Err(RoomError::MissingBody(_)) => {}
+            Err(error) => return Err(error.into()),
         }
         if auth.len() + predecessors.len() >= MAX_RECOVERED_EVENTS {
-            return Err("dependency recovery event budget exceeded".to_owned());
+            return Err(Failure::Budget(
+                "dependency recovery event budget exceeded".to_owned(),
+            ));
         }
         let body = match predecessors.get(&id) {
             Some(body) => body.clone(),
             None => state
                 .federation
-                .remote_event(origin, &id)
+                .remote_event(peer, &id)
                 .await
-                .map_err(|error| error.to_string())?,
+                .map_err(|error| Failure::from_peer(&error))?,
         };
-        charge(&body, bytes)?;
-        let event = verify(state, room_id, version, &body, Some(&id), keys).await?;
+        charge(&body, bytes, MAX_RECOVERED_BYTES)?;
+        let event = verify(state, room_id, version, &body, Some(&id), keys)
+            .await
+            .map_err(Failure::Invalid)?;
         if event.id != id {
-            return Err("recovered auth ID does not match the requested event".to_owned());
+            return Err(Failure::Invalid(
+                "recovered auth ID does not match the requested event".to_owned(),
+            ));
         }
         pending.extend(
             state
                 .rooms
-                .missing_remote_dependencies(room_id, &event.body)
-                .map_err(|error| error.to_string())?
+                .missing_remote_dependencies(room_id, &event.body)?
                 .1,
         );
         auth.insert(id, event.body);
     }
+    state
+        .metrics
+        .record_fetched(FetchKind::Auth, count(auth.len()));
     if !auth.is_empty() {
         state
             .rooms
-            .retain_remote_auth(room_id, &auth.into_iter().collect::<Vec<_>>())
-            .map_err(|error| error.to_string())?;
+            .retain_remote_auth(room_id, &auth.into_iter().collect::<Vec<_>>())?;
     }
     Ok(())
 }
 
-fn charge(body: &Value, bytes: &mut usize) -> Result<(), String> {
+/// Charge one fetched body against a byte budget.
+pub(super) fn charge(body: &Value, bytes: &mut usize, limit: usize) -> Result<(), Failure> {
     let length = serde_json::to_vec(body)
-        .map_err(|error| error.to_string())?
+        .map_err(|error| Failure::Invalid(error.to_string()))?
         .len();
-    if length > MAX_RECOVERED_BYTES.saturating_sub(*bytes) {
-        return Err("dependency recovery byte budget exceeded".to_owned());
+    if length > limit.saturating_sub(*bytes) {
+        return Err(Failure::Budget(
+            "dependency recovery byte budget exceeded".to_owned(),
+        ));
     }
     *bytes += length;
     Ok(())
+}
+
+/// A collection's length as a counter increment.
+pub(super) fn count(length: usize) -> u64 {
+    u64::try_from(length).unwrap_or(u64::MAX)
 }

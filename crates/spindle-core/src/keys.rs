@@ -412,6 +412,11 @@ pub enum Keyspace {
     ImportedAuthOnly = 0x42,
     /// Fresh offline-import notification boundary, separate from the live cursor.
     ImportNotificationFence = 0x43,
+    /// `(room_id, event_id)` -> a federation gap: a forward event accepted
+    /// on a peer's `/state_ids` because its predecessors could not be
+    /// recovered, with the predecessors it named that this server lacks.
+    /// What a later backfill reads to know where history is missing.
+    FederationGap = 0x44,
     /// `(room_id, synapse_stream_ordering)` -> the linear index the
     /// importer gave that event (#568). Lets a Synapse pagination token
     /// a client kept across the migration name a place in this room.
@@ -626,6 +631,14 @@ pub fn sidelined(room_id: &str, event_id: &str) -> Vec<u8> {
 #[must_use]
 pub fn historical_rejection(room_id: &str, event_id: &str) -> Vec<u8> {
     let mut key = room_prefix(Keyspace::HistoricalRejection, room_id);
+    key.extend_from_slice(event_id.as_bytes());
+    key
+}
+
+/// One federation gap marker ([`Keyspace::FederationGap`]).
+#[must_use]
+pub fn federation_gap(room_id: &str, event_id: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::FederationGap, room_id);
     key.extend_from_slice(event_id.as_bytes());
     key
 }
