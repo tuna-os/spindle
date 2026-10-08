@@ -10,6 +10,9 @@ use crate::AppState;
 
 pub mod routes_legacy;
 
+// Re-export items that were previously at crate::routes level
+pub use routes_legacy::{MAX_TXN_ID_LEN, room_error, record_invite};
+
 // Phase 1: Establish module structure (this file)
 // Phase 2: Extract submodules one at a time
 //   - routes/accounts.rs (account + device endpoints)
