@@ -6,8 +6,9 @@ Synapse, Spindle or their ingress stops. A migration needs it most at those
 times.
 
 This page covers the foundation from issue #457: the service, the durable
-operation engine, the session model and the API contract. The console pages
-(#458), the migration workspace (#459) and the ESS driver (#460) build on it.
+operation engine, the session model and the API contract. It also covers the
+first console pages from #458. The migration workspace (#459) and the ESS
+driver (#460) build on the same API.
 
 ## Run it
 
@@ -19,9 +20,77 @@ cargo run -p spindle-operator -- --config spindle-operator.toml
 holds no secret. The OIDC client secret and each driver credential are
 references of the form `env:NAME` or `file:/path`.
 
+## Console
+
+Open the operator's public URL in a browser. `/` goes to `/console/`, which
+asks you to sign in and then shows three pages:
+
+- **Now** tells you what needs a person, which change is active, and how each
+  homeserver answered its last probe. It also gives the next safe action. A
+  header on every page shows authority, write state, the active change and
+  failed probes. Authority and write state come from the latest assessment:
+  a driver reports them as findings with the codes `authority` and `writes`.
+  When no driver reports them, the header says so.
+- **People & access** finds accounts by user ID or display name. It shows an
+  account's status, devices and rooms.
+- **Rooms & safety** lists rooms and recent reports. It shows a room's
+  settings, block state, deletion tasks, reports and members.
+
+The pages are three static files in the operator binary. They read only
+`/_spindle/operator/v1`, and the browser holds only the session cookie. Their
+content security policy allows script, style and requests from the operator's
+own origin, and nothing else.
+
+The pages work with a keyboard and a screen reader. They have a skip link,
+landmarks, table captions and headers, visible focus, and a live region for
+results. They meet WCAG AA contrast in light and dark mode, and they work on a
+narrow screen. They have no animation. Status always has a text label, not
+only a color.
+
+The first version does not change anything on a homeserver. To lock an
+account or block a room, use an operation. The console does not offer those
+actions yet.
+
+### People and rooms
+
+To browse a homeserver, give its connection a `credential` reference to an
+admin access token, for example `"credential": "env:SPINDLE_ADMIN_TOKEN"`.
+The operator calls the homeserver's Synapse admin API
+(`/_synapse/admin`) with that token. Spindle and Synapse both serve this API.
+The token goes only to the homeserver.
+
+| Route | Purpose |
+|---|---|
+| `GET /connections/{id}/people?search&from&limit` | accounts |
+| `GET /connections/{id}/people/{user_id}` | one account, its devices and rooms |
+| `GET /connections/{id}/rooms?search&from&limit&order_by` | rooms |
+| `GET /connections/{id}/rooms/{room_id}` | one room, its members, block, tasks and reports |
+| `GET /connections/{id}/reports?from&limit` | reports, newest first |
+
+Each route needs the viewer role. Email addresses, linked identities and
+device IP addresses are shown only to the operator role. The operator copies
+only named fields from each answer, so a new field on the homeserver does not
+reach the browser.
+
+When a lookup fails, the error code says why:
+
+| Code | Meaning |
+|---|---|
+| `no_credential` (409) | the connection has no credential |
+| `credential_unavailable` (503) | the operator cannot read the secret |
+| `homeserver_unreachable` (502) | no answer, or no answer in time |
+| `homeserver_refused` (502) | the homeserver refused the credential |
+| `homeserver_error` (502) | the homeserver answered with an error |
+
+On the account and room pages, a failed secondary lookup does not fail the
+page. The page lists that part under `unavailable` and shows the rest.
+
 ## State
 
-The operator keeps one file, `journal.jsonl`, in its data directory. Each
+The operator keeps one file, `journal.jsonl`, in its data directory. A lock
+on `journal.lock` stops a second operator process from using the same
+directory. If an append fails, the operator removes the partial line. If it
+cannot remove the line, it refuses all later writes. Each
 change is one JSON line. The engine syncs the line to disk before it changes
 its memory or answers the request. At startup the engine reads the file again
 and gets the same state back.
@@ -75,7 +144,7 @@ All four are `POST /operations/{id}:<verb>` calls with `If-Match`.
 |---|---|---|
 | `pause` | `running`, `awaiting_approval` | stops before the next step |
 | `resume` | `paused`, `failed`, `attention_required` | runs from the first open step |
-| `cancel` | any state before the end | stops and releases the lease, with no undo |
+| `cancel` | any state before the end, except during a rollback | stops and releases the lease, with no undo |
 | `rollback` | `paused`, `failed`, `attention_required`, `awaiting_approval` | undoes changes, last first |
 
 The driver cannot undo some steps, for example a traffic switch after the
@@ -99,7 +168,12 @@ the program and writes one JSON document to its stdin:
 ```
 
 The program writes `{"ok": <result>}` or `{"error": "<text>"}` to stdout. The
-operator gives the program a clean environment. It adds only `PATH` and the
+operator accepts an `ok` only if the program exits with success. A reply must
+be smaller than 4 MiB. The operator logs at most 64 KiB of stderr, with
+secrets removed. Each call runs in its own process group, and a timeout stops
+the whole group. The operator removes secrets from every driver error and
+finding before it stores or returns them. The operator gives the program a
+clean environment. It adds only `PATH` and the
 secrets from `[drivers.<name>.secrets]`. Thus secret values never go into the
 request, the journal or the logs. The operator stops a call at
 `timeout_secs`.
@@ -148,8 +222,11 @@ All routes are under `/_spindle/operator/v1`. The browser console and a
 future `spindlectl` use the same routes.
 
 - Every `POST` needs an `Idempotency-Key` header. A retry with the same key
-  and body gets the first reply again, with `Idempotent-Replayed: true`. The
-  same key with a different body gets `422 idempotency_key_reused`.
+  and body gets the first successful reply again, with
+  `Idempotent-Replayed: true`. The operator does not store a refusal, so a
+  retry after a refusal is checked again. The same key with a different body
+  gets `422 idempotency_key_reused`. If the client disconnects before the
+  reply, the operator releases the key.
 - Each resource has an `ETag`. A change to a resource that exists needs
   `If-Match`. Without it, the reply is `428`. With an old value, the reply is
   `412`.

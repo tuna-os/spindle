@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Spindle Operator</title>
+  <link rel="stylesheet" href="/console/app.css">
+  <script src="/console/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="masthead">
+    <div class="masthead-row">
+      <p class="product">Spindle Operator</p>
+      <div id="who" class="who"></div>
+    </div>
+    <nav aria-label="Primary">
+      <ul class="nav">
+        <li><a href="#/now" data-page="now">Now</a></li>
+        <li><a href="#/people" data-page="people">People &amp; access</a></li>
+        <li><a href="#/rooms" data-page="rooms">Rooms &amp; safety</a></li>
+      </ul>
+    </nav>
+    <section id="global-state" class="global-state" aria-label="Deployment state">
+      <p>Loading deployment state…</p>
+    </section>
+  </header>
+  <main id="main" tabindex="-1">
+    <noscript>
+      <p>The console needs JavaScript. The same information is available from the
+        <code>/_spindle/operator/v1</code> API.</p>
+    </noscript>
+  </main>
+  <div id="announcer" class="visually-hidden" role="status" aria-live="polite"></div>
+</body>
+</html>

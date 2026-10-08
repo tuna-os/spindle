@@ -174,6 +174,14 @@ async fn idempotent(
         }
         Ok(None) => {}
     }
+    // Released if this future is dropped before it finishes: a client that
+    // disconnects mid-request must not leave its key claimed until restart.
+    let mut claim = Claim {
+        engine,
+        subject,
+        key,
+        finished: false,
+    };
     let (status, body) = match work.await {
         Ok(done) => done,
         Err(error) => (
@@ -181,6 +189,7 @@ async fn idempotent(
             json!({"error": {"code": error.code, "message": error.message}}),
         ),
     };
+    claim.finished = true;
     engine.finish_idempotent(
         &who.context(),
         subject,
@@ -190,6 +199,22 @@ async fn idempotent(
         &body,
     );
     with_etag(status, body)
+}
+
+/// An idempotency key claimed for a request in progress.
+struct Claim<'a> {
+    engine: &'a Engine,
+    subject: &'a str,
+    key: &'a str,
+    finished: bool,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.engine.release_idempotent(self.subject, self.key);
+        }
+    }
 }
 
 fn to_value<T: serde::Serialize>(value: &T) -> Value {
@@ -650,12 +675,19 @@ async fn operation_events(
             .filter(|event| event.seq > after && event.operation.as_deref() == Some(id.as_str()))
             .cloned()
             .collect();
-        (backlog, state.operations.contains_key(&id))
+        let terminal = state
+            .operations
+            .get(&id)
+            .map(|operation| operation.state.is_terminal());
+        (backlog, terminal)
     });
-    if !known {
+    let Some(terminal) = known else {
         return Err(ApiError::not_found("operation"));
-    }
-    let done = backlog.iter().any(ends_stream);
+    };
+    // A terminal state is final, so nothing more will come. That holds
+    // for a client reconnecting past the last event, whose backlog is
+    // empty: it is told the stream is over instead of waiting forever.
+    let done = terminal || backlog.iter().any(ends_stream);
     let last = backlog.last().map_or(after, |event| event.seq);
     let to_sse = |event: &Event| {
         render(event).map(|data| {

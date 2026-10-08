@@ -49,6 +49,8 @@ const LOGIN_COOKIE: &str = "__Host-spindle-operator-login";
 pub const CSRF_HEADER: &str = "x-csrf-token";
 /// How long a person has to finish signing in at the provider.
 const LOGIN_WINDOW: Duration = Duration::from_secs(600);
+/// Logins started and not yet finished, at most.
+const MAX_PENDING_LOGINS: usize = 1024;
 const PREFIX: &str = "/_spindle/operator/v1";
 
 #[derive(Clone, Debug, Deserialize)]
@@ -333,6 +335,19 @@ async fn login(State(app): State<AppState>, Query(query): Query<LoginQuery>) -> 
         URL_SAFE_NO_PAD.encode(<sha2::Sha256 as sha2::Digest>::digest(verifier.as_bytes()));
     if let Ok(mut pending) = auth.pending.lock() {
         pending.retain(|_, login| login.created.elapsed() < LOGIN_WINDOW);
+        // Anyone can start a login, so the number in flight is capped: past
+        // the cap the oldest is dropped (its browser just starts again)
+        // rather than letting unauthenticated requests grow memory.
+        while pending.len() >= MAX_PENDING_LOGINS {
+            let Some(oldest) = pending
+                .iter()
+                .min_by_key(|(_, login)| login.created)
+                .map(|(state, _)| state.clone())
+            else {
+                break;
+            };
+            pending.remove(&oldest);
+        }
         pending.insert(
             state.clone(),
             Pending {

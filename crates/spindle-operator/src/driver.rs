@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,7 @@ use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt as _;
 
 use crate::model::{Deployment, Finding, Step, StepSpec};
-use crate::secret::SecretRef;
+use crate::secret::{self, SecretRef};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -151,7 +152,10 @@ impl ExecDriver {
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
+            // Its own process group, so a timeout stops everything the
+            // driver started (`kubectl`, `psql`), not only the driver.
+            .process_group(0)
             // A timed-out or abandoned call must not leave a mutation
             // running behind the engine's back.
             .kill_on_drop(true);
@@ -161,22 +165,51 @@ impl ExecDriver {
         let mut child = command.spawn().map_err(|error| {
             format!("driver `{}` did not start: {error}", self.config.command[0])
         })?;
+        let group = child.id();
         let input = serde_json::to_vec(&document).map_err(|error| error.to_string())?;
         let mut stdin = child.stdin.take().ok_or("driver stdin unavailable")?;
+        let stdout = child.stdout.take().ok_or("driver stdout unavailable")?;
+        let stderr = child.stderr.take().ok_or("driver stderr unavailable")?;
         let run = async move {
             stdin
                 .write_all(&input)
                 .await
                 .map_err(|error| error.to_string())?;
             drop(stdin);
-            child
-                .wait_with_output()
-                .await
-                .map_err(|error| error.to_string())
+            let (out, err, status) = tokio::join!(
+                read_bounded(stdout, MAX_REPLY_BYTES),
+                read_bounded(stderr, MAX_STDERR_BYTES),
+                child.wait()
+            );
+            let status = status.map_err(|error| error.to_string())?;
+            Ok::<_, String>((out?, err?, status))
         };
-        let output = tokio::time::timeout(Duration::from_secs(self.config.timeout_secs), run)
-            .await
-            .map_err(|_| format!("driver call `{call}` timed out"))??;
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(self.config.timeout_secs), run).await;
+        let Ok(outcome) = outcome else {
+            if let Some(group) = group {
+                // `kill_on_drop` reaches only the direct child.
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{group}")])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            return Err(format!("driver call `{call}` timed out"));
+        };
+        let (stdout, stderr, status) = outcome?;
+        if !stderr.is_empty() {
+            tracing::warn!(
+                call,
+                stderr = %scrub(String::from_utf8_lossy(&stderr).into_owned()),
+                "driver wrote to stderr"
+            );
+        }
+        let output = std::process::Output {
+            status,
+            stdout,
+            stderr: Vec::new(),
+        };
         let reply: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
             format!(
                 "driver call `{call}` exited with {} and no JSON reply",
@@ -187,6 +220,14 @@ impl ExecDriver {
             return Err(error
                 .as_str()
                 .map_or_else(|| error.to_string(), str::to_owned));
+        }
+        if !output.status.success() {
+            // An `ok` from a program that then failed is not trusted: the
+            // failure may have come after the reply was written.
+            return Err(format!(
+                "driver call `{call}` replied but exited with {}",
+                output.status
+            ));
         }
         reply
             .get("ok")
@@ -202,6 +243,91 @@ impl ExecDriver {
         let value = self.call(call, request).await?;
         serde_json::from_value(value)
             .map_err(|error| format!("driver call `{call}` replied with the wrong shape: {error}"))
+    }
+}
+
+/// The most a driver may answer with. A reply is a plan, a checkpoint or a
+/// few findings; anything larger is a bug, and reading it unbounded would
+/// let one driver exhaust the operator's memory.
+const MAX_REPLY_BYTES: u64 = 4 * 1024 * 1024;
+/// How much of a driver's stderr is kept for the log.
+const MAX_STDERR_BYTES: u64 = 64 * 1024;
+
+async fn read_bounded(
+    reader: impl tokio::io::AsyncRead + Unpin,
+    limit: u64,
+) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt as _;
+    let mut buffer = Vec::new();
+    let mut limited = reader.take(limit + 1);
+    limited
+        .read_to_end(&mut buffer)
+        .await
+        .map_err(|error| error.to_string())?;
+    if buffer.len() as u64 > limit {
+        // Keep draining so the child is not blocked writing, but stop
+        // keeping what it writes.
+        let mut rest = limited.into_inner();
+        let _ = tokio::io::copy(&mut rest, &mut tokio::io::sink()).await;
+        if limit == MAX_STDERR_BYTES {
+            buffer.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            return Ok(buffer);
+        }
+        return Err(format!("driver reply is larger than {limit} bytes"));
+    }
+    Ok(buffer)
+}
+
+/// `text` with any secret it carries cut out, by the same rules as every
+/// other exit ([`secret::redact`]).
+#[must_use]
+pub fn scrub(text: String) -> String {
+    let mut value = Value::String(text);
+    secret::redact(&mut value);
+    match value {
+        Value::String(text) => text,
+        _ => secret::REDACTED.to_owned(),
+    }
+}
+
+/// Wraps every driver the engine uses, so that what a driver says on the
+/// way out (an error, an observation it could not make, a finding's
+/// summary) is redacted before the engine stores it, returns it, or puts
+/// it in `/view`. A driver is outside code; its messages are treated as
+/// untrusted text that may quote a credential back.
+pub struct Redacting(pub Arc<dyn Driver>);
+
+impl Driver for Redacting {
+    fn plan(&self, request: DriverRequest) -> BoxFuture<'_, Result<Vec<StepSpec>, String>> {
+        Box::pin(async move { self.0.plan(request).await.map_err(scrub) })
+    }
+    fn assess(&self, request: DriverRequest) -> BoxFuture<'_, Result<Vec<Finding>, String>> {
+        Box::pin(async move {
+            let findings = self.0.assess(request).await.map_err(scrub)?;
+            Ok(findings
+                .into_iter()
+                .map(|mut finding| {
+                    finding.summary = scrub(finding.summary);
+                    finding
+                })
+                .collect())
+        })
+    }
+    fn execute(&self, request: DriverRequest) -> BoxFuture<'_, Result<StepOutput, String>> {
+        Box::pin(async move { self.0.execute(request).await.map_err(scrub) })
+    }
+    fn observe(&self, request: DriverRequest) -> BoxFuture<'_, Result<Observation, String>> {
+        Box::pin(async move {
+            match self.0.observe(request).await.map_err(scrub)? {
+                Observation::Unknown { detail } => Ok(Observation::Unknown {
+                    detail: detail.map(scrub),
+                }),
+                other => Ok(other),
+            }
+        })
+    }
+    fn compensate(&self, request: DriverRequest) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move { self.0.compensate(request).await.map_err(scrub) })
     }
 }
 

@@ -12,14 +12,19 @@
 //! - [`driver`]: the interface deployment-specific code implements.
 //! - [`auth`]: OIDC-backed browser sessions, CSRF, and roles.
 //! - [`api`]: `/_spindle/operator/v1`, shared by the console and the CLI.
+//! - [`homeserver`]: read-only people, rooms and reports, fetched with a
+//!   connection's admin credential so the browser never holds one.
+//! - [`console`]: the browser console (#458), static files over the API.
 //! - [`secret`]: secrets by reference, and the redaction on every exit.
 
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod console;
 pub mod driver;
 pub mod engine;
 pub mod error;
+pub mod homeserver;
 pub mod journal;
 pub mod model;
 pub mod secret;
@@ -54,10 +59,13 @@ async fn harden(mut response: Response) -> Response {
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
-    );
+    // The console's own pages set a policy that lets them load their
+    // script and style from this origin; everything else gets none.
+    headers
+        .entry(header::CONTENT_SECURITY_POLICY)
+        .or_insert(HeaderValue::from_static(
+            "default-src 'none'; frame-ancestors 'none'",
+        ));
     headers
         .entry(header::CACHE_CONTROL)
         .or_insert(HeaderValue::from_static("no-store"));
@@ -117,6 +125,8 @@ pub fn build(
     let router = Router::new()
         .merge(auth::routes())
         .merge(api::routes())
+        .merge(homeserver::routes())
+        .merge(console::routes())
         .fallback(api::fallback)
         .layer(axum::middleware::map_response(harden))
         .with_state(state);

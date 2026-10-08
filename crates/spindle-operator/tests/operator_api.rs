@@ -351,7 +351,9 @@ impl Operator {
     /// What a crash does: runners stop mid-step, nothing more is recorded,
     /// and a new process opens the same journal.
     async fn crash_and_restart(self) -> Operator {
-        self.engine.abort_runners();
+        // Runners stop mid-step, nothing more is written, and the data
+        // directory's lock goes, as when a process dies.
+        self.engine.shutdown();
         self.server.abort();
         let _ = self.server.await;
         let Operator {
@@ -1254,4 +1256,453 @@ async fn inline_secrets_are_refused_at_the_door() {
         .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(!operator.journal().contains("hunter2"));
+}
+
+// ---- the console (#458) and its homeserver views --------------------------
+
+const ADMIN_TOKEN: &str = "syt_b3BlcmF0b3I_fakeadmintoken_0aBcD";
+
+/// A stand-in homeserver serving the Synapse admin API the console reads.
+/// It records every request so a test can see what the operator asked.
+#[derive(Clone, Default)]
+struct Homeserver {
+    seen: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+async fn homeserver_admin(
+    State(server): State<Homeserver>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    // Decoded, as a homeserver's router decodes it.
+    let path = percent_decode(uri.path());
+    let query = uri.query().unwrap_or_default().to_owned();
+    server
+        .seen
+        .lock()
+        .unwrap()
+        .push((format!("{path}?{query}"), authorization.clone()));
+    if authorization != format!("Bearer {ADMIN_TOKEN}") {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"errcode": "M_UNKNOWN_TOKEN", "error": "no"})),
+        )
+            .into_response();
+    }
+    let alice = "@alice:hs.example";
+    let room = "!ops:hs.example";
+    let body = match path.as_str() {
+        "/_synapse/admin/v2/users" => json!({
+            "users": [{
+                "name": alice, "displayname": "Alice", "admin": false, "deactivated": false,
+                "locked": true, "suspended": false, "erased": false, "shadow_banned": false,
+                "creation_ts": 1_700_000_000_000_u64, "last_seen_ts": null,
+                "password_hash": "$argon2id$should-never-leave",
+                "internal_note": "not for the browser",
+            }],
+            "total": 3,
+            "next_token": "2",
+        }),
+        "/_synapse/admin/v2/users/@alice:hs.example" => json!({
+            "name": alice, "displayname": "Alice", "admin": false, "deactivated": false,
+            "locked": true, "suspended": false, "erased": false,
+            "threepids": [{"medium": "email", "address": "alice@example.org"}],
+            "external_ids": [],
+            "password_hash": "$argon2id$should-never-leave",
+        }),
+        "/_synapse/admin/v2/users/@alice:hs.example/devices" => json!({
+            "devices": [{"device_id": "PHONE", "display_name": "Phone",
+                         "last_seen_ts": 1, "last_seen_ip": "203.0.113.7",
+                         "last_seen_user_agent": "Element X"}],
+            "total": 1,
+        }),
+        "/_synapse/admin/v1/users/@alice:hs.example/joined_rooms" => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"errcode": "M_UNKNOWN", "error": "boom"})),
+            )
+                .into_response();
+        }
+        "/_synapse/admin/v1/rooms" => json!({
+            "rooms": [{"room_id": room, "name": "Ops", "canonical_alias": null,
+                       "joined_members": 2, "joined_local_members": 1, "version": "11",
+                       "creator": alice, "encryption": null, "federatable": true,
+                       "public": false, "join_rules": "invite", "room_type": null,
+                       "state_events": 9}],
+            "offset": 0, "total_rooms": 1,
+        }),
+        "/_synapse/admin/v1/rooms/!ops:hs.example" => json!({
+            "room_id": room, "name": "Ops", "topic": "on call", "canonical_alias": null,
+            "joined_members": 2, "joined_local_members": 1, "joined_local_devices": 1,
+            "version": "11", "creator": alice, "encryption": "m.megolm.v1.aes-sha2",
+            "federatable": true, "public": false, "join_rules": "invite",
+            "guest_access": null, "history_visibility": "shared", "state_events": 9,
+            "room_type": null, "forgotten": false,
+        }),
+        "/_synapse/admin/v1/rooms/!ops:hs.example/members" => {
+            json!({"members": [alice, "@bob:elsewhere.example"], "total": 2})
+        }
+        "/_synapse/admin/v1/rooms/!ops:hs.example/block" => {
+            json!({"block": true, "user_id": "@root:hs.example"})
+        }
+        "/_synapse/admin/v1/scheduled_tasks" => json!({"scheduled_tasks": []}),
+        "/_synapse/admin/v1/event_reports" => json!({
+            "event_reports": [{"id": 4, "received_ts": 5, "room_id": room, "name": "Ops",
+                               "event_id": "$e", "user_id": alice,
+                               "sender": "@bob:elsewhere.example", "reason": "spam",
+                               "score": -100}],
+            "total": 1,
+        }),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"errcode": "M_NOT_FOUND", "error": "no"})),
+            )
+                .into_response();
+        }
+    };
+    Json(body).into_response()
+}
+
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let Some(byte) = raw
+                .get(index + 1..index + 3)
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+        {
+            out.push(byte);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).unwrap()
+}
+
+impl Homeserver {
+    async fn start() -> (Homeserver, String) {
+        let server = Homeserver::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .fallback(homeserver_admin)
+            .with_state(server.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (server, url)
+    }
+
+    fn seen(&self) -> Vec<(String, String)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl Operator {
+    /// A connection to `url` whose admin credential is the file `token`.
+    async fn connection(&self, session: &Session, url: &str, token: Option<&str>) -> String {
+        let mut body = json!({"name": "homeserver", "base_url": url});
+        if let Some(token) = token {
+            let path = self.dir.path().join(format!("token-{}", rand_suffix()));
+            std::fs::write(&path, format!("{token}\n")).unwrap();
+            body["credential"] = json!(format!("file:{}", path.display()));
+        }
+        let (status, connection) = self
+            .post(
+                session,
+                "/connections",
+                &format!("conn-{}", rand_suffix()),
+                &body,
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{connection}");
+        connection["id"].as_str().unwrap().to_owned()
+    }
+}
+
+/// People & access and Rooms & safety read the homeserver through the
+/// operator: the browser gets fixed fields, never the credential, and a
+/// viewer does not see contact details or addresses.
+#[tokio::test]
+async fn people_and_rooms_come_from_the_homeserver_without_its_credential() {
+    let operator = Operator::start().await;
+    let (homeserver, url) = Homeserver::start().await;
+    let alice = operator.login("alice").await.unwrap();
+    let victor = operator.login("victor").await.unwrap();
+    let id = operator.connection(&alice, &url, Some(ADMIN_TOKEN)).await;
+
+    let (status, people) = operator
+        .get(
+            &victor,
+            &format!("/connections/{id}/people?search=ali&limit=1000"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{people}");
+    assert_eq!(people["total"], 3);
+    assert_eq!(people["next"], 2, "an offset, as a number");
+    let person = &people["people"][0];
+    assert_eq!(person["name"], "@alice:hs.example");
+    assert_eq!(person["locked"], true);
+    assert!(person.get("password_hash").is_none(), "{person}");
+    assert!(person.get("internal_note").is_none(), "{person}");
+    let (asked, authorization) = &homeserver.seen()[0];
+    assert!(asked.contains("name=ali"), "{asked}");
+    assert!(
+        asked.contains("limit=100"),
+        "the page size is capped: {asked}"
+    );
+    assert_eq!(authorization, &format!("Bearer {ADMIN_TOKEN}"));
+
+    // A viewer's person page: devices, no address, no email; the rooms
+    // lookup failed and says so rather than blanking the page.
+    let path = format!("/connections/{id}/people/%40alice%3Ahs.example");
+    let (status, page) = operator.get(&victor, &path).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["devices"][0]["device_id"], "PHONE");
+    assert!(page["devices"][0].get("last_seen_ip").is_none(), "{page}");
+    assert!(page["person"].get("threepids").is_none(), "{page}");
+    assert!(page["person"].get("password_hash").is_none(), "{page}");
+    assert_eq!(page["joined_rooms"], Value::Null);
+    assert_eq!(page["unavailable"][0]["part"], "joined_rooms");
+    assert_eq!(page["unavailable"][0]["code"], "homeserver_error");
+    // An operator sees them.
+    let (_, page) = operator.get(&alice, &path).await;
+    assert_eq!(page["devices"][0]["last_seen_ip"], "203.0.113.7");
+    assert_eq!(
+        page["person"]["threepids"][0]["address"],
+        "alice@example.org"
+    );
+
+    let (status, rooms) = operator
+        .get(
+            &victor,
+            &format!("/connections/{id}/rooms?search=op&order_by=joined_members"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{rooms}");
+    assert_eq!(rooms["rooms"][0]["room_id"], "!ops:hs.example");
+    assert_eq!(rooms["total"], 1);
+    assert_eq!(rooms["next"], Value::Null);
+    let (status, _) = operator
+        .get(
+            &victor,
+            &format!("/connections/{id}/rooms?order_by=password"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (status, room) = operator
+        .get(
+            &victor,
+            &format!("/connections/{id}/rooms/%21ops%3Ahs.example"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    assert_eq!(room["room"]["topic"], "on call");
+    assert_eq!(room["block"]["block"], true);
+    assert_eq!(room["members"]["total"], 2);
+    assert_eq!(room["reports"][0]["reason"], "spam");
+    assert_eq!(room["tasks"], json!([]));
+    assert_eq!(room["unavailable"], json!([]));
+
+    let (status, reports) = operator
+        .get(&victor, &format!("/connections/{id}/reports"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reports}");
+    assert_eq!(reports["reports"][0]["id"], 4);
+
+    // The credential reached the homeserver and nowhere else.
+    let (_, view) = operator.get(&victor, "/view").await;
+    let (_, audit) = operator.get(&alice, "/audit").await;
+    for text in [view.to_string(), audit.to_string(), operator.journal()] {
+        assert!(!text.contains(ADMIN_TOKEN), "the admin token leaked");
+    }
+    // Reads need a session.
+    let (status, _) = reply(operator.call(
+        reqwest::Method::GET,
+        &format!("/connections/{id}/people"),
+        None,
+    ))
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// Every way the homeserver side can fail has its own code, so the console
+/// can say what is wrong instead of showing an empty table.
+#[tokio::test]
+async fn homeserver_failures_are_named_not_blank() {
+    let operator = Operator::start().await;
+    let (_, url) = Homeserver::start().await;
+    let alice = operator.login("alice").await.unwrap();
+
+    let without = operator.connection(&alice, &url, None).await;
+    let (status, error) = operator
+        .get(&alice, &format!("/connections/{without}/people"))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert_eq!(error["error"]["code"], "no_credential");
+
+    let wrong = operator
+        .connection(&alice, &url, Some("syt_not_the_right_token"))
+        .await;
+    let (status, error) = operator
+        .get(&alice, &format!("/connections/{wrong}/rooms"))
+        .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{error}");
+    assert_eq!(error["error"]["code"], "homeserver_refused");
+    assert!(!error.to_string().contains("syt_not_the_right_token"));
+
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let down = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let stopped = operator.connection(&alice, &down, Some(ADMIN_TOKEN)).await;
+    let (status, error) = operator
+        .get(&alice, &format!("/connections/{stopped}/reports"))
+        .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{error}");
+    assert_eq!(error["error"]["code"], "homeserver_unreachable");
+
+    let (status, error) = operator
+        .post(
+            &alice,
+            "/connections",
+            "missing-secret",
+            &json!({"name": "gone", "base_url": url, "credential": "file:/nonexistent/spindle-token"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{error}");
+    let gone = error["id"].as_str().unwrap();
+    let (status, error) = operator
+        .get(&alice, &format!("/connections/{gone}/people"))
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{error}");
+    assert_eq!(error["error"]["code"], "credential_unavailable");
+
+    let (status, _) = operator.get(&alice, "/connections/nope/people").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// The console is three static files on the operator's own origin, with a
+/// policy that lets them load and call nothing else.
+#[tokio::test]
+async fn the_console_is_served_from_the_operator_with_a_strict_policy() {
+    let operator = Operator::start().await;
+    let root = operator
+        .http
+        .get(format!("{}/", operator.base))
+        .send()
+        .await
+        .unwrap();
+    assert!(root.status().is_redirection());
+    assert_eq!(root.headers()["location"], "/console/");
+
+    let page = operator
+        .http
+        .get(format!("{}/console/", operator.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let policy = page.headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(policy.contains("script-src 'self'"), "{policy}");
+    assert!(policy.contains("frame-ancestors 'none'"), "{policy}");
+    assert!(!policy.contains("unsafe-inline"), "{policy}");
+    assert_eq!(page.headers()["x-frame-options"], "DENY");
+    let html = page.text().await.unwrap();
+    // The accessibility skeleton: a language, a skip link, landmarks, a
+    // live region, and no inline script.
+    for needle in [
+        "<html lang=\"en\"",
+        "class=\"skip-link\" href=\"#main\"",
+        "<nav aria-label=\"Primary\">",
+        "<main id=\"main\"",
+        "aria-live=\"polite\"",
+        "<script src=\"/console/app.js\" defer></script>",
+    ] {
+        assert!(html.contains(needle), "{needle} missing");
+    }
+    for (path, kind) in [
+        ("/console/app.js", "text/javascript"),
+        ("/console/app.css", "text/css"),
+    ] {
+        let asset = operator
+            .http
+            .get(format!("{}{path}", operator.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(asset.status(), StatusCode::OK);
+        assert!(
+            asset.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with(kind)
+        );
+    }
+    // The script reads only the operator API and never stores anything.
+    let script = operator
+        .http
+        .get(format!("{}/console/app.js", operator.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(script.contains("const API = \"/_spindle/operator/v1\""));
+    for forbidden in [
+        "localStorage",
+        "sessionStorage",
+        "indexedDB",
+        "innerHTML",
+        "/_synapse",
+        "/_matrix",
+    ] {
+        assert!(!script.contains(forbidden), "the console uses {forbidden}");
+    }
+    // The API keeps its own closed policy.
+    let (status, _) = reply(operator.call(reqwest::Method::GET, "/view", None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let api = operator
+        .http
+        .get(format!("{}{PREFIX}/view", operator.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        api.headers()["content-security-policy"],
+        "default-src 'none'; frame-ancestors 'none'"
+    );
+}
+
+/// A refused request is not remembered under its key: the refusal changed
+/// nothing, and storing it would let anyone grow the journal.
+#[tokio::test]
+async fn refusals_are_not_stored_under_their_key() {
+    let operator = Operator::start().await;
+    let victor = operator.login("victor").await.unwrap();
+    let before = operator.journal().lines().count();
+    for _ in 0..3 {
+        let response = operator
+            .call(reqwest::Method::POST, "/connections", Some(&victor))
+            .header("idempotency-key", "viewer-key")
+            .json(&json!({"name": "x", "base_url": "https://x.example"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(response.headers().get("idempotent-replayed").is_none());
+    }
+    assert_eq!(operator.journal().lines().count(), before);
 }

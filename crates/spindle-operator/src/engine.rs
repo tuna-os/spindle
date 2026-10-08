@@ -221,9 +221,12 @@ impl State {
                 if let Some(operation) = self.operation_mut(event) {
                     operation.state = *state;
                     operation.reason.clone_from(reason);
-                    if matches!(state, OperationState::Paused | OperationState::Running) {
-                        operation.pause_requested = false;
-                    }
+                    // A request is for the run it was made against. Once the
+                    // operation changes state it is answered or overtaken: a
+                    // cancel that lost the race to a failure must not cancel
+                    // the run a later `:resume` or approval starts.
+                    operation.pause_requested = false;
+                    operation.cancel_requested = false;
                 }
             }
             Change::PauseRequested => {
@@ -409,7 +412,16 @@ impl Engine {
                 running: HashSet::new(),
                 in_flight: HashSet::new(),
             }),
-            drivers,
+            // Every driver's words are redacted on the way in (`Redacting`).
+            drivers: drivers
+                .into_iter()
+                .map(|(name, driver)| {
+                    (
+                        name,
+                        Arc::new(crate::driver::Redacting(driver)) as Arc<dyn Driver>,
+                    )
+                })
+                .collect(),
             data_dir,
             artifact_ttl_ms: u64::try_from(artifact_ttl.as_millis()).unwrap_or(u64::MAX),
             probe_timeout,
@@ -490,6 +502,14 @@ impl Engine {
         Ok(())
     }
 
+    /// The client every call to a homeserver goes through: no redirects
+    /// followed, and the probe timeout on every request, so a dead
+    /// homeserver cannot hang the console that is meant to diagnose it.
+    #[must_use]
+    pub fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
@@ -505,6 +525,15 @@ impl Engine {
             .get(name)
             .cloned()
             .ok_or_else(|| ApiError::invalid(format!("no driver named `{name}` is configured")))
+    }
+
+    /// Stop writing and give up the data directory: the journal refuses
+    /// every later write and its lock is released, as when the process
+    /// exits. With [`Engine::abort_runners`], this is what a crash leaves
+    /// behind, without waiting for every handle on the engine to drop.
+    pub fn shutdown(&self) {
+        self.abort_runners();
+        self.lock().journal.close();
     }
 
     /// Stop every runner task without recording anything: what a crash
@@ -560,10 +589,19 @@ impl Engine {
         Ok(None)
     }
 
-    /// Record the response to a claimed key. Error responses that leave no
-    /// state behind (4xx) are stored too: a retry of a refused request is
-    /// refused the same way rather than being re-judged against new state.
-    /// A 5xx is not stored, so a retry can succeed once the fault clears.
+    /// Give up a claimed key without recording a response: the request
+    /// was abandoned before it finished.
+    pub fn release_idempotent(&self, subject: &str, key: &str) {
+        self.lock()
+            .in_flight
+            .remove(&(subject.to_owned(), key.to_owned()));
+    }
+
+    /// Record the response to a claimed key. Only a success is stored. A
+    /// refusal (401, 403, 409, 412, 422) changed nothing, so a retry is
+    /// judged afresh against the current state; storing it would let a
+    /// caller without rights grow the journal with refusals, and would
+    /// replay a stale 412 to a client that has since fetched the `ETag`.
     pub fn finish_idempotent(
         &self,
         context: &Context,
@@ -577,7 +615,7 @@ impl Engine {
         inner
             .in_flight
             .remove(&(subject.to_owned(), key.to_owned()));
-        if status >= 500 {
+        if status >= 400 {
             return;
         }
         let change = Change::IdempotencyStored {

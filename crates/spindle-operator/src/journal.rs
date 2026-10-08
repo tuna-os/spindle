@@ -167,6 +167,15 @@ impl Change {
 pub struct Journal {
     file: File,
     next_seq: u64,
+    /// The length of the file up to the last acknowledged event.
+    len: u64,
+    /// Set when a failed append could not be undone: the file may hold
+    /// bytes no caller was told about, so nothing more is written to it.
+    poisoned: bool,
+    /// An exclusive lock on the data directory, held for the life of the
+    /// process. Two operators on one journal would interleave sequence
+    /// numbers and both resume the same operations.
+    lock: File,
 }
 
 impl Journal {
@@ -178,6 +187,20 @@ impl Journal {
     /// On I/O failure, or a malformed line before the last.
     pub fn open(dir: &Path) -> std::io::Result<(Self, Vec<Event>)> {
         std::fs::create_dir_all(dir)?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("journal.lock"))?;
+        lock.try_lock().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "another spindle-operator is using {}; stop it first",
+                    dir.display()
+                ),
+            )
+        })?;
         let path = dir.join("journal.jsonl");
         let mut file = OpenOptions::new()
             .create(true)
@@ -215,7 +238,22 @@ impl Journal {
             file.sync_all()?;
         }
         let next_seq = events.last().map_or(1, |event| event.seq + 1);
-        Ok((Journal { file, next_seq }, events))
+        Ok((
+            Journal {
+                file,
+                next_seq,
+                len: good_len,
+                poisoned: false,
+                lock,
+            },
+            events,
+        ))
+    }
+
+    /// Refuse every later write and release the directory lock.
+    pub fn close(&mut self) {
+        self.poisoned = true;
+        let _ = self.lock.unlock();
     }
 
     /// Append `changes` as consecutive events and sync them to disk. They
@@ -248,8 +286,30 @@ impl Journal {
             buffer.push(b'\n');
             events.push(event);
         }
-        self.file.write_all(&buffer)?;
-        self.file.sync_data()?;
+        if self.poisoned {
+            return Err(std::io::Error::other(
+                "the journal refused writes after a failed append it could not undo",
+            ));
+        }
+        if let Err(error) = self
+            .file
+            .write_all(&buffer)
+            .and_then(|()| self.file.sync_data())
+        {
+            // Undo whatever part of the write landed, so replay never sees
+            // an event its caller was told had failed. If even that fails,
+            // stop writing: the file's tail is no longer known.
+            if self
+                .file
+                .set_len(self.len)
+                .and_then(|()| self.file.sync_all())
+                .is_err()
+            {
+                self.poisoned = true;
+            }
+            return Err(error);
+        }
+        self.len += buffer.len() as u64;
         self.next_seq += events.len() as u64;
         Ok(events)
     }
@@ -287,12 +347,25 @@ mod tests {
             .append(2, &Actor::System, None, None, vec![Change::CancelRequested])
             .unwrap();
         assert_eq!(appended[0].seq, 2);
+        drop(journal);
         let (_, events) = Journal::open(dir.path()).unwrap();
         assert_eq!(
             events.len(),
             2,
             "the torn bytes were truncated before appending"
         );
+    }
+
+    #[test]
+    fn a_second_process_cannot_open_a_journal_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let (journal, _) = Journal::open(dir.path()).unwrap();
+        let error = Journal::open(dir.path())
+            .err()
+            .expect("the directory is locked");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        drop(journal);
+        Journal::open(dir.path()).expect("the lock went with the first journal");
     }
 
     #[test]
