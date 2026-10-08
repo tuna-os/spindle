@@ -68,6 +68,10 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/unstable/org.matrix.msc4140/delayed_events",
     "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}",
     "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}",
+    "/_matrix/client/unstable/org.matrix.msc4140/rooms/{room_id}/delayed_event/{event_type}/{txn_id}",
+    "/_matrix/client/v3/rooms/{room_id}/delayed_event/{event_type}/{txn_id}",
+    "/_matrix/client/v1/delayed_events/{delay_id}",
+    "/_matrix/client/v1/delayed_events/{delay_id}/{action}",
     "/_matrix/client/v3/rooms/{room_id}/state",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}",
@@ -111,6 +115,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::presence_routes::routes())
         .merge(room_routes())
         .merge(timeline_routes())
+        .merge(delayed_routes())
         .merge(media_routes(state.media.max_upload_bytes()))
         .merge(discovery_routes())
         .merge(federation_read_routes())
@@ -643,6 +648,47 @@ fn room_routes() -> Router<AppState> {
         )
 }
 
+/// MSC4140's delayed events: scheduling, lookup and management, under the
+/// stable paths the merged MSC names and the unstable ones shipping clients
+/// call.
+fn delayed_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc4140/delayed_events",
+            get(delayed_events),
+        )
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}",
+            post(delayed_event_action).get(delayed_event_lookup),
+        )
+        // MSC4140 as merged: scheduling through an endpoint of its own, and
+        // the stable management and lookup paths, beside the unstable ones
+        // shipping clients call.
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc4140/rooms/{room_id}/delayed_event/{event_type}/{txn_id}",
+            axum::routing::put(delayed_event_put_unstable),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/delayed_event/{event_type}/{txn_id}",
+            axum::routing::put(delayed_event_put_stable),
+        )
+        .route(
+            "/_matrix/client/v1/delayed_events/{delay_id}",
+            get(delayed_event_lookup),
+        )
+        .route(
+            "/_matrix/client/v1/delayed_events/{delay_id}/{action}",
+            post(delayed_event_action_stable),
+        )
+        // The current MSC4140 shape: the action in the path and no access
+        // token, so a delegate (lk-jwt-service) can keep a leave event
+        // pending, or send it, for a client that has gone away.
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}",
+            post(delayed_event_action_by_id),
+        )
+}
+
 /// Everything that reads or writes a room's log, and its state.
 fn timeline_routes() -> Router<AppState> {
     Router::new()
@@ -709,21 +755,6 @@ fn timeline_routes() -> Router<AppState> {
         .route(
             "/_matrix/client/unstable/org.matrix.msc4143/rtc/transports",
             get(rtc_transports_endpoint),
-        )
-        .route(
-            "/_matrix/client/unstable/org.matrix.msc4140/delayed_events",
-            get(delayed_events),
-        )
-        .route(
-            "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}",
-            post(delayed_event_action),
-        )
-        // The current MSC4140 shape: the action in the path and no access
-        // token, so a delegate (lk-jwt-service) can keep a leave event
-        // pending, or send it, for a client that has gone away.
-        .route(
-            "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}",
-            post(delayed_event_action_by_id),
         )
         .route("/_matrix/client/v3/rooms/{room_id}/state", get(room_state))
         // Two routes, because the spec has two forms and a router cannot
@@ -1362,8 +1393,14 @@ async fn versions() -> Json<Value> {
 /// treats a missing capability as "unknown, assume the default", whereas an
 /// empty `available` map is a positive claim that no room version works. Until
 /// rooms exist (#7) the honest thing is to say nothing, not to say none.
-async fn capabilities() -> Json<Value> {
+async fn capabilities(State(state): State<AppState>) -> Json<Value> {
     let mut capabilities = serde_json::Map::new();
+    // MSC4140: both limits, which the server must enforce and so must
+    // state, under the stable name and the unstable one clients read today.
+    let (max_delay_ms, max_scheduled) = state.delayed.limits();
+    let delayed = json!({ "max_delay_ms": max_delay_ms, "max_scheduled": max_scheduled });
+    capabilities.insert("m.delayed_events".to_owned(), delayed.clone());
+    capabilities.insert("org.matrix.msc4140.delayed_events".to_owned(), delayed);
     if let Some(default) = surface::DEFAULT_ROOM_VERSION {
         let available: serde_json::Map<String, Value> = surface::ROOM_VERSIONS
             .iter()
@@ -5149,7 +5186,10 @@ fn ruleset_of(state: &AppState, user_id: &str) -> Result<Value, MatrixError> {
         .account_data
         .get(user_id, "", crate::push_rules::TYPE)
         .map_err(|error| account_data_error(&error))?
-        .unwrap_or_else(|| crate::push_rules::defaults(user_id)))
+        .map_or_else(
+            || crate::push_rules::defaults(user_id),
+            |stored| crate::push_rules::with_defaults(stored, user_id),
+        ))
 }
 
 fn save_ruleset(state: &AppState, user_id: &str, ruleset: &Value) -> Result<(), MatrixError> {
@@ -7796,7 +7836,7 @@ fn finalised_delays(
     user_id: &str,
     filter: Option<&crate::filters::Filter>,
     (since, next_batch): (Option<u64>, u64),
-) -> Result<Option<Vec<crate::delayed::FinalisedDelay>>, MatrixError> {
+) -> Result<Option<Vec<Value>>, MatrixError> {
     if !filter.is_none_or(crate::filters::Filter::wants_finalised_delayed_events) {
         return Ok(None);
     }
@@ -7804,7 +7844,12 @@ fn finalised_delays(
         .delayed
         .finalised_between(user_id, since, next_batch)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    Ok((!finalised.is_empty()).then_some(finalised))
+    Ok((!finalised.is_empty()).then(|| {
+        finalised
+            .iter()
+            .map(crate::delayed::FinalisedDelay::sync_view)
+            .collect()
+    }))
 }
 
 /// The account-level account data a sync carries, defaults included.
@@ -7832,7 +7877,9 @@ fn sync_account_data(
     for event in &mut global {
         if event["type"] == crate::push_rules::TYPE {
             let ruleset = event["content"].take();
-            event["content"] = json!({ "global": ruleset });
+            event["content"] = json!({
+                "global": crate::push_rules::with_defaults(ruleset, &identity.user_id),
+            });
         }
     }
     // A user who has never edited a rule still has a ruleset, and a client
@@ -8589,7 +8636,14 @@ struct DelayQuery {
 }
 
 /// Turn a delay failure into the response a client can act on.
-fn delay_error(error: crate::delayed::DelayError) -> MatrixError {
+///
+/// The error codes are MSC4140's as merged. `stable` picks the spelling of
+/// the one code the MSC gives an unstable form: a delay past the cap is
+/// `M_DELAY_TOO_LARGE` on the stable endpoint and
+/// `ORG.MATRIX.MSC4140_DELAY_TOO_LARGE` on the unstable ones, with the cap
+/// itself beside it under the key Synapse has always sent it as, which is
+/// the one key a client could read to retry with less.
+fn delay_error_as(error: crate::delayed::DelayError, stable: bool) -> MatrixError {
     use crate::delayed::DelayError;
     match error {
         DelayError::NotFound => MatrixError::new(
@@ -8597,59 +8651,141 @@ fn delay_error(error: crate::delayed::DelayError) -> MatrixError {
             "M_NOT_FOUND",
             "no such delayed event",
         ),
-        // `M_INVALID_PARAM` with the limit in the message: a client that
-        // asked for too long can retry with less, but only if it is told
-        // what "too long" is.
-        DelayError::TooLong { limit_ms } => MatrixError::new(
+        DelayError::TooLong { limit_ms } => {
+            let mut extra = serde_json::Map::new();
+            extra.insert("org.matrix.msc4140.max_delay".to_owned(), json!(limit_ms));
+            MatrixError {
+                extra: Some(Box::new(extra)),
+                ..MatrixError::new(
+                    StatusCode::BAD_REQUEST,
+                    if stable {
+                        "M_DELAY_TOO_LARGE"
+                    } else {
+                        "ORG.MATRIX.MSC4140_DELAY_TOO_LARGE"
+                    },
+                    format!("the maximum delay is {limit_ms}ms"),
+                )
+            }
+        }
+        // 429 with the wait until the caller's first pending delay is due:
+        // nothing about the request was wrong, and the same request works
+        // once one of the delays it already holds fires or is cancelled.
+        DelayError::TooMany { retry_after_ms, .. } => MatrixError {
+            error: error.to_string(),
+            ..MatrixError::limit_exceeded(retry_after_ms)
+        },
+        DelayError::NotPositive => MatrixError::new(
             StatusCode::BAD_REQUEST,
             "M_INVALID_PARAM",
-            format!("the maximum delay is {limit_ms}ms"),
+            "a delay must be a whole number of milliseconds greater than zero",
         ),
-        // `M_LIMIT_EXCEEDED` rather than `M_INVALID_PARAM`: nothing about the
-        // request was wrong, and the same request will work once one of this
-        // caller's pending delays in this room fires or is cancelled.
-        DelayError::TooMany { limit } => MatrixError::new(
-            StatusCode::BAD_REQUEST,
-            "M_LIMIT_EXCEEDED",
-            format!("at most {limit} delayed events may be pending in one room"),
+        DelayError::Conflict => MatrixError::new(
+            StatusCode::CONFLICT,
+            "M_UNKNOWN",
+            "the delayed event has already finished, and not in the way asked for",
         ),
         DelayError::Store(inner) => MatrixError::internal(&inner.to_string()),
     }
+}
+
+/// [`delay_error_as`] for the unstable endpoints, which is all of them but
+/// the stable scheduling one.
+fn delay_error(error: crate::delayed::DelayError) -> MatrixError {
+    delay_error_as(error, false)
+}
+
+/// One delay as MSC4140's lookup reports it, pending or finished.
+fn delay_info(event: &crate::delayed::DelayedEvent) -> Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("delay_id".to_owned(), json!(event.delay_id));
+    entry.insert("room_id".to_owned(), json!(event.room_id));
+    entry.insert("type".to_owned(), json!(event.event_type));
+    if let Some(state_key) = &event.state_key {
+        entry.insert("state_key".to_owned(), json!(state_key));
+    }
+    let since = event.fire_at_ms.saturating_sub(event.delay_ms);
+    entry.insert("delay_ms".to_owned(), json!(event.delay_ms));
+    entry.insert("delayed_since_ts".to_owned(), json!(since));
+    // The names the list endpoint has always used, kept beside the merged
+    // ones: they are what Synapse sends and what shipping clients read.
+    entry.insert("delay".to_owned(), json!(event.delay_ms));
+    entry.insert("running_since".to_owned(), json!(since));
+    entry.insert("content".to_owned(), event.content.clone());
+    Value::Object(entry)
+}
+
+/// The same for a delay that has finished, with how it finished.
+fn finalised_info(record: &crate::delayed::FinalisedDelay) -> Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("delay_id".to_owned(), json!(record.delay_id));
+    entry.insert("room_id".to_owned(), json!(record.room_id));
+    entry.insert("type".to_owned(), json!(record.event_type));
+    if let Some(state_key) = &record.state_key {
+        entry.insert("state_key".to_owned(), json!(state_key));
+    }
+    entry.insert("delay_ms".to_owned(), json!(record.delay_ms));
+    entry.insert(
+        "delayed_since_ts".to_owned(),
+        json!(record.delayed_since_ts),
+    );
+    entry.insert("content".to_owned(), record.content.clone());
+    let mut finalised = serde_json::Map::new();
+    if let Some(event_id) = &record.event_id {
+        finalised.insert("event_id".to_owned(), json!(event_id));
+    }
+    if let Some(error) = &record.error {
+        finalised.insert(
+            "error".to_owned(),
+            json!({
+                "errcode": record.errcode.as_deref().unwrap_or("M_UNKNOWN"),
+                "error": error,
+            }),
+        );
+    }
+    finalised.insert("finalised_ts".to_owned(), json!(record.finalised_ts));
+    entry.insert("finalised".to_owned(), Value::Object(finalised));
+    Value::Object(entry)
 }
 
 /// `GET /_matrix/client/unstable/org.matrix.msc4140/delayed_events`
 ///
 /// What this caller is still waiting on. Scoped to the caller: a delay is a
 /// pending action taken in their name, and whose it is is the only sensible
-/// unit here.
+/// unit here. Not in MSC4140 as merged (MSC4486 takes it on), and kept
+/// because Synapse serves it and clients call it.
 async fn delayed_events(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
 ) -> Result<Json<Value>, MatrixError> {
     let pending = state.delayed.list(&identity.user_id).map_err(delay_error)?;
-    let chunk: Vec<Value> = pending
-        .into_iter()
-        .map(|event| {
-            let mut entry = serde_json::Map::new();
-            entry.insert("delay_id".to_owned(), json!(event.delay_id));
-            entry.insert("room_id".to_owned(), json!(event.room_id));
-            entry.insert("type".to_owned(), json!(event.event_type));
-            if let Some(state_key) = event.state_key {
-                entry.insert("state_key".to_owned(), json!(state_key));
-            }
-            entry.insert("delay".to_owned(), json!(event.delay_ms));
-            // When the current window started, which is the one field a
-            // client could not have computed for itself and the one it needs
-            // in order to decide whether to restart.
-            entry.insert(
-                "running_since".to_owned(),
-                json!(event.fire_at_ms.saturating_sub(event.delay_ms)),
-            );
-            entry.insert("content".to_owned(), event.content);
-            Value::Object(entry)
-        })
-        .collect();
+    let chunk: Vec<Value> = pending.iter().map(delay_info).collect();
     Ok(Json(json!({ "delayed_events": chunk })))
+}
+
+/// `GET /_matrix/client/v1/delayed_events/{delay_id}`, and its unstable
+/// alias.
+///
+/// One delay of the caller's, pending or finished: MSC4140's way for a
+/// client that was away to learn whether its delay was sent, cancelled or
+/// refused, and why. Another user's delay is not found, exactly as one that
+/// never existed.
+async fn delayed_event_lookup(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(delay_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    match state.delayed.get(&delay_id, &identity.user_id) {
+        Ok(event) => Ok(Json(delay_info(&event))),
+        Err(crate::delayed::DelayError::NotFound) => {
+            match state.delayed.outcome(&delay_id).map_err(delay_error)? {
+                Some((owner, record)) if owner == identity.user_id => {
+                    Ok(Json(finalised_info(&record)))
+                }
+                _ => Err(delay_error(crate::delayed::DelayError::NotFound)),
+            }
+        }
+        Err(error) => Err(delay_error(error)),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -8659,11 +8795,10 @@ struct DelayActionRequest {
 
 /// `POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}`
 ///
-/// `restart` is the one that matters: it is the heartbeat a live client sends
-/// to say "not yet", and it re-applies the *original* delay rather than what
-/// remained. A restart that shortened the window each time would converge on
-/// firing while the client was still there, which is the opposite of what
-/// restarting means.
+/// The earliest shape of the management endpoint, with the action in the
+/// body; matrix-js-sdk still falls back to it. `restart` is the one that
+/// matters: it is the heartbeat a live client sends to say "not yet", and
+/// it re-applies the *original* delay rather than what remained.
 async fn delayed_event_action(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
@@ -8676,52 +8811,108 @@ async fn delayed_event_action(
             request.action
         ))
     })?;
-    let to_send = state
+    act_on_delay(&state, &delay_id, Some(&identity.user_id), action)
+}
+
+/// Apply `action` to a delay -- the caller's when `owner` names them, the
+/// holder of the id's otherwise -- and do what follows from it: send the
+/// event for `send`, record the outcome for `cancel`.
+fn act_on_delay(
+    state: &AppState,
+    delay_id: &str,
+    owner: Option<&str>,
+    action: crate::delayed::Action,
+) -> Result<Json<Value>, MatrixError> {
+    let pending = state
         .delayed
-        .act(&delay_id, &identity.user_id, action)
-        .map_err(delay_error)?;
-    if let Some(event) = to_send {
-        send_delayed_now(&state, &event)?;
+        .pending(delay_id)
+        .filter(|event| owner.is_none_or(|owner| event.sender == owner));
+    let acted = match owner {
+        Some(owner) => state.delayed.act(delay_id, owner, action),
+        None => state.delayed.act_by_id(delay_id, action),
+    }
+    .map_err(delay_error)?;
+    if let Some(event) = acted {
+        send_delayed_now(state, &event)?;
+    } else if action == crate::delayed::Action::Cancel {
+        // A cancel is kept as an outcome like any other, so a lookup can
+        // report it and a repeated cancel is the success it should be. Not
+        // when the delay had already finished: that cancel changed nothing.
+        if let Some(event) = pending {
+            record_cancel(state, &event);
+        }
     }
     Ok(Json(json!({})))
 }
 
+/// Keep a cancellation as the delay's outcome.
+fn record_cancel(state: &AppState, event: &crate::delayed::DelayedEvent) {
+    let record = crate::delayed::FinalisedDelay::cancelled(event);
+    if let Err(error) =
+        state
+            .delayed
+            .finalise(&event.sender, state.rooms.stream_position(), &record)
+    {
+        tracing::warn!(
+            delay_id = %event.delay_id,
+            "a delayed event was cancelled but its outcome was not recorded: {error}"
+        );
+    }
+}
+
 /// Send a delayed event now, on its owner's behalf, and record the outcome
 /// for MSC4309 -- the `send` action, from either route.
+///
+/// Sticky if it was scheduled sticky: `MatrixRTC` 2.0's leave is a sticky
+/// delayed event, and a delegate that sends it early (lk-jwt-service, when
+/// the participant drops off the SFU) must deliver the same event the fire
+/// loop would have, or clients that track membership through the sticky
+/// map never see the participant go.
+///
+/// A send that is refused leaves the delay scheduled and answers with the
+/// refusal, as MSC4140 asks: whatever refused it may have changed by its
+/// deadline, and the client may retry until then.
 fn send_delayed_now(
     state: &AppState,
     event: &crate::delayed::DelayedEvent,
 ) -> Result<(), MatrixError> {
     let sent = match &event.state_key {
-        Some(state_key) => state.rooms.set_state(
+        Some(state_key) => state.rooms.set_state_sticky(
             &event.room_id,
             &event.sender,
             state.key.pair(),
             &event.event_type,
             state_key,
             &event.content,
+            event.sticky_ms,
         ),
-        None => state.rooms.send(
+        None => state.rooms.send_sticky(
             &event.room_id,
             &event.sender,
             state.key.pair(),
             &event.event_type,
             &event.content,
+            event.sticky_ms,
         ),
+    };
+    let event_id = match sent {
+        Ok(event_id) => event_id,
+        Err(error) => {
+            if let Err(store) = state.delayed.reinstate(event) {
+                tracing::warn!(
+                    delay_id = %event.delay_id,
+                    "a refused delayed send could not be put back: {store}"
+                );
+            }
+            return Err(room_error(error));
+        }
     };
     // MSC4309, for the same reason the fire loop records its outcome:
     // this device learns the result from the response, but the user's
     // *other* devices are exactly as uninformed as if the delay had
     // fired on its own. A failure to record must not fail the send that
     // already happened, so it is logged rather than returned.
-    let record = crate::delayed::FinalisedDelay {
-        delay_id: event.delay_id.clone(),
-        room_id: event.room_id.clone(),
-        event_type: event.event_type.clone(),
-        state_key: event.state_key.clone(),
-        event_id: sent.as_ref().ok().cloned(),
-        error: sent.as_ref().err().map(ToString::to_string),
-    };
+    let record = crate::delayed::FinalisedDelay::of(event, Ok(event_id));
     if let Err(error) =
         state
             .delayed
@@ -8732,20 +8923,22 @@ fn send_delayed_now(
             "a delayed event was sent but its outcome was not recorded: {error}"
         );
     }
-    sent.map_err(room_error)?;
     Ok(())
 }
 
 /// `POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}`
 ///
-/// No access token: the delay ID is the capability (see
-/// [`crate::delayed::Delayed::act_by_id`]). This is what
-/// lk-jwt-service calls to restart a delegated leave event while the
-/// participant is still connected to the SFU, and to send it when they are
-/// not; answering it 404 makes the service drop the delegation, and the
-/// leave fires while the caller is still in the call.
+/// An access token is optional here. With one, the delay must be the
+/// caller's, as on the stable endpoint -- which is how lk-jwt-service 0.8
+/// calls it, as the user, through its application service. Without one the
+/// delay ID is the capability (see [`crate::delayed::Delayed::act_by_id`]),
+/// which is how earlier releases call it to restart a delegated leave while
+/// the participant is still on the SFU and send it when they are not;
+/// answering that 404 makes the service drop the delegation, and the leave
+/// fires while the caller is still in the call.
 async fn delayed_event_action_by_id(
     State(state): State<AppState>,
+    crate::auth::MaybeAuthenticated(identity): crate::auth::MaybeAuthenticated,
     axum::extract::Path((delay_id, action)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, MatrixError> {
     let action = crate::delayed::Action::parse(&action).ok_or_else(|| {
@@ -8755,14 +8948,168 @@ async fn delayed_event_action_by_id(
             format!("no delayed-event action {action:?}"),
         )
     })?;
-    if let Some(event) = state
-        .delayed
-        .act_by_id(&delay_id, action)
-        .map_err(delay_error)?
+    act_on_delay(
+        &state,
+        &delay_id,
+        identity.as_ref().map(|identity| identity.user_id.as_str()),
+        action,
+    )
+}
+
+/// `POST /_matrix/client/v1/delayed_events/{delay_id}/{action}`
+///
+/// MSC4140 as merged: authenticated, and scoped to the delay's owner.
+async fn delayed_event_action_stable(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((delay_id, action)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    let action = crate::delayed::Action::parse(&action).ok_or_else(|| {
+        MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_UNRECOGNIZED",
+            format!("no delayed-event action {action:?}"),
+        )
+    })?;
+    act_on_delay(&state, &delay_id, Some(&identity.user_id), action)
+}
+
+/// The body of MSC4140's scheduling endpoint.
+#[derive(Debug, Deserialize)]
+struct DelayedEventBody {
+    delay_ms: Value,
+    content: Option<Value>,
+    state_key: Option<Value>,
+    /// MSC4354's sticky duration, accepted in the body as well as the query,
+    /// as Synapse does until the MSCs settle on one.
+    #[serde(rename = "org.matrix.msc4354.sticky_duration_ms")]
+    sticky: Option<u64>,
+}
+
+/// `PUT /_matrix/client/v3/rooms/{room_id}/delayed_event/{event_type}/{txn_id}`,
+/// and its unstable alias under `org.matrix.msc4140`.
+///
+/// MSC4140 as merged schedules through an endpoint of its own, with the
+/// delay, the content and (for a state event) the state key in the body,
+/// rather than through a query parameter on `/send` and `/state` -- which
+/// stay served, because that is what shipping clients call. It is a
+/// transaction like `/send`: a retried request returns the delay it made
+/// the first time, rather than scheduling a second one, which for a
+/// participant's leave would be a second leave nobody restarts.
+fn schedule_delayed_event(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    (room_id, event_type, txn_id): (String, String, String),
+    query: &DelayQuery,
+    body: DelayedEventBody,
+    stable: bool,
+) -> Result<Json<Value>, MatrixError> {
+    let delay_ms = body
+        .delay_ms
+        .as_u64()
+        .filter(|delay| *delay > 0)
+        .ok_or_else(|| {
+            MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                "delay_ms must be a whole number of milliseconds greater than zero",
+            )
+        })?;
+    let content = match body.content {
+        Some(Value::Object(content)) => Value::Object(content),
+        Some(_) => {
+            return Err(MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                "content must be an object",
+            ));
+        }
+        None => return Err(MatrixError::missing_param("content is required")),
+    };
+    let state_key = match body.state_key {
+        None => None,
+        Some(Value::String(state_key)) => Some(state_key),
+        Some(_) => {
+            return Err(MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                "state_key must be a string",
+            ));
+        }
+    };
+    let sticky = match (query.sticky, body.sticky) {
+        (Some(query), Some(body)) if query != body => {
+            return Err(MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                "conflicting values given for org.matrix.msc4354.sticky_duration_ms",
+            ));
+        }
+        (query, body) => query.or(body),
+    };
+    let key = delayed_transaction_key(identity, &txn_id);
+    if let Ok(Some(stored)) = spindle_store::ReadView::get(state.store.as_ref(), &key)
+        && let Ok(delay_id) = String::from_utf8(stored)
     {
-        send_delayed_now(&state, &event)?;
+        return Ok(Json(json!({ "delay_id": delay_id })));
     }
-    Ok(Json(json!({})))
+    if !state
+        .rooms
+        .is_joined(&identity.user_id, &room_id)
+        .unwrap_or(false)
+    {
+        return Err(MatrixError::forbidden(format!(
+            "{} is not in {room_id}",
+            identity.user_id
+        )));
+    }
+    let delay_id = state
+        .delayed
+        .schedule(
+            &room_id,
+            &identity.user_id,
+            &event_type,
+            state_key.as_deref(),
+            &content,
+            delay_ms,
+            sticky,
+        )
+        .map_err(|error| delay_error_as(error, stable))?;
+    spindle_store::Store::put(state.store.as_ref(), &key, delay_id.as_bytes())
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    Ok(Json(json!({ "delay_id": delay_id })))
+}
+
+/// Where a scheduling transaction is remembered: the device's transaction
+/// row, in a namespace of its own. The spec scopes a transaction ID to one
+/// device and one endpoint, so the same ID on `/send` is a different
+/// transaction and must not answer with a delay.
+fn delayed_transaction_key(identity: &crate::accounts::Identity, txn_id: &str) -> Vec<u8> {
+    spindle_core::keys::transaction(
+        &identity.user_id,
+        &identity.device_id,
+        &format!("\u{0}msc4140/{txn_id}"),
+    )
+}
+
+async fn delayed_event_put_unstable(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(path): axum::extract::Path<(String, String, String)>,
+    axum::extract::Query(query): axum::extract::Query<DelayQuery>,
+    Json(body): Json<DelayedEventBody>,
+) -> Result<Json<Value>, MatrixError> {
+    schedule_delayed_event(&state, &identity, path, &query, body, false)
+}
+
+async fn delayed_event_put_stable(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(path): axum::extract::Path<(String, String, String)>,
+    axum::extract::Query(query): axum::extract::Query<DelayQuery>,
+    Json(body): Json<DelayedEventBody>,
+) -> Result<Json<Value>, MatrixError> {
+    schedule_delayed_event(&state, &identity, path, &query, body, true)
 }
 
 /// `GET /_matrix/client/v3/voip/turnServer`
@@ -9358,7 +9705,9 @@ fn with_transaction_id(
     }
     let key = spindle_core::keys::transaction_echo(&identity.user_id, event_id);
     let Ok(Some(raw)) = spindle_store::ReadView::get(state.store.as_ref(), &key) else {
-        return event;
+        // No transaction: perhaps a delay sent it, which MSC4140 stamps in
+        // the transaction's place.
+        return with_delay_id(state, identity, event);
     };
     let Some((device_id, txn_id)) = spindle_core::keys::transaction_echo_parts(&raw) else {
         return event;
@@ -9373,6 +9722,42 @@ fn with_transaction_id(
             .as_object_mut()
     }) {
         unsigned.insert("transaction_id".to_owned(), Value::String(txn_id));
+    }
+    event
+}
+
+/// Stamp MSC4140's delay ID on an event the reader sent through a delay.
+///
+/// For the sender only, on every device: the delay is the user's, not one
+/// device's, and any of their clients may be the one watching for it.
+fn with_delay_id(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    mut event: Value,
+) -> Value {
+    let Some(event_id) = event["event_id"].as_str() else {
+        return event;
+    };
+    if event["sender"].as_str() != Some(identity.user_id.as_str()) {
+        return event;
+    }
+    let key = spindle_core::keys::delay_echo(&identity.user_id, event_id);
+    let Ok(Some(raw)) = spindle_store::ReadView::get(state.store.as_ref(), &key) else {
+        return event;
+    };
+    let Ok(delay_id) = String::from_utf8(raw) else {
+        return event;
+    };
+    if let Some(unsigned) = event.as_object_mut().and_then(|object| {
+        object
+            .entry("unsigned")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+    }) {
+        unsigned.insert(
+            "org.matrix.msc4140.delay_id".to_owned(),
+            Value::String(delay_id),
+        );
     }
     event
 }

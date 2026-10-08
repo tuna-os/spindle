@@ -532,9 +532,9 @@ async fn a_ring_reaches_who_it_mentions_at_high_priority_and_a_decline_reaches_n
     tokio::time::sleep(Duration::from_millis(300)).await;
     let before = gateway.deliveries().len();
 
-    // MSC4075: a ring is routed by `m.mentions`, so the default mention
-    // rule is what makes a fresh account's phone ring -- with a highlight,
-    // which is what makes the gateway wake the device.
+    // MSC4075: a ring is routed by `m.mentions`, through the ring rules
+    // that sit ahead of the mention rules -- with the ring sound, which is
+    // what makes the gateway wake the device and the phone ring.
     let ring = json!({
         "application": {
             "type": "m.call",
@@ -557,7 +557,7 @@ async fn a_ring_reaches_who_it_mentions_at_high_priority_and_a_decline_reaches_n
     let devices = notification["devices"].as_array().unwrap();
     assert_eq!(devices.len(), 1);
     assert_eq!(devices[0]["pushkey"], "bobkey");
-    assert_eq!(devices[0]["tweaks"]["highlight"], true);
+    assert_eq!(devices[0]["tweaks"]["sound"], "ring", "{notification}");
     // Carol was not mentioned: her phone stays quiet.
     gateway.settle(before + 1).await;
 

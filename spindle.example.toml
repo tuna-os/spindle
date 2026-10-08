@@ -405,6 +405,12 @@ registrations = []
 # per room, because that is the unit a client works in -- a legitimate
 # Matrix RTC client sits at one. Must be > 0, for the same reason.
 # max_per_room = 100
+#
+# The most pending delays one user may hold across every room: MSC4140's
+# `max_scheduled`, advertised to clients in /capabilities together with
+# max_delay_ms. A refusal is 429 with Retry-After set to when the user's
+# next delay is due. Must be > 0.
+# max_per_user = 1000
 
 [limits]
 # Ceilings on what one account may make this server hold. Each of these

@@ -164,6 +164,10 @@ pub const UNSTABLE_FEATURES: &[(&str, bool)] = &[
     // expected to fall back to leaving a stale membership behind. So the
     // advertisement is not decoration: it changes what clients do.
     ("org.matrix.msc4140", true),
+    // MSC4140 is merged, and the stable endpoints it names are served
+    // beside the unstable ones: this is the MSC's own flag for "use them"
+    // until a spec version that contains it is advertised.
+    ("org.matrix.msc4140.stable", true),
     // MSC4143's MatrixRTC discovery. Advertised unconditionally, because
     // the flag answers "does this server serve /rtc/transports", not "does
     // it have a backend to name": the endpoint is served either way and

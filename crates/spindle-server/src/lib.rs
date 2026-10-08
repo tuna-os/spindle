@@ -478,11 +478,14 @@ fn app_state_with(
         delegated,
         oidc: oidc_provider,
         federation,
-        delayed: Arc::new(delayed::Delayed::with_limits(
-            Arc::clone(&store_for_delayed),
-            delayed_caps.max_delay_ms,
-            delayed_caps.max_per_room,
-        )),
+        delayed: Arc::new(
+            delayed::Delayed::with_limits(
+                Arc::clone(&store_for_delayed),
+                delayed_caps.max_delay_ms,
+                delayed_caps.max_per_room,
+            )
+            .with_user_cap(delayed_caps.max_per_user),
+        ),
         push,
         registration_nonces: Arc::new(shared_secret_registration::RegistrationNonces::new()),
         rendezvous: Arc::new(rendezvous::Rendezvous::new()),

@@ -465,6 +465,22 @@ pub enum Keyspace {
     /// `localpart` -> the account's one-time recovery codes, each as a
     /// salt and the BLAKE3 digest of salt and code; never the codes.
     RecoveryCodes = 0x54,
+    /// `delay_id` -> the user and stream position of its
+    /// [`Self::FinalisedDelay`] row.
+    ///
+    /// MSC4140 as merged keeps a finished delay answerable by id: a `GET`
+    /// reports how it ended, and an action repeated after the fact succeeds
+    /// when it agrees with that ending and is refused with 409 when it does
+    /// not. The id is all the token-less management route has, so without
+    /// this a finished delay is a scan of every user's history away.
+    /// Written and pruned with the row it points at.
+    FinalisedDelayById = 0x55,
+    /// `(user_id, event_id)` -> the `delay_id` that event was sent from.
+    ///
+    /// MSC4140 puts the delay id in the `unsigned` of the event a delay
+    /// became, for its sender only -- the same shape as
+    /// [`Self::TransactionEcho`], and read at the same point.
+    DelayEcho = 0x56,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -1467,6 +1483,44 @@ pub fn finalised_delay_position(user_id: &str, key: &[u8]) -> Option<u64> {
     let rest = key.strip_prefix(prefix.as_slice())?;
     let bytes: [u8; 8] = rest.get(..8)?.try_into().ok()?;
     Some(u64::from_be_bytes(bytes))
+}
+
+/// The by-id row for one finalised delay ([`Keyspace::FinalisedDelayById`]).
+#[must_use]
+pub fn finalised_delay_by_id(delay_id: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::FinalisedDelayById as u8];
+    key.extend_from_slice(delay_id.as_bytes());
+    key
+}
+
+/// The value of a [`finalised_delay_by_id`] row: the user, length-prefixed,
+/// then the position of their [`finalised_delay`] row.
+#[must_use]
+pub fn finalised_delay_by_id_value(user_id: &str, position: u64) -> Vec<u8> {
+    let (len, user) = framed(user_id.as_bytes());
+    let mut value = Vec::with_capacity(2 + user.len() + 8);
+    value.extend_from_slice(&len.to_be_bytes());
+    value.extend_from_slice(user);
+    value.extend_from_slice(&position.to_be_bytes());
+    value
+}
+
+/// Read a [`finalised_delay_by_id_value`] back: `(user_id, position)`.
+#[must_use]
+pub fn finalised_delay_by_id_parts(value: &[u8]) -> Option<(String, u64)> {
+    let len = usize::from(u16::from_be_bytes(value.get(..2)?.try_into().ok()?));
+    let user = String::from_utf8(value.get(2..2 + len)?.to_vec()).ok()?;
+    let position: [u8; 8] = value.get(2 + len..2 + len + 8)?.try_into().ok()?;
+    Some((user, u64::from_be_bytes(position)))
+}
+
+/// The echo row naming the delay one event was sent from
+/// ([`Keyspace::DelayEcho`]).
+#[must_use]
+pub fn delay_echo(user_id: &str, event_id: &str) -> Vec<u8> {
+    let mut key = user_prefix(Keyspace::DelayEcho, user_id);
+    key.extend_from_slice(event_id.as_bytes());
+    key
 }
 
 /// One user's presence row.
