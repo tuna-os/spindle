@@ -108,6 +108,11 @@ async fn no_hub_endpoint_answers_and_nothing_hub_shaped_crosses_the_wire() {
         }
     }
     for node in [&first, &second] {
+        let scrape = node.state.metrics.render();
+        assert!(
+            !scrape.contains("spindle_hub"),
+            "no hub series in this build"
+        );
         let unknown: u64 = EduResult::ALL
             .iter()
             .map(|result| {

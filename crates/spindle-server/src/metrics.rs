@@ -360,6 +360,9 @@ pub struct Metrics {
     edus: EduMetrics,
     /// State resolution's work and the forks that cause it (#626).
     state_res: StateResMetrics,
+    /// MSC3995 hub mode's counters (#22), in a build with the feature.
+    #[cfg(feature = "hub-mode")]
+    hub: crate::hub::HubMetrics,
 }
 
 /// State resolution, and the forward extremities that make it necessary.
@@ -431,6 +434,8 @@ impl Default for Metrics {
             auth: AuthCounters::default(),
             edus: EduMetrics::default(),
             state_res: StateResMetrics::default(),
+            #[cfg(feature = "hub-mode")]
+            hub: crate::hub::HubMetrics::default(),
         }
     }
 }
@@ -938,7 +943,16 @@ impl Metrics {
         self.render_sync(&mut out);
         self.render_responsiveness(&mut out);
         self.render_auth(&mut out);
+        #[cfg(feature = "hub-mode")]
+        self.hub.render(&mut out);
         out
+    }
+
+    /// MSC3995 hub mode's counters (#22).
+    #[cfg(feature = "hub-mode")]
+    #[must_use]
+    pub fn hub(&self) -> &crate::hub::HubMetrics {
+        &self.hub
     }
 }
 

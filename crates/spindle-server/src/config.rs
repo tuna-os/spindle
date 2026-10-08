@@ -921,6 +921,23 @@ pub struct HubConfig {
     /// milliseconds. A probe that fails to get an answer is not cached.
     #[serde(default = "default_hub_capability_ttl_ms")]
     pub capability_ttl_ms: u64,
+    /// How long a room's hub must have been unreachable before this server,
+    /// if it is the room's first listed backup, claims the next epoch
+    /// (SPEC section 13.2), milliseconds.
+    #[serde(default = "default_hub_failover_after_ms")]
+    pub failover_after_ms: u64,
+    /// As hub: sign a checkpoint -- position, chain value and state root --
+    /// every this many entries (SPEC section 13.3).
+    #[serde(default = "default_hub_checkpoint_interval")]
+    pub checkpoint_interval: u64,
+}
+
+const fn default_hub_failover_after_ms() -> u64 {
+    60_000
+}
+
+const fn default_hub_checkpoint_interval() -> u64 {
+    1_000
 }
 
 const fn default_hub_submit_timeout_ms() -> u64 {
@@ -955,6 +972,12 @@ impl HubConfig {
                 message: "must be at least 1".to_owned(),
             });
         }
+        if self.checkpoint_interval == 0 {
+            return Err(ConfigError::Invalid {
+                field: "federation.hub.checkpoint_interval",
+                message: "must be at least 1".to_owned(),
+            });
+        }
         Ok(())
     }
 }
@@ -966,6 +989,8 @@ impl Default for HubConfig {
             submit_timeout_ms: default_hub_submit_timeout_ms(),
             submit_attempts: default_hub_submit_attempts(),
             capability_ttl_ms: default_hub_capability_ttl_ms(),
+            failover_after_ms: default_hub_failover_after_ms(),
+            checkpoint_interval: default_hub_checkpoint_interval(),
         }
     }
 }

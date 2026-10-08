@@ -216,6 +216,7 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::RecoveryCodes, 0x54),
         (Keyspace::HubAttestation, 0x70),
         (Keyspace::HubEquivocation, 0x71),
+        (Keyspace::HubCheckpoint, 0x72),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(

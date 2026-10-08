@@ -23,18 +23,20 @@ use super::{RoomError, Rooms, edge_ids};
 /// The state event that names a room's hub (MSC3995).
 pub const HUB_EVENT_TYPE: &str = "m.room.hub";
 
-/// Who hubs a room, as the overlay reads it.
+/// One live log entry as the hub attests it: position, event, the chain
+/// value recorded when this server sequenced it, and the state root after
+/// it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HubDesignation {
-    /// The hub: the server of the `m.room.hub` event's sender (MSC3995).
-    pub server: String,
-    /// `org.spindle.epoch` from the event's content, `0` when absent.
-    /// Carried into every attestation; failover, which would advance it,
-    /// is designed-only (SPEC section 13.2).
-    pub epoch: u64,
-    /// The `m.room.hub` event in force.
+pub struct ChainEntry {
+    pub li: i64,
     pub event_id: String,
+    pub chain: [u8; 32],
+    pub state_root: [u8; 32],
 }
+
+/// A handoff's check of the outgoing epoch's last entry, run under the
+/// room lock with the head check.
+pub type FinalGuard<'a> = &'a dyn Fn(Option<&ChainEntry>) -> bool;
 
 /// What the hub did with a participant's event.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,52 +46,39 @@ pub enum Sequenced {
     /// Not appended: the event did not name the head. `head` is what it
     /// is now, so the participant can catch up and build again.
     Stale { head: Vec<String> },
+    /// Not appended: a handoff whose stated final entry is not the last
+    /// entry this hub attests. `last` is what that entry is.
+    WrongFinal { last: Option<ChainEntry> },
 }
 
 impl Rooms {
-    /// The room's hub, if hub mode is in force in it.
-    ///
-    /// MSC3995 makes the hub the server of the `m.room.hub` sender, and
-    /// requires the event to be signed by the *current* hub -- the
-    /// `m.room.create` sender's server while there is none. In an ordinary
-    /// room version no peer enforces that rule, so the overlay does, in
-    /// the narrowest form that needs no handoff: the designation counts
-    /// only when the hub it names is the room creator's server, which
-    /// signed it by sending it. Anything else -- a hub event from another
-    /// server, i.e. a transfer -- leaves the room ordinary until handoff
-    /// (dual signatures, epochs) is built (TODO(#22): SPEC section 13.2).
-    ///
-    /// Unlike the MSC's own room version, a room with no `m.room.hub` is
-    /// not hubbed by its creator: in an ordinary room version hub mode is
-    /// opt-in, per room, by sending the event.
+    /// The room's current `m.room.hub` event, stamped with its ID, if it
+    /// has one. Whether it designates a hub is the overlay's judgement
+    /// (`crate::hub`), which needs keys and attestations this does not.
     ///
     /// # Errors
     ///
     /// Returns [`RoomError`] if the room is unknown or cannot be read.
-    pub fn hub_designation(&self, room_id: &str) -> Result<Option<HubDesignation>, RoomError> {
-        let hub = match self.state_event_full(room_id, HUB_EVENT_TYPE, "") {
-            Ok(event) => event,
-            Err(RoomError::UnknownState(_)) => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let create = self.state_event_full(room_id, "m.room.create", "")?;
-        let server_of = |event: &Value| {
-            event["sender"]
-                .as_str()
-                .and_then(|sender| sender.split_once(':'))
-                .map(|(_, domain)| domain.to_owned())
-        };
-        let (Some(server), Some(creator)) = (server_of(&hub), server_of(&create)) else {
-            return Ok(None);
-        };
-        if server != creator {
-            return Ok(None);
+    pub fn hub_event(&self, room_id: &str) -> Result<Option<Value>, RoomError> {
+        match self.state_event_full(room_id, HUB_EVENT_TYPE, "") {
+            Ok(event) => Ok(Some(event)),
+            Err(RoomError::UnknownState(_)) => Ok(None),
+            Err(error) => Err(error),
         }
-        Ok(Some(HubDesignation {
-            server,
-            epoch: hub["content"]["org.spindle.epoch"].as_u64().unwrap_or(0),
-            event_id: hub["event_id"].as_str().unwrap_or_default().to_owned(),
-        }))
+    }
+
+    /// The server of the room creator: MSC3995's hub when no `m.room.hub`
+    /// has moved it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room is unknown or has no create event.
+    pub fn creator_server(&self, room_id: &str) -> Result<Option<String>, RoomError> {
+        let create = self.state_event_full(room_id, "m.room.create", "")?;
+        Ok(create["sender"]
+            .as_str()
+            .and_then(|sender| sender.split_once(':'))
+            .map(|(_, domain)| domain.to_owned()))
     }
 
     /// Build, sign and authorize an event on this server's head, without
@@ -138,6 +127,7 @@ impl Rooms {
         room_id: &str,
         event_id: &str,
         json: &Value,
+        final_guard: Option<FinalGuard<'_>>,
     ) -> Result<Sequenced, RoomError> {
         self.with_room(room_id, |rooms, log| {
             // A retried submission whose answer was lost: already in.
@@ -156,6 +146,14 @@ impl Rooms {
                 return Ok(Sequenced::Stale {
                     head: head.into_iter().collect(),
                 });
+            }
+            // A handoff names the last entry of the outgoing epoch; under
+            // the same lock as the head check, so nothing slips in between.
+            if let Some(guard) = final_guard {
+                let last = log.entries().rev().find_map(chain_entry);
+                if !guard(last.as_ref()) {
+                    return Ok(Sequenced::WrongFinal { last });
+                }
             }
             rooms.ingest(log, room_id, event_id, json, false)?;
             let entry = log
@@ -235,10 +233,11 @@ impl Rooms {
     }
 
     /// The live entries after `after`, oldest first, at most `limit`, each
-    /// with the chain value this server recorded when it sequenced it:
-    /// what the hub attests (SPEC section 12.5). Entries without a chain
-    /// value -- seeded or backfilled history -- are skipped; this server
-    /// did not order them and does not vouch for their order.
+    /// with the chain value this server recorded when it sequenced it and
+    /// the state root after it: what the hub attests and checkpoints (SPEC
+    /// section 12.6). Entries without a chain value -- seeded or backfilled
+    /// history -- are skipped; this server did not order them and does not
+    /// vouch for their order.
     ///
     /// # Errors
     ///
@@ -248,21 +247,50 @@ impl Rooms {
         room_id: &str,
         after: i64,
         limit: usize,
-    ) -> Result<Vec<(i64, String, [u8; 32])>, RoomError> {
+    ) -> Result<Vec<ChainEntry>, RoomError> {
         self.with_room_read(room_id, |_, log| {
             Ok(log
                 .entries_in((after.saturating_add(1))..)
-                .filter_map(|entry| {
-                    entry.chain.map(|chain| {
-                        (
-                            entry.li.get(),
-                            entry.event_id.as_str().to_owned(),
-                            *chain.as_bytes(),
-                        )
-                    })
-                })
+                .filter_map(chain_entry)
                 .take(limit)
                 .collect())
+        })
+    }
+
+    /// The entry at `li`, or the one holding `event_id`, as [`ChainEntry`],
+    /// if this server sequenced it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room is unknown.
+    pub(crate) fn hub_entry(
+        &self,
+        room_id: &str,
+        li: Option<i64>,
+        event_id: Option<&str>,
+    ) -> Result<Option<ChainEntry>, RoomError> {
+        self.with_room_read(room_id, |_, log| {
+            let entry = match (li, event_id) {
+                (Some(li), _) => log.entry_at(li),
+                (None, Some(id)) => log.get(&EventId::new(id)),
+                (None, None) => log.entries().rev().find(|entry| entry.chain.is_some()),
+            };
+            Ok(entry.and_then(chain_entry))
+        })
+    }
+
+    /// Where `event_id` sits in this server's log, if it is in it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room is unknown.
+    pub(crate) fn hub_position(
+        &self,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<Option<i64>, RoomError> {
+        self.with_room_read(room_id, |_, log| {
+            Ok(log.get(&EventId::new(event_id)).map(|entry| entry.li.get()))
         })
     }
 
@@ -275,4 +303,14 @@ impl Rooms {
     pub(crate) fn hub_last_position(&self, room_id: &str) -> Result<i64, RoomError> {
         self.with_room_read(room_id, |_, log| Ok(log.next_forward().saturating_sub(1)))
     }
+}
+
+/// A log entry as a [`ChainEntry`], when it carries a chain value.
+fn chain_entry(entry: &spindle_core::LogEntry) -> Option<ChainEntry> {
+    entry.chain.map(|chain| ChainEntry {
+        li: entry.li.get(),
+        event_id: entry.event_id.as_str().to_owned(),
+        chain: *chain.as_bytes(),
+        state_root: *entry.state_root.as_bytes(),
+    })
 }

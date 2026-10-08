@@ -162,7 +162,7 @@ use unread::{ScoreTally, UnreadIndex};
 
 pub use gaps::{GapChunk, GapChunkOutcome, GapProgress};
 #[cfg(feature = "hub-mode")]
-pub use hub::{HUB_EVENT_TYPE, HubDesignation, Sequenced};
+pub use hub::{ChainEntry, HUB_EVENT_TYPE, Sequenced};
 
 pub struct Rooms {
     store: Arc<FjallStore>,

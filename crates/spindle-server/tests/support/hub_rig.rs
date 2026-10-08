@@ -40,7 +40,8 @@ impl Node {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
         let hub_section = if hub {
-            "[federation.hub]\nenabled = true\nsubmit_timeout_ms = 1500\nsubmit_attempts = 10\n"
+            "[federation.hub]\nenabled = true\nsubmit_timeout_ms = 1500\nsubmit_attempts = 10\n\
+             failover_after_ms = 400\ncheckpoint_interval = 4\n"
         } else {
             ""
         };
@@ -165,10 +166,14 @@ impl Node {
                 "/_matrix/client/v3/createRoom",
                 Some(token),
                 // Anyone may set the topic, so a joined user's state event
-                // can go through the hub like a message does.
+                // can go through the hub like a message does; and anyone
+                // may send `m.room.hub`, so any server's user can hand the
+                // hub over or claim it.
                 Some(&json!({
                     "preset": "public_chat",
-                    "power_level_content_override": { "events": { "m.room.topic": 0 } },
+                    "power_level_content_override": {
+                        "events": { "m.room.topic": 0, "m.room.hub": 0 },
+                    },
                 })),
             )
             .await;
@@ -178,12 +183,18 @@ impl Node {
 
     /// Name this node the room's hub: an `m.room.hub` sent by `token`.
     pub async fn designate_hub(&self, token: &str, room: &str) -> String {
+        self.designate_hub_with(token, room, &json!({})).await
+    }
+
+    /// An `m.room.hub` with `content`, sent by `token`: the first one, a
+    /// handoff to this node, or whatever the content makes it.
+    pub async fn designate_hub_with(&self, token: &str, room: &str, content: &Value) -> String {
         let (status, body) = self
             .request(
                 reqwest::Method::PUT,
                 &format!("/_matrix/client/v3/rooms/{room}/state/m.room.hub"),
                 Some(token),
-                Some(&json!({})),
+                Some(content),
             )
             .await;
         assert_eq!(status, 200, "{body}");

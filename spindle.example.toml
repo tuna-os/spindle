@@ -220,6 +220,12 @@ gap_acceptance_window_secs = 600
 # submit_attempts = 3
 # How long a peer's answer to the hub capability probe is believed.
 # capability_ttl_ms = 300000
+# How long the hub must be unreachable before this server, if it is the
+# room's first listed backup hub, claims the next epoch (failover).
+# failover_after_ms = 60000
+# As hub, sign a checkpoint (position, chain value, state root) every this
+# many entries, so a new participant can anchor without replaying history.
+# checkpoint_interval = 1000
 
 [appservices]
 # Paths to appservice registration files, in the spec's YAML shape. Every

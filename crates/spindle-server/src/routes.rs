@@ -9108,16 +9108,31 @@ async fn set_room_state(
             .map_err(delay_error)?;
         return Ok(Json(json!({ "delay_id": delay_id })));
     }
+    // A new `m.room.hub` in a room that has a hub is a handoff (#22).
     #[cfg(feature = "hub-mode")]
     if query.sticky.is_none()
-        && let Some(event_id) = crate::hub::try_send(
+        && event_type == crate::rooms::HUB_EVENT_TYPE
+        && state_key.is_empty()
+        && let Some(event_id) = Box::pin(crate::hub::try_handoff(
+            &state,
+            &identity.user_id,
+            &room_id,
+            &content,
+        ))
+        .await?
+    {
+        return Ok(Json(json!({ "event_id": event_id })));
+    }
+    #[cfg(feature = "hub-mode")]
+    if query.sticky.is_none()
+        && let Some(event_id) = Box::pin(crate::hub::try_send(
             &state,
             &identity.user_id,
             &room_id,
             &event_type,
             Some(&state_key),
             &content,
-        )
+        ))
         .await?
     {
         return Ok(Json(json!({ "event_id": event_id })));
@@ -9497,7 +9512,7 @@ async fn send_event(
     // below runs exactly as it would in a build without the feature.
     #[cfg(feature = "hub-mode")]
     if query.sticky.is_none()
-        && let Some(response) = crate::hub::send_with_transaction(
+        && let Some(response) = Box::pin(crate::hub::send_with_transaction(
             &state,
             &identity,
             &txn_id,
@@ -9505,7 +9520,7 @@ async fn send_event(
             &event_type,
             None,
             &content,
-        )
+        ))
         .await?
     {
         return Ok(response);
