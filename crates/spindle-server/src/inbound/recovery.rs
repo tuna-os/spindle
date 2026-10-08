@@ -347,22 +347,44 @@ pub(super) async fn verify(
             );
             continue;
         }
-        if !keys.contains_key(server) {
-            let fetched = peers
-                .federation
-                .peer_keys(server)
-                .await
-                .map_err(|error| error.to_string())?;
-            keys.insert(server.to_owned(), fetched);
-        }
-        public_keys.extend(keys[server].map_for(
-            body["origin_server_ts"].as_u64(),
-            rules.enforce_key_validity,
-        ));
+        // The keys the server signed this event with, valid when it says
+        // it signed it: from what is held, or looked for further -- the
+        // server itself, then the notaries -- when it is not.
+        let at = body["origin_server_ts"].as_u64();
+        let fetched = peers
+            .federation
+            .event_keys(
+                server,
+                keys.get(server),
+                &crate::federation::signing_key_ids(body, server),
+                at,
+                rules.enforce_key_validity,
+            )
+            .await
+            .map_err(|error| {
+                signature_refusal(peers.metrics, None, None, body, version, &error.to_string())
+            })?;
+        public_keys.extend(fetched.map_for(at, rules.enforce_key_validity));
+        keys.insert(server.to_owned(), fetched);
     }
-    let body = match spindle_core::version::verify(&public_keys, &canonical, version)
-        .map_err(|error| format!("signature: {error}"))?
-    {
+    let verdict =
+        spindle_core::version::verify(&public_keys, &canonical, version).map_err(|error| {
+            let error = error.to_string();
+            // Name the failing server for the classification: the first
+            // required one whose keys are held, which is the one ruma
+            // reports on when only one is required.
+            let server = keys.keys().find(|server| error.contains(server.as_str()));
+            let held = server.and_then(|server| keys.get(server));
+            signature_refusal(
+                peers.metrics,
+                held,
+                server.map(String::as_str),
+                body,
+                version,
+                &error,
+            )
+        })?;
+    let body = match verdict {
         ruma::signatures::Verified::All => body.clone(),
         ruma::signatures::Verified::Signatures => {
             let redacted = spindle_core::version::redact(&canonical, version)
@@ -375,6 +397,64 @@ pub(super) async fn verify(
         id: pdu.event_id().as_str().to_owned(),
         body,
     })
+}
+
+/// Count a signature refusal by reason, and say why in the refusal: the
+/// reason, the room version it was judged under, the key IDs it was signed
+/// with, and ruma's error -- what a refused event in production otherwise
+/// leaves no trace of. A signature that does not match the bytes also logs
+/// those bytes: the redacted form, which is all a signature covers and
+/// holds no message content, so the disagreement can be found.
+fn signature_refusal(
+    metrics: &Metrics,
+    keys: Option<&PeerKeys>,
+    server: Option<&str>,
+    body: &Value,
+    version: &RoomVersionId,
+    error: &str,
+) -> String {
+    let reason =
+        crate::federation::Federation::classify_signature_failure(keys, server, body, error);
+    metrics.record_signature_failure(reason);
+    if reason == crate::metrics::SignatureFailure::BadSignature
+        && let Ok(CanonicalJsonValue::Object(canonical)) =
+            CanonicalJsonValue::try_from(body.clone())
+        && let Ok(redacted) = spindle_core::version::redact(&canonical, version)
+    {
+        let mut signed = serde_json::to_string(&redacted).unwrap_or_default();
+        if signed.len() > 4096 {
+            let mut end = 4096;
+            while !signed.is_char_boundary(end) {
+                end -= 1;
+            }
+            signed.truncate(end);
+        }
+        tracing::warn!(
+            room_version = %version,
+            room_id = body["room_id"].as_str().unwrap_or("?"),
+            "an event's signature does not match the bytes judged; redacted form: {signed}"
+        );
+    }
+    let signed_with: Vec<String> = body["signatures"]
+        .as_object()
+        .map(|signatures| {
+            signatures
+                .iter()
+                .take(4)
+                .flat_map(|(server, keys)| {
+                    keys.as_object()
+                        .into_iter()
+                        .flat_map(|keys| keys.keys().take(4))
+                        .map(move |key_id| format!("{server}/{key_id}"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    format!(
+        "signature: {}: {error} (room v{version}, signed with [{}])",
+        reason.label(),
+        signed_with.join(", ")
+    )
 }
 
 /// Judge one pushed PDU, recovering or bridging its dependencies when it

@@ -40,6 +40,8 @@ the incident it was supposed to explain.
 | `spindle_federation_backfill_chunks_total` | counter | `result` = `filled`\|`completed`\|`peer_error`\|`rate_limited`\|`invalid`\|`truncated` | Gap backfill chunks. `invalid` is a peer serving history that failed verification; nothing of that chunk was stored. |
 | `spindle_federation_backfill_events_total` | counter | `result` = `fetched`\|`inserted`\|`rejected` | Events a gap backfill fetched, stored, or kept out of the timeline for failing its auth checks. |
 | `spindle_federation_backfill_duration_seconds` | histogram | `result` | Time one backfill chunk took: the page, its auth events, its `/state_ids` and the write. |
+| `spindle_federation_key_fetches_total` | counter | `source` = `direct`\|`notary`\|`cache`, `result` = `ok`\|`error`\|`invalid`\|`throttled` (direct, notary), `hit`\|`miss` (cache) | Lookups of a peer's signing keys. `notary` `ok` climbing means peers this server cannot reach are being verified through `[federation] trusted_key_servers`; `invalid` is a document that failed its signature checks and was refused. |
+| `spindle_federation_signature_failures_total` | counter | `reason` = `no_key`\|`expired_key`\|`bad_signature`\|`missing_signature`\|`malformed` | Received events refused for their signatures. `bad_signature` means a key under the right ID did not verify the bytes judged; each one logs the redacted form it checked. |
 
 ## Alert rules, a scrape target and a dashboard
 

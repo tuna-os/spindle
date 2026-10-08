@@ -152,7 +152,20 @@ pub(crate) fn receive_brokered_pdu(
                     Err(error) => (event_id, Err(error.to_string())),
                 };
             }
-            Err(error) => return (event_id, Err(format!("signature: {error}"))),
+            Err(error) => {
+                let error = error.to_string();
+                let reason = crate::federation::Federation::classify_signature_failure(
+                    Some(keys),
+                    Some(signer),
+                    pdu,
+                    &error,
+                );
+                state.metrics.record_signature_failure(reason);
+                return (
+                    event_id,
+                    Err(format!("signature: {}: {error}", reason.label())),
+                );
+            }
         }
     }
 

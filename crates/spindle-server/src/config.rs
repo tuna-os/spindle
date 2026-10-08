@@ -663,6 +663,82 @@ pub struct FederationConfig {
     /// The window both gap acceptance caps count over, seconds.
     #[serde(default = "default_gap_acceptance_window_secs")]
     pub gap_acceptance_window_secs: u64,
+    /// Notary servers asked for a peer's keys when the peer itself cannot
+    /// answer: it is down, gone, or no longer publishes the key an old
+    /// event was signed with. Each entry is a server name, or a table
+    /// `{ server_name = "...", verify_keys = { "ed25519:id" = "base64" } }`
+    /// pinning the keys the notary must sign its answers with.
+    ///
+    /// Unset means `["matrix.org"]`, Synapse's default -- except with
+    /// `insecure_http`, where it means none: a test rig has no business
+    /// asking a public notary, and could only ask it over plain http.
+    /// `[]` turns the fallback off.
+    ///
+    /// **Trust:** a notary is trusted to say what keys another server had.
+    /// Every document it returns must still carry that server's own
+    /// signature made with a key inside the document, so a notary alone
+    /// cannot mint a key for a server -- but a notary colluding with
+    /// whoever holds a server's (old or stolen) key can make events signed
+    /// with it verify here after the server itself stopped publishing it.
+    /// Without `verify_keys`, the notary's own keys are fetched from it
+    /// directly over TLS, as Synapse does when its warning is suppressed.
+    #[serde(default)]
+    pub trusted_key_servers: Option<Vec<TrustedKeyServer>>,
+}
+
+/// One notary in `[federation] trusted_key_servers`: a bare server name,
+/// or a name with the keys its answers must be signed with.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum TrustedKeyServer {
+    Name(String),
+    Pinned {
+        server_name: String,
+        /// Key ID (`ed25519:...`) to unpadded base64 public key. At least
+        /// one of the notary's signatures must be by one of these.
+        #[serde(default)]
+        verify_keys: Option<std::collections::BTreeMap<String, String>>,
+    },
+}
+
+impl TrustedKeyServer {
+    /// The notary's server name.
+    #[must_use]
+    pub fn server_name(&self) -> &str {
+        match self {
+            Self::Name(name)
+            | Self::Pinned {
+                server_name: name, ..
+            } => name,
+        }
+    }
+
+    /// The pinned keys, if any were configured.
+    #[must_use]
+    pub fn verify_keys(&self) -> Option<&std::collections::BTreeMap<String, String>> {
+        match self {
+            Self::Name(_) => None,
+            Self::Pinned { verify_keys, .. } => verify_keys.as_ref(),
+        }
+    }
+}
+
+/// The notary used when `trusted_key_servers` is not set: Synapse's.
+pub const DEFAULT_TRUSTED_KEY_SERVER: &str = "matrix.org";
+
+impl FederationConfig {
+    /// The notaries in effect: the configured list, or the default one
+    /// (none on an `insecure_http` test rig).
+    #[must_use]
+    pub fn trusted_key_servers(&self) -> Vec<TrustedKeyServer> {
+        match &self.trusted_key_servers {
+            Some(servers) => servers.clone(),
+            None if self.insecure_http => Vec::new(),
+            None => vec![TrustedKeyServer::Name(
+                DEFAULT_TRUSTED_KEY_SERVER.to_owned(),
+            )],
+        }
+    }
 }
 
 fn default_retry_base_ms() -> u64 {
@@ -721,6 +797,7 @@ impl Default for FederationConfig {
             gap_acceptances_per_room: default_gap_acceptances_per_room(),
             gap_acceptances_per_origin: default_gap_acceptances_per_origin(),
             gap_acceptance_window_secs: default_gap_acceptance_window_secs(),
+            trusted_key_servers: None,
         }
     }
 }
@@ -937,6 +1014,40 @@ impl Config {
                 field: "federation.bind",
                 message: "must be unset while federation.enabled = false".to_owned(),
             });
+        }
+        for notary in self.federation.trusted_key_servers() {
+            let name = notary.server_name();
+            if ruma::OwnedServerName::try_from(name).is_err() || name == self.server.name {
+                return Err(ConfigError::Invalid {
+                    field: "federation.trusted_key_servers",
+                    message: format!("{name:?} is not another server's name"),
+                });
+            }
+            for (key_id, key) in notary.verify_keys().into_iter().flatten() {
+                let version_ok = key_id.strip_prefix("ed25519:").is_some_and(|version| {
+                    !version.is_empty()
+                        && version
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                });
+                let key_ok = ruma::serde::Base64::<ruma::serde::base64::Standard>::parse(key)
+                    .is_ok_and(|key| key.as_bytes().len() == 32);
+                if !version_ok || !key_ok {
+                    return Err(ConfigError::Invalid {
+                        field: "federation.trusted_key_servers.verify_keys",
+                        message: format!("{name}: {key_id} is not an ed25519 key ID and key"),
+                    });
+                }
+            }
+            if notary
+                .verify_keys()
+                .is_some_and(std::collections::BTreeMap::is_empty)
+            {
+                return Err(ConfigError::Invalid {
+                    field: "federation.trusted_key_servers.verify_keys",
+                    message: format!("{name}: an empty pin would trust no key; omit it instead"),
+                });
+            }
         }
         for (name, peer) in &self.federation.peers {
             let url = reqwest::Url::parse(&peer.url).map_err(|error| ConfigError::Invalid {
