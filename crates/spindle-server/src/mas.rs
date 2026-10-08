@@ -370,6 +370,11 @@ pub(crate) fn deactivate_user(
         .set_deactivated(localpart, true)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
     let user_id = accounts.user_id(localpart);
+    // Device-less verdicts (an admin-scoped token) are not covered by the
+    // per-device evictions above.
+    if let Some(delegated) = &state.delegated {
+        delegated.forget_user(&user_id);
+    }
     if erase {
         accounts
             .set_erased(localpart, true)
@@ -467,6 +472,13 @@ pub(crate) fn remove_device(
         .devices
         .remove_device_material(&accounts.user_id(localpart), device_id)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    // The provider deletes the device when it ends the session (a logout
+    // through its compatibility layer included), and this is the only word
+    // of it this server gets: every cached verdict for the device goes now,
+    // not when the introspection cache would have expired them (#615).
+    if let Some(delegated) = &state.delegated {
+        delegated.forget_device(&accounts.user_id(localpart), device_id);
+    }
     Ok(())
 }
 

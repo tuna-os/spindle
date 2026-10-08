@@ -2039,6 +2039,12 @@ async fn logout(
         .to_owned();
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     accounts.logout(&token).map_err(|error| internal(&error))?;
+    // Under delegation the token was vouched for by the provider and the
+    // verdict is cached; a logout that left it there would let the token
+    // keep working for the rest of the cache window (#615).
+    if let Some(delegated) = &state.delegated {
+        delegated.forget_token(&token);
+    }
     Ok(Json(json!({})))
 }
 
@@ -2064,6 +2070,9 @@ async fn logout_all(
     accounts
         .logout_everywhere(&localpart_of(&identity.user_id))
         .map_err(|error| internal(&error))?;
+    if let Some(delegated) = &state.delegated {
+        delegated.forget_user(&identity.user_id);
+    }
     Ok(Json(json!({})))
 }
 
@@ -10429,6 +10438,9 @@ async fn deactivate_account(
     accounts
         .logout_everywhere(&localpart)
         .map_err(|error| internal(&error))?;
+    if let Some(delegated) = &state.delegated {
+        delegated.forget_user(&identity.user_id);
+    }
     state.rooms.wake_sync_waiters();
 
     // No identity server is contacted, so no third-party binding is removed.
