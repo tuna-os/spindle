@@ -34,3 +34,12 @@ reconnect.spec.ts :: can only interact with header and footer while reconnecting
 sfu-reconnect-bug.spec.ts :: When creator left, avoid reconnect to the same SFU
 spa-call-sticky.spec.ts :: One to One call using matrix rtc 2.0 aka sticky events
 spa-call-sticky.spec.ts :: One to One rejoin after improper leave does not crash EC
+#
+# Recorded on the nightly run of 2026-10-08 (workflow run 37765413592,
+# element-call pin a03f23e, chromium): MSC4075 ringing and MSC4310 decline,
+# driven through Element Web's widget in a DM -- the voice and the video ring
+# answered from the incoming-call toast, and the video ring declined, with
+# the caller's widget closing on both sides.
+widget/voice-call-dm.spec.ts :: Decline a new video call in DM as widget
+widget/voice-call-dm.spec.ts :: Start a new video call in DM as widget
+widget/voice-call-dm.spec.ts :: Start a new voice call in DM as widget
