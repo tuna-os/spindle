@@ -493,7 +493,20 @@ pub(crate) async fn send_transaction(
         })?)
     };
 
-    let results = receive_pdus(&state, &origin, key_map.as_ref(), &pdus).await;
+    // Off the async workers: ingesting a backlog into a large room is
+    // seconds of synchronous work per PDU -- cold loads, state resolution
+    // -- and #614's liveness failures were four of these at once holding
+    // all four workers while `/health` waited to be polled.
+    let results = {
+        let state = state.clone();
+        let origin = origin.clone();
+        crate::blocking::offload_async(
+            std::sync::Arc::clone(&state.metrics),
+            crate::metrics::BlockingTask::FederationSend,
+            move || async move { receive_pdus(&state, &origin, key_map.as_ref(), &pdus).await },
+        )
+        .await?
+    };
 
     // EDUs after PDUs, so a join and the typing that follows it land in
     // order within one transaction. `m.typing` only, and only about the

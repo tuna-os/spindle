@@ -34,6 +34,10 @@ bind = "127.0.0.1:8008"
 
 [storage]
 path = "./data"
+# Rooms loaded in the background after startup, at once, so the first
+# requests after a restart do not each pay for a cold load. Readiness does
+# not wait for it. 0 turns the warm-up off.
+# warm_concurrency = 2
 
 # Upload allowance in bytes, enforced on POST and reserved-media PUT and
 # advertised by both media config endpoints. Match the old server on migration.

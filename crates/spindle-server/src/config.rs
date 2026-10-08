@@ -707,6 +707,18 @@ pub struct StorageConfig {
     /// media request before a byte moves.
     #[serde(default)]
     pub s3: Option<S3Config>,
+    /// How many rooms the server loads at once in the background after it
+    /// starts, so the first requests after a restart do not each pay for a
+    /// cold load (#614). `0` turns the warm-up off. Kept low on purpose:
+    /// the warm-up competes for the same cores as the traffic it is
+    /// warming for, and two is enough to keep one giant room from holding
+    /// up every other.
+    #[serde(default = "default_warm_concurrency")]
+    pub warm_concurrency: usize,
+}
+
+fn default_warm_concurrency() -> usize {
+    2
 }
 
 /// Media upload limits, advertised to clients and enforced on both upload paths.
@@ -736,6 +748,7 @@ impl Default for StorageConfig {
         Self {
             path: default_data_dir(),
             s3: None,
+            warm_concurrency: default_warm_concurrency(),
         }
     }
 }

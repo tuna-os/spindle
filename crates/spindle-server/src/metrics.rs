@@ -64,7 +64,7 @@ pub enum Origin {
 /// paying for stronger ordering on the append hot path to make a number
 /// that is sampled every 15 seconds marginally fresher would be a poor
 /// trade.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Metrics {
     fork_cases: [AtomicU64; 3],
     events: [AtomicU64; 2],
@@ -80,12 +80,403 @@ pub struct Metrics {
     federation_queue: RwLock<Vec<(String, u64)>>,
     sync_subscribers: AtomicU64,
     sync_lag: Family,
+    /// Cold room loads, by [`RoomSize`]: a count and how long each took.
+    cold_loads: [AtomicU64; RoomSize::ALL.len()],
+    cold_load_latency: [Histogram; RoomSize::ALL.len()],
+    /// How the server counts the rooms it holds open, and the last
+    /// answer it gave (served when the registry is busy at scrape time).
+    resident_rooms: ResidentProbe,
+    /// Time spent waiting to acquire `[registry exclusive, registry shared,
+    /// room exclusive, room shared]`.
+    lock_waits: [Histogram; 4],
+    /// The sync handlers' phases, by [`SyncPhase`].
+    sync_phases: [Histogram; SyncPhase::ALL.len()],
+    /// Work moved off the async workers that has not finished, by
+    /// [`BlockingTask`].
+    blocking_in_flight: [AtomicU64; BlockingTask::ALL.len()],
+    /// Outbound federation transactions by [`TxnResult`], with their
+    /// durations.
+    outbound_txns: [AtomicU64; TxnResult::ALL.len()],
+    outbound_txn_latency: [Histogram; TxnResult::ALL.len()],
+    /// Rooms the startup warm-up has still to load, and has loaded.
+    warmup_pending: AtomicU64,
+    warmup_loaded: AtomicU64,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            fork_cases: Default::default(),
+            events: Default::default(),
+            sidelined: Default::default(),
+            room_locks: Default::default(),
+            registry_locks: Default::default(),
+            append_latency: Family::default(),
+            http_latency: Family::default(),
+            http_requests: RwLock::default(),
+            federation_queue: RwLock::default(),
+            sync_subscribers: AtomicU64::new(0),
+            sync_lag: Family::default(),
+            cold_loads: Default::default(),
+            cold_load_latency: std::array::from_fn(|_| Histogram::with_bounds(&SLOW_BUCKETS)),
+            resident_rooms: ResidentProbe::default(),
+            lock_waits: std::array::from_fn(|_| Histogram::with_bounds(&SLOW_BUCKETS)),
+            sync_phases: std::array::from_fn(|_| Histogram::with_bounds(&SLOW_BUCKETS)),
+            blocking_in_flight: Default::default(),
+            outbound_txns: Default::default(),
+            outbound_txn_latency: std::array::from_fn(|_| Histogram::with_bounds(&SLOW_BUCKETS)),
+            warmup_pending: AtomicU64::new(0),
+            warmup_loaded: AtomicU64::new(0),
+        }
+    }
 }
 
 impl Metrics {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+/// A room's size, coarsely, as a label.
+///
+/// Never the room id: that label would mint a series per room the server
+/// has ever loaded, which is the cardinality #166 rules out. What an
+/// operator needs from a slow load is how big the room was, and five
+/// decades answer that.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoomSize {
+    Under1k,
+    Under10k,
+    Under100k,
+    Under1m,
+    AtLeast1m,
+}
+
+impl RoomSize {
+    pub const ALL: [Self; 5] = [
+        Self::Under1k,
+        Self::Under10k,
+        Self::Under100k,
+        Self::Under1m,
+        Self::AtLeast1m,
+    ];
+
+    /// The bucket a room of `events` log entries falls in.
+    #[must_use]
+    pub fn of(events: usize) -> Self {
+        match events {
+            0..1_000 => Self::Under1k,
+            1_000..10_000 => Self::Under10k,
+            10_000..100_000 => Self::Under100k,
+            100_000..1_000_000 => Self::Under1m,
+            _ => Self::AtLeast1m,
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Under1k => "lt_1k",
+            Self::Under10k => "lt_10k",
+            Self::Under100k => "lt_100k",
+            Self::Under1m => "lt_1m",
+            Self::AtLeast1m => "ge_1m",
+        }
+    }
+}
+
+/// One timed phase of a sync handler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncPhase {
+    /// Sliding sync: sorting the caller's rooms by recency.
+    SlidingOrder,
+    /// Sliding sync: building the entries for the rooms in view.
+    SlidingAssemble,
+    /// Classic `/sync`: reading what changed.
+    SyncRead,
+    /// Classic `/sync`: building the response from it.
+    SyncAssemble,
+}
+
+impl SyncPhase {
+    pub const ALL: [Self; 4] = [
+        Self::SlidingOrder,
+        Self::SlidingAssemble,
+        Self::SyncRead,
+        Self::SyncAssemble,
+    ];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn labels(self) -> (&'static str, &'static str) {
+        match self {
+            Self::SlidingOrder => ("sliding", "order"),
+            Self::SlidingAssemble => ("sliding", "assemble"),
+            Self::SyncRead => ("sync", "read"),
+            Self::SyncAssemble => ("sync", "assemble"),
+        }
+    }
+}
+
+/// Work this server moves off the async worker threads (#614).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockingTask {
+    /// A sliding-sync request's room work (`spawn_blocking`).
+    SlidingSync,
+    /// A classic `/sync` request's room work (`spawn_blocking`).
+    Sync,
+    /// One room loaded by the startup warm-up (`spawn_blocking`).
+    RoomWarmup,
+    /// An inbound federation transaction's PDUs (`spawn_blocking`).
+    FederationSend,
+    /// A cold room load reached from async code (`block_in_place`).
+    ColdLoad,
+    /// A wait for a contended room lock (`block_in_place`).
+    LockWait,
+}
+
+impl BlockingTask {
+    pub const ALL: [Self; 6] = [
+        Self::SlidingSync,
+        Self::Sync,
+        Self::RoomWarmup,
+        Self::FederationSend,
+        Self::ColdLoad,
+        Self::LockWait,
+    ];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SlidingSync => "sliding_sync",
+            Self::Sync => "sync",
+            Self::RoomWarmup => "room_warmup",
+            Self::FederationSend => "federation_send",
+            Self::ColdLoad => "cold_load",
+            Self::LockWait => "lock_wait",
+        }
+    }
+}
+
+/// How one outbound federation transaction ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TxnResult {
+    /// The peer acknowledged it.
+    Success,
+    /// The peer answered, with something other than success.
+    HttpError,
+    /// The peer did not answer in time.
+    Timeout,
+    /// Anything else: unresolvable, unreachable, unsignable.
+    Error,
+}
+
+impl TxnResult {
+    pub const ALL: [Self; 4] = [Self::Success, Self::HttpError, Self::Timeout, Self::Error];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::HttpError => "http_error",
+            Self::Timeout => "timeout",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// Which lock a wait was for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LockKind {
+    /// The registry that maps room ids to their locks: server-wide.
+    Registry,
+    /// One room's log.
+    Room,
+}
+
+type ProbeFn = Box<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// A gauge read at scrape time from whoever owns the number.
+#[derive(Default)]
+struct ResidentProbe {
+    probe: RwLock<Option<ProbeFn>>,
+    last: AtomicU64,
+}
+
+impl std::fmt::Debug for ResidentProbe {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResidentProbe")
+            .field("last", &self.last)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Metrics {
+    /// Record one cold room load: a room this process had not opened,
+    /// read and restored from the store.
+    pub fn observe_cold_load(&self, size: RoomSize, elapsed: Duration) {
+        self.cold_loads[size.index()].fetch_add(1, Ordering::Relaxed);
+        self.cold_load_latency[size.index()].observe(elapsed);
+    }
+
+    /// Read the cold-load counter, for tests that assert it moved.
+    #[must_use]
+    pub fn cold_loads(&self, size: RoomSize) -> u64 {
+        self.cold_loads[size.index()].load(Ordering::Relaxed)
+    }
+
+    /// Cold loads of every size, for tests.
+    #[must_use]
+    pub fn cold_loads_total(&self) -> u64 {
+        RoomSize::ALL
+            .iter()
+            .map(|size| self.cold_loads(*size))
+            .sum()
+    }
+
+    /// Say how to count resident rooms. The probe answers `None` when it
+    /// cannot read without waiting, and the scrape then serves the last
+    /// answer it had rather than queue behind the registry.
+    pub fn set_resident_rooms_probe(
+        &self,
+        probe: impl Fn() -> Option<u64> + Send + Sync + 'static,
+    ) {
+        if let Ok(mut slot) = self.resident_rooms.probe.write() {
+            *slot = Some(Box::new(probe));
+        }
+    }
+
+    /// The resident-room gauge as a scrape would render it.
+    #[must_use]
+    pub fn resident_rooms(&self) -> u64 {
+        if let Ok(probe) = self.resident_rooms.probe.read()
+            && let Some(probe) = probe.as_ref()
+            && let Some(count) = probe()
+        {
+            self.resident_rooms.last.store(count, Ordering::Relaxed);
+            return count;
+        }
+        self.resident_rooms.last.load(Ordering::Relaxed)
+    }
+
+    /// Record how long a lock took to acquire.
+    pub fn observe_lock_wait(&self, kind: LockKind, exclusive: bool, elapsed: Duration) {
+        let index = match kind {
+            LockKind::Registry => 0,
+            LockKind::Room => 2,
+        } + usize::from(!exclusive);
+        self.lock_waits[index].observe(elapsed);
+    }
+
+    /// Lock waits recorded for `kind`, for tests.
+    #[must_use]
+    pub fn lock_waits(&self, kind: LockKind) -> u64 {
+        let base = match kind {
+            LockKind::Registry => 0,
+            LockKind::Room => 2,
+        };
+        self.lock_waits[base].count.load(Ordering::Relaxed)
+            + self.lock_waits[base + 1].count.load(Ordering::Relaxed)
+    }
+
+    /// Record one sync handler phase.
+    pub fn observe_sync_phase(&self, phase: SyncPhase, elapsed: Duration) {
+        self.sync_phases[phase.index()].observe(elapsed);
+    }
+
+    /// Phases recorded, for tests.
+    #[must_use]
+    pub fn sync_phases(&self, phase: SyncPhase) -> u64 {
+        self.sync_phases[phase.index()]
+            .count
+            .load(Ordering::Relaxed)
+    }
+
+    /// One piece of work has left the async workers. The returned guard
+    /// marks it finished when dropped, so a panic cannot leak the gauge.
+    #[must_use]
+    pub fn blocking_started(&self, task: BlockingTask) -> BlockingGuard<'_> {
+        self.blocking_in_flight[task.index()].fetch_add(1, Ordering::Relaxed);
+        BlockingGuard {
+            gauge: &self.blocking_in_flight[task.index()],
+        }
+    }
+
+    /// Work in flight for `task`, for tests.
+    #[must_use]
+    pub fn blocking_in_flight(&self, task: BlockingTask) -> u64 {
+        self.blocking_in_flight[task.index()].load(Ordering::Relaxed)
+    }
+
+    /// Record how one outbound federation transaction ended.
+    pub fn observe_outbound_txn(&self, result: TxnResult, elapsed: Duration) {
+        self.outbound_txns[result.index()].fetch_add(1, Ordering::Relaxed);
+        self.outbound_txn_latency[result.index()].observe(elapsed);
+    }
+
+    /// Outbound transactions by result, for tests.
+    #[must_use]
+    pub fn outbound_txns(&self, result: TxnResult) -> u64 {
+        self.outbound_txns[result.index()].load(Ordering::Relaxed)
+    }
+
+    /// The warm-up has `pending` rooms left to load.
+    pub fn set_warmup_pending(&self, pending: u64) {
+        self.warmup_pending.store(pending, Ordering::Relaxed);
+    }
+
+    /// The warm-up loaded one more room.
+    pub fn warmup_loaded(&self) {
+        self.warmup_loaded.fetch_add(1, Ordering::Relaxed);
+        let _ = self
+            .warmup_pending
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            });
+    }
+
+    /// The warm-up gave up on one room; it is no longer pending.
+    pub fn warmup_failed(&self) {
+        let _ = self
+            .warmup_pending
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            });
+    }
+
+    /// Rooms the warm-up has loaded, for tests.
+    #[must_use]
+    pub fn warmup_loaded_count(&self) -> u64 {
+        self.warmup_loaded.load(Ordering::Relaxed)
+    }
+}
+
+/// Decrements a [`BlockingTask`] gauge when dropped.
+#[derive(Debug)]
+pub struct BlockingGuard<'a> {
+    gauge: &'a AtomicU64,
+}
+
+impl Drop for BlockingGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .gauge
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            });
     }
 }
 
@@ -187,6 +578,7 @@ impl Metrics {
         self.render_http(&mut out);
         self.render_federation(&mut out);
         self.render_sync(&mut out);
+        self.render_responsiveness(&mut out);
         out
     }
 }
@@ -371,6 +763,140 @@ impl Metrics {
     }
 }
 
+impl Metrics {
+    /// The #614 set: cold loads, residency, lock waits, sync phases, work
+    /// off the async workers, outbound transactions and the warm-up. Every
+    /// series is fixed by code and rendered at zero, so a dashboard reads
+    /// "none happened" rather than "no data".
+    #[allow(clippy::too_many_lines, reason = "one flat list of series")]
+    fn render_responsiveness(&self, out: &mut String) {
+        out.push_str(
+            "# HELP spindle_room_cold_loads_total Rooms restored from the store, by size.\n\
+             # TYPE spindle_room_cold_loads_total counter\n",
+        );
+        for size in RoomSize::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_room_cold_loads_total{{size=\"{}\"}} {}",
+                size.label(),
+                self.cold_loads[size.index()].load(Ordering::Relaxed)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_room_cold_load_duration_seconds Time to restore one room \
+             from the store, by size.\n\
+             # TYPE spindle_room_cold_load_duration_seconds histogram\n",
+        );
+        for size in RoomSize::ALL {
+            self.cold_load_latency[size.index()].render_into(
+                out,
+                "spindle_room_cold_load_duration_seconds",
+                &format!("size=\"{}\"", size.label()),
+            );
+        }
+
+        out.push_str(
+            "# HELP spindle_rooms_resident Rooms held open in memory.\n\
+             # TYPE spindle_rooms_resident gauge\n",
+        );
+        let _ = writeln!(out, "spindle_rooms_resident {}", self.resident_rooms());
+
+        out.push_str(
+            "# HELP spindle_lock_wait_seconds Time spent acquiring the room registry \
+             and room locks.\n\
+             # TYPE spindle_lock_wait_seconds histogram\n",
+        );
+        for (index, (lock, mode)) in [
+            ("registry", "exclusive"),
+            ("registry", "shared"),
+            ("room", "exclusive"),
+            ("room", "shared"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            self.lock_waits[index].render_into(
+                out,
+                "spindle_lock_wait_seconds",
+                &format!("lock=\"{lock}\",mode=\"{mode}\""),
+            );
+        }
+
+        out.push_str(
+            "# HELP spindle_sync_phase_duration_seconds Time in each phase of a sync \
+             request.\n\
+             # TYPE spindle_sync_phase_duration_seconds histogram\n",
+        );
+        for phase in SyncPhase::ALL {
+            let (endpoint, name) = phase.labels();
+            self.sync_phases[phase.index()].render_into(
+                out,
+                "spindle_sync_phase_duration_seconds",
+                &format!("endpoint=\"{endpoint}\",phase=\"{name}\""),
+            );
+        }
+
+        out.push_str(
+            "# HELP spindle_blocking_tasks_in_flight Work moved off the async workers \
+             and not yet finished.\n\
+             # TYPE spindle_blocking_tasks_in_flight gauge\n",
+        );
+        for task in BlockingTask::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_blocking_tasks_in_flight{{task=\"{}\"}} {}",
+                task.label(),
+                self.blocking_in_flight[task.index()].load(Ordering::Relaxed)
+            );
+        }
+
+        out.push_str(
+            "# HELP spindle_federation_outbound_transactions_total Outbound federation \
+             transactions, by result.\n\
+             # TYPE spindle_federation_outbound_transactions_total counter\n",
+        );
+        for result in TxnResult::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_outbound_transactions_total{{result=\"{}\"}} {}",
+                result.label(),
+                self.outbound_txns[result.index()].load(Ordering::Relaxed)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_federation_outbound_transaction_duration_seconds Time to \
+             deliver one outbound federation transaction, by result.\n\
+             # TYPE spindle_federation_outbound_transaction_duration_seconds histogram\n",
+        );
+        for result in TxnResult::ALL {
+            self.outbound_txn_latency[result.index()].render_into(
+                out,
+                "spindle_federation_outbound_transaction_duration_seconds",
+                &format!("result=\"{}\"", result.label()),
+            );
+        }
+
+        out.push_str(
+            "# HELP spindle_room_warmup_pending Rooms the startup warm-up has still to load.\n\
+             # TYPE spindle_room_warmup_pending gauge\n",
+        );
+        let _ = writeln!(
+            out,
+            "spindle_room_warmup_pending {}",
+            self.warmup_pending.load(Ordering::Relaxed)
+        );
+        out.push_str(
+            "# HELP spindle_room_warmup_loaded_total Rooms the startup warm-up has loaded.\n\
+             # TYPE spindle_room_warmup_loaded_total counter\n",
+        );
+        let _ = writeln!(
+            out,
+            "spindle_room_warmup_loaded_total {}",
+            self.warmup_loaded.load(Ordering::Relaxed)
+        );
+    }
+}
+
 /// Bucket bounds, in seconds.
 ///
 /// Weighted to where SPEC §18.3 puts its targets — local send p50 under
@@ -382,6 +908,16 @@ const BUCKETS: [f64; 12] = [
     0.000_5, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
 ];
 
+/// Bucket bounds for the slow things, in seconds: cold room loads, lock
+/// waits behind them, and whole sync phases. #614 measured a first sliding
+/// sync at 105 s and a liveness stall of 95 s; the default set tops out at
+/// 2.5 s and would have put every one of those in `+Inf`, which says
+/// "slow" and not how slow.
+const SLOW_BUCKETS: [f64; 16] = [
+    0.000_1, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+    120.0,
+];
+
 /// A Prometheus histogram: per-bucket counts, a sum and a total.
 ///
 /// Counts are per-bucket here and made cumulative at render, which is
@@ -389,7 +925,8 @@ const BUCKETS: [f64; 12] = [
 /// touching every bucket above the observation on the hot path.
 #[derive(Debug)]
 struct Histogram {
-    buckets: [AtomicU64; BUCKETS.len()],
+    bounds: &'static [f64],
+    buckets: Box<[AtomicU64]>,
     /// Microseconds, so the sum needs no float atomic. Rendered as
     /// seconds, which is the unit the metric name promises.
     sum_micros: AtomicU64,
@@ -397,11 +934,14 @@ struct Histogram {
 }
 
 impl Histogram {
-    const fn new() -> Self {
-        #[allow(clippy::declare_interior_mutable_const)]
-        const ZERO: AtomicU64 = AtomicU64::new(0);
+    fn new() -> Self {
+        Self::with_bounds(&BUCKETS)
+    }
+
+    fn with_bounds(bounds: &'static [f64]) -> Self {
         Self {
-            buckets: [ZERO; BUCKETS.len()],
+            bounds,
+            buckets: bounds.iter().map(|_| AtomicU64::new(0)).collect(),
             sum_micros: AtomicU64::new(0),
             count: AtomicU64::new(0),
         }
@@ -412,10 +952,11 @@ impl Histogram {
     /// cast that has to be reasoned about.
     fn observe(&self, elapsed: Duration) {
         let seconds = elapsed.as_secs_f64();
-        let slot = BUCKETS
+        let slot = self
+            .bounds
             .iter()
             .position(|bound| seconds <= *bound)
-            .unwrap_or(BUCKETS.len());
+            .unwrap_or(self.bounds.len());
         if let Some(bucket) = self.buckets.get(slot) {
             bucket.fetch_add(1, Ordering::Relaxed);
         }
@@ -431,7 +972,7 @@ impl Histogram {
     fn render_into(&self, out: &mut String, name: &str, labels: &str) {
         let mut cumulative = 0;
         let separator = if labels.is_empty() { "" } else { "," };
-        for (index, bound) in BUCKETS.iter().enumerate() {
+        for (index, bound) in self.bounds.iter().enumerate() {
             cumulative += self.buckets[index].load(Ordering::Relaxed);
             let _ = writeln!(
                 out,
@@ -637,6 +1178,103 @@ mod tests {
         // every client on earth as connected to this server.
         metrics.sync_waiter_finished();
         assert_eq!(metrics.sync_subscribers(), 0);
+    }
+
+    /// The #614 series exist at zero, move when recorded, and carry no
+    /// label a caller could grow.
+    #[test]
+    fn the_responsiveness_series_register_and_move() {
+        let metrics = Metrics::new();
+        let text = metrics.render();
+        for name in [
+            "spindle_room_cold_loads_total",
+            "spindle_room_cold_load_duration_seconds",
+            "spindle_rooms_resident",
+            "spindle_lock_wait_seconds",
+            "spindle_sync_phase_duration_seconds",
+            "spindle_blocking_tasks_in_flight",
+            "spindle_federation_outbound_transactions_total",
+            "spindle_federation_outbound_transaction_duration_seconds",
+            "spindle_room_warmup_pending",
+            "spindle_room_warmup_loaded_total",
+        ] {
+            assert!(text.contains(&format!("# HELP {name} ")), "{text}");
+            assert!(text.contains(&format!("# TYPE {name} ")), "{text}");
+        }
+        assert!(text.contains("spindle_room_cold_loads_total{size=\"ge_1m\"} 0"));
+        assert!(text.contains("spindle_rooms_resident 0"));
+
+        metrics.observe_cold_load(RoomSize::of(1_010_000), Duration::from_secs(90));
+        metrics.observe_cold_load(RoomSize::of(12), Duration::from_millis(3));
+        assert_eq!(metrics.cold_loads(RoomSize::AtLeast1m), 1);
+        assert_eq!(metrics.cold_loads(RoomSize::Under1k), 1);
+        assert_eq!(RoomSize::of(999), RoomSize::Under1k);
+        assert_eq!(RoomSize::of(1_000), RoomSize::Under10k);
+        assert_eq!(RoomSize::of(87_000), RoomSize::Under100k);
+        assert_eq!(RoomSize::of(999_999), RoomSize::Under1m);
+
+        metrics.set_resident_rooms_probe(|| Some(7));
+        metrics.observe_lock_wait(LockKind::Room, false, Duration::from_millis(2));
+        metrics.observe_sync_phase(SyncPhase::SlidingOrder, Duration::from_millis(4));
+        metrics.observe_outbound_txn(TxnResult::Timeout, Duration::from_secs(30));
+        metrics.set_warmup_pending(3);
+        metrics.warmup_loaded();
+        {
+            let _guard = metrics.blocking_started(BlockingTask::SlidingSync);
+            assert_eq!(metrics.blocking_in_flight(BlockingTask::SlidingSync), 1);
+            assert!(
+                metrics
+                    .render()
+                    .contains("spindle_blocking_tasks_in_flight{task=\"sliding_sync\"} 1")
+            );
+        }
+        assert_eq!(metrics.blocking_in_flight(BlockingTask::SlidingSync), 0);
+
+        let text = metrics.render();
+        assert!(
+            text.contains("spindle_room_cold_loads_total{size=\"ge_1m\"} 1"),
+            "{text}"
+        );
+        // 90 s lands in the 120 s bucket, not +Inf: the slow bounds exist
+        // so a minutes-long load is still measured.
+        assert!(
+            text.contains(
+                "spindle_room_cold_load_duration_seconds_bucket{size=\"ge_1m\",le=\"120\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "spindle_room_cold_load_duration_seconds_bucket{size=\"ge_1m\",le=\"60\"} 0"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("spindle_rooms_resident 7"), "{text}");
+        assert!(
+            text.contains("spindle_lock_wait_seconds_count{lock=\"room\",mode=\"shared\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "spindle_sync_phase_duration_seconds_count{endpoint=\"sliding\",phase=\"order\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("spindle_federation_outbound_transactions_total{result=\"timeout\"} 1"),
+            "{text}"
+        );
+        assert!(text.contains("spindle_room_warmup_pending 2"), "{text}");
+        assert!(
+            text.contains("spindle_room_warmup_loaded_total 1"),
+            "{text}"
+        );
+        // No room id, no destination, nothing from a request in any of them.
+        for line in text.lines().filter(|line| {
+            line.starts_with("spindle_room_cold") || line.starts_with("spindle_lock_wait")
+        }) {
+            assert!(!line.contains('!'), "a room id leaked into a label: {line}");
+        }
     }
 
     /// The exposition is the contract, so it is asserted rather than eyeballed.
