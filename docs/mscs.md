@@ -57,6 +57,7 @@ what became of each proposal.
 
 | MSC | Title | Stable in | Flags | Evidence | Notes |
 |---|---|---|---|---|---|
+| [MSC3995](https://github.com/matrix-org/matrix-spec-proposals/pull/3995) | Linearized Matrix | — | — | `SPEC.md`, `divergence.md`, `hub_mode.rs`, `hub_mode_disabled.rs` | The design basis: an append-only per-room log with materialized state and no state resolution on the hot path. Hub mode is opt-in per room, behind the off-by-default hub-mode Cargo feature: hub designation, compare-and-append ordering and signed chain attestations between Spindle peers, in ordinary room versions. Handoff, failover, checkpoints and the MSC's own room version are designed only. The MSC is a WIP that has not changed since 2023, and its IETF draft has expired. SPEC.md section 12 records where Spindle follows each text. |
 | [MSC4108](https://github.com/matrix-org/matrix-spec-proposals/pull/4108) | QR code login | — | `org.matrix.msc4108` | `rendezvous.rs` | Homeserver rendezvous mailbox with conditional reads and writes, expiry and capacity limits. OAuth device authorization and secure-channel negotiation belong to MAS and the clients; their integrated rehearsal is pending. |
 
 ## Planned
@@ -69,12 +70,6 @@ what became of each proposal.
 | [MSC4256](https://github.com/matrix-org/matrix-spec-proposals/pull/4256) | MLS mode with deterministic epochs | — | — | `SPEC.md`, `ROADMAP.md` |  |
 | [MSC4428](https://github.com/matrix-org/matrix-spec-proposals/pull/4428) | Hydra: stable member identifiers | — | — | `mesh-federation.md` | Named with MSC4242 as the phase-2 set; not started. |
 | [MSC4430](https://github.com/matrix-org/matrix-spec-proposals/pull/4430) | Hydra: member keys | — | — | `mesh-federation.md` | Named with MSC4242 as the phase-2 set; not started. |
-
-## Design basis
-
-| MSC | Title | Stable in | Flags | Evidence | Notes |
-|---|---|---|---|---|---|
-| [MSC3995](https://github.com/matrix-org/matrix-spec-proposals/pull/3995) | Linearized Matrix | — | — | `SPEC.md`, `divergence.md` | The design basis: an append-only per-room log with materialized state and no state resolution on the hot path. Hub mode is opt-in per room. The MSC is a WIP that has not changed since 2023, and its IETF draft has expired. SPEC.md section 12.0 records where Spindle follows each text. |
 
 ## Superseded
 

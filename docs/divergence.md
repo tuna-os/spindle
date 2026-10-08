@@ -269,10 +269,14 @@ optimization would break compatibility:
 
 Worth being blunt, because the project's name invites the opposite assumption:
 
-**There is no MSC3995 protocol code in this repository.** What is implemented
-is linear *storage*, which peers cannot observe — Spindle emits ordinary room
+**A default build has no MSC3995 protocol code.** What it implements is
+linear *storage*, which peers cannot observe — Spindle emits ordinary room
 v11 PDUs and federates as a normal homeserver. Linearized Matrix hub mode is
-#22, milestone M6, behind a feature flag, and it is deliberately last.
+#22, milestone M6. Its first slice is behind the `hub-mode` Cargo feature,
+which is off by default and off in production. It works only between
+Spindle servers that turn it on, and a server without it sees an ordinary
+room. SPEC §12.6 has the design, and `hub_mode_disabled.rs` is the test that
+a default build serves none of it.
 
 The performance claims come from the implementation, not the protocol. That
 ordering is the plan, not an accident of what got built first: the storage

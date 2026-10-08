@@ -860,7 +860,7 @@ MSC3706 as planned, and this paragraph is the design it will be built to.
 | 6–10 | Full | Served at their own rules: two-server join, event exchange and redaction tested per version; v7 knocks, v8/v9 restricted joins, v1–v9 string power levels |
 | **11** | **Full** | `MSC3820` cleanups: no top-level `origin` (MSC3989), no `creator` in create content (MSC2175), `redacts` in content (MSC2174), updated redaction algorithm (MSC2176/MSC3821) |
 | **12** | **Full; default candidate — see below** | Current stable version; supported by Ruma 0.16 and by both surveyed Rust homeservers |
-| `org.matrix.msc3995` | Experimental, behind `unstable-msc3995` | MSC3995's LM room version, v10-based, with hub-assigned `prev_event` (§12.4) |
+| `org.matrix.msc3995` | Designed, not built | MSC3995's LM room version, v10-based, with hub-assigned `prev_event` (§12.4); would be behind the `hub-mode` feature |
 
 The load-bearing decision is **not which version number** — it is that native
 rooms use an *ordinary* room version. A room whose DAG is a chain needs no new
@@ -887,7 +887,8 @@ orders and fans out.
 
 ### 12.0 Where the proposal stands
 
-Checked on 2026-10-02; recheck before any wire code lands (#22).
+Checked on 2026-10-02, and again on 2026-10-08 before the first wire code
+landed (#22): the MSC's head is still `ad2b46f`, last updated 2023-08-19.
 
 - **[MSC3995](https://github.com/matrix-org/matrix-spec-proposals/pull/3995)**
   is open, titled "[WIP] Linearized Matrix", labelled `needs-implementation`,
@@ -977,7 +978,11 @@ PUT /_matrix/federation/v1/send/{txnId}
 The I-D's `v2/send` path is not used. The room version (§12.4) is the MSC's,
 an LPDU is only valid in a room of that version, and so the room version
 already gates the unstable behaviour without a second endpoint. A build
-without `unstable-msc3995` rejects such a room before it reads an LPDU.
+without `hub-mode` rejects such a room before it reads an LPDU.
+
+This section and §12.4 describe the LM room version, which is designed and
+not built. What is built is hub mode in an ordinary room version (§12.6),
+where a participant submits a finished PDU instead of an LPDU.
 
 The LPDU is a PDU with `hub_server` set to the current hub and without
 `auth_events`, `prev_events` and the top-level `hashes`. Spindle follows the
@@ -1045,19 +1050,113 @@ are not supported: the I-D is expired and no peer speaks either.
 
 Everything in this list is in neither text. Each one is Spindle-namespaced on
 the wire, is negotiated only between Spindle peers, and must be absent from
-a build without the `unstable-msc3995` feature (§15). A peer that knows only
+a build without the `hub-mode` feature (§15). A peer that knows only
 the MSC sees ordinary LM events with extra, ignorable keys.
 
 | Extension | Where | Why the proposal is not enough |
 |---|---|---|
 | Epochs and `prev_epoch_final_*` on `m.room.hub` | §12.1 | The MSC has no answer for a transfer away from a hub that is down |
-| Chain attestation: the hub signs `(room_id, li, event_id, chain[li])`, carried in `unsigned` under `org.spindle.attestation` | §13.3 | The MSC's "participants don't know what they don't know" problem has "no current solutions"; a signed chain makes withheld or reordered history provable |
+| Chain attestation: the hub signs `(room_id, hub, epoch, li, event_id, chain[li])` and sends it in an `org.spindle.msc3995.attestations` EDU to hub-mode peers only (**built**, §12.6) | §13.3 | The MSC's "participants don't know what they don't know" problem has "no current solutions"; a signed chain makes withheld or reordered history provable |
+| Capability probe `GET /_matrix/federation/unstable/org.spindle.msc3995/capabilities` (**built**, §12.6) | §12.6 | The MSC's `m.linearized` flag means "not DAG-capable", which Spindle is not |
+| Compare-and-append submission `POST .../org.spindle.msc3995/submit/{roomId}` (**built**, §12.6) | §12.6 | The MSC's LPDU needs its own room version; this works in any room version |
 | `m.room.checkpoint`, renamed `org.spindle.checkpoint` | §13.3 | No equivalent |
 | Failover election at `epoch + 1` without the outgoing hub's signature | §13.2 | Contradicts the MSC's dual-signature rule, so it only works between Spindle peers |
 
-`unsigned` is the place for the attestation because a PDU's `unsigned` does
-not feed the event ID, so adding it changes nothing a legacy peer validates;
-the attestation carries its own signature for the same reason.
+An earlier draft of this section put the attestation in the PDU's
+`unsigned`. The built slice sends it in an EDU instead: `unsigned` is part
+of what every server in the room receives, and a server that does not speak
+hub mode must receive nothing namespaced for it. The attestation carries its
+own signature, so it needs no PDU to vouch for it.
+
+### 12.6 What is built: hub mode in an ordinary room version (#22)
+
+The first slice is behind the `hub-mode` Cargo feature (off by default) and
+then behind `[federation.hub] enabled` (off by default). It works in **any
+ordinary room version**, so a room can have a hub and Synapse members at the
+same time. That is the requirement for a room that is still a normal Matrix
+room. The MSC's own room version (§12.4) is still designed only.
+
+**Designation.** A room has a hub when its current `m.room.hub` state event
+was sent by a user on the server that sent `m.room.create`. As in the MSC,
+the hub is the server of the sender. The MSC rule that the current hub must
+sign the event is enforced by the overlay, because an ordinary room version
+does not enforce it. In its narrowest form: no handoff exists yet, so an
+`m.room.hub` from any other server makes the room ordinary again. A room with
+no `m.room.hub` is ordinary. That is a change from the MSC, where the creator
+is the hub by default: in an ordinary room version, hub mode is opt-in.
+
+**Discovery.** A peer is asked
+`GET /_matrix/federation/unstable/org.spindle.msc3995/capabilities`. A
+definite answer is kept for `capability_ttl_ms`. Synapse's
+`404 M_UNRECOGNIZED` is a definite "no". No answer is kept as "no" for ten
+seconds.
+
+**Ordering (compare-and-append).** A participant builds the event as it
+always does: on its own head, with its own `prev_events`, `auth_events`,
+hashes and signature. It then sends the event to the hub before any other
+server sees it:
+
+```
+POST /_matrix/federation/unstable/org.spindle.msc3995/submit/{roomId}
+{"pdu": { ...the finished event... }}
+```
+
+The hub verifies the signature and the content hash, and it refuses a bad
+hash. It does not redact. Then, under the same room lock that its own
+appends take, it appends the event only if `prev_events` is exactly its
+current head. If so, it answers `200 {"event_id", "li", "attestation"}`. If
+not, it answers `409 ORG.SPINDLE.MSC3995_STALE_HEAD` with its head and up to
+50 events the participant does not have. The participant takes those
+events, builds the event again and tries again (`submit_attempts`). Every
+event that the hub accepts extends the one chain, so hub-ordered events
+cannot fork.
+
+**Dual ordinary-PDU projection.** The submitted event is already an
+ordinary PDU, so the projection is the identity. After the hub places the
+event, its origin commits it and sends it to every server in the room, the
+hub included, in the ordinary way. The hub does not relay it. A server that
+does not speak hub mode gets ordinary events from their own origins, each
+with one parent. The MSC's star delivery, where the hub relays all events,
+needs relayed-PDU acceptance and the LM room version. It is designed only.
+
+**Attestations.** After every event it sequences, local or submitted, the
+hub signs `{room_id, hub, epoch, li, event_id, chain}` for each new entry.
+It sends these in an `org.spindle.msc3995.attestations` EDU to the
+hub-mode servers in the room, and to no other server. It attests events
+from servers without hub mode as well, because it vouches for its order
+and not for their content. A participant verifies each attestation against
+the hub's key and keeps it. It checks that `chain[li] =
+BLAKE3(domain || chain[li-1] || event_id)` holds with each neighbour that it
+holds. A second, different attestation for a position it already holds is
+not stored. Together with the first, it is kept as a proof. A broken chain
+step is also kept as a proof (§13.3).
+
+**Failure.** If the hub cannot place an event (it is unreachable, too slow,
+too often stale, or it refuses), the participant commits the event that it
+already built and sends it in the ordinary way. It never builds a second
+event, so a submission whose answer was lost does not become two messages.
+The room then heals in the ordinary way: a fork that the next event merges.
+In an ordinary room version, liveness is never given up for ordering. This
+is the opposite of the MSC's trade (§13.1), and it is correct here.
+
+| Spindle already has | Gives hub mode, without new wire format |
+|---|---|
+| The signed linear index `li` (§5.1) | The sequence number in each attestation, and the position a stale participant catches up from |
+| The chain value `chain[li]` (§5.3), computed at append for live entries | The attestation's commitment. The hub signs it, and does not compute it again |
+| One write lock per room on every append (§15) | Compare-and-append is a check under that lock. No new concurrency control |
+| Ordinary PDUs, fork merging and state resolution (§9) | The fallback, and every room with a member that does not speak hub mode |
+
+| New, and Spindle-namespaced | Why |
+|---|---|
+| The capability probe | The MSC has no advertisement for a DAG-capable hub |
+| The submit endpoint and its `409` | An ordinary room version cannot carry an LPDU |
+| The attestation EDU and its format | Neither text has attestations |
+| `org.spindle.epoch` in `m.room.hub` content | Read into attestations; failover that would advance it is designed only |
+
+Designed only, with TODOs in `crates/spindle-server/src/hub.rs`: handoff and
+failover (§13.2), the rule that failover cannot truncate an attested prefix,
+checkpoints, the LM room version (§12.4), relayed delivery, and hub metrics
+on `/metrics`.
 
 ---
 
@@ -1070,7 +1169,7 @@ the attestation carries its own signature for the same reason.
 | Decide event order | Yes | That is its function |
 | Delay or drop an event | Yes | Detectable by the originator (no fan-out), not preventable |
 | Forge an event from another server | **No** | Origin Ed25519 signature |
-| Modify an event's content | **No** | `hashes.lpdu` covers the participant's content and its signature covers the LPDU (§12.2); the reference hash covers the redacted event. This holds only because Spindle follows the I-D here: under the MSC's text alone the answer is yes |
+| Modify an event's content | **No** | `hashes.lpdu` covers the participant's content and its signature covers the LPDU (§12.2); the reference hash covers the redacted event. This holds only because Spindle follows the I-D here: under the MSC's text alone the answer is yes. In an ordinary room version (§12.6) the participant submits a finished event, so the ordinary content hash and the origin signature cover it |
 | Reorder committed history silently | **No** | Chain hash + hub signature per entry (§13.3) |
 | Present different histories to different participants | **No, not undetectably** | §13.3 |
 | Read E2EE content | **No** | Megolm/MLS; the hub is a transport |
@@ -1079,6 +1178,10 @@ This is strictly the same content-integrity guarantee as DAG Matrix. What is
 given up is *liveness independence*: a partitioned participant cannot make
 progress without the hub, whereas DAG Matrix would let it fork and merge later.
 That is the deliberate trade — forking and merging is exactly the expensive thing.
+
+That trade belongs to the LM room version. In an ordinary room version
+(§12.6) it is not made: a participant that cannot reach its hub sends the
+event as an ordinary event, and gives up only the hub's ordering of it.
 
 ### 13.2 Hub failover
 
@@ -1108,6 +1211,12 @@ The chain hash makes the log a transparency log. If a hub signs two different
 entries at the same `li`, or two entries whose chain hashes are inconsistent, any
 participant holding both signatures possesses a self-contained, non-repudiable
 proof of misbehavior.
+
+Built (§12.6): a participant stores such a pair as
+`{"kind": "org.spindle.msc3995.equivocation", "reason":
+"conflicting_entries" | "broken_chain", "room_id", "hub", "li",
+"attestations": [a, b]}`. Anybody with the hub's public key can verify it.
+Publishing the proof to the room, and acting on it, is designed only.
 
 Spindle additionally supports periodic `org.spindle.checkpoint` state events carrying
 `chain[li]` and the current `StateRoot`. Because the state root is a hash of the
@@ -1182,7 +1291,7 @@ Implementation language is **Rust**, on the `ruma` crate family for spec types:
 `ruma-events`, `ruma-client-api`, `ruma-federation-api`, `ruma-common`,
 `ruma-signatures`, and `ruma-state-res` (the auth predicate everywhere, and state
 resolution wherever an event's parents hold different states, §9.2).
-Unstable MSCs are gated behind Cargo features (`unstable-msc3995`,
+Unstable MSCs are gated behind Cargo features (`hub-mode` for MSC3995,
 `unstable-msc3820`, `unstable-msc4186`, `unstable-msc4244`, `unstable-msc4256`),
 so nothing experimental compiles into a production binary by accident.
 
