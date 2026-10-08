@@ -4446,24 +4446,17 @@ async fn join_remote(
         // preceding timeline. A bounded backfill makes immediate client
         // pagination useful; failure is non-fatal because the join itself is
         // complete and a partial peer must not leave a corrupt room behind.
-        match state
-            .federation
-            .remote_backfill(server, room_id, &join_id, INITIAL_HISTORY_LIMIT, &version)
-            .await
-        {
-            Ok(page) => {
-                if let Err(error) = state.rooms.backfill_remote(
-                    room_id,
-                    &page.state,
-                    &page.auth_chain,
-                    &page.history,
-                ) {
-                    tracing::warn!(%error, %room_id, %server, "initial federation backfill refused");
-                }
-            }
-            Err(error) => {
-                tracing::debug!(%error, %room_id, %server, "initial federation backfill unavailable");
-            }
+        //
+        // Only a join that left a gap asks, though: a prev_event of our join
+        // the response did not carry is history to fetch, while a room whose
+        // heads all arrived (a freshly created one, Complement's mock server)
+        // has nothing before the join, and a strict test peer counts the
+        // needless request itself as a failure.
+        let gap = crate::rooms::edge_ids(&join["prev_events"])
+            .iter()
+            .any(|id| state.rooms.event(room_id, id).is_err());
+        if gap {
+            fetch_initial_history(&state, server, room_id, &join_id, &version).await;
         }
         state.rooms.wake_sync_waiters();
         return Ok(Json(json!({ "room_id": room_id })));
@@ -4476,6 +4469,36 @@ async fn join_remote(
             format!("no server admitted the join: {last_refusal}"),
         )
     }))
+}
+
+/// Fetch and store the bounded pre-join history page after a completed
+/// remote join. Failure is logged, never surfaced: the join stands either
+/// way.
+async fn fetch_initial_history(
+    state: &AppState,
+    server: &str,
+    room_id: &str,
+    join_id: &str,
+    version: &ruma::RoomVersionId,
+) {
+    match state
+        .federation
+        .remote_backfill(server, room_id, join_id, INITIAL_HISTORY_LIMIT, version)
+        .await
+    {
+        Ok(page) => {
+            if let Err(error) =
+                state
+                    .rooms
+                    .backfill_remote(room_id, &page.state, &page.auth_chain, &page.history)
+            {
+                tracing::warn!(%error, %room_id, %server, "initial federation backfill refused");
+            }
+        }
+        Err(error) => {
+            tracing::debug!(%error, %room_id, %server, "initial federation backfill unavailable");
+        }
+    }
 }
 
 /// `POST /_matrix/client/v3/rooms/{room_id}/leave`
