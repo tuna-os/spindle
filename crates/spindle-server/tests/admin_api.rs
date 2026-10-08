@@ -138,6 +138,30 @@ fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
             reqwest::Method::POST,
             "/_synapse/admin/v1/purge_history/!r:x".to_owned(),
         ),
+        (
+            reqwest::Method::GET,
+            format!("/_synapse/admin/v2/users/{user}/devices/DEV"),
+        ),
+        (
+            reqwest::Method::PUT,
+            format!("/_synapse/admin/v2/users/{user}/devices/DEV"),
+        ),
+        (
+            reqwest::Method::DELETE,
+            format!("/_synapse/admin/v2/users/{user}/devices/DEV"),
+        ),
+        (
+            reqwest::Method::DELETE,
+            "/_synapse/admin/v2/rooms/!r:x".to_owned(),
+        ),
+        (
+            reqwest::Method::GET,
+            "/_synapse/admin/v2/rooms/!r:x/delete_status".to_owned(),
+        ),
+        (
+            reqwest::Method::GET,
+            "/_synapse/admin/v2/rooms/delete_status/abc".to_owned(),
+        ),
     ]);
     for prefix in ["/_spindle/admin/v1", "/_synapse/admin/v1"] {
         routes.extend([
@@ -222,6 +246,47 @@ fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
             (reqwest::Method::GET, format!("{prefix}/event_reports")),
             (reqwest::Method::GET, format!("{prefix}/event_reports/1")),
             (reqwest::Method::GET, format!("{prefix}/audit")),
+            (
+                reqwest::Method::GET,
+                format!("{prefix}/users/{user}/devices/DEV"),
+            ),
+            (
+                reqwest::Method::PUT,
+                format!("{prefix}/users/{user}/devices/DEV"),
+            ),
+            (reqwest::Method::GET, format!("{prefix}/users/{user}/admin")),
+            (reqwest::Method::PUT, format!("{prefix}/users/{user}/admin")),
+            (
+                reqwest::Method::GET,
+                format!("{prefix}/username_available?username=x"),
+            ),
+            (reqwest::Method::GET, format!("{prefix}/rooms/!r:x/block")),
+            (reqwest::Method::PUT, format!("{prefix}/rooms/!r:x/block")),
+            (reqwest::Method::DELETE, format!("{prefix}/event_reports/1")),
+            (reqwest::Method::GET, format!("{prefix}/scheduled_tasks")),
+            (
+                reqwest::Method::GET,
+                format!("{prefix}/federation/destinations"),
+            ),
+            (
+                reqwest::Method::GET,
+                format!("{prefix}/federation/destinations/peer"),
+            ),
+            (
+                reqwest::Method::GET,
+                format!("{prefix}/federation/destinations/peer/rooms"),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("{prefix}/federation/destinations/peer/reset_connection"),
+            ),
+            (reqwest::Method::GET, format!("{prefix}/users/{user}/media")),
+            (
+                reqwest::Method::DELETE,
+                format!("{prefix}/users/{user}/media"),
+            ),
+            (reqwest::Method::GET, format!("{prefix}/media/x/y")),
+            (reqwest::Method::DELETE, format!("{prefix}/media/x/y")),
         ]);
     }
     routes
@@ -583,7 +648,7 @@ async fn rooms_fixture(server: &Instance) -> (String, String, String) {
             reqwest::Method::POST,
             "/_matrix/client/v3/createRoom",
             Some(&admin_token),
-            Some(&json!({ "name": "Operations", "preset": "public_chat" })),
+            Some(&json!({ "name": "Operations", "preset": "public_chat", "visibility": "public" })),
         )
         .await;
     assert_eq!(status, 200, "{body}");
@@ -649,6 +714,7 @@ async fn the_room_listing_orders_filters_and_paginates() {
     assert_eq!(body["rooms"][1]["room_id"], unnamed.as_str(), "{body}");
     assert_eq!(body["rooms"][0]["name"], "Operations", "{body}");
     assert_eq!(body["rooms"][0]["joined_members"], 2, "{body}");
+    // `public` is Synapse's: in this server's room directory.
     assert_eq!(body["rooms"][0]["public"], true, "{body}");
     assert_eq!(body["rooms"][1]["public"], false, "{body}");
     assert!(body["rooms"][0]["version"].is_string(), "{body}");
@@ -1571,7 +1637,8 @@ async fn event_reports_list_newest_first_and_paginate() {
         .await;
     assert_eq!(status, 200, "{page}");
     assert_eq!(page["event_reports"].as_array().unwrap().len(), 1, "{page}");
-    assert_eq!(page["next_token"], "1", "{page}");
+    // An integer, as Synapse's event report paging is.
+    assert_eq!(page["next_token"], 1, "{page}");
     let (_, page) = server
         .request(
             reqwest::Method::GET,
@@ -1851,4 +1918,415 @@ async fn reset_links_need_the_builtin_provider() {
         )
         .await;
     assert_eq!(status, 404, "{body}");
+}
+
+/// The users group in Synapse's shapes, as synadm and the admin panels
+/// read them: every field of a user, a device, and the listing's filters,
+/// orderings and paging.
+#[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one walk through the group")]
+async fn users_and_devices_answer_in_synapses_shapes() {
+    let server = Instance::start().await;
+    let admin_token = server.register("root").await;
+    server.promote("root");
+    let alice_token = server.register("alice").await;
+    server.register("bob").await;
+    let alice = server.user("alice");
+    let get = |path: String| {
+        let server = &server;
+        let token = admin_token.clone();
+        async move {
+            let (status, body) = server
+                .request(reqwest::Method::GET, &path, Some(&token), None)
+                .await;
+            assert_eq!(status, 200, "{path}: {body}");
+            body
+        }
+    };
+
+    let listed = get("/_synapse/admin/v2/users".to_owned()).await;
+    for user in listed["users"].as_array().unwrap() {
+        for field in [
+            "name",
+            "user_type",
+            "is_guest",
+            "admin",
+            "deactivated",
+            "erased",
+            "shadow_banned",
+            "displayname",
+            "avatar_url",
+            "creation_ts",
+            "approved",
+            "locked",
+            "suspended",
+            "last_seen_ts",
+        ] {
+            assert!(user.get(field).is_some(), "{field} missing from {user}");
+        }
+    }
+    // Name ascending by default, descending with `dir=b`.
+    let names = |body: &Value| -> Vec<String> {
+        body["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|user| user["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(
+        names(&listed),
+        [
+            server.user("alice"),
+            server.user("bob"),
+            server.user("root")
+        ]
+    );
+    let backwards = get("/_synapse/admin/v2/users?dir=b".to_owned()).await;
+    assert_eq!(
+        names(&backwards),
+        [
+            server.user("root"),
+            server.user("bob"),
+            server.user("alice")
+        ]
+    );
+    let admins = get("/_synapse/admin/v2/users?admins=true".to_owned()).await;
+    assert_eq!(names(&admins), [server.user("root")]);
+    // `name` matches the display name too, case-insensitively.
+    server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_synapse/admin/v2/users/{alice}"),
+            Some(&admin_token),
+            Some(&json!({ "displayname": "Wonderland" })),
+        )
+        .await;
+    let by_name = get("/_synapse/admin/v2/users?name=WONDER".to_owned()).await;
+    assert_eq!(names(&by_name), std::slice::from_ref(&alice));
+    let page = get("/_synapse/admin/v2/users?limit=2".to_owned()).await;
+    assert_eq!(page["next_token"], "2", "{page}");
+    assert_eq!(page["total"], 3, "{page}");
+    let (status, _) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v2/users?order_by=height",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 400);
+
+    // The detail adds third-party IDs and the rest.
+    let detail = get(format!("/_synapse/admin/v2/users/{alice}")).await;
+    for field in [
+        "threepids",
+        "external_ids",
+        "appservice_id",
+        "consent_version",
+    ] {
+        assert!(detail.get(field).is_some(), "{field} missing from {detail}");
+    }
+
+    // A device, listed, read, renamed.
+    let devices = get(format!("/_synapse/admin/v2/users/{alice}/devices")).await;
+    let device = &devices["devices"][0];
+    for field in [
+        "device_id",
+        "display_name",
+        "last_seen_ip",
+        "last_seen_ts",
+        "last_seen_user_agent",
+        "user_id",
+    ] {
+        assert!(device.get(field).is_some(), "{field} missing from {device}");
+    }
+    let device_id = device["device_id"].as_str().unwrap().to_owned();
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_synapse/admin/v2/users/{alice}/devices/{device_id}"),
+            Some(&admin_token),
+            Some(&json!({ "display_name": "Alice's laptop" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let one = get(format!(
+        "/_synapse/admin/v2/users/{alice}/devices/{device_id}"
+    ))
+    .await;
+    assert_eq!(one["display_name"], "Alice's laptop", "{one}");
+    assert_eq!(one["user_id"], alice.as_str(), "{one}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v2/users/{alice}/devices/NOPE"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 404, "{body}");
+
+    // The admin flag, which an admin cannot take from themselves.
+    let flag = get(format!("/_synapse/admin/v1/users/{alice}/admin")).await;
+    assert_eq!(flag, json!({ "admin": false }));
+    let root = server.user("root");
+    let (status, _) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_synapse/admin/v1/users/{root}/admin"),
+            Some(&admin_token),
+            Some(&json!({ "admin": false })),
+        )
+        .await;
+    assert_eq!(status, 400, "self-demotion");
+
+    // Username availability.
+    let free = get("/_synapse/admin/v1/username_available?username=carol".to_owned()).await;
+    assert_eq!(free, json!({ "available": true }));
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/username_available?username=alice",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["errcode"], "M_USER_IN_USE", "{body}");
+
+    // A password set through PUT signs the user out, as Synapse does.
+    let (status, _) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_synapse/admin/v2/users/{alice}"),
+            Some(&admin_token),
+            Some(&json!({ "password": "a-new-password-1" })),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, _) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(&alice_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 401, "signed out by the password change");
+
+    // Locking through PUT, and the listing filter for it.
+    server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_synapse/admin/v2/users/{alice}"),
+            Some(&admin_token),
+            Some(&json!({ "locked": true })),
+        )
+        .await;
+    let locked = get("/_synapse/admin/v2/users?locked=true".to_owned()).await;
+    assert_eq!(names(&locked), [alice]);
+}
+
+/// Media: a user's uploads, one item, and deletion that takes the bytes.
+#[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one walk through the group")]
+async fn user_media_lists_and_deletes() {
+    let server = Instance::start().await;
+    let admin_token = server.register("root").await;
+    server.promote("root");
+    let alice_token = server.register("alice").await;
+    let alice = server.user("alice");
+    let mut uploaded = Vec::new();
+    for name in ["one.txt", "two.txt"] {
+        let response = server
+            .client
+            .post(format!(
+                "http://{}/_matrix/media/v3/upload?filename={name}",
+                server.name
+            ))
+            .header("authorization", format!("Bearer {alice_token}"))
+            .header("content-type", "text/plain")
+            .body(format!("contents of {name}"))
+            .send()
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+        let mxc = body["content_uri"].as_str().unwrap().to_owned();
+        uploaded.push(mxc.rsplit('/').next().unwrap().to_owned());
+    }
+
+    let (status, listing) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v1/users/{alice}/media"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{listing}");
+    assert_eq!(listing["total"], 2, "{listing}");
+    let item = &listing["media"][0];
+    for field in [
+        "media_id",
+        "media_type",
+        "media_length",
+        "upload_name",
+        "created_ts",
+        "last_access_ts",
+        "quarantined_by",
+        "safe_from_quarantine",
+    ] {
+        assert!(item.get(field).is_some(), "{field} missing from {item}");
+    }
+
+    let server_name = server.name.clone();
+    let (status, info) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v1/media/{server_name}/{}", uploaded[0]),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{info}");
+    assert_eq!(info["media_info"]["user_id"], alice.as_str(), "{info}");
+    assert_eq!(info["media_info"]["upload_name"], "one.txt", "{info}");
+
+    let (status, deleted) = server
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/_synapse/admin/v1/media/{server_name}/{}", uploaded[0]),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{deleted}");
+    assert_eq!(
+        deleted,
+        json!({ "deleted_media": [uploaded[0]], "total": 1 })
+    );
+    let response = server
+        .client
+        .get(format!(
+            "http://{}/_matrix/client/v1/media/download/{server_name}/{}",
+            server.name, uploaded[0]
+        ))
+        .header("authorization", format!("Bearer {alice_token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 404, "deleted media is gone");
+    let (status, _) = server
+        .request(
+            reqwest::Method::DELETE,
+            "/_synapse/admin/v1/media/elsewhere.example/abc",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 400, "remote media is the other server's to delete");
+
+    let (status, deleted) = server
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/_synapse/admin/v1/users/{alice}/media"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{deleted}");
+    assert_eq!(deleted["total"], 1, "{deleted}");
+}
+
+/// Event reports filter, page by integer token, and can be dismissed;
+/// rooms can be blocked and unblocked without being deleted.
+#[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one walk through the group")]
+async fn reports_dismiss_and_rooms_block_in_synapses_shapes() {
+    let server = Instance::start().await;
+    let (admin_token, room, _, _) = reports_fixture(&server).await;
+    let (status, reports) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/event_reports?dir=f",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{reports}");
+    let first = reports["event_reports"][0]["id"].as_u64().unwrap();
+    let (_, newest) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/event_reports",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert!(
+        newest["event_reports"][0]["id"].as_u64().unwrap() > first,
+        "{newest}"
+    );
+    let (_, filtered) = server
+        .request(
+            reqwest::Method::GET,
+            &format!(
+                "/_synapse/admin/v1/event_reports?event_sender_user_id={}",
+                server.user("nobody")
+            ),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(filtered["total"], 0, "{filtered}");
+
+    let (status, _) = server
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/_synapse/admin/v1/event_reports/{first}"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, _) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v1/event_reports/{first}"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 404, "a dismissed report is gone");
+
+    let block_path = format!("/_synapse/admin/v1/rooms/{room}/block");
+    let (_, block) = server
+        .request(reqwest::Method::GET, &block_path, Some(&admin_token), None)
+        .await;
+    assert_eq!(block, json!({ "block": false }));
+    let (status, block) = server
+        .request(
+            reqwest::Method::PUT,
+            &block_path,
+            Some(&admin_token),
+            Some(&json!({ "block": true })),
+        )
+        .await;
+    assert_eq!(status, 200, "{block}");
+    assert_eq!(block, json!({ "block": true }));
+    let (_, block) = server
+        .request(reqwest::Method::GET, &block_path, Some(&admin_token), None)
+        .await;
+    assert_eq!(block["block"], true, "{block}");
+    assert_eq!(block["user_id"], server.user("root"), "{block}");
+    let (_, block) = server
+        .request(
+            reqwest::Method::PUT,
+            &block_path,
+            Some(&admin_token),
+            Some(&json!({ "block": false })),
+        )
+        .await;
+    assert_eq!(block, json!({ "block": false }));
 }

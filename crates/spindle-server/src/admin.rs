@@ -3,21 +3,27 @@
 //!
 //! The shape is deliberately Synapse's (#83): operators have tooling and
 //! muscle memory, and inventing a different spelling for the same
-//! operations buys nothing. What is *not* Synapse's is the auth model —
-//! an `admin` flag on an ordinary account rather than a shared secret,
-//! so every audit record names who acted and revocation is per-operator
-//! — and the audit log itself: an append-only record per mutating
-//! request, in its own keyspace, exempt from purge.
+//! operations buys nothing. Element Admin, the console the ESS deployment
+//! ships, is the strictest of those tools: it validates every response
+//! against Synapse's schema, so a missing field breaks a whole page.
+//! What is *not* Synapse's is the auth model — an `admin` flag on an
+//! ordinary account, or a delegated token carrying the
+//! `urn:synapse:admin:*` scope, rather than a shared secret, so every
+//! audit record names who acted — and the audit log itself: an
+//! append-only record per mutating request, in its own keyspace, exempt
+//! from purge.
 //!
 //! The honest-advertisement rule from `surface.rs` applies here in its
 //! sternest form: an admin endpoint that is routed must work, because a
 //! stub returning `{}` is indistinguishable from success to the tooling
-//! that calls it. This module carries the groups of #83's spec that are
-//! built — the users group, the rooms group and event reports — and
-//! routes nothing beyond what it serves: registration tokens are not
-//! here because `m.login.registration_token` is not a flow this server
-//! offers, and server notices are not here because there is no
-//! server-notices room to send them into.
+//! that calls it. Where Synapse reports something this server does not
+//! record (when an account was created, where a device was last seen),
+//! the field is present and `null`, never invented.
+//!
+//! This module carries the users, rooms, event-report, registration-token
+//! and server-notice groups. Background room deletion and the
+//! `scheduled_tasks` listing are in `admin_tasks`, federation
+//! destinations in `admin_federation`, and media in `admin_media`.
 
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::StatusCode;
@@ -36,6 +42,7 @@ use crate::accounts::{Account, Accounts, unguessable_password};
 use crate::auth::Authenticated;
 use crate::errors::MatrixError;
 
+#[allow(clippy::too_many_lines, reason = "one row per route")]
 pub fn routes() -> Router<AppState> {
     let group = |prefix: &str| {
         Router::new()
@@ -64,7 +71,15 @@ pub fn routes() -> Router<AppState> {
             .route(&format!("{prefix}/users/{{user_id}}/devices"), get(devices))
             .route(
                 &format!("{prefix}/users/{{user_id}}/devices/{{device_id}}"),
-                axum::routing::delete(delete_device),
+                get(get_device).put(put_device).delete(delete_device),
+            )
+            .route(
+                &format!("{prefix}/users/{{user_id}}/admin"),
+                get(get_user_admin).put(put_user_admin),
+            )
+            .route(
+                &format!("{prefix}/username_available"),
+                get(username_available),
             )
             .route(
                 &format!("{prefix}/users/{{user_id}}/joined_rooms"),
@@ -79,6 +94,10 @@ pub fn routes() -> Router<AppState> {
             .route(
                 &format!("{prefix}/rooms/{{room_id}}/members"),
                 get(room_members),
+            )
+            .route(
+                &format!("{prefix}/rooms/{{room_id}}/block"),
+                get(get_room_block).put(put_room_block),
             )
             .route(
                 &format!("{prefix}/rooms/{{room_id}}/state"),
@@ -103,7 +122,7 @@ pub fn routes() -> Router<AppState> {
             .route(&format!("{prefix}/event_reports"), get(list_event_reports))
             .route(
                 &format!("{prefix}/event_reports/{{report_id}}"),
-                get(get_event_report),
+                get(get_event_report).delete(delete_event_report),
             )
             .route(&format!("{prefix}/audit"), get(audit_log))
             .route(
@@ -149,6 +168,10 @@ fn synapse_spellings() -> Router<AppState> {
             get(get_user).put(put_user),
         )
         .route("/_synapse/admin/v2/users/{user_id}/devices", get(devices))
+        .route(
+            "/_synapse/admin/v2/users/{user_id}/devices/{device_id}",
+            get(get_device).put(put_device).delete(delete_device),
+        )
         .route(
             "/_synapse/admin/v2/users/{user_id}/delete_devices",
             post(delete_devices),
@@ -290,6 +313,14 @@ impl AdminActor {
     #[must_use]
     pub fn identity(&self) -> &crate::accounts::Identity {
         &self.0
+    }
+
+    /// A second handle on the same proof, for work an admin request hands
+    /// to a background task (`admin_tasks`). Only an existing proof can be
+    /// duplicated, so this mints nothing a handler did not already hold.
+    #[must_use]
+    pub(crate) fn duplicate(&self) -> Self {
+        Self(self.0.clone())
     }
 }
 
@@ -488,17 +519,59 @@ fn target_account(state: &AppState, user_id: &str) -> Result<(String, Account), 
     Ok((localpart, account))
 }
 
+/// One account in the shape of Synapse's user listing.
+///
+/// The fields Synapse reports that this server does not track are
+/// present with the value that is true here: no guests, no shadow bans,
+/// no user types, no consent tracking, every account approved. When an
+/// account was created and when it was last seen are not recorded, and
+/// are `null` rather than invented.
 fn user_json(state: &AppState, account: &Account) -> Value {
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     let user_id = accounts.user_id(&account.localpart);
     let profile = state.profiles.get(&user_id).unwrap_or_default();
     json!({
         "name": user_id,
-        "displayname": profile.displayname,
-        "avatar_url": profile.avatar_url,
+        "user_type": null,
+        "is_guest": false,
         "admin": account.admin,
         "deactivated": account.deactivated,
+        "erased": account.erased,
+        "shadow_banned": false,
+        "displayname": profile.displayname,
+        "avatar_url": profile.avatar_url,
+        "creation_ts": null,
+        "approved": true,
+        "locked": account.locked,
+        "suspended": account.suspended,
+        "last_seen_ts": null,
     })
+}
+
+/// One account in the shape of Synapse's user detail: the listing's
+/// fields, its email addresses as third-party IDs, and the fields this
+/// server has no counterpart for.
+fn user_detail_json(state: &AppState, account: &Account) -> Value {
+    let mut user = user_json(state, account);
+    let threepids: Vec<Value> = crate::email::addresses_of(state, &account.localpart)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(address, added_at)| {
+            json!({
+                "medium": "email",
+                "address": address,
+                "added_at": added_at,
+                "validated_at": added_at,
+            })
+        })
+        .collect();
+    user["threepids"] = json!(threepids);
+    user["external_ids"] = json!([]);
+    user["appservice_id"] = Value::Null;
+    user["consent_server_notice_sent"] = Value::Null;
+    user["consent_version"] = Value::Null;
+    user["consent_ts"] = Value::Null;
+    user
 }
 
 /// `GET /server_version`
@@ -517,45 +590,117 @@ struct ListQuery {
     #[serde(default)]
     from: usize,
     limit: Option<usize>,
-    name: Option<String>,
-    deactivated: Option<bool>,
     actor: Option<String>,
     action: Option<String>,
 }
 
-/// `GET /users?from&limit&name&deactivated`
+#[derive(Deserialize)]
+struct UsersQuery {
+    from: Option<String>,
+    limit: Option<i64>,
+    user_id: Option<String>,
+    name: Option<String>,
+    /// Accepted for Synapse's callers. There are no guest accounts, so
+    /// including or excluding them changes nothing.
+    #[allow(dead_code, reason = "accepted and ignored, as documented")]
+    guests: Option<bool>,
+    admins: Option<bool>,
+    deactivated: Option<bool>,
+    locked: Option<bool>,
+    suspended: Option<bool>,
+    order_by: Option<String>,
+    dir: Option<String>,
+}
+
+/// `GET /users` — Synapse's v2 listing.
+///
+/// `user_id` matches part of the user ID; `name` matches part of the user
+/// ID or the display name, either case-insensitively. `deactivated`,
+/// `admins`, `locked` and `suspended` narrow to accounts with or without
+/// the flag. `guests=true` adds nothing, since there are no guests.
+/// `from` is an offset, and `next_token` the next one, as a string.
 async fn list_users(
     State(state): State<AppState>,
     _actor: AdminActor,
-    Query(query): Query<ListQuery>,
+    Query(query): Query<UsersQuery>,
 ) -> Result<Json<Value>, MatrixError> {
+    let from = match query.from.as_deref() {
+        None => 0,
+        Some(from) => from.parse::<usize>().map_err(|_| {
+            invalid_param("Query parameter from must be a string representing a positive integer.")
+        })?,
+    };
+    let limit = usize::try_from(query.limit.unwrap_or(100))
+        .map_err(|_| invalid_param("Query parameter limit must be a positive integer."))?;
+    let order_by = query.order_by.as_deref().unwrap_or("name");
+    if !matches!(
+        order_by,
+        "name"
+            | "is_guest"
+            | "admin"
+            | "user_type"
+            | "deactivated"
+            | "shadow_banned"
+            | "displayname"
+            | "avatar_url"
+            | "creation_ts"
+            | "last_seen_ts"
+            | "locked"
+            | "suspended"
+            | "approved"
+    ) {
+        return Err(invalid_param(format!(
+            "Unknown value for order_by: {order_by}"
+        )));
+    }
+    let ascending = match query.dir.as_deref().unwrap_or("f") {
+        "f" => true,
+        "b" => false,
+        other => return Err(invalid_param(format!("Unknown direction: {other}"))),
+    };
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     let all = accounts
         .all_accounts()
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    let matching: Vec<&Account> = all
+    let user_needle = query.user_id.as_deref().map(str::to_lowercase);
+    let name_needle = query.name.as_deref().map(str::to_lowercase);
+    let mut users: Vec<Value> = all
         .iter()
         .filter(|account| {
             query
-                .name
-                .as_deref()
-                .is_none_or(|name| account.localpart.contains(name))
+                .deactivated
+                .is_none_or(|wanted| account.deactivated == wanted)
+                && query.admins.is_none_or(|wanted| account.admin == wanted)
+                && query.locked.is_none_or(|wanted| account.locked == wanted)
                 && query
-                    .deactivated
-                    .is_none_or(|wanted| account.deactivated == wanted)
+                    .suspended
+                    .is_none_or(|wanted| account.suspended == wanted)
+        })
+        .map(|account| user_json(&state, account))
+        .filter(|user| {
+            let id = user["name"].as_str().unwrap_or_default().to_lowercase();
+            let displayname = user["displayname"]
+                .as_str()
+                .unwrap_or_default()
+                .to_lowercase();
+            user_needle
+                .as_deref()
+                .is_none_or(|needle| id.contains(needle))
+                && name_needle
+                    .as_deref()
+                    .is_none_or(|needle| id.contains(needle) || displayname.contains(needle))
         })
         .collect();
-    let total = matching.len();
-    let limit = query.limit.unwrap_or(100);
-    let page: Vec<Value> = matching
-        .iter()
-        .skip(query.from)
-        .take(limit)
-        .map(|account| user_json(&state, account))
-        .collect();
+    users.sort_by(|a, b| {
+        let order = compare_field(&a[order_by], &b[order_by])
+            .then_with(|| compare_field(&a["name"], &b["name"]));
+        if ascending { order } else { order.reverse() }
+    });
+    let total = users.len();
+    let page: Vec<Value> = users.into_iter().skip(from).take(limit).collect();
     let mut body = json!({ "users": page, "total": total });
-    if query.from + limit < total {
-        body["next_token"] = json!((query.from + limit).to_string());
+    if from + limit < total && limit > 0 {
+        body["next_token"] = json!((from + limit).to_string());
     }
     Ok(Json(body))
 }
@@ -567,15 +712,20 @@ async fn get_user(
     Path(user_id): Path<String>,
 ) -> Result<Json<Value>, MatrixError> {
     let (_, account) = target_account(&state, &user_id)?;
-    Ok(Json(user_json(&state, &account)))
+    Ok(Json(user_detail_json(&state, &account)))
 }
 
 #[derive(Deserialize)]
 struct PutUser {
     displayname: Option<String>,
+    avatar_url: Option<String>,
     admin: Option<bool>,
     deactivated: Option<bool>,
+    locked: Option<bool>,
     password: Option<String>,
+    /// Synapse signs the user out everywhere when an administrator sets
+    /// their password, unless told not to.
+    logout_devices: Option<bool>,
 }
 
 /// `PUT /users/{userId}` — create or modify.
@@ -609,6 +759,11 @@ async fn put_user(
         accounts
             .set_password(&localpart, password)
             .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        if request.logout_devices.unwrap_or(true) {
+            accounts
+                .logout_everywhere(&localpart)
+                .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        }
     }
     if let Some(admin) = request.admin {
         accounts
@@ -622,13 +777,18 @@ async fn put_user(
             .set_deactivated(&localpart, false)
             .map_err(|error| MatrixError::internal(&error.to_string()))?;
     }
-    if let Some(displayname) = &request.displayname {
+    if let Some(locked) = request.locked {
+        accounts
+            .set_locked(&localpart, locked)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    }
+    if request.displayname.is_some() || request.avatar_url.is_some() {
         state
             .profiles
             .set(
                 &accounts.user_id(&localpart),
-                Some(Some(displayname.clone())),
-                None,
+                request.displayname.clone().map(Some),
+                request.avatar_url.clone().map(Some),
             )
             .map_err(|error| MatrixError::internal(&error.to_string()))?;
     }
@@ -643,7 +803,9 @@ async fn put_user(
             "password_changed": request.password.is_some(),
             "admin": request.admin,
             "deactivated": request.deactivated,
+            "locked": request.locked,
             "displayname": request.displayname,
+            "avatar_url": request.avatar_url,
         }),
     )?;
     let (_, account) = target_account(&state, &user_id)?;
@@ -652,7 +814,7 @@ async fn put_user(
     } else {
         StatusCode::CREATED
     };
-    Ok((status, Json(user_json(&state, &account))))
+    Ok((status, Json(user_detail_json(&state, &account))))
 }
 
 #[derive(Deserialize)]
@@ -830,18 +992,157 @@ async fn devices(
 ) -> Result<Json<Value>, MatrixError> {
     let (localpart, _) = target_account(&state, &user_id)?;
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let user_id = accounts.user_id(&localpart);
     let devices: Vec<Value> = accounts
         .devices_of(&localpart)
         .map_err(|error| MatrixError::internal(&error.to_string()))?
-        .into_iter()
-        .map(|device| {
-            json!({
-                "device_id": device.device_id,
-                "display_name": device.display_name,
-            })
-        })
+        .iter()
+        .map(|device| device_json(&user_id, device))
         .collect();
     Ok(Json(json!({ "total": devices.len(), "devices": devices })))
+}
+
+/// One device in Synapse's shape. Where and when a device was last seen
+/// is not recorded here, so those fields are `null`, as Synapse reports a
+/// device it has never seen.
+fn device_json(user_id: &str, device: &crate::accounts::Device) -> Value {
+    json!({
+        "device_id": device.device_id,
+        "display_name": device.display_name,
+        "last_seen_ip": null,
+        "last_seen_ts": null,
+        "last_seen_user_agent": null,
+        "user_id": user_id,
+        "dehydrated": false,
+    })
+}
+
+fn target_device(
+    state: &AppState,
+    user_id: &str,
+    device_id: &str,
+) -> Result<(String, crate::accounts::Device), MatrixError> {
+    let (localpart, _) = target_account(state, user_id)?;
+    let device = Accounts::new(state.store.as_ref(), &state.config.server.name)
+        .device(&localpart, device_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+        .ok_or_else(|| MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No device found"))?;
+    Ok((localpart, device))
+}
+
+/// `GET /users/{userId}/devices/{deviceId}`
+async fn get_device(
+    State(state): State<AppState>,
+    _actor: AdminActor,
+    Path((user_id, device_id)): Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    let (localpart, device) = target_device(&state, &user_id, &device_id)?;
+    let user_id =
+        Accounts::new(state.store.as_ref(), &state.config.server.name).user_id(&localpart);
+    Ok(Json(device_json(&user_id, &device)))
+}
+
+#[derive(Deserialize)]
+struct PutDevice {
+    display_name: Option<String>,
+}
+
+/// `PUT /users/{userId}/devices/{deviceId}` — `{display_name}`.
+async fn put_device(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path((user_id, device_id)): Path<(String, String)>,
+    Json(request): Json<PutDevice>,
+) -> Result<Json<Value>, MatrixError> {
+    let (localpart, _) = target_device(&state, &user_id, &device_id)?;
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    accounts
+        .put_device(&localpart, &device_id, request.display_name.clone())
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    crate::mas::device_list_changed(&state, &accounts.user_id(&localpart));
+    audit(
+        &state,
+        &actor.identity().user_id,
+        "rename_device",
+        &user_id,
+        &json!({ "device_id": device_id, "display_name": request.display_name }),
+    )?;
+    Ok(Json(json!({})))
+}
+
+/// `GET /users/{userId}/admin` — `{admin}`.
+async fn get_user_admin(
+    State(state): State<AppState>,
+    _actor: AdminActor,
+    Path(user_id): Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    let (_, account) = target_account(&state, &user_id)?;
+    Ok(Json(json!({ "admin": account.admin })))
+}
+
+#[derive(Deserialize)]
+struct SetAdmin {
+    admin: bool,
+}
+
+/// `PUT /users/{userId}/admin` — `{admin}`. As in Synapse, an admin
+/// cannot take their own admin flag away: the last admin doing so by
+/// mistake leaves nobody able to give it back.
+async fn put_user_admin(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path(user_id): Path<String>,
+    Json(request): Json<SetAdmin>,
+) -> Result<Json<Value>, MatrixError> {
+    let (localpart, _) = target_account(&state, &user_id)?;
+    if !request.admin && actor.identity().user_id == user_id {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_UNKNOWN",
+            "You may not demote yourself.",
+        ));
+    }
+    Accounts::new(state.store.as_ref(), &state.config.server.name)
+        .set_admin(&localpart, request.admin)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    audit(
+        &state,
+        &actor.identity().user_id,
+        "set_admin",
+        &user_id,
+        &json!({ "admin": request.admin }),
+    )?;
+    Ok(Json(json!({})))
+}
+
+#[derive(Deserialize)]
+struct UsernameQuery {
+    username: String,
+}
+
+/// `GET /username_available?username=` — `{available: true}`, or a 400
+/// `M_USER_IN_USE` / `M_INVALID_USERNAME`, as Synapse answers.
+async fn username_available(
+    State(state): State<AppState>,
+    _actor: AdminActor,
+    Query(query): Query<UsernameQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    let localpart = query.username.to_lowercase();
+    if localpart.is_empty()
+        || !localpart.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._=-/+".contains(&byte)
+        })
+    {
+        return Err(MatrixError::invalid_username());
+    }
+    let taken = Accounts::new(state.store.as_ref(), &state.config.server.name)
+        .account(&localpart)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+        .is_some();
+    if taken {
+        return Err(MatrixError::user_in_use());
+    }
+    Ok(Json(json!({ "available": true })))
 }
 
 /// `DELETE /users/{userId}/devices/{deviceId}`
@@ -934,68 +1235,214 @@ async fn whois(
     Ok(Json(json!({ "user_id": user_id, "devices": devices })))
 }
 
-/// One room as the admin listing and detail views describe it.
+/// One room as Synapse's admin room listing describes it.
 ///
 /// Everything here is read from the room's current state and metadata —
 /// nothing is cached or estimated, because an operator acting on this
 /// view (blocking, purging) needs it to be the room, not a summary of
-/// last week's room.
-fn room_json(state: &AppState, room_id: &str) -> Result<Value, crate::rooms::RoomError> {
-    let events = state.rooms.state(room_id)?;
+/// last week's room. Each field is one state lookup, not a read of the
+/// whole state: a listing reads every room, and some rooms' state runs
+/// to tens of thousands of events.
+///
+/// `public` is Synapse's: whether the room is in this server's room
+/// directory, not whether its join rule is public.
+fn room_json(
+    state: &AppState,
+    actor: &AdminActor,
+    room_id: &str,
+) -> Result<Value, crate::rooms::RoomError> {
+    let joined = state.rooms.joined_member_ids(room_id)?;
     let content = |event_type: &str, field: &str| -> Value {
-        events
-            .iter()
-            .find(|event| event["type"] == event_type && event["state_key"] == "")
-            .map_or(Value::Null, |event| event["content"][field].clone())
+        state
+            .rooms
+            .admin(actor)
+            .state_event(room_id, event_type, "")
+            .map_or(Value::Null, |content| content[field].clone())
     };
-    let create = events
-        .iter()
-        .find(|event| event["type"] == "m.room.create" && event["state_key"] == "");
-    let joined = state.rooms.joined_members(room_id)?;
+    let create = state
+        .rooms
+        .state_event_full(room_id, "m.room.create", "")
+        .ok();
     let local_suffix = format!(":{}", state.config.server.name);
     let joined_local = joined
-        .keys()
+        .iter()
         .filter(|user| user.ends_with(&local_suffix))
         .count();
+    let public = state.directory.is_published(room_id).unwrap_or(false);
+    let string_or_null = |value: Value| {
+        if value.is_string() {
+            value
+        } else {
+            Value::Null
+        }
+    };
     Ok(json!({
         "room_id": room_id,
-        "name": content("m.room.name", "name"),
-        "topic": content("m.room.topic", "topic"),
-        "avatar": content("m.room.avatar", "url"),
-        "canonical_alias": content("m.room.canonical_alias", "alias"),
+        "name": string_or_null(content("m.room.name", "name")),
+        "canonical_alias": string_or_null(content("m.room.canonical_alias", "alias")),
         "joined_members": joined.len(),
         "joined_local_members": joined_local,
         // The spec's default when m.room.create names no version.
         "version": create
+            .as_ref()
             .and_then(|event| event["content"]["room_version"].as_str())
             .unwrap_or("1"),
-        "creator": create.and_then(|event| event["sender"].as_str()),
-        "encryption": content("m.room.encryption", "algorithm"),
-        "federatable": create.is_none_or(|event| event["content"]["m.federate"] != false),
-        "public": content("m.room.join_rules", "join_rule") == "public",
-        "join_rules": content("m.room.join_rules", "join_rule"),
-        "guest_access": content("m.room.guest_access", "guest_access"),
-        "history_visibility": content("m.room.history_visibility", "history_visibility"),
-        "room_type": create.map_or(Value::Null, |event| event["content"]["type"].clone()),
-        "state_events": events.len(),
+        "creator": create
+            .as_ref()
+            .and_then(|event| event["content"]["creator"].as_str().or_else(|| event["sender"].as_str()))
+            .unwrap_or_default(),
+        "encryption": string_or_null(content("m.room.encryption", "algorithm")),
+        "federatable": create
+            .as_ref()
+            .is_none_or(|event| event["content"]["m.federate"] != false),
+        "public": public,
+        "join_rules": string_or_null(content("m.room.join_rules", "join_rule")),
+        "guest_access": string_or_null(content("m.room.guest_access", "guest_access")),
+        "history_visibility": string_or_null(content("m.room.history_visibility", "history_visibility")),
+        "state_events": state.rooms.admin(actor).state_entry_count(room_id)?,
+        "room_type": create
+            .as_ref()
+            .map_or(Value::Null, |event| string_or_null(event["content"]["type"].clone())),
     }))
+}
+
+/// The room as Synapse's room detail describes it: the listing's fields,
+/// and the topic, avatar, local device count and whether every local
+/// member has forgotten it.
+fn room_detail_json(
+    state: &AppState,
+    actor: &AdminActor,
+    room_id: &str,
+) -> Result<Value, crate::rooms::RoomError> {
+    let mut room = room_json(state, actor, room_id)?;
+    let content = |event_type: &str, field: &str| -> Value {
+        state
+            .rooms
+            .admin(actor)
+            .state_event(room_id, event_type, "")
+            .ok()
+            .map(|content| content[field].clone())
+            .filter(Value::is_string)
+            .unwrap_or(Value::Null)
+    };
+    room["topic"] = content("m.room.topic", "topic");
+    room["avatar"] = content("m.room.avatar", "url");
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let joined = state.rooms.joined_member_ids(room_id)?;
+    let devices: usize = joined
+        .iter()
+        .filter_map(|user| local_localpart(state, user))
+        .map(|localpart| {
+            accounts
+                .devices_of(&localpart)
+                .map_or(0, |devices| devices.len())
+        })
+        .sum();
+    room["joined_local_devices"] = json!(devices);
+    // Synapse: true once every local user who was ever in the room has
+    // forgotten it. Nobody local still joined is the cheap first test;
+    // only then are the room's member events read.
+    let forgotten = room["joined_local_members"] == 0 && {
+        let local_suffix = format!(":{}", state.config.server.name);
+        let locals: Vec<String> = state
+            .rooms
+            .state(room_id)?
+            .iter()
+            .filter(|event| event["type"] == "m.room.member")
+            .filter_map(|event| event["state_key"].as_str())
+            .filter(|user| user.ends_with(&local_suffix))
+            .map(str::to_owned)
+            .collect();
+        !locals.is_empty()
+            && locals
+                .iter()
+                .all(|user| state.rooms.is_forgotten(user, room_id).unwrap_or(false))
+    };
+    room["forgotten"] = json!(forgotten);
+    Ok(room)
 }
 
 #[derive(Deserialize)]
 struct RoomsQuery {
-    #[serde(default)]
-    from: usize,
-    limit: Option<usize>,
+    from: Option<i64>,
+    limit: Option<i64>,
     order_by: Option<String>,
+    dir: Option<String>,
     search_term: Option<String>,
+    public_rooms: Option<bool>,
+    empty_rooms: Option<bool>,
 }
 
-/// `GET /rooms?from&limit&order_by&search_term`
+fn invalid_param(message: impl Into<String>) -> MatrixError {
+    MatrixError::new(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", message)
+}
+
+/// Synapse's room orderings: the field each sorts on, and whether it
+/// sorts ascending before `dir=b` flips it.
+fn room_order(order_by: &str) -> Option<(&'static str, bool)> {
+    Some(match order_by {
+        "name" | "alphabetical" => ("name", true),
+        "size" | "joined_members" => ("joined_members", false),
+        "joined_local_members" => ("joined_local_members", false),
+        "version" => ("version", false),
+        "state_events" => ("state_events", false),
+        "canonical_alias" => ("canonical_alias", true),
+        "creator" => ("creator", true),
+        "encryption" => ("encryption", true),
+        "federatable" => ("federatable", true),
+        "public" => ("public", true),
+        "join_rules" => ("join_rules", true),
+        "guest_access" => ("guest_access", true),
+        "history_visibility" => ("history_visibility", true),
+        _ => return None,
+    })
+}
+
+/// Compare two JSON values of one room field. A null sorts after every
+/// value, as `PostgreSQL` sorts `NULL` ascending, so it comes last ascending
+/// and first descending.
+fn compare_field(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Greater,
+        (_, Value::Null) => Ordering::Less,
+        (Value::Number(a), Value::Number(b)) => a
+            .as_u64()
+            .unwrap_or_default()
+            .cmp(&b.as_u64().unwrap_or_default()),
+        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        (Value::String(a), Value::String(b)) => a.cmp(b),
+        _ => Ordering::Equal,
+    }
+}
+
+/// `GET /rooms?from&limit&order_by&dir&search_term&public_rooms&empty_rooms`
+///
+/// Synapse's room listing, field for field: `search_term` matches a
+/// room's name or canonical alias case-insensitively, or its ID exactly;
+/// `public_rooms` filters on the directory; `empty_rooms` on whether
+/// anyone is joined. `from` is an offset, and the page carries
+/// `offset`, `total_rooms`, and `next_batch`/`prev_batch` offsets.
 async fn list_rooms(
     State(state): State<AppState>,
     actor: AdminActor,
     Query(query): Query<RoomsQuery>,
 ) -> Result<Json<Value>, MatrixError> {
+    let from = usize::try_from(query.from.unwrap_or(0))
+        .map_err(|_| invalid_param("Query parameter from must be a non-negative integer."))?;
+    let limit = usize::try_from(query.limit.unwrap_or(100))
+        .map_err(|_| invalid_param("Query parameter limit must be a non-negative integer."))?;
+    let order_by = query.order_by.as_deref().unwrap_or("name");
+    let (field, ascending) = room_order(order_by)
+        .ok_or_else(|| invalid_param(format!("Unknown value for order_by: {order_by}")))?;
+    let ascending = match query.dir.as_deref().unwrap_or("f") {
+        "f" => ascending,
+        "b" => !ascending,
+        other => return Err(invalid_param(format!("Unknown direction: {other}"))),
+    };
+    let needle = query.search_term.as_deref().map(str::to_lowercase);
+
     let mut rooms = Vec::new();
     for room_id in state
         .rooms
@@ -1003,47 +1450,45 @@ async fn list_rooms(
         .all_room_ids()
         .map_err(|error| MatrixError::internal(&error.to_string()))?
     {
-        let room = room_json(&state, &room_id).map_err(crate::routes::room_error)?;
-        let matches = query.search_term.as_deref().is_none_or(|term| {
-            [&room["room_id"], &room["name"], &room["canonical_alias"]]
-                .iter()
-                .any(|field| field.as_str().is_some_and(|value| value.contains(term)))
-        });
+        let room = match room_json(&state, &actor, &room_id) {
+            Ok(room) => room,
+            // A room whose metadata row outlived its log is not a room
+            // anyone can act on; one bad room must not blank the list.
+            Err(crate::rooms::RoomError::UnknownRoom(_)) => continue,
+            Err(error) => return Err(crate::routes::room_error(error)),
+        };
+        let matches = needle.as_deref().is_none_or(|needle| {
+            room_id == query.search_term.as_deref().unwrap_or_default()
+                || [&room["name"], &room["canonical_alias"]]
+                    .iter()
+                    .any(|field| {
+                        field
+                            .as_str()
+                            .is_some_and(|value| value.to_lowercase().contains(needle))
+                    })
+        }) && query
+            .public_rooms
+            .is_none_or(|public| room["public"] == public)
+            && query
+                .empty_rooms
+                .is_none_or(|empty| (room["joined_members"] == 0) == empty);
         if matches {
             rooms.push(room);
         }
     }
-    // Synapse's orderings, the ones this store can answer exactly: name
-    // ascending (rooms without one sort by ID, so they group last rather
-    // than vanishing), sizes descending.
-    match query.order_by.as_deref().unwrap_or("name") {
-        "name" => rooms.sort_by_key(|room| {
-            (
-                room["name"].as_str().is_none(),
-                room["name"].as_str().unwrap_or_default().to_owned(),
-                room["room_id"].as_str().unwrap_or_default().to_owned(),
-            )
-        }),
-        "joined_members" => {
-            rooms.sort_by_key(|room| std::cmp::Reverse(room["joined_members"].as_u64()));
-        }
-        "state_events" => {
-            rooms.sort_by_key(|room| std::cmp::Reverse(room["state_events"].as_u64()));
-        }
-        other => {
-            return Err(MatrixError::new(
-                StatusCode::BAD_REQUEST,
-                "M_INVALID_PARAM",
-                format!("cannot order by {other:?}"),
-            ));
-        }
-    }
+    rooms.sort_by(|a, b| {
+        let order = compare_field(&a[field], &b[field])
+            .then_with(|| compare_field(&a["room_id"], &b["room_id"]));
+        if ascending { order } else { order.reverse() }
+    });
     let total = rooms.len();
-    let limit = query.limit.unwrap_or(100);
-    let page: Vec<Value> = rooms.into_iter().skip(query.from).take(limit).collect();
-    let mut body = json!({ "rooms": page, "offset": query.from, "total_rooms": total });
-    if query.from + limit < total {
-        body["next_batch"] = json!(query.from + limit);
+    let page: Vec<Value> = rooms.into_iter().skip(from).take(limit).collect();
+    let mut body = json!({ "rooms": page, "offset": from, "total_rooms": total });
+    if from + limit < total {
+        body["next_batch"] = json!(from + limit);
+    }
+    if from > 0 {
+        body["prev_batch"] = json!(from.saturating_sub(limit));
     }
     Ok(Json(body))
 }
@@ -1051,10 +1496,10 @@ async fn list_rooms(
 /// `GET /rooms/{roomId}`
 async fn room_detail(
     State(state): State<AppState>,
-    _actor: AdminActor,
+    actor: AdminActor,
     Path(room_id): Path<String>,
 ) -> Result<Json<Value>, MatrixError> {
-    let room = room_json(&state, &room_id).map_err(crate::routes::room_error)?;
+    let room = room_detail_json(&state, &actor, &room_id).map_err(crate::routes::room_error)?;
     Ok(Json(room))
 }
 
@@ -1064,12 +1509,15 @@ async fn room_members(
     _actor: AdminActor,
     Path(room_id): Path<String>,
 ) -> Result<Json<Value>, MatrixError> {
+    // The IDs alone: rendering every member's profile to throw it away
+    // is most of the cost of a large room.
     let members = state
         .rooms
-        .joined_members(&room_id)
+        .joined_member_ids(&room_id)
         .map_err(crate::routes::room_error)?;
-    let names: Vec<&String> = members.keys().collect();
-    Ok(Json(json!({ "total": names.len(), "members": names })))
+    Ok(Json(
+        json!({ "total": members.len(), "members": members.as_slice() }),
+    ))
 }
 
 /// `GET /rooms/{roomId}/state`
@@ -1261,18 +1709,32 @@ async fn purge_history(
     ))
 }
 
-#[derive(Deserialize)]
-struct DeleteRoom {
+/// The body of Synapse's room deletion, v1 and v2 alike.
+#[derive(Clone, Deserialize)]
+pub(crate) struct DeleteRoom {
     #[serde(default)]
-    block: bool,
+    pub(crate) block: bool,
+    /// Synapse's default is to purge; a caller that wants the history
+    /// kept says `"purge": false`.
+    #[serde(default = "purge_by_default")]
+    pub(crate) purge: bool,
+    pub(crate) new_room_user_id: Option<String>,
+    pub(crate) room_name: Option<String>,
+    pub(crate) message: Option<String>,
+    /// Accepted for Synapse's callers. This server's purge keeps the
+    /// spine and needs no members gone first, so there is nothing to
+    /// force.
     #[serde(default)]
-    purge: bool,
-    new_room_user_id: Option<String>,
-    message: Option<String>,
+    #[allow(dead_code, reason = "accepted and ignored, as documented")]
+    pub(crate) force_purge: bool,
 }
 
-/// A fresh room owned by `creator` with nothing in it yet: no name, no
-/// topic, no preset, and no profile on the creator's join, since an
+const fn purge_by_default() -> bool {
+    true
+}
+
+/// A fresh room owned by `creator` with nothing in it yet: no topic, no
+/// preset, and no profile on the creator's join, since an
 /// administrator creating a room on a user's behalf is not that user
 /// joining it.
 fn bare_room(state: &AppState, creator: &str) -> Result<String, MatrixError> {
@@ -1294,7 +1756,24 @@ fn bare_room(state: &AppState, creator: &str) -> Result<String, MatrixError> {
         .map_err(crate::routes::room_error)
 }
 
-/// `DELETE /rooms/{roomId}` — `{block, purge, new_room_user_id, message}`.
+/// Check what can be checked before a deletion starts, so the v2 endpoint
+/// refuses a bad request rather than scheduling a task that will fail.
+pub(crate) fn validate_delete(state: &AppState, request: &DeleteRoom) -> Result<(), MatrixError> {
+    if let Some(creator) = &request.new_room_user_id
+        && local_localpart(state, creator).is_none()
+    {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            "new_room_user_id must be a user of this server",
+        ));
+    }
+    Ok(())
+}
+
+/// Delete a room as Synapse's `DELETE /rooms/{roomId}` does: block it if
+/// asked, take its local aliases out of the directory, evict every local
+/// member, optionally open a replacement room, and purge.
 ///
 /// Every departure is a real leave event through the ordinary append
 /// path (#83 §2) — the log records the eviction the same way it records
@@ -1302,44 +1781,91 @@ fn bare_room(state: &AppState, creator: &str) -> Result<String, MatrixError> {
 /// same room. The block row is written first so nobody rejoins between
 /// the eviction and the block; `purge` reuses `purge_history` over the
 /// whole log, so the spine and the chain survive even total deletion.
-async fn delete_room(
-    State(state): State<AppState>,
-    actor: AdminActor,
-    Path(room_id): Path<String>,
-    Json(request): Json<DeleteRoom>,
-) -> Result<Json<Value>, MatrixError> {
-    let members = state
-        .rooms
-        .joined_members(&room_id)
-        .map_err(crate::routes::room_error)?;
+///
+/// A room this server does not hold can still be blocked, so a room
+/// can be refused before anyone here joins it; anything else about an
+/// unknown room is a 404. Returns Synapse's `shutdown_room` result.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sequence, in the order Synapse performs it"
+)]
+pub(crate) fn shutdown_room(
+    state: &AppState,
+    actor: &AdminActor,
+    room_id: &str,
+    request: &DeleteRoom,
+) -> Result<Value, MatrixError> {
+    validate_delete(state, request)?;
+    let members = match state.rooms.joined_members(room_id) {
+        Ok(members) => Some(members),
+        Err(crate::rooms::RoomError::UnknownRoom(_)) if request.block => None,
+        Err(error) => return Err(crate::routes::room_error(error)),
+    };
     let local_suffix = format!(":{}", state.config.server.name);
     let locals: Vec<String> = members
-        .keys()
-        .filter(|user| user.ends_with(&local_suffix))
-        .cloned()
-        .collect();
+        .as_ref()
+        .map(|members| {
+            members
+                .keys()
+                .filter(|user| user.ends_with(&local_suffix))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
 
     if request.block {
         state
             .rooms
-            .admin(&actor)
-            .set_room_block(&room_id, &json!({ "actor": actor.identity().user_id }))
+            .admin(actor)
+            .set_room_block(room_id, &json!({ "actor": actor.identity().user_id }))
             .map_err(crate::routes::room_error)?;
     }
+    let Some(_) = members else {
+        return Ok(json!({
+            "kicked_users": [],
+            "failed_to_kick_users": [],
+            "local_aliases": [],
+            "new_room_id": null,
+        }));
+    };
+
+    // The room leaves this server's directory, and its aliases stop
+    // resolving to it: Synapse moves them to the replacement room when
+    // there is one, and so does this.
+    let local_aliases = state
+        .directory
+        .for_room(room_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    for alias in &local_aliases {
+        Store::delete(state.store.as_ref(), &keys::alias(alias))
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    }
+    state
+        .directory
+        .unpublish(room_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
 
     // The replacement room, when asked for: created by the named local
     // user, opening with the administrator's message, every evicted
     // local user invited into it.
     let new_room = match &request.new_room_user_id {
         Some(creator) => {
-            local_localpart(&state, creator).ok_or_else(|| {
-                MatrixError::new(
-                    StatusCode::BAD_REQUEST,
-                    "M_INVALID_PARAM",
-                    "new_room_user_id must be a user of this server",
+            let new_room = bare_room(state, creator)?;
+            let name = request
+                .room_name
+                .as_deref()
+                .unwrap_or("Content Violation Notification");
+            state
+                .rooms
+                .set_state(
+                    &new_room,
+                    creator,
+                    state.key.pair(),
+                    "m.room.name",
+                    "",
+                    &json!({ "name": name }),
                 )
-            })?;
-            let new_room = bare_room(&state, creator)?;
+                .map_err(crate::routes::room_error)?;
             if let Some(message) = &request.message {
                 state
                     .rooms
@@ -1351,6 +1877,11 @@ async fn delete_room(
                         &json!({ "msgtype": "m.text", "body": message }),
                     )
                     .map_err(crate::routes::room_error)?;
+            }
+            for alias in &local_aliases {
+                // Best-effort, as the invites below are: an alias the
+                // new room cannot take must not stop the deletion.
+                let _ = state.directory.create(alias, &new_room, creator);
             }
             Some(new_room)
         }
@@ -1375,7 +1906,7 @@ async fn delete_room(
             );
         }
         match state.rooms.set_membership(
-            &room_id,
+            room_id,
             user,
             user,
             "leave",
@@ -1390,28 +1921,107 @@ async fn delete_room(
     if request.purge {
         state
             .rooms
-            .admin(&actor)
-            .purge_history(&room_id, i64::MAX)
+            .admin(actor)
+            .purge_history(room_id, i64::MAX)
             .map_err(crate::routes::room_error)?;
     }
 
     audit(
-        &state,
+        state,
         &actor.identity().user_id,
         "delete_room",
-        &room_id,
+        room_id,
         &json!({
             "block": request.block,
             "purge": request.purge,
             "kicked": kicked.len(),
             "new_room_id": new_room,
+            "local_aliases": local_aliases,
         }),
     )?;
-    Ok(Json(json!({
+    Ok(json!({
         "kicked_users": kicked,
         "failed_to_kick_users": failed,
+        "local_aliases": local_aliases,
         "new_room_id": new_room,
-    })))
+    }))
+}
+
+/// `DELETE /rooms/{roomId}` — `{block, purge, new_room_user_id, room_name,
+/// message}`, synchronously: Synapse's v1. The v2 spelling, which runs the
+/// same deletion as a background task, is in `admin_tasks`.
+async fn delete_room(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path(room_id): Path<String>,
+    Json(request): Json<DeleteRoom>,
+) -> Result<Json<Value>, MatrixError> {
+    shutdown_room(&state, &actor, &room_id, &request).map(Json)
+}
+
+/// `GET /rooms/{roomId}/block` — `{block, user_id}` when blocked, and
+/// `{block: false}` otherwise. Answers for a room this server does not
+/// hold, since a room can be blocked before anyone here joins it.
+async fn get_room_block(
+    State(state): State<AppState>,
+    _actor: AdminActor,
+    Path(room_id): Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    legal_room_id(&room_id)?;
+    let block = state
+        .rooms
+        .room_block(&room_id)
+        .map_err(crate::routes::room_error)?;
+    Ok(Json(match block {
+        Some(record) => json!({ "block": true, "user_id": record["actor"] }),
+        None => json!({ "block": false }),
+    }))
+}
+
+#[derive(Deserialize)]
+struct BlockRequest {
+    block: bool,
+}
+
+/// `PUT /rooms/{roomId}/block` — `{block}`. Blocking stops local users
+/// joining; it evicts nobody (that is what deleting the room does).
+async fn put_room_block(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path(room_id): Path<String>,
+    Json(request): Json<BlockRequest>,
+) -> Result<Json<Value>, MatrixError> {
+    legal_room_id(&room_id)?;
+    let admin = state.rooms.admin(&actor);
+    if request.block {
+        admin
+            .set_room_block(&room_id, &json!({ "actor": actor.identity().user_id }))
+            .map_err(crate::routes::room_error)?;
+    } else {
+        admin
+            .clear_room_block(&room_id)
+            .map_err(crate::routes::room_error)?;
+    }
+    audit(
+        &state,
+        &actor.identity().user_id,
+        if request.block {
+            "block_room"
+        } else {
+            "unblock_room"
+        },
+        &room_id,
+        &json!({}),
+    )?;
+    Ok(Json(json!({ "block": request.block })))
+}
+
+fn legal_room_id(room_id: &str) -> Result<(), MatrixError> {
+    if room_id.starts_with('!') && room_id.contains(':') {
+        Ok(())
+    } else {
+        Err(invalid_param(format!("{room_id} is not a legal room ID")))
+    }
 }
 
 #[derive(Deserialize)]
@@ -1523,15 +2133,37 @@ fn report_room_labels(state: &AppState, actor: &AdminActor, record: &mut Value) 
     record["canonical_alias"] = content("m.room.canonical_alias", "alias");
 }
 
-/// `GET /event_reports?from&limit`
+#[derive(Deserialize)]
+struct ReportsQuery {
+    from: Option<i64>,
+    limit: Option<i64>,
+    dir: Option<String>,
+    room_id: Option<String>,
+    user_id: Option<String>,
+    event_sender_user_id: Option<String>,
+}
+
+/// `GET /event_reports?from&limit&dir&room_id&user_id&event_sender_user_id`
 ///
-/// Newest first, as Synapse lists them: the report an operator has not
-/// yet seen is the one filed most recently.
+/// Newest first by default, as Synapse lists them: the report an operator
+/// has not yet seen is the one filed most recently. `dir=f` is oldest
+/// first. `user_id` matches part of the reporter's ID; `room_id` part of
+/// the room's; `event_sender_user_id` is the reported user, exactly.
+/// `next_token` is an integer offset, as Synapse's is.
 async fn list_event_reports(
     State(state): State<AppState>,
     actor: AdminActor,
-    Query(query): Query<ListQuery>,
+    Query(query): Query<ReportsQuery>,
 ) -> Result<Json<Value>, MatrixError> {
+    let from = usize::try_from(query.from.unwrap_or(0))
+        .map_err(|_| invalid_param("The start parameter must be a positive integer."))?;
+    let limit = usize::try_from(query.limit.unwrap_or(100))
+        .map_err(|_| invalid_param("The limit parameter must be a positive integer."))?;
+    let newest_first = match query.dir.as_deref().unwrap_or("b") {
+        "b" => true,
+        "f" => false,
+        other => return Err(invalid_param(format!("Unknown direction: {other}"))),
+    };
     let mut reports = Vec::new();
     for (_, raw) in
         spindle_store::ReadView::scan_prefix(state.store.as_ref(), &keys::event_reports_prefix())
@@ -1539,14 +2171,30 @@ async fn list_event_reports(
     {
         let record: Value = serde_json::from_slice(&raw)
             .map_err(|error| MatrixError::internal(&error.to_string()))?;
-        reports.push(record);
+        let contains = |field: &str, wanted: Option<&String>| {
+            wanted.is_none_or(|wanted| {
+                record[field]
+                    .as_str()
+                    .is_some_and(|value| value.contains(wanted.as_str()))
+            })
+        };
+        if contains("room_id", query.room_id.as_ref())
+            && contains("user_id", query.user_id.as_ref())
+            && query
+                .event_sender_user_id
+                .as_deref()
+                .is_none_or(|sender| record["sender"] == sender)
+        {
+            reports.push(record);
+        }
     }
-    reports.reverse();
+    if newest_first {
+        reports.reverse();
+    }
     let total = reports.len();
-    let limit = query.limit.unwrap_or(100);
     let page: Vec<Value> = reports
         .into_iter()
-        .skip(query.from)
+        .skip(from)
         .take(limit)
         .map(|mut record| {
             report_room_labels(&state, &actor, &mut record);
@@ -1554,10 +2202,42 @@ async fn list_event_reports(
         })
         .collect();
     let mut body = json!({ "event_reports": page, "total": total });
-    if query.from + limit < total {
-        body["next_token"] = json!((query.from + limit).to_string());
+    if from + limit < total && limit > 0 {
+        body["next_token"] = json!(from + limit);
     }
     Ok(Json(body))
+}
+
+/// `DELETE /event_reports/{reportId}` — the report is dealt with.
+async fn delete_event_report(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path(report_id): Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    let not_found = || {
+        MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "Event report not found",
+        )
+    };
+    let seq: u64 = report_id.parse().map_err(|_| {
+        invalid_param("The report_id parameter must be a string representing a positive integer.")
+    })?;
+    let key = keys::event_report(seq);
+    spindle_store::ReadView::get(state.store.as_ref(), &key)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+        .ok_or_else(not_found)?;
+    Store::delete(state.store.as_ref(), &key)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    audit(
+        &state,
+        &actor.identity().user_id,
+        "delete_event_report",
+        &report_id,
+        &json!({}),
+    )?;
+    Ok(Json(json!({})))
 }
 
 /// `GET /event_reports/{reportId}`
