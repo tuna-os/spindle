@@ -1482,16 +1482,27 @@ async fn well_known_server(
 }
 
 /// Liveness: the process is up.
+///
+/// Takes no state and no lock -- not the room registry, not a room --
+/// and must stay that way: it answers whenever a worker can poll it, and
+/// #614 is about making sure one always can, by keeping room work off the
+/// async workers. A liveness answer that waited on the work it is meant
+/// to see past would get a busy server killed.
 async fn health() -> StatusCode {
     StatusCode::OK
 }
 
 /// Readiness: the process can serve.
 ///
-/// Currently the same answer as liveness, which is honest only because nothing
-/// is initialised asynchronously yet. When storage opens here, this has to stop
-/// reporting ready before it is — a readiness probe that lies is worse than no
-/// readiness probe, because it takes traffic on the strength of the lie.
+/// Storage is open, the stream counters resumed and the signing key loaded
+/// before the listener accepts anything, so by the time this can answer at
+/// all the server can serve every request. It does **not** wait for the
+/// startup room warm-up (`spawn_room_warmup`): a room of a million events
+/// takes minutes to load, and holding a single-replica deployment out of
+/// rotation for that long is an outage bought to avoid a slow first
+/// request. A room not yet warm is loaded by the request that needs it,
+/// off the async workers. A readiness probe that lies is worse than none
+/// -- this one claims only what is true.
 async fn ready() -> StatusCode {
     StatusCode::OK
 }
@@ -2039,6 +2050,12 @@ async fn logout(
         .to_owned();
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     accounts.logout(&token).map_err(|error| internal(&error))?;
+    // Under delegation the token was vouched for by the provider and the
+    // verdict is cached; a logout that left it there would let the token
+    // keep working for the rest of the cache window (#615).
+    if let Some(delegated) = &state.delegated {
+        delegated.forget_token(&token);
+    }
     Ok(Json(json!({})))
 }
 
@@ -2064,6 +2081,9 @@ async fn logout_all(
     accounts
         .logout_everywhere(&localpart_of(&identity.user_id))
         .map_err(|error| internal(&error))?;
+    if let Some(delegated) = &state.delegated {
+        delegated.forget_user(&identity.user_id);
+    }
     Ok(Json(json!({})))
 }
 
@@ -6696,11 +6716,73 @@ async fn sliding_sync(
     let position =
         sliding_long_poll(&state, since, timeout_ms, request.extensions.typing.on()).await;
 
+    // Everything below is synchronous room work -- for a cold room, a load
+    // from the store -- so it runs on the blocking pool, not on one of the
+    // handful of async workers the whole server shares (#614).
+    let worker_state = state.clone();
+    crate::blocking::offload(
+        std::sync::Arc::clone(&state.metrics),
+        crate::metrics::BlockingTask::SlidingSync,
+        move || {
+            sliding_answer(
+                &worker_state,
+                &identity,
+                &request,
+                SlidingInputs {
+                    since,
+                    position,
+                    previous_windows: previous_windows.as_ref(),
+                    lists: &lists,
+                    subscriptions: &subscriptions,
+                },
+            )
+        },
+    )
+    .await
+}
+
+/// How many cold rooms one sliding-sync request loads at once. Bounded:
+/// a load is CPU and I/O on cores the rest of the server shares, and four
+/// is past the two the production pod has.
+const WINDOW_LOAD_PARALLELISM: usize = 4;
+
+/// What [`sliding_answer`] needs beyond the request itself, decoded and
+/// positioned by the handler.
+#[derive(Clone, Copy)]
+struct SlidingInputs<'a> {
+    since: Option<u64>,
+    position: u64,
+    previous_windows: Option<&'a crate::sliding::Windows>,
+    lists: &'a [(String, crate::sliding::ListRequest)],
+    subscriptions: &'a [(String, crate::sliding::RoomSubscription)],
+}
+
+/// The body of a sliding-sync response, assembled synchronously.
+#[allow(clippy::too_many_lines)]
+fn sliding_answer(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    request: &crate::sliding::SlidingRequest,
+    inputs: SlidingInputs<'_>,
+) -> Result<Json<Value>, MatrixError> {
+    let SlidingInputs {
+        since,
+        position,
+        previous_windows,
+        lists,
+        subscriptions,
+    } = inputs;
+
     // The sorted room list: every joined room, newest activity first. The
     // sort is recomputed per request because it is what the ranges index
     // into, and a stale order would make the client's window show the wrong
     // rooms — the exact bug sliding sync exists to avoid.
-    let (ordered, invited) = sliding_room_order(&state, &identity)?;
+    let ordering = std::time::Instant::now();
+    let (ordered, invited) = sliding_room_order(state, identity)?;
+    state
+        .metrics
+        .observe_sync_phase(crate::metrics::SyncPhase::SlidingOrder, ordering.elapsed());
+    let assembling = std::time::Instant::now();
 
     // Every room this request may be answered with. A list window can only
     // produce rooms out of `ordered`, which came from the caller's own
@@ -6749,13 +6831,11 @@ async fn sliding_sync(
     // Rooms in view now that were in no window this `pos` was answered for:
     // the client has never been sent them, changed or not.
     let mut newly_in_view: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (name, list) in &lists {
+    for (name, list) in lists {
         let indices = crate::sliding::indices_in_view(&list.ranges, ordered.len());
         for &index in &indices {
             let room_id = &ordered[index].0;
-            if since.is_some()
-                && !crate::sliding::was_in_view(previous_windows.as_ref(), name, index)
-            {
+            if since.is_some() && !crate::sliding::was_in_view(previous_windows, name, index) {
                 newly_in_view.insert(room_id.clone());
             }
             let entry = wanted
@@ -6766,7 +6846,7 @@ async fn sliding_sync(
         }
         lists_out.insert(name.clone(), json!({ "count": ordered.len() }));
     }
-    for (room_id, subscription) in &subscriptions {
+    for (room_id, subscription) in subscriptions {
         // Silence rather than an error: a client that subscribed to a room it
         // has since left should get a response about its other rooms, not a
         // rejected request -- and a client fishing for a room it was never in
@@ -6786,6 +6866,24 @@ async fn sliding_sync(
     // The rooms in view, whether or not they changed: the room extensions
     // below answer for all of them.
     let in_view: Vec<String> = wanted.keys().cloned().collect();
+    // Every cold room about to be rendered is loaded first, several at once,
+    // rather than one after another as the loop below reaches it: after a
+    // restart a window of twenty cold rooms costs its slowest load, not the
+    // sum of all twenty (#614). Rooms answered silently, and invites (which
+    // have no log here to load), are left alone.
+    let cold: Vec<String> = in_view
+        .iter()
+        .filter(|room_id| {
+            !invited.contains(*room_id)
+                && (changed
+                    .as_ref()
+                    .is_none_or(|changed| changed.contains(*room_id))
+                    || newly_in_view.contains(*room_id))
+                && !state.rooms.is_resident(room_id)
+        })
+        .cloned()
+        .collect();
+    state.rooms.warm_all(&cold, WINDOW_LOAD_PARALLELISM);
     for (room_id, (required_state, timeline_limit)) in wanted {
         // Incrementally, silence about an unchanged room *is* the answer.
         let newly = newly_in_view.contains(&room_id);
@@ -6796,11 +6894,11 @@ async fn sliding_sync(
             continue;
         }
         let entry = if invited.contains(&room_id) {
-            sliding_invite_entry(&state, &identity, &room_id)?
+            sliding_invite_entry(state, identity, &room_id)?
         } else {
             sliding_room_entry(
-                &state,
-                &identity,
+                state,
+                identity,
                 &room_id,
                 &required_state,
                 timeline_limit,
@@ -6811,18 +6909,22 @@ async fn sliding_sync(
     }
 
     let extensions = sliding_extensions(
-        &state,
-        &identity,
+        state,
+        identity,
         &request.extensions,
         since,
         position,
         &in_view,
     )?;
+    state.metrics.observe_sync_phase(
+        crate::metrics::SyncPhase::SlidingAssemble,
+        assembling.elapsed(),
+    );
 
     Ok(Json(json!({
         "pos": crate::sliding::encode_pos(
             &crate::tokens::Sync(position).to_string(),
-            &crate::sliding::windows_of(&lists),
+            &crate::sliding::windows_of(lists),
         ),
         "lists": lists_out,
         "rooms": rooms_out,
@@ -7486,19 +7588,30 @@ async fn sync(
         crate::rooms::StateBlock::Deferred
     };
     let state_after = query.state_after();
+    // The read and the assembly are synchronous room work -- a cold room
+    // is a load from the store -- so both run on the blocking pool rather
+    // than on an async worker (#614). The long-poll between them is the
+    // one stretch that genuinely waits, and it stays async.
     let read = |since: Option<u64>| {
-        state
-            .rooms
-            .sync(
-                &identity.user_id,
-                since,
-                timeline_limit,
-                state_block,
-                state_after,
-            )
-            .map_err(room_error)
+        let state = state.clone();
+        let user_id = identity.user_id.clone();
+        crate::blocking::offload(
+            std::sync::Arc::clone(&state.metrics),
+            crate::metrics::BlockingTask::Sync,
+            move || {
+                let started = std::time::Instant::now();
+                let result = state
+                    .rooms
+                    .sync(&user_id, since, timeline_limit, state_block, state_after)
+                    .map_err(room_error);
+                state
+                    .metrics
+                    .observe_sync_phase(crate::metrics::SyncPhase::SyncRead, started.elapsed());
+                result
+            },
+        )
     };
-    let mut result = read(since)?;
+    let mut result = read(since).await?;
 
     // Long-poll, but only for an incremental sync: an initial sync always has
     // something to say, and blocking one would leave a first-time client
@@ -7519,27 +7632,55 @@ async fn sync(
                 () = state.rooms.wait_for_event(timeout) => {}
                 () = state.typing.wait(timeout) => {}
             }
-            result = read(Some(since))?;
+            result = read(Some(since)).await?;
         }
     }
 
-    let join = sync_join(
-        &state,
-        &identity,
-        result.rooms,
-        filter.as_ref(),
-        query.state_label(),
-        since,
-    )?;
+    let state_label = query.state_label();
+    let worker_state = state.clone();
+    crate::blocking::offload(
+        std::sync::Arc::clone(&state.metrics),
+        crate::metrics::BlockingTask::Sync,
+        move || {
+            let started = std::time::Instant::now();
+            let response = sync_answer(
+                &worker_state,
+                &identity,
+                result,
+                filter.as_ref(),
+                state_label,
+                resume,
+            );
+            worker_state
+                .metrics
+                .observe_sync_phase(crate::metrics::SyncPhase::SyncAssemble, started.elapsed());
+            response
+        },
+    )
+    .await
+}
 
-    let invite = sync_invite(&state, &identity, result.invited, filter.as_ref());
-    let knock = sync_knock(&state, &identity, result.knocked, filter.as_ref());
-    let leave = sync_leave(result.left, filter.as_ref());
+/// The body of a `/sync` response, assembled synchronously from what the
+/// read found.
+fn sync_answer(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    result: crate::rooms::SyncResult,
+    filter: Option<&crate::filters::Filter>,
+    state_label: &'static str,
+    resume: crate::tokens::Resume,
+) -> Result<axum::response::Response, MatrixError> {
+    let since = resume.position();
+    let join = sync_join(state, identity, result.rooms, filter, state_label, since)?;
+
+    let invite = sync_invite(state, identity, result.invited, filter);
+    let knock = sync_knock(state, identity, result.knocked, filter);
+    let leave = sync_leave(result.left, filter);
 
     let (to_device, device_changes, key_counts, unused_fallback) =
-        sync_device_sections(&state, &identity, resume, result.next_batch)?;
+        sync_device_sections(state, identity, resume, result.next_batch)?;
 
-    let global = sync_account_data(&state, &identity, filter.as_ref(), since, result.next_batch)?;
+    let global = sync_account_data(state, identity, filter, since, result.next_batch)?;
 
     // Assembled from pre-serialized parts rather than as one `Value`, so the
     // joined rooms' state blocks -- which `sync_join` may have taken straight
@@ -7569,7 +7710,7 @@ async fn sync(
     body.insert("account_data", raw(&json!({ "events": global }))?);
 
     let window = (since, result.next_batch);
-    if let Some(done) = finalised_delays(&state, &identity.user_id, filter.as_ref(), window)? {
+    if let Some(done) = finalised_delays(state, &identity.user_id, filter, window)? {
         body.insert("org.matrix.msc4140.finalised_delayed_events", raw(&done)?);
     }
 
@@ -10433,6 +10574,9 @@ async fn deactivate_account(
     accounts
         .logout_everywhere(&localpart)
         .map_err(|error| internal(&error))?;
+    if let Some(delegated) = &state.delegated {
+        delegated.forget_user(&identity.user_id);
+    }
     state.rooms.wake_sync_waiters();
 
     // No identity server is contacted, so no third-party binding is removed.

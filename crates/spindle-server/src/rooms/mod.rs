@@ -4481,22 +4481,93 @@ impl Rooms {
         {
             return Ok(cached);
         }
-        let head = self.with_room_read(room_id, |_, log| {
-            Ok(log
-                .entries()
-                .next_back()
-                .map(|entry| entry.event_id.as_str().to_owned()))
-        })?;
-        let Some(event_id) = head else {
-            return Ok(0);
+        // A sort key must not cost a room load (#614). A resident room
+        // answers from its log in memory, as it always did; a cold one
+        // answers from the store -- the last row of its log and that
+        // event's body, two point reads -- and stays cold. Loading every
+        // joined room just to read one timestamp from each was what made
+        // the first sliding sync after a restart take 105 s for an account
+        // in a room of a million events.
+        // A resident room whose lock is busy -- an ingest working through
+        // a backlog holds it for as long as that takes -- is read from the
+        // store too: the store holds every entry the log does, and the sort
+        // key is not worth queueing behind an ingest for.
+        let in_memory = self
+            .resident(room_id)
+            .and_then(|room| match room.try_read() {
+                Ok(log) => Some(Self::head_in_memory(&log)),
+                Err(std::sync::TryLockError::Poisoned(log)) => {
+                    Some(Self::head_in_memory(&log.into_inner()))
+                }
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            });
+        let head = match in_memory {
+            Some(head) => head,
+            None => self.head_in_store(room_id)?,
         };
-        let event = self.event(room_id, &event_id)?;
-        let activity = event["origin_server_ts"].as_i64().unwrap_or(0);
-        self.last_activity
+        let activity = match head {
+            None => 0,
+            Some((event_id, rejected)) => {
+                if rejected {
+                    return Err(RoomError::MissingBody(event_id));
+                }
+                self.read_event(room_id, &EventId::new(event_id.as_str()))?["origin_server_ts"]
+                    .as_i64()
+                    .unwrap_or(0)
+            }
+        };
+        // Filled only if still empty: an append that landed while this was
+        // reading has already stored a fresher key, and must not be
+        // overwritten by the older one read before it.
+        Ok(*self
+            .last_activity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(room_id.to_owned(), activity);
-        Ok(activity)
+            .entry(room_id.to_owned())
+            .or_insert(activity))
+    }
+
+    /// The head entry of a resident log: its event id, and whether that
+    /// event is historically rejected (and so has no body to show).
+    fn head_in_memory(log: &RoomLog) -> Option<(String, bool)> {
+        log.entries().next_back().map(|entry| {
+            (
+                entry.event_id.as_str().to_owned(),
+                log.historically_rejected(&entry.event_id),
+            )
+        })
+    }
+
+    /// [`Self::head_in_memory`] for a room that is not resident, read from
+    /// the store without restoring the room.
+    ///
+    /// The log keyspace is ordered by linear index -- the encoding is
+    /// order-preserving across the sign boundary, which is what lets a
+    /// restore scan it straight into a log -- so the room's last row is the
+    /// entry a restored log would hold at its head.
+    fn head_in_store(&self, room_id: &str) -> Result<Option<(String, bool)>, RoomError> {
+        let store = self.store.as_ref();
+        let prefix = spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::Log, room_id);
+        let mut end = prefix.clone();
+        end.extend_from_slice(&[0xff; 9]);
+        let Some((_, value)) = spindle_store::ReadView::last_before(store, &prefix, &end)? else {
+            // No entries: an empty room, or no room at all -- which a load
+            // would have told apart by the room's metadata, so this does too.
+            let meta =
+                spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::RoomMeta, room_id);
+            return if spindle_store::ReadView::get(store, &meta)?.is_some() {
+                Ok(None)
+            } else {
+                Err(RoomError::UnknownRoom(room_id.to_owned()))
+            };
+        };
+        let record = spindle_store::codec::EntryRecord::decode(&value).map_err(StoreError::from)?;
+        let rejected = spindle_store::ReadView::get(
+            store,
+            &spindle_core::keys::historical_rejection(room_id, &record.event_id),
+        )?
+        .is_some();
+        Ok(Some((record.event_id, rejected)))
     }
 
     /// Which of `rooms` had at least one event in the stream range
@@ -4601,23 +4672,228 @@ impl Rooms {
     /// a room another reader or writer has already published.
     fn room(&self, room_id: &str) -> Result<Arc<RwLock<RoomLog>>, RoomError> {
         self.room_or_load(room_id, || {
-            let restored = RoomStore::new(self.store.as_ref(), room_id)
-                .load_runtime()?
-                .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
-            let mut log = restored.log;
-            if !log.current_is_settled() {
-                match self.resolve_in(&log, room_id, |log, resolver, load| {
-                    log.resolve_current(resolver, load)
-                }) {
-                    Ok(current) => log.set_current(current),
-                    Err(error) => tracing::warn!(
-                        room = room_id,
-                        "cannot resolve the reopened room's forward extremities: {error}"
-                    ),
-                }
-            }
-            Ok(log)
+            // A cold load runs for as long as the room is big -- minutes,
+            // for a room of a million events -- so it is marked blocking:
+            // the worker it started on hands its other tasks on rather than
+            // stalling them for the duration (#614).
+            crate::blocking::section(
+                &self.metrics,
+                crate::metrics::BlockingTask::ColdLoad,
+                || self.load_cold(room_id),
+            )
         })
+    }
+
+    /// Restore one room from the store, timing it by the room's size.
+    fn load_cold(&self, room_id: &str) -> Result<RoomLog, RoomError> {
+        let started = std::time::Instant::now();
+        let log = self.restore_room(room_id)?;
+        let elapsed = started.elapsed();
+        let size = crate::metrics::RoomSize::of(log.len());
+        self.metrics.observe_cold_load(size, elapsed);
+        if elapsed > std::time::Duration::from_secs(1) {
+            tracing::info!(
+                room = room_id,
+                entries = log.len(),
+                elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                "loaded a cold room"
+            );
+        }
+        Ok(log)
+    }
+
+    fn restore_room(&self, room_id: &str) -> Result<RoomLog, RoomError> {
+        let restored = RoomStore::new(self.store.as_ref(), room_id)
+            .load_runtime()?
+            .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
+        let mut log = restored.log;
+        if !log.current_is_settled() {
+            match self.resolve_in(&log, room_id, |log, resolver, load| {
+                log.resolve_current(resolver, load)
+            }) {
+                Ok(current) => log.set_current(current),
+                Err(error) => tracing::warn!(
+                    room = room_id,
+                    "cannot resolve the reopened room's forward extremities: {error}"
+                ),
+            }
+        }
+        Ok(log)
+    }
+
+    /// The room's lock if this process holds it open, without loading it.
+    fn resident(&self, room_id: &str) -> Option<Arc<RwLock<RoomLog>>> {
+        self.registry_read().get(room_id).map(Arc::clone)
+    }
+
+    /// A room's lock, loading the room if need be, for tests that must hold
+    /// it -- to stand in for an ingest that holds a room for a backlog.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room cannot be restored.
+    #[doc(hidden)]
+    pub fn lock_for_test(&self, room_id: &str) -> Result<Arc<RwLock<RoomLog>>, RoomError> {
+        self.room(room_id)
+    }
+
+    /// Whether this process holds the room open: loaded, and kept.
+    #[must_use]
+    pub fn is_resident(&self, room_id: &str) -> bool {
+        self.resident(room_id).is_some()
+    }
+
+    /// How many rooms are resident, or `None` if the registry is busy --
+    /// a scrape must not queue behind an admission.
+    #[must_use]
+    pub fn resident_count(&self) -> Option<u64> {
+        match self.open.try_read() {
+            Ok(open) => Some(open.len() as u64),
+            Err(std::sync::TryLockError::Poisoned(open)) => Some(open.into_inner().len() as u64),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// Load a room if it is not resident, so the first request for it after
+    /// a restart does not pay for the load. What the startup warm-up calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room cannot be restored.
+    pub fn warm(&self, room_id: &str) -> Result<(), RoomError> {
+        self.room(room_id).map(drop)
+    }
+
+    /// Load each of `rooms` that is not resident, up to `parallelism` at a
+    /// time, on scoped threads of this call's own. A room that cannot be
+    /// loaded is skipped: the caller that needs it will meet the error
+    /// itself, where it can say what it means.
+    pub fn warm_all(&self, rooms: &[String], parallelism: usize) {
+        let cold: Vec<&String> = rooms
+            .iter()
+            .filter(|room| !self.is_resident(room))
+            .collect();
+        match cold.as_slice() {
+            [] => {}
+            [room] => {
+                let _ = self.warm(room);
+            }
+            _ => {
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                std::thread::scope(|scope| {
+                    for _ in 0..parallelism.clamp(1, cold.len()) {
+                        scope.spawn(|| {
+                            while let Some(room) =
+                                cold.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                            {
+                                let _ = self.warm(room);
+                            }
+                        });
+                    }
+                });
+            }
+        }
+    }
+
+    /// The rooms worth warming after a restart: every room a local user is
+    /// joined to that is not already resident, newest activity first, so
+    /// the rooms at the top of a client's list are the first to be ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the membership index cannot be read.
+    pub fn warm_candidates(&self) -> Result<Vec<String>, RoomError> {
+        let probe = spindle_core::keys::user_prefix(spindle_core::keys::Keyspace::Membership, "");
+        let keyspace = probe.get(..2).unwrap_or_default();
+        let suffix = format!(":{}", self.server_name);
+        let mut rooms: HashSet<String> = HashSet::new();
+        for (key, membership) in
+            spindle_store::ReadView::scan_prefix(self.store.as_ref(), keyspace)?
+        {
+            if membership.as_slice() != JOIN {
+                continue;
+            }
+            let Some((user_id, room_id)) = split_user_room(&key) else {
+                continue;
+            };
+            if user_id.ends_with(&suffix) && !self.is_resident(&room_id) {
+                rooms.insert(room_id);
+            }
+        }
+        let mut ordered: Vec<(String, i64)> = rooms
+            .into_iter()
+            .map(|room_id| {
+                let activity = self.last_activity(&room_id).unwrap_or(0);
+                (room_id, activity)
+            })
+            .collect();
+        ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(ordered.into_iter().map(|(room_id, _)| room_id).collect())
+    }
+
+    /// The registry, shared, with the wait timed.
+    fn registry_read(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, HashMap<String, Arc<RwLock<RoomLog>>>> {
+        self.metrics.record_registry_lock(false);
+        let started = std::time::Instant::now();
+        let open = self
+            .open
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.metrics.observe_lock_wait(
+            crate::metrics::LockKind::Registry,
+            false,
+            started.elapsed(),
+        );
+        open
+    }
+
+    /// One room's lock, shared. Uncontended, it is taken at once; contended
+    /// -- an ingest holding the room for a backlog, say -- the wait is
+    /// marked blocking so it parks this thread and not a whole worker.
+    fn read_room<'a>(&self, room: &'a RwLock<RoomLog>) -> std::sync::RwLockReadGuard<'a, RoomLog> {
+        self.metrics.record_room_lock(false);
+        let started = std::time::Instant::now();
+        let guard = match room.try_read() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(guard)) => guard.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => crate::blocking::section(
+                &self.metrics,
+                crate::metrics::BlockingTask::LockWait,
+                || {
+                    room.read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                },
+            ),
+        };
+        self.metrics
+            .observe_lock_wait(crate::metrics::LockKind::Room, false, started.elapsed());
+        guard
+    }
+
+    /// [`Self::read_room`], exclusive.
+    fn write_room<'a>(
+        &self,
+        room: &'a RwLock<RoomLog>,
+    ) -> std::sync::RwLockWriteGuard<'a, RoomLog> {
+        self.metrics.record_room_lock(true);
+        let started = std::time::Instant::now();
+        let guard = match room.try_write() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(guard)) => guard.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => crate::blocking::section(
+                &self.metrics,
+                crate::metrics::BlockingTask::LockWait,
+                || {
+                    room.write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                },
+            ),
+        };
+        self.metrics
+            .observe_lock_wait(crate::metrics::LockKind::Room, true, started.elapsed());
+        guard
     }
 
     fn room_or_load(
@@ -4625,25 +4901,21 @@ impl Rooms {
         room_id: &str,
         load: impl FnOnce() -> Result<RoomLog, RoomError>,
     ) -> Result<Arc<RwLock<RoomLog>>, RoomError> {
-        {
-            self.metrics.record_registry_lock(false);
-            let open = self
-                .open
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(room) = open.get(room_id) {
-                return Ok(Arc::clone(room));
-            }
+        if let Some(room) = self.resident(room_id) {
+            return Ok(room);
         }
         // Cold I/O and resolution never hold the registry. Duplicate read-only
         // loads are allowed; entry-or-insert preserves the canonical lock and
         // any append performed after another caller first published the room.
         let room = Arc::new(RwLock::new(load()?));
         self.metrics.record_registry_lock(true);
+        let started = std::time::Instant::now();
         let mut open = self
             .open
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.metrics
+            .observe_lock_wait(crate::metrics::LockKind::Registry, true, started.elapsed());
         Ok(Arc::clone(open.entry(room_id.to_owned()).or_insert(room)))
     }
 
@@ -4662,10 +4934,7 @@ impl Rooms {
         work: impl FnOnce(&Self, &RoomLog) -> Result<T, RoomError>,
     ) -> Result<T, RoomError> {
         let room = self.room(room_id)?;
-        self.metrics.record_room_lock(false);
-        let log = room
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let log = self.read_room(&room);
         work(self, &log)
     }
 
@@ -4677,10 +4946,7 @@ impl Rooms {
         let before = self.store.journalled();
         let room = self.room(room_id)?;
         let done = {
-            self.metrics.record_room_lock(true);
-            let mut log = room
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut log = self.write_room(&room);
             work(self, &mut log)
         };
         // The guard is gone by here, so the barrier below is not holding
@@ -6185,6 +6451,15 @@ fn purged_marker() -> Value {
         "type": "org.spindle.purged",
         "content": {},
     })
+}
+
+/// The `(user_id, room_id)` a membership-index key names: a schema byte,
+/// a keyspace byte, the user's big-endian length and bytes, then the room.
+fn split_user_room(key: &[u8]) -> Option<(String, String)> {
+    let length = usize::from(u16::from_be_bytes([*key.get(2)?, *key.get(3)?]));
+    let user = std::str::from_utf8(key.get(4..4 + length)?).ok()?;
+    let room = std::str::from_utf8(key.get(4 + length..)?).ok()?;
+    Some((user.to_owned(), room.to_owned()))
 }
 
 /// Event bodies live beside the log, keyed by room and event ID.

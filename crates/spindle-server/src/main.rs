@@ -1213,7 +1213,7 @@ fn build_app(
     store: Arc<FjallStore>,
     metrics: Arc<spindle_server::metrics::Metrics>,
 ) -> Option<axum::Router> {
-    match spindle_server::app_with_metrics(config, store, metrics) {
+    match spindle_server::app_warming(config, store, metrics) {
         Ok(app) => Some(app),
         Err(error) => {
             tracing::error!("cannot build the server: {error}");

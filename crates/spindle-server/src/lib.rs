@@ -14,6 +14,7 @@ pub mod auth;
 pub mod authorize;
 pub mod backups;
 pub mod blobs;
+pub mod blocking;
 pub mod config;
 pub mod dehydrated;
 pub mod delayed;
@@ -179,6 +180,157 @@ pub fn app_with_metrics(
     store: Arc<FjallStore>,
     metrics: Arc<metrics::Metrics>,
 ) -> Result<Router, AppError> {
+    let state = app_state(config, store, metrics)?;
+    spawn_delivery_loops(&state);
+    Ok(routes::router(state))
+}
+
+/// [`app_with_metrics`], also handing back the state the router serves,
+/// for tests that need to reach behind the HTTP surface -- to hold a
+/// room's lock, or ask which rooms are resident.
+///
+/// # Errors
+///
+/// As [`app`].
+#[doc(hidden)]
+pub fn app_with_state(
+    config: Config,
+    store: Arc<FjallStore>,
+    metrics: Arc<metrics::Metrics>,
+) -> Result<(Router, AppState), AppError> {
+    let state = app_state(config, store, metrics)?;
+    spawn_delivery_loops(&state);
+    Ok((routes::router(state.clone()), state))
+}
+
+/// [`app_with_metrics`], plus the startup warm-up `[storage]
+/// warm_concurrency` asks for: what the server binary runs.
+///
+/// Separate so that a test building an app gets exactly the rooms it
+/// touched resident and no background loads racing its assertions.
+///
+/// # Errors
+///
+/// As [`app`].
+pub fn app_warming(
+    config: Config,
+    store: Arc<FjallStore>,
+    metrics: Arc<metrics::Metrics>,
+) -> Result<Router, AppError> {
+    let concurrency = config.storage.warm_concurrency;
+    let state = app_state(config, store, metrics)?;
+    spawn_delivery_loops(&state);
+    spawn_room_warmup(&state.rooms, &state.metrics, concurrency);
+    Ok(routes::router(state))
+}
+
+/// Load every room a local user is joined to in the background, newest
+/// activity first, `concurrency` at a time, on the blocking pool (#614).
+///
+/// Readiness does not wait for this. A room of a million events takes
+/// minutes to load on the hardware this runs on, and a readiness gate
+/// on it would hold a single-replica deployment out of service for all
+/// of them -- an outage to avoid a slow first request. Requests for a
+/// room the warm-up has not reached yet still work: they load it
+/// themselves, off the async workers, and the warm-up skips it.
+/// `spindle_room_warmup_pending` says how far it has got.
+///
+/// Holds the rooms weakly between loads, so a shutdown is held up by at
+/// most the loads already in progress.
+pub fn spawn_room_warmup(
+    rooms: &Arc<rooms::Rooms>,
+    metrics: &Arc<metrics::Metrics>,
+    concurrency: usize,
+) {
+    if concurrency == 0 || tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    let rooms = Arc::downgrade(rooms);
+    let metrics = Arc::clone(metrics);
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let candidates = {
+            let rooms = rooms.clone();
+            tokio::task::spawn_blocking(move || {
+                rooms
+                    .upgrade()
+                    .map_or_else(|| Ok(Vec::new()), |rooms| rooms.warm_candidates())
+            })
+            .await
+        };
+        let candidates = match candidates {
+            Ok(Ok(candidates)) => candidates,
+            Ok(Err(error)) => {
+                tracing::warn!("room warm-up cannot list rooms: {error}");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!("room warm-up failed: {error}");
+                return;
+            }
+        };
+        let total = candidates.len();
+        metrics.set_warmup_pending(total as u64);
+        tracing::info!(rooms = total, concurrency, "warming rooms");
+        let queue = Arc::new(std::sync::Mutex::new(
+            candidates
+                .into_iter()
+                .collect::<std::collections::VecDeque<_>>(),
+        ));
+        let workers: Vec<_> = (0..concurrency.min(total.max(1)))
+            .map(|_| {
+                let queue = Arc::clone(&queue);
+                let rooms = rooms.clone();
+                let metrics = Arc::clone(&metrics);
+                tokio::task::spawn_blocking(move || warm_from(&queue, &rooms, &metrics))
+            })
+            .collect();
+        for worker in workers {
+            let _ = worker.await;
+        }
+        tracing::info!(
+            rooms = total,
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "room warm-up finished"
+        );
+    });
+}
+
+/// One warm-up worker: load rooms off the shared queue until it is empty
+/// or the server is gone.
+fn warm_from(
+    queue: &std::sync::Mutex<std::collections::VecDeque<String>>,
+    rooms: &std::sync::Weak<rooms::Rooms>,
+    metrics: &metrics::Metrics,
+) {
+    loop {
+        let Some(room_id) = queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+        else {
+            return;
+        };
+        let Some(rooms) = rooms.upgrade() else {
+            return;
+        };
+        let _in_flight = metrics.blocking_started(metrics::BlockingTask::RoomWarmup);
+        match rooms.warm(&room_id) {
+            Ok(()) => metrics.warmup_loaded(),
+            Err(error) => {
+                tracing::warn!(room = room_id, "room warm-up cannot load: {error}");
+                metrics.warmup_failed();
+            }
+        }
+    }
+}
+
+/// Everything a handler needs, built from configuration.
+fn app_state(
+    config: Config,
+    store: Arc<FjallStore>,
+    metrics: Arc<metrics::Metrics>,
+) -> Result<AppState, AppError> {
     let key =
         Arc::new(signing::ServerKey::load_or_create(store.as_ref()).map_err(AppError::Signing)?);
     let rooms = Arc::new(rooms::Rooms::with_metrics(
@@ -274,8 +426,14 @@ pub fn app_with_metrics(
         recovery: Arc::new(inbound::RecoveryGate::new()),
         metrics,
     };
-    spawn_delivery_loops(&state);
-    Ok(routes::router(state))
+    // Resident rooms are counted at scrape time, from the registry itself,
+    // rather than kept as a counter every admission path would have to
+    // remember to move. Weakly, so the registry never outlives the server.
+    let resident = Arc::downgrade(&state.rooms);
+    state
+        .metrics
+        .set_resident_rooms_probe(move || resident.upgrade()?.resident_count());
+    Ok(state)
 }
 
 /// The delivery loops that run for the life of the process. Spawned only

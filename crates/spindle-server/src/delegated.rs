@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -21,9 +22,12 @@ use crate::config::DelegatedAuthConfig;
 use crate::errors::MatrixError;
 
 /// How long one introspection verdict is trusted before the provider is
-/// asked again. The window is the revocation lag: a token MAS revokes
-/// keeps working here for at most this long. Synapse ships the same
-/// order of magnitude for the same trade.
+/// asked again. This is the revocation lag only for a revocation this
+/// server is never told about: a logout it serves, and a device the
+/// provider deletes through `/_synapse/mas/delete_device`, evict the
+/// verdicts they end at once (#615), and a cached verdict whose device
+/// has gone is refused on sight, the check Synapse's `MasDelegatedAuth`
+/// makes for the same reason. Synapse ships the same two minutes.
 const INTROSPECTION_TTL: Duration = Duration::from_secs(120);
 
 /// The scope prefix MSC2967 uses to bind a token to one device.
@@ -50,6 +54,13 @@ pub struct Delegated {
     /// the provider in every API call's latency; the hash keeps usable
     /// tokens out of process memory dumps, same as the token store.
     verdicts: Mutex<HashMap<[u8; 32], (Verdict, Instant)>>,
+    /// Bumped by every eviction. An introspection that was in flight
+    /// while one happened may be carrying the very verdict the eviction
+    /// ended -- the provider answered before the session was revoked --
+    /// so its answer serves the request it was made for and is not
+    /// cached, and it provisions no device: re-creating the row a
+    /// deletion just removed would bring the dead device back.
+    evictions: AtomicU64,
     /// The provider's metadata document, fetched once on first ask.
     metadata: Mutex<Option<Value>>,
 }
@@ -61,8 +72,49 @@ impl Delegated {
             config,
             client: reqwest::Client::new(),
             verdicts: Mutex::new(HashMap::new()),
+            evictions: AtomicU64::new(0),
             metadata: Mutex::new(None),
         }
+    }
+
+    /// Forget the cached verdict for one token: it has been logged out.
+    pub fn forget_token(&self, token: &str) {
+        let key: [u8; 32] = *blake3::hash(token.as_bytes()).as_bytes();
+        self.evict(|candidate, _| *candidate == key);
+    }
+
+    /// Forget every cached verdict bound to one device of one user: the
+    /// device is gone, and with it every session the provider issued for it.
+    pub fn forget_device(&self, user_id: &str, device_id: &str) {
+        self.evict(|_, verdict| {
+            verdict.user_id == user_id && verdict.device_id.as_deref() == Some(device_id)
+        });
+    }
+
+    /// Forget every cached verdict for one user, device-bound or not:
+    /// logged out everywhere, or deactivated.
+    pub fn forget_user(&self, user_id: &str) {
+        self.evict(|_, verdict| verdict.user_id == user_id);
+    }
+
+    /// How many verdicts are cached, for tests that assert an eviction.
+    #[must_use]
+    pub fn cached_verdicts(&self) -> usize {
+        self.verdicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    fn evict(&self, matches: impl Fn(&[u8; 32], &Verdict) -> bool) {
+        let mut verdicts = self
+            .verdicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Bumped under the lock, so an introspection cannot read the old
+        // count, lose the race to this eviction, and still insert.
+        self.evictions.fetch_add(1, Ordering::SeqCst);
+        verdicts.retain(|key, (verdict, _)| !matches(key, verdict));
     }
 
     #[must_use]
@@ -197,22 +249,41 @@ impl Delegated {
         token: &str,
     ) -> Result<Verdict, MatrixError> {
         let key: [u8; 32] = *blake3::hash(token.as_bytes()).as_bytes();
-        if let Some((identity, fresh_until)) = self
+        let cached = self
             .verdicts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
-            .cloned()
+            .cloned();
+        if let Some((verdict, fresh_until)) = cached
             && fresh_until > Instant::now()
         {
-            return Ok(identity);
+            // The device the verdict names must still exist. A session the
+            // provider ended has its device deleted here through the
+            // provisioning API, so a missing row is a revocation this cache
+            // has not heard about yet -- Synapse makes exactly this check on
+            // every request for exactly this reason. Refused rather than
+            // re-asked: the provider is the one that just said so.
+            if let Some(device_id) = &verdict.device_id
+                && !device_exists(store, server_name, &verdict.user_id, device_id)?
+            {
+                self.forget_token(token);
+                return Err(MatrixError::unknown_token());
+            }
+            return Ok(verdict);
         }
-        let identity = self.introspect(store, server_name, token).await?;
-        self.verdicts
+        let generation = self.evictions.load(Ordering::SeqCst);
+        let verdict = self
+            .introspect(store, server_name, token, generation)
+            .await?;
+        let mut verdicts = self
+            .verdicts
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key, (identity.clone(), Instant::now() + INTROSPECTION_TTL));
-        Ok(identity)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.evictions.load(Ordering::SeqCst) == generation {
+            verdicts.insert(key, (verdict.clone(), Instant::now() + INTROSPECTION_TTL));
+        }
+        Ok(verdict)
     }
 
     async fn introspect(
@@ -220,6 +291,7 @@ impl Delegated {
         store: &spindle_store::FjallStore,
         server_name: &str,
         token: &str,
+        generation: u64,
     ) -> Result<Verdict, MatrixError> {
         let request = self
             .client
@@ -297,6 +369,7 @@ impl Delegated {
         // it — MSC3861's account/device mapping, written down so device
         // lists and E2EE key uploads have something to hang off.
         if let Some(device_id) = &device_id
+            && self.evictions.load(Ordering::SeqCst) == generation
             && accounts
                 .device(&localpart, device_id)
                 .map_err(|error| MatrixError::internal(&error.to_string()))?
@@ -312,4 +385,24 @@ impl Delegated {
             admin,
         })
     }
+}
+
+/// Whether `device_id` of the local `user_id` still has its row.
+fn device_exists(
+    store: &spindle_store::FjallStore,
+    server_name: &str,
+    user_id: &str,
+    device_id: &str,
+) -> Result<bool, MatrixError> {
+    let Some(localpart) = user_id
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(localpart, _)| localpart)
+    else {
+        return Ok(false);
+    };
+    Ok(Accounts::new(store, server_name)
+        .device(localpart, device_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+        .is_some())
 }

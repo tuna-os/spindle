@@ -1668,6 +1668,7 @@ impl Federation {
         deliver(
             self.transaction_request(destination, txn_id, body)?,
             destination,
+            &self.metrics,
         )
         .await
     }
@@ -1712,10 +1713,29 @@ struct PreparedTransaction {
     body: String,
 }
 
-/// Send one built transaction and read the peer's verdict.
-async fn deliver(prepared: PreparedTransaction, destination: &str) -> Result<(), FederationError> {
-    let destination_address = prepared.address.resolve().await?;
-    let response = destination_address
+/// Send one built transaction and read the peer's verdict, counting how it
+/// ended and how long it took.
+async fn deliver(
+    prepared: PreparedTransaction,
+    destination: &str,
+    metrics: &crate::metrics::Metrics,
+) -> Result<(), FederationError> {
+    let started = Instant::now();
+    let (result, outcome) = deliver_once(prepared, destination).await;
+    metrics.observe_outbound_txn(result, started.elapsed());
+    outcome
+}
+
+async fn deliver_once(
+    prepared: PreparedTransaction,
+    destination: &str,
+) -> (crate::metrics::TxnResult, Result<(), FederationError>) {
+    use crate::metrics::TxnResult;
+    let destination_address = match prepared.address.resolve().await {
+        Ok(address) => address,
+        Err(error) => return (TxnResult::Error, Err(error)),
+    };
+    let response = match destination_address
         .request(reqwest::Method::PUT, &prepared.uri)
         .header("authorization", prepared.authorization)
         .header("content-type", "application/json")
@@ -1723,14 +1743,30 @@ async fn deliver(prepared: PreparedTransaction, destination: &str) -> Result<(),
         .body(prepared.body)
         .send()
         .await
-        .map_err(|error| FederationError::Refused(format!("send: {error}")))?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let result = if error.is_timeout() {
+                TxnResult::Timeout
+            } else {
+                TxnResult::Error
+            };
+            return (
+                result,
+                Err(FederationError::Refused(format!("send: {error}"))),
+            );
+        }
+    };
     if !response.status().is_success() {
-        return Err(FederationError::Refused(format!(
-            "{destination} answered {}",
-            response.status()
-        )));
+        return (
+            TxnResult::HttpError,
+            Err(FederationError::Refused(format!(
+                "{destination} answered {}",
+                response.status()
+            ))),
+        );
     }
-    Ok(())
+    (TxnResult::Success, Ok(()))
 }
 
 fn client_builder(allowed: &[Cidr]) -> reqwest::ClientBuilder {
@@ -1785,11 +1821,16 @@ pub async fn drain_outbox(
                 .max(Duration::from_millis(25)),
         )
         .await;
-        let transactions = {
+        let (transactions, metrics) = {
             let (Some(store), Some(federation)) = (store.upgrade(), federation.upgrade()) else {
                 return;
             };
-            plan_transactions(&store, &federation, &backoff)
+            // The registry is not something the store's close waits on,
+            // so holding it across a send is as harmless as the request.
+            (
+                plan_transactions(&store, &federation, &backoff),
+                Arc::clone(&federation.metrics),
+            )
         };
         for OutboundTransaction {
             destination,
@@ -1798,8 +1839,11 @@ pub async fn drain_outbox(
         } in transactions
         {
             let sent = match request {
-                Ok(request) => deliver(request, &destination).await,
-                Err(error) => Err(error),
+                Ok(request) => deliver(request, &destination, &metrics).await,
+                Err(error) => {
+                    metrics.observe_outbound_txn(crate::metrics::TxnResult::Error, Duration::ZERO);
+                    Err(error)
+                }
             };
             match sent {
                 Ok(()) => {
