@@ -887,6 +887,87 @@ pub struct FederationConfig {
     /// directly over TLS, as Synapse does when its warning is suppressed.
     #[serde(default)]
     pub trusted_key_servers: Option<Vec<TrustedKeyServer>>,
+    /// MSC3995 hub mode (`[federation.hub]`, #22, SPEC section 12).
+    ///
+    /// Parsed by every build so one config file serves both, but only a
+    /// build with the `hub-mode` cargo feature can act on it: anywhere else
+    /// `enabled = true` is a startup error rather than a silent no-op.
+    #[serde(default)]
+    pub hub: HubConfig,
+}
+
+/// `[federation.hub]`: Spindle's MSC3995 hub mode, between Spindle peers.
+///
+/// Off by default. With it off -- or in a build without the `hub-mode`
+/// feature -- the server mounts no hub route, sends no hub EDU, and treats
+/// an `m.room.hub` event as the ordinary state event it is to every other
+/// server.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubConfig {
+    /// Speak hub mode: advertise it, sequence submissions for rooms this
+    /// server hubs, and submit this server's events to a room's hub.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How long a submission to a remote hub may take before this server
+    /// stops waiting and sends the event the ordinary way, milliseconds.
+    #[serde(default = "default_hub_submit_timeout_ms")]
+    pub submit_timeout_ms: u64,
+    /// Submissions per event before falling back to an ordinary send, when
+    /// the hub keeps answering that this server's view of the head is stale.
+    #[serde(default = "default_hub_submit_attempts")]
+    pub submit_attempts: u32,
+    /// How long a peer's answer to the capability probe is believed,
+    /// milliseconds. A probe that fails to get an answer is not cached.
+    #[serde(default = "default_hub_capability_ttl_ms")]
+    pub capability_ttl_ms: u64,
+}
+
+const fn default_hub_submit_timeout_ms() -> u64 {
+    5_000
+}
+
+const fn default_hub_submit_attempts() -> u32 {
+    3
+}
+
+const fn default_hub_capability_ttl_ms() -> u64 {
+    300_000
+}
+
+impl HubConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        // A build without the feature cannot honour the switch, and an
+        // operator who turned it on expects hub behaviour: refuse to start
+        // rather than run as an ordinary server that looks configured.
+        #[cfg(not(feature = "hub-mode"))]
+        if self.enabled {
+            return Err(ConfigError::Invalid {
+                field: "federation.hub.enabled",
+                message: "this build has no MSC3995 hub mode; rebuild with the `hub-mode` \
+                          cargo feature or remove [federation.hub]"
+                    .to_owned(),
+            });
+        }
+        if self.submit_attempts == 0 {
+            return Err(ConfigError::Invalid {
+                field: "federation.hub.submit_attempts",
+                message: "must be at least 1".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Default for HubConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            submit_timeout_ms: default_hub_submit_timeout_ms(),
+            submit_attempts: default_hub_submit_attempts(),
+            capability_ttl_ms: default_hub_capability_ttl_ms(),
+        }
+    }
 }
 
 /// One notary in `[federation] trusted_key_servers`: a bare server name,
@@ -1001,6 +1082,7 @@ impl Default for FederationConfig {
             gap_acceptances_per_origin: default_gap_acceptances_per_origin(),
             gap_acceptance_window_secs: default_gap_acceptance_window_secs(),
             trusted_key_servers: None,
+            hub: HubConfig::default(),
         }
     }
 }
@@ -1185,6 +1267,7 @@ impl Config {
         })?;
         config.validate()?;
         config.validate_media()?;
+        config.federation.hub.validate()?;
         if let Some(delegated) = &config.auth.delegated {
             delegated.validate()?;
         }

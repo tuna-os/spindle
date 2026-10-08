@@ -1679,6 +1679,25 @@ impl Federation {
         Ok(answer)
     }
 
+    /// A signed MSC3995 hub request (#22): a `GET` without `body`, a
+    /// `POST` with one. The answer is bounded; a `4xx` with a Matrix error
+    /// body comes back as [`FederationError::Answered`], which is how a
+    /// participant reads the hub's "your head is stale".
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::signed_json`].
+    #[cfg(feature = "hub-mode")]
+    pub(crate) async fn hub_request(
+        &self,
+        destination: &str,
+        uri: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, FederationError> {
+        self.signed_json_bounded(destination, uri, body, "msc3995 hub", Some(4 * 1024 * 1024))
+            .await
+    }
+
     /// Fetch a bounded predecessor window. Returned PDUs still need event
     /// identity, signature and room authorization checks before storage.
     ///

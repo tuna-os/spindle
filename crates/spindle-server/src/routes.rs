@@ -122,7 +122,17 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::recovery::routes())
         .merge(crate::openid::routes())
         .merge(crate::rendezvous::routes())
-        .merge(crate::livekit::routes())
+        .merge(crate::livekit::routes());
+    // MSC3995 hub mode (#22): mounted only in a build with the feature and
+    // only with `[federation.hub] enabled`. Unmounted, its paths fall to
+    // the fallback below like any path this server does not speak.
+    #[cfg(feature = "hub-mode")]
+    let routes = if state.config.federation.hub.enabled {
+        routes.merge(crate::hub::routes())
+    } else {
+        routes
+    };
+    let routes = routes
         // SPEC: an endpoint the server does not recognize answers 404
         // M_UNRECOGNIZED — a JSON verdict, not a bare status. Clients (and
         // Complement's TestUnknownEndpoints) read the errcode to tell "this
@@ -9098,6 +9108,20 @@ async fn set_room_state(
             .map_err(delay_error)?;
         return Ok(Json(json!({ "delay_id": delay_id })));
     }
+    #[cfg(feature = "hub-mode")]
+    if query.sticky.is_none()
+        && let Some(event_id) = crate::hub::try_send(
+            &state,
+            &identity.user_id,
+            &room_id,
+            &event_type,
+            Some(&state_key),
+            &content,
+        )
+        .await?
+    {
+        return Ok(Json(json!({ "event_id": event_id })));
+    }
     let event_id = state
         .rooms
         .set_state_sticky(
@@ -9110,6 +9134,8 @@ async fn set_room_state(
             query.sticky,
         )
         .map_err(room_error)?;
+    #[cfg(feature = "hub-mode")]
+    crate::hub::after_local_send(&state, &room_id);
     Ok(Json(json!({ "event_id": event_id })))
 }
 
@@ -9325,6 +9351,19 @@ fn with_transaction(
         return Ok(Json(json!({ "event_id": event_id })));
     }
     let event_id = mint()?;
+    record_transaction(state, identity, txn_id, &event_id)
+}
+
+/// Remember which event a client transaction minted, both ways round:
+/// the retry answers with it, and the event comes back to the device
+/// with the transaction ID it chose.
+pub(crate) fn record_transaction(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    txn_id: &str,
+    event_id: &str,
+) -> Result<Json<Value>, MatrixError> {
+    let key = spindle_core::keys::transaction(&identity.user_id, &identity.device_id, txn_id);
     spindle_store::Store::put(state.store.as_ref(), &key, event_id.as_bytes())
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
     // The inverse row, so the event comes back to this device with the
@@ -9332,7 +9371,7 @@ fn with_transaction(
     // echo to the local one it is still showing.
     spindle_store::Store::put(
         state.store.as_ref(),
-        &spindle_core::keys::transaction_echo(&identity.user_id, &event_id),
+        &spindle_core::keys::transaction_echo(&identity.user_id, event_id),
         &spindle_core::keys::transaction_echo_value(&identity.device_id, txn_id),
     )
     .map_err(|error| MatrixError::internal(&error.to_string()))?;
@@ -9452,7 +9491,26 @@ async fn send_event(
             .map_err(delay_error)?;
         return Ok(Json(json!({ "delay_id": delay_id })));
     }
-    with_transaction(&state, &identity, &txn_id, || {
+    // MSC3995 hub mode (#22): in a room another Spindle hubs, the event is
+    // sequenced there first. `None` is "not a hub room here" or "the hub
+    // could not be used before anything was built", and the ordinary path
+    // below runs exactly as it would in a build without the feature.
+    #[cfg(feature = "hub-mode")]
+    if query.sticky.is_none()
+        && let Some(response) = crate::hub::send_with_transaction(
+            &state,
+            &identity,
+            &txn_id,
+            &room_id,
+            &event_type,
+            None,
+            &content,
+        )
+        .await?
+    {
+        return Ok(response);
+    }
+    let response = with_transaction(&state, &identity, &txn_id, || {
         state
             .rooms
             .send_sticky(
@@ -9464,7 +9522,10 @@ async fn send_event(
                 query.sticky,
             )
             .map_err(room_error)
-    })
+    })?;
+    #[cfg(feature = "hub-mode")]
+    crate::hub::after_local_send(&state, &room_id);
+    Ok(response)
 }
 
 #[derive(Debug, Deserialize)]

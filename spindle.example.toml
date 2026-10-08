@@ -207,6 +207,20 @@ gap_acceptances_per_room = 10
 gap_acceptances_per_origin = 30
 gap_acceptance_window_secs = 600
 
+# MSC3995 hub mode (#22, SPEC section 12.6), between Spindle servers that
+# both turn it on. Only a build with the `hub-mode` Cargo feature can enable
+# it; any other build refuses to start with enabled = true. Off, an
+# m.room.hub event is ordinary state and this server speaks no hub endpoint.
+# [federation.hub]
+# enabled = false
+# How long a submission to a room's hub may take before the event is sent
+# the ordinary way instead.
+# submit_timeout_ms = 5000
+# Tries per event while the hub answers that this server's head is stale.
+# submit_attempts = 3
+# How long a peer's answer to the hub capability probe is believed.
+# capability_ttl_ms = 300000
+
 [appservices]
 # Paths to appservice registration files, in the spec's YAML shape. Every
 # file must load and validate or the server refuses to start: a bridge

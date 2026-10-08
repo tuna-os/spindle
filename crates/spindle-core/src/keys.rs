@@ -465,6 +465,16 @@ pub enum Keyspace {
     /// `localpart` -> the account's one-time recovery codes, each as a
     /// salt and the BLAKE3 digest of salt and code; never the codes.
     RecoveryCodes = 0x54,
+    /// `(room_id, li)` -> a hub's signed chain attestation for the entry it
+    /// sequenced at `li` (SPEC section 12.5, #22). Written only by a build
+    /// with the `hub-mode` feature; a hub keeps none of its own, it re-signs.
+    ///
+    /// `0x70` rather than the next free value, so the hub's two keyspaces
+    /// sit apart from the run other branches allocate from.
+    HubAttestation = 0x70,
+    /// `(room_id, li)` -> a portable equivocation proof: two attestations
+    /// by one hub that cannot both be true (SPEC section 13.3).
+    HubEquivocation = 0x71,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -656,6 +666,25 @@ pub fn room_prefix(keyspace: Keyspace, room_id: &str) -> Vec<u8> {
     key.push(keyspace as u8);
     key.extend_from_slice(&len.to_be_bytes());
     key.extend_from_slice(room);
+    key
+}
+
+/// A hub's attestation for one entry of a room it sequences
+/// ([`Keyspace::HubAttestation`]). Ordered by `li`, so a room's
+/// attestations scan in sequence order.
+#[must_use]
+pub fn hub_attestation(room_id: &str, li: i64) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::HubAttestation, room_id);
+    key.extend_from_slice(&order_preserving(li));
+    key
+}
+
+/// An equivocation proof about one room position
+/// ([`Keyspace::HubEquivocation`]).
+#[must_use]
+pub fn hub_equivocation(room_id: &str, li: i64) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::HubEquivocation, room_id);
+    key.extend_from_slice(&order_preserving(li));
     key
 }
 

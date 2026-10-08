@@ -60,9 +60,16 @@ opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "trace"] }
 synapse-import = ["dep:postgres", "dep:rusqlite"]
 # Enable the production-corpus replay harness.
 corpus-replay = []
+# MSC3995 linearized hub mode (#22, SPEC section 12). Off by default and off
+# in production: a build without it serves no hub route, sends no hub EDU and
+# reads none, so it carries no unstable wire behaviour at all. With it, the
+# behaviour is still dormant until `[federation.hub] enabled = true`.
+hub-mode = []
 
 [dev-dependencies]
 tokio-rustls = "0.26"
+# The hub-mode tests partition two servers with a TCP proxy between them.
+tokio = { workspace = true, features = ["io-util", "sync"] }
 # `state-res` so the tests can judge our events with the same implementation a
 # federating peer would (ADR 0002: ruma judges, it never builds our side).
 ruma = { workspace = true, features = ["state-res", "events"] }

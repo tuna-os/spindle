@@ -147,6 +147,8 @@ mod erasure;
 pub mod extremities;
 mod federation;
 mod gaps;
+#[cfg(feature = "hub-mode")]
+mod hub;
 mod read;
 mod synapse_positions;
 mod unread;
@@ -159,6 +161,8 @@ pub use unread::{Receipt, Scored, Unread, Unscored};
 use unread::{ScoreTally, UnreadIndex};
 
 pub use gaps::{GapChunk, GapChunkOutcome, GapProgress};
+#[cfg(feature = "hub-mode")]
+pub use hub::{HUB_EVENT_TYPE, HubDesignation, Sequenced};
 
 pub struct Rooms {
     store: Arc<FjallStore>,
