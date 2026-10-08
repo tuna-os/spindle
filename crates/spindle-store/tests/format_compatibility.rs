@@ -204,6 +204,7 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::AccountDataStream, 0x3c),
         (Keyspace::SynapsePosition, 0x3e),
         (Keyspace::SynapseTopologicalPosition, 0x3f),
+        (Keyspace::BrowserSession, 0x50),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(

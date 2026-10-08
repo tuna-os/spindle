@@ -80,6 +80,7 @@ pub struct Metrics {
     federation_queue: RwLock<Vec<(String, u64)>>,
     sync_subscribers: AtomicU64,
     sync_lag: Family,
+    auth: AuthCounters,
 }
 
 impl Metrics {
@@ -187,6 +188,7 @@ impl Metrics {
         self.render_http(&mut out);
         self.render_federation(&mut out);
         self.render_sync(&mut out);
+        self.render_auth(&mut out);
         out
     }
 }
@@ -581,6 +583,337 @@ impl Metrics {
     }
 }
 
+/// Which door a sign-in came through.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoginMethod {
+    /// `POST /_matrix/client/v3/login` with `m.login.password`.
+    Password,
+    /// The built-in provider's authorization page, with a password.
+    Oidc,
+    /// The built-in provider's authorization page, continuing an existing
+    /// browser session ("Continue as …") rather than re-entering a password.
+    OidcSession,
+    /// The account-management sign-in page.
+    Account,
+}
+
+impl LoginMethod {
+    const ALL: [Self; 4] = [Self::Password, Self::Oidc, Self::OidcSession, Self::Account];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Password => "password",
+            Self::Oidc => "oidc",
+            Self::OidcSession => "oidc_session",
+            Self::Account => "account",
+        }
+    }
+}
+
+/// How a sign-in ended. `BadPassword` covers an unknown user too: the
+/// server does not distinguish them anywhere else, and a metric that did
+/// would be the enumeration oracle the login path refuses to be.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoginResult {
+    Success,
+    BadPassword,
+    RateLimited,
+    Error,
+}
+
+impl LoginResult {
+    const ALL: [Self; 4] = [
+        Self::Success,
+        Self::BadPassword,
+        Self::RateLimited,
+        Self::Error,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::BadPassword => "bad_password",
+            Self::RateLimited => "rate_limited",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// An OAuth 2.0 token-endpoint grant type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TokenGrant {
+    AuthorizationCode,
+    RefreshToken,
+}
+
+impl TokenGrant {
+    const ALL: [Self; 2] = [Self::AuthorizationCode, Self::RefreshToken];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::AuthorizationCode => "authorization_code",
+            Self::RefreshToken => "refresh_token",
+        }
+    }
+}
+
+/// How a token grant ended, in RFC 6749's terms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GrantResult {
+    Success,
+    /// A code or refresh token that is unknown, spent, expired, or fails
+    /// PKCE or the client binding.
+    InvalidGrant,
+    /// A malformed request: a missing field.
+    InvalidRequest,
+    Error,
+}
+
+impl GrantResult {
+    const ALL: [Self; 4] = [
+        Self::Success,
+        Self::InvalidGrant,
+        Self::InvalidRequest,
+        Self::Error,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::InvalidGrant => "invalid_grant",
+            Self::InvalidRequest => "invalid_request",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// A change a user made through the account-management pages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccountAction {
+    Profile,
+    PasswordChange,
+    SessionEnd,
+    Deactivate,
+    EmailAdd,
+    EmailVerify,
+    EmailRemove,
+    CrossSigningReset,
+}
+
+impl AccountAction {
+    const ALL: [Self; 8] = [
+        Self::Profile,
+        Self::PasswordChange,
+        Self::SessionEnd,
+        Self::Deactivate,
+        Self::EmailAdd,
+        Self::EmailVerify,
+        Self::EmailRemove,
+        Self::CrossSigningReset,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Profile => "profile",
+            Self::PasswordChange => "password_change",
+            Self::SessionEnd => "session_end",
+            Self::Deactivate => "deactivate",
+            Self::EmailAdd => "email_add",
+            Self::EmailVerify => "email_verify",
+            Self::EmailRemove => "email_remove",
+            Self::CrossSigningReset => "cross_signing_reset",
+        }
+    }
+}
+
+/// Which mail the server sent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmailKind {
+    PasswordReset,
+    Verification,
+}
+
+impl EmailKind {
+    const ALL: [Self; 2] = [Self::PasswordReset, Self::Verification];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::PasswordReset => "password_reset",
+            Self::Verification => "verification",
+        }
+    }
+}
+
+/// The authentication counters (#607/#608's observability).
+///
+/// Every label is one of the enums above, so the series set is fixed at
+/// compile time: no username, address, client or device ever becomes a
+/// label value, which is both the cardinality rule and the privacy one.
+#[derive(Debug, Default)]
+struct AuthCounters {
+    logins: [[AtomicU64; 4]; 4],
+    grants: [[AtomicU64; 4]; 2],
+    /// `[requested, completed]`.
+    resets: [AtomicU64; 2],
+    /// `[kind][sent, failed]`.
+    emails: [[AtomicU64; 2]; 2],
+    account_actions: [AtomicU64; 8],
+}
+
+fn index_of<T: PartialEq + Copy>(all: &[T], value: T) -> usize {
+    all.iter().position(|item| *item == value).unwrap_or(0)
+}
+
+impl Metrics {
+    /// Record one sign-in attempt and how it ended.
+    pub fn record_login(&self, method: LoginMethod, result: LoginResult) {
+        self.auth.logins[index_of(&LoginMethod::ALL, method)][index_of(&LoginResult::ALL, result)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one token-endpoint grant and how it ended.
+    pub fn record_token_grant(&self, grant: TokenGrant, result: GrantResult) {
+        self.auth.grants[index_of(&TokenGrant::ALL, grant)][index_of(&GrantResult::ALL, result)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a password reset requested — counted per form submission,
+    /// whether or not the address belonged to anyone, because the page
+    /// cannot say either and neither may the metric.
+    pub fn record_password_reset_requested(&self) {
+        self.auth.resets[0].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a password reset completed with a valid token.
+    pub fn record_password_reset_completed(&self) {
+        self.auth.resets[1].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one email handed to the mail transport, and whether it took it.
+    pub fn record_email(&self, kind: EmailKind, sent: bool) {
+        self.auth.emails[index_of(&EmailKind::ALL, kind)][usize::from(!sent)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one completed account-management action.
+    pub fn record_account_action(&self, action: AccountAction) {
+        self.auth.account_actions[index_of(&AccountAction::ALL, action)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read one sign-in counter, for tests that assert it moved.
+    #[must_use]
+    pub fn login_count(&self, method: LoginMethod, result: LoginResult) -> u64 {
+        self.auth.logins[index_of(&LoginMethod::ALL, method)][index_of(&LoginResult::ALL, result)]
+            .load(Ordering::Relaxed)
+    }
+
+    /// Read one grant counter, for tests that assert it moved.
+    #[must_use]
+    pub fn token_grant_count(&self, grant: TokenGrant, result: GrantResult) -> u64 {
+        self.auth.grants[index_of(&TokenGrant::ALL, grant)][index_of(&GrantResult::ALL, result)]
+            .load(Ordering::Relaxed)
+    }
+
+    /// Read the reset counters, `(requested, completed)`.
+    #[must_use]
+    pub fn password_reset_counts(&self) -> (u64, u64) {
+        (
+            self.auth.resets[0].load(Ordering::Relaxed),
+            self.auth.resets[1].load(Ordering::Relaxed),
+        )
+    }
+
+    /// Read one email counter, for tests that assert it moved.
+    #[must_use]
+    pub fn email_count(&self, kind: EmailKind, sent: bool) -> u64 {
+        self.auth.emails[index_of(&EmailKind::ALL, kind)][usize::from(!sent)]
+            .load(Ordering::Relaxed)
+    }
+
+    /// Read one account-action counter, for tests that assert it moved.
+    #[must_use]
+    pub fn account_action_count(&self, action: AccountAction) -> u64 {
+        self.auth.account_actions[index_of(&AccountAction::ALL, action)].load(Ordering::Relaxed)
+    }
+
+    fn render_auth(&self, out: &mut String) {
+        out.push_str(
+            "# HELP spindle_auth_logins_total Sign-in attempts, by door and outcome.\n\
+             # TYPE spindle_auth_logins_total counter\n",
+        );
+        for method in LoginMethod::ALL {
+            for result in LoginResult::ALL {
+                let _ = writeln!(
+                    out,
+                    "spindle_auth_logins_total{{method=\"{}\",result=\"{}\"}} {}",
+                    method.label(),
+                    result.label(),
+                    self.login_count(method, result)
+                );
+            }
+        }
+        out.push_str(
+            "# HELP spindle_oauth_token_grants_total Built-in provider token-endpoint \
+             grants, by grant type and outcome.\n\
+             # TYPE spindle_oauth_token_grants_total counter\n",
+        );
+        for grant in TokenGrant::ALL {
+            for result in GrantResult::ALL {
+                let _ = writeln!(
+                    out,
+                    "spindle_oauth_token_grants_total{{grant=\"{}\",result=\"{}\"}} {}",
+                    grant.label(),
+                    result.label(),
+                    self.token_grant_count(grant, result)
+                );
+            }
+        }
+        out.push_str(
+            "# HELP spindle_password_resets_total Password resets by email, requested \
+             and completed.\n\
+             # TYPE spindle_password_resets_total counter\n",
+        );
+        let (requested, completed) = self.password_reset_counts();
+        let _ = writeln!(
+            out,
+            "spindle_password_resets_total{{stage=\"requested\"}} {requested}"
+        );
+        let _ = writeln!(
+            out,
+            "spindle_password_resets_total{{stage=\"completed\"}} {completed}"
+        );
+        out.push_str(
+            "# HELP spindle_emails_sent_total Emails handed to the mail transport, by \
+             kind and whether it accepted them.\n\
+             # TYPE spindle_emails_sent_total counter\n",
+        );
+        for kind in EmailKind::ALL {
+            for (sent, result) in [(true, "sent"), (false, "failed")] {
+                let _ = writeln!(
+                    out,
+                    "spindle_emails_sent_total{{kind=\"{}\",result=\"{result}\"}} {}",
+                    kind.label(),
+                    self.email_count(kind, sent)
+                );
+            }
+        }
+        out.push_str(
+            "# HELP spindle_account_actions_total Changes made through the \
+             account-management pages, by action.\n\
+             # TYPE spindle_account_actions_total counter\n",
+        );
+        for action in AccountAction::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_account_actions_total{{action=\"{}\"}} {}",
+                action.label(),
+                self.account_action_count(action)
+            );
+        }
+    }
+}
+
 /// Escape a label value per the exposition format.
 fn escape(value: &str) -> String {
     value
@@ -637,6 +970,59 @@ mod tests {
         // every client on earth as connected to this server.
         metrics.sync_waiter_finished();
         assert_eq!(metrics.sync_subscribers(), 0);
+    }
+
+    /// Each auth counter moves its own series and no other, and every
+    /// series renders at zero before anything happens.
+    #[test]
+    fn auth_counters_move_their_own_series() {
+        let metrics = Metrics::new();
+        let text = metrics.render();
+        for line in [
+            "spindle_auth_logins_total{method=\"oidc\",result=\"rate_limited\"} 0",
+            "spindle_oauth_token_grants_total{grant=\"refresh_token\",result=\"invalid_grant\"} 0",
+            "spindle_password_resets_total{stage=\"completed\"} 0",
+            "spindle_emails_sent_total{kind=\"verification\",result=\"failed\"} 0",
+            "spindle_account_actions_total{action=\"deactivate\"} 0",
+        ] {
+            assert!(text.contains(line), "{line} missing from {text}");
+        }
+        metrics.record_login(LoginMethod::Oidc, LoginResult::RateLimited);
+        metrics.record_token_grant(TokenGrant::RefreshToken, GrantResult::InvalidGrant);
+        metrics.record_password_reset_requested();
+        metrics.record_password_reset_completed();
+        metrics.record_email(EmailKind::Verification, false);
+        metrics.record_account_action(AccountAction::Deactivate);
+        assert_eq!(
+            metrics.login_count(LoginMethod::Oidc, LoginResult::RateLimited),
+            1
+        );
+        assert_eq!(
+            metrics.login_count(LoginMethod::Oidc, LoginResult::Success),
+            0
+        );
+        assert_eq!(
+            metrics.login_count(LoginMethod::Password, LoginResult::RateLimited),
+            0
+        );
+        assert_eq!(
+            metrics.token_grant_count(TokenGrant::RefreshToken, GrantResult::InvalidGrant),
+            1
+        );
+        assert_eq!(metrics.password_reset_counts(), (1, 1));
+        assert_eq!(metrics.email_count(EmailKind::Verification, false), 1);
+        assert_eq!(metrics.email_count(EmailKind::Verification, true), 0);
+        assert_eq!(metrics.account_action_count(AccountAction::Deactivate), 1);
+        let text = metrics.render();
+        for line in [
+            "spindle_auth_logins_total{method=\"oidc\",result=\"rate_limited\"} 1",
+            "spindle_oauth_token_grants_total{grant=\"refresh_token\",result=\"invalid_grant\"} 1",
+            "spindle_password_resets_total{stage=\"requested\"} 1",
+            "spindle_emails_sent_total{kind=\"verification\",result=\"failed\"} 1",
+            "spindle_account_actions_total{action=\"deactivate\"} 1",
+        ] {
+            assert!(text.contains(line), "{line} missing from {text}");
+        }
     }
 
     /// The exposition is the contract, so it is asserted rather than eyeballed.

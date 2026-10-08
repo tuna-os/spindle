@@ -420,6 +420,12 @@ pub enum Keyspace {
     SynapseTopologicalPosition = 0x3f,
     /// Global marker: accounts may carry an erasure policy.
     ErasurePolicy = 0x40,
+    /// The built-in provider's browser sessions (#607): the BLAKE3 digest
+    /// of the session cookie -> who it signs in, its CSRF secret and when
+    /// it lapses. The digest, never the cookie, so a copy of the store
+    /// signs nobody in. Numbered from 0x50 to leave 0x44.. to the
+    /// importer's and federation's keyspaces.
+    BrowserSession = 0x50,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -935,6 +941,21 @@ pub fn media_reservation(media_id: &str) -> Vec<u8> {
     let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::MediaReservation as u8];
     key.extend_from_slice(media_id.as_bytes());
     key
+}
+
+/// One browser session's row, by the digest of its cookie
+/// ([`Keyspace::BrowserSession`]).
+#[must_use]
+pub fn browser_session(digest: &[u8; 32]) -> Vec<u8> {
+    let mut key = browser_session_prefix();
+    key.extend_from_slice(digest);
+    key
+}
+
+/// The prefix every browser-session row shares.
+#[must_use]
+pub fn browser_session_prefix() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::BrowserSession as u8]
 }
 
 /// The row for one single-use login token.

@@ -27,6 +27,7 @@ use crate::inbound::{
     FederationStateQuery, federation_origin, join_candidates, merge_returned_signatures,
     sign_membership_template,
 };
+use crate::metrics::LoginResult;
 use crate::ratelimit::{FAILED_LOGIN_PER_ACCOUNT, FAILED_LOGIN_PER_SOURCE, REGISTER_PER_SOURCE};
 use crate::rooms::ReadScope;
 use crate::{AppState, surface};
@@ -1422,10 +1423,11 @@ async fn well_known_client(
             "account": format!("{}/account", delegated.issuer().trim_end_matches('/')),
         });
     } else if state.oidc.is_some() {
-        // The built-in provider is its own issuer; there is no account
-        // management UI to point at, so none is advertised.
+        // The built-in provider is its own issuer, and serves its own
+        // account pages (#607).
         body["org.matrix.msc2965.authentication"] = json!({
             "issuer": format!("{}/", crate::oidc::issuer(&state)),
+            "account": crate::account::management_uri(&state),
         });
     }
     // MSC4143 (which absorbed MSC4158): the MatrixRTC backend, named here
@@ -1676,6 +1678,7 @@ async fn login(
         (&source_key, FAILED_LOGIN_PER_SOURCE),
     ] {
         if let Err(retry) = state.limiter.check(key, limit) {
+            record_password_login(&state, LoginResult::RateLimited);
             return Err(MatrixError::limit_exceeded(retry.as_millis()));
         }
     }
@@ -1684,12 +1687,17 @@ async fn login(
     // One message for a wrong password and for an unknown user. The
     // verification cost is already equal (see `verify_password`); saying
     // "no such user" here would give the difference back for free.
-    if !accounts
+    let verified = accounts
         .verify_password(&localpart, password)
-        .map_err(|error| internal(&error))?
-    {
+        .map_err(|error| {
+            record_password_login(&state, LoginResult::Error);
+            internal(&error)
+        })?;
+    if !verified {
+        record_password_login(&state, LoginResult::BadPassword);
         return Err(MatrixError::forbidden("invalid username or password"));
     }
+    record_password_login(&state, LoginResult::Success);
 
     // A correct login is not the traffic being defended against, and counting
     // it would lock out the legitimate users of a busy shared address first.
@@ -1706,6 +1714,12 @@ async fn login(
         .map_err(|error| internal(&error))?;
 
     Ok(Json(session_body(&accounts.user_id(&localpart), &session)))
+}
+
+fn record_password_login(state: &AppState, result: LoginResult) {
+    state
+        .metrics
+        .record_login(crate::metrics::LoginMethod::Password, result);
 }
 
 /// `POST /_matrix/client/v3/refresh`
@@ -3443,7 +3457,7 @@ async fn delete_profile_field(
 /// event — the propagation the spec asks for, and the step that carries a
 /// renamed user across federation, because member events fan out and
 /// profile rows do not.
-fn propagate_profile(state: &AppState, user_id: &str) -> Result<(), MatrixError> {
+pub(crate) fn propagate_profile(state: &AppState, user_id: &str) -> Result<(), MatrixError> {
     let profile = state
         .profiles
         .get(user_id)

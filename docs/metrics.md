@@ -36,6 +36,11 @@ the incident it was supposed to explain.
 | `spindle_sync_lag_seconds` | histogram | — | Age of the newest event a `/sync` delivered. |
 | `spindle_room_registry_acquisitions_total` | counter | `mode` = `exclusive`\|`shared` | Acquisitions of the registry that hands rooms out. |
 | `spindle_room_lock_acquisitions_total` | counter | `mode` = `exclusive`\|`shared` | Acquisitions of a room's own lock: `exclusive` is the write path. |
+| `spindle_auth_logins_total` | counter | `method` = `password`\|`oidc`\|`oidc_session`\|`account`, `result` = `success`\|`bad_password`\|`rate_limited`\|`error` | Sign-in attempts: the client API's password login, the built-in provider's authorization page (with a password, or continuing a browser session), and the account pages. An unknown user counts as `bad_password`, as everywhere else. |
+| `spindle_oauth_token_grants_total` | counter | `grant` = `authorization_code`\|`refresh_token`, `result` = `success`\|`invalid_grant`\|`invalid_request`\|`error` | Built-in provider token-endpoint grants. A climbing `invalid_grant` on `refresh_token` is clients holding rotated-away tokens. |
+| `spindle_password_resets_total` | counter | `stage` = `requested`\|`completed` | Forgot-password requests (counted per submission, whether or not the address is known) and resets completed with a valid emailed link. |
+| `spindle_emails_sent_total` | counter | `kind` = `password_reset`\|`verification`, `result` = `sent`\|`failed` | Mail handed to the SMTP transport. `failed` is the relay refusing or unreachable. |
+| `spindle_account_actions_total` | counter | `action` = `profile`\|`password_change`\|`session_end`\|`deactivate`\|`email_add`\|`email_verify`\|`email_remove`\|`cross_signing_reset` | Changes made through the account-management pages. |
 
 ## Alert rules, a scrape target and a dashboard
 

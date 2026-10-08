@@ -401,8 +401,9 @@ pub struct AuthConfig {
     /// The built-in OIDC provider (#159): this server issues its own
     /// authorization codes and sessions over the accounts it already
     /// holds, so Element X's OIDC-native login works from one binary
-    /// with nothing else deployed. The floor, not a MAS replacement —
-    /// upstream identity providers, SSO and account management are what
+    /// with nothing else deployed. It also serves the account management
+    /// pages (#607) and, with `[email]`, address confirmation and password
+    /// reset (#608); upstream identity providers (#610) are still what
     /// `[auth.delegated]` and a real MAS are for.
     #[serde(default)]
     pub builtin_oidc: bool,
