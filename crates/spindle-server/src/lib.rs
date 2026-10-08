@@ -325,6 +325,30 @@ fn warm_from(
     }
 }
 
+/// The federation client `[federation]` describes.
+fn federation_client(
+    config: &Config,
+    store: &Arc<FjallStore>,
+    key: &Arc<signing::ServerKey>,
+    metrics: &Arc<metrics::Metrics>,
+) -> Result<Arc<federation::Federation>, AppError> {
+    let client = federation::Federation::new(
+        Arc::clone(store),
+        config.server.name.clone(),
+        Arc::clone(key),
+        config.federation.insecure_http,
+        &config.federation.allow_internal,
+    )
+    .and_then(|client| client.with_trusted_key_servers(&config.federation.trusted_key_servers()))
+    .map_err(|error| AppError::FederationConfig(error.to_string()))?;
+    Ok(Arc::new(
+        client
+            .with_peers(&config.federation.peers)
+            .with_enabled(config.federation.enabled)
+            .with_metrics(Arc::clone(metrics)),
+    ))
+}
+
 /// Everything a handler needs, built from configuration.
 fn app_state(
     config: Config,
@@ -369,19 +393,7 @@ fn app_state(
         )
         .map_err(|error| AppError::PreviewConfig(error.to_string()))?,
     );
-    let federation = Arc::new(
-        federation::Federation::new(
-            Arc::clone(&store),
-            config.server.name.clone(),
-            Arc::clone(&key),
-            config.federation.insecure_http,
-            &config.federation.allow_internal,
-        )
-        .map_err(|error| AppError::FederationConfig(error.to_string()))?
-        .with_peers(&config.federation.peers)
-        .with_enabled(config.federation.enabled)
-        .with_metrics(Arc::clone(&metrics)),
-    );
+    let federation = federation_client(&config, &store, &key, &metrics)?;
     let delegated = config
         .auth
         .delegated

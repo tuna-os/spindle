@@ -36,6 +36,8 @@ the incident it was supposed to explain.
 | `spindle_sync_lag_seconds` | histogram | — | Age of the newest event a `/sync` delivered. |
 | `spindle_room_registry_acquisitions_total` | counter | `mode` = `exclusive`\|`shared` | Acquisitions of the registry that hands rooms out. |
 | `spindle_room_lock_acquisitions_total` | counter | `mode` = `exclusive`\|`shared` | Acquisitions of a room's own lock: `exclusive` is the write path. |
+| `spindle_federation_key_fetches_total` | counter | `source` = `direct`\|`notary`\|`cache`, `result` = `ok`\|`error`\|`invalid`\|`throttled` (direct, notary), `hit`\|`miss` (cache) | Lookups of a peer's signing keys. `notary` `ok` climbing means peers this server cannot reach are being verified through `[federation] trusted_key_servers`; `invalid` is a document that failed its signature checks and was refused. |
+| `spindle_federation_signature_failures_total` | counter | `reason` = `no_key`\|`expired_key`\|`bad_signature`\|`missing_signature`\|`malformed` | Received events refused for their signatures. `bad_signature` means a key under the right ID did not verify the bytes judged; each one logs the redacted form it checked. |
 
 ## Alert rules, a scrape target and a dashboard
 

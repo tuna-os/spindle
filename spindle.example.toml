@@ -154,6 +154,20 @@ retry_base_ms = 1000
 # that is expected to be dark -- and nothing queued is dropped either way.
 # peers = { "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2" = { url = "http://10.20.0.5:8008", max_backoff_ms = 3600000 } }
 
+# Notaries asked for a peer's signing keys when the peer cannot answer for
+# them itself: it is down, unreachable from here, or no longer publishes the
+# key an old event was signed with (POST /_matrix/key/v2/query). Unset means
+# ["matrix.org"], Synapse's default (none with insecure_http); [] turns the
+# fallback off. A table entry pins the keys the notary must sign with:
+#   trusted_key_servers = [{ server_name = "matrix.org", verify_keys = { "ed25519:auto" = "Noi6WqcDj0QmPxCNQqgezwTlBKrfqehY1u2FyWP9uYw" } }]
+# Trust: every document a notary hands on must also carry the peer's own
+# signature by a key inside it, so a notary cannot mint keys alone -- but a
+# notary colluding with whoever holds a peer's old or stolen key can make
+# events signed with it verify here. Without verify_keys, the notary's own
+# keys are fetched from it directly over TLS. Documents from a notary are
+# never served on by this server's own /_matrix/key/v2/query.
+# trusted_key_servers = ["matrix.org"]
+
 # Where the federation TLS listener binds. Unset means no federation
 # listener at all — which is right for a deployment behind a reverse proxy
 # that terminates TLS and serves federation on the main bind.

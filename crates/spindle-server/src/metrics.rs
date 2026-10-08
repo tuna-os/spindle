@@ -266,6 +266,8 @@ pub struct Metrics {
     /// Rooms the startup warm-up has still to load, and has loaded.
     warmup_pending: AtomicU64,
     warmup_loaded: AtomicU64,
+    /// Peer signing-key lookups and event signature failures.
+    keys: KeyMetrics,
 }
 
 impl Default for Metrics {
@@ -298,6 +300,7 @@ impl Default for Metrics {
             outbound_txn_latency: std::array::from_fn(|_| Histogram::with_bounds(&SLOW_BUCKETS)),
             warmup_pending: AtomicU64::new(0),
             warmup_loaded: AtomicU64::new(0),
+            keys: KeyMetrics::default(),
         }
     }
 }
@@ -749,6 +752,7 @@ impl Metrics {
         self.render_http(&mut out);
         self.render_federation(&mut out);
         self.render_inbound(&mut out);
+        self.render_keys(&mut out);
         self.render_sync(&mut out);
         self.render_responsiveness(&mut out);
         out
@@ -1457,6 +1461,187 @@ impl Metrics {
     #[must_use]
     pub fn event_count(&self, origin: Origin) -> u64 {
         self.events[origin.index()].load(Ordering::Relaxed)
+    }
+}
+
+/// Where one lookup of a peer's signing keys was answered from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeySource {
+    /// The peer's own `/_matrix/key/v2/server`.
+    Direct,
+    /// A trusted notary's `/_matrix/key/v2/query`.
+    Notary,
+    /// What this server already held.
+    Cache,
+}
+
+impl KeySource {
+    const ALL: [Self; 3] = [Self::Direct, Self::Notary, Self::Cache];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Notary => "notary",
+            Self::Cache => "cache",
+        }
+    }
+
+    /// The results that mean something for this source.
+    fn results(self) -> &'static [KeyFetchResult] {
+        match self {
+            Self::Direct | Self::Notary => &[
+                KeyFetchResult::Ok,
+                KeyFetchResult::Error,
+                KeyFetchResult::Invalid,
+                KeyFetchResult::Throttled,
+            ],
+            Self::Cache => &[KeyFetchResult::Hit, KeyFetchResult::Miss],
+        }
+    }
+}
+
+/// How one key lookup from one [`KeySource`] ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyFetchResult {
+    /// A document was fetched and verified.
+    Ok,
+    /// The source could not be reached, or answered with an error.
+    Error,
+    /// The source answered, and what it answered did not verify.
+    Invalid,
+    /// Not asked: it was asked, or failed, too recently.
+    Throttled,
+    /// The cache held a usable key.
+    Hit,
+    /// The cache did not.
+    Miss,
+}
+
+impl KeyFetchResult {
+    const ALL: [Self; 6] = [
+        Self::Ok,
+        Self::Error,
+        Self::Invalid,
+        Self::Throttled,
+        Self::Hit,
+        Self::Miss,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::Invalid => "invalid",
+            Self::Throttled => "throttled",
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+        }
+    }
+}
+
+/// Why a received event's signatures did not verify.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignatureFailure {
+    /// No key at all for a server whose signature is required, or none
+    /// under the key IDs it signed with.
+    NoKey,
+    /// The key is known, but was not valid when the event says it was
+    /// signed (`valid_until_ts`, or a retired key's `expired_ts`).
+    ExpiredKey,
+    /// A key was found and the signature does not verify with it.
+    BadSignature,
+    /// A server whose signature is required did not sign.
+    MissingSignature,
+    /// The event or its signatures are not well formed.
+    Malformed,
+}
+
+impl SignatureFailure {
+    const ALL: [Self; 5] = [
+        Self::NoKey,
+        Self::ExpiredKey,
+        Self::BadSignature,
+        Self::MissingSignature,
+        Self::Malformed,
+    ];
+
+    /// The label value, also used in refusal messages.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NoKey => "no_key",
+            Self::ExpiredKey => "expired_key",
+            Self::BadSignature => "bad_signature",
+            Self::MissingSignature => "missing_signature",
+            Self::Malformed => "malformed",
+        }
+    }
+}
+
+/// Key lookups by source and result, and signature failures by reason.
+/// Fixed enum labels only: no server name, so a peer cannot mint series.
+#[derive(Debug, Default)]
+struct KeyMetrics {
+    fetches: [[AtomicU64; KeyFetchResult::ALL.len()]; KeySource::ALL.len()],
+    signature_failures: [AtomicU64; SignatureFailure::ALL.len()],
+}
+
+impl Metrics {
+    /// Record one lookup of a peer's signing keys.
+    pub fn record_key_fetch(&self, source: KeySource, result: KeyFetchResult) {
+        self.keys.fetches[slot(&KeySource::ALL, source)][slot(&KeyFetchResult::ALL, result)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one received event refused for its signatures.
+    pub fn record_signature_failure(&self, reason: SignatureFailure) {
+        self.keys.signature_failures[slot(&SignatureFailure::ALL, reason)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn key_fetch_count(&self, source: KeySource, result: KeyFetchResult) -> u64 {
+        self.keys.fetches[slot(&KeySource::ALL, source)][slot(&KeyFetchResult::ALL, result)]
+            .load(Ordering::Relaxed)
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn signature_failure_count(&self, reason: SignatureFailure) -> u64 {
+        self.keys.signature_failures[slot(&SignatureFailure::ALL, reason)].load(Ordering::Relaxed)
+    }
+
+    fn render_keys(&self, out: &mut String) {
+        out.push_str(
+            "# HELP spindle_federation_key_fetches_total Lookups of a peer's signing \
+         keys, by where they were answered from and how.\n\
+         # TYPE spindle_federation_key_fetches_total counter\n",
+        );
+        for source in KeySource::ALL {
+            for result in source.results() {
+                let _ = writeln!(
+                    out,
+                    "spindle_federation_key_fetches_total{{source=\"{}\",result=\"{}\"}} {}",
+                    source.label(),
+                    result.label(),
+                    self.key_fetch_count(source, *result)
+                );
+            }
+        }
+        out.push_str(
+            "# HELP spindle_federation_signature_failures_total Received events \
+         refused because their signatures did not verify, by reason.\n\
+         # TYPE spindle_federation_signature_failures_total counter\n",
+        );
+        for reason in SignatureFailure::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_signature_failures_total{{reason=\"{}\"}} {}",
+                reason.label(),
+                self.signature_failure_count(reason)
+            );
+        }
     }
 }
 

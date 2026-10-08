@@ -21,14 +21,12 @@ use spindle_store::{FjallStore, ReadView, Store};
 use crate::netguard::{Cidr, VettingResolver, permits};
 use crate::signing::ServerKey;
 
+mod keyring;
 mod srv;
+pub use keyring::{PeerKeys, signing_key_ids};
 use srv::Destination;
 
-/// How long a fetched key document serves at most, whatever its own
-/// `valid_until_ts` says. The spec's cap: a peer cannot mint a key valid
-/// for years and have caches honour it — seven days is the ceiling, so a
-/// compromised key ages out even if its owner claimed otherwise.
-const MAX_KEY_VALIDITY: Duration = Duration::from_secs(7 * 24 * 3600);
+use crate::metrics::{KeyFetchResult, KeySource};
 
 /// How long a failed key fetch is remembered before the origin is tried
 /// again. Without it every miss refetched, so a stranger could make this
@@ -36,6 +34,31 @@ const MAX_KEY_VALIDITY: Duration = Duration::from_secs(7 * 24 * 3600);
 /// send a header (#288). A minute bounds that at one connection per name
 /// per minute, and a peer that was genuinely down retries within it.
 const NEGATIVE_CACHE: Duration = Duration::from_secs(60);
+
+/// How soon after a successful fetch an origin is asked again because the
+/// key someone named was not in what it said. A peer that has just
+/// rotated is found within this; a stranger naming key IDs that do not
+/// exist gets at most one fetch of the real server per interval.
+const REFETCH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How soon the notaries are asked about the same origin again, whatever
+/// they answered. Their answer for one origin carries its whole history,
+/// so asking again sooner learns nothing new.
+const NOTARY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The most notary queries made in one minute, for all origins together.
+/// Every server name a stranger can put in front of this server is a
+/// possible query; this is what keeps it from becoming a stranger's way
+/// to make us hammer matrix.org.
+const NOTARY_QUERIES_PER_MINUTE: u32 = 120;
+
+/// The most of a key document read, from a server or a notary. A server's
+/// document is a few hundred bytes; a notary's answer for one server with
+/// its history is a few kilobytes.
+const KEY_DOCUMENT_MAX_BYTES: usize = 256 * 1024;
+
+/// How long one key fetch, direct or notary, may take.
+const KEY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a server's `.well-known/matrix/server` answer is used when the
 /// response does not say (SPEC: server discovery, step 3: "24 hours is
@@ -94,6 +117,33 @@ pub struct Federation {
     well_known_port: u16,
     destinations: Arc<std::sync::Mutex<HashMap<String, (Destination, Instant)>>>,
     srv_dns: Arc<std::sync::OnceLock<Result<hickory_resolver::TokioResolver, String>>>,
+    /// `[federation] trusted_key_servers`: who is asked for a peer's keys
+    /// when the peer cannot answer for them itself.
+    notaries: Vec<Notary>,
+    /// Origins fetched successfully, and when: a fetch for a key the last
+    /// answer lacked waits [`REFETCH_INTERVAL`] after it.
+    fetched: std::sync::Mutex<HashMap<String, Instant>>,
+    /// Origins the notaries were asked about, and when.
+    notary_asked: std::sync::Mutex<HashMap<String, Instant>>,
+    /// Notary queries in the current minute: `(minute began, count)`.
+    notary_budget: std::sync::Mutex<(Instant, u32)>,
+}
+
+/// One trusted key server, and the keys its answers must carry if the
+/// operator pinned them.
+#[derive(Clone, Debug)]
+struct Notary {
+    server_name: String,
+    pinned: Option<ruma::signatures::PublicKeySet>,
+}
+
+/// What a key lookup has to find: a key under one of `key_ids` that
+/// answers for `at` (see [`PeerKeys::covers`]), or, with no key IDs, any
+/// document still valid now.
+struct Want<'a> {
+    key_ids: &'a [String],
+    at: Option<u64>,
+    enforce: bool,
 }
 
 #[derive(Debug)]
@@ -453,7 +503,45 @@ impl Federation {
             well_known_port: 443,
             destinations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             srv_dns: Arc::new(std::sync::OnceLock::new()),
+            notaries: Vec::new(),
+            fetched: std::sync::Mutex::new(HashMap::new()),
+            notary_asked: std::sync::Mutex::new(HashMap::new()),
+            notary_budget: std::sync::Mutex::new((Instant::now(), 0)),
         })
+    }
+
+    /// Ask these notaries for a peer's keys when the peer cannot answer
+    /// for them (`[federation] trusted_key_servers`). None by default: an
+    /// embedder that builds a client by hand has not chosen to trust
+    /// anyone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError::Refused`] if a pinned key does not parse:
+    /// a config error, surfaced at startup.
+    pub fn with_trusted_key_servers(
+        mut self,
+        servers: &[crate::config::TrustedKeyServer],
+    ) -> Result<Self, FederationError> {
+        let mut notaries = Vec::with_capacity(servers.len());
+        for server in servers {
+            let pinned = match server.verify_keys() {
+                None => None,
+                Some(keys) => {
+                    let mut set = ruma::signatures::PublicKeySet::new();
+                    for (key_id, key) in keys {
+                        set.insert(key_id.clone(), keyring_key(key)?);
+                    }
+                    Some(set)
+                }
+            };
+            notaries.push(Notary {
+                server_name: server.server_name().to_owned(),
+                pinned,
+            });
+        }
+        self.notaries = notaries;
+        Ok(self)
     }
 
     /// Fetch `.well-known/matrix/server` from `port` instead of 443.
@@ -743,141 +831,567 @@ impl Federation {
         Ok(parsed.origin)
     }
 
-    /// Every key the origin publishes, current and retired, for verifying
-    /// whole events -- which may carry any key the origin held when it
-    /// signed them. See [`PeerKeys`] for which key answers for which event.
+    /// Every key the origin is known to have held, current, retired and
+    /// historical, for verifying whole events -- which may carry any key
+    /// the origin held when it signed them. See [`PeerKeys`] for which key
+    /// answers for which event, and [`Federation::event_keys`] for finding
+    /// one an event names that is not held yet.
+    ///
+    /// From the cache while some document is still valid; otherwise the
+    /// origin is asked, then the notaries. If neither answers, whatever is
+    /// held still serves: a lapsed document still answers for the events
+    /// signed while it was valid.
     ///
     /// # Errors
     ///
-    /// Returns [`FederationError`] if the document cannot be fetched or is
-    /// not credible.
+    /// Returns [`FederationError`] if nothing at all is held for `origin`
+    /// and nothing credible can be had.
     pub async fn peer_keys(&self, origin: &str) -> Result<PeerKeys, FederationError> {
-        // A fetch-if-stale pass first: `server_key` refreshes the cache as
-        // a side effect, and the throwaway id keeps "stale" and "missing"
-        // from conflating.
-        let _ = self.server_key(origin, "ed25519:_warm").await;
-        let cache_key = server_keys_row(origin);
-        let bytes = ReadView::get(self.store.as_ref(), &cache_key)
-            .map_err(|error| FederationError::Storage(error.to_string()))?
-            .ok_or_else(|| FederationError::Refused(format!("no keys for {origin}")))?;
-        let cached: Value = serde_json::from_slice(&bytes)
-            .map_err(|error| FederationError::Storage(error.to_string()))?;
-        let mut keys = PeerKeys::from_document(origin, &cached["document"])?;
-        keys.valid_until = cached["fetched_valid_until"].as_u64();
-        Ok(keys)
+        let record = self.key_record(origin)?;
+        if let Some(record) = &record
+            && keyring::fresh(record, now_millis())
+        {
+            self.metrics
+                .record_key_fetch(KeySource::Cache, KeyFetchResult::Hit);
+            return Ok(PeerKeys::from_record(origin, record));
+        }
+        self.metrics
+            .record_key_fetch(KeySource::Cache, KeyFetchResult::Miss);
+        let want = Want {
+            key_ids: &[],
+            at: None,
+            enforce: true,
+        };
+        Box::pin(self.refresh_keys(origin, record, &want))
+            .await?
+            .0
+            .map(|record| PeerKeys::from_record(origin, &record))
+            .ok_or_else(|| FederationError::Refused(format!("no keys for {origin}")))
+    }
+
+    /// `origin`'s keys, with one of `key_ids` -- the ones it signed an event
+    /// with -- answering for `at`, the moment the event says it was signed,
+    /// if that can be had.
+    ///
+    /// `held` is what the caller already has for `origin`, if anything. When
+    /// it, or the cache, covers the event, nothing is fetched. Otherwise the
+    /// origin has rotated to a key not seen yet, or the event predates every
+    /// document held, or the origin is unreachable: the origin is asked,
+    /// then the notaries, which keep history. Both are throttled per
+    /// origin, so a stranger naming key IDs that do not exist costs a
+    /// bounded number of fetches.
+    ///
+    /// What comes back may still not cover the event; verification then
+    /// fails, and [`Federation::classify_signature_failure`] says why.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] if nothing at all is held for `origin`
+    /// and nothing credible can be had.
+    pub async fn event_keys(
+        &self,
+        origin: &str,
+        held: Option<&PeerKeys>,
+        key_ids: &[String],
+        at: Option<u64>,
+        enforce: bool,
+    ) -> Result<PeerKeys, FederationError> {
+        if let Some(held) = held
+            && (key_ids.is_empty() || held.covers(key_ids, at, enforce))
+        {
+            return Ok(held.clone());
+        }
+        let record = self.key_record(origin)?;
+        if let Some(record) = &record {
+            let keys = PeerKeys::from_record(origin, record);
+            if keys.covers(key_ids, at, enforce)
+                || (key_ids.is_empty() && keyring::fresh(record, now_millis()))
+            {
+                self.metrics
+                    .record_key_fetch(KeySource::Cache, KeyFetchResult::Hit);
+                return Ok(keys);
+            }
+        }
+        self.metrics
+            .record_key_fetch(KeySource::Cache, KeyFetchResult::Miss);
+        let want = Want {
+            key_ids,
+            at,
+            enforce,
+        };
+        Box::pin(self.refresh_keys(origin, record, &want))
+            .await?
+            .0
+            .map(|record| PeerKeys::from_record(origin, &record))
+            .ok_or_else(|| FederationError::Refused(format!("no keys for {origin}")))
+    }
+
+    /// Why `event`, which failed to verify against `keys` for `server`, did:
+    /// for the signature-failure metric and the refusal message.
+    #[must_use]
+    pub fn classify_signature_failure(
+        keys: Option<&PeerKeys>,
+        server: Option<&str>,
+        event: &Value,
+        error: &str,
+    ) -> crate::metrics::SignatureFailure {
+        use crate::metrics::SignatureFailure;
+        if error.contains("ed25519 signature verification failed")
+            || error.contains("Invalid ed25519 signature length")
+            || error.contains("Could not parse base64-encoded signature")
+        {
+            return SignatureFailure::BadSignature;
+        }
+        if error.contains("Could not find signatures for entity")
+            || error.contains("no signature by")
+        {
+            return SignatureFailure::MissingSignature;
+        }
+        if error.contains("Could not find supported signature")
+            || error.contains("Could not find public keys")
+            || error.contains("no keys for")
+            || error.contains("could not be fetched")
+        {
+            let known = match (keys, server) {
+                (Some(keys), Some(server)) => {
+                    keys.knows_any(&keyring::signing_key_ids(event, server))
+                }
+                _ => false,
+            };
+            return if known {
+                SignatureFailure::ExpiredKey
+            } else {
+                SignatureFailure::NoKey
+            };
+        }
+        SignatureFailure::Malformed
     }
 
     /// The origin's key document as it published it, from cache or
     /// fetched: what a notary hands on (`/_matrix/key/v2/query`), still
     /// carrying the origin's own signature so the asker can check it too.
     ///
+    /// Only what the origin itself served is handed on -- never a
+    /// document this server had from a notary, and a lookup here never
+    /// asks one: vouching for a key is vouching for what we saw.
+    ///
     /// # Errors
     ///
     /// Returns [`FederationError`] if the document cannot be fetched or is
     /// not credible.
     pub async fn peer_key_document(&self, origin: &str) -> Result<Value, FederationError> {
-        let _ = self.server_key(origin, "ed25519:_warm").await;
-        let bytes = ReadView::get(self.store.as_ref(), &server_keys_row(origin))
-            .map_err(|error| FederationError::Storage(error.to_string()))?
-            .ok_or_else(|| FederationError::Refused(format!("no keys for {origin}")))?;
-        let cached: Value = serde_json::from_slice(&bytes)
-            .map_err(|error| FederationError::Storage(error.to_string()))?;
-        Ok(cached["document"].clone())
+        let now = now_millis();
+        let mut record = self.key_record(origin)?.unwrap_or_else(|| json!({}));
+        let fresh = record["fetched_valid_until"]
+            .as_u64()
+            .is_some_and(|until| until > now);
+        if !(fresh && record["document"].is_object())
+            && let Some(document) = self.direct_key_document(origin, false).await
+        {
+            keyring::merge(&mut record, &document, keyring::Source::Direct, now);
+            record["checked_at"] = json!(now);
+            self.put_key_record(origin, &record)?;
+        }
+        if record["document"].is_object() {
+            Ok(record["document"].clone())
+        } else {
+            Err(FederationError::Refused(format!("no keys for {origin}")))
+        }
     }
 
-    /// The origin's public key (unpadded base64), from cache or fetched.
+    /// The origin's public key `key_id` (unpadded base64) for checking a
+    /// request it signed now: valid now and not retired. From cache, or
+    /// fetched -- from the origin, then the notaries.
     async fn server_key(&self, origin: &str, key_id: &str) -> Result<String, FederationError> {
-        let cache_key = server_keys_row(origin);
         let now = now_millis();
-        if let Some(bytes) = ReadView::get(self.store.as_ref(), &cache_key)
-            .map_err(|error| FederationError::Storage(error.to_string()))?
-            && let Ok(cached) = serde_json::from_slice::<Value>(&bytes)
-            && cached["fetched_valid_until"]
-                .as_u64()
-                .is_some_and(|until| now < until)
-            && let Some(key) = cached["document"]["verify_keys"][key_id]["key"].as_str()
+        let record = self.key_record(origin)?;
+        if let Some(record) = &record
+            && let Some(key) = PeerKeys::from_record(origin, record).request_key(key_id, now)
+        {
+            self.metrics
+                .record_key_fetch(KeySource::Cache, KeyFetchResult::Hit);
+            return Ok(key.encode());
+        }
+        self.metrics
+            .record_key_fetch(KeySource::Cache, KeyFetchResult::Miss);
+        let key_ids = [key_id.to_owned()];
+        let want = Want {
+            key_ids: &key_ids,
+            at: Some(now),
+            enforce: true,
+        };
+        let (record, fetched) = Box::pin(self.refresh_keys(origin, record, &want)).await?;
+        // A document fetched for this very request answers it, whatever
+        // validity it claims: the origin said so just now. A cache serves
+        // only what is still valid.
+        if let Some(key) = fetched
+            .as_ref()
+            .and_then(|document| document["verify_keys"][key_id]["key"].as_str())
         {
             return Ok(key.to_owned());
         }
+        let record = record.ok_or_else(|| {
+            FederationError::Refused(format!("{origin}'s keys could not be fetched"))
+        })?;
+        PeerKeys::from_record(origin, &record)
+            .request_key(key_id, now_millis())
+            .map(Base64::encode)
+            .ok_or_else(|| FederationError::Unauthorized(format!("{origin} has no key {key_id}")))
+    }
+}
 
-        // Cache miss, expiry, or an unknown key id (a peer that rotated):
-        // all three refetch -- unless the last fetch failed a moment ago,
-        // in which case the answer is still no and costs no connection.
+type Base64 = ruma::serde::Base64;
+
+fn keyring_key(key: &str) -> Result<Base64, FederationError> {
+    Base64::parse(key).map_err(|error| FederationError::Refused(error.to_string()))
+}
+
+impl Federation {
+    /// The stored key record for `origin`, if any.
+    fn key_record(&self, origin: &str) -> Result<Option<Value>, FederationError> {
+        Ok(ReadView::get(self.store.as_ref(), &server_keys_row(origin))
+            .map_err(|error| FederationError::Storage(error.to_string()))?
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .filter(keyring::has_documents))
+    }
+
+    fn put_key_record(&self, origin: &str, record: &Value) -> Result<(), FederationError> {
+        Store::put(
+            self.store.as_ref(),
+            &server_keys_row(origin),
+            record.to_string().as_bytes(),
+        )
+        .map_err(|error| FederationError::Storage(error.to_string()))
+    }
+
+    /// Whether `record` has what `want` asks for.
+    fn satisfies(origin: &str, record: &Value, want: &Want<'_>) -> bool {
+        if want.key_ids.is_empty() {
+            return keyring::fresh(record, now_millis());
+        }
+        PeerKeys::from_record(origin, record).covers(want.key_ids, want.at, want.enforce)
+    }
+
+    /// Look further for `origin`'s keys: the origin itself, then, if that
+    /// did not give what `want` asks for, the notaries. Whatever verified is
+    /// kept. The record afterwards (`None` if nothing is held at all), and
+    /// the document the origin served just now, if it did.
+    ///
+    /// While the record is still valid, the origin was answering, so it is
+    /// asked again only [`REFETCH_INTERVAL`] after it last answered: that
+    /// is a stranger naming key IDs it never had. A lapsed record is
+    /// refetched whenever it is needed, as it always was.
+    async fn refresh_keys(
+        &self,
+        origin: &str,
+        record: Option<Value>,
+        want: &Want<'_>,
+    ) -> Result<(Option<Value>, Option<Value>), FederationError> {
+        let now = now_millis();
+        let mut record = record.unwrap_or_else(|| json!({}));
+        let mut changed = false;
+        let fresh = keyring::fresh(&record, now);
+        let fetched = self.direct_key_document(origin, fresh).await;
+        if let Some(document) = &fetched {
+            keyring::merge(&mut record, document, keyring::Source::Direct, now);
+            changed = true;
+        }
+        if !Self::satisfies(origin, &record, want) {
+            for document in self.notary_key_documents(origin, want).await {
+                keyring::merge(&mut record, &document, keyring::Source::Notary, now);
+                changed = true;
+            }
+        }
+        if changed {
+            record["checked_at"] = json!(now);
+            self.put_key_record(origin, &record)?;
+        }
+        Ok((keyring::has_documents(&record).then_some(record), fetched))
+    }
+
+    /// The origin's own key document, verified, or `None` if it failed, or
+    /// failed too recently to be asked again -- or, with `recent_success`,
+    /// answered too recently.
+    async fn direct_key_document(&self, origin: &str, recent_success: bool) -> Option<Value> {
+        let instant = Instant::now();
         {
             let mut negative = self
                 .negative
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let instant = Instant::now();
             negative.retain(|_, until| *until > instant);
-            if negative.contains_key(origin) {
-                return Err(FederationError::Refused(format!(
-                    "{origin} could not be fetched from recently"
-                )));
+            let mut fetched = self
+                .fetched
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            fetched.retain(|_, at| instant.duration_since(*at) < REFETCH_INTERVAL);
+            if negative.contains_key(origin) || (recent_success && fetched.contains_key(origin)) {
+                self.metrics
+                    .record_key_fetch(KeySource::Direct, KeyFetchResult::Throttled);
+                return None;
             }
         }
-        let document = match self.fetch_key_document(origin).await {
-            Ok(document) => document,
-            Err(error) => {
+        match self.fetch_key_document(origin).await {
+            Ok(document) => {
+                self.metrics
+                    .record_key_fetch(KeySource::Direct, KeyFetchResult::Ok);
+                self.fetched
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(origin.to_owned(), Instant::now());
+                Some(document)
+            }
+            Err((error, invalid)) => {
+                tracing::debug!(%origin, "key fetch failed: {error}");
+                self.metrics.record_key_fetch(
+                    KeySource::Direct,
+                    if invalid {
+                        KeyFetchResult::Invalid
+                    } else {
+                        KeyFetchResult::Error
+                    },
+                );
                 self.negative
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(origin.to_owned(), Instant::now() + NEGATIVE_CACHE);
-                return Err(error);
+                None
             }
-        };
-
-        let claimed_until = document["valid_until_ts"].as_u64().unwrap_or(0);
-        let ceiling = now + u64::try_from(MAX_KEY_VALIDITY.as_millis()).unwrap_or(u64::MAX);
-        let capped = claimed_until.min(ceiling);
-        let record = json!({ "document": document, "fetched_valid_until": capped });
-        Store::put(
-            self.store.as_ref(),
-            &cache_key,
-            record.to_string().as_bytes(),
-        )
-        .map_err(|error| FederationError::Storage(error.to_string()))?;
-
-        record["document"]["verify_keys"][key_id]["key"]
-            .as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| FederationError::Unauthorized(format!("{origin} has no key {key_id}")))
+        }
     }
-}
 
-impl Federation {
-    /// GET a peer's key document and check it vouches for itself.
+    /// GET a peer's key document and check it vouches for itself. The
+    /// error says whether the peer answered with something that did not
+    /// verify (`true`) or did not answer usefully at all.
     ///
     /// The name is resolved like every other destination
     /// ([`Federation::base_url`]): `.well-known` delegation first, then
     /// `name:8448`.
-    async fn fetch_key_document(&self, origin: &str) -> Result<Value, FederationError> {
-        let document: Value = self
+    async fn fetch_key_document(&self, origin: &str) -> Result<Value, (FederationError, bool)> {
+        let response = self
             .request(reqwest::Method::GET, origin, "/_matrix/key/v2/server")
-            .await?
-            .timeout(Duration::from_secs(10))
+            .await
+            .map_err(|error| (error, false))?
+            .timeout(KEY_FETCH_TIMEOUT)
             .send()
             .await
-            .map_err(|error| FederationError::Refused(format!("key fetch: {error}")))?
-            .bytes()
-            .await
-            .map_err(|error| FederationError::Refused(format!("key fetch body: {error}")))
-            .and_then(|bytes| {
-                serde_json::from_slice(&bytes)
-                    .map_err(|error| FederationError::Refused(format!("key document: {error}")))
+            .map_err(|error| {
+                (
+                    FederationError::Refused(format!("key fetch: {error}")),
+                    false,
+                )
             })?;
-
+        if !response.status().is_success() {
+            return Err((
+                FederationError::Refused(format!("key fetch: {}", response.status())),
+                false,
+            ));
+        }
+        let bytes = read_bounded(response, KEY_DOCUMENT_MAX_BYTES, "key document")
+            .await
+            .map_err(|error| (error, false))?;
+        let document: Value = serde_json::from_slice(&bytes).map_err(|error| {
+            (
+                FederationError::Refused(format!("key document: {error}")),
+                true,
+            )
+        })?;
         // The document must be signed by the server it describes, with the
         // very key inside it — otherwise anyone on the path could hand us a
         // key of their own making.
-        verify_self_signed(origin, &document)?;
-        if document["server_name"].as_str() != Some(origin) {
-            return Err(FederationError::Refused(
-                "key document names a different server".to_owned(),
-            ));
-        }
+        keyring::verify_self_signed(origin, &document).map_err(|error| (error, true))?;
         Ok(document)
     }
+
+    /// Ask the notaries for `origin`'s key documents. Each one returned is
+    /// signed by the notary with a key it is trusted with, and by `origin`
+    /// with a key inside it ([`keyring::verify_notary_document`]); the rest
+    /// are dropped. The first notary that hands on anything credible ends
+    /// the search.
+    async fn notary_key_documents(&self, origin: &str, want: &Want<'_>) -> Vec<Value> {
+        if self.notaries.is_empty() || origin == self.server_name {
+            return Vec::new();
+        }
+        if !self.notary_turn(origin) {
+            self.metrics
+                .record_key_fetch(KeySource::Notary, KeyFetchResult::Throttled);
+            return Vec::new();
+        }
+        // The criteria: the key IDs the event names, each needing to be
+        // valid when the event was signed (or now). With none named, every
+        // key the notary holds for the origin -- its whole history.
+        let minimum = want.at.unwrap_or_else(now_millis);
+        let criteria: serde_json::Map<String, Value> = want
+            .key_ids
+            .iter()
+            .map(|key_id| (key_id.clone(), json!({ "minimum_valid_until_ts": minimum })))
+            .collect();
+        let query = json!({ "server_keys": { origin: criteria } });
+        for notary in &self.notaries {
+            if notary.server_name == origin {
+                continue;
+            }
+            let Some(notary_keys) = self.notary_keys(notary).await else {
+                tracing::debug!(notary = %notary.server_name, "notary's own keys cannot be had");
+                self.metrics
+                    .record_key_fetch(KeySource::Notary, KeyFetchResult::Error);
+                continue;
+            };
+            let answer = match self.query_notary(&notary.server_name, &query).await {
+                Ok(answer) => answer,
+                Err(error) => {
+                    tracing::debug!(notary = %notary.server_name, %origin, "notary query failed: {error}");
+                    self.metrics
+                        .record_key_fetch(KeySource::Notary, KeyFetchResult::Error);
+                    continue;
+                }
+            };
+            let mut verified = Vec::new();
+            let mut rejected = 0_usize;
+            for document in answer["server_keys"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .filter(|document| document["server_name"].as_str() == Some(origin))
+                .take(keyring::MAX_HISTORY)
+            {
+                match keyring::verify_notary_document(
+                    origin,
+                    &notary.server_name,
+                    &notary_keys,
+                    document,
+                ) {
+                    Ok(document) => verified.push(document),
+                    Err(error) => {
+                        rejected += 1;
+                        tracing::warn!(
+                            notary = %notary.server_name,
+                            %origin,
+                            "refused a key document a notary handed on: {error}"
+                        );
+                    }
+                }
+            }
+            if !verified.is_empty() {
+                self.metrics
+                    .record_key_fetch(KeySource::Notary, KeyFetchResult::Ok);
+                return verified;
+            }
+            self.metrics.record_key_fetch(
+                KeySource::Notary,
+                if rejected > 0 {
+                    KeyFetchResult::Invalid
+                } else {
+                    KeyFetchResult::Error
+                },
+            );
+        }
+        Vec::new()
+    }
+
+    /// Whether the notaries may be asked about `origin` now: not asked
+    /// about it within [`NOTARY_INTERVAL`], and the minute's budget not
+    /// spent. Asking takes the turn.
+    fn notary_turn(&self, origin: &str) -> bool {
+        let now = Instant::now();
+        let mut asked = self
+            .notary_asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        asked.retain(|_, at| now.duration_since(*at) < NOTARY_INTERVAL);
+        if asked.contains_key(origin) {
+            return false;
+        }
+        let mut budget = self
+            .notary_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if now.duration_since(budget.0) >= Duration::from_secs(60) {
+            *budget = (now, 0);
+        }
+        if budget.1 >= NOTARY_QUERIES_PER_MINUTE {
+            return false;
+        }
+        budget.1 += 1;
+        asked.insert(origin.to_owned(), now);
+        true
+    }
+
+    /// The keys `notary`'s answers must be signed with: the pinned ones,
+    /// or else its own current keys, fetched from it directly and never
+    /// from a notary -- a notary does not vouch for itself.
+    async fn notary_keys(&self, notary: &Notary) -> Option<ruma::signatures::PublicKeySet> {
+        if let Some(pinned) = &notary.pinned {
+            return Some(pinned.clone());
+        }
+        let now = now_millis();
+        let mut record = self
+            .key_record(&notary.server_name)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| json!({}));
+        let held = PeerKeys::from_record(&notary.server_name, &record).current_keys(now);
+        if !held.is_empty() {
+            return Some(held);
+        }
+        let document = self.direct_key_document(&notary.server_name, false).await?;
+        keyring::merge(&mut record, &document, keyring::Source::Direct, now);
+        record["checked_at"] = json!(now);
+        let _ = self.put_key_record(&notary.server_name, &record);
+        let keys = PeerKeys::from_record(&notary.server_name, &record).current_keys(now);
+        (!keys.is_empty()).then_some(keys)
+    }
+
+    /// `POST /_matrix/key/v2/query` to `notary`, bounded in time and size.
+    /// Unsigned: the endpoint is public, and the answer is checked by its
+    /// signatures, not by who we asked.
+    async fn query_notary(&self, notary: &str, query: &Value) -> Result<Value, FederationError> {
+        let response = self
+            .request(reqwest::Method::POST, notary, "/_matrix/key/v2/query")
+            .await?
+            .header("content-type", "application/json")
+            .body(query.to_string())
+            .timeout(KEY_FETCH_TIMEOUT)
+            .send()
+            .await
+            .map_err(|error| FederationError::Refused(format!("notary query: {error}")))?;
+        if !response.status().is_success() {
+            return Err(FederationError::Refused(format!(
+                "notary query: {}",
+                response.status()
+            )));
+        }
+        let bytes = read_bounded(response, KEY_DOCUMENT_MAX_BYTES, "notary answer").await?;
+        serde_json::from_slice(&bytes)
+            .map_err(|error| FederationError::Refused(format!("notary answer: {error}")))
+    }
+}
+
+/// A response body, refused past `maximum` bytes rather than read whole.
+async fn read_bounded(
+    mut response: reqwest::Response,
+    maximum: usize,
+    what: &str,
+) -> Result<Vec<u8>, FederationError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum as u64)
+    {
+        return Err(FederationError::Refused(format!("{what} is too large")));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| FederationError::Refused(format!("{what}: {error}")))?
+    {
+        if chunk.len() > maximum.saturating_sub(bytes.len()) {
+            return Err(FederationError::Refused(format!("{what} is too large")));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 impl Federation {
@@ -2016,104 +2530,6 @@ fn request_object(
     }
 }
 
-/// Check a `/key/v2/server` document's self-signature, using the key the
-/// document itself carries.
-/// A peer's published signing keys, split the way the spec splits them.
-///
-/// `verify_keys` are what the peer signs with now. `old_verify_keys` are
-/// keys it has retired, each with the `expired_ts` at which it stopped: an
-/// event the peer signed before that moment still verifies with the retired
-/// key, and one it claims to have signed after it does not -- otherwise a
-/// rotation would change nothing (#296). A retired key published without an
-/// `expired_ts` is not used at all: a key that keeps working forever is a
-/// rotation that did not happen, and refusing is the safe reading of a
-/// malformed entry.
-///
-/// Request signatures (`X-Matrix`) are checked against current keys only,
-/// in [`Federation::server_key`]: a request is made now, and a key the peer
-/// has retired has no business signing one.
-#[derive(Clone, Debug, Default)]
-pub struct PeerKeys {
-    origin: String,
-    current: BTreeMap<String, ruma::serde::Base64>,
-    retired: BTreeMap<String, (ruma::serde::Base64, u64)>,
-    /// Keys of *other* servers that must also verify the event -- the
-    /// countersignature on a restricted join is ours, not the peer's.
-    vouched: ruma::signatures::PublicKeyMap,
-    /// How long the current keys answer for an event, for the versions
-    /// that enforce it (v5+): the document's `valid_until_ts` capped at
-    /// seven days after the fetch. `None` when unknown.
-    valid_until: Option<u64>,
-}
-
-impl PeerKeys {
-    fn from_document(origin: &str, document: &Value) -> Result<Self, FederationError> {
-        let mut keys = Self {
-            origin: origin.to_owned(),
-            ..Self::default()
-        };
-        if let Some(entries) = document["verify_keys"].as_object() {
-            for (key_id, entry) in entries {
-                if let Some(key) = entry["key"].as_str() {
-                    keys.current.insert(key_id.clone(), parse_key(key)?);
-                }
-            }
-        }
-        if let Some(entries) = document["old_verify_keys"].as_object() {
-            for (key_id, entry) in entries {
-                if let (Some(key), Some(expired_ts)) =
-                    (entry["key"].as_str(), entry["expired_ts"].as_u64())
-                {
-                    keys.retired
-                        .insert(key_id.clone(), (parse_key(key)?, expired_ts));
-                }
-            }
-        }
-        Ok(keys)
-    }
-
-    /// The map ruma verifies against, for an event that says it was signed
-    /// at `origin_server_ts`: every current key, plus each retired key whose
-    /// expiry is after that moment. An event with no timestamp gets current
-    /// keys only.
-    ///
-    /// `enforce_key_validity` is room version 5's rule, kept by every later
-    /// version: a current key answers only for events signed no later than
-    /// the document's `valid_until_ts` (capped at seven days after it was
-    /// fetched, which is what the cache stores). Versions 1 to 4 do not
-    /// have the rule, and an old event there still verifies with a key
-    /// whose document has lapsed.
-    #[must_use]
-    pub fn map_for(
-        &self,
-        origin_server_ts: Option<u64>,
-        enforce_key_validity: bool,
-    ) -> ruma::signatures::PublicKeyMap {
-        let at = origin_server_ts.unwrap_or(u64::MAX);
-        let lapsed = enforce_key_validity
-            && origin_server_ts.is_some()
-            && self.valid_until.is_some_and(|until| at > until);
-        let mut set: ruma::signatures::PublicKeySet = if lapsed {
-            ruma::signatures::PublicKeySet::new()
-        } else {
-            self.current.clone()
-        };
-        for (key_id, (key, expired_ts)) in &self.retired {
-            if at < *expired_ts {
-                set.entry(key_id.clone()).or_insert_with(|| key.clone());
-            }
-        }
-        let mut map = self.vouched.clone();
-        map.insert(self.origin.clone(), set);
-        map
-    }
-
-    /// Add a key of another server, for an event that server also signed.
-    pub fn vouch(&mut self, server: String, key_id: String, key: ruma::serde::Base64) {
-        self.vouched.entry(server).or_default().insert(key_id, key);
-    }
-}
-
 /// An identifier as one path segment of a federation URL.
 ///
 /// A room v3 event ID is standard base64 and may contain `/`, which would
@@ -2134,35 +2550,6 @@ pub(crate) fn path_segment(id: &str) -> String {
         }
     }
     out
-}
-
-fn parse_key(key: &str) -> Result<ruma::serde::Base64, FederationError> {
-    ruma::serde::Base64::parse(key).map_err(|error| FederationError::Refused(error.to_string()))
-}
-
-fn verify_self_signed(origin: &str, document: &Value) -> Result<(), FederationError> {
-    let Some(verify_keys) = document["verify_keys"].as_object() else {
-        return Err(FederationError::Refused("no verify_keys".to_owned()));
-    };
-    let mut key_map = ruma::signatures::PublicKeyMap::new();
-    let entry = key_map.entry(origin.to_owned()).or_default();
-    for (key_id, key) in verify_keys {
-        if let Some(key) = key["key"].as_str() {
-            entry.insert(
-                key_id.clone(),
-                ruma::serde::Base64::parse(key)
-                    .map_err(|error| FederationError::Refused(error.to_string()))?,
-            );
-        }
-    }
-    let Ok(CanonicalJsonValue::Object(object)) = CanonicalJsonValue::try_from(document.clone())
-    else {
-        return Err(FederationError::Refused(
-            "unreadable key document".to_owned(),
-        ));
-    };
-    ruma::signatures::verify_json(&key_map, &object)
-        .map_err(|error| FederationError::Refused(format!("key document signature: {error}")))
 }
 
 /// The URL a server name resolves to, before any request path.
@@ -2524,49 +2911,5 @@ mod well_known_tests {
         assert_eq!(ttl("max-age=99999999"), WELL_KNOWN_MAX);
         assert_eq!(ttl("no-store"), WELL_KNOWN_MIN);
         assert_eq!(ttl("private"), WELL_KNOWN_DEFAULT);
-    }
-}
-
-#[cfg(test)]
-mod key_validity_tests {
-    use super::PeerKeys;
-    use serde_json::json;
-
-    fn keys() -> PeerKeys {
-        let document = json!({
-            "verify_keys": { "ed25519:new": { "key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" } },
-            "old_verify_keys": {
-                "ed25519:old": {
-                    "key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
-                    "expired_ts": 500,
-                },
-            },
-        });
-        let mut keys = PeerKeys::from_document("peer.example", &document).unwrap();
-        keys.valid_until = Some(1_000);
-        keys
-    }
-
-    fn held(keys: &PeerKeys, ts: u64, enforce: bool) -> Vec<String> {
-        keys.map_for(Some(ts), enforce)["peer.example"]
-            .keys()
-            .cloned()
-            .collect()
-    }
-
-    /// Room version 5's rule: a current key answers only for events signed
-    /// before its document's `valid_until_ts`. Versions 1–4 do not have it.
-    #[test]
-    fn a_lapsed_document_answers_only_where_the_version_does_not_enforce_validity() {
-        let keys = keys();
-        assert_eq!(held(&keys, 900, true), ["ed25519:new"]);
-        assert!(
-            held(&keys, 1_001, true).is_empty(),
-            "v5+ refuses a lapsed key"
-        );
-        assert_eq!(held(&keys, 1_001, false), ["ed25519:new"], "v1–v4 do not");
-        // A retired key is bounded by its own `expired_ts` in every version.
-        assert_eq!(held(&keys, 400, true), ["ed25519:new", "ed25519:old"]);
-        assert_eq!(held(&keys, 600, false), ["ed25519:new"]);
     }
 }
