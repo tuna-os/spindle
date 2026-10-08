@@ -189,8 +189,78 @@ fn profile_cold_load_of_a_huge_room() {
         );
     }
     let store = FjallStore::open(dir.path()).unwrap();
-    let prefix = room_prefix(Keyspace::Log, ROOM);
+    phases(&store, &shape);
 
+    // Memory is measured in a fresh process: this one's allocator holds
+    // on to everything the phases above freed, so its resident set says
+    // nothing about what a load costs a server that has just started.
+    drop(store);
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "cold_load_in_a_fresh_process",
+            "--nocapture",
+        ])
+        .env("SPINDLE_COLD_STORE", dir.path())
+        .output()
+        .unwrap();
+    print!("{}", String::from_utf8_lossy(&child.stdout));
+    assert!(
+        child.status.success(),
+        "{}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let store = FjallStore::open(dir.path()).unwrap();
+
+    let room = RoomStore::new(&store, ROOM);
+    for run in 0..2 {
+        let log = timed(&format!("load_runtime (run {run})"), || {
+            room.load_runtime().unwrap().unwrap().log
+        });
+        assert_eq!(log.len(), usize::try_from(total).unwrap());
+        timed("drop the restored log", || drop(log));
+    }
+}
+
+/// The child half of [`profile_cold_load_of_a_huge_room`]: one load, in a
+/// process that has done nothing else, so its resident set is the load's.
+#[test]
+#[ignore = "run by profile_cold_load_of_a_huge_room"]
+fn cold_load_in_a_fresh_process() {
+    let Some(path) = std::env::var_os("SPINDLE_COLD_STORE") else {
+        return;
+    };
+    let store = FjallStore::open(path).unwrap();
+    let (before, _) = rss();
+    reset_peak();
+    let started = Instant::now();
+    let (restored, profile) = RoomStore::new(&store, ROOM)
+        .load_runtime_profiled()
+        .unwrap()
+        .unwrap();
+    let elapsed = started.elapsed();
+    let (after, peak) = rss();
+    println!(
+        "  {:<42} {:>8.3}s  rss {before:>5} -> {after:>5} MiB  peak {peak:>5} MiB  ({} entries)",
+        "load_runtime, fresh process",
+        elapsed.as_secs_f64(),
+        restored.log.len()
+    );
+    println!(
+        "    rows {} ({} MiB): records {:.3}s, roots {:.3}s, sidelined {:.3}s, rejections {:.3}s",
+        profile.rows,
+        profile.row_bytes >> 20,
+        profile.records.as_secs_f64(),
+        profile.roots.as_secs_f64(),
+        profile.sidelined.as_secs_f64(),
+        profile.rejections.as_secs_f64(),
+    );
+}
+
+/// Each part of a restore on its own, in this (warm) process.
+fn phases(store: &FjallStore, shape: &Shape) {
+    let prefix = room_prefix(Keyspace::Log, ROOM);
     println!("phases (warm page cache):");
     let records = timed("scan_prefix (copy every key and value)", || {
         store.scan_prefix(&prefix).unwrap()
@@ -249,62 +319,4 @@ fn profile_cold_load_of_a_huge_room() {
         .log
     });
     timed("drop the restored log", || drop(log));
-
-    // Memory is measured in a fresh process: this one's allocator holds
-    // on to everything the phases above freed, so its resident set says
-    // nothing about what a load costs a server that has just started.
-    drop(store);
-    let child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--ignored",
-            "--exact",
-            "cold_load_in_a_fresh_process",
-            "--nocapture",
-        ])
-        .env("SPINDLE_COLD_STORE", dir.path())
-        .output()
-        .unwrap();
-    print!("{}", String::from_utf8_lossy(&child.stdout));
-    assert!(
-        child.status.success(),
-        "{}",
-        String::from_utf8_lossy(&child.stderr)
-    );
-    let store = FjallStore::open(dir.path()).unwrap();
-
-    let room = RoomStore::new(&store, ROOM);
-    for run in 0..2 {
-        let log = timed(&format!("load_runtime (run {run})"), || {
-            room.load_runtime().unwrap().unwrap().log
-        });
-        assert_eq!(log.len(), usize::try_from(total).unwrap());
-        timed("drop the restored log", || drop(log));
-    }
-}
-
-/// The child half of [`profile_cold_load_of_a_huge_room`]: one load, in a
-/// process that has done nothing else, so its resident set is the load's.
-#[test]
-#[ignore = "run by profile_cold_load_of_a_huge_room"]
-fn cold_load_in_a_fresh_process() {
-    let Some(path) = std::env::var_os("SPINDLE_COLD_STORE") else {
-        return;
-    };
-    let store = FjallStore::open(path).unwrap();
-    let (before, _) = rss();
-    reset_peak();
-    let started = Instant::now();
-    let log = RoomStore::new(&store, ROOM)
-        .load_runtime()
-        .unwrap()
-        .unwrap()
-        .log;
-    let elapsed = started.elapsed();
-    let (after, peak) = rss();
-    println!(
-        "  {:<42} {:>8.3}s  rss {before:>5} -> {after:>5} MiB  peak {peak:>5} MiB  ({} entries)",
-        "load_runtime, fresh process",
-        elapsed.as_secs_f64(),
-        log.len()
-    );
 }
