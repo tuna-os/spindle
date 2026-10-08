@@ -1,6 +1,7 @@
 [workspace]
 members = ["crates/spindle-core", "crates/spindle-operator", "crates/spindle-server", "crates/spindle-store"]
 resolver = "2"
+exclude = ["vendor/ruma-state-res"]
 
 [workspace.package]
 edition = "2024"
@@ -39,6 +40,15 @@ rand = "0.10"
 # migration tool is not a reason to make every operator install a system
 # library, nor to make the default build pay for one.
 rusqlite = { version = "0.40", features = ["bundled"] }
+# Native reads from a live Synapse PostgreSQL database. Kept behind the same
+# one-shot migration feature as the SQLite fixture reader.
+postgres = "0.19"
+hickory-resolver = "0.26.1"
+# Outgoing mail for the built-in provider's address confirmation and
+# password resets (#608). The SMTP transport and message builder only, over
+# the rustls + ring stack and native roots the rest of the server uses: no
+# native-tls, no connection pool, no sendmail or file transports.
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls", "ring", "rustls-native-certs"] }
 imbl = "7"
 # `state-res` is a runtime dependency, not just an oracle: SPEC 9.3 and
 # docs/divergence.md both require the local send path to use the same auth
@@ -75,3 +85,6 @@ pedantic = "deny"
 # large stack frame is a crash on a deep call, and a large future is a
 # per-request allocation. See clippy.toml for the thresholds.
 large_stack_frames = "deny"
+
+[patch.crates-io]
+ruma-state-res = { path = "vendor/ruma-state-res" }

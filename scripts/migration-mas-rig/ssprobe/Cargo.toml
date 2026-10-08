@@ -1,0 +1,23 @@
+[package]
+name = "ssprobe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Element X's sync stack (matrix-sdk-ui SyncService over MSC4186) against a homeserver"
+
+[workspace]
+
+[dependencies]
+matrix-sdk = { version = "=0.18.0", default-features = false, features = ["e2e-encryption", "sqlite", "bundled-sqlite"] }
+matrix-sdk-ui = { version = "=0.18.0", default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+futures-util = "0.3"
+eyeball-im = "=0.8.0"
+anyhow = "1"
+serde_json = "1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+debug = false
+strip = true

@@ -24,6 +24,7 @@ WORKDIR /src
 # and cargo refuses to parse a workspace whose member manifest is missing,
 # so each member crate must be copied and stubbed below.
 COPY Cargo.toml Cargo.lock ./
+COPY vendor ./vendor
 COPY crates/spindle-core/Cargo.toml crates/spindle-core/
 COPY crates/spindle-store/Cargo.toml crates/spindle-store/
 COPY crates/spindle-server/Cargo.toml crates/spindle-server/

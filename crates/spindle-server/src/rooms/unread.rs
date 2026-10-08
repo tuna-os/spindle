@@ -22,22 +22,45 @@ use super::{RoomError, Rooms, now_ms};
 /// per sync, which for a user with no receipt (every bot, every client
 /// that doesn't send read receipts) meant the whole room, every time. The
 /// M2 close-out benchmark caught it: the one column where a sibling was
-/// faster, and the one whose curve grew with room size. Built once per
-/// room per process (the one remaining full walk), updated on append,
+/// faster, and the one whose curve grew with room size. Updated on append,
 /// queried by binary search.
-#[derive(Default)]
+///
+/// **It covers a suffix of the room, not the room.** Every timeline entry
+/// above [`Self::floor`] is indexed; nothing below it need be, because no
+/// reader has asked about it. It is built from the head down to the lowest
+/// boundary a reader has asked for, and extended further down only when a
+/// reader asks about a boundary below that. It used to be built over the
+/// whole room on first use, which read every body the room had ever held
+/// -- a million point reads and JSON parses, under the room's exclusive
+/// lock, for the first sync after a restart of an account in a room of a
+/// million events, whose readers were a few events behind.
 pub(super) struct UnreadIndex {
-    /// Linear indices of every timeline (non-state) entry, ascending.
+    /// Linear indices of every indexed timeline (non-state) entry, ascending.
     timeline: Vec<i64>,
     /// The same, per sender.
     by_sender: HashMap<String, Vec<i64>>,
+    /// Everything above this position is indexed. Starts above every
+    /// position, covering nothing.
+    floor: i64,
+}
+
+impl Default for UnreadIndex {
+    fn default() -> Self {
+        Self {
+            timeline: Vec::new(),
+            by_sender: HashMap::new(),
+            floor: i64::MAX,
+        }
+    }
 }
 
 impl UnreadIndex {
     pub(super) fn push(&mut self, li: i64, sender: &str) {
-        // Appends arrive in li order, so pushing keeps both vectors sorted.
-        // Backfill (negative indices, M3) must not use this path: it would
-        // break the invariant — invalidate the room's cache instead.
+        // Appends arrive in li order above everything indexed, so pushing
+        // keeps both vectors sorted. Backfill takes positions below the
+        // whole room, which is below the floor of any index that could
+        // have counted it: a reader asking about that range extends the
+        // index down over it, and finds it there.
         self.timeline.push(li);
         self.by_sender
             .entry(sender.to_owned())
@@ -45,7 +68,38 @@ impl UnreadIndex {
             .push(li);
     }
 
-    /// Timeline events after `boundary` not sent by `user_id`.
+    /// Whether a count after `boundary` can be answered from what is indexed.
+    fn covers(&self, boundary: i64) -> bool {
+        boundary >= self.floor
+    }
+
+    /// The position below which nothing is indexed yet.
+    fn floor(&self) -> i64 {
+        self.floor
+    }
+
+    /// Index the timeline entries in `(floor, self.floor]`, given as
+    /// `(li, sender)` in ascending order. All of them sort below every
+    /// position already indexed, so this is a prepend.
+    fn extend_down(&mut self, floor: i64, below: Vec<(i64, String)>) {
+        debug_assert!(floor < self.floor);
+        let mut timeline = Vec::with_capacity(below.len() + self.timeline.len());
+        let mut by_sender: HashMap<String, Vec<i64>> = HashMap::new();
+        for (li, sender) in below {
+            timeline.push(li);
+            by_sender.entry(sender).or_default().push(li);
+        }
+        timeline.append(&mut self.timeline);
+        for (sender, mut lis) in std::mem::take(&mut self.by_sender) {
+            by_sender.entry(sender).or_default().append(&mut lis);
+        }
+        self.timeline = timeline;
+        self.by_sender = by_sender;
+        self.floor = floor;
+    }
+
+    /// Timeline events after `boundary` not sent by `user_id`. Only
+    /// meaningful when the index [`covers`](Self::covers) `boundary`.
     fn count_after(&self, boundary: i64, user_id: &str) -> usize {
         let after = |lis: &[i64]| lis.len() - lis.partition_point(|&li| li <= boundary);
         let own = self.by_sender.get(user_id).map_or(0, |lis| after(lis));
@@ -136,16 +190,80 @@ impl Rooms {
         event_id: &str,
         thread_id: Option<&str>,
     ) -> Result<(), RoomError> {
+        self.set_receipt_among(
+            room_id,
+            user_id,
+            receipt_type,
+            &[event_id],
+            thread_id,
+            now_ms(),
+        )
+        .map(|_| ())
+    }
+
+    /// Record a receipt a peer sent in an `m.receipt` EDU.
+    ///
+    /// Stored exactly as a local receipt is -- same key, same record, same
+    /// stream mark -- so classic `/sync` and the sliding-sync receipts
+    /// extension serve it without knowing where it came from. The spec
+    /// lets one receipt name several events; the one this room places
+    /// latest wins, and events this server does not hold are skipped
+    /// rather than refusing the receipt. `ts` is the reader's own clock,
+    /// clamped to ours so a peer cannot date a receipt in the future.
+    /// Returns the event the receipt was placed on.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_receipt`]: [`RoomError::Forbidden`] for a reader who
+    /// is not joined, [`RoomError::MissingBody`] when none of the events is
+    /// one this room holds.
+    pub fn set_remote_receipt(
+        &self,
+        room_id: &str,
+        user_id: &str,
+        receipt_type: &str,
+        event_ids: &[&str],
+        thread_id: Option<&str>,
+        ts: u64,
+    ) -> Result<String, RoomError> {
+        self.set_receipt_among(
+            room_id,
+            user_id,
+            receipt_type,
+            event_ids,
+            thread_id,
+            ts.min(now_ms()),
+        )
+    }
+
+    fn set_receipt_among(
+        &self,
+        room_id: &str,
+        user_id: &str,
+        receipt_type: &str,
+        event_ids: &[&str],
+        thread_id: Option<&str>,
+        ts: u64,
+    ) -> Result<String, RoomError> {
         if !self.is_joined(user_id, room_id)? {
             return Err(RoomError::Forbidden(format!(
                 "{user_id} is not in {room_id}"
             )));
         }
-        let li = self
-            .with_room(room_id, |_, log| {
-                Ok(log.get(&EventId::new(event_id)).map(|entry| entry.li.get()))
-            })?
-            .ok_or_else(|| RoomError::MissingBody(event_id.to_owned()))?;
+        let placed = self.with_room(room_id, |_, log| {
+            Ok(event_ids
+                .iter()
+                .filter_map(|event_id| {
+                    log.get(&EventId::new(*event_id))
+                        .map(|entry| (entry.li.get(), *event_id))
+                })
+                .max_by_key(|(li, _)| *li))
+        })?;
+        let Some((li, event_id)) = placed else {
+            return Err(RoomError::MissingBody(
+                event_ids.first().copied().unwrap_or_default().to_owned(),
+            ));
+        };
 
         spindle_store::Store::put(
             self.store.as_ref(),
@@ -153,12 +271,43 @@ impl Rooms {
             &ReceiptRecord {
                 event_id: event_id.to_owned(),
                 li,
-                ts: now_ms(),
+                ts,
             }
             .encode(),
         )?;
         self.mark_receipt(room_id, user_id);
-        Ok(())
+        Ok(event_id.to_owned())
+    }
+
+    /// Every receipt one reader holds in a room, as `(receipt_type,
+    /// event_id, ts, thread_id)`: what an incremental `/sync` re-sends for
+    /// a reader whose receipt moved. One prefix scan of that reader's rows,
+    /// not the room's.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the records cannot be read.
+    #[allow(clippy::type_complexity, reason = "one row per receipt")]
+    pub fn user_receipts(
+        &self,
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<Vec<(String, String, u64, Option<String>)>, RoomError> {
+        let prefix = receipt_key(room_id, user_id, "", None);
+        let mut receipts = Vec::new();
+        for (key, value) in spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)? {
+            let Ok(tail) = std::str::from_utf8(&key[prefix.len()..]) else {
+                continue;
+            };
+            let (receipt_type, thread) = match tail.split_once('\0') {
+                Some((receipt_type, thread)) => (receipt_type, Some(thread.to_owned())),
+                None => (tail, None),
+            };
+            if let Some(record) = ReceiptRecord::decode(&value) {
+                receipts.push((receipt_type.to_owned(), record.event_id, record.ts, thread));
+            }
+        }
+        Ok(receipts)
     }
 
     /// How many events a user has not read, and where they read up to.
@@ -234,30 +383,47 @@ impl Rooms {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             Ok(cache
                 .get(room_id)
+                .filter(|index| index.covers(boundary))
                 .map(|index| index.count_after(boundary, user_id)))
         })?;
         let notification_count = match warm {
             Some(count) => count,
-            // Cold. The one remaining full walk: once per room per process,
-            // and under the *exclusive* lock deliberately, so no append can
-            // slip past unindexed while it runs.
+            // Cold, or asked about a boundary below what is indexed: index
+            // the range between, once. Under the room's *exclusive* lock
+            // deliberately, so no append can slip past unindexed while it
+            // runs -- but not under the index's own lock, which every
+            // room's warm path takes and which must not wait on this
+            // room's body reads.
             None => self.with_room(room_id, |rooms, log| {
+                let floor = rooms
+                    .unread_index
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(room_id)
+                    .map_or(i64::MAX, UnreadIndex::floor);
+                let mut below = Vec::new();
+                if boundary < floor {
+                    for entry in log.entries_in((
+                        std::ops::Bound::Excluded(boundary),
+                        std::ops::Bound::Included(floor),
+                    )) {
+                        if entry.state_key.is_some() {
+                            continue;
+                        }
+                        below.push((entry.li.get(), rooms.read_sender(room_id, &entry.event_id)?));
+                    }
+                }
                 let mut cache = rooms
                     .unread_index
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if !cache.contains_key(room_id) {
-                    let mut index = UnreadIndex::default();
-                    for entry in log.entries() {
-                        if entry.state_key.is_some() {
-                            continue;
-                        }
-                        let event = rooms.read_event(room_id, &entry.event_id)?;
-                        index.push(entry.li.get(), event["sender"].as_str().unwrap_or(""));
-                    }
-                    cache.insert(room_id.to_owned(), index);
+                let index = cache.entry(room_id.to_owned()).or_default();
+                // The room's exclusive lock has been held since `floor` was
+                // read, so nothing has moved it.
+                if boundary < index.floor() {
+                    index.extend_down(boundary, below);
                 }
-                Ok(cache[room_id].count_after(boundary, user_id))
+                Ok(index.count_after(boundary, user_id))
             })?,
         };
 
@@ -517,5 +683,61 @@ impl ReceiptRecord {
         let ts = u64::from_be_bytes(bytes.get(8..16)?.try_into().ok()?);
         let event_id = String::from_utf8(bytes.get(16..)?.to_vec()).ok()?;
         Some(Self { event_id, li, ts })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UnreadIndex;
+
+    /// An index built from the head down in steps, and appended to, answers
+    /// every boundary it covers exactly as a count over the whole timeline.
+    #[test]
+    fn a_suffix_index_extended_downwards_counts_as_a_whole_one() {
+        let senders = ["@a:t", "@b:t", "@c:t"];
+        // Backfilled history below zero, live history above, a state event
+        // (absent from the timeline) every seventh position.
+        let mut timeline: Vec<(i64, &str)> = (-12_i64..=50)
+            .filter(|li| li.rem_euclid(7) != 3)
+            .map(|li| (li, senders[usize::try_from(li.rem_euclid(3)).unwrap()]))
+            .collect();
+        let naive = |timeline: &[(i64, &str)], boundary: i64, user: &str| {
+            timeline
+                .iter()
+                .filter(|(li, sender)| *li > boundary && *sender != user)
+                .count()
+        };
+        let mut index = UnreadIndex::default();
+        assert!(!index.covers(50), "a new index covers nothing");
+        for floor in [44, 43, 20, 0, -13] {
+            let below: Vec<(i64, String)> = timeline
+                .iter()
+                .filter(|(li, _)| *li > floor && *li <= index.floor())
+                .map(|(li, sender)| (*li, (*sender).to_owned()))
+                .collect();
+            index.extend_down(floor, below);
+            assert!(index.covers(floor) && !index.covers(floor - 1));
+            for boundary in floor..=55 {
+                for user in ["@a:t", "@b:t", "@c:t", "@nobody:t"] {
+                    assert_eq!(
+                        index.count_after(boundary, user),
+                        naive(&timeline, boundary, user),
+                        "floor {floor}, boundary {boundary}, {user}"
+                    );
+                }
+            }
+        }
+        for (li, sender) in [(51, "@a:t"), (52, "@b:t"), (54, "@a:t")] {
+            index.push(li, sender);
+            timeline.push((li, sender));
+        }
+        for boundary in -13..=56 {
+            for user in ["@a:t", "@b:t", "@c:t"] {
+                assert_eq!(
+                    index.count_after(boundary, user),
+                    naive(&timeline, boundary, user)
+                );
+            }
+        }
     }
 }

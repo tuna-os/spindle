@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
 use serde_json::Value;
-use spindle_core::{AppendError, EventId, EventInput, LogEntry, Pdu, RoomLog, StateKey};
+use spindle_core::{EventId, EventInput, LogEntry, Pdu, RoomLog, StateKey};
 use spindle_store::RoomStore;
 
 use super::{
@@ -37,12 +37,7 @@ impl Rooms {
     /// Returns [`RoomError`] if the room or its indexes cannot be read.
     pub fn server_in_room(&self, room_id: &str, domain: &str) -> Result<bool, RoomError> {
         let members = self.with_room_read(room_id, |_, log| {
-            let Some(state) = log
-                .entries()
-                .next_back()
-                .map(|entry| entry.li)
-                .and_then(|li| log.state_after(li))
-            else {
+            let Some(state) = log.current_state() else {
                 return Ok(Vec::new());
             };
             let mut members = Vec::new();
@@ -74,6 +69,518 @@ impl Rooms {
         Ok(false)
     }
 
+    /// Dependencies of a received event that this room does not hold yet.
+    /// Predecessors need a position and state; auth events need a body only.
+    ///
+    /// # Errors
+    /// Returns [`RoomError`] if the room or dependency bodies cannot be read.
+    pub fn missing_remote_dependencies(
+        &self,
+        room_id: &str,
+        event: &Value,
+    ) -> Result<(Vec<String>, Vec<String>), RoomError> {
+        self.with_room_read(room_id, |rooms, log| {
+            let mut predecessors = super::edge_ids(&event["prev_events"]);
+            if spindle_core::is_state_dag(&rooms.version_in_log(log, room_id)?) {
+                predecessors.extend(super::edge_ids(&event["prev_state_events"]));
+            }
+            predecessors.sort();
+            predecessors.dedup();
+            predecessors.retain(|id| {
+                let id = EventId::new(id.as_str());
+                log.get(&id).is_none() && log.sidelined(&id).is_none()
+            });
+            let mut auth = Vec::new();
+            for id in super::edge_ids(&event["auth_events"]) {
+                match rooms.read_event(room_id, &EventId::new(id.as_str())) {
+                    Ok(_) => {}
+                    Err(RoomError::MissingBody(_)) => auth.push(id),
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok((predecessors, auth))
+        })
+    }
+
+    /// The current forward extremities to delimit a missing-event window.
+    ///
+    /// # Errors
+    /// Returns [`RoomError`] if the room cannot be read.
+    pub fn remote_recovery_heads(&self, room_id: &str) -> Result<Vec<String>, RoomError> {
+        self.with_room_read(room_id, |_, log| {
+            Ok(log
+                .forward_extremities()
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect())
+        })
+    }
+
+    /// Retain signature-verified auth dependencies without timeline or client
+    /// indexes. The caller verifies signatures before this synchronous step;
+    /// this step verifies IDs, room ownership and the cited auth rules.
+    /// Existing bodies and Synapse rejection decisions are never overwritten.
+    ///
+    /// # Errors
+    /// Returns [`RoomError`] for malformed, foreign-room or unauthorized
+    /// dependencies, an incomplete/cyclic auth chain, or an atomic write failure.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "validate the entire auth batch before one atomic commit"
+    )]
+    pub fn retain_remote_auth(
+        &self,
+        room_id: &str,
+        events: &[(String, Value)],
+    ) -> Result<(), RoomError> {
+        use ruma::state_res::events::Event as _;
+        use spindle_store::Store as _;
+        use std::collections::BTreeMap;
+
+        self.with_room(room_id, |rooms, log| {
+            let version = rooms.version_in_log(log, room_id)?;
+            if spindle_core::is_state_dag(&version) {
+                return Err(RoomError::Append(
+                    "state-DAG dependencies require predecessor state".to_owned(),
+                ));
+            }
+            let rules = rooms.rules_in(log, room_id)?;
+            let create_id = log
+                .current_state()
+                .and_then(|state| state.get(&StateKey::new("m.room.create", "")))
+                .ok_or_else(|| RoomError::Append("the room has no create event".to_owned()))?
+                .to_owned();
+            let mut pending = BTreeMap::new();
+            for (id, body) in events {
+                match rooms.read_event(room_id, &EventId::new(id.as_str())) {
+                    Ok(_) => continue,
+                    Err(RoomError::MissingBody(_)) => {}
+                    Err(error) => return Err(error),
+                }
+                if let Some(held_room) = spindle_store::ReadView::get(
+                    rooms.store.as_ref(),
+                    &spindle_core::keys::event_room(id),
+                )? && held_room != room_id.as_bytes()
+                {
+                    return Err(RoomError::Forbidden(
+                        "auth event ID is already held in another room".to_owned(),
+                    ));
+                }
+                let ruma::CanonicalJsonValue::Object(canonical) =
+                    ruma::CanonicalJsonValue::try_from(body.clone())
+                        .map_err(|error| RoomError::Build(error.to_string()))?
+                else {
+                    return Err(RoomError::Build("auth event is not an object".to_owned()));
+                };
+                let pdu = Pdu::from_remote(version.clone(), canonical)
+                    .map_err(|error| RoomError::Build(format!("auth event: {error:?}")))?;
+                if pdu.event_id().as_str() != id {
+                    return Err(RoomError::Build(
+                        "auth event ID does not match its body".to_owned(),
+                    ));
+                }
+                let candidate = crate::authorize::StoredEvent::parse_in(id, room_id, body)
+                    .map_err(RoomError::Build)?;
+                if candidate.room_id().map(ruma::RoomId::as_str) != Some(room_id)
+                    || candidate.state_key().is_none()
+                {
+                    return Err(RoomError::Forbidden(
+                        "auth dependency is not state in this room".to_owned(),
+                    ));
+                }
+                if candidate.event_type() == &ruma::events::TimelineEventType::RoomCreate
+                    && id != &create_id
+                {
+                    return Err(RoomError::Forbidden(
+                        "auth dependency replaces the room's create event".to_owned(),
+                    ));
+                }
+                pending
+                    .entry(id.clone())
+                    .or_insert((body.clone(), candidate));
+            }
+            let mut accepted: BTreeMap<String, crate::authorize::StoredEvent> = BTreeMap::new();
+            let mut writes = Vec::new();
+            while !pending.is_empty() {
+                let ready: Vec<String> = pending
+                    .iter()
+                    .filter(|(_, (_, event))| {
+                        event
+                            .auth_event_ids()
+                            .iter()
+                            .all(|auth| !pending.contains_key(auth.as_str()))
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                if ready.is_empty() {
+                    return Err(RoomError::Forbidden(
+                        "auth dependencies contain a cycle".to_owned(),
+                    ));
+                }
+                for id in ready {
+                    let (body, candidate) = pending
+                        .remove(&id)
+                        .ok_or_else(|| RoomError::Build("ready auth event is absent".to_owned()))?;
+                    let fetch = |auth: &ruma::EventId| {
+                        if let Some(event) = accepted.get(auth.as_str()) {
+                            return Some(event.clone());
+                        }
+                        let body = rooms
+                            .read_event(room_id, &EventId::new(auth.as_str()))
+                            .ok()?;
+                        let event = crate::authorize::StoredEvent::parse_auth_in(
+                            auth.as_str(),
+                            room_id,
+                            &body,
+                        )
+                        .ok()?;
+                        let rejected = log
+                            .sidelined(&EventId::new(auth.as_str()))
+                            .is_some_and(|entry| entry.kind == spindle_core::Sideline::Rejected);
+                        Some(event.with_rejected(rejected).with_preserved_rejection(
+                            log.historically_rejected(&EventId::new(auth.as_str())),
+                        ))
+                    };
+                    ruma::state_res::check_state_independent_auth_rules(
+                        &rules.authorization,
+                        candidate.clone(),
+                        fetch,
+                    )
+                    .map_err(|why| RoomError::Forbidden(format!("recovered auth events: {why}")))?;
+                    let mut named = std::collections::HashMap::new();
+                    for auth in candidate.auth_event_ids() {
+                        let event =
+                            fetch(auth).ok_or_else(|| RoomError::MissingBody(auth.to_string()))?;
+                        if event.event_type() == &ruma::events::TimelineEventType::RoomCreate
+                            && auth.as_str() != create_id
+                        {
+                            return Err(RoomError::Forbidden(
+                                "auth chain uses another create event".to_owned(),
+                            ));
+                        }
+                        if let Some(key) = event.state_key() {
+                            named.insert(
+                                (
+                                    ruma::events::StateEventType::from(
+                                        event.event_type().to_string(),
+                                    ),
+                                    key.to_owned(),
+                                ),
+                                event,
+                            );
+                        }
+                    }
+                    if rules.authorization.room_create_event_id_as_room_id {
+                        let create = ruma::OwnedEventId::try_from(create_id.as_str())
+                            .map_err(|error| RoomError::Build(error.to_string()))?;
+                        let event = fetch(&create)
+                            .ok_or_else(|| RoomError::MissingBody(create_id.clone()))?;
+                        named.insert(
+                            (ruma::events::StateEventType::RoomCreate, String::new()),
+                            event,
+                        );
+                    }
+                    crate::authorize::authorize(&rules.authorization, &candidate, |kind, key| {
+                        named
+                            .get(&(kind.clone(), key.to_owned()))
+                            .filter(|event| !event.rejected())
+                            .cloned()
+                    })
+                    .map_err(RoomError::Forbidden)?;
+                    writes.push((event_body_key(room_id, &id), serde_json::to_vec(&body)?));
+                    writes.push((
+                        spindle_core::keys::event_room(&id),
+                        room_id.as_bytes().to_vec(),
+                    ));
+                    accepted.insert(id, candidate);
+                }
+            }
+            rooms
+                .store
+                .commit(&writes, spindle_store::Durability::Group)?;
+            Ok(())
+        })
+    }
+
+    /// Accept a verified remote event whose predecessors could not be
+    /// recovered, on the state before it that a participating server named
+    /// (`/state_ids`), as a forward event across a gap in this room's
+    /// history.
+    ///
+    /// The caller has already fetched, verified and retained (via
+    /// [`Self::retain_remote_auth`]) every state and auth-chain event that
+    /// `state_before` names; this step is synchronous, under the room lock,
+    /// and runs the same receipt checks as [`Self::receive_remote`] -- the
+    /// event's own auth events, then the state before it (here the peer's,
+    /// since its parents' states are not ours to compute), then the room's
+    /// current state -- before placing it with
+    /// [`RoomLog::append_across_gap`]. The room's existing head stays a
+    /// forward extremity beside the new event, and [`Self::settle`]
+    /// re-resolves the current state over both, so the peer's view of the
+    /// room never simply replaces ours: it is merged by the room version's
+    /// algorithm, as any fork is.
+    ///
+    /// Nothing is sidelined on a failed check: an event whose parents are
+    /// unknown has nowhere to be kept outside the timeline. It is refused,
+    /// and a redelivery is judged again.
+    ///
+    /// The gap itself -- the history between the predecessors this server
+    /// lacks and what it holds -- is not filled here. A marker is written
+    /// under [`spindle_core::keys::federation_gap`] naming the missing
+    /// predecessors, for a later backfill to start from.
+    ///
+    /// The background backfill (`crate::inbound::backfill`) walks each
+    /// marker's missing predecessors back with `/backfill` (SPEC §6.5: one
+    /// `/state_ids` per chunk), stores that history as the gap's segment
+    /// ([`Self::commit_gap_chunk`]), and clears the marker once the walk
+    /// meets history this server already holds.
+    ///
+    /// Returns the predecessors the event named that this server does not
+    /// hold, or `None` when nothing needed bridging -- the event was
+    /// already held, or its parents arrived meanwhile and it took the
+    /// ordinary path.
+    ///
+    /// # Errors
+    ///
+    /// [`RoomError::Forbidden`] when the state is malformed, names a
+    /// rejected event or another create event, or the event fails a receipt
+    /// check; [`RoomError::MissingBody`] for a state event the caller did
+    /// not retain; [`RoomError::Append`] for a state-DAG room, whose state
+    /// cannot be taken from `/state_ids`.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the receipt checks and placement of one event, in order"
+    )]
+    pub fn accept_across_gap(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        json: &Value,
+        state_before: &[String],
+        state_from: &str,
+    ) -> Result<Option<Vec<String>>, RoomError> {
+        use spindle_core::{Sideline, StateSnapshot};
+        use spindle_store::Store as _;
+
+        self.with_room(room_id, |rooms, log| {
+            let id = EventId::new(event_id);
+            if log.get(&id).is_some() {
+                return Ok(None);
+            }
+            if log.historically_rejected(&id) {
+                return Err(RoomError::Forbidden(format!(
+                    "rejected: {event_id} was rejected before migration"
+                )));
+            }
+            if let Some(sidelined) = log.sidelined(&id) {
+                return Err(RoomError::Forbidden(match sidelined.kind {
+                    Sideline::SoftFailed => format!("{event_id} was soft-failed"),
+                    Sideline::Rejected => format!("{event_id} was rejected"),
+                }));
+            }
+            let version = rooms.version_in_log(log, room_id)?;
+            if spindle_core::is_state_dag(&version) {
+                return Err(RoomError::Append(
+                    "a state-DAG room's state cannot be taken from /state_ids".to_owned(),
+                ));
+            }
+            let prev: Vec<EventId> = super::edge_ids(&json["prev_events"])
+                .into_iter()
+                .map(EventId::new)
+                .collect();
+            let missing: Vec<String> = prev
+                .iter()
+                .filter(|parent| !log.holds(parent))
+                .map(|parent| parent.as_str().to_owned())
+                .collect();
+            if missing.is_empty() {
+                // Recovery or another PDU filled the gap meanwhile: the
+                // ordinary path, with our own state, is the right one.
+                rooms.ingest(log, room_id, event_id, json, false)?;
+                return Ok(None);
+            }
+
+            // The peer's state before the event, keyed by what each named
+            // body says it is. Every body was verified and retained by the
+            // caller; a rejected or foreign one is refused, not skipped,
+            // because a state that silently loses entries is a different
+            // state from the one the peer vouched for.
+            let create_id = log
+                .current_state()
+                .and_then(|state| state.get(&StateKey::new("m.room.create", "")))
+                .ok_or_else(|| RoomError::Append("the room has no create event".to_owned()))?
+                .to_owned();
+            let mut state = StateSnapshot::new();
+            for state_id in state_before {
+                if state_id == event_id {
+                    continue;
+                }
+                let held = EventId::new(state_id.as_str());
+                if log.historically_rejected(&held)
+                    || log
+                        .sidelined(&held)
+                        .is_some_and(|entry| entry.kind == Sideline::Rejected)
+                {
+                    return Err(RoomError::Forbidden(format!(
+                        "the peer's state names {state_id}, which this room rejected"
+                    )));
+                }
+                let body = rooms.read_event(room_id, &held)?;
+                let (Some(kind), Some(state_key)) =
+                    (body["type"].as_str(), body["state_key"].as_str())
+                else {
+                    return Err(RoomError::Forbidden(format!(
+                        "the peer's state names {state_id}, which is not a state event"
+                    )));
+                };
+                if kind == "m.room.create" && state_id != &create_id {
+                    return Err(RoomError::Forbidden(
+                        "the peer's state names another create event".to_owned(),
+                    ));
+                }
+                let key = StateKey::new(kind, state_key);
+                if state.get(&key).is_some_and(|other| other != state_id) {
+                    return Err(RoomError::Forbidden(format!(
+                        "the peer's state names two events for {kind}/{state_key}"
+                    )));
+                }
+                state = state.apply(key, state_id.as_str());
+            }
+            if state
+                .get(&StateKey::new("m.room.create", ""))
+                .is_none_or(|named| named != create_id)
+            {
+                return Err(RoomError::Forbidden(
+                    "the peer's state does not name this room's create event".to_owned(),
+                ));
+            }
+
+            // Check 3's "current state", as Synapse computes it across a
+            // gap: our extremities' states resolved together with the
+            // peer's. Our own current state is stale by the length of the
+            // gap -- a member who joined in it is unknown to it -- while a
+            // ban that reached either side still lands in the resolution,
+            // so a gap manufactured to dodge one does not dodge it.
+            let tips: Vec<EventId> = log.forward_extremities().iter().cloned().collect();
+            let current = rooms.resolve_in(log, room_id, |log, resolver, load| {
+                let mut states: Vec<StateSnapshot> = Vec::with_capacity(tips.len() + 1);
+                for tip in &tips {
+                    let tip_state = log.state_after_any(tip, load)?;
+                    if !states.iter().any(|held| held.root() == tip_state.root()) {
+                        states.push(tip_state);
+                    }
+                }
+                if !states.iter().any(|held| held.root() == state.root()) {
+                    states.push(state.clone());
+                }
+                if states.len() == 1 {
+                    return Ok(states.pop().unwrap_or_default());
+                }
+                resolver.resolve(&states)
+            })?;
+            if let Some((kind, reason)) =
+                rooms.receipt_checks(log, room_id, event_id, json, &state, &prev, Some(&current))?
+            {
+                return Err(RoomError::Forbidden(match kind {
+                    Sideline::SoftFailed => {
+                        format!("soft-failed against the current state: {reason}")
+                    }
+                    Sideline::Rejected => format!("rejected: {reason}"),
+                }));
+            }
+            let redaction_target = rooms.redaction_target(log, room_id, json)?;
+
+            let event_type = json["type"].as_str().unwrap_or_default().to_owned();
+            let state_key = json["state_key"].as_str().map(str::to_owned);
+            let sender = json["sender"].as_str().unwrap_or_default().to_owned();
+            let input = EventInput::new(event_id, prev);
+            let input = match &state_key {
+                Some(state_key) => {
+                    input.with_state_key(StateKey::new(event_type.as_str(), state_key.as_str()))
+                }
+                None => input,
+            };
+            let previous_current = log.current_state().cloned();
+            let previous_tips = log.forward_extremities().clone();
+            let entry = log
+                .append_across_gap(input, state, json["depth"].as_u64().unwrap_or(0))
+                .map_err(|error| rooms.append_error(&error))?
+                .clone();
+            rooms.metrics.record_append(
+                crate::metrics::Origin::Federated,
+                super::case_of(state_key.is_some(), false),
+            );
+            let content = json["content"].clone();
+            rooms.persist_entry(
+                log,
+                room_id,
+                &entry,
+                event_id,
+                &PersistInput {
+                    event_type: &event_type,
+                    state_key: state_key.as_deref(),
+                    sender: &sender,
+                    content: &content,
+                    json,
+                },
+            )?;
+            // Two extremities now, ours and the peer's: their resolution is
+            // the room's current state, and every membership it moved is
+            // re-indexed from it.
+            rooms.settle(log, room_id, Some(&entry), previous_current, &previous_tips)?;
+            if let Some(target) = redaction_target {
+                if log.get(&EventId::new(target.as_str())).is_some()
+                    || rooms.gap_position(room_id, &target)?.is_some()
+                {
+                    rooms.apply_redaction(room_id, &target, event_id)?;
+                } else {
+                    rooms.note_unheld_redaction(log, room_id, &target, event_id, json)?;
+                }
+            }
+
+            // The marker is advisory -- the event is placed and durable
+            // whether or not it lands -- so a failed write is reported, not
+            // turned into a refusal of an event already in the timeline.
+            let marker = serde_json::json!({
+                "event_id": event_id,
+                "missing_prev_events": missing,
+                "state_from": state_from,
+                "li": entry.li.get(),
+                "accepted_ts": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)),
+            });
+            if let Err(error) = rooms.store.put(
+                &spindle_core::keys::federation_gap(room_id, event_id),
+                marker.to_string().as_bytes(),
+            ) {
+                tracing::warn!(
+                    room = room_id,
+                    event_id,
+                    "cannot record a federation gap marker: {error}"
+                );
+            }
+            Ok(Some(missing))
+        })
+    }
+
+    /// The federation gaps recorded in a room by
+    /// [`Self::accept_across_gap`] and not yet filled: one marker per
+    /// event accepted across a gap, naming the predecessors it lacked.
+    ///
+    /// # Errors
+    /// Returns [`RoomError`] if the markers cannot be read.
+    pub fn federation_gaps(&self, room_id: &str) -> Result<Vec<Value>, RoomError> {
+        let prefix =
+            spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::FederationGap, room_id);
+        Ok(
+            spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?
+                .into_iter()
+                .filter_map(|(_, value)| serde_json::from_slice(&value).ok())
+                .collect(),
+        )
+    }
+
     /// A join-event template for a remote user, for `make_join`.
     ///
     /// The template is everything but the signature: the caller's server
@@ -100,17 +607,14 @@ impl Rooms {
             ));
         }
         self.with_room(room_id, |rooms, log| {
-            // What this server would author on itself: a template naming
-            // a tip this server cannot fold hands the user an event
-            // `send_*` then refuses.
-            self.set_aside_contested(log, room_id)?;
+            // What this server would author on itself: the newest forward
+            // extremities, and the state they resolve to.
             let head = log
                 .entries()
                 .next_back()
                 .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
-            let state = log
-                .state_after(head.li)
-                .ok_or_else(|| RoomError::StateUnavailable("no head state".to_owned()))?;
+            let parents: Vec<EventId> = log.authoring_extremities().cloned().collect();
+            let (state, _) = rooms.state_for_parents(log, room_id, &parents)?;
 
             // `read_event`, not `event()`: the latter re-enters `with_room`
             // on a lock this closure already holds.
@@ -149,17 +653,14 @@ impl Rooms {
                 content["join_authorised_via_users_server"] = Value::String(nominee);
             }
             let auth = auth_events_for(
-                log,
+                Some(&state),
                 &rooms.rules_in(log, room_id)?.authorization,
                 user_id,
                 "m.room.member",
                 Some(user_id),
                 &content,
             )?;
-            let prev: Vec<String> = log
-                .authoring_extremities()
-                .map(|id| id.as_str().to_owned())
-                .collect();
+            let prev: Vec<String> = parents.iter().map(|id| id.as_str().to_owned()).collect();
             let depth = head.depth.saturating_add(1);
             let mut template = serde_json::json!({
                 "type": "m.room.member",
@@ -191,17 +692,24 @@ impl Rooms {
     /// [`RoomError::Forbidden`] when the room does not accept knocks.
     pub fn make_knock_template(&self, room_id: &str, user_id: &str) -> Result<Value, RoomError> {
         self.with_room(room_id, |rooms, log| {
-            // What this server would author on itself: a template naming
-            // a tip this server cannot fold hands the user an event
-            // `send_*` then refuses.
-            self.set_aside_contested(log, room_id)?;
+            // Knocking arrived in v7. In an older room a `knock` join rule
+            // is a value the rules do not know and a knock membership is
+            // refused outright, so the template would be a promise the
+            // version cannot keep -- refused here, as Synapse does, at the
+            // cheap step.
+            if !rooms.rules_in(log, room_id)?.authorization.knocking {
+                return Err(RoomError::Forbidden(
+                    "this room's version does not support knocking".to_owned(),
+                ));
+            }
+            // What this server would author on itself: the newest forward
+            // extremities, and the state they resolve to.
             let head = log
                 .entries()
                 .next_back()
                 .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
-            let state = log
-                .state_after(head.li)
-                .ok_or_else(|| RoomError::StateUnavailable("no head state".to_owned()))?;
+            let parents: Vec<EventId> = log.authoring_extremities().cloned().collect();
+            let (state, _) = rooms.state_for_parents(log, room_id, &parents)?;
             let join_rule = state
                 .get(&StateKey::new("m.room.join_rules", ""))
                 .map(str::to_owned)
@@ -216,17 +724,14 @@ impl Rooms {
 
             let content = serde_json::json!({ "membership": "knock" });
             let auth = auth_events_for(
-                log,
+                Some(&state),
                 &rooms.rules_in(log, room_id)?.authorization,
                 user_id,
                 "m.room.member",
                 Some(user_id),
                 &content,
             )?;
-            let prev: Vec<String> = log
-                .authoring_extremities()
-                .map(|id| id.as_str().to_owned())
-                .collect();
+            let prev: Vec<String> = parents.iter().map(|id| id.as_str().to_owned()).collect();
             let depth = head.depth.saturating_add(1);
             let mut template = serde_json::json!({
                 "type": "m.room.member",
@@ -258,14 +763,14 @@ impl Rooms {
     /// [`RoomError::Forbidden`] when the user has nothing to leave.
     pub fn make_leave_template(&self, room_id: &str, user_id: &str) -> Result<Value, RoomError> {
         self.with_room(room_id, |rooms, log| {
-            // What this server would author on itself: a template naming
-            // a tip this server cannot fold hands the user an event
-            // `send_*` then refuses.
-            self.set_aside_contested(log, room_id)?;
+            // What this server would author on itself: the newest forward
+            // extremities, and the state they resolve to.
             let head = log
                 .entries()
                 .next_back()
                 .ok_or_else(|| RoomError::UnknownRoom(room_id.to_owned()))?;
+            let parents: Vec<EventId> = log.authoring_extremities().cloned().collect();
+            let (state, _) = rooms.state_for_parents(log, room_id, &parents)?;
             let membership = spindle_store::ReadView::get(
                 self.store.as_ref(),
                 &spindle_core::keys::user_room(
@@ -283,17 +788,14 @@ impl Rooms {
 
             let content = serde_json::json!({ "membership": "leave" });
             let auth = auth_events_for(
-                log,
+                Some(&state),
                 &rooms.rules_in(log, room_id)?.authorization,
                 user_id,
                 "m.room.member",
                 Some(user_id),
                 &content,
             )?;
-            let prev: Vec<String> = log
-                .authoring_extremities()
-                .map(|id| id.as_str().to_owned())
-                .collect();
+            let prev: Vec<String> = parents.iter().map(|id| id.as_str().to_owned()).collect();
             let depth = head.depth.saturating_add(1);
             let mut template = serde_json::json!({
                 "type": "m.room.member",
@@ -339,16 +841,9 @@ impl Rooms {
                 .rev()
                 .filter(|entry| entry.li <= start)
                 .take(limit)
-                .map(|entry| {
-                    let mut event = rooms.read_event(room_id, &entry.event_id)?;
-                    if let Some(object) = event.as_object_mut() {
-                        object.insert(
-                            "event_id".to_owned(),
-                            Value::String(entry.event_id.as_str().to_owned()),
-                        );
-                    }
-                    Ok(event)
-                })
+                // The stored PDU as signed: see `Rooms::pdu` for why no
+                // `event_id` is added.
+                .map(|entry| rooms.read_event(room_id, &entry.event_id))
                 .collect()
         })
     }
@@ -401,16 +896,9 @@ impl Rooms {
                         && entry.depth >= min_depth
                 })
                 .take(limit)
-                .map(|entry| {
-                    let mut event = rooms.read_event(room_id, &entry.event_id)?;
-                    if let Some(object) = event.as_object_mut() {
-                        object.insert(
-                            "event_id".to_owned(),
-                            Value::String(entry.event_id.as_str().to_owned()),
-                        );
-                    }
-                    Ok(event)
-                })
+                // The stored PDU as signed: see `Rooms::pdu` for why no
+                // `event_id` is added.
+                .map(|entry| rooms.read_event(room_id, &entry.event_id))
                 .collect::<Result<_, RoomError>>()?;
             newest_first.reverse();
             Ok(newest_first)
@@ -528,11 +1016,12 @@ impl Rooms {
         auth: &[String],
         depth: u64,
     ) -> Result<(), RoomError> {
+        let version = self.version_in_log(log, room_id)?;
         let Some(object) = template.as_object_mut() else {
             return Err(RoomError::Build("a template is an object".to_owned()));
         };
         object.insert("prev_events".to_owned(), serde_json::json!(prev));
-        if spindle_core::is_state_dag(&self.version_in_log(log, room_id)?) {
+        if spindle_core::is_state_dag(&version) {
             object.insert(
                 "prev_state_events".to_owned(),
                 serde_json::json!(self.state_dag_heads(log, room_id)?),
@@ -540,6 +1029,17 @@ impl Rooms {
         } else {
             object.insert("auth_events".to_owned(), serde_json::json!(auth));
             object.insert("depth".to_owned(), serde_json::json!(depth));
+        }
+        if !spindle_core::version::names_events_by_hash(&version) {
+            // v1/v2: the references are `[id, hashes]` pairs, which only
+            // the resident can write -- it holds the parents.
+            let Ok(ruma::CanonicalJsonValue::Object(mut canonical)) =
+                ruma::CanonicalJsonValue::try_from(template.clone())
+            else {
+                return Err(RoomError::Build("a template is canonical JSON".to_owned()));
+            };
+            self.link_edges(room_id, &version, &mut canonical)?;
+            *template = serde_json::to_value(&canonical)?;
         }
         Ok(())
     }
@@ -549,15 +1049,12 @@ impl Rooms {
     ///
     /// Before rather than after, matching what a joining or backfilling
     /// server needs: the state its new event was authorized against. That
-    /// is the fold of the event's parents (`RoomLog::state_before`), which
-    /// in a linear room is one content-addressed rehydration of the entry
-    /// before it -- the read SPEC §18.1 is about. It used to be *only*
-    /// that, the linear predecessor's root whatever the event's parents,
-    /// which after a fork is one branch's state: a peer asking at the
-    /// event that merged two branches was told a state missing the other
-    /// branch's writes, while a client of this server saw both. The
-    /// federation fork tests compare the two reads, and that is what they
-    /// found (#16).
+    /// is its parents' states, resolved when they differ
+    /// ([`Self::state_before_event`]), which in a linear room is one
+    /// content-addressed rehydration of the entry before it -- the read
+    /// SPEC §18.1 is about. It used to be the linear predecessor's root
+    /// whatever the event's parents, which after a fork is one branch's
+    /// state (#16).
     ///
     /// # Errors
     ///
@@ -568,28 +1065,7 @@ impl Rooms {
         room_id: &str,
         event_id: &str,
     ) -> Result<(Vec<IdentifiedEvent>, Vec<IdentifiedEvent>), RoomError> {
-        let before = self.with_room_read(room_id, |rooms, log| {
-            let mut load = |address: &spindle_core::StateRoot| {
-                spindle_store::ReadView::get(
-                    rooms.store.as_ref(),
-                    &spindle_core::keys::content_addressed(
-                        spindle_core::keys::Keyspace::StateNode,
-                        address.as_bytes(),
-                    ),
-                )
-                .ok()
-                .flatten()
-            };
-            log.state_before(&EventId::new(event_id), &mut load)
-                .map_err(|error| match error {
-                    AppendError::UnknownPredecessor(_) => {
-                        RoomError::MissingBody(event_id.to_owned())
-                    }
-                    other => RoomError::Build(format!(
-                        "cannot rebuild the state before {event_id}: {other:?}"
-                    )),
-                })
-        })?;
+        let before = self.state_before_event(room_id, event_id)?;
         let pdus = self.state_pairs_of(room_id, &before)?;
 
         // The auth chain is every event the state transitively cites: a
@@ -600,6 +1076,30 @@ impl Rooms {
             .collect();
         let auth_chain = self.auth_chain_from(room_id, frontier);
         Ok((pdus, auth_chain))
+    }
+
+    /// The state the room was in just before `event_id`: its parents'
+    /// states, resolved by the room version's algorithm when they differ
+    /// (ADR 0005) -- exactly what the event was authorized against when it
+    /// arrived, and what the live path computes for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::MissingBody`] for an event the room does not
+    /// hold, or [`RoomError`] if a state cannot be read or resolved.
+    pub fn state_before_event(
+        &self,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<spindle_core::StateSnapshot, RoomError> {
+        self.with_room_read(room_id, |rooms, log| {
+            if !log.holds(&EventId::new(event_id)) {
+                return Err(RoomError::MissingBody(event_id.to_owned()));
+            }
+            rooms.resolve_in(log, room_id, |log, resolver, load| {
+                log.state_before(&EventId::new(event_id), resolver, load)
+            })
+        })
     }
 
     /// The auth chain of one event (`GET /event_auth/{roomId}/{eventId}`):
@@ -627,7 +1127,7 @@ impl Rooms {
             if !seen.insert(id.clone()) {
                 continue;
             }
-            let Ok(event) = self.event(room_id, &id) else {
+            let Ok(event) = self.pdu(room_id, &id) else {
                 continue;
             };
             frontier.extend(cited_auth_events(&event));
@@ -672,10 +1172,7 @@ impl Rooms {
             "m.room.encryption",
         ];
         let ids = match self.with_room_read(room_id, |_, log| {
-            let Some(head) = log.entries().next_back() else {
-                return Ok(Vec::new());
-            };
-            let Some(state) = log.state_after(head.li) else {
+            let Some(state) = log.current_state() else {
                 return Ok(Vec::new());
             };
             let mut ids: Vec<(String, String, String)> = Vec::new();
@@ -710,14 +1207,20 @@ impl Rooms {
                         .pending_knock(user_id, room_id)?
                         .and_then(|record| record["knock_state"].as_array().cloned()),
                 };
-                return Ok(stripped.unwrap_or_default());
+                return self.prune_erased_stripped(stripped.unwrap_or_default());
             }
             Err(error) => return Err(error),
         };
+        let erasure_active = self.erasure_active()?;
         let mut stripped = Vec::with_capacity(ids.len() + 1);
         let mut inviter: Option<String> = None;
         for (event_type, state_key, id) in ids {
             let event = self.read_event(room_id, &EventId::new(id.as_str()))?;
+            let event = if erasure_active {
+                self.prune_erased_event(user_id, room_id, super::stamp(event, &id))?
+            } else {
+                event
+            };
             if event_type == "m.room.member" && state_key == user_id {
                 inviter = event["sender"].as_str().map(str::to_owned);
             }
@@ -736,15 +1239,17 @@ impl Rooms {
         if let Some(inviter) = inviter.filter(|inviter| inviter != user_id) {
             let key = spindle_core::StateKey::new("m.room.member", inviter.as_str());
             let id = self.with_room_read(room_id, |_, log| {
-                let Some(head) = log.entries().next_back() else {
-                    return Ok(None);
-                };
                 Ok(log
-                    .state_after(head.li)
+                    .current_state()
                     .and_then(|state| state.get(&key).map(str::to_owned)))
             })?;
             if let Some(id) = id {
                 let event = self.read_event(room_id, &EventId::new(id.as_str()))?;
+                let event = if erasure_active {
+                    self.prune_erased_event(user_id, room_id, super::stamp(event, &id))?
+                } else {
+                    event
+                };
                 stripped.push(serde_json::json!({
                     "type": "m.room.member",
                     "state_key": inviter,
@@ -889,15 +1394,10 @@ impl Rooms {
             if let Some(key) = state_key.clone() {
                 *snapshot = snapshot.apply(key, id);
             }
-            let prev: Vec<EventId> = event["prev_events"]
-                .as_array()
-                .map(|ids| {
-                    ids.iter()
-                        .filter_map(Value::as_str)
-                        .map(EventId::new)
-                        .collect()
-                })
-                .unwrap_or_default();
+            let prev: Vec<EventId> = super::edge_ids(&event["prev_events"])
+                .into_iter()
+                .map(EventId::new)
+                .collect();
             let input = match state_key {
                 Some(key) => EventInput::new(id, prev).with_state_key(key),
                 None => EventInput::new(id, prev),
@@ -1053,9 +1553,9 @@ impl Rooms {
             return Ok(true);
         };
         let names_invite = |key: &str| {
-            leave[key]
-                .as_array()
-                .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(invite_id)))
+            super::edge_ids(&leave[key])
+                .iter()
+                .any(|id| id == invite_id)
         };
         Ok(names_invite("auth_events") || names_invite("prev_events"))
     }
@@ -1185,13 +1685,5 @@ fn order_state_dag(events: Vec<(String, Value)>) -> Vec<(String, Value)> {
 
 /// The event ids an event's `auth_events` names.
 fn cited_auth_events(event: &Value) -> Vec<String> {
-    event["auth_events"]
-        .as_array()
-        .map(|ids| {
-            ids.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+    super::edge_ids(&event["auth_events"])
 }

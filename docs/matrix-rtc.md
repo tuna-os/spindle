@@ -122,6 +122,15 @@ federation listener has to be reachable from wherever the service runs.
 Nothing else on this server is involved: the service mints for whatever
 room the client names, with no membership check on this side.
 
+Recent `lk-jwt-service` releases (0.6 and later; Element Server Suite
+ships 0.6.0) also take over a client's delayed leave event when the
+client asks (`/delegate_delayed_leave`, or a `delay_id` on `/get_token`):
+while the participant stays connected to the SFU the service restarts the
+delay, and when they drop it sends it. It does that with
+`POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{restart|send}`
+and no access token, the delay ID being the capability, so that route has
+to reach this server from wherever the service runs, like `openid/userinfo`.
+
 The two options compose. With both configured, the built-in service is
 listed first and the operator's `foci` follow in the order written;
 clients read the list as a priority order.

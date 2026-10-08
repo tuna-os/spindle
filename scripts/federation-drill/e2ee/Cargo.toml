@@ -1,0 +1,27 @@
+[package]
+name = "drill-e2ee"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Encrypted-room check for the Synapse -> Spindle federation drill"
+
+# Standalone: not a member of the Spindle workspace.
+[workspace]
+
+[dependencies]
+# Same matrix-sdk release and features as scripts/migration-e2ee-rig, so
+# the two share a build cache. No automatic room-key forwarding: a device
+# that reads history after the cut-over must get its keys from the
+# server-side backup.
+matrix-sdk = { version = "=0.18.0", default-features = false, features = ["e2e-encryption", "sqlite", "bundled-sqlite"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+debug = false
+strip = true

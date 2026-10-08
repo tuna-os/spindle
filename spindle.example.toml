@@ -34,6 +34,15 @@ bind = "127.0.0.1:8008"
 
 [storage]
 path = "./data"
+# Rooms loaded in the background after startup, at once, so the first
+# requests after a restart do not each pay for a cold load. Readiness does
+# not wait for it. 0 turns the warm-up off.
+# warm_concurrency = 2
+
+# Upload allowance in bytes, enforced on POST and reserved-media PUT and
+# advertised by both media config endpoints. Match the old server on migration.
+# [media]
+# max_upload_bytes = 52428800 # 50 MiB default; 104857600 for 100 MiB
 
 # Media blobs in an S3-compatible bucket instead of on local disk. The
 # metadata store stays local either way: it is the index, and an index a
@@ -108,6 +117,14 @@ enabled = true
 allow_internal = []
 
 [federation]
+# Federate at all. false makes the server an island: every outbound
+# federation request is refused before a name is resolved or a socket is
+# opened, the outbox is not drained, `bind` must be unset, and
+# /_matrix/federation/* and /_matrix/key/* answer 404 M_UNRECOGNIZED. For a
+# dark copy of a live server (a migration rehearsal with the production
+# server name and signing key) that must never speak for it to peers.
+enabled = true
+
 # Fetch peer keys and send requests over plain http instead of https. For
 # test rigs whose "servers" are loopback stubs. A production deployment with
 # this on has disabled federation authentication in all but name: anyone on
@@ -137,6 +154,20 @@ retry_base_ms = 1000
 # that is expected to be dark -- and nothing queued is dropped either way.
 # peers = { "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2" = { url = "http://10.20.0.5:8008", max_backoff_ms = 3600000 } }
 
+# Notaries asked for a peer's signing keys when the peer cannot answer for
+# them itself: it is down, unreachable from here, or no longer publishes the
+# key an old event was signed with (POST /_matrix/key/v2/query). Unset means
+# ["matrix.org"], Synapse's default (none with insecure_http); [] turns the
+# fallback off. A table entry pins the keys the notary must sign with:
+#   trusted_key_servers = [{ server_name = "matrix.org", verify_keys = { "ed25519:auto" = "Noi6WqcDj0QmPxCNQqgezwTlBKrfqehY1u2FyWP9uYw" } }]
+# Trust: every document a notary hands on must also carry the peer's own
+# signature by a key inside it, so a notary cannot mint keys alone -- but a
+# notary colluding with whoever holds a peer's old or stolen key can make
+# events signed with it verify here. Without verify_keys, the notary's own
+# keys are fetched from it directly over TLS. Documents from a notary are
+# never served on by this server's own /_matrix/key/v2/query.
+# trusted_key_servers = ["matrix.org"]
+
 # Where the federation TLS listener binds. Unset means no federation
 # listener at all — which is right for a deployment behind a reverse proxy
 # that terminates TLS and serves federation on the main bind.
@@ -147,6 +178,34 @@ retry_base_ms = 1000
 # prove its name is unreachable in practice.
 # tls_cert = "/etc/spindle/fullchain.pem"
 # tls_key = "/etc/spindle/privkey.pem"
+
+# Fill recorded federation gaps in the background. After an outage longer
+# than dependency recovery can span, a peer's new event is accepted across
+# a gap in the room's history; this fetches that history with /backfill
+# (one /state_ids per chunk), verifies every event, and stores it so
+# /messages and /context serve it. Backfilled events never notify, never
+# change the room's current state and are never sent on.
+gap_backfill = true
+# Events per /backfill request, and so per chunk.
+gap_backfill_chunk = 100
+# Pause between chunks, in milliseconds: a 10k-event gap fills over
+# minutes rather than competing with request handling.
+gap_backfill_interval_ms = 1000
+# How often an idle loop looks for gaps, in milliseconds. A client paging
+# into a gap wakes it at once.
+gap_backfill_idle_ms = 30000
+# Base delay before retrying a gap whose last chunk failed, in
+# milliseconds; doubles per consecutive failure, up to an hour.
+gap_backfill_retry_ms = 30000
+# Events one gap may backfill before it is left truncated.
+gap_backfill_max_events = 100000
+
+# Amplification guard: one gap acceptance can fetch up to 20k state and
+# auth events, so at most this many per room, and per origin across rooms,
+# within each window.
+gap_acceptances_per_room = 10
+gap_acceptances_per_origin = 30
+gap_acceptance_window_secs = 600
 
 [appservices]
 # Paths to appservice registration files, in the spec's YAML shape. Every
@@ -161,8 +220,20 @@ registrations = []
 # mints are ordinary Spindle sessions. The issuer is
 # `server.public_base_url` (falling back to `https://<server.name>`);
 # mutually exclusive with `[auth.delegated]`. See docs/delegated-auth.md
-# for both options.
+# for both options. With it, the provider also serves account management
+# pages at {issuer}/account/ (profile, password, devices, deactivation;
+# email and password reset with [email] below), advertised to clients as
+# MSC4191's account_management_uri.
 # builtin_oidc = false
+#
+# The built-in provider's issuer, when it should not be the client base URL
+# (#609) -- e.g. the issuer a retired MAS used, so clients that stored it
+# keep working. An origin only (scheme, host, optional port, optional
+# trailing slash): discovery, `auth_metadata` and every endpoint URL are
+# built on it, and the endpoints are served at the root of whichever host
+# reaches Spindle, so point that host's proxy at Spindle too. Requires
+# builtin_oidc = true.
+# oidc_issuer = "https://auth.example.org/"
 
 # MSC3861 delegation: an external OIDC provider (typically the Matrix
 # Authentication Service) owns identity, and this server validates its
@@ -182,7 +253,40 @@ registrations = []
 # The token the provider presents when calling *us* — MAS's `matrix.secret`,
 # guarding the `/_synapse/mas/*` provisioning surface. Without it that
 # surface answers 404 and the provider cannot manage accounts here.
+# With client_id/client_secret left out, introspection presents this
+# secret as a bearer token instead, the way Synapse's
+# `matrix_authentication_service` section does — so a MAS set up for that
+# (no client of its own for the homeserver) needs no change.
 # homeserver_secret = "..."
+
+# Outgoing mail for the built-in provider (#608; needs builtin_oidc = true).
+# Entirely optional: without it, users recover a forgotten password with the
+# one-time recovery codes the account pages generate, or with a reset link
+# an administrator issues (`spindle issue-reset-link`, or the admin API's
+# users/{user_id}/reset_link). See docs/delegated-auth.md.
+# With it, users can confirm an email address on the account pages
+# ({issuer}/account/) and reset a forgotten password from a link mailed to
+# it; without it, neither page is offered and nothing is ever mailed. Links
+# are single-use, stored only as digests, and lapse after an hour (password
+# reset) or a day (address confirmation). Nothing connects to the relay
+# until the first message, so a relay that is down at startup does not stop
+# the server; delivery failures are logged and counted in
+# spindle_emails_sent_total{result="failed"}.
+# [email]
+# The From: of every message.
+# from = "Example <noreply@example.org>"
+# smtp_host = "smtp.example.org"
+# "starttls" (default; STARTTLS required), "tls" (TLS from the first byte,
+# a.k.a. SMTPS), or "none" (a relay on this host or a private network only;
+# refused together with credentials, which it would send in clear).
+# tls = "starttls"
+# Defaults by tls: 587, 465 or 25.
+# smtp_port = 587
+# Relay credentials, if it wants them. The password inline or, better, in a
+# mounted file (trailing newline ignored); not both.
+# username = "noreply@example.org"
+# password = "..."
+# password_file = "/run/secrets/smtp-password"
 
 [turn]
 # TURN relays, for calls that cannot connect peer-to-peer.
