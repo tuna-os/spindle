@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**230 routes implemented; 0 known gaps in scope.**
+**244 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -259,8 +259,9 @@ neither implemented nor counted.
 - `GET/PUT /_matrix/client/v3/profile/{user_id}/displayname`
 - `GET/PUT/DELETE /_matrix/client/v3/profile/{user_id}/{key}`
 
-### Accounts, devices & auth — 12 implemented, 0 planned
+### Accounts, devices & auth — 13 implemented, 0 planned
 
+- `GET /_matrix/client/v3/account/3pid`
 - `POST /_matrix/client/v3/account/deactivate`
 - `POST /_matrix/client/v3/account/password`
 - `GET /_matrix/client/v3/account/whoami`
@@ -274,7 +275,7 @@ neither implemented nor counted.
 - `POST /_matrix/client/v3/register`
 - `GET /_matrix/client/v3/register/available`
 
-### Server, discovery & operations — 29 implemented, 0 planned
+### Server, discovery & operations — 42 implemented, 0 planned
 
 - `GET /.well-known/matrix/client`
 - `GET /.well-known/matrix/server`
@@ -303,6 +304,19 @@ neither implemented nor counted.
 - `GET /_matrix/key/v2/server`
 - `POST /_matrix/media/v1/create`
 - `GET/PUT/DELETE /_synapse/client/rendezvous/{session_id}`
+- `GET /account`
+- `GET /account/`
+- `POST /account/deactivate`
+- `POST /account/emails/add`
+- `POST /account/emails/remove`
+- `GET/POST /account/emails/verify`
+- `GET/POST /account/login`
+- `POST /account/logout`
+- `POST /account/password`
+- `GET/POST /account/password/forgot`
+- `GET/POST /account/password/reset`
+- `POST /account/profile`
+- `POST /account/sessions/end`
 - `GET /health`
 - `GET /ready`
 

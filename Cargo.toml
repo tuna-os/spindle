@@ -44,6 +44,11 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # one-shot migration feature as the SQLite fixture reader.
 postgres = "0.19"
 hickory-resolver = "0.26.1"
+# Outgoing mail for the built-in provider's address confirmation and
+# password resets (#608). The SMTP transport and message builder only, over
+# the rustls + ring stack and native roots the rest of the server uses: no
+# native-tls, no connection pool, no sendmail or file transports.
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls", "ring", "rustls-native-certs"] }
 imbl = "7"
 # `state-res` is a runtime dependency, not just an oracle: SPEC 9.3 and
 # docs/divergence.md both require the local send path to use the same auth

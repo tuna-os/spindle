@@ -22,6 +22,7 @@ pub mod delegated;
 pub mod devices;
 pub mod directory;
 pub mod e2ee_federation;
+pub mod email;
 pub mod errors;
 pub mod federation;
 pub mod filters;
@@ -106,6 +107,10 @@ pub struct AppState {
     /// creation. Process-local because a restart invalidates them.
     pub registration_nonces: Arc<shared_secret_registration::RegistrationNonces>,
     pub rendezvous: Arc<rendezvous::Rendezvous>,
+    /// Where the built-in provider's mail goes (#608): the SMTP relay
+    /// `[email]` names, or what a test supplied. Absent, nothing is mailed
+    /// and the pages that would need it are not offered.
+    pub mailer: Option<Arc<dyn email::Mailer>>,
 }
 
 /// Why the application cannot be built. Both are startup-fatal on purpose:
@@ -118,6 +123,7 @@ pub enum AppError {
     FederationConfig(String),
     PushConfig(String),
     Appservice(String),
+    Email(String),
 }
 
 impl std::fmt::Display for AppError {
@@ -128,6 +134,7 @@ impl std::fmt::Display for AppError {
             Self::FederationConfig(why) => write!(formatter, "federation config: {why}"),
             Self::PushConfig(why) => write!(formatter, "push config: {why}"),
             Self::Appservice(why) => write!(formatter, "appservice registration: {why}"),
+            Self::Email(why) => write!(formatter, "email: {why}"),
         }
     }
 }
@@ -177,6 +184,37 @@ pub fn app_with_metrics(
     config: Config,
     store: Arc<FjallStore>,
     metrics: Arc<metrics::Metrics>,
+) -> Result<Router, AppError> {
+    let mailer = match &config.email {
+        Some(email) => Some(Arc::new(
+            email::SmtpMailer::new(email, &config.server.name).map_err(AppError::Email)?,
+        ) as Arc<dyn email::Mailer>),
+        None => None,
+    };
+    build(config, store, metrics, mailer)
+}
+
+/// [`app_with_metrics`], with the mail transport supplied rather than
+/// built from `[email]` — a test's [`email::MemoryMailer`], typically.
+/// The pages that send mail are offered whenever a mailer is present.
+///
+/// # Errors
+///
+/// As [`app`].
+pub fn app_with_mailer(
+    config: Config,
+    store: Arc<FjallStore>,
+    metrics: Arc<metrics::Metrics>,
+    mailer: Arc<dyn email::Mailer>,
+) -> Result<Router, AppError> {
+    build(config, store, metrics, Some(mailer))
+}
+
+fn build(
+    config: Config,
+    store: Arc<FjallStore>,
+    metrics: Arc<metrics::Metrics>,
+    mailer: Option<Arc<dyn email::Mailer>>,
 ) -> Result<Router, AppError> {
     let key =
         Arc::new(signing::ServerKey::load_or_create(store.as_ref()).map_err(AppError::Signing)?);
@@ -271,6 +309,7 @@ pub fn app_with_metrics(
         registration_nonces: Arc::new(shared_secret_registration::RegistrationNonces::new()),
         rendezvous: Arc::new(rendezvous::Rendezvous::new()),
         metrics,
+        mailer,
     };
     spawn_delivery_loops(&state);
     Ok(routes::router(state))

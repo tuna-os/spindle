@@ -506,3 +506,85 @@ fn a_builtin_issuer_must_be_an_origin_of_an_enabled_provider() {
         );
     }
 }
+
+const BUILTIN: &str = "[server]\nname = \"example.org\"\n[auth]\nbuiltin_oidc = true\n";
+
+#[test]
+fn email_defaults_its_port_by_tls_mode() {
+    for (tls, port) in [("starttls", 587), ("tls", 465), ("none", 25)] {
+        let config = parse(&format!(
+            "{BUILTIN}[email]\nfrom = \"Example <noreply@example.org>\"\n\
+             smtp_host = \"smtp.example.org\"\ntls = \"{tls}\"\n"
+        ))
+        .unwrap();
+        assert_eq!(config.email.unwrap().port(), port, "{tls}");
+    }
+}
+
+#[test]
+fn email_settings_that_cannot_work_are_refused() {
+    for (email, field) in [
+        (
+            "from = \"not-an-address\"\nsmtp_host = \"smtp.example.org\"\n",
+            "email.from",
+        ),
+        (
+            "from = \"a@example.org\"\nsmtp_host = \"smtp.example.org:587\"\n",
+            "email.smtp_host",
+        ),
+        (
+            "from = \"a@example.org\"\nsmtp_host = \"smtp.example.org\"\nusername = \"u\"\n",
+            "email.username",
+        ),
+        (
+            "from = \"a@example.org\"\nsmtp_host = \"smtp.example.org\"\nusername = \"u\"\n\
+             password = \"p\"\npassword_file = \"/run/secrets/smtp\"\n",
+            "email.password",
+        ),
+        (
+            "from = \"a@example.org\"\nsmtp_host = \"localhost\"\ntls = \"none\"\n\
+             username = \"u\"\npassword = \"p\"\n",
+            "email.tls",
+        ),
+    ] {
+        let error = parse(&format!("{BUILTIN}[email]\n{email}")).expect_err(field);
+        assert!(format!("{error}").contains(field), "{field}: {error}");
+    }
+    // Mail is the built-in provider's; without it there is nothing to send.
+    let error = parse(
+        "[server]\nname = \"example.org\"\n[email]\nfrom = \"a@example.org\"\nsmtp_host = \"h\"\n",
+    )
+    .expect_err("email without the provider");
+    assert!(format!("{error}").contains("builtin_oidc"), "{error}");
+}
+
+#[test]
+fn the_smtp_password_never_prints() {
+    let config = parse(&format!(
+        "{BUILTIN}[email]\nfrom = \"a@example.org\"\nsmtp_host = \"smtp.example.org\"\n\
+         username = \"u\"\npassword = \"hunter2-smtp\"\n"
+    ))
+    .unwrap();
+    assert!(!format!("{config:?}").contains("hunter2-smtp"));
+    assert_eq!(
+        config.email.unwrap().resolve_password().unwrap(),
+        "hunter2-smtp"
+    );
+}
+
+#[test]
+fn the_smtp_password_can_come_from_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("smtp");
+    std::fs::write(&path, "from-a-file\n").unwrap();
+    let config = parse(&format!(
+        "{BUILTIN}[email]\nfrom = \"a@example.org\"\nsmtp_host = \"smtp.example.org\"\n\
+         username = \"u\"\npassword_file = \"{}\"\n",
+        path.display()
+    ))
+    .unwrap();
+    assert_eq!(
+        config.email.unwrap().resolve_password().unwrap(),
+        "from-a-file"
+    );
+}

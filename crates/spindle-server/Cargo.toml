@@ -30,6 +30,7 @@ sha2.workspace = true
 sha1.workspace = true
 hmac.workspace = true
 hickory-resolver.workspace = true
+lettre.workspace = true
 blake3.workspace = true
 image.workspace = true
 rand.workspace = true

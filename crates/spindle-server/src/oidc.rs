@@ -153,7 +153,6 @@ pub fn routes() -> Router<AppState> {
         .route("/oauth2/authorize", get(authorize_page).post(authorize))
         .route("/oauth2/token", post(token))
         .route("/oauth2/revoke", post(revoke))
-        .merge(crate::account::routes())
 }
 
 /// The provider, or the 404 an undelegated non-provider answers. The
@@ -520,7 +519,11 @@ fn login_page(
     let notice = error.map_or(String::new(), |message| {
         format!("<p class=\"error\">{}</p>", escape(message))
     });
-    let forgot = "";
+    let forgot = if crate::email::configured(state) {
+        "<p><a href=\"/account/password/forgot\">Forgot your password?</a></p>"
+    } else {
+        ""
+    };
     let body = format!(
         "<form method=\"post\" action=\"/oauth2/authorize\">\
          <h1>Sign in to {server}</h1>\

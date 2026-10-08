@@ -206,6 +206,12 @@ pub(crate) fn digest(secret: &str) -> [u8; 32] {
     *blake3::hash(secret.as_bytes()).as_bytes()
 }
 
+/// The digest of a non-secret value, hex-encoded: what a rate-limit key
+/// holds instead of an email address.
+pub(crate) fn hex_digest(value: &str) -> String {
+    blake3::hash(value.as_bytes()).to_hex().to_string()
+}
+
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

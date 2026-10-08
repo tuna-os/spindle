@@ -104,6 +104,9 @@ fn signed_in_page(
         "<nav><a href=\"/account/?action=org.matrix.profile\">Profile</a>\
          <a href=\"/account/?action=password\">Password</a>",
     );
+    if crate::email::configured(state) {
+        nav.push_str("<a href=\"/account/?action=emails\">Email</a>");
+    }
     let _ = write!(
         nav,
         "<a href=\"/account/?action=org.matrix.sessions_list\">Devices</a>\
@@ -151,6 +154,23 @@ pub(crate) fn message_page(
     )
 }
 
+/// A signed-in page re-rendered with a problem, for the forms that live
+/// on another module's page (`email.rs`).
+pub(crate) fn refusal_page(
+    state: &AppState,
+    session: &BrowserSession,
+    status: StatusCode,
+    title: &str,
+    problem: &str,
+    body: &str,
+) -> Response {
+    web::html(
+        status,
+        FormTargets::SelfOnly,
+        signed_in_page(state, session, title, None, Some(problem), body),
+    )
+}
+
 fn expired_form(state: &AppState) -> Response {
     message_page(
         state,
@@ -162,7 +182,7 @@ fn expired_form(state: &AppState) -> Response {
 
 /// The signed-in session for a POST, or the response that refuses it:
 /// to the sign-in page without a session, "expired" without the CSRF.
-fn session_for_post(
+pub(crate) fn session_for_post(
     state: &AppState,
     headers: &HeaderMap,
     csrf: Option<&str>,
@@ -223,6 +243,9 @@ async fn home(
             ("Reset your identity", cross_signing_view())
         }
         (Some("password"), _) => ("Password", password_view(&session)),
+        (Some("emails"), _) if crate::email::configured(&state) => {
+            ("Email", crate::email::emails_view(&state, &session)?)
+        }
         _ => ("Profile", profile_view(&state, &session)?),
     };
     Ok(web::html(
@@ -390,7 +413,11 @@ fn render_login(
     let error = error.map_or(String::new(), |text| {
         format!("<p class=\"error\">{}</p>", escape(text))
     });
-    let forgot = "";
+    let forgot = if crate::email::configured(state) {
+        "<p><a href=\"/account/password/forgot\">Forgot your password?</a></p>"
+    } else {
+        ""
+    };
     let body = format!(
         "<h1>Sign in to {server}</h1>{error}\
          <form method=\"post\" action=\"/account/login\">{csrf}{next}\
@@ -576,7 +603,7 @@ async fn save_profile(
 /// Check the current password for a change the session alone must not
 /// be enough to make, against the shared attempt budget. `Ok(None)` when
 /// it is right; the message to show when it is not.
-fn recheck_password(
+pub(crate) fn recheck_password(
     state: &AppState,
     localpart: &str,
     source: &str,
@@ -786,6 +813,7 @@ async fn deactivate(
     accounts
         .logout_everywhere(&localpart)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    crate::email::forget_account(&state, &localpart)?;
     web::end_browser_sessions_of(&state, &localpart, None)?;
     state.rooms.wake_sync_waiters();
     state

@@ -47,6 +47,148 @@ pub struct Config {
     /// says so.
     #[serde(default)]
     pub server_notices: Option<ServerNoticesConfig>,
+    /// Outgoing mail for the built-in provider (#608). Absent, nothing
+    /// is ever mailed: no addresses on accounts, no forgotten-password
+    /// link.
+    #[serde(default)]
+    pub email: Option<EmailConfig>,
+}
+
+/// How to reach the SMTP relay.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum EmailTls {
+    /// Plain connection upgraded with `STARTTLS`, which is required; port
+    /// 587 by default.
+    #[default]
+    Starttls,
+    /// TLS from the first byte ("SMTPS"); port 465 by default.
+    Tls,
+    /// No TLS at all; port 25 by default. Only for a relay on the same
+    /// host or a private network, and refused with credentials.
+    None,
+}
+
+/// `[email]`: the SMTP relay the built-in provider's mail goes through.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmailConfig {
+    /// The `From:` of every message, e.g. `Example <noreply@example.org>`.
+    pub from: String,
+    pub smtp_host: String,
+    /// Defaults by `tls`: 587, 465 or 25.
+    #[serde(default)]
+    pub smtp_port: Option<u16>,
+    #[serde(default)]
+    pub tls: EmailTls,
+    #[serde(default)]
+    pub username: Option<String>,
+    /// The relay password, inline. Prefer `password_file`.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// A file holding the relay password (trailing newline ignored), so the
+    /// secret can be mounted rather than written into the config.
+    #[serde(default)]
+    pub password_file: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for EmailConfig {
+    /// Everything but the password, which is never printed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EmailConfig")
+            .field("from", &self.from)
+            .field("smtp_host", &self.smtp_host)
+            .field("smtp_port", &self.smtp_port)
+            .field("tls", &self.tls)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("password_file", &self.password_file)
+            .finish()
+    }
+}
+
+impl EmailConfig {
+    /// The port to connect to: as configured, or the one `tls` implies.
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        self.smtp_port.unwrap_or(match self.tls {
+            EmailTls::Starttls => 587,
+            EmailTls::Tls => 465,
+            EmailTls::None => 25,
+        })
+    }
+
+    /// The relay password, from wherever it was configured.
+    ///
+    /// # Errors
+    ///
+    /// When `password_file` cannot be read — naming the file, never the
+    /// contents.
+    pub fn resolve_password(&self) -> Result<String, String> {
+        if let Some(path) = &self.password_file {
+            return std::fs::read_to_string(path)
+                .map(|text| text.trim_end_matches(['\r', '\n']).to_owned())
+                .map_err(|error| format!("email.password_file {}: {error}", path.display()));
+        }
+        Ok(self.password.clone().unwrap_or_default())
+    }
+
+    fn validate(&self, builtin_oidc: bool) -> Result<(), ConfigError> {
+        let invalid = |field: &'static str, message: &str| {
+            Err(ConfigError::Invalid {
+                field,
+                message: message.to_owned(),
+            })
+        };
+        if !builtin_oidc {
+            return invalid(
+                "email",
+                "is used by the built-in provider's pages and needs auth.builtin_oidc = true",
+            );
+        }
+        let (Some((name, domain)), false) = (
+            self.from
+                .rsplit_once('<')
+                .map_or(self.from.as_str(), |(_, rest)| rest.trim_end_matches('>'))
+                .split_once('@'),
+            self.from.contains(['\r', '\n']),
+        ) else {
+            return invalid(
+                "email.from",
+                "must be an address, e.g. \"Example <noreply@example.org>\"",
+            );
+        };
+        if name.trim().is_empty() || domain.trim().is_empty() {
+            return invalid(
+                "email.from",
+                "must be an address, e.g. \"Example <noreply@example.org>\"",
+            );
+        }
+        if self.smtp_host.trim().is_empty() || self.smtp_host.contains(['/', ' ', ':']) {
+            return invalid(
+                "email.smtp_host",
+                "must be a host name (the port is smtp_port)",
+            );
+        }
+        if self.smtp_port == Some(0) {
+            return invalid("email.smtp_port", "must not be zero");
+        }
+        if self.password.is_some() && self.password_file.is_some() {
+            return invalid("email.password", "set password or password_file, not both");
+        }
+        let has_password = self.password.is_some() || self.password_file.is_some();
+        if self.username.is_some() != has_password {
+            return invalid("email.username", "username and a password go together");
+        }
+        if self.tls == EmailTls::None && self.username.is_some() {
+            return invalid(
+                "email.tls",
+                "\"none\" would send the relay password in clear; use starttls or tls",
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Who may register.
@@ -979,6 +1121,9 @@ impl Config {
             });
         }
         self.validate_builtin_oidc()?;
+        if let Some(email) = &self.email {
+            email.validate(self.auth.builtin_oidc)?;
+        }
         // Two credential schemes would mean the server picks one silently,
         // and an operator who configured both has already told us they are
         // unsure which their relay speaks. Refusing is the only answer that
