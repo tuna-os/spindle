@@ -82,6 +82,19 @@ async fn main() -> ExitCode {
         return promote_admin(&config_path, &localpart);
     }
 
+    // `spindle set-password-hash <config> [<localpart>]` — store Argon2
+    // PHC hashes computed elsewhere (#611), read from stdin so they never
+    // sit in a process listing or shell history. With a localpart, stdin
+    // is that account's one hash; without, each line is
+    // `<localpart> <hash>` — the bulk path a MAS migration takes.
+    if std::env::args().nth(1).as_deref() == Some("set-password-hash") {
+        let Some(config_path) = std::env::args().nth(2) else {
+            eprintln!("usage: spindle set-password-hash <config> [<localpart>] < hashes");
+            return ExitCode::FAILURE;
+        };
+        return set_password_hash(&config_path, std::env::args().nth(3).as_deref());
+    }
+
     // `spindle backup <config> <file>` and `spindle restore <config> <file>`
     // — the offline lifecycle pair (#20). Offline because the store is
     // opened directly: fjall holds a lock, so these run with the server
@@ -981,6 +994,81 @@ fn promote_admin(config_path: &str, localpart: &str) -> ExitCode {
             eprintln!("spindle: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Store pre-computed password hashes, offline (#611).
+///
+/// Every line is validated and applied on its own; a refused line is
+/// reported by line number and localpart — never with its hash — and
+/// makes the command exit non-zero once the rest are done, so a bulk
+/// import tells the operator exactly which accounts still need attention.
+fn set_password_hash(config_path: &str, localpart: Option<&str>) -> ExitCode {
+    use std::io::Read as _;
+    let config = match Config::load(config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("spindle: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut input = String::new();
+    if let Err(error) = std::io::stdin().read_to_string(&mut input) {
+        eprintln!("spindle: cannot read stdin: {error}");
+        return ExitCode::FAILURE;
+    }
+    let entries: Vec<(usize, String, String)> = match localpart {
+        Some(localpart) => vec![(1, localpart.to_owned(), input.trim().to_owned())],
+        None => input
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+            .map(|(index, line)| {
+                let mut fields = line.split_whitespace();
+                (
+                    index + 1,
+                    fields.next().unwrap_or_default().to_owned(),
+                    fields.next().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect(),
+    };
+    let store = match FjallStore::open(&config.storage.path) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!(
+                "spindle: cannot open storage at {}: {error}",
+                config.storage.path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let accounts = spindle_server::accounts::Accounts::new(&store, &config.server.name);
+    let (mut stored, mut failed) = (0_usize, 0_usize);
+    for (line, localpart, hash) in entries {
+        // `@alice:server` is accepted as well as `alice`.
+        let localpart = localpart
+            .strip_prefix('@')
+            .and_then(|rest| rest.split_once(':'))
+            .map_or(localpart.as_str(), |(name, _)| name)
+            .to_lowercase();
+        match accounts.set_password_hash(&localpart, &hash) {
+            Ok(true) => stored += 1,
+            Ok(false) => {
+                failed += 1;
+                eprintln!("spindle: line {line}: no account named {localpart}");
+            }
+            Err(error) => {
+                failed += 1;
+                eprintln!("spindle: line {line}: {localpart}: {error}");
+            }
+        }
+    }
+    println!("stored {stored} password hash(es), {failed} refused");
+    if failed == 0 && stored > 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 

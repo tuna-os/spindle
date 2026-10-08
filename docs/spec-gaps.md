@@ -72,7 +72,7 @@ and the diff is the work the release brought.
 
 ## Served beyond the spec at this pin
 
-91 routes the pinned spec does not define: MSC surfaces under
+93 routes the pinned spec does not define: MSC surfaces under
 `unstable/`, the admin and MAS-compatibility APIs, and stable spellings
 newer than the pin. Each MSC route must be accounted for in
 `contrib/msc/ledger.toml`; `scripts/msc-ledger.py --check` enforces that.
@@ -114,6 +114,7 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_spindle/admin/v1/users/{}/devices`
 - `/_spindle/admin/v1/users/{}/devices/{}`
 - `/_spindle/admin/v1/users/{}/joined_rooms`
+- `/_spindle/admin/v1/users/{}/password_hash`
 - `/_spindle/admin/v1/users/{}/reset_password`
 - `/_spindle/admin/v1/whois/{}`
 - `/_spindle/rtc/livekit/sfu/get`
@@ -143,6 +144,7 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_synapse/admin/v1/users/{}/devices`
 - `/_synapse/admin/v1/users/{}/devices/{}`
 - `/_synapse/admin/v1/users/{}/joined_rooms`
+- `/_synapse/admin/v1/users/{}/password_hash`
 - `/_synapse/admin/v1/users/{}/reset_password`
 - `/_synapse/admin/v1/whois/{}`
 - `/_synapse/admin/v2/users`

@@ -53,6 +53,10 @@ pub fn routes() -> Router<AppState> {
                 &format!("{prefix}/users/{{user_id}}/reset_password"),
                 post(reset_password),
             )
+            .route(
+                &format!("{prefix}/users/{{user_id}}/password_hash"),
+                post(set_password_hash),
+            )
             .route(&format!("{prefix}/users/{{user_id}}/devices"), get(devices))
             .route(
                 &format!("{prefix}/users/{{user_id}}/devices/{{device_id}}"),
@@ -703,6 +707,63 @@ async fn reset_password(
         "reset_password",
         &user_id,
         &json!({ "logout_devices": logout }),
+    )?;
+    Ok(Json(json!({})))
+}
+
+#[derive(Deserialize)]
+struct SetPasswordHash {
+    password_hash: String,
+    /// Off by default, unlike `reset_password`: importing the hash a user
+    /// already signs in with elsewhere changes nothing they know, and
+    /// signing every migrated user out would be the migration's only
+    /// visible effect.
+    #[serde(default)]
+    logout_devices: bool,
+}
+
+/// `POST /users/{userId}/password_hash` (#611)
+///
+/// Store an Argon2 PHC hash computed elsewhere — a Matrix Authentication
+/// Service's `user_passwords.hashed_password`, typically — so its user
+/// signs in here with the password they already have. The hash is
+/// validated (`accounts::validate_password_hash`) and refused with
+/// `M_INVALID_PARAM` when it cannot verify. Works while authentication is
+/// still delegated, which is the point: hashes land before the cutover.
+/// Neither the hash nor any part of it reaches the audit log.
+async fn set_password_hash(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path(user_id): Path<String>,
+    Json(request): Json<SetPasswordHash>,
+) -> Result<Json<Value>, MatrixError> {
+    let (localpart, _) = target_account(&state, &user_id)?;
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    accounts
+        .set_password_hash(&localpart, &request.password_hash)
+        .map_err(|error| match error {
+            crate::accounts::AccountError::InvalidHash(why) => {
+                MatrixError::new(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", why)
+            }
+            other => MatrixError::internal(&other.to_string()),
+        })?;
+    if request.logout_devices {
+        accounts
+            .logout_everywhere(&localpart)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    }
+    let algorithm = request
+        .password_hash
+        .split('$')
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    audit(
+        &state,
+        &actor.identity().user_id,
+        "set_password_hash",
+        &user_id,
+        &json!({ "algorithm": algorithm, "logout_devices": request.logout_devices }),
     )?;
     Ok(Json(json!({})))
 }
