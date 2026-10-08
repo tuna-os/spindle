@@ -555,7 +555,7 @@ mod tests {
     #[test]
     fn constant_time_equality_is_equality() {
         assert!(ct_eq(b"abc", b"abc"));
-        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"abx"));
         assert!(!ct_eq(b"abc", b"abcd"));
         assert!(ct_eq(b"", b""));
     }
