@@ -5,13 +5,13 @@
 //!
 //! See spindle#493 for the refactoring roadmap.
 
-use axum::Router;
 use crate::AppState;
+use axum::Router;
 
 pub mod routes_legacy;
 
 // Re-export items that were previously at crate::routes level
-pub use routes_legacy::{MAX_TXN_ID_LEN, room_error, record_invite};
+pub(crate) use routes_legacy::{MAX_TXN_ID_LEN, record_invite, room_error};
 
 // Phase 1: Establish module structure (this file)
 // Phase 2: Extract submodules one at a time
@@ -125,7 +125,10 @@ mod tests {
 
     #[test]
     fn test_endpoints_list_not_empty() {
-        assert!(!ENDPOINTS.is_empty(), "ENDPOINTS list must contain at least one endpoint");
+        assert!(
+            !ENDPOINTS.is_empty(),
+            "ENDPOINTS list must contain at least one endpoint"
+        );
     }
 
     #[test]
