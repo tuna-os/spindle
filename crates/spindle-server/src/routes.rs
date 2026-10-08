@@ -9229,6 +9229,14 @@ async fn room_messages(
         None => None,
     };
     let limit = query.limit.unwrap_or(10).clamp(1, 100);
+    // Paging back into a room whose history has a gap still being filled:
+    // put that room first in the backfill loop's queue (#619). The page
+    // itself is served from what is held now; it does not wait.
+    if matches!(direction, crate::rooms::Direction::Backward)
+        && state.rooms.has_open_gap(&room_id).unwrap_or(false)
+    {
+        state.backfill.poke(&room_id);
+    }
 
     let (events, next) = reader
         .page(

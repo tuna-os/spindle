@@ -218,6 +218,12 @@ the current earliest known event, so no insertion *between* two stored events is
 ever required and a plain integer key suffices — no fractional indexing, no
 rebalancing.
 
+The one exception is history missing from the *middle* of the log: a server
+that was offline longer than dependency recovery can span accepts the room's
+next event across a gap, and the history between its old head and that
+event has no `li` to take. It is stored as a *gap segment* outside the log
+(§6.6), not by renumbering it.
+
 `li` is the room's topological ordering by construction. `/messages` pagination
 is a reverse range scan. `prev_batch`/`next_batch` tokens are `t{li}`.
 
@@ -400,6 +406,59 @@ rather than a state res per event. Fetching state for backfilled ranges is
 asynchronous and does not block `/messages`: events are served with their
 `li` order immediately, and lazy-loaded member state resolves as the chunk's
 state materializes.
+
+### 6.6 Gap segments: history missing from the middle
+
+An event accepted across a federation gap (`append_across_gap`) is placed at
+`li = G`, directly above this server's old head; the room's history between
+the two is missing, and a durable gap marker names the predecessors `G` cites
+that this server lacks. A background task fills it, one chunk at a time, by
+the §6.5 procedure walked from the marker instead of from the earliest event:
+
+1. `/backfill` from the walk's frontier (initially the marker's missing
+   predecessors), keeping only events the walk asked for — the frontier and,
+   transitively, their `prev_events`. Event IDs are reference hashes, so
+   everything kept is pinned by `G`'s signature; a branch ends where it meets
+   an event this server holds.
+2. Verify each event (hash, signatures, ID); fetch, verify and authorize any
+   auth event this server lacks.
+3. `/state_ids` **once per chunk**, at its oldest event; fold that state
+   forward across the chunk, judging each event against its auth events and
+   the folded state before it. An event that fails is walked through but
+   kept out of the timeline.
+4. Store the chunk and the walk's new frontier (in the marker) in one atomic
+   write. A forged or refused chunk stores nothing; a restart resumes from
+   the last stored chunk. The marker is removed when the frontier is empty.
+
+There is no `li` between `G - 1` and `G`, so the chunk is not given one. Each
+gap's events are a **segment** keyed by its anchor `G`: positions in a band
+reserved far below every `li` (`-2^62 + G·2^20 + seq`), `seq` counting down
+from just below `G` as the walk goes back, so one segment's positions are
+contiguous and in order. Pagination reads the room in *stitched* order — the
+log's, with each segment spliced in directly below its anchor:
+
+    … G+1, G, [segment of G, newest first], G-1, G-2 …
+
+`/messages` tokens remain `t{position}`; a token inside a segment names a band
+position, and the walk resumes there in either direction. `/context` stitches
+the same way and returns the state stored with the segment event. A room
+with no segment pages by the plain range scan of §10.4.
+
+Segment events are outside the log by design: they take no stream position
+(so `/sync` never fans them out and push never sees them), never become
+forward extremities, and never change the room's current state. They are
+served to clients and over `/event`, but not over `/backfill` or
+`/get_missing_events`, are not searchable, and have no relation index. A
+segment is visible to a reader who may see both sides of the gap (`G - 1`
+and `G`). Redactions apply as they would have live: one inside the segment
+rewrites its target, and one whose target has not arrived yet is held
+until backfill brings the target in.
+
+Peers are chosen as for recovery — the server that served `G`'s state, `G`'s
+origin, then the servers with the most joined members — leaving out any still
+cooling down from a 429 or a 403 for that room. Chunks are paced
+(`gap_backfill_interval_ms`), a failed gap backs off, and a gap that outgrows
+`gap_backfill_max_events` is left truncated rather than fetched without end.
 
 ---
 
@@ -690,6 +749,11 @@ ordering over a graph that may need backfilling mid-scan. Here, ordering was
 decided at write time, and a gap in history is a contiguous `li` range that is
 either present or not.
 
+A room with a filled federation gap is the one exception: its scan splices
+each gap segment in below the event accepted across the gap (§6.6). Paging
+back into a gap still being filled moves that room to the front of the
+backfill queue; the page is served from what is held and does not wait.
+
 `limit`, `filter`, and `dir` apply as specified. Filters that exclude by type or
 sender are evaluated against the fixed-width header fields of `LogEntry` without
 deserializing `client_json`.
@@ -765,7 +829,10 @@ A transaction touching ten rooms is fanned into ten partitions and never blocks
 on the slowest.
 
 Rate limiting is per-origin and per-room, with a separate budget for events that
-trigger `/get_missing_events` — the classic amplification vector.
+trigger `/get_missing_events` — the classic amplification vector. Accepting an
+event across a gap (§6.6) fetches a room's state and auth chain, so it is
+capped separately, per room and per origin over a window
+(`gap_acceptances_per_room`, `gap_acceptances_per_origin`).
 
 ### 11.5 Joining an existing large room
 

@@ -20,8 +20,8 @@
 //!
 //! What it does not do is fill the gap. The history between the event's
 //! unknown predecessors and what this server holds stays missing; the room
-//! records a marker for it (`Rooms::federation_gaps`) and backfill is the
-//! follow-up that reads them.
+//! records a marker for it (`Rooms::federation_gaps`), and the background
+//! backfill ([`super::backfill`]) reads the markers and fills them.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use ruma::RoomVersionId;
 use serde_json::Value;
 
-use super::recovery::{Endpoint, Failure, VerifiedPdu, charge, count, verify};
+use super::recovery::{Endpoint, Failure, Peers, VerifiedPdu, charge, count, verify};
 use crate::AppState;
 use crate::federation::PeerKeys;
 use crate::metrics::FetchKind;
@@ -77,11 +77,13 @@ pub(super) async fn accept(
             "a state-DAG room's state cannot be taken from /state_ids".to_owned(),
         ));
     }
+    // The origin, then the servers with the most joined members first: a
+    // server whose users all left answers 403 and has no state to give.
     let mut candidates = vec![origin.to_owned()];
     candidates.extend(
         state
             .rooms
-            .remote_domains(room_id)?
+            .participating_servers(room_id)?
             .into_iter()
             .filter(|domain| domain != origin && *domain != state.config.server.name),
     );
@@ -103,6 +105,15 @@ pub(super) async fn accept(
             }
             Err(error) => {
                 let failure = Failure::from_peer(&error);
+                if matches!(
+                    failure,
+                    Failure::Peer {
+                        forbidden: true,
+                        ..
+                    }
+                ) {
+                    state.recovery.shun(room_id, &peer);
+                }
                 let result = if cool(state, room_id, &peer, &failure) {
                     "rate_limited"
                 } else {
@@ -133,6 +144,7 @@ pub(super) async fn accept(
     Err(last.unwrap_or_else(|| Failure::Peer {
         message: "no participating server can be asked for the state at the event".to_owned(),
         rate_limited: Some(Duration::ZERO),
+        forbidden: false,
     }))
 }
 
@@ -193,83 +205,23 @@ async fn bridge(
     // cite, walked through each fetched body's auth events in turn: the
     // retention below authorizes every body against its auth events, so
     // all of them must be here or already held.
-    let mut pending: BTreeSet<String> = state_before.iter().chain(&auth_chain).cloned().collect();
-    pending.extend(
+    let mut roots: BTreeSet<String> = state_before.iter().chain(&auth_chain).cloned().collect();
+    roots.extend(
         state
             .rooms
             .missing_remote_dependencies(room_id, &event.body)?
             .1,
     );
-    pending.remove(&event.id);
-    let mut fetched: BTreeMap<String, Value> = BTreeMap::new();
-    let mut bytes = 0;
-    loop {
-        let mut wave = Vec::with_capacity(FETCH_CONCURRENCY);
-        while wave.len() < FETCH_CONCURRENCY {
-            let Some(id) = pending.pop_first() else {
-                break;
-            };
-            if id == event.id || fetched.contains_key(&id) {
-                continue;
-            }
-            match state.rooms.pdu(room_id, &id) {
-                Ok(_) => {}
-                Err(RoomError::MissingBody(_)) => wave.push(id),
-                Err(error) => return Err(error.into()),
-            }
-        }
-        if wave.is_empty() {
-            break;
-        }
-        if fetched.len().saturating_add(wave.len()) > MAX_GAP_EVENTS {
-            state
-                .metrics
-                .record_fetched(FetchKind::GapState, count(fetched.len()));
-            return Err(Failure::Budget(format!(
-                "the state at the event needs more than {MAX_GAP_EVENTS} events this server lacks"
-            )));
-        }
-        let mut requests = tokio::task::JoinSet::new();
-        for id in wave {
-            let federation = Arc::clone(&state.federation);
-            let peer = peer.to_owned();
-            requests.spawn(async move {
-                let body = federation.remote_event(&peer, &id).await;
-                (id, body)
-            });
-        }
-        let mut bodies = Vec::with_capacity(FETCH_CONCURRENCY);
-        while let Some(joined) = requests.join_next().await {
-            let (id, body) = joined.map_err(|error| Failure::Peer {
-                message: format!("event fetch failed: {error}"),
-                rate_limited: None,
-            })?;
-            bodies.push((id, body.map_err(|error| Failure::from_peer(&error))?));
-        }
-        // Deterministic order for verification, whatever order they landed in.
-        bodies.sort_by(|left, right| left.0.cmp(&right.0));
-        for (id, body) in bodies {
-            charge(&body, &mut bytes, MAX_GAP_BYTES)?;
-            let verified = verify(state, room_id, version, &body, Some(&id), keys)
-                .await
-                .map_err(|why| Failure::Invalid(format!("state event {id}: {why}")))?;
-            if verified.id != id {
-                return Err(Failure::Invalid(format!(
-                    "state event {id} does not match the body served for it"
-                )));
-            }
-            pending.extend(
-                state
-                    .rooms
-                    .missing_remote_dependencies(room_id, &verified.body)?
-                    .1,
-            );
-            fetched.insert(id, verified.body);
-        }
-    }
-    state
-        .metrics
-        .record_fetched(FetchKind::GapState, count(fetched.len()));
+    let fetched = fetch_state(
+        &Peers::of(state),
+        peer,
+        room_id,
+        version,
+        roots,
+        &event.id,
+        keys,
+    )
+    .await?;
 
     if !fetched.is_empty() {
         state
@@ -290,4 +242,98 @@ async fn bridge(
             // The peer's state could not be a state of this room.
             other => Failure::Invalid(other.to_string()),
         })
+}
+
+/// Fetch, verify and return every body named in `roots` -- and every auth
+/// event those cite, transitively -- that this server lacks, from `peer`.
+/// `skip` is the event the state is *for*, never part of it.
+///
+/// Bounded to [`MAX_GAP_EVENTS`] bodies and [`MAX_GAP_BYTES`]; past either
+/// it fails closed. Each body is named by its own hash and signature-
+/// checked; authorization is the caller's, through
+/// [`crate::rooms::Rooms::retain_remote_auth`], which needs every auth
+/// event in hand -- hence the walk.
+///
+/// # Errors
+///
+/// A [`Failure`]: the peer would not serve a body, a body failed
+/// verification, or the walk outgrew its budget.
+pub(super) async fn fetch_state(
+    peers: &Peers<'_>,
+    peer: &str,
+    room_id: &str,
+    version: &RoomVersionId,
+    mut pending: BTreeSet<String>,
+    skip: &str,
+    keys: &mut HashMap<String, PeerKeys>,
+) -> Result<BTreeMap<String, Value>, Failure> {
+    pending.remove(skip);
+    let mut fetched: BTreeMap<String, Value> = BTreeMap::new();
+    let mut bytes = 0;
+    loop {
+        let mut wave = Vec::with_capacity(FETCH_CONCURRENCY);
+        while wave.len() < FETCH_CONCURRENCY {
+            let Some(id) = pending.pop_first() else {
+                break;
+            };
+            if id == skip || fetched.contains_key(&id) {
+                continue;
+            }
+            match peers.rooms.pdu(room_id, &id) {
+                Ok(_) => {}
+                Err(RoomError::MissingBody(_)) => wave.push(id),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if wave.is_empty() {
+            break;
+        }
+        if fetched.len().saturating_add(wave.len()) > MAX_GAP_EVENTS {
+            peers
+                .metrics
+                .record_fetched(FetchKind::GapState, count(fetched.len()));
+            return Err(Failure::Budget(format!(
+                "the state at the event needs more than {MAX_GAP_EVENTS} events this server lacks"
+            )));
+        }
+        let mut requests = tokio::task::JoinSet::new();
+        for id in wave {
+            let federation = Arc::clone(peers.federation);
+            let peer = peer.to_owned();
+            requests.spawn(async move {
+                let body = federation.remote_event(&peer, &id).await;
+                (id, body)
+            });
+        }
+        let mut bodies = Vec::with_capacity(FETCH_CONCURRENCY);
+        while let Some(joined) = requests.join_next().await {
+            let (id, body) =
+                joined.map_err(|error| Failure::peer(format!("event fetch failed: {error}")))?;
+            bodies.push((id, body.map_err(|error| Failure::from_peer(&error))?));
+        }
+        // Deterministic order for verification, whatever order they landed in.
+        bodies.sort_by(|left, right| left.0.cmp(&right.0));
+        for (id, body) in bodies {
+            charge(&body, &mut bytes, MAX_GAP_BYTES)?;
+            let verified = verify(peers, room_id, version, &body, Some(&id), keys)
+                .await
+                .map_err(|why| Failure::Invalid(format!("state event {id}: {why}")))?;
+            if verified.id != id {
+                return Err(Failure::Invalid(format!(
+                    "state event {id} does not match the body served for it"
+                )));
+            }
+            pending.extend(
+                peers
+                    .rooms
+                    .missing_remote_dependencies(room_id, &verified.body)?
+                    .1,
+            );
+            fetched.insert(id, verified.body);
+        }
+    }
+    peers
+        .metrics
+        .record_fetched(FetchKind::GapState, count(fetched.len()));
+    Ok(fetched)
 }

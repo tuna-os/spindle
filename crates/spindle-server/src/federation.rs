@@ -1157,6 +1157,56 @@ impl Federation {
         Ok(events.clone())
     }
 
+    /// Fetch history walking backwards from `from` (`GET /backfill`), for
+    /// filling a recorded gap. Returned PDUs still need event identity,
+    /// signature and room authorization checks before storage, and the
+    /// caller keeps only the ones its walk actually asked for.
+    ///
+    /// # Errors
+    /// Returns [`FederationError`] for an invalid request, a refusal, an
+    /// oversized response, or an invalid response shape.
+    pub async fn remote_backfill(
+        &self,
+        destination: &str,
+        room_id: &str,
+        from: &[String],
+        limit: usize,
+    ) -> Result<Vec<Value>, FederationError> {
+        if !(1..=100).contains(&limit) || from.is_empty() || from.len() > 50 {
+            return Err(FederationError::Refused(
+                "backfill needs 1..=50 starting events and a limit of 1..=100".to_owned(),
+            ));
+        }
+        // Built and dropped before the request: the serializer is not `Send`.
+        let query = {
+            let mut query = form_urlencoded::Serializer::new(String::new());
+            for event_id in from {
+                query.append_pair("v", event_id);
+            }
+            query.append_pair("limit", &limit.to_string());
+            query.finish()
+        };
+        let uri = format!(
+            "/_matrix/federation/v1/backfill/{}?{query}",
+            path_segment(room_id),
+        );
+        let response = self
+            .signed_json_bounded(destination, &uri, None, "backfill", Some(32 * 1024 * 1024))
+            .await?;
+        let pdus = response["pdus"].as_array().ok_or_else(|| {
+            FederationError::Refused("backfill response has no pdus array".to_owned())
+        })?;
+        // A peer may include the starting events beside `limit` more; any
+        // more than that is not a page.
+        if pdus.len() > limit.saturating_add(from.len()) || pdus.iter().any(|pdu| !pdu.is_object())
+        {
+            return Err(FederationError::Refused(
+                "backfill returned an invalid page".to_owned(),
+            ));
+        }
+        Ok(pdus.clone())
+    }
+
     /// Fetch one event body for dependency recovery. The requesting caller
     /// must verify its computed ID and signature against the requested ID.
     ///

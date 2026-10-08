@@ -417,6 +417,28 @@ pub enum Keyspace {
     /// recovered, with the predecessors it named that this server lacks.
     /// What a later backfill reads to know where history is missing.
     FederationGap = 0x44,
+    /// `(room_id, position)` -> one event of a filled federation gap: its
+    /// ID and the root of the state after it. History backfilled into the
+    /// *middle* of a room's timeline -- between the head this server held
+    /// and an event accepted across a gap -- has no linear index of its
+    /// own (SPEC §6.5), so it lives in a band of positions below every
+    /// linear index, keyed so that one gap's events sort together and in
+    /// order; `/messages` stitches them in just below the gap event.
+    FederationGapEvent = 0x45,
+    /// `(room_id, event_id)` -> the position of a backfilled gap event,
+    /// the inverse of [`Self::FederationGapEvent`]: what `/context` and a
+    /// redaction look an event up by.
+    FederationGapPosition = 0x46,
+    /// `(room_id, anchor li)` -> the range of positions a gap's backfilled
+    /// events occupy below the event accepted across it. Outlives the
+    /// [`Self::FederationGap`] marker, which is deleted once the gap is
+    /// filled; this is what pagination reads to know a segment is there.
+    FederationGapSpan = 0x47,
+    /// `(room_id, target event_id)` -> the redaction naming an event this
+    /// server did not hold when the redaction arrived, in a room with a gap
+    /// still open: applied when backfill brings the target in, so history
+    /// filled late is never served unredacted.
+    PendingRedaction = 0x48,
     /// `(room_id, synapse_stream_ordering)` -> the linear index the
     /// importer gave that event (#568). Lets a Synapse pagination token
     /// a client kept across the migration name a place in this room.
@@ -640,6 +662,40 @@ pub fn historical_rejection(room_id: &str, event_id: &str) -> Vec<u8> {
 pub fn federation_gap(room_id: &str, event_id: &str) -> Vec<u8> {
     let mut key = room_prefix(Keyspace::FederationGap, room_id);
     key.extend_from_slice(event_id.as_bytes());
+    key
+}
+
+/// One backfilled gap event's row ([`Keyspace::FederationGapEvent`]),
+/// ordered by position within the room.
+#[must_use]
+pub fn federation_gap_event(room_id: &str, position: i64) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::FederationGapEvent, room_id);
+    key.extend_from_slice(&order_preserving(position));
+    key
+}
+
+/// A backfilled gap event's position ([`Keyspace::FederationGapPosition`]).
+#[must_use]
+pub fn federation_gap_position(room_id: &str, event_id: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::FederationGapPosition, room_id);
+    key.extend_from_slice(event_id.as_bytes());
+    key
+}
+
+/// The span of one filled gap ([`Keyspace::FederationGapSpan`]), keyed by
+/// the linear index of the event accepted across it.
+#[must_use]
+pub fn federation_gap_span(room_id: &str, anchor: i64) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::FederationGapSpan, room_id);
+    key.extend_from_slice(&order_preserving(anchor));
+    key
+}
+
+/// A redaction waiting for its target ([`Keyspace::PendingRedaction`]).
+#[must_use]
+pub fn pending_redaction(room_id: &str, target: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::PendingRedaction, room_id);
+    key.extend_from_slice(target.as_bytes());
     key
 }
 

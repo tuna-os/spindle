@@ -145,6 +145,7 @@ type Destinations = ([u8; 32], Arc<Vec<String>>);
 mod admin;
 mod erasure;
 mod federation;
+mod gaps;
 mod read;
 mod synapse_positions;
 mod unread;
@@ -155,6 +156,8 @@ pub use synapse_positions::SynapseGap;
 
 pub use unread::{Receipt, Scored, Unread, Unscored};
 use unread::{ScoreTally, UnreadIndex};
+
+pub use gaps::{GapChunk, GapChunkOutcome, GapProgress};
 
 pub struct Rooms {
     store: Arc<FjallStore>,
@@ -2431,7 +2434,7 @@ impl Rooms {
         // federate that nothing to every peer.
         let known = self.with_room_read(room_id, |_, log| {
             Ok(log.get(&EventId::new(target)).is_some())
-        })?;
+        })? || self.gap_position(room_id, target)?.is_some();
         if !known {
             return Err(RoomError::MissingBody(target.to_owned()));
         }
@@ -2472,31 +2475,15 @@ impl Rooms {
         redaction_id: &str,
     ) -> Result<(), RoomError> {
         let stored = self.read_event(room_id, &EventId::new(target))?;
-        let object = CanonicalJsonValue::try_from(stored)
-            .map_err(|error| RoomError::Build(error.to_string()))?;
-        let CanonicalJsonValue::Object(object) = object else {
-            return Err(RoomError::Build(
-                "a stored event is not an object".to_owned(),
-            ));
-        };
 
         // The room's own rules, not this build's default. Redaction is where
         // the versions differ most visibly -- which keys survive a redaction
         // changed in v11 -- so applying ours to someone else's room would
-        // strip fields the room's own version keeps.
+        // strip fields the room's own version keeps. `redacted_because`
+        // goes in `unsigned`, which is not covered by the event ID -- so a
+        // client can see why without the ID changing.
         let version = self.room_version(room_id)?;
-        let redacted = spindle_core::version::redact(&object, &version)
-            .map_err(|error| RoomError::Build(format!("cannot redact: {error}")))?;
-
-        let mut json = canonical_to_json(&redacted);
-        // `redacted_because` goes in `unsigned`, which is not covered by the
-        // event ID -- so a client can see why without the ID changing.
-        if let Some(map) = json.as_object_mut() {
-            map.insert(
-                "unsigned".to_owned(),
-                serde_json::json!({ "redacted_because": { "event_id": redaction_id } }),
-            );
-        }
+        let json = Self::redacted_body(&version, &stored, redaction_id)?;
 
         spindle_store::Store::put(
             self.store.as_ref(),
@@ -2759,7 +2746,68 @@ impl Rooms {
         after_limit: usize,
         visible: &(dyn Fn(i64) -> bool + Sync),
     ) -> Result<Context, RoomError> {
-        let found = self.with_room_read(room_id, |_, log| {
+        let spans = self.gap_spans(room_id)?;
+        let found = if spans.is_empty() {
+            self.context_log(room_id, event_id, before_limit, after_limit, visible)?
+        } else {
+            self.stitched_context(
+                room_id,
+                event_id,
+                before_limit,
+                after_limit,
+                visible,
+                &spans,
+            )?
+            .map(|window| {
+                (
+                    window.before,
+                    window.after,
+                    window.start,
+                    window.end,
+                    window.root,
+                )
+            })
+        };
+
+        let Some((before, after, start, end, state_root)) = found else {
+            return Err(RoomError::MissingBody(event_id.to_owned()));
+        };
+
+        let mut events_before = Vec::with_capacity(before.len());
+        for id in before {
+            events_before.push(self.event(room_id, &id)?);
+        }
+        let mut events_after = Vec::with_capacity(after.len());
+        for id in after {
+            events_after.push(self.event(room_id, &id)?);
+        }
+
+        Ok(Context {
+            event: self.event(room_id, event_id)?,
+            events_before,
+            events_after,
+            state: self.state_at(room_id, state_root)?,
+            start,
+            end,
+        })
+    }
+
+    /// The `/context` window from the log alone, for a room with no filled
+    /// gap: see [`Self::context_visible`].
+    #[allow(
+        clippy::type_complexity,
+        reason = "the window's two halves, its tokens and its state, as the caller wants them"
+    )]
+    fn context_log(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        before_limit: usize,
+        after_limit: usize,
+        visible: &(dyn Fn(i64) -> bool + Sync),
+    ) -> Result<Option<(Vec<String>, Vec<String>, i64, i64, spindle_core::StateRoot)>, RoomError>
+    {
+        self.with_room_read(room_id, |_, log| {
             let Some(entry) = log.get(&EventId::new(event_id)) else {
                 return Ok(None);
             };
@@ -2803,28 +2851,6 @@ impl Rooms {
                 })
                 .saturating_add(1);
             Ok(Some((before, after, start, end, state_root)))
-        })?;
-
-        let Some((before, after, start, end, state_root)) = found else {
-            return Err(RoomError::MissingBody(event_id.to_owned()));
-        };
-
-        let mut events_before = Vec::with_capacity(before.len());
-        for id in before {
-            events_before.push(self.event(room_id, &id)?);
-        }
-        let mut events_after = Vec::with_capacity(after.len());
-        for id in after {
-            events_after.push(self.event(room_id, &id)?);
-        }
-
-        Ok(Context {
-            event: self.event(room_id, event_id)?,
-            events_before,
-            events_after,
-            state: self.state_at(room_id, state_root)?,
-            start,
-            end,
         })
     }
 
@@ -3215,13 +3241,91 @@ impl Rooms {
             to,
             direction,
         } = page;
+        // A room with a filled federation gap pages in stitched order, the
+        // gap's segment spliced in below the event accepted across it
+        // (`gaps`). Every other room takes the plain range scan below.
+        let spans = self.gap_spans(room_id)?;
+        let wanted = if spans.is_empty() {
+            self.page_log(room_id, from, to, direction, limit, visible)?
+        } else {
+            self.with_room_read(room_id, |rooms, log| {
+                let stitch = gaps::Stitch {
+                    rooms,
+                    room_id,
+                    log,
+                    spans: &spans,
+                    visible,
+                };
+                let mut wanted: Vec<(i64, String)> = Vec::new();
+                let mut next = None;
+                match direction {
+                    Direction::Backward => stitch.backward(from, to, &mut |item| {
+                        if wanted.len() == limit {
+                            next = Some(stitch.above(item.position));
+                            return Ok(false);
+                        }
+                        wanted.push((item.position, item.event_id));
+                        Ok(true)
+                    })?,
+                    Direction::Forward => {
+                        stitch.forward(from, to, &mut |item| {
+                            if wanted.len() == limit {
+                                next = Some(item.position);
+                                return Ok(false);
+                            }
+                            wanted.push((item.position, item.event_id));
+                            Ok(true)
+                        })?;
+                        if next.is_none() {
+                            next = wanted.last().map(|(position, _)| stitch.above(*position));
+                        }
+                    }
+                }
+                Ok((wanted, next))
+            })?
+        };
+
+        let (wanted, next) = wanted;
+        let watermark = self.purge_watermark(room_id)?;
+        let mut out = Vec::with_capacity(wanted.len());
+        for (li, event_id) in wanted {
+            let json = match self.read_event(room_id, &EventId::new(event_id.as_str())) {
+                Ok(json) => json,
+                // SPEC/#83 §3: a purged entry is a marker, not a hole —
+                // the client can tell "deleted on purpose" from "never
+                // existed", which is the property purge preserves.
+                Err(RoomError::MissingBody(_)) if watermark.is_some_and(|mark| li < mark) => {
+                    purged_marker()
+                }
+                Err(error) => return Err(error),
+            };
+            out.push(TimelineEvent { event_id, li, json });
+        }
+        Ok((out, next))
+    }
+
+    /// The plain `/messages` scan over the log alone, for a room with no
+    /// filled gap: see [`Self::page_visible`].
+    #[allow(
+        clippy::type_complexity,
+        reason = "the page's IDs and the token after it, as the caller wants them"
+    )]
+    fn page_log(
+        &self,
+        room_id: &str,
+        from: Option<i64>,
+        to: Option<i64>,
+        direction: Direction,
+        limit: usize,
+        visible: &(dyn Fn(i64) -> bool + Sync),
+    ) -> Result<(Vec<(i64, String)>, Option<i64>), RoomError> {
         // Against the open log, not a fresh `load()`. Reloading rebuilt the
         // whole `RoomLog` from storage on every page, which made the one
         // endpoint SPEC §10.4 calls "a reverse range scan ... that is the
         // whole implementation" cost `O(room)` per request instead. The API
         // benchmark caught it: `/messages` grew 2.47x between a 10-event room
         // and a 500-event one, and `/sync` 4.79x, while `send` stayed flat.
-        let wanted = self.with_room_read(room_id, |_, log| {
+        self.with_room_read(room_id, |_, log| {
             let mut wanted = Vec::new();
             let mut next = None;
             let mut take = |entry: &spindle_core::LogEntry, gap_after: i64| {
@@ -3273,25 +3377,7 @@ impl Rooms {
                 }
             }
             Ok((wanted, next))
-        })?;
-
-        let (wanted, next) = wanted;
-        let watermark = self.purge_watermark(room_id)?;
-        let mut out = Vec::with_capacity(wanted.len());
-        for (li, event_id) in wanted {
-            let json = match self.read_event(room_id, &EventId::new(event_id.as_str())) {
-                Ok(json) => json,
-                // SPEC/#83 §3: a purged entry is a marker, not a hole —
-                // the client can tell "deleted on purpose" from "never
-                // existed", which is the property purge preserves.
-                Err(RoomError::MissingBody(_)) if watermark.is_some_and(|mark| li < mark) => {
-                    purged_marker()
-                }
-                Err(error) => return Err(error),
-            };
-            out.push(TimelineEvent { event_id, li, json });
-        }
-        Ok((out, next))
+        })
     }
 
     /// Events in `room_id` that `matches` accepts, newest first, starting
@@ -5454,10 +5540,17 @@ impl Rooms {
         // accepting an ambiguous event. A target that has not arrived yet is
         // left untouched; normal transaction order and the predecessor edge
         // make the already-present case the common one.
-        if let Some(target) = redaction_target
-            && log.get(&EventId::new(target.as_str())).is_some()
-        {
-            self.apply_redaction(room_id, &target, event_id)?;
+        // A target backfilled into a gap's segment is held too; one not held
+        // anywhere, in a room whose gap is still being filled, waits for
+        // backfill to bring it in (`gaps::note_unheld_redaction`).
+        if let Some(target) = redaction_target {
+            if log.get(&EventId::new(target.as_str())).is_some()
+                || self.gap_position(room_id, &target)?.is_some()
+            {
+                self.apply_redaction(room_id, &target, event_id)?;
+            } else {
+                self.note_unheld_redaction(log, room_id, &target, event_id, json)?;
+            }
         }
         if fan_out {
             self.enqueue_outbound(log, room_id, json)?;

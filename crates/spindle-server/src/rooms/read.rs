@@ -478,8 +478,18 @@ impl RoomReader<'_> {
     /// read.
     pub fn event(&self, event_id: &str) -> Result<Option<Value>, RoomError> {
         if self.scope != ReadScope::Whole {
-            let position = self.rooms.event_position(&self.room_id, event_id)?;
-            if position.is_none_or(|position| !self.scope.admits(position)) {
+            let admitted = match self.rooms.event_position(&self.room_id, event_id)? {
+                Some(position) => self.scope.admits(position),
+                // A backfilled gap event is judged at its gap, as the
+                // stitched timeline judges it: both sides must be readable.
+                None => self
+                    .rooms
+                    .gap_anchor_of(&self.room_id, event_id)?
+                    .is_some_and(|anchor| {
+                        self.scope.admits(anchor.saturating_sub(1)) && self.scope.admits(anchor)
+                    }),
+            };
+            if !admitted {
                 return Ok(None);
             }
         }

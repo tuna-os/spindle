@@ -107,6 +107,9 @@ pub struct AppState {
     /// One dependency recovery per room at a time, and the peers resting
     /// after a 429 (`inbound::recovery`).
     pub recovery: Arc<inbound::RecoveryGate>,
+    /// The background fill of recorded federation gaps, which a client
+    /// paging into one wakes (`inbound::backfill`).
+    pub backfill: Arc<inbound::GapBackfill>,
 }
 
 /// Why the application cannot be built. Both are startup-fatal on purpose:
@@ -272,6 +275,7 @@ pub fn app_with_metrics(
         registration_nonces: Arc::new(shared_secret_registration::RegistrationNonces::new()),
         rendezvous: Arc::new(rendezvous::Rendezvous::new()),
         recovery: Arc::new(inbound::RecoveryGate::new()),
+        backfill: Arc::new(inbound::GapBackfill::new()),
         metrics,
     };
     spawn_delivery_loops(&state);
@@ -316,6 +320,22 @@ fn spawn_delivery_loops(state: &AppState) {
             Arc::downgrade(&state.store),
             Arc::downgrade(&state.federation),
             std::time::Duration::from_millis(state.config.federation.retry_base_ms),
+        ));
+    }
+    // Recorded federation gaps fill in the background, a chunk at a time
+    // (`inbound::backfill`); nothing to do with federation off.
+    if state.config.federation.enabled && state.config.federation.gap_backfill {
+        tokio::spawn(inbound::run_backfill(
+            inbound::BackfillSources {
+                rooms: Arc::downgrade(&state.rooms),
+                federation: Arc::downgrade(&state.federation),
+                key: Arc::downgrade(&state.key),
+                metrics: Arc::downgrade(&state.metrics),
+                recovery: Arc::downgrade(&state.recovery),
+                backfill: Arc::downgrade(&state.backfill),
+                server_name: state.config.server.name.clone(),
+            },
+            inbound::BackfillSettings::of(&state.config.federation),
         ));
     }
     // Push delivery shares the outbox's retry base for the same reason

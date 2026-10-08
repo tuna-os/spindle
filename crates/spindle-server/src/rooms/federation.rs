@@ -329,10 +329,11 @@ impl Rooms {
     /// under [`spindle_core::keys::federation_gap`] naming the missing
     /// predecessors, for a later backfill to start from.
     ///
-    /// TODO(federation-gap-backfill): walk each marker's missing
-    /// predecessors back with `/backfill` (SPEC §6.5: one `/state_ids` per
-    /// chunk), prepend that history, and clear the marker once it meets the
-    /// history this server already holds.
+    /// The background backfill (`crate::inbound::backfill`) walks each
+    /// marker's missing predecessors back with `/backfill` (SPEC §6.5: one
+    /// `/state_ids` per chunk), stores that history as the gap's segment
+    /// ([`Self::commit_gap_chunk`]), and clears the marker once the walk
+    /// meets history this server already holds.
     ///
     /// Returns the predecessors the event named that this server does not
     /// hold, or `None` when nothing needed bridging -- the event was
@@ -527,10 +528,14 @@ impl Rooms {
             // the room's current state, and every membership it moved is
             // re-indexed from it.
             rooms.settle(log, room_id, Some(&entry), previous_current, &previous_tips)?;
-            if let Some(target) = redaction_target
-                && log.get(&EventId::new(target.as_str())).is_some()
-            {
-                rooms.apply_redaction(room_id, &target, event_id)?;
+            if let Some(target) = redaction_target {
+                if log.get(&EventId::new(target.as_str())).is_some()
+                    || rooms.gap_position(room_id, &target)?.is_some()
+                {
+                    rooms.apply_redaction(room_id, &target, event_id)?;
+                } else {
+                    rooms.note_unheld_redaction(log, room_id, &target, event_id, json)?;
+                }
             }
 
             // The marker is advisory -- the event is placed and durable
