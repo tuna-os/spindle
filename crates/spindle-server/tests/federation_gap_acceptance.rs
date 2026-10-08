@@ -195,6 +195,23 @@ impl Peer {
     }
 }
 
+/// A fresh app over `store`, serving on a socket of its own: its own
+/// `Rooms`, so every room it touches is cold-loaded from the store.
+async fn serve(
+    store: &Arc<FjallStore>,
+    metrics: &Arc<Metrics>,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let config = spindle_server::Config::parse("[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n[federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n").unwrap();
+    let app =
+        spindle_server::app_with_metrics(config, Arc::clone(store), Arc::clone(metrics)).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (address, task)
+}
+
 struct Harness {
     _dir: TempDir,
     store: Arc<FjallStore>,
@@ -261,15 +278,7 @@ impl Harness {
             .collect();
         let version = RoomVersionId::try_from(version.to_string()).unwrap();
         let metrics = Arc::new(Metrics::new());
-        let config = spindle_server::Config::parse("[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n[federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n").unwrap();
-        let app =
-            spindle_server::app_with_metrics(config, Arc::clone(&store), Arc::clone(&metrics))
-                .unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        let (address, task) = serve(&store, &metrics).await;
         Self {
             _dir: dir,
             store,
@@ -393,6 +402,41 @@ impl Harness {
             .unwrap();
         assert_eq!(response.status(), 200);
         serde_json::from_slice(&response.bytes().await.unwrap()).unwrap()
+    }
+
+    /// Drop the running app -- its `Rooms`, its open logs, its caches --
+    /// and serve a fresh one over the same store, as a restart does.
+    async fn restart(&mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+        self.metrics = Arc::new(Metrics::new());
+        let (address, task) = serve(&self.store, &self.metrics).await;
+        self.address = address;
+        self.task = task;
+    }
+
+    /// One client-server API call as `token`.
+    async fn client(&self, method: &str, path: &str, token: &str, body: Option<Value>) -> Value {
+        let request = reqwest::Client::new().request(
+            reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+            format!("http://{}{path}", self.address),
+        );
+        let request = if token.is_empty() {
+            request
+        } else {
+            request.header("authorization", format!("Bearer {token}"))
+        };
+        let request = match body {
+            Some(body) => request
+                .header("content-type", "application/json")
+                .body(body.to_string()),
+            None => request,
+        };
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+        assert!(status.is_success(), "{method} {path}: {status} {body}");
+        body
     }
 
     fn rooms(&self) -> Rooms {
@@ -632,6 +676,181 @@ async fn an_event_the_peers_state_does_not_admit_is_refused() {
     assert!(!harness.in_timeline(&latest.0));
     assert_eq!(harness.metrics.pdu_count(PduOutcome::GapAccepted), 0);
     assert_eq!(harness.metrics.pdu_count(PduOutcome::Rejected), 1);
+}
+
+/// A gap event survives a restart: the room is cold-loaded through the
+/// runtime restore path by a fresh app, reads back over `/messages`, classic
+/// and sliding sync, takes the next ordinary PDU, and a local event merges
+/// both extremities -- after which an exhaustive restore verifies every
+/// root and chain value the gap left behind.
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one restart scenario, asserted end to end"
+)]
+async fn a_gap_event_survives_a_cold_restart_and_merges_on_the_next_local_event() {
+    let mut harness = Harness::new(10).await;
+    let bob = harness.user("bob");
+    let carol = harness.user("carol");
+    let bob_join = harness.head.clone();
+    let carol_join = harness.carol_joins(&harness.head);
+    harness.peer.serve(&carol_join);
+    let hidden = harness.message(&bob, &bob_join, &carol_join, "undivulged");
+    harness.peer.served.lock().unwrap().state_ids = Some(harness.state_ids(&[&carol_join]));
+    let latest = harness.message(&carol, &carol_join, &hidden, "across the gap");
+    let response = harness.push(&[&latest]).await;
+    assert_eq!(response["pdus"][&latest.0], json!({}), "{response}");
+
+    harness.restart().await;
+    let room = harness.room.clone();
+
+    // (1) Reads, through the cold-loaded room.
+    let token = harness
+        .client(
+            "POST",
+            "/_matrix/client/v3/register",
+            "",
+            Some(json!({"username":"alice","password":"hunter2",
+                "auth":{"type":"m.login.dummy","session":"register"}})),
+        )
+        .await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let messages = harness
+        .client(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=10"),
+            &token,
+            None,
+        )
+        .await;
+    assert!(
+        messages["chunk"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event_id"] == latest.0.as_str()),
+        "/messages: {messages}"
+    );
+    let sync = harness
+        .client("GET", "/_matrix/client/v3/sync", &token, None)
+        .await;
+    assert!(
+        sync["rooms"]["join"][&room]["timeline"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event_id"] == latest.0.as_str()),
+        "sync: {sync}"
+    );
+    let sliding = harness
+        .client(
+            "POST",
+            "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync",
+            &token,
+            Some(json!({"room_subscriptions":{room.clone():
+                {"timeline_limit":10,"required_state":[["*","*"]]}}})),
+        )
+        .await;
+    assert!(
+        sliding["rooms"][&room]["timeline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event_id"] == latest.0.as_str()),
+        "sliding sync: {sliding}"
+    );
+    assert!(
+        sliding["rooms"][&room]["required_state"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["type"] == "m.room.member" && event["state_key"] == carol.as_str()),
+        "sliding sync state: {sliding}"
+    );
+
+    // (2) The next ordinary PDU, citing the gap event.
+    let state_ids = harness.peer.calls("state_ids");
+    let next = harness.message(&carol, &carol_join, &latest, "after the restart");
+    let response = harness.push(&[&next]).await;
+    assert_eq!(response["pdus"][&next.0], json!({}), "{response}");
+    assert_eq!(harness.metrics.pdu_count(PduOutcome::Accepted), 1);
+    assert_eq!(harness.peer.calls("state_ids"), state_ids);
+
+    // (3) A local event names both extremities and merges them.
+    let sent = harness
+        .client(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/merge-1"),
+            &token,
+            Some(json!({"msgtype":"m.text","body":"merging"})),
+        )
+        .await;
+    let local = sent["event_id"].as_str().unwrap().to_owned();
+    let pdu = harness.rooms().pdu(&room, &local).unwrap();
+    let parents: Vec<&str> = pdu["prev_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        parents.contains(&bob_join.0.as_str()) && parents.contains(&next.0.as_str()),
+        "the merge cites both extremities: {parents:?}"
+    );
+    let state = harness
+        .client(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room}/state"),
+            &token,
+            None,
+        )
+        .await;
+    for user in [ALICE, bob.as_str(), carol.as_str()] {
+        assert!(
+            state.as_array().unwrap().iter().any(|event| {
+                event["type"] == "m.room.member"
+                    && event["state_key"] == user
+                    && event["content"]["membership"] == "join"
+            }),
+            "{user} is joined after the merge: {state}"
+        );
+    }
+
+    // Every persisted root and chain value verifies, and so does the
+    // runtime restore production uses.
+    let room_store = RoomStore::new(harness.store.as_ref(), &room);
+    let exhaustive = room_store.load_exhaustive().unwrap().unwrap();
+    assert!(exhaustive.unverified.is_empty() && exhaustive.broken_chain.is_empty());
+    let tips: Vec<&str> = exhaustive
+        .log
+        .forward_extremities()
+        .iter()
+        .map(spindle_core::EventId::as_str)
+        .collect();
+    assert_eq!(tips, vec![local.as_str()], "the merge is the only head");
+    for id in [&latest.0, &next.0, &local] {
+        assert!(
+            exhaustive
+                .log
+                .get(&spindle_core::EventId::new(id.as_str()))
+                .is_some()
+        );
+    }
+    let current = exhaustive.log.current_state().unwrap();
+    assert_eq!(
+        current.get(&spindle_core::StateKey::new(
+            "m.room.member",
+            carol.as_str()
+        )),
+        Some(carol_join.0.as_str())
+    );
+    let runtime = room_store.load_runtime().unwrap().unwrap();
+    assert_eq!(
+        runtime.log.forward_extremities(),
+        exhaustive.log.forward_extremities()
+    );
 }
 
 /// (d) A small gap still recovers its full history and never asks for state.
