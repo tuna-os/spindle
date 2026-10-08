@@ -90,7 +90,7 @@ fn notice_text(code: &str) -> Option<&'static str> {
 }
 
 /// A signed-in page: navigation, a heading, any notice or error, the body.
-fn signed_in_page(
+pub(crate) fn signed_in_page(
     state: &AppState,
     session: &BrowserSession,
     title: &str,
@@ -102,7 +102,8 @@ fn signed_in_page(
         Accounts::new(state.store.as_ref(), &state.config.server.name).user_id(&session.localpart);
     let mut nav = String::from(
         "<nav><a href=\"/account/?action=org.matrix.profile\">Profile</a>\
-         <a href=\"/account/?action=password\">Password</a>",
+         <a href=\"/account/?action=password\">Password</a>\
+         <a href=\"/account/?action=recovery\">Recovery codes</a>",
     );
     if crate::email::configured(state) {
         nav.push_str("<a href=\"/account/?action=emails\">Email</a>");
@@ -243,6 +244,10 @@ async fn home(
             ("Reset your identity", cross_signing_view())
         }
         (Some("password"), _) => ("Password", password_view(&session)),
+        (Some("recovery"), _) => (
+            "Recovery codes",
+            crate::recovery::recovery_view(&state, &session)?,
+        ),
         (Some("emails"), _) if crate::email::configured(&state) => {
             ("Email", crate::email::emails_view(&state, &session)?)
         }
@@ -413,11 +418,7 @@ fn render_login(
     let error = error.map_or(String::new(), |text| {
         format!("<p class=\"error\">{}</p>", escape(text))
     });
-    let forgot = if crate::email::configured(state) {
-        "<p><a href=\"/account/password/forgot\">Forgot your password?</a></p>"
-    } else {
-        ""
-    };
+    let forgot = crate::recovery::recovery_links(state);
     let body = format!(
         "<h1>Sign in to {server}</h1>{error}\
          <form method=\"post\" action=\"/account/login\">{csrf}{next}\
@@ -814,6 +815,7 @@ async fn deactivate(
         .logout_everywhere(&localpart)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
     crate::email::forget_account(&state, &localpart)?;
+    crate::recovery::forget_account(&state, &localpart)?;
     web::end_browser_sessions_of(&state, &localpart, None)?;
     state.rooms.wake_sync_waiters();
     state

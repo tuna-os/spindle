@@ -119,6 +119,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::oidc::routes())
         .merge(crate::account::routes())
         .merge(crate::email::routes())
+        .merge(crate::recovery::routes())
         .merge(crate::openid::routes())
         .merge(crate::rendezvous::routes())
         .merge(crate::livekit::routes())

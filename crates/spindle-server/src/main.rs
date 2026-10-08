@@ -82,17 +82,8 @@ async fn main() -> ExitCode {
         return promote_admin(&config_path, &localpart);
     }
 
-    // `spindle set-password-hash <config> [<localpart>]` — store Argon2
-    // PHC hashes computed elsewhere (#611), read from stdin so they never
-    // sit in a process listing or shell history. With a localpart, stdin
-    // is that account's one hash; without, each line is
-    // `<localpart> <hash>` — the bulk path a MAS migration takes.
-    if std::env::args().nth(1).as_deref() == Some("set-password-hash") {
-        let Some(config_path) = std::env::args().nth(2) else {
-            eprintln!("usage: spindle set-password-hash <config> [<localpart>] < hashes");
-            return ExitCode::FAILURE;
-        };
-        return set_password_hash(&config_path, std::env::args().nth(3).as_deref());
+    if let Some(code) = credential_command() {
+        return code;
     }
 
     // `spindle backup <config> <file>` and `spindle restore <config> <file>`
@@ -992,6 +983,107 @@ fn promote_admin(config_path: &str, localpart: &str) -> ExitCode {
         }
         Err(error) => {
             eprintln!("spindle: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The credential commands, offline against the store:
+/// `spindle set-password-hash <config> [<localpart>]` stores Argon2 PHC
+/// hashes computed elsewhere (#611), read from stdin so they never sit in a
+/// process listing or shell history (with a localpart, stdin is that
+/// account's one hash; without, each line is `<localpart> <hash>`, the bulk
+/// path a MAS migration takes); and `spindle issue-reset-link <config>
+/// <localpart> [--ttl 24h]` prints a password-reset link for a server that
+/// sends no mail (the running server's equivalent is the admin API's
+/// `reset_link`). `None` when the command is neither.
+fn credential_command() -> Option<ExitCode> {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    match arguments.first().map(String::as_str) {
+        Some("set-password-hash") => {
+            let Some(config_path) = arguments.get(1) else {
+                eprintln!("usage: spindle set-password-hash <config> [<localpart>] < hashes");
+                return Some(ExitCode::FAILURE);
+            };
+            Some(set_password_hash(
+                config_path,
+                arguments.get(2).map(String::as_str),
+            ))
+        }
+        Some("issue-reset-link") => Some(issue_reset_link(&arguments[1..])),
+        _ => None,
+    }
+}
+
+/// Print a single-use password-reset link for one account, offline.
+///
+/// The URL goes to stdout and nowhere else: it is the credential, to be
+/// handed to its user by whatever channel the operator trusts. A newer
+/// link (or a mailed one) supersedes it.
+fn issue_reset_link(arguments: &[String]) -> ExitCode {
+    const USAGE: &str = "usage: spindle issue-reset-link <config> <localpart> [--ttl 24h]";
+    let mut positional = Vec::new();
+    let mut ttl_ms = spindle_server::email::DEFAULT_RESET_LINK_TTL_MS;
+    let mut rest = arguments.iter();
+    while let Some(argument) = rest.next() {
+        if argument == "--ttl" {
+            let Some(text) = rest.next() else {
+                eprintln!("{USAGE}");
+                return ExitCode::FAILURE;
+            };
+            match spindle_server::email::parse_ttl(text) {
+                Ok(ttl) => ttl_ms = ttl,
+                Err(why) => {
+                    eprintln!("spindle: --ttl: {why}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else {
+            positional.push(argument.as_str());
+        }
+    }
+    let [config_path, localpart] = positional.as_slice() else {
+        eprintln!("{USAGE}");
+        return ExitCode::FAILURE;
+    };
+    let config = match Config::load(config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("spindle: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if !config.auth.builtin_oidc {
+        eprintln!("spindle: reset links open the built-in provider's pages; set auth.builtin_oidc");
+        return ExitCode::FAILURE;
+    }
+    let store = match FjallStore::open(&config.storage.path) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!(
+                "spindle: cannot open storage at {}: {error}",
+                config.storage.path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let localpart = localpart
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(':'))
+        .map_or(*localpart, |(name, _)| name)
+        .to_lowercase();
+    match spindle_server::email::issue_reset_link(&store, &config, &localpart, ttl_ms) {
+        Ok((url, _)) => {
+            println!("{url}");
+            eprintln!(
+                "spindle: a single-use link for {localpart}, valid for {} minutes; \
+                 it signs every device out when used",
+                ttl_ms / 60_000
+            );
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            eprintln!("spindle: {why}");
             ExitCode::FAILURE
         }
     }

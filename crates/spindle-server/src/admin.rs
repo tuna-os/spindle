@@ -57,6 +57,10 @@ pub fn routes() -> Router<AppState> {
                 &format!("{prefix}/users/{{user_id}}/password_hash"),
                 post(set_password_hash),
             )
+            .route(
+                &format!("{prefix}/users/{{user_id}}/reset_link"),
+                post(issue_reset_link),
+            )
             .route(&format!("{prefix}/users/{{user_id}}/devices"), get(devices))
             .route(
                 &format!("{prefix}/users/{{user_id}}/devices/{{device_id}}"),
@@ -766,6 +770,56 @@ async fn set_password_hash(
         &json!({ "algorithm": algorithm, "logout_devices": request.logout_devices }),
     )?;
     Ok(Json(json!({})))
+}
+
+#[derive(Default, Deserialize)]
+struct ResetLinkRequest {
+    /// How long the link works, as `24h`, `30m`, `2d` or seconds; a day
+    /// when absent, a week at most.
+    ttl: Option<String>,
+}
+
+/// `POST /users/{userId}/reset_link` — a password-reset link for a user
+/// who cannot sign in, issued by an administrator rather than mailed: the
+/// recovery path for a server without SMTP. The URL is in the response
+/// and nowhere else — it is the only time the token exists in clear — and
+/// opens the same page a mailed link does, which signs every device out.
+/// Single-use, expiring, newest-only. The audit log records the issuance
+/// and its lifetime, never the token.
+async fn issue_reset_link(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path(user_id): Path<String>,
+    body: Option<Json<ResetLinkRequest>>,
+) -> Result<Json<Value>, MatrixError> {
+    if state.oidc.is_none() {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_UNRECOGNIZED",
+            "reset links open the built-in provider's pages, and it is not enabled",
+        ));
+    }
+    let (localpart, _) = target_account(&state, &user_id)?;
+    let request = body.map(|Json(request)| request).unwrap_or_default();
+    let ttl_ms = match request.ttl.as_deref() {
+        Some(text) => crate::email::parse_ttl(text)
+            .map_err(|why| MatrixError::new(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", why))?,
+        None => crate::email::DEFAULT_RESET_LINK_TTL_MS,
+    };
+    let (url, expires_at_ms) =
+        crate::email::issue_reset_link(state.store.as_ref(), &state.config, &localpart, ttl_ms)
+            .map_err(|why| MatrixError::new(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", why))?;
+    state.metrics.record_reset_link_issued();
+    audit(
+        &state,
+        &actor.identity().user_id,
+        "issue_reset_link",
+        &user_id,
+        &json!({ "ttl_ms": ttl_ms }),
+    )?;
+    Ok(Json(
+        json!({ "reset_url": url, "expires_at_ms": expires_at_ms }),
+    ))
 }
 
 /// `GET /users/{userId}/devices`

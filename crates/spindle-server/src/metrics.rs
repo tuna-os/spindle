@@ -698,10 +698,11 @@ pub enum AccountAction {
     EmailVerify,
     EmailRemove,
     CrossSigningReset,
+    RecoveryCodes,
 }
 
 impl AccountAction {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Profile,
         Self::PasswordChange,
         Self::SessionEnd,
@@ -710,6 +711,7 @@ impl AccountAction {
         Self::EmailVerify,
         Self::EmailRemove,
         Self::CrossSigningReset,
+        Self::RecoveryCodes,
     ];
 
     fn label(self) -> &'static str {
@@ -722,6 +724,7 @@ impl AccountAction {
             Self::EmailVerify => "email_verify",
             Self::EmailRemove => "email_remove",
             Self::CrossSigningReset => "cross_signing_reset",
+            Self::RecoveryCodes => "recovery_codes",
         }
     }
 }
@@ -744,6 +747,50 @@ impl EmailKind {
     }
 }
 
+/// How a forgotten password was recovered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PasswordRecoveryMethod {
+    /// A reset link: mailed to a confirmed address, or issued by an
+    /// administrator. One label for both, because a dead link cannot say
+    /// which it was; `spindle_password_resets_total` and
+    /// `spindle_reset_links_issued_total` count each kind's issuance.
+    ResetLink,
+    /// One of the account's one-time recovery codes.
+    RecoveryCode,
+}
+
+impl PasswordRecoveryMethod {
+    const ALL: [Self; 2] = [Self::ResetLink, Self::RecoveryCode];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ResetLink => "reset_link",
+            Self::RecoveryCode => "recovery_code",
+        }
+    }
+}
+
+/// How a recovery attempt ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PasswordRecoveryResult {
+    Success,
+    /// A dead link, or a username and code that did not match.
+    Rejected,
+    RateLimited,
+}
+
+impl PasswordRecoveryResult {
+    const ALL: [Self; 3] = [Self::Success, Self::Rejected, Self::RateLimited];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Rejected => "rejected",
+            Self::RateLimited => "rate_limited",
+        }
+    }
+}
+
 /// The authentication counters (#607/#608's observability).
 ///
 /// Every label is one of the enums above, so the series set is fixed at
@@ -757,7 +804,11 @@ struct AuthCounters {
     resets: [AtomicU64; 2],
     /// `[kind][sent, failed]`.
     emails: [[AtomicU64; 2]; 2],
-    account_actions: [AtomicU64; 8],
+    account_actions: [AtomicU64; 9],
+    /// `[method][result]` password recoveries.
+    recoveries: [[AtomicU64; 3]; 2],
+    /// Reset links issued by an administrator through the API.
+    reset_links_issued: AtomicU64,
 }
 
 fn index_of<T: PartialEq + Copy>(all: &[T], value: T) -> usize {
@@ -799,6 +850,42 @@ impl Metrics {
     pub fn record_account_action(&self, action: AccountAction) {
         self.auth.account_actions[index_of(&AccountAction::ALL, action)]
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one password-recovery attempt and how it ended.
+    pub fn record_password_recovery(
+        &self,
+        method: PasswordRecoveryMethod,
+        result: PasswordRecoveryResult,
+    ) {
+        self.auth.recoveries[index_of(&PasswordRecoveryMethod::ALL, method)]
+            [index_of(&PasswordRecoveryResult::ALL, result)]
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a reset link an administrator issued through the API. The
+    /// offline CLI has no running server to count it, and says so in the
+    /// audit trail it does have: its own output.
+    pub fn record_reset_link_issued(&self) {
+        self.auth.reset_links_issued.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read one recovery counter, for tests that assert it moved.
+    #[must_use]
+    pub fn password_recovery_count(
+        &self,
+        method: PasswordRecoveryMethod,
+        result: PasswordRecoveryResult,
+    ) -> u64 {
+        self.auth.recoveries[index_of(&PasswordRecoveryMethod::ALL, method)]
+            [index_of(&PasswordRecoveryResult::ALL, result)]
+        .load(Ordering::Relaxed)
+    }
+
+    /// Read the admin reset-link counter.
+    #[must_use]
+    pub fn reset_links_issued(&self) -> u64 {
+        self.auth.reset_links_issued.load(Ordering::Relaxed)
     }
 
     /// Read one sign-in counter, for tests that assert it moved.
@@ -911,6 +998,32 @@ impl Metrics {
                 self.account_action_count(action)
             );
         }
+        out.push_str(
+            "# HELP spindle_password_recoveries_total Forgotten-password recoveries, by \
+             method and outcome.\n\
+             # TYPE spindle_password_recoveries_total counter\n",
+        );
+        for method in PasswordRecoveryMethod::ALL {
+            for result in PasswordRecoveryResult::ALL {
+                let _ = writeln!(
+                    out,
+                    "spindle_password_recoveries_total{{method=\"{}\",result=\"{}\"}} {}",
+                    method.label(),
+                    result.label(),
+                    self.password_recovery_count(method, result)
+                );
+            }
+        }
+        out.push_str(
+            "# HELP spindle_reset_links_issued_total Password-reset links issued by an \
+             administrator through the admin API.\n\
+             # TYPE spindle_reset_links_issued_total counter\n",
+        );
+        let _ = writeln!(
+            out,
+            "spindle_reset_links_issued_total {}",
+            self.reset_links_issued()
+        );
     }
 }
 
