@@ -220,7 +220,10 @@ registrations = []
 # mints are ordinary Spindle sessions. The issuer is
 # `server.public_base_url` (falling back to `https://<server.name>`);
 # mutually exclusive with `[auth.delegated]`. See docs/delegated-auth.md
-# for both options.
+# for both options. With it, the provider also serves account management
+# pages at {issuer}/account/ (profile, password, devices, deactivation;
+# email and password reset with [email] below), advertised to clients as
+# MSC4191's account_management_uri.
 # builtin_oidc = false
 #
 # The built-in provider's issuer, when it should not be the client base URL
@@ -255,6 +258,31 @@ registrations = []
 # `matrix_authentication_service` section does — so a MAS set up for that
 # (no client of its own for the homeserver) needs no change.
 # homeserver_secret = "..."
+
+# Outgoing mail for the built-in provider (#608; needs builtin_oidc = true).
+# With it, users can confirm an email address on the account pages
+# ({issuer}/account/) and reset a forgotten password from a link mailed to
+# it; without it, neither page is offered and nothing is ever mailed. Links
+# are single-use, stored only as digests, and lapse after an hour (password
+# reset) or a day (address confirmation). Nothing connects to the relay
+# until the first message, so a relay that is down at startup does not stop
+# the server; delivery failures are logged and counted in
+# spindle_emails_sent_total{result="failed"}.
+# [email]
+# The From: of every message.
+# from = "Example <noreply@example.org>"
+# smtp_host = "smtp.example.org"
+# "starttls" (default; STARTTLS required), "tls" (TLS from the first byte,
+# a.k.a. SMTPS), or "none" (a relay on this host or a private network only;
+# refused together with credentials, which it would send in clear).
+# tls = "starttls"
+# Defaults by tls: 587, 465 or 25.
+# smtp_port = 587
+# Relay credentials, if it wants them. The password inline or, better, in a
+# mounted file (trailing newline ignored); not both.
+# username = "noreply@example.org"
+# password = "..."
+# password_file = "/run/secrets/smtp-password"
 
 [turn]
 # TURN relays, for calls that cannot connect peer-to-peer.

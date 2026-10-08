@@ -23,6 +23,7 @@ pub mod delegated;
 pub mod devices;
 pub mod directory;
 pub mod e2ee_federation;
+pub mod email;
 pub mod errors;
 pub mod federation;
 pub mod filters;
@@ -113,6 +114,10 @@ pub struct AppState {
     /// The background fill of recorded federation gaps, which a client
     /// paging into one wakes (`inbound::backfill`).
     pub backfill: Arc<inbound::GapBackfill>,
+    /// Where the built-in provider's mail goes (#608): the SMTP relay
+    /// `[email]` names, or what a test supplied. Absent, nothing is mailed
+    /// and the pages that would need it are not offered.
+    pub mailer: Option<Arc<dyn email::Mailer>>,
 }
 
 /// Why the application cannot be built. Both are startup-fatal on purpose:
@@ -125,6 +130,7 @@ pub enum AppError {
     FederationConfig(String),
     PushConfig(String),
     Appservice(String),
+    Email(String),
 }
 
 impl std::fmt::Display for AppError {
@@ -135,6 +141,7 @@ impl std::fmt::Display for AppError {
             Self::FederationConfig(why) => write!(formatter, "federation config: {why}"),
             Self::PushConfig(why) => write!(formatter, "push config: {why}"),
             Self::Appservice(why) => write!(formatter, "appservice registration: {why}"),
+            Self::Email(why) => write!(formatter, "email: {why}"),
         }
     }
 }
@@ -364,6 +371,39 @@ fn app_state(
     store: Arc<FjallStore>,
     metrics: Arc<metrics::Metrics>,
 ) -> Result<AppState, AppError> {
+    let mailer = match &config.email {
+        Some(email) => Some(Arc::new(
+            email::SmtpMailer::new(email, &config.server.name).map_err(AppError::Email)?,
+        ) as Arc<dyn email::Mailer>),
+        None => None,
+    };
+    app_state_with(config, store, metrics, mailer)
+}
+
+/// [`app_with_metrics`], with the mail transport supplied rather than
+/// built from `[email]` — a test's [`email::MemoryMailer`], typically.
+/// The pages that send mail are offered whenever a mailer is present.
+///
+/// # Errors
+///
+/// As [`app`].
+pub fn app_with_mailer(
+    config: Config,
+    store: Arc<FjallStore>,
+    metrics: Arc<metrics::Metrics>,
+    mailer: Arc<dyn email::Mailer>,
+) -> Result<Router, AppError> {
+    let state = app_state_with(config, store, metrics, Some(mailer))?;
+    spawn_delivery_loops(&state);
+    Ok(routes::router(state))
+}
+
+fn app_state_with(
+    config: Config,
+    store: Arc<FjallStore>,
+    metrics: Arc<metrics::Metrics>,
+    mailer: Option<Arc<dyn email::Mailer>>,
+) -> Result<AppState, AppError> {
     let key =
         Arc::new(signing::ServerKey::load_or_create(store.as_ref()).map_err(AppError::Signing)?);
     let rooms = Arc::new(rooms::Rooms::with_metrics(
@@ -447,6 +487,7 @@ fn app_state(
         recovery: Arc::new(inbound::RecoveryGate::new()),
         backfill: Arc::new(inbound::GapBackfill::new()),
         metrics,
+        mailer,
     };
     // Resident rooms are counted at scrape time, from the registry itself,
     // rather than kept as a counter every admission path would have to

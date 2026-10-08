@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use sha2::Digest;
-use spindle_server::metrics::{AccountAction, LoginMethod, LoginResult, Metrics};
+use spindle_server::email::{MemoryMailer, OutgoingEmail};
+use spindle_server::metrics::{AccountAction, EmailKind, LoginMethod, LoginResult, Metrics};
 use spindle_store::FjallStore;
 use tempfile::TempDir;
 
@@ -889,4 +890,458 @@ async fn password_attempts_share_the_login_budget() {
         "{text}"
     );
     assert!(!text.contains("alice"), "no username in any label");
+}
+
+const MAIL: &str = "[email]\nfrom = \"Example <noreply@example.org>\"\nsmtp_host = \"localhost\"\n";
+
+impl Instance {
+    /// The built-in provider with `[email]`, its mail captured in memory.
+    async fn with_mail(extra: &str) -> (Instance, Arc<MemoryMailer>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let config = spindle_server::Config::parse(&format!(
+            "[server]\nname = \"{name}\"\npublic_base_url = \"http://{name}\"\n\
+             [auth]\nbuiltin_oidc = true\n{extra}{MAIL}"
+        ))
+        .unwrap();
+        let metrics = Arc::new(Metrics::new());
+        let mailer = Arc::new(MemoryMailer::new());
+        let app = spindle_server::app_with_mailer(
+            config,
+            store,
+            Arc::clone(&metrics),
+            Arc::clone(&mailer) as Arc<dyn spindle_server::email::Mailer>,
+        )
+        .expect("the app builds");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let instance = Instance {
+            _dir: dir,
+            name,
+            metrics,
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+        };
+        (instance, mailer)
+    }
+}
+
+/// Mail is sent from a task of its own; wait until `count` messages exist.
+async fn mail(mailer: &MemoryMailer, count: usize) -> Vec<OutgoingEmail> {
+    for _ in 0..200 {
+        let sent = mailer.sent();
+        if sent.len() >= count {
+            return sent;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("expected {count} messages, have {}", mailer.sent().len());
+}
+
+/// The token in the one link a message carries.
+fn token_in(email: &OutgoingEmail, path: &str) -> String {
+    let marker = format!("{path}?token=");
+    let start = email.body.find(&marker).expect("a link") + marker.len();
+    email.body[start..start + 64].to_owned()
+}
+
+async fn add_and_confirm(
+    server: &Instance,
+    mailer: &MemoryMailer,
+    browser: &mut Browser,
+    address: &str,
+    already: usize,
+) {
+    let csrf = browser
+        .get(server, "/account/?action=emails")
+        .await
+        .field("csrf");
+    let page = browser
+        .post(
+            server,
+            "/account/emails/add",
+            &[("csrf", &csrf), ("email", address), ("password", PASSWORD)],
+        )
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let sent = mail(mailer, already + 1).await;
+    let token = token_in(&sent[already], "/account/emails/verify");
+    let page = browser
+        .post(server, "/account/emails/verify", &[("token", &token)])
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+}
+
+#[tokio::test]
+async fn an_address_is_bound_only_by_following_its_link() {
+    let (server, mailer) = Instance::with_mail("[ratelimit]\nenabled = false\n").await;
+    let token = server.register("alice").await;
+    let mut browser = Browser::default();
+    browser.sign_in(&server, "alice", PASSWORD).await;
+    let page = browser.get(&server, "/account/?action=emails").await;
+    assert_eq!(page.status, 200);
+    let csrf = page.field("csrf");
+
+    let page = browser
+        .post(
+            &server,
+            "/account/emails/add",
+            &[
+                ("csrf", &csrf),
+                ("email", "Alice@Example.org"),
+                ("password", "wrong"),
+            ],
+        )
+        .await;
+    assert_eq!(page.status, 401, "adding an address needs the password");
+    let page = browser
+        .post(
+            &server,
+            "/account/emails/add",
+            &[
+                ("csrf", &csrf),
+                ("email", "Alice@Example.org"),
+                ("password", PASSWORD),
+            ],
+        )
+        .await;
+    assert_eq!(page.status, 303);
+    let sent = mail(&mailer, 1).await;
+    assert_eq!(sent[0].to, "alice@example.org");
+    assert!(
+        sent[0].body.contains(&server.user("alice")),
+        "{}",
+        sent[0].body
+    );
+    let link_token = token_in(&sent[0], "/account/emails/verify");
+
+    let threepids = |token: String| {
+        let server = &server;
+        async move {
+            server
+                .api(
+                    reqwest::Method::GET,
+                    "/_matrix/client/v3/account/3pid",
+                    Some(&token),
+                    None,
+                )
+                .await
+        }
+    };
+    // Opening the link (a mail scanner would) binds nothing.
+    let mut scanner = Browser::default();
+    let page = scanner
+        .get(
+            &server,
+            &format!("/account/emails/verify?token={link_token}"),
+        )
+        .await;
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("alice@example.org"));
+    let (_, body) = threepids(token.clone()).await;
+    assert_eq!(body["threepids"], json!([]), "{body}");
+
+    let page = scanner
+        .post(&server, "/account/emails/verify", &[("token", &link_token)])
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    let (status, body) = threepids(token.clone()).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["threepids"][0]["medium"], "email", "{body}");
+    assert_eq!(body["threepids"][0]["address"], "alice@example.org");
+
+    // Single use.
+    let page = scanner
+        .post(&server, "/account/emails/verify", &[("token", &link_token)])
+        .await;
+    assert_eq!(page.status, 400);
+
+    // Removing it unbinds it.
+    let csrf = browser
+        .get(&server, "/account/?action=emails")
+        .await
+        .field("csrf");
+    let page = browser
+        .post(
+            &server,
+            "/account/emails/remove",
+            &[("csrf", &csrf), ("email", "alice@example.org")],
+        )
+        .await;
+    assert_eq!(page.status, 303);
+    let (_, body) = threepids(token).await;
+    assert_eq!(body["threepids"], json!([]), "{body}");
+
+    assert_eq!(server.metrics.email_count(EmailKind::Verification, true), 1);
+    for action in [
+        AccountAction::EmailAdd,
+        AccountAction::EmailVerify,
+        AccountAction::EmailRemove,
+    ] {
+        assert_eq!(server.metrics.account_action_count(action), 1, "{action:?}");
+    }
+}
+
+/// One address, one account: a second account's claim on a bound address
+/// is answered exactly like any other, and mails nobody.
+#[tokio::test]
+async fn a_bound_address_cannot_be_claimed_twice() {
+    let (server, mailer) = Instance::with_mail("[ratelimit]\nenabled = false\n").await;
+    server.register("alice").await;
+    server.register("bob").await;
+    let mut alice = Browser::default();
+    alice.sign_in(&server, "alice", PASSWORD).await;
+    add_and_confirm(&server, &mailer, &mut alice, "shared@example.org", 0).await;
+
+    let mut bob = Browser::default();
+    bob.sign_in(&server, "bob", PASSWORD).await;
+    let csrf = bob
+        .get(&server, "/account/?action=emails")
+        .await
+        .field("csrf");
+    let page = bob
+        .post(
+            &server,
+            "/account/emails/add",
+            &[
+                ("csrf", &csrf),
+                ("email", "shared@example.org"),
+                ("password", PASSWORD),
+            ],
+        )
+        .await;
+    assert_eq!(page.status, 303, "the same answer as for a free address");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(mailer.sent().len(), 1, "no mail for a taken address");
+}
+
+/// The forgotten-password flow, end to end, and the property that matters
+/// most: the request page says the same thing for an address that has an
+/// account and one that does not.
+#[tokio::test]
+async fn a_forgotten_password_is_reset_by_email() {
+    let (server, mailer) = Instance::with_mail("[ratelimit]\nenabled = false\n").await;
+    let old_token = server.register("alice").await;
+    let mut browser = Browser::default();
+    browser.sign_in(&server, "alice", PASSWORD).await;
+    add_and_confirm(&server, &mailer, &mut browser, "alice@example.org", 0).await;
+
+    // The sign-in pages offer the flow once mail is configured.
+    let mut stranger = Browser::default();
+    let page = stranger.get(&server, "/account/login").await;
+    assert!(page.body.contains("/account/password/forgot"));
+
+    let mut answers = Vec::new();
+    for address in ["nobody@example.org", "ALICE@example.org", "not an address"] {
+        let page = stranger.get(&server, "/account/password/forgot").await;
+        let csrf = page.field("csrf");
+        let page = stranger
+            .post(
+                &server,
+                "/account/password/forgot",
+                &[("csrf", &csrf), ("email", address)],
+            )
+            .await;
+        answers.push((page.status, page.body));
+    }
+    assert!(
+        answers.iter().all(|answer| *answer == answers[0]),
+        "every address gets the same page: {answers:?}"
+    );
+    assert_eq!(answers[0].0, 200);
+    let sent = mail(&mailer, 2).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(mailer.sent().len(), 2, "only the known address is mailed");
+    let reset = &sent[1];
+    assert_eq!(reset.to, "alice@example.org");
+    let token = token_in(reset, "/account/password/reset");
+
+    let page = stranger
+        .get(&server, &format!("/account/password/reset?token={token}"))
+        .await;
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains(&server.user("alice")));
+    // A mismatched pair costs a retry, not the link.
+    let page = stranger
+        .post(
+            &server,
+            "/account/password/reset",
+            &[
+                ("token", &token),
+                ("new_password", "a-new-password"),
+                ("confirm_password", "another-password"),
+            ],
+        )
+        .await;
+    assert_eq!(page.status, 400);
+    let page = stranger
+        .post(
+            &server,
+            "/account/password/reset",
+            &[
+                ("token", &token),
+                ("new_password", "a-new-password"),
+                ("confirm_password", "a-new-password"),
+            ],
+        )
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+
+    let (status, _) = server.password_login("alice", PASSWORD, "D1").await;
+    assert_eq!(status, 403);
+    let (status, _) = server.password_login("alice", "a-new-password", "D2").await;
+    assert_eq!(status, 200);
+    let (status, _) = server
+        .api(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(&old_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 401, "a reset signs every device out");
+    assert_eq!(
+        browser.get(&server, "/account/").await.status,
+        303,
+        "and every browser"
+    );
+    let page = stranger
+        .post(
+            &server,
+            "/account/password/reset",
+            &[
+                ("token", &token),
+                ("new_password", "a-third-password"),
+                ("confirm_password", "a-third-password"),
+            ],
+        )
+        .await;
+    assert_eq!(page.status, 400, "a link works once");
+
+    assert_eq!(server.metrics.password_reset_counts(), (3, 1));
+    assert_eq!(
+        server.metrics.email_count(EmailKind::PasswordReset, true),
+        1
+    );
+    let text = server.metrics.render();
+    assert!(!text.contains("example.org"), "no address in any label");
+}
+
+/// Only the newest reset link works, and a forged token is just a dead link.
+#[tokio::test]
+async fn a_newer_reset_link_supersedes_the_older() {
+    let (server, mailer) = Instance::with_mail("[ratelimit]\nenabled = false\n").await;
+    server.register("alice").await;
+    let mut browser = Browser::default();
+    browser.sign_in(&server, "alice", PASSWORD).await;
+    add_and_confirm(&server, &mailer, &mut browser, "alice@example.org", 0).await;
+    let mut stranger = Browser::default();
+    for count in [2, 3] {
+        let csrf = stranger
+            .get(&server, "/account/password/forgot")
+            .await
+            .field("csrf");
+        stranger
+            .post(
+                &server,
+                "/account/password/forgot",
+                &[("csrf", &csrf), ("email", "alice@example.org")],
+            )
+            .await;
+        mail(&mailer, count).await;
+    }
+    let sent = mailer.sent();
+    let first = token_in(&sent[1], "/account/password/reset");
+    let second = token_in(&sent[2], "/account/password/reset");
+    for (token, status) in [
+        (first.as_str(), 400),
+        (&"0".repeat(64), 400),
+        (second.as_str(), 200),
+    ] {
+        let page = stranger
+            .get(&server, &format!("/account/password/reset?token={token}"))
+            .await;
+        assert_eq!(page.status, status, "{token}");
+    }
+}
+
+/// Requests are limited per address whether or not the address is anyone's.
+#[tokio::test]
+async fn reset_requests_are_rate_limited_per_address() {
+    let (server, _mailer) = Instance::with_mail("").await;
+    let mut stranger = Browser::default();
+    let mut statuses = Vec::new();
+    for _ in 0..4 {
+        let csrf = stranger
+            .get(&server, "/account/password/forgot")
+            .await
+            .field("csrf");
+        let page = stranger
+            .post(
+                &server,
+                "/account/password/forgot",
+                &[("csrf", &csrf), ("email", "nobody@example.org")],
+            )
+            .await;
+        statuses.push(page.status);
+    }
+    assert_eq!(statuses, [200, 200, 200, 429]);
+}
+
+/// Deactivating releases the account's addresses for someone else.
+#[tokio::test]
+async fn deactivation_releases_the_address() {
+    let (server, mailer) = Instance::with_mail("[ratelimit]\nenabled = false\n").await;
+    server.register("alice").await;
+    let bob_token = server.register("bob").await;
+    let mut alice = Browser::default();
+    alice.sign_in(&server, "alice", PASSWORD).await;
+    add_and_confirm(&server, &mailer, &mut alice, "mine@example.org", 0).await;
+    let csrf = alice
+        .get(&server, "/account/?action=org.matrix.account_deactivate")
+        .await
+        .field("csrf");
+    let page = alice
+        .post(
+            &server,
+            "/account/deactivate",
+            &[("csrf", &csrf), ("password", PASSWORD), ("confirm", "yes")],
+        )
+        .await;
+    assert_eq!(page.status, 200);
+
+    let mut bob = Browser::default();
+    bob.sign_in(&server, "bob", PASSWORD).await;
+    add_and_confirm(&server, &mailer, &mut bob, "mine@example.org", 1).await;
+    let (_, body) = server
+        .api(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/3pid",
+            Some(&bob_token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        body["threepids"][0]["address"], "mine@example.org",
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn without_mail_there_is_no_email_surface() {
+    let server = Instance::builtin().await;
+    let mut browser = Browser::default();
+    let page = browser.get(&server, "/account/login").await;
+    assert!(!page.body.contains("forgot"), "{}", page.body);
+    for path in [
+        "/account/password/forgot",
+        "/account/password/reset?token=x",
+    ] {
+        assert_eq!(browser.get(&server, path).await.status, 404, "{path}");
+    }
 }

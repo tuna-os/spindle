@@ -453,6 +453,15 @@ pub enum Keyspace {
     /// signs nobody in. Numbered from 0x50 to leave 0x44.. to the
     /// importer's and federation's keyspaces.
     BrowserSession = 0x50,
+    /// An emailed link (#608): the BLAKE3 digest of its token -> what it
+    /// does (verify an address, reset a password), for whom, and when it
+    /// lapses. Deleted when used.
+    EmailToken = 0x51,
+    /// `(localpart, address)` -> a confirmed email address on an account.
+    UserEmail = 0x52,
+    /// `address` -> the localpart it is confirmed on: the reverse of
+    /// [`Keyspace::UserEmail`], so an address belongs to one account.
+    EmailOwner = 0x53,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -1025,6 +1034,43 @@ pub fn browser_session(digest: &[u8; 32]) -> Vec<u8> {
 #[must_use]
 pub fn browser_session_prefix() -> Vec<u8> {
     vec![KEY_SCHEMA_VERSION, Keyspace::BrowserSession as u8]
+}
+
+/// One emailed link's row, by the digest of its token
+/// ([`Keyspace::EmailToken`]).
+#[must_use]
+pub fn email_token(digest: &[u8; 32]) -> Vec<u8> {
+    let mut key = email_token_prefix();
+    key.extend_from_slice(digest);
+    key
+}
+
+/// The prefix every emailed-link row shares.
+#[must_use]
+pub fn email_token_prefix() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::EmailToken as u8]
+}
+
+/// One confirmed address of one account ([`Keyspace::UserEmail`]).
+#[must_use]
+pub fn user_email(localpart: &str, address: &str) -> Vec<u8> {
+    let mut key = user_email_prefix(localpart);
+    key.extend_from_slice(address.as_bytes());
+    key
+}
+
+/// Every confirmed address of one account.
+#[must_use]
+pub fn user_email_prefix(localpart: &str) -> Vec<u8> {
+    room_prefix(Keyspace::UserEmail, localpart)
+}
+
+/// Who an address is confirmed on ([`Keyspace::EmailOwner`]).
+#[must_use]
+pub fn email_owner(address: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::EmailOwner as u8];
+    key.extend_from_slice(address.as_bytes());
+    key
 }
 
 /// The row for one single-use login token.

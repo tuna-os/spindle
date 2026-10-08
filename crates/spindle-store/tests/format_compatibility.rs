@@ -210,6 +210,9 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::SynapsePosition, 0x3e),
         (Keyspace::SynapseTopologicalPosition, 0x3f),
         (Keyspace::BrowserSession, 0x50),
+        (Keyspace::EmailToken, 0x51),
+        (Keyspace::UserEmail, 0x52),
+        (Keyspace::EmailOwner, 0x53),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(
