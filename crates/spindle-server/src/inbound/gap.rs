@@ -309,7 +309,9 @@ pub(super) async fn fetch_state(
         while let Some(joined) = requests.join_next().await {
             let (id, body) =
                 joined.map_err(|error| Failure::peer(format!("event fetch failed: {error}")))?;
-            bodies.push((id, body.map_err(|error| Failure::from_peer(&error))?));
+            let body =
+                body.map_err(|error| Failure::from_peer_doing(&format!("/event {id}"), &error))?;
+            bodies.push((id, body));
         }
         // Deterministic order for verification, whatever order they landed in.
         bodies.sort_by(|left, right| left.0.cmp(&right.0));

@@ -265,16 +265,20 @@ pub enum BackfillEvent {
     /// Walked through but kept out of the timeline: it failed its auth
     /// events or the state before it.
     Rejected,
+    /// Named by the history but served by no participating server -- a
+    /// peer leaves out what it rejected -- and stepped over.
+    Skipped,
 }
 
 impl BackfillEvent {
-    const ALL: [Self; 3] = [Self::Fetched, Self::Inserted, Self::Rejected];
+    const ALL: [Self; 4] = [Self::Fetched, Self::Inserted, Self::Rejected, Self::Skipped];
 
     fn label(self) -> &'static str {
         match self {
             Self::Fetched => "fetched",
             Self::Inserted => "inserted",
             Self::Rejected => "rejected",
+            Self::Skipped => "skipped",
         }
     }
 }
@@ -1586,7 +1590,7 @@ impl Metrics {
         }
         out.push_str(
             "# HELP spindle_federation_backfill_events_total Events a gap backfill \
-         fetched, inserted, or kept out of the timeline.\n\
+         fetched, inserted, kept out of the timeline, or stepped over.\n\
          # TYPE spindle_federation_backfill_events_total counter\n",
         );
         for kind in BackfillEvent::ALL {

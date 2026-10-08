@@ -332,6 +332,12 @@ pub struct GapChunk<'a> {
     /// What the walk still has to fetch after this chunk; empty when every
     /// branch has met history this server holds.
     pub frontier: Vec<String>,
+    /// For each frontier event, the depth of the newest event that named
+    /// it: the ceiling a bridge over it may not reach above.
+    pub bounds: BTreeMap<String, u64>,
+    /// Frontier events no participating server would serve, walked over
+    /// from what the peer's page held below them.
+    pub skipped: Vec<String>,
 }
 
 /// What storing one chunk did.
@@ -359,6 +365,10 @@ pub struct GapProgress {
     /// `open`, `complete`, `truncated` or `failed`.
     pub status: String,
     pub last_error: Option<String>,
+    /// For each frontier event, the depth of the newest event naming it.
+    pub bounds: BTreeMap<String, u64>,
+    /// Events the walk had to step over because no server would serve them.
+    pub skipped: u64,
 }
 
 impl GapProgress {
@@ -386,6 +396,8 @@ impl GapProgress {
                 next_attempt_ms: 0,
                 status: "open".to_owned(),
                 last_error: None,
+                bounds: BTreeMap::new(),
+                skipped: 0,
             };
         }
         Self {
@@ -403,6 +415,13 @@ impl GapProgress {
             next_attempt_ms: progress["next_attempt_ms"].as_u64().unwrap_or(0),
             status: progress["status"].as_str().unwrap_or("open").to_owned(),
             last_error: progress["last_error"].as_str().map(str::to_owned),
+            bounds: progress["bounds"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(id, depth)| Some((id.clone(), depth.as_u64()?)))
+                .collect(),
+            skipped: progress["skipped"].as_u64().unwrap_or(0),
         }
     }
 
@@ -418,6 +437,8 @@ impl GapProgress {
             "next_attempt_ms": self.next_attempt_ms,
             "status": self.status,
             "last_error": self.last_error,
+            "bounds": self.bounds,
+            "skipped": self.skipped,
         });
         marker
     }
@@ -541,6 +562,20 @@ impl Rooms {
             .into_iter()
             .map(|(_, event_id, _)| event_id)
             .collect())
+    }
+
+    /// The depth of the newest event this room's log holds below `anchor`:
+    /// the floor under a gap, which history walked across a missing event
+    /// must stay above.
+    ///
+    /// # Errors
+    /// Returns [`RoomError`] if the room cannot be read.
+    pub fn gap_depth_floor(&self, room_id: &str, anchor: i64) -> Result<u64, RoomError> {
+        self.with_room_read(room_id, |_, log| {
+            Ok(log
+                .entry_at_or_before(anchor.saturating_sub(1))
+                .map_or(0, |entry| entry.depth))
+        })
     }
 
     /// The band position of a backfilled gap event, if this room holds one.
@@ -1283,6 +1318,15 @@ impl Rooms {
                 .rejected
                 .saturating_add(u64::try_from(outcome.rejected).unwrap_or(u64::MAX));
             progress.frontier.clone_from(&chunk.frontier);
+            progress.bounds = chunk
+                .bounds
+                .iter()
+                .filter(|(id, _)| chunk.frontier.contains(id))
+                .map(|(id, depth)| (id.clone(), *depth))
+                .collect();
+            progress.skipped = progress
+                .skipped
+                .saturating_add(u64::try_from(chunk.skipped.len()).unwrap_or(u64::MAX));
             progress.attempts = 0;
             progress.next_attempt_ms = 0;
             progress.last_error = None;

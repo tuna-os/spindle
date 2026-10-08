@@ -55,6 +55,13 @@ struct Served {
     limit_backfill: bool,
     /// `/backfill` answers this many pages, then 500 until reset.
     backfill_budget: Option<usize>,
+    /// Events this peer will not serve -- what Synapse does with an event
+    /// it rejected: left out of `/backfill` pages (whose walk still goes on
+    /// through it) and 404 over `/event`.
+    hidden: BTreeSet<String>,
+    /// With `hidden`: the peer does not know those events at all, so a
+    /// `/backfill` walk stops at them instead of going on through them.
+    hidden_unknown: bool,
     calls: Vec<String>,
 }
 
@@ -72,12 +79,18 @@ impl Served {
             let Some(body) = self.forged.get(&id).or_else(|| self.bodies.get(&id)) else {
                 continue;
             };
+            let hidden = self.hidden.contains(&id);
+            if hidden && self.hidden_unknown {
+                continue;
+            }
             for parent in body["prev_events"].as_array().into_iter().flatten() {
                 if let Some(parent) = parent.as_str() {
                     queue.push_back(parent.to_owned());
                 }
             }
-            out.push(body.clone());
+            if !hidden {
+                out.push(body.clone());
+            }
         }
         out.sort_by_key(|body| std::cmp::Reverse(body["depth"].as_u64().unwrap_or(0)));
         out
@@ -159,7 +172,6 @@ impl Peer {
                     let served = Arc::clone(&served);
                     move |axum::extract::RawQuery(query): axum::extract::RawQuery| {
                         let mut served = served.lock().unwrap();
-                        served.calls.push("backfill".to_owned());
                         let mut from = Vec::new();
                         let mut limit = 100;
                         for (key, value) in
@@ -171,6 +183,7 @@ impl Peer {
                                 _ => {}
                             }
                         }
+                        served.calls.push(format!("backfill:{}", from.join(",")));
                         let reply: Reply = if served.limit_backfill {
                             (
                                 axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -224,7 +237,16 @@ impl Peer {
                     move |axum::extract::Path(id): axum::extract::Path<String>| {
                         let mut served = served.lock().unwrap();
                         served.calls.push(format!("event:{id}"));
-                        let reply = match served.bodies.get(&id) {
+                        let reply = match served
+                            .bodies
+                            .get(&id)
+                            .filter(|_| !served.hidden.contains(&id))
+                        {
+                            None if served.hidden.contains(&id) => (
+                                axum::http::StatusCode::NOT_FOUND,
+                                axum::Json(json!({"errcode":"M_NOT_FOUND",
+                                    "error":"Could not find event"})),
+                            ),
                             Some(body) => (
                                 axum::http::StatusCode::OK,
                                 axum::Json(json!({"pdus":[body]})),
@@ -1383,4 +1405,132 @@ async fn paging_into_an_open_gap_wakes_the_backfill() {
     assert!(rooms.pdu(&harness.room, &latest.0).is_ok());
     let (after, _) = harness.page_back(&token, 100).await;
     assert_eq!(after, ids, "purged events keep their place as markers");
+}
+
+/// The calls the peer saw with `prefix`, for asserting none repeats.
+fn calls_of(harness: &Harness, prefix: &str) -> Vec<String> {
+    harness
+        .peer
+        .served
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .filter(|call| call.starts_with(prefix))
+        .cloned()
+        .collect()
+}
+
+/// Production, 2026-10-08: the walk reached an event no participating
+/// server would serve -- left out of `/backfill` (as Synapse leaves out an
+/// event it rejected) and 404 over `/event` -- and every later chunk asked
+/// the same question again until the peers answered 429 "Too many
+/// duplicate requests". Now the walk steps over that event onto what the
+/// page held below it, finishes the gap, and never asks a peer the same
+/// question twice.
+#[tokio::test]
+async fn an_event_no_peer_serves_is_stepped_over_without_repeating_requests() {
+    let harness = Harness::new(Setup::default()).await;
+    let history = harness.history(250);
+    let carol = harness.user("carol");
+    let latest = harness.message(
+        &carol,
+        &history.carol_join,
+        history.messages.last().unwrap(),
+        "after the outage",
+    );
+    let unserved = history.messages[120].0.clone();
+    harness
+        .peer
+        .served
+        .lock()
+        .unwrap()
+        .hidden
+        .insert(unserved.clone());
+    let anchor = accept_gap(&harness, &latest).await;
+    harness
+        .until(
+            30,
+            "the gap is backfilled past the unserved event",
+            Harness::filled,
+        )
+        .await;
+
+    assert_eq!(
+        harness
+            .rooms()
+            .gap_segment_len(&harness.room, anchor)
+            .unwrap(),
+        250,
+        "everything but the one event nobody serves"
+    );
+    assert_eq!(
+        harness.metrics.backfill_event_count(BackfillEvent::Skipped),
+        1
+    );
+    let backfills = calls_of(&harness, "backfill:");
+    let distinct: HashSet<&String> = backfills.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        backfills.len(),
+        "a repeated request: {backfills:?}"
+    );
+    assert_eq!(
+        calls_of(&harness, &format!("event:{unserved}")).len(),
+        1,
+        "the unserved event is asked for once"
+    );
+
+    let token = harness.login_alice().await;
+    let (ids, _) = harness.page_back(&token, 50).await;
+    let expected: Vec<String> = expected_order(&harness, &history, &latest)
+        .into_iter()
+        .filter(|id| *id != unserved)
+        .collect();
+    assert_eq!(ids, expected);
+}
+
+/// A peer that has nothing at all for the frontier -- an empty page and a
+/// 404 -- is not asked the same question again while the gap backs off:
+/// one request, then silence, and the gap stays open for a later answer.
+#[tokio::test]
+async fn a_peer_with_nothing_for_the_frontier_is_not_asked_again() {
+    let harness = Harness::new(Setup::default()).await;
+    let history = harness.history(150);
+    let carol = harness.user("carol");
+    let latest = harness.message(
+        &carol,
+        &history.carol_join,
+        history.messages.last().unwrap(),
+        "after the outage",
+    );
+    let unknown = history.messages[100].0.clone();
+    {
+        let mut served = harness.peer.served.lock().unwrap();
+        served.hidden.insert(unknown.clone());
+        served.hidden_unknown = true;
+    }
+    accept_gap(&harness, &latest).await;
+    harness
+        .until(30, "the stuck frontier fails a few times", |harness| {
+            harness
+                .gaps()
+                .first()
+                .is_some_and(|marker| marker["backfill"]["attempts"].as_u64() >= Some(4))
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let marker = harness.gaps()[0].clone();
+    assert_eq!(marker["backfill"]["frontier"], json!([unknown]), "{marker}");
+    assert_eq!(marker["backfill"]["status"], "open");
+    assert_eq!(
+        calls_of(&harness, &format!("backfill:{unknown}")).len(),
+        1,
+        "asked once"
+    );
+    assert_eq!(calls_of(&harness, &format!("event:{unknown}")).len(), 1);
+    let backfills = calls_of(&harness, "backfill:");
+    let distinct: HashSet<&String> = backfills.iter().collect();
+    assert_eq!(distinct.len(), backfills.len(), "{backfills:?}");
 }
