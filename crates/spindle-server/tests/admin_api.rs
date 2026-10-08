@@ -2330,3 +2330,389 @@ async fn reports_dismiss_and_rooms_block_in_synapses_shapes() {
         .await;
     assert_eq!(block, json!({ "block": false }));
 }
+
+/// Five rooms that differ in every column Synapse's room listing sorts on:
+/// sizes 5, 3, 2, 1 and 0; two unnamed rooms (so `NULL` placement and the
+/// room-ID tie-break both show); room versions whose byte order differs
+/// from their numeric order; and different creators, join rules, history
+/// visibility, guest access, encryption, federation and publication.
+#[allow(clippy::too_many_lines, reason = "one room per block, five rooms")]
+async fn ordering_fixture(server: &Instance) -> (String, Vec<(&'static str, String)>) {
+    let root = server.register("root").await;
+    server.promote("root");
+    let mut tokens = std::collections::HashMap::new();
+    for user in ["alice", "bob", "carol", "dave", "erin"] {
+        tokens.insert(user, server.register(user).await);
+    }
+    let create = |creator: &'static str, body: Value| {
+        let token = tokens[creator].clone();
+        async move {
+            let (status, created) = server
+                .request(
+                    reqwest::Method::POST,
+                    "/_matrix/client/v3/createRoom",
+                    Some(&token),
+                    Some(&body),
+                )
+                .await;
+            assert_eq!(status, 200, "{created}");
+            created["room_id"].as_str().unwrap().to_owned()
+        }
+    };
+    let join = |user: &'static str, room: String| {
+        let token = tokens[user].clone();
+        async move {
+            let (status, body) = server
+                .request(
+                    reqwest::Method::POST,
+                    &format!("/_matrix/client/v3/join/{room}"),
+                    Some(&token),
+                    Some(&json!({})),
+                )
+                .await;
+            assert_eq!(status, 200, "{user} joins {room}: {body}");
+        }
+    };
+
+    let zebra = create(
+        "alice",
+        json!({
+            "name": "Zebra crossing", "room_version": "6", "preset": "public_chat",
+            "visibility": "public", "room_alias_name": "zebra",
+            "initial_state": [
+                {"type": "m.room.history_visibility", "state_key": "", "content": {"history_visibility": "world_readable"}},
+                {"type": "m.room.guest_access", "state_key": "", "content": {"guest_access": "can_join"}},
+            ],
+        }),
+    )
+    .await;
+    for user in ["bob", "carol", "dave", "erin"] {
+        join(user, zebra.clone()).await;
+    }
+    let apple = create(
+        "bob",
+        json!({
+            "name": "apple", "room_version": "10", "preset": "public_chat",
+            "initial_state": [{"type": "m.room.encryption", "state_key": "",
+                               "content": {"algorithm": "m.megolm.v1.aes-sha2"}}],
+        }),
+    )
+    .await;
+    join("carol", apple.clone()).await;
+    let lonely = create(
+        "carol",
+        json!({
+            "room_version": "11", "room_alias_name": "middle",
+            "creation_content": {"m.federate": false},
+        }),
+    )
+    .await;
+    let mango = create(
+        "dave",
+        json!({"name": "Mango", "room_version": "12", "topic": "fruit"}),
+    )
+    .await;
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/rooms/{mango}/leave"),
+            Some(&tokens["dave"]),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let crowd = create(
+        "erin",
+        json!({
+            "room_version": "12", "preset": "public_chat",
+            "initial_state": [{"type": "m.room.join_rules", "state_key": "",
+                               "content": {"join_rule": "public"}},
+                              {"type": "m.room.history_visibility", "state_key": "",
+                               "content": {"history_visibility": "invited"}}],
+        }),
+    )
+    .await;
+    join("alice", crowd.clone()).await;
+    join("bob", crowd.clone()).await;
+    (
+        root,
+        vec![
+            ("zebra", zebra),
+            ("apple", apple),
+            ("lonely", lonely),
+            ("mango", mango),
+            ("crowd", crowd),
+        ],
+    )
+}
+
+/// Synapse's ordering, written out independently of the server: the
+/// column, whether it sorts ascending by default, `dir=b` flipping it,
+/// `NULL` last ascending and first descending (`PostgreSQL`), byte order for
+/// text (the `C` collation Synapse requires), and the room ID as the tie
+/// break in the same direction.
+#[derive(PartialEq, PartialOrd)]
+enum SortKey {
+    Number(u64),
+    Text(String),
+    Flag(bool),
+}
+
+fn synapse_order(rows: &[Value], order_by: &str, dir: &str) -> Vec<String> {
+    let (column, ascending) = match order_by {
+        "name" | "alphabetical" => ("name", true),
+        "size" | "joined_members" => ("joined_members", false),
+        "joined_local_members" => ("joined_local_members", false),
+        "version" => ("version", false),
+        "state_events" => ("state_events", false),
+        other => (other, true),
+    };
+    let ascending = if dir == "b" { !ascending } else { ascending };
+    let key = |row: &Value| -> Option<SortKey> {
+        match &row[column] {
+            Value::Number(n) => Some(SortKey::Number(n.as_u64().unwrap())),
+            Value::String(s) => Some(SortKey::Text(s.clone())),
+            Value::Bool(b) => Some(SortKey::Flag(*b)),
+            _ => None,
+        }
+    };
+    let mut sorted: Vec<&Value> = rows.iter().collect();
+    sorted.sort_by(|a, b| {
+        let by_column = match (key(a), key(b)) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap(),
+        };
+        let order = by_column.then_with(|| {
+            a["room_id"]
+                .as_str()
+                .unwrap()
+                .cmp(b["room_id"].as_str().unwrap())
+        });
+        if ascending { order } else { order.reverse() }
+    });
+    sorted
+        .iter()
+        .map(|row| row["room_id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Every `order_by` Synapse accepts, in both directions, against rooms that
+/// differ in every column: the exact order, and paging through it two at a
+/// time with Synapse's `offset`, `next_batch` and `prev_batch`.
+#[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one table of expectations")]
+async fn room_listing_orders_exactly_as_synapse_for_every_column_and_direction() {
+    let server = Instance::start().await;
+    let (token, rooms) = ordering_fixture(&server).await;
+    let id = |name: &str| {
+        rooms
+            .iter()
+            .find(|(label, _)| *label == name)
+            .unwrap()
+            .1
+            .clone()
+    };
+    let label = |room_id: &str| {
+        rooms
+            .iter()
+            .find(|(_, id)| id == room_id)
+            .map_or("?", |(label, _)| *label)
+    };
+    let list = |query: String| {
+        let server = &server;
+        let token = token.clone();
+        async move {
+            let (status, body) = server
+                .request(
+                    reqwest::Method::GET,
+                    &format!("/_synapse/admin/v1/rooms{query}"),
+                    Some(&token),
+                    None,
+                )
+                .await;
+            assert_eq!(status, 200, "{query}: {body}");
+            body
+        }
+    };
+    let all = list("?limit=100".to_owned()).await;
+    let rows = all["rooms"].as_array().unwrap().clone();
+    assert_eq!(rows.len(), 5, "{all}");
+    let row = |name: &str| rows.iter().find(|r| r["room_id"] == id(name)).unwrap();
+    // The fixture really does differ where the orderings look.
+    let sizes: Vec<_> = ["zebra", "crowd", "apple", "lonely", "mango"]
+        .iter()
+        .map(|name| row(name)["joined_members"].as_u64().unwrap())
+        .collect();
+    assert_eq!(sizes, [5, 3, 2, 1, 0]);
+    assert_eq!(row("lonely")["name"], Value::Null);
+    assert_eq!(row("crowd")["name"], Value::Null);
+    assert_eq!(row("lonely")["federatable"], false);
+    assert_eq!(row("zebra")["public"], true);
+    assert_eq!(row("apple")["encryption"], "m.megolm.v1.aes-sha2");
+
+    // Spelled out, for the columns an operator sorts by most, so a mistake
+    // shared by the server and the oracle above still fails.
+    let named = |names: &[&str]| -> Vec<String> { names.iter().map(|n| id(n)).collect() };
+    let (unnamed_first, unnamed_second) = {
+        let (a, b) = (id("lonely"), id("crowd"));
+        if a < b {
+            ("lonely", "crowd")
+        } else {
+            ("crowd", "lonely")
+        }
+    };
+    let spelled: Vec<(&str, &str, Vec<String>)> = vec![
+        (
+            "joined_members",
+            "f",
+            named(&["zebra", "crowd", "apple", "lonely", "mango"]),
+        ),
+        (
+            "joined_members",
+            "b",
+            named(&["mango", "lonely", "apple", "crowd", "zebra"]),
+        ),
+        (
+            "size",
+            "f",
+            named(&["zebra", "crowd", "apple", "lonely", "mango"]),
+        ),
+        (
+            "joined_local_members",
+            "f",
+            named(&["zebra", "crowd", "apple", "lonely", "mango"]),
+        ),
+        (
+            "joined_local_members",
+            "b",
+            named(&["mango", "lonely", "apple", "crowd", "zebra"]),
+        ),
+        // Byte order: uppercase before lowercase, unnamed last; reversed,
+        // unnamed first with their room IDs descending.
+        (
+            "name",
+            "f",
+            named(&["mango", "zebra", "apple", unnamed_first, unnamed_second]),
+        ),
+        (
+            "name",
+            "b",
+            named(&[unnamed_second, unnamed_first, "apple", "zebra", "mango"]),
+        ),
+        // Text, descending by default: "6" > "12" > "11" > "10".
+        ("version", "f", {
+            let (twelve_a, twelve_b) = if id("mango") > id("crowd") {
+                ("mango", "crowd")
+            } else {
+                ("crowd", "mango")
+            };
+            named(&["zebra", twelve_a, twelve_b, "lonely", "apple"])
+        }),
+    ];
+    for (order_by, dir, expected) in &spelled {
+        let body = list(format!("?limit=100&order_by={order_by}&dir={dir}")).await;
+        let got: Vec<String> = body["rooms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["room_id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            got.iter().map(|r| label(r)).collect::<Vec<_>>(),
+            expected.iter().map(|r| label(r)).collect::<Vec<_>>(),
+            "{order_by} dir={dir}"
+        );
+    }
+
+    for order_by in [
+        "alphabetical",
+        "size",
+        "name",
+        "canonical_alias",
+        "joined_members",
+        "joined_local_members",
+        "version",
+        "creator",
+        "encryption",
+        "federatable",
+        "public",
+        "join_rules",
+        "guest_access",
+        "history_visibility",
+        "state_events",
+    ] {
+        for dir in ["f", "b"] {
+            let expected = synapse_order(&rows, order_by, dir);
+            let body = list(format!("?limit=100&order_by={order_by}&dir={dir}")).await;
+            let got: Vec<String> = body["rooms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["room_id"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(
+                got.iter().map(|r| label(r)).collect::<Vec<_>>(),
+                expected.iter().map(|r| label(r)).collect::<Vec<_>>(),
+                "{order_by} dir={dir}"
+            );
+
+            // Two at a time: the same order, no overlap, Synapse's offsets.
+            let mut walked = Vec::new();
+            let mut from = 0_u64;
+            loop {
+                let page = list(format!(
+                    "?limit=2&from={from}&order_by={order_by}&dir={dir}"
+                ))
+                .await;
+                assert_eq!(page["offset"], from, "{order_by} {dir}: {page}");
+                assert_eq!(page["total_rooms"], 5, "{order_by} {dir}: {page}");
+                if from == 0 {
+                    assert!(page.get("prev_batch").is_none(), "{page}");
+                } else {
+                    assert_eq!(page["prev_batch"], from.saturating_sub(2), "{page}");
+                }
+                walked.extend(
+                    page["rooms"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|r| r["room_id"].as_str().unwrap().to_owned()),
+                );
+                match page.get("next_batch") {
+                    Some(next) => {
+                        assert_eq!(next, &json!(from + 2), "{page}");
+                        from += 2;
+                    }
+                    None => break,
+                }
+            }
+            assert_eq!(walked, expected, "{order_by} dir={dir} paged");
+        }
+    }
+
+    // Synapse's search: name anywhere, alias only in its localpart, room ID
+    // exactly.
+    let search = |term: String| {
+        let list = &list;
+        async move {
+            let body = list(format!("?search_term={term}")).await;
+            body["rooms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["room_id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(search("CROSS".to_owned()).await, [id("zebra")]);
+    assert_eq!(search("middl".to_owned()).await, [id("lonely")]);
+    // The alias is `#middle:127.0.0.1:<port>`; its last part is not in the
+    // localpart, so it does not match, as on a server named `reilly.asia`.
+    let port = server.name.rsplit(':').next().unwrap().to_owned();
+    assert!(
+        search(port).await.is_empty(),
+        "the end of the server name is not in any alias's localpart"
+    );
+}
