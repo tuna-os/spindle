@@ -54,7 +54,6 @@ pub mod recovery;
 pub mod registration_tokens;
 pub mod rendezvous;
 pub mod rooms;
-pub mod routes_legacy;
 pub mod routes;
 pub mod s3;
 pub mod secrets;
