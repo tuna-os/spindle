@@ -4454,7 +4454,7 @@ async fn join_remote(
             .iter()
             .any(|id| state.rooms.event(room_id, id).is_err());
         if gap {
-            fetch_initial_history(&state, server, room_id, &join_id, &version).await;
+            fetch_initial_history(state, server, room_id, &join_id, &version).await;
         }
         state.rooms.wake_sync_waiters();
         return Ok(Json(json!({ "room_id": room_id })));
