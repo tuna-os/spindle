@@ -329,6 +329,10 @@ fn warm_from(
 }
 
 /// Everything a handler needs, built from configuration.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one construction of the shared state, a field per subsystem"
+)]
 fn app_state(
     config: Config,
     store: Arc<FjallStore>,
