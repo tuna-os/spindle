@@ -106,6 +106,16 @@ tls_cert = "/certs/${SERVER_NAME}.crt"
 tls_key = "/certs/${SERVER_NAME}.key"
 TOML
 
+# MSC3995 hub mode (#22), for the hub-mode interop job's image only.
+if [[ "${SPINDLE_HUB_MODE:-0}" == 1 ]]; then
+    say "turning on hub mode"
+    cat >> /data/spindle.toml <<TOML
+
+[federation.hub]
+enabled = true
+TOML
+fi
+
 # Everything above needed root: the trust store, and Complement's 0600 CA key.
 # Nothing below does. `exec` means PID 1 is the server itself, running as
 # uid 10001 -- so the process that stays up and takes traffic is unprivileged

@@ -11,6 +11,10 @@
 FROM rust:1.98-bookworm AS build
 WORKDIR /src
 
+# Cargo features to build with, e.g. `hub-mode` for the hub-mode interop job
+# (#22). Empty, the default, is the server every other job tests.
+ARG SPINDLE_FEATURES=""
+
 # The dependency layer: manifests only, with placeholder sources, so the
 # workspace's dependency graph compiles once and stays cached until
 # Cargo.lock moves. Every CI run changes our own code and nothing else,
@@ -44,7 +48,7 @@ RUN mkdir -p crates/spindle-core/src crates/spindle-store/src \
                echo 'fn main() {}' > "crates/$crate/benches/$bench.rs"; \
              done; \
        done \
-    && cargo build --release --locked --bin spindle
+    && cargo build --release --locked --bin spindle ${SPINDLE_FEATURES:+--features "$SPINDLE_FEATURES"}
 
 # The real sources. `touch` because cargo decides freshness by mtime, and
 # a checkout can hand it files older than the placeholder artefacts —
@@ -52,9 +56,14 @@ RUN mkdir -p crates/spindle-core/src crates/spindle-store/src \
 # that does nothing is a very confusing Complement failure.
 COPY crates ./crates
 RUN find crates -name '*.rs' -exec touch {} + \
-    && cargo build --release --locked --bin spindle
+    && cargo build --release --locked --bin spindle ${SPINDLE_FEATURES:+--features "$SPINDLE_FEATURES"}
 
 FROM debian:bookworm-slim
+
+# 1 turns on `[federation.hub]` in the generated config; only meaningful in
+# an image built with SPINDLE_FEATURES=hub-mode, which any other refuses.
+ARG SPINDLE_HUB_MODE=0
+ENV SPINDLE_HUB_MODE=${SPINDLE_HUB_MODE}
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates openssl curl util-linux \
