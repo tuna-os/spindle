@@ -272,6 +272,40 @@ Metrics for all of this — sign-ins by door and result, token grants,
 resets requested and completed, mail sent and failed, account actions —
 are in [metrics.md](metrics.md).
 
+### Password recovery without email
+
+`[email]` is optional, and a server without it is not stuck when a user
+forgets their password. Two ways back need no mail at all:
+
+- **Recovery codes.** The account pages' *Recovery codes* section
+  (`?action=recovery`) generates ten one-time codes behind the current
+  password. They are shown once; generating a new set retires the old one.
+  The sign-in pages link to *Use a recovery code* (`/account/recover`):
+  username, one code and a new password. The code is used up, the password
+  set, and every device and browser signed out. Each code is 80 random
+  bits, stored as a per-code salt and `BLAKE3(salt ‖ code)` — not Argon2,
+  because a slow hash protects guessable human secrets, and an 80-bit random
+  code is beyond guessing with any hash, while ten Argon2 runs per attempt
+  would hand anyone who can post the form a way to burn CPU and memory.
+  Attempts spend the same per-account and per-source budget as a password
+  (5 and 30 a minute), and an unknown user and a wrong code get the same
+  answer.
+- **An administrator's reset link.** `spindle issue-reset-link <config>
+  <localpart> [--ttl 24h]` (offline, like `set-password-hash`) or
+  `POST /_spindle/admin/v1/users/{user_id}/reset_link` with an optional
+  `{"ttl": "2h"}` (the running server's way) returns a URL on the issuer,
+  once. Hand it to the user by any channel you trust. It is the same link a
+  mailed reset sends: single-use, a day by default and a week at most,
+  stored only as a digest, superseded by any newer link, and it opens the
+  same *choose a new password* page, which signs every device out. The
+  admin API records the issuance and its lifetime in the audit log, never
+  the token.
+
+Without `[email]` the sign-in pages show only *Use a recovery code*, and
+there is no Email page or forgotten-password form; with it, both ways
+appear. Metrics: `spindle_password_recoveries_total{method,result}` and
+`spindle_reset_links_issued_total` ([metrics.md](metrics.md)).
+
 ### Moving from MAS to the built-in provider
 
 What carries over, and how:
@@ -293,8 +327,8 @@ What carries over, and how:
    Email page.
 5. **Upstream identity providers** (MAS `upstream_oauth2`) are not
    supported; users who only ever signed in through one have no password
-   here and need one set (admin `reset_password`, or the reset flow once
-   they have a confirmed address).
+   here and need one set: an administrator's reset link (above) is the way,
+   with or without mail.
 
 ### Upstream identity providers (#610): not yet
 

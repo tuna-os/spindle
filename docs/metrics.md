@@ -46,7 +46,9 @@ the incident it was supposed to explain.
 | `spindle_oauth_token_grants_total` | counter | `grant` = `authorization_code`\|`refresh_token`, `result` = `success`\|`invalid_grant`\|`invalid_request`\|`error` | Built-in provider token-endpoint grants. A climbing `invalid_grant` on `refresh_token` is clients holding rotated-away tokens. |
 | `spindle_password_resets_total` | counter | `stage` = `requested`\|`completed` | Forgot-password requests (counted per submission, whether or not the address is known) and resets completed with a valid emailed link. |
 | `spindle_emails_sent_total` | counter | `kind` = `password_reset`\|`verification`, `result` = `sent`\|`failed` | Mail handed to the SMTP transport. `failed` is the relay refusing or unreachable. |
-| `spindle_account_actions_total` | counter | `action` = `profile`\|`password_change`\|`session_end`\|`deactivate`\|`email_add`\|`email_verify`\|`email_remove`\|`cross_signing_reset` | Changes made through the account-management pages. |
+| `spindle_account_actions_total` | counter | `action` = `profile`\|`password_change`\|`session_end`\|`deactivate`\|`email_add`\|`email_verify`\|`email_remove`\|`cross_signing_reset`\|`recovery_codes` | Changes made through the account-management pages (`recovery_codes`: a fresh set generated). |
+| `spindle_password_recoveries_total` | counter | `method` = `reset_link`\|`recovery_code`, `result` = `success`\|`rejected`\|`rate_limited` | Forgotten-password recoveries: a reset link (mailed or administrator-issued) or a recovery code. `rejected` is a dead link or a code that did not match. |
+| `spindle_reset_links_issued_total` | counter | — | Reset links issued through the admin API (the offline CLI cannot count into a running server). |
 
 ## Alert rules, a scrape target and a dashboard
 

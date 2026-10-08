@@ -462,6 +462,9 @@ pub enum Keyspace {
     /// `address` -> the localpart it is confirmed on: the reverse of
     /// [`Keyspace::UserEmail`], so an address belongs to one account.
     EmailOwner = 0x53,
+    /// `localpart` -> the account's one-time recovery codes, each as a
+    /// salt and the BLAKE3 digest of salt and code; never the codes.
+    RecoveryCodes = 0x54,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -1071,6 +1074,12 @@ pub fn email_owner(address: &str) -> Vec<u8> {
     let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::EmailOwner as u8];
     key.extend_from_slice(address.as_bytes());
     key
+}
+
+/// One account's recovery-code row ([`Keyspace::RecoveryCodes`]).
+#[must_use]
+pub fn recovery_codes(localpart: &str) -> Vec<u8> {
+    room_prefix(Keyspace::RecoveryCodes, localpart)
 }
 
 /// The row for one single-use login token.

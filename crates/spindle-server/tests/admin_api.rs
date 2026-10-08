@@ -158,6 +158,10 @@ fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
                 format!("{prefix}/users/{user}/password_hash"),
             ),
             (
+                reqwest::Method::POST,
+                format!("{prefix}/users/{user}/reset_link"),
+            ),
+            (
                 reqwest::Method::GET,
                 format!("{prefix}/users/{user}/devices"),
             ),
@@ -1825,4 +1829,26 @@ async fn an_imported_password_hash_signs_the_user_in() {
         !body.to_string().contains("CEd7EMae") && !body.to_string().contains("bWFzLW1p"),
         "the hash leaked into the audit log: {body}"
     );
+}
+
+/// Without the built-in provider there is no page for a reset link to
+/// open, so none is issued.
+#[tokio::test]
+async fn reset_links_need_the_builtin_provider() {
+    let server = Instance::start().await;
+    let admin_token = server.register("root").await;
+    server.promote("root");
+    server.register("alice").await;
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!(
+                "/_spindle/admin/v1/users/{}/reset_link",
+                server.user("alice")
+            ),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 404, "{body}");
 }

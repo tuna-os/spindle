@@ -82,6 +82,26 @@ with `{"password_hash": "...", "logout_devices": false}`, which also works
 while authentication is still delegated, so hashes can land before a
 cutover.
 
+## Issuing a password-reset link
+
+```
+spindle issue-reset-link <config> <localpart> [--ttl 24h]
+```
+
+For a user who cannot sign in, on a server that sends no mail (or for
+anyone, really): prints a single-use link to the built-in provider's
+*choose a new password* page, on the configured issuer. Hand it over by a
+channel you trust; whoever opens it can set the account's password, and
+doing so signs every device out. `--ttl` takes `30m`, `24h`, `2d` or
+seconds; a day by default, a week at most. Only the newest link of an
+account works, so issuing another (or the user requesting a mailed one)
+retires this one. The token is stored only as a digest. Needs
+`auth.builtin_oidc`; offline like the other commands here, and the running
+server's equivalent is `POST /_spindle/admin/v1/users/{user_id}/reset_link`
+(optional body `{"ttl": "2h"}`), which audit-logs the issuance without the
+token. Users can also recover on their own with the recovery codes the
+account pages generate — see [delegated-auth.md](delegated-auth.md).
+
 ## Migration
 
 ```

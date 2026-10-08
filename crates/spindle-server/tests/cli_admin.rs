@@ -257,3 +257,85 @@ fn set_password_hash_in_bulk_reports_each_refusal() {
     );
     assert!(accounts.verify_password("bob", "bob's own").unwrap());
 }
+
+fn builtin_config(work: &TempDir) -> std::path::PathBuf {
+    let config_path = work.path().join("builtin.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[server]\nname = \"example.org\"\npublic_base_url = \"https://matrix.example.org\"\n\
+             [storage]\npath = \"{}\"\n[auth]\nbuiltin_oidc = true\n\
+             oidc_issuer = \"https://auth.example.org/\"\n",
+            work.path().join("data").display()
+        ),
+    )
+    .unwrap();
+    config_path
+}
+
+#[test]
+fn issue_reset_link_without_arguments_prints_usage_and_fails() {
+    let output = run(&[os("issue-reset-link")]);
+    assert!(!output.status.success());
+    assert!(text(&output.stderr).contains("usage: spindle issue-reset-link"));
+}
+
+/// A link for a server that sends no mail: printed once, on the issuer,
+/// for an existing account only, within the lifetime bounds.
+#[test]
+fn issue_reset_link_prints_a_link_on_the_issuer() {
+    let work = TempDir::new().unwrap();
+    let config = builtin_config(&work);
+    {
+        let store = store_of(&config);
+        spindle_server::accounts::Accounts::new(&store, "example.org")
+            .register("alice", "before")
+            .unwrap();
+    }
+    let output = run(&[os("issue-reset-link"), config.as_os_str(), os("nobody")]);
+    assert!(!output.status.success());
+    assert!(text(&output.stderr).contains("no account named nobody"));
+    let output = run(&[
+        os("issue-reset-link"),
+        config.as_os_str(),
+        os("alice"),
+        os("--ttl"),
+        os("8d"),
+    ]);
+    assert!(!output.status.success(), "a week at most");
+    let output = run(&[
+        os("issue-reset-link"),
+        config.as_os_str(),
+        os("@alice:example.org"),
+        os("--ttl"),
+        os("2h"),
+    ]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let url = text(&output.stdout);
+    let token = url
+        .trim()
+        .strip_prefix("https://auth.example.org/account/password/reset?token=")
+        .unwrap_or_else(|| panic!("{url}"));
+    assert_eq!(token.len(), 64);
+    assert!(text(&output.stderr).contains("120 minutes"));
+    // The store holds a digest, not the token.
+    let store = store_of(&config);
+    let leaked =
+        spindle_store::ReadView::scan_prefix(&store, &spindle_core::keys::email_token_prefix())
+            .unwrap()
+            .iter()
+            .any(|(key, value)| {
+                String::from_utf8_lossy(key).contains(token)
+                    || String::from_utf8_lossy(value).contains(token)
+            });
+    assert!(!leaked, "the token is at rest in clear");
+}
+
+#[test]
+fn issue_reset_link_needs_the_builtin_provider() {
+    let work = TempDir::new().unwrap();
+    let config = config_for(&work, "data");
+    let output = run(&[os("issue-reset-link"), config.as_os_str(), os("alice")]);
+    assert!(!output.status.success());
+    assert!(text(&output.stderr).contains("builtin_oidc"));
+}

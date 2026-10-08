@@ -14,7 +14,10 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use sha2::Digest;
 use spindle_server::email::{MemoryMailer, OutgoingEmail};
-use spindle_server::metrics::{AccountAction, EmailKind, LoginMethod, LoginResult, Metrics};
+use spindle_server::metrics::{
+    AccountAction, EmailKind, LoginMethod, LoginResult, Metrics, PasswordRecoveryMethod,
+    PasswordRecoveryResult,
+};
 use spindle_store::FjallStore;
 use tempfile::TempDir;
 
@@ -23,6 +26,7 @@ const REDIRECT: &str = "https://element.example/callback";
 
 struct Instance {
     _dir: TempDir,
+    store: Arc<FjallStore>,
     name: String,
     metrics: Arc<Metrics>,
     client: reqwest::Client,
@@ -39,13 +43,15 @@ impl Instance {
         ))
         .unwrap();
         let metrics = Arc::new(Metrics::new());
-        let app = spindle_server::app_with_metrics(config, store, Arc::clone(&metrics))
-            .expect("the app builds");
+        let app =
+            spindle_server::app_with_metrics(config, Arc::clone(&store), Arc::clone(&metrics))
+                .expect("the app builds");
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
         Instance {
             _dir: dir,
+            store,
             name,
             metrics,
             client: reqwest::Client::builder()
@@ -910,7 +916,7 @@ impl Instance {
         let mailer = Arc::new(MemoryMailer::new());
         let app = spindle_server::app_with_mailer(
             config,
-            store,
+            Arc::clone(&store),
             Arc::clone(&metrics),
             Arc::clone(&mailer) as Arc<dyn spindle_server::email::Mailer>,
         )
@@ -920,6 +926,7 @@ impl Instance {
         });
         let instance = Instance {
             _dir: dir,
+            store,
             name,
             metrics,
             client: reqwest::Client::builder()
@@ -1338,10 +1345,333 @@ async fn without_mail_there_is_no_email_surface() {
     let mut browser = Browser::default();
     let page = browser.get(&server, "/account/login").await;
     assert!(!page.body.contains("forgot"), "{}", page.body);
-    for path in [
-        "/account/password/forgot",
-        "/account/password/reset?token=x",
-    ] {
-        assert_eq!(browser.get(&server, path).await.status, 404, "{path}");
+    assert!(page.body.contains("/account/recover"), "{}", page.body);
+    assert_eq!(
+        browser
+            .get(&server, "/account/password/forgot")
+            .await
+            .status,
+        404
+    );
+    // The reset page itself is served (an administrator's link opens it);
+    // a token it does not know is a dead link.
+    assert_eq!(
+        browser
+            .get(&server, "/account/password/reset?token=x")
+            .await
+            .status,
+        400
+    );
+    // No email page either.
+    server.register("carol").await;
+    browser.sign_in(&server, "carol", PASSWORD).await;
+    let page = browser.get(&server, "/account/").await;
+    assert!(!page.body.contains("action=emails"), "{}", page.body);
+    assert!(page.body.contains("action=recovery"), "{}", page.body);
+}
+
+/// The sign-in pages offer both ways back when mail is configured.
+#[tokio::test]
+async fn with_mail_both_recovery_links_show() {
+    let (server, _mailer) = Instance::with_mail("[ratelimit]\nenabled = false\n").await;
+    let mut browser = Browser::default();
+    let page = browser.get(&server, "/account/login").await;
+    assert!(page.body.contains("/account/password/forgot"));
+    assert!(page.body.contains("/account/recover"));
+}
+
+async fn recover(
+    server: &Instance,
+    browser: &mut Browser,
+    username: &str,
+    code: &str,
+    password: &str,
+) -> Page {
+    let csrf = browser.get(server, "/account/recover").await.field("csrf");
+    browser
+        .post(
+            server,
+            "/account/recover",
+            &[
+                ("csrf", &csrf),
+                ("username", username),
+                ("code", code),
+                ("new_password", password),
+                ("confirm_password", password),
+            ],
+        )
+        .await
+}
+
+/// Recovery codes, the no-mail way back: generated behind the password,
+/// shown once, each good once, a new set retiring the old, and a used code
+/// ending every session — counted, with the attempt budget of a login.
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end flow, read top to bottom"
+)]
+async fn recovery_codes_reset_a_forgotten_password() {
+    let server = Instance::builtin().await;
+    let token = server.register("alice").await;
+    let mut browser = Browser::default();
+    browser.sign_in(&server, "alice", PASSWORD).await;
+    let page = browser.get(&server, "/account/?action=recovery").await;
+    assert!(page.body.contains("no recovery codes"), "{}", page.body);
+    let csrf = page.field("csrf");
+    let page = browser
+        .post(
+            &server,
+            "/account/recovery/generate",
+            &[("csrf", &csrf), ("password", "wrong")],
+        )
+        .await;
+    assert_eq!(page.status, 401, "generating needs the password");
+    let page = browser
+        .post(
+            &server,
+            "/account/recovery/generate",
+            &[("csrf", &csrf), ("password", PASSWORD)],
+        )
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert_eq!(page.headers["cache-control"], "no-store");
+    let codes: Vec<String> = page
+        .body
+        .split("<li><code>")
+        .skip(1)
+        .map(|rest| rest.split('<').next().unwrap().to_owned())
+        .collect();
+    assert_eq!(codes.len(), 10, "{}", page.body);
+    let page = browser.get(&server, "/account/?action=recovery").await;
+    assert!(page.body.contains("<strong>10</strong>"), "{}", page.body);
+    assert!(!page.body.contains(&codes[0]), "shown once");
+
+    // Regenerating retires the first set.
+    let csrf = page.field("csrf");
+    let page = browser
+        .post(
+            &server,
+            "/account/recovery/generate",
+            &[("csrf", &csrf), ("password", PASSWORD)],
+        )
+        .await;
+    let fresh: Vec<String> = page
+        .body
+        .split("<li><code>")
+        .skip(1)
+        .map(|rest| rest.split('<').next().unwrap().to_owned())
+        .collect();
+    let mut stranger = Browser::default();
+    let page = recover(&server, &mut stranger, "alice", &codes[0], "recovered-pass").await;
+    assert_eq!(page.status, 401, "an old code is dead");
+    let page = recover(
+        &server,
+        &mut stranger,
+        "nobody",
+        &fresh[0],
+        "recovered-pass",
+    )
+    .await;
+    assert_eq!(page.status, 401, "a code is bound to its account");
+    let page = recover(&server, &mut stranger, "alice", &fresh[0], "short").await;
+    assert_eq!(
+        page.status, 400,
+        "a bad new password does not spend the code"
+    );
+    let page = recover(&server, &mut stranger, "alice", &fresh[0], "recovered-pass").await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("9 recovery codes left"), "{}", page.body);
+    let page = recover(&server, &mut stranger, "alice", &fresh[0], "another-pass1").await;
+    assert_eq!(page.status, 401, "each code works once");
+
+    let (status, _) = server
+        .api(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 401, "recovery signs every device out");
+    assert_eq!(browser.get(&server, "/account/").await.status, 303);
+    let (status, _) = server.password_login("alice", "recovered-pass", "D").await;
+    assert_eq!(status, 200);
+
+    assert_eq!(
+        server
+            .metrics
+            .account_action_count(AccountAction::RecoveryCodes),
+        2
+    );
+    assert_eq!(
+        server.metrics.password_recovery_count(
+            PasswordRecoveryMethod::RecoveryCode,
+            PasswordRecoveryResult::Success
+        ),
+        1
+    );
+    assert_eq!(
+        server.metrics.password_recovery_count(
+            PasswordRecoveryMethod::RecoveryCode,
+            PasswordRecoveryResult::Rejected
+        ),
+        3
+    );
+}
+
+/// Recovery-code guesses spend the login budget.
+#[tokio::test]
+async fn recovery_code_guesses_are_rate_limited() {
+    let server = Instance::start("[auth]\nbuiltin_oidc = true\n").await;
+    server.register("alice").await;
+    let mut stranger = Browser::default();
+    for _ in 0..5 {
+        let page = recover(
+            &server,
+            &mut stranger,
+            "alice",
+            "AAAA-BBBB-CCCC-DDDD",
+            "new-password",
+        )
+        .await;
+        assert_eq!(page.status, 401);
     }
+    let page = recover(
+        &server,
+        &mut stranger,
+        "alice",
+        "AAAA-BBBB-CCCC-DDDD",
+        "new-password",
+    )
+    .await;
+    assert_eq!(page.status, 429);
+    assert_eq!(
+        server.metrics.password_recovery_count(
+            PasswordRecoveryMethod::RecoveryCode,
+            PasswordRecoveryResult::RateLimited
+        ),
+        1
+    );
+}
+
+/// An administrator's reset link: returned once by the admin API, audited
+/// without the token, opening the same page a mailed link does, single-use,
+/// newest-only, and signing every device out.
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end flow, read top to bottom"
+)]
+async fn an_admin_reset_link_needs_no_mail() {
+    let server = Instance::builtin().await;
+    let admin_token = server.register("root").await;
+    assert!(
+        spindle_server::accounts::Accounts::new(server.store.as_ref(), &server.name)
+            .set_admin("root", true)
+            .unwrap()
+    );
+    let token = server.register("alice").await;
+    let path = format!(
+        "/_spindle/admin/v1/users/{}/reset_link",
+        server.user("alice")
+    );
+    let (status, body) = server
+        .api(reqwest::Method::POST, &path, Some(&token), Some(json!({})))
+        .await;
+    assert_eq!(status, 403, "admins only: {body}");
+    let (status, body) = server
+        .api(
+            reqwest::Method::POST,
+            &path,
+            Some(&admin_token),
+            Some(json!({ "ttl": "9d" })),
+        )
+        .await;
+    assert_eq!(status, 400, "a week at most: {body}");
+    let (status, first) = server
+        .api(reqwest::Method::POST, &path, Some(&admin_token), None)
+        .await;
+    assert_eq!(status, 200, "{first}");
+    let (status, second) = server
+        .api(
+            reqwest::Method::POST,
+            &path,
+            Some(&admin_token),
+            Some(json!({ "ttl": "2h" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{second}");
+    let url = |body: &Value| {
+        let url = body["reset_url"].as_str().unwrap().to_owned();
+        assert!(
+            url.starts_with(&server.url("/account/password/reset?token=")),
+            "{url}"
+        );
+        url.split_once(&server.name).unwrap().1.to_owned()
+    };
+    let (first, second) = (url(&first), url(&second));
+    let mut stranger = Browser::default();
+    assert_eq!(
+        stranger.get(&server, &first).await.status,
+        400,
+        "the newer link supersedes the older"
+    );
+    let page = stranger.get(&server, &second).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    let reset_token = page.field("token");
+    let reset = |password: &'static str| {
+        let reset_token = reset_token.clone();
+        let server = &server;
+        async move {
+            Browser::default()
+                .post(
+                    server,
+                    "/account/password/reset",
+                    &[
+                        ("token", reset_token.as_str()),
+                        ("new_password", password),
+                        ("confirm_password", password),
+                    ],
+                )
+                .await
+        }
+    };
+    assert_eq!(reset("set-by-link").await.status, 200);
+    assert_eq!(reset("again-by-link").await.status, 400, "single use");
+    let (status, _) = server
+        .api(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 401);
+    let (status, _) = server.password_login("alice", "set-by-link", "D").await;
+    assert_eq!(status, 200);
+
+    let (_, audit) = server
+        .api(
+            reqwest::Method::GET,
+            "/_spindle/admin/v1/audit?action=issue_reset_link",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(audit["total"], 2, "{audit}");
+    assert!(
+        !audit.to_string().contains(&reset_token),
+        "a token in the audit log"
+    );
+    assert_eq!(server.metrics.reset_links_issued(), 2);
+    assert_eq!(
+        server.metrics.password_recovery_count(
+            PasswordRecoveryMethod::ResetLink,
+            PasswordRecoveryResult::Success
+        ),
+        1
+    );
+    // Not an email reset.
+    assert_eq!(server.metrics.password_reset_counts(), (0, 0));
 }

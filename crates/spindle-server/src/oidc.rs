@@ -519,11 +519,7 @@ fn login_page(
     let notice = error.map_or(String::new(), |message| {
         format!("<p class=\"error\">{}</p>", escape(message))
     });
-    let forgot = if crate::email::configured(state) {
-        "<p><a href=\"/account/password/forgot\">Forgot your password?</a></p>"
-    } else {
-        ""
-    };
+    let forgot = crate::recovery::recovery_links(state);
     let body = format!(
         "<form method=\"post\" action=\"/oauth2/authorize\">\
          <h1>Sign in to {server}</h1>\

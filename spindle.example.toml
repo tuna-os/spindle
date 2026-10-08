@@ -260,6 +260,10 @@ registrations = []
 # homeserver_secret = "..."
 
 # Outgoing mail for the built-in provider (#608; needs builtin_oidc = true).
+# Entirely optional: without it, users recover a forgotten password with the
+# one-time recovery codes the account pages generate, or with a reset link
+# an administrator issues (`spindle issue-reset-link`, or the admin API's
+# users/{user_id}/reset_link). See docs/delegated-auth.md.
 # With it, users can confirm an email address on the account pages
 # ({issuer}/account/) and reset a forgotten password from a link mailed to
 # it; without it, neither page is offered and nothing is ever mailed. Links

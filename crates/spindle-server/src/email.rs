@@ -42,7 +42,7 @@ use crate::accounts::Accounts;
 use crate::auth::Authenticated;
 use crate::config::{EmailConfig, EmailTls};
 use crate::errors::MatrixError;
-use crate::metrics::{AccountAction, EmailKind};
+use crate::metrics::{AccountAction, EmailKind, PasswordRecoveryMethod, PasswordRecoveryResult};
 use crate::ratelimit::{
     EMAIL_PER_USER, FAILED_LOGIN_PER_SOURCE, RESET_REQUEST_PER_ADDRESS, RESET_REQUEST_PER_SOURCE,
 };
@@ -321,13 +321,30 @@ pub(crate) fn forget_account(state: &AppState, localpart: &str) -> Result<(), Ma
     for (address, _) in addresses_of(state, localpart)? {
         unbind(state, localpart, &address)?;
     }
-    drop_tokens(state, |row| row.localpart == localpart)
+    drop_tokens(state.store.as_ref(), |row| row.localpart == localpart)
+}
+
+/// Drop every outstanding reset link of an account — what any other
+/// successful recovery does, so an older link cannot undo it.
+///
+/// # Errors
+///
+/// A storage error.
+pub(crate) fn drop_reset_links(
+    store: &spindle_store::FjallStore,
+    localpart: &str,
+) -> Result<(), MatrixError> {
+    drop_tokens(store, |row| {
+        row.kind == TokenKind::Reset && row.localpart == localpart
+    })
 }
 
 /// Delete every token row `doomed` picks, and every lapsed one.
-fn drop_tokens(state: &AppState, doomed: impl Fn(&TokenRow) -> bool) -> Result<(), MatrixError> {
+fn drop_tokens(
+    store: &spindle_store::FjallStore,
+    doomed: impl Fn(&TokenRow) -> bool,
+) -> Result<(), MatrixError> {
     let now = web::now_ms();
-    let store = state.store.as_ref();
     for (key, raw) in
         ReadView::scan_prefix(store, &keys::email_token_prefix()).map_err(|e| storage(&e))?
     {
@@ -342,13 +359,13 @@ fn drop_tokens(state: &AppState, doomed: impl Fn(&TokenRow) -> bool) -> Result<(
 /// Mint a link token. A new reset link supersedes the account's earlier
 /// ones: only the newest mail in the inbox works.
 fn issue_token(
-    state: &AppState,
+    store: &spindle_store::FjallStore,
     kind: TokenKind,
     localpart: &str,
     address: &str,
     lifetime_ms: u64,
 ) -> Result<String, MatrixError> {
-    drop_tokens(state, |row| {
+    drop_tokens(store, |row| {
         kind == TokenKind::Reset && row.kind == TokenKind::Reset && row.localpart == localpart
     })?;
     let token = web::random_secret();
@@ -359,7 +376,7 @@ fn issue_token(
         expires_ms: web::now_ms().saturating_add(lifetime_ms),
     };
     Store::put(
-        state.store.as_ref(),
+        store,
         &keys::email_token(&web::digest(&token)),
         &encode(&row)?,
     )
@@ -387,6 +404,80 @@ fn token_row(
         Store::delete(state.store.as_ref(), &key).map_err(|e| storage(&e))?;
     }
     Ok(decode::<TokenRow>(&raw).filter(|row| row.kind == kind && row.expires_ms > web::now_ms()))
+}
+
+/// The longest an administrator's reset link may live: a week.
+pub const MAX_RESET_LINK_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// The default lifetime of an administrator's reset link: a day, long
+/// enough to reach the user by whatever channel the operator has.
+pub const DEFAULT_RESET_LINK_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Parse a lifetime like `24h`, `30m`, `2d` or `900s` (a bare number is
+/// seconds) into milliseconds, refusing zero and anything past a week.
+///
+/// # Errors
+///
+/// What is wrong with it.
+pub fn parse_ttl(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let (digits, unit) = text.split_at(
+        text.find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(text.len()),
+    );
+    let count: u64 = digits
+        .parse()
+        .map_err(|_| format!("{text:?} is not a lifetime such as 24h, 30m or 2d"))?;
+    let unit_ms = match unit {
+        "" | "s" => 1000,
+        "m" => 60 * 1000,
+        "h" => 60 * 60 * 1000,
+        "d" => 24 * 60 * 60 * 1000,
+        _ => return Err(format!("{text:?} is not a lifetime such as 24h, 30m or 2d")),
+    };
+    let ttl = count.saturating_mul(unit_ms);
+    if ttl == 0 || ttl > MAX_RESET_LINK_TTL_MS {
+        return Err("a reset link lives more than nothing and at most 7d".to_owned());
+    }
+    Ok(ttl)
+}
+
+/// Mint a password-reset link for `localpart` on an administrator's say-so
+/// — the recovery path that needs no mail. It is the same token as a mailed
+/// reset (single-use, digest at rest, newest only: earlier links of the
+/// account die) and opens the same page, which signs every device out.
+/// Returns the URL, the only time the token exists in clear, and when it
+/// lapses.
+///
+/// # Errors
+///
+/// When the account does not exist, is deactivated, or the store fails.
+pub fn issue_reset_link(
+    store: &spindle_store::FjallStore,
+    config: &crate::Config,
+    localpart: &str,
+    ttl_ms: u64,
+) -> Result<(String, u64), String> {
+    let account = Accounts::new(store, &config.server.name)
+        .account(localpart)
+        .map_err(|error| error.to_string())?;
+    match account {
+        None => return Err(format!("no account named {localpart}")),
+        Some(account) if account.deactivated => {
+            return Err(format!("{localpart} is deactivated"));
+        }
+        Some(_) => {}
+    }
+    let token =
+        issue_token(store, TokenKind::Reset, localpart, "", ttl_ms).map_err(|error| error.error)?;
+    let expires = web::now_ms().saturating_add(ttl_ms);
+    Ok((
+        format!(
+            "{}/account/password/reset?token={token}",
+            config.oidc_issuer_base()
+        ),
+        expires,
+    ))
 }
 
 /// Hand a message to the mailer in a task of its own, counting the
@@ -521,7 +612,7 @@ async fn add_email(
     let owner = owner_of(&state, &address)?;
     if owner.is_none() {
         let token = issue_token(
-            &state,
+            state.store.as_ref(),
             TokenKind::Verify,
             &session.localpart,
             &address,
@@ -589,7 +680,7 @@ fn dead_link(state: &AppState) -> Response {
         state,
         StatusCode::BAD_REQUEST,
         "That link has expired",
-        "Links in our emails work once, for a limited time. Ask for a new one.",
+        "Reset and confirmation links work once, for a limited time. Ask for a new one.",
     )
 }
 
@@ -788,7 +879,7 @@ fn send_reset_link(state: &AppState, address: &str) -> Result<(), MatrixError> {
         return Ok(());
     }
     let token = issue_token(
-        state,
+        state.store.as_ref(),
         TokenKind::Reset,
         &localpart,
         address,
@@ -848,9 +939,7 @@ async fn reset_page(
     State(state): State<AppState>,
     Query(query): Query<TokenQuery>,
 ) -> Result<Response, MatrixError> {
-    if !configured(&state) {
-        return Err(not_configured());
-    }
+    crate::oidc::provider(&state)?;
     let token = query.token.unwrap_or_default();
     let Some(row) = token_row(&state, &token, TokenKind::Reset, false)? else {
         return Ok(dead_link(&state));
@@ -876,14 +965,16 @@ async fn reset(
     source: ClientAddr,
     Form(form): Form<ResetForm>,
 ) -> Result<Response, MatrixError> {
-    if !configured(&state) {
-        return Err(not_configured());
-    }
+    crate::oidc::provider(&state)?;
     if state
         .limiter
         .check(&format!("reset:redeem:{source}"), FAILED_LOGIN_PER_SOURCE)
         .is_err()
     {
+        state.metrics.record_password_recovery(
+            PasswordRecoveryMethod::ResetLink,
+            PasswordRecoveryResult::RateLimited,
+        );
         return Ok(crate::account::message_page(
             &state,
             StatusCode::TOO_MANY_REQUESTS,
@@ -892,8 +983,16 @@ async fn reset(
         ));
     }
     let Some(peeked) = token_row(&state, &form.token, TokenKind::Reset, false)? else {
+        state.metrics.record_password_recovery(
+            PasswordRecoveryMethod::ResetLink,
+            PasswordRecoveryResult::Rejected,
+        );
         return Ok(dead_link(&state));
     };
+    let method = PasswordRecoveryMethod::ResetLink;
+    // An admin-issued link carries no address; a mailed one names the
+    // address it went to.
+    let mailed = !peeked.email.is_empty();
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     if let Some(problem) = web::new_password_problem(&form.new_password, &form.confirm_password) {
         let user_id = accounts.user_id(&peeked.localpart);
@@ -910,7 +1009,12 @@ async fn reset(
     };
     // Still this address's account? An address removed, or moved, after
     // the mail went out takes its links with it.
-    if owner_of(&state, &row.email)?.as_deref() != Some(row.localpart.as_str()) {
+    if !row.email.is_empty()
+        && owner_of(&state, &row.email)?.as_deref() != Some(row.localpart.as_str())
+    {
+        state
+            .metrics
+            .record_password_recovery(method, PasswordRecoveryResult::Rejected);
         return Ok(dead_link(&state));
     }
     let changed = accounts
@@ -923,10 +1027,15 @@ async fn reset(
         .logout_everywhere(&row.localpart)
         .map_err(|e| storage(&e))?;
     web::end_browser_sessions_of(&state, &row.localpart, None)?;
-    drop_tokens(&state, |other| {
+    drop_tokens(state.store.as_ref(), |other| {
         other.kind == TokenKind::Reset && other.localpart == row.localpart
     })?;
-    state.metrics.record_password_reset_completed();
+    if mailed {
+        state.metrics.record_password_reset_completed();
+    }
+    state
+        .metrics
+        .record_password_recovery(method, PasswordRecoveryResult::Success);
     Ok(crate::account::message_page(
         &state,
         StatusCode::OK,
