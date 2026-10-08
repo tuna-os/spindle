@@ -18,14 +18,14 @@ Location: `crates/spindle-core/src/`
 - `log.rs` — Append-only event log with index
 - `state.rs` — Room state storage
 - `pdu.rs` — Event type
-- `keys.rs` — Ed25519 signing
+- `keys.rs` — Ed25519 signatures
 - `version.rs` — Room versions
 
 ## spindle-store
 
 Location: `crates/spindle-store/src/`
 
-Durable storage. Provides APIs for reading and writing logs and state.
+Durable storage. Provides APIs to read and write logs and state.
 
 ## spindle-server
 
@@ -37,14 +37,14 @@ HTTP endpoints. Main modules:
 - `federation.rs` — Federation
 - `accounts.rs` — Accounts
 - `authorize.rs` — Access control
-- `devices.rs` — Device tracking
+- `devices.rs` — Device records
 - `media.rs` — File operations
 - `push.rs` — Notifications
 - `presence.rs` — Presence
 - `profiles.rs` — Profiles
 - `routes.rs` — HTTP routes
 - `config.rs` — Configuration
-- `errors.rs` — Error handling
+- `errors.rs` — Error types
 - `metrics.rs` — Metrics
 
 ## AppState
@@ -96,7 +96,7 @@ grep -n "POST /sync" crates/spindle-server/src/routes.rs
 2. Handler checks access
 3. Store appends to log
 4. `spindle-core` updates state
-5. Subscribers are notified
+5. `spindle-server` notifies subscribers
 
 ### Debug
 
@@ -114,7 +114,7 @@ RUST_LOG=debug cargo run
 
 ## Performance
 
-Add `debug_assert!()` for counting operations. Do not use timing tests.
+Add `debug_assert!()` to count operations. Do not use timing tests.
 
 Add metrics to `metrics.rs`. View at `/metrics`.
 
