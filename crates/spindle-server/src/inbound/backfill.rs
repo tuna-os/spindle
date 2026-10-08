@@ -269,6 +269,19 @@ fn next_due(live: &Live) -> Option<Due> {
     due.into_iter().next()
 }
 
+/// Set the open-gaps gauge from the markers as they stand now.
+fn refresh_gaps_remaining(peers: &Peers<'_>) {
+    if let Ok(markers) = peers.rooms.all_federation_gaps() {
+        let open = markers
+            .iter()
+            .filter(|(_, marker)| GapProgress::of(marker).status == "open")
+            .count();
+        peers
+            .metrics
+            .set_gaps_remaining(u64::try_from(open).unwrap_or(u64::MAX));
+    }
+}
+
 /// Fill one chunk of one gap and record how it went.
 async fn step(peers: &Peers<'_>, backfill: &GapBackfill, due: &Due, settings: Settings) {
     let started = Instant::now();
@@ -283,6 +296,12 @@ async fn step(peers: &Peers<'_>, backfill: &GapBackfill, due: &Due, settings: Se
     .await;
     let failure = match attempt {
         Ok(Ok(outcome)) => {
+            if outcome.complete {
+                // The gap just closed: the gauge says so before the chunk is
+                // counted, not one idle interval later at the next scan, so
+                // whoever sees the completion sees the gauge agree with it.
+                refresh_gaps_remaining(peers);
+            }
             let result = if outcome.complete {
                 BackfillChunk::Completed
             } else {
