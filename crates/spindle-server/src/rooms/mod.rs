@@ -6447,6 +6447,32 @@ impl Rooms {
         .ok_or_else(|| RoomError::MissingBody(event_id.as_str().to_owned()))?;
         Ok(serde_json::from_slice(&raw)?)
     }
+
+    /// The `sender` of a stored event, as [`Self::read_event`] followed by
+    /// `["sender"].as_str().unwrap_or("")` would give it, without building
+    /// the rest of the body. The unread index reads this for every event it
+    /// indexes and nothing else, and the event's content is most of its
+    /// size.
+    fn read_sender(&self, room_id: &str, event_id: &EventId) -> Result<String, RoomError> {
+        #[derive(serde::Deserialize)]
+        struct Sender<'a> {
+            #[serde(borrow, default)]
+            sender: Option<std::borrow::Cow<'a, str>>,
+        }
+        let raw = spindle_store::ReadView::get(
+            self.store.as_ref(),
+            &event_body_key(room_id, event_id.as_str()),
+        )?
+        .ok_or_else(|| RoomError::MissingBody(event_id.as_str().to_owned()))?;
+        if let Ok(Sender { sender }) = serde_json::from_slice::<Sender<'_>>(&raw) {
+            return Ok(sender.map(std::borrow::Cow::into_owned).unwrap_or_default());
+        }
+        // Whatever the narrow read refuses -- a sender that is not a
+        // string, a repeated key -- is answered the way the whole-body
+        // read answers it, errors included.
+        let event: Value = serde_json::from_slice(&raw)?;
+        Ok(event["sender"].as_str().unwrap_or("").to_owned())
+    }
 }
 
 /// One cold load in flight ([`Rooms::room_or_load`]): its outcome once it

@@ -64,15 +64,10 @@ fn time<T>(label: &str, work: impl FnOnce() -> T) -> T {
     out
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "resource-envelope measurement; run explicitly with --ignored --release"]
-async fn profile_first_sliding_sync_over_a_huge_room() {
-    let events: usize = std::env::var("SPINDLE_COLD_EVENTS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(100_000);
-    let dir = TempDir::new().unwrap();
-    let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+/// A room alice created and bob joined, then `events` messages from
+/// alice, with alice's receipt on the last. Returns alice's token and the
+/// room.
+fn seed(store: &Arc<FjallStore>, events: usize) -> (String, String) {
     let key = spindle_server::signing::ServerKey::load_or_create(store.as_ref()).unwrap();
     let accounts = spindle_server::accounts::Accounts::new(store.as_ref(), SERVER);
     accounts.register("alice", "hunter2").unwrap();
@@ -82,7 +77,7 @@ async fn profile_first_sliding_sync_over_a_huge_room() {
         .unwrap()
         .access_token;
     let room = {
-        let rooms = spindle_server::rooms::Rooms::new(Arc::clone(&store), SERVER);
+        let rooms = spindle_server::rooms::Rooms::new(Arc::clone(store), SERVER);
         let room = rooms
             .create(
                 ALICE,
@@ -124,12 +119,25 @@ async fn profile_first_sliding_sync_over_a_huge_room() {
             .unwrap();
         room
     };
+    (token, room)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "resource-envelope measurement; run explicitly with --ignored --release"]
+async fn profile_first_sliding_sync_over_a_huge_room() {
+    let events: usize = std::env::var("SPINDLE_COLD_EVENTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(100_000);
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+    let (token, room) = seed(&store, events);
 
     println!("restart 1, phase by phase:");
     {
         let (app, state) = restarted(&store);
         time("cold load (Rooms::warm)", || {
-            state.rooms.warm(&room).unwrap()
+            state.rooms.warm(&room).unwrap();
         });
         time("first unread count", || {
             state.rooms.unread(&room, ALICE).unwrap()
@@ -165,7 +173,7 @@ async fn profile_first_sliding_sync_over_a_huge_room() {
     {
         let (_app, state) = restarted(&store);
         time("cold load (Rooms::warm)", || {
-            state.rooms.warm(&room).unwrap()
+            state.rooms.warm(&room).unwrap();
         });
         time("first unread count, boundary at join", || {
             state.rooms.unread(&room, BOB).unwrap()
