@@ -726,13 +726,13 @@ async fn a_leave_the_client_sends_itself_spends_the_delay() {
     let (_, content) = harness.state(&room, &bob, MEMBER, &key).await;
     assert_eq!(content, json!({}), "left, immediately");
     assert!(harness.pending(&alice).await.is_empty());
-    // Nothing left to restart. MSC4140 as merged says so with a 409 -- the
-    // delay is known, and was sent -- which matrix-js-sdk's membership
-    // manager and lk-jwt-service both read as final, as they read a 404.
+    // Nothing left to restart. A 404 on the unstable endpoint Element Call
+    // calls: the merged MSC's 409 is the stable endpoint's, because the
+    // js-sdk in shipping Element Call ends the call on a 409.
     let (status, body) = harness.act(&delay_id, &alice, "restart").await;
     assert_eq!(
         status,
-        StatusCode::CONFLICT,
+        StatusCode::NOT_FOUND,
         "nothing left to restart: {body}"
     );
 }

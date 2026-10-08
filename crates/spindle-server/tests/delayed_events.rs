@@ -321,10 +321,14 @@ async fn send_delivers_it_immediately_and_only_once() {
         .filter(|body| body == "now")
         .count();
     assert_eq!(sent, 1, "the delay survived being sent, and was sent twice");
-    // And what conflicts with having been sent is a 409.
+    // And what conflicts with having been sent is "not found" on this
+    // unstable endpoint, as it always was here and still is on Synapse --
+    // the 409 MSC4140 settled on is the stable endpoint's
+    // (delayed_events_merged.rs), because a js-sdk built before it ends
+    // the call on one.
     for action in ["cancel", "restart"] {
         let (status, body) = harness.act(&delay_id, &alice, action).await;
-        assert_eq!(status, StatusCode::CONFLICT, "{action}: {body}");
+        assert_eq!(status, StatusCode::NOT_FOUND, "{action}: {body}");
     }
 }
 
@@ -1229,12 +1233,12 @@ async fn a_delegate_restarts_and_sends_with_only_the_delay_id() {
         "the delegate's send did not send it, as alice"
     );
     // Sent once. A second send succeeds without sending again (MSC4140's
-    // retry rule), and a restart after it is the 409 lk-jwt-service reads
-    // as final.
+    // retry rule), and a restart after it is the 404 lk-jwt-service before
+    // 0.7 reads as "gone" -- it retries a 409 until its deadline.
     let (status, body) = act_by_id(&harness, &delay_id, "send").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = act_by_id(&harness, &delay_id, "restart").await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     let sent = harness
         .timeline_bodies(&room, &alice)
         .await

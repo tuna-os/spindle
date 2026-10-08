@@ -8814,17 +8814,26 @@ async fn delayed_event_action(
             request.action
         ))
     })?;
-    act_on_delay(&state, &delay_id, Some(&identity.user_id), action)
+    act_on_delay(&state, &delay_id, Some(&identity.user_id), action, false)
 }
 
 /// Apply `action` to a delay -- the caller's when `owner` names them, the
 /// holder of the id's otherwise -- and do what follows from it: send the
 /// event for `send`, record the outcome for `cancel`.
+///
+/// `stable` picks how an action that contradicts a finished delay is
+/// refused. MSC4140 as merged says 409, and the stable endpoint says so.
+/// The unstable endpoints keep the 404 they have always given, because the
+/// clients calling them were built against it: matrix-js-sdk before October
+/// 2026 treats a 409 on `restart` or `cancel` as unrecoverable and ends the
+/// call, and lk-jwt-service before 0.7 retries a 409 until its deadline
+/// where a 404 tells it the delay is gone. Synapse answers 404 there too.
 fn act_on_delay(
     state: &AppState,
     delay_id: &str,
     owner: Option<&str>,
     action: crate::delayed::Action,
+    stable: bool,
 ) -> Result<Json<Value>, MatrixError> {
     let pending = state
         .delayed
@@ -8834,7 +8843,12 @@ fn act_on_delay(
         Some(owner) => state.delayed.act(delay_id, owner, action),
         None => state.delayed.act_by_id(delay_id, action),
     }
-    .map_err(delay_error)?;
+    .map_err(|error| match error {
+        crate::delayed::DelayError::Conflict if !stable => {
+            delay_error(crate::delayed::DelayError::NotFound)
+        }
+        other => delay_error(other),
+    })?;
     if let Some(event) = acted {
         send_delayed_now(state, &event)?;
     } else if action == crate::delayed::Action::Cancel {
@@ -8956,6 +8970,7 @@ async fn delayed_event_action_by_id(
         &delay_id,
         identity.as_ref().map(|identity| identity.user_id.as_str()),
         action,
+        false,
     )
 }
 
@@ -8974,7 +8989,7 @@ async fn delayed_event_action_stable(
             format!("no delayed-event action {action:?}"),
         )
     })?;
-    act_on_delay(&state, &delay_id, Some(&identity.user_id), action)
+    act_on_delay(&state, &delay_id, Some(&identity.user_id), action, true)
 }
 
 /// The body of MSC4140's scheduling endpoint.

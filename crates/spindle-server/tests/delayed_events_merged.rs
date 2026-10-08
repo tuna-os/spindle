@@ -397,6 +397,27 @@ async fn an_action_after_the_end_agrees_or_conflicts() {
         .act("ffffffffffffffffffffffffffffffff", Some(&alice), "cancel")
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // On the unstable endpoint a contradiction stays the 404 shipping
+    // clients were built against; agreement is still a success.
+    let (status, body) = harness
+        .call(
+            "POST",
+            &format!("{UNSTABLE}/delayed_events/{cancelled}/restart"),
+            Some(&alice),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) = harness
+        .call(
+            "POST",
+            &format!("{UNSTABLE}/delayed_events/{cancelled}/cancel"),
+            None,
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 /// The stable management endpoint needs a token, and the delay must be the
