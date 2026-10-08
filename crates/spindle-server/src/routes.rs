@@ -217,11 +217,16 @@ async fn observe(
         next.run(request).instrument(span.clone()).await
     };
     span.record("http.response.status_code", response.status().as_u16());
+    let long_poll = response
+        .extensions()
+        .get::<crate::metrics::LongPoll>()
+        .is_some();
     state.metrics.observe_request(
         &route,
         &method,
         response.status().as_u16(),
         started.elapsed(),
+        long_poll,
     );
     response
 }
@@ -6715,7 +6720,7 @@ async fn sliding_sync(
     Authenticated(identity): Authenticated,
     axum::extract::Query(query): axum::extract::Query<SlidingQuery>,
     Json(request): Json<crate::sliding::SlidingRequest>,
-) -> Result<Json<Value>, MatrixError> {
+) -> Result<axum::response::Response, MatrixError> {
     let (stream_pos, previous_windows) = match query.pos.as_deref() {
         Some(pos) => {
             let (stream, windows) = crate::sliding::decode_pos(pos);
@@ -6730,6 +6735,9 @@ async fn sliding_sync(
         .map_err(MatrixError::bad_json)?;
 
     let timeout_ms = request.timeout.or(query.timeout).unwrap_or(0).min(60_000);
+    // Timed apart from the rest (#625): a request that may wait its
+    // timeout on purpose is not latency anybody should be paged about.
+    let long_poll = since.is_some() && timeout_ms > 0;
     let position =
         sliding_long_poll(&state, since, timeout_ms, request.extensions.typing.on()).await;
 
@@ -6756,6 +6764,19 @@ async fn sliding_sync(
         },
     )
     .await
+    .map(|body| mark_long_poll(body.into_response(), long_poll))
+}
+
+/// Tag a sync response that was allowed to long-poll, so the request
+/// middleware times it under its own series (#625).
+fn mark_long_poll(
+    mut response: axum::response::Response,
+    long_poll: bool,
+) -> axum::response::Response {
+    if long_poll {
+        response.extensions_mut().insert(crate::metrics::LongPoll);
+    }
+    response
 }
 
 /// How many cold rooms one sliding-sync request loads at once. Bounded:
@@ -6929,9 +6950,9 @@ fn sliding_answer(
         state,
         identity,
         &request.extensions,
-        since,
-        position,
+        (since, position),
         &in_view,
+        &newly_in_view,
     )?;
     state.metrics.observe_sync_phase(
         crate::metrics::SyncPhase::SlidingAssemble,
@@ -6981,19 +7002,20 @@ async fn sliding_long_poll(
 
 /// The `extensions` object of a sliding-sync response.
 ///
-/// The room extensions (account data, receipts, typing) answer for every
-/// room in view, changed or not. Stateless as this endpoint is, there is no
-/// record of what a client was last told, and a receipt or a typing change
-/// bumps no stream position; repeating a window's worth is the answer that
+/// The account data and typing extensions answer for every room in view,
+/// changed or not. Stateless as this endpoint is, there is no record of
+/// what a client was last told, and an account-data or typing change bumps
+/// no stream position; repeating a window's worth is the answer that
 /// cannot silently drop one, the same trade classic sync makes for room
-/// account data.
+/// account data. Receipts do bump one (`Rooms::mark_receipt`), so their
+/// extension is incremental: see [`receipts_extension`].
 fn sliding_extensions(
     state: &AppState,
     identity: &crate::accounts::Identity,
     extensions: &crate::sliding::Extensions,
-    since: Option<u64>,
-    position: u64,
+    (since, position): (Option<u64>, u64),
     in_view: &[String],
+    newly_in_view: &std::collections::HashSet<String>,
 ) -> Result<Value, MatrixError> {
     let mut out = serde_json::Map::new();
     if !extensions.any() {
@@ -7021,7 +7043,7 @@ fn sliding_extensions(
     if extensions.receipts.on() {
         out.insert(
             "receipts".to_owned(),
-            receipts_extension(state, identity, in_view)?,
+            receipts_extension(state, identity, in_view, (since, position), newly_in_view)?,
         );
     }
     if extensions.typing.on() {
@@ -7116,36 +7138,44 @@ fn account_data_extension(
 
 /// The receipts extension: one `m.receipt` event per room in view that has
 /// any, keyed by event then by type then by reader, as the spec shapes it.
-/// A private receipt is shown to its owner and nobody else.
+/// A private receipt (and the `m.fully_read` marker) is shown to its owner
+/// and nobody else. Receipts from other servers are in the same rows.
+///
+/// Incremental once the client has seen a room (#624): with federated
+/// readers a large room holds a receipt per member, and resending every
+/// one of them on every request priced each long-poll at the room's size.
+/// A room the client has not been sent yet -- the first request, or one
+/// newly in a window -- gets the caller's own receipts and the newest
+/// [`crate::receipts::MAX_INITIAL_RECEIPTS`] of everyone else's; after that,
+/// the receipts of readers who moved since `pos`.
 fn receipts_extension(
     state: &AppState,
     identity: &crate::accounts::Identity,
     in_view: &[String],
+    (since, position): (Option<u64>, u64),
+    newly_in_view: &std::collections::HashSet<String>,
 ) -> Result<Value, MatrixError> {
+    let moved = since.map(|since| {
+        state
+            .rooms
+            .receipt_readers_since(in_view.iter().map(String::as_str), since, position)
+    });
     let mut rooms = serde_json::Map::new();
     for room_id in in_view {
-        let mut content: serde_json::Map<String, Value> = serde_json::Map::new();
-        for (user, receipt_type, event_id, ts, thread) in
-            state.rooms.room_receipts(room_id).map_err(room_error)?
-        {
-            if receipt_type == "m.read.private" && user != identity.user_id {
-                continue;
+        let rows = match &moved {
+            Some(moved) if !newly_in_view.contains(room_id) => {
+                let Some(readers) = moved.get(room_id) else {
+                    continue;
+                };
+                readers_receipts(state, room_id, readers)?
             }
-            let mut data = json!({ "ts": ts });
-            if let Some(thread) = thread {
-                data["thread_id"] = json!(thread);
-            }
-            content
-                .entry(event_id)
-                .or_insert_with(|| json!({}))
-                .as_object_mut()
-                .expect("inserted as an object")
-                .entry(receipt_type)
-                .or_insert_with(|| json!({}))
-                .as_object_mut()
-                .expect("inserted as an object")
-                .insert(user, data);
-        }
+            _ => crate::receipts::newest(
+                state.rooms.room_receipts(room_id).map_err(room_error)?,
+                &identity.user_id,
+                crate::receipts::MAX_INITIAL_RECEIPTS,
+            ),
+        };
+        let content = crate::receipts::event_content(rows, &identity.user_id);
         if !content.is_empty() {
             rooms.insert(
                 room_id.clone(),
@@ -7633,6 +7663,7 @@ async fn sync(
     // Long-poll, but only for an incremental sync: an initial sync always has
     // something to say, and blocking one would leave a first-time client
     // staring at nothing for the whole timeout.
+    let long_poll = since.is_some() && query.timeout.unwrap_or(0) > 0;
     if let Some(since) = since {
         let timeout = std::time::Duration::from_millis(query.timeout.unwrap_or(0).min(60_000));
         // A side stream (account data, to-device messages, receipts) can
@@ -7675,6 +7706,7 @@ async fn sync(
         },
     )
     .await
+    .map(|response| mark_long_poll(response, long_poll))
 }
 
 /// The body of a `/sync` response, assembled synchronously from what the
@@ -7688,7 +7720,14 @@ fn sync_answer(
     resume: crate::tokens::Resume,
 ) -> Result<axum::response::Response, MatrixError> {
     let since = resume.position();
-    let join = sync_join(state, identity, result.rooms, filter, state_label, since)?;
+    let join = sync_join(
+        state,
+        identity,
+        result.rooms,
+        filter,
+        state_label,
+        (since, result.next_batch),
+    )?;
 
     let invite = sync_invite(state, identity, result.invited, filter);
     let knock = sync_knock(state, identity, result.knocked, filter);
@@ -7975,15 +8014,38 @@ fn sticky_section(
         .map_err(room_error)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "every section of one joined room, in the order the response holds them"
+)]
 fn sync_join(
     state: &AppState,
     identity: &crate::accounts::Identity,
     rooms: Vec<crate::rooms::SyncRoom>,
     filter: Option<&crate::filters::Filter>,
     state_label: &'static str,
-    since: Option<u64>,
+    (since, until): (Option<u64>, u64),
 ) -> Result<BTreeMap<String, Box<RawValue>>, MatrixError> {
     let mut join: BTreeMap<String, Box<RawValue>> = BTreeMap::new();
+    let joined = state.rooms.joined(&identity.user_id).map_err(room_error)?;
+    // Readers whose receipt moved inside this sync's window, local or
+    // federated, per room: what an incremental sync owes as `m.receipt`.
+    let moved_receipts = since.map(|since| {
+        state
+            .rooms
+            .receipt_readers_since(joined.iter().map(String::as_str), since, until)
+    });
+    let receipts_for = |room_id: &str, timeline: &[Value]| {
+        sync_receipts(
+            state,
+            identity,
+            room_id,
+            moved_receipts
+                .as_ref()
+                .map(|moved| moved.get(room_id).map_or(&[][..], Vec::as_slice)),
+            timeline,
+        )
+    };
     for room in rooms {
         if filter.is_some_and(|f| !f.allows_room(&room.room_id)) {
             continue;
@@ -8006,6 +8068,7 @@ fn sync_join(
         let typing = state.typing.event(&room.room_id);
         let room_filter = filter.map(|filter| &filter.room);
         let events = sync_timeline(state, identity, room_filter, room.events);
+        let receipts = receipts_for(&room.room_id, &events)?;
         let mut room_state = crate::filters::Filter::apply(
             room_filter.and_then(|room| room.state.as_ref()),
             room.state,
@@ -8073,7 +8136,7 @@ fn sync_join(
             raw(&json!({
                 "events": crate::filters::Filter::apply(
                     room_filter.and_then(|room| room.ephemeral.as_ref()),
-                    typing.map(|event| vec![event]).unwrap_or_default(),
+                    typing.into_iter().chain(receipts).collect(),
                 ),
             }))?,
         );
@@ -8087,23 +8150,119 @@ fn sync_join(
         join.insert(room.room_id, raw(&entry)?);
     }
 
-    // A room where the only news is that someone is typing has no timeline
-    // events, so `Rooms::sync` leaves it out -- correctly, since it knows
-    // nothing about typing. Adding it back here is what keeps typing out of
-    // the log layer entirely.
-    for room_id in state.rooms.joined(&identity.user_id).map_err(room_error)? {
-        if join.contains_key(&room_id) || filter.is_some_and(|f| !f.allows_room(&room_id)) {
+    sync_ephemeral_only(
+        state,
+        identity,
+        filter,
+        &joined,
+        moved_receipts.as_ref(),
+        &mut join,
+    )?;
+    Ok(join)
+}
+
+/// A room where the only news is that someone is typing, or that a
+/// receipt moved, has no timeline events, so `Rooms::sync` leaves it out
+/// -- correctly, since it knows nothing about either. Adding it back here
+/// is what keeps both out of the log layer entirely.
+fn sync_ephemeral_only(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    filter: Option<&crate::filters::Filter>,
+    joined: &[String],
+    moved_receipts: Option<&std::collections::HashMap<String, Vec<String>>>,
+    join: &mut BTreeMap<String, Box<RawValue>>,
+) -> Result<(), MatrixError> {
+    for room_id in joined {
+        if join.contains_key(room_id) || filter.is_some_and(|f| !f.allows_room(room_id)) {
             continue;
         }
-        let Some(typing) = state.typing.event(&room_id) else {
-            continue;
+        // An initial sync spoke about every room already; only an
+        // incremental one has receipt-only rooms to add.
+        let receipts = match moved_receipts.and_then(|moved| moved.get(room_id)) {
+            Some(readers) => sync_receipts(state, identity, room_id, Some(readers), &[])?,
+            None => None,
         };
+        let events: Vec<Value> = state
+            .typing
+            .event(room_id)
+            .into_iter()
+            .chain(receipts)
+            .collect();
+        let events = crate::filters::Filter::apply(
+            filter.and_then(|filter| filter.room.ephemeral.as_ref()),
+            events,
+        );
+        if events.is_empty() {
+            continue;
+        }
         join.insert(
-            room_id,
-            raw(&json!({ "ephemeral": { "events": [typing] } }))?,
+            room_id.clone(),
+            raw(&json!({ "ephemeral": { "events": events } }))?,
         );
     }
-    Ok(join)
+    Ok(())
+}
+
+/// The `m.receipt` event one room's `/sync` entry carries, if any.
+///
+/// Incrementally (`moved` is `Some`), the receipts of every reader whose
+/// receipt moved in the window -- local or from another server. On an
+/// initial sync, the receipts on the events in the timeline being sent
+/// plus the caller's own (others capped at the newest
+/// [`crate::receipts::MAX_INITIAL_RECEIPTS`]): what a client draws read
+/// markers on, without shipping a ten-thousand-member room's whole receipt
+/// table on login.
+fn sync_receipts(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    room_id: &str,
+    moved: Option<&[String]>,
+    timeline: &[Value],
+) -> Result<Option<Value>, MatrixError> {
+    let rows: Vec<crate::receipts::ReceiptRow> = match moved {
+        Some([]) => return Ok(None),
+        Some(readers) => readers_receipts(state, room_id, readers)?,
+        None => {
+            let shown: std::collections::HashSet<&str> = timeline
+                .iter()
+                .filter_map(|event| event["event_id"].as_str())
+                .collect();
+            crate::receipts::newest(
+                state
+                    .rooms
+                    .room_receipts(room_id)
+                    .map_err(room_error)?
+                    .into_iter()
+                    .filter(|(user, _, event_id, _, _)| {
+                        *user == identity.user_id || shown.contains(event_id.as_str())
+                    }),
+                &identity.user_id,
+                crate::receipts::MAX_INITIAL_RECEIPTS,
+            )
+        }
+    };
+    let content = crate::receipts::event_content(rows, &identity.user_id);
+    Ok((!content.is_empty()).then(|| json!({ "type": "m.receipt", "content": content })))
+}
+
+/// Every receipt the named readers hold in a room, as rows.
+fn readers_receipts(
+    state: &AppState,
+    room_id: &str,
+    readers: &[String],
+) -> Result<Vec<crate::receipts::ReceiptRow>, MatrixError> {
+    let mut rows = Vec::new();
+    for reader in readers {
+        for (receipt_type, event_id, ts, thread) in state
+            .rooms
+            .user_receipts(room_id, reader)
+            .map_err(room_error)?
+        {
+            rows.push((reader.clone(), receipt_type, event_id, ts, thread));
+        }
+    }
+    Ok(rows)
 }
 
 /// `POST /_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}`
@@ -8132,6 +8291,16 @@ async fn set_receipt(
             request.thread_id.as_deref(),
         )
         .map_err(room_error)?;
+    // The room's other servers hear about a public receipt in their next
+    // transaction (#624); a private one never leaves.
+    crate::receipts::federate(
+        &state,
+        &room_id,
+        &identity.user_id,
+        &receipt_type,
+        &event_id,
+        request.thread_id.as_deref(),
+    );
     Ok(Json(json!({})))
 }
 
@@ -8169,6 +8338,15 @@ async fn read_markers(
                 .rooms
                 .set_receipt(&room_id, &identity.user_id, receipt_type, event_id, None)
                 .map_err(room_error)?;
+            // `m.read` federates; `m.fully_read` is the reader's own.
+            crate::receipts::federate(
+                &state,
+                &room_id,
+                &identity.user_id,
+                receipt_type,
+                event_id,
+                None,
+            );
         }
     }
     Ok(Json(json!({})))

@@ -106,6 +106,11 @@ pub struct Federation {
     /// retried — stale typing redelivered late is a lie about the present,
     /// and whoever is still typing says so again within seconds.
     edu_queue: std::sync::Mutex<std::collections::HashMap<String, Vec<Value>>>,
+    /// Read receipts waiting for each destination, coalesced into
+    /// `m.receipt` EDU contents rather than queued one EDU per receipt: a
+    /// busy room's readers would otherwise fill [`Self::queue_edu`]'s
+    /// hundred slots and push out the device-list updates that share them.
+    receipt_queue: std::sync::Mutex<std::collections::HashMap<String, PendingReceipts>>,
     /// `[federation] enabled`. Off refuses every outbound request in
     /// [`Federation::base_url`], the one place each of them is addressed.
     enabled: bool,
@@ -498,6 +503,7 @@ impl Federation {
             allowed,
             negative: std::sync::Mutex::new(HashMap::new()),
             edu_queue: std::sync::Mutex::new(std::collections::HashMap::new()),
+            receipt_queue: std::sync::Mutex::new(std::collections::HashMap::new()),
             enabled: true,
             delegations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             well_known_port: 443,
@@ -717,25 +723,74 @@ impl Federation {
         }
     }
 
-    /// Take everything queued for `destination`, leaving it empty.
+    /// Queue one public read receipt for `destination`, coalesced.
+    ///
+    /// A reader's newer receipt in the same room and thread replaces the
+    /// one still waiting -- the peer only ever wants where they are now.
+    /// `m.receipt` content is keyed by reader, so one EDU cannot carry a
+    /// reader's unthreaded and threaded receipts at once; a receipt that
+    /// collides with a different thread goes into the next EDU, up to
+    /// [`MAX_RECEIPT_EDUS`]. Bounded per destination at
+    /// [`MAX_PENDING_RECEIPTS`] readers: an unreachable peer must not grow
+    /// an unbounded queue, and a receipt is superseded by the reader's
+    /// next one anyway.
+    pub fn queue_receipt(&self, destination: &str, receipt: &OutboundReceipt<'_>) {
+        let mut queue = self
+            .receipt_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue
+            .entry(destination.to_owned())
+            .or_default()
+            .insert(receipt);
+    }
+
+    /// Take everything queued for `destination`, leaving it empty --
+    /// coalesced receipts first, then the rest, at most a hundred EDUs (the
+    /// spec's per-transaction cap). What does not fit stays queued for the
+    /// next transaction.
     #[must_use]
     pub fn take_edus(&self, destination: &str) -> Vec<Value> {
-        self.edu_queue
+        let mut edus: Vec<Value> = self
+            .receipt_queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(destination)
-            .unwrap_or_default()
+            .map(PendingReceipts::into_edus)
+            .unwrap_or_default();
+        let mut queue = self
+            .edu_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(mut pending) = queue.remove(destination) {
+            let room = MAX_EDUS_PER_TRANSACTION.saturating_sub(edus.len());
+            if pending.len() > room {
+                let rest = pending.split_off(room);
+                queue.insert(destination.to_owned(), rest);
+            }
+            edus.extend(pending);
+        }
+        edus
     }
 
     /// The destinations with EDUs waiting.
     #[must_use]
     pub fn edu_destinations(&self) -> Vec<String> {
-        self.edu_queue
+        let mut destinations: std::collections::BTreeSet<String> = self
+            .edu_queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .keys()
             .cloned()
-            .collect()
+            .collect();
+        destinations.extend(
+            self.receipt_queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .keys()
+                .cloned(),
+        );
+        destinations.into_iter().collect()
     }
 
     /// Sign an outbound request, returning the `Authorization` header value.
@@ -2518,6 +2573,11 @@ fn plan_transactions(
         if pdus.is_empty() && edus.is_empty() {
             continue;
         }
+        for edu in &edus {
+            federation
+                .metrics()
+                .record_edu_sent(crate::metrics::EduType::of(edu["edu_type"].as_str()));
+        }
         let txn_id = if let Some((key, _)) = batch.first() {
             let first_seq = key
                 .get(key.len() - 8..)
@@ -2811,6 +2871,99 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// The spec's cap on EDUs in one transaction.
+const MAX_EDUS_PER_TRANSACTION: usize = 100;
+
+/// How many `m.receipt` EDUs one destination's coalesced receipts may
+/// span: more than one only when a reader has receipts in several threads
+/// of one room waiting at once.
+pub const MAX_RECEIPT_EDUS: usize = 8;
+
+/// How many readers' receipts may wait for one destination; past it a
+/// new reader's receipt is not queued (a waiting reader's still replaces).
+pub const MAX_PENDING_RECEIPTS: usize = 1_000;
+
+/// One public read receipt on its way to a peer.
+#[derive(Clone, Copy, Debug)]
+pub struct OutboundReceipt<'a> {
+    pub room_id: &'a str,
+    pub user_id: &'a str,
+    pub event_id: &'a str,
+    pub thread_id: Option<&'a str>,
+    pub ts: u64,
+}
+
+/// Receipts waiting for one destination: a short list of `m.receipt`
+/// contents, `room -> m.read -> user -> {event_ids, data}`.
+#[derive(Debug, Default)]
+pub struct PendingReceipts {
+    edus: Vec<serde_json::Map<String, Value>>,
+    rows: usize,
+}
+
+impl PendingReceipts {
+    fn insert(&mut self, receipt: &OutboundReceipt<'_>) {
+        let mut data = serde_json::json!({ "ts": receipt.ts });
+        if let Some(thread) = receipt.thread_id {
+            data["thread_id"] = Value::String(thread.to_owned());
+        }
+        let entry = serde_json::json!({ "event_ids": [receipt.event_id], "data": data });
+        let thread_of =
+            |existing: &Value| existing["data"]["thread_id"].as_str().map(str::to_owned);
+        // Overwrite the reader's waiting receipt for the same thread, or
+        // take the first EDU with no receipt of theirs in this room.
+        let mut target = None;
+        for (index, edu) in self.edus.iter().enumerate() {
+            match edu
+                .get(receipt.room_id)
+                .and_then(|room| room["m.read"].get(receipt.user_id))
+            {
+                Some(existing) if thread_of(existing).as_deref() == receipt.thread_id => {
+                    target = Some((index, false));
+                    break;
+                }
+                Some(_) => {}
+                None => {
+                    if target.is_none() {
+                        target = Some((index, true));
+                    }
+                }
+            }
+        }
+        let (index, fresh) = match target {
+            Some(found) => found,
+            None if self.edus.len() < MAX_RECEIPT_EDUS => {
+                self.edus.push(serde_json::Map::new());
+                (self.edus.len() - 1, true)
+            }
+            // Every EDU already holds a different-thread receipt of this
+            // reader's: replace the newest batch's.
+            None => (self.edus.len() - 1, false),
+        };
+        if fresh {
+            // A peer that has been unreachable long enough to leave this
+            // many readers waiting is told about the ones it already owes;
+            // a new reader's receipt waits for their next one.
+            if self.rows >= MAX_PENDING_RECEIPTS {
+                return;
+            }
+            self.rows += 1;
+        }
+        let room = self.edus[index]
+            .entry(receipt.room_id.to_owned())
+            .or_insert_with(|| serde_json::json!({ "m.read": {} }));
+        room["m.read"][receipt.user_id] = entry;
+    }
+
+    fn into_edus(self) -> Vec<Value> {
+        self.edus
+            .into_iter()
+            .filter(|content| !content.is_empty())
+            .map(|content| serde_json::json!({ "edu_type": "m.receipt", "content": content }))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod url_tests {
     use super::base_url;
@@ -2961,5 +3114,70 @@ mod well_known_tests {
         assert_eq!(ttl("max-age=99999999"), WELL_KNOWN_MAX);
         assert_eq!(ttl("no-store"), WELL_KNOWN_MIN);
         assert_eq!(ttl("private"), WELL_KNOWN_DEFAULT);
+    }
+}
+
+#[cfg(test)]
+mod receipt_queue_tests {
+    use super::{MAX_PENDING_RECEIPTS, OutboundReceipt, PendingReceipts};
+
+    fn receipt<'a>(user: &'a str, event: &'a str, thread: Option<&'a str>) -> OutboundReceipt<'a> {
+        OutboundReceipt {
+            room_id: "!r:x",
+            user_id: user,
+            event_id: event,
+            thread_id: thread,
+            ts: 1,
+        }
+    }
+
+    #[test]
+    fn a_readers_newer_receipt_replaces_the_waiting_one() {
+        let mut pending = PendingReceipts::default();
+        pending.insert(&receipt("@a:x", "$1", None));
+        pending.insert(&receipt("@b:x", "$1", None));
+        pending.insert(&receipt("@a:x", "$2", None));
+        let edus = pending.into_edus();
+        assert_eq!(edus.len(), 1, "{edus:?}");
+        assert_eq!(edus[0]["edu_type"], "m.receipt");
+        assert_eq!(
+            edus[0]["content"]["!r:x"]["m.read"]["@a:x"]["event_ids"],
+            serde_json::json!(["$2"])
+        );
+        assert_eq!(
+            edus[0]["content"]["!r:x"]["m.read"]["@b:x"]["event_ids"],
+            serde_json::json!(["$1"])
+        );
+    }
+
+    #[test]
+    fn a_reader_in_two_threads_needs_two_edus() {
+        let mut pending = PendingReceipts::default();
+        pending.insert(&receipt("@a:x", "$1", None));
+        pending.insert(&receipt("@a:x", "$2", Some("$root")));
+        pending.insert(&receipt("@a:x", "$3", Some("$root")));
+        let edus = pending.into_edus();
+        assert_eq!(edus.len(), 2, "{edus:?}");
+        let threaded = &edus[1]["content"]["!r:x"]["m.read"]["@a:x"];
+        assert_eq!(threaded["data"]["thread_id"], "$root");
+        assert_eq!(threaded["event_ids"], serde_json::json!(["$3"]));
+        assert!(edus[0]["content"]["!r:x"]["m.read"]["@a:x"]["data"]["thread_id"].is_null());
+    }
+
+    #[test]
+    fn the_queue_for_one_destination_is_bounded() {
+        let mut pending = PendingReceipts::default();
+        let users: Vec<String> = (0..MAX_PENDING_RECEIPTS + 50)
+            .map(|index| format!("@u{index}:x"))
+            .collect();
+        for user in &users {
+            pending.insert(&receipt(user, "$1", None));
+        }
+        let held: usize = pending
+            .into_edus()
+            .iter()
+            .map(|edu| edu["content"]["!r:x"]["m.read"].as_object().unwrap().len())
+            .sum();
+        assert_eq!(held, MAX_PENDING_RECEIPTS);
     }
 }

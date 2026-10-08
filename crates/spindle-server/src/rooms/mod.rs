@@ -186,7 +186,7 @@ pub struct Rooms {
     /// Continuwuity across two sittings. A sort key is one i64; it lives
     /// in memory and is refreshed by the append that changes it.
     last_activity: Mutex<HashMap<String, i64>>,
-    /// `(room, user)` -> the stream position allocated when that user last
+    /// room -> user -> the stream position allocated when that user last
     /// sent a receipt in that room. A receipt is not an event and writes
     /// no stream row, so nothing about the room moves when one lands --
     /// and yet the reader's own unread counts just changed, and a sliding
@@ -195,7 +195,11 @@ pub struct Rooms {
     /// notification-count test waited four seconds for the new count and
     /// gave up; it was waiting on the next message. Positions on the same
     /// counter events use, so `since` orders receipts and events together.
-    receipt_marks: Mutex<HashMap<(String, String), u64>>,
+    ///
+    /// Keyed room first, so classic `/sync` can ask who in one room moved
+    /// their receipt since its token without walking every room's readers;
+    /// a federated reader's receipt is marked exactly as a local one is.
+    receipt_marks: Mutex<HashMap<String, HashMap<String, u64>>>,
     /// The rendered `/state` body per room, keyed by the state root it was
     /// rendered from.
     ///
@@ -3660,8 +3664,40 @@ impl Rooms {
         self.receipt_marks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert((room_id.to_owned(), user_id.to_owned()), position);
+            .entry(room_id.to_owned())
+            .or_default()
+            .insert(user_id.to_owned(), position);
         self.wake_sync_waiters();
+    }
+
+    /// Of `rooms`, the readers in each whose receipt moved at a position in
+    /// `(since, until]`: what an incremental `/sync` owes the client as an
+    /// `m.receipt` ephemeral event. Rooms where nobody moved are absent.
+    pub fn receipt_readers_since<'a>(
+        &self,
+        rooms: impl IntoIterator<Item = &'a str>,
+        since: u64,
+        until: u64,
+    ) -> HashMap<String, Vec<String>> {
+        let marks = self
+            .receipt_marks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out = HashMap::new();
+        for room_id in rooms {
+            let Some(readers) = marks.get(room_id) else {
+                continue;
+            };
+            let moved: Vec<String> = readers
+                .iter()
+                .filter(|(_, position)| **position > since && **position <= until)
+                .map(|(reader, _)| reader.clone())
+                .collect();
+            if !moved.is_empty() {
+                out.insert(room_id.to_owned(), moved);
+            }
+        }
+        out
     }
 
     /// Of `rooms`, the ones `user_id` sent a receipt in at a position in
@@ -3683,7 +3719,8 @@ impl Rooms {
             .into_iter()
             .filter(|room_id| {
                 marks
-                    .get(&((*room_id).to_owned(), user_id.to_owned()))
+                    .get(*room_id)
+                    .and_then(|readers| readers.get(user_id))
                     .is_some_and(|position| *position > since && *position <= until)
             })
             .map(str::to_owned)

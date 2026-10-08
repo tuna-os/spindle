@@ -356,6 +356,8 @@ pub struct Metrics {
     /// Peer signing-key lookups and event signature failures.
     keys: KeyMetrics,
     auth: AuthCounters,
+    /// Federation EDUs in and out, and inbound receipts by result.
+    edus: EduMetrics,
 }
 
 impl Default for Metrics {
@@ -394,6 +396,7 @@ impl Default for Metrics {
             gaps_remaining: AtomicU64::new(0),
             keys: KeyMetrics::default(),
             auth: AuthCounters::default(),
+            edus: EduMetrics::default(),
         }
     }
 }
@@ -846,6 +849,7 @@ impl Metrics {
         self.render_federation(&mut out);
         self.render_inbound(&mut out);
         self.render_keys(&mut out);
+        self.render_edus(&mut out);
         self.render_sync(&mut out);
         self.render_responsiveness(&mut out);
         self.render_auth(&mut out);
@@ -957,7 +961,7 @@ impl Metrics {
 
     fn render_http(&self, out: &mut String) {
         out.push_str(
-        "# HELP spindle_http_request_duration_seconds Time to serve one request, by matched route.\n\
+        "# HELP spindle_http_request_duration_seconds Time to serve one request, by matched route; a sync allowed to long-poll is under its route with \" (long-poll)\" appended.\n\
          # TYPE spindle_http_request_duration_seconds histogram\n",
     );
         if let Ok(read) = self.http_latency.read() {
@@ -1178,6 +1182,16 @@ const BUCKETS: [f64; 12] = [
     0.000_5, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
 ];
 
+/// Appended to a route's `spindle_http_request_duration_seconds` label for
+/// a request that was allowed to long-poll: a classic `/sync` or sliding
+/// sync with a `since`/`pos` and a non-zero `timeout`.
+pub const LONG_POLL_SUFFIX: &str = " (long-poll)";
+
+/// A response extension a sync handler sets when its request was allowed
+/// to long-poll; the request middleware reads it to pick the series.
+#[derive(Clone, Copy, Debug)]
+pub struct LongPoll;
+
 /// Bucket bounds for the slow things, in seconds: cold room loads, lock
 /// waits behind them, and whole sync phases. #614 measured a first sliding
 /// sync at 105 s and a liveness stall of 95 s; the default set tops out at
@@ -1306,8 +1320,34 @@ impl Metrics {
     /// never the raw URI: the raw path carries room and user IDs, and a
     /// label taking values from the request would let any caller mint
     /// series until the scrape falls over.
-    pub fn observe_request(&self, route: &str, method: &str, status: u16, elapsed: Duration) {
-        observe_in(&self.http_latency, route, elapsed);
+    ///
+    /// The latency uses [`SLOW_BUCKETS`]: #625 found `/keys/query` and
+    /// sliding sync with a p95 of exactly 2.5 s, the old top bucket, which
+    /// says "somewhere above" and nothing more. A request that was allowed
+    /// to long-poll (`long_poll`) is timed under its route with
+    /// [`LONG_POLL_SUFFIX`] appended, so a sync that waited its 30 s on
+    /// purpose sits in a series of its own instead of being every
+    /// dashboard's p95. Still the `route` label -- the dashboard groups by
+    /// it -- and still bounded: one extra value per long-polling route.
+    /// The request counter keeps the plain template.
+    pub fn observe_request(
+        &self,
+        route: &str,
+        method: &str,
+        status: u16,
+        elapsed: Duration,
+        long_poll: bool,
+    ) {
+        if long_poll {
+            observe_in_buckets(
+                &self.http_latency,
+                &format!("{route}{LONG_POLL_SUFFIX}"),
+                elapsed,
+                &SLOW_BUCKETS,
+            );
+        } else {
+            observe_in_buckets(&self.http_latency, route, elapsed, &SLOW_BUCKETS);
+        }
         let key = format!("{route}\u{1}{method}\u{1}{status}");
         if let Ok(read) = self.http_requests.read()
             && let Some(counter) = read.get(&key)
@@ -2278,6 +2318,228 @@ impl Metrics {
     }
 }
 
+/// The kind of an EDU a transaction carried, as a label.
+///
+/// The spec's types this server knows by name; anything else a peer
+/// invents is `other`, so the label set is fixed by the code (#166).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EduType {
+    Typing,
+    Receipt,
+    Presence,
+    DirectToDevice,
+    DeviceListUpdate,
+    SigningKeyUpdate,
+    Other,
+}
+
+impl EduType {
+    pub const ALL: [Self; 7] = [
+        Self::Typing,
+        Self::Receipt,
+        Self::Presence,
+        Self::DirectToDevice,
+        Self::DeviceListUpdate,
+        Self::SigningKeyUpdate,
+        Self::Other,
+    ];
+
+    /// The label for an `edu_type` string as it arrived or went out.
+    #[must_use]
+    pub fn of(edu_type: Option<&str>) -> Self {
+        match edu_type {
+            Some("m.typing") => Self::Typing,
+            Some("m.receipt") => Self::Receipt,
+            Some("m.presence") => Self::Presence,
+            Some("m.direct_to_device") => Self::DirectToDevice,
+            Some("m.device_list_update") => Self::DeviceListUpdate,
+            Some("m.signing_key_update" | "org.matrix.signing_key_update") => {
+                Self::SigningKeyUpdate
+            }
+            _ => Self::Other,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Typing => "m.typing",
+            Self::Receipt => "m.receipt",
+            Self::Presence => "m.presence",
+            Self::DirectToDevice => "m.direct_to_device",
+            Self::DeviceListUpdate => "m.device_list_update",
+            Self::SigningKeyUpdate => "m.signing_key_update",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// What became of one inbound EDU.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EduResult {
+    /// Applied, at least in part. For to-device, device-list and
+    /// signing-key EDUs: handed to the handler, which runs its own checks.
+    Accepted,
+    /// Well-formed, but nothing in it was applied: a user not on the
+    /// origin, a reader not in the room, an event this server lacks.
+    Ignored,
+    /// Not the shape the spec gives this EDU type.
+    Malformed,
+    /// A type this server does not act on (presence, unknown types).
+    Unsupported,
+}
+
+impl EduResult {
+    pub const ALL: [Self; 4] = [
+        Self::Accepted,
+        Self::Ignored,
+        Self::Malformed,
+        Self::Unsupported,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Ignored => "ignored",
+            Self::Malformed => "malformed",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// What became of one receipt inside an inbound `m.receipt` EDU.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReceiptResult {
+    /// Stored, and served to local clients from now on.
+    Accepted,
+    /// The reader is not one of the origin's users.
+    ForeignUser,
+    /// The reader is not joined to the room (or the room is unknown here).
+    NotJoined,
+    /// None of the events the receipt names is one this server holds.
+    UnknownEvent,
+    /// A receipt type that does not federate (`m.read.private`, anything
+    /// but `m.read`).
+    UnsupportedType,
+    /// Missing or oversized fields.
+    Malformed,
+    /// Past the per-EDU bound; dropped unread.
+    OverLimit,
+}
+
+impl ReceiptResult {
+    pub const ALL: [Self; 7] = [
+        Self::Accepted,
+        Self::ForeignUser,
+        Self::NotJoined,
+        Self::UnknownEvent,
+        Self::UnsupportedType,
+        Self::Malformed,
+        Self::OverLimit,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::ForeignUser => "foreign_user",
+            Self::NotJoined => "not_joined",
+            Self::UnknownEvent => "unknown_event",
+            Self::UnsupportedType => "unsupported_type",
+            Self::Malformed => "malformed",
+            Self::OverLimit => "over_limit",
+        }
+    }
+}
+
+/// EDUs in and out of federation transactions. Fixed enum labels only.
+#[derive(Debug, Default)]
+struct EduMetrics {
+    received: [[AtomicU64; EduResult::ALL.len()]; EduType::ALL.len()],
+    sent: [AtomicU64; EduType::ALL.len()],
+    receipts: [AtomicU64; ReceiptResult::ALL.len()],
+}
+
+impl Metrics {
+    /// Record one EDU a peer's transaction carried, and what became of it.
+    pub fn record_edu_received(&self, edu_type: EduType, result: EduResult) {
+        self.edus.received[slot(&EduType::ALL, edu_type)][slot(&EduResult::ALL, result)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one EDU put into an outbound transaction.
+    pub fn record_edu_sent(&self, edu_type: EduType) {
+        self.edus.sent[slot(&EduType::ALL, edu_type)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record what became of one receipt inside an inbound `m.receipt`.
+    pub fn record_receipt_received(&self, result: ReceiptResult) {
+        self.edus.receipts[slot(&ReceiptResult::ALL, result)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn edu_received_count(&self, edu_type: EduType, result: EduResult) -> u64 {
+        self.edus.received[slot(&EduType::ALL, edu_type)][slot(&EduResult::ALL, result)]
+            .load(Ordering::Relaxed)
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn edu_sent_count(&self, edu_type: EduType) -> u64 {
+        self.edus.sent[slot(&EduType::ALL, edu_type)].load(Ordering::Relaxed)
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn receipt_received_count(&self, result: ReceiptResult) -> u64 {
+        self.edus.receipts[slot(&ReceiptResult::ALL, result)].load(Ordering::Relaxed)
+    }
+
+    fn render_edus(&self, out: &mut String) {
+        out.push_str(
+            "# HELP spindle_federation_edus_received_total EDUs peers sent in \
+         transactions, by type and what became of them.\n\
+         # TYPE spindle_federation_edus_received_total counter\n",
+        );
+        for edu_type in EduType::ALL {
+            for result in EduResult::ALL {
+                let _ = writeln!(
+                    out,
+                    "spindle_federation_edus_received_total{{edu_type=\"{}\",result=\"{}\"}} {}",
+                    edu_type.label(),
+                    result.label(),
+                    self.edu_received_count(edu_type, result)
+                );
+            }
+        }
+        out.push_str(
+            "# HELP spindle_federation_edus_sent_total EDUs put into outbound \
+         transactions, by type.\n\
+         # TYPE spindle_federation_edus_sent_total counter\n",
+        );
+        for edu_type in EduType::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_edus_sent_total{{edu_type=\"{}\"}} {}",
+                edu_type.label(),
+                self.edu_sent_count(edu_type)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_federation_receipts_received_total Read receipts inside \
+         inbound m.receipt EDUs, by what became of each.\n\
+         # TYPE spindle_federation_receipts_received_total counter\n",
+        );
+        for result in ReceiptResult::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_receipts_received_total{{result=\"{}\"}} {}",
+                result.label(),
+                self.receipt_received_count(result)
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2378,6 +2640,70 @@ mod tests {
 
     /// The #614 series exist at zero, move when recorded, and carry no
     /// label a caller could grow.
+    /// #625: a request slower than 2.5 s lands in a bucket that says how
+    /// slow, and a long-poll is timed under a series of its own.
+    #[test]
+    fn http_latency_reaches_past_two_and_a_half_seconds_and_splits_long_polls() {
+        let metrics = Metrics::new();
+        let route = "/_matrix/client/v3/keys/query";
+        metrics.observe_request(route, "POST", 200, Duration::from_secs(7), false);
+        let sync = "/_matrix/client/v3/sync";
+        metrics.observe_request(sync, "GET", 200, Duration::from_secs(30), true);
+        metrics.observe_request(sync, "GET", 200, Duration::from_millis(3), false);
+        let text = metrics.render();
+        let name = "spindle_http_request_duration_seconds_bucket";
+        assert!(
+            text.contains(&format!("{name}{{route=\"{route}\",le=\"5\"}} 0")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{name}{{route=\"{route}\",le=\"10\"}} 1")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{name}{{route=\"{route}\",le=\"120\"}} 1")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "{name}{{route=\"{sync}{LONG_POLL_SUFFIX}\",le=\"30\"}} 1"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{name}{{route=\"{sync}\",le=\"120\"}} 1")),
+            "the plain sync series holds only the request that did not wait: {text}"
+        );
+        // The request counter keeps the plain template for both.
+        assert!(
+            text.contains(&format!(
+                "spindle_http_requests_total{{route=\"{sync}\",method=\"GET\",status=\"200\"}} 2"
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn edu_series_are_present_at_zero_and_move() {
+        let metrics = Metrics::new();
+        let text = metrics.render();
+        assert!(text.contains(
+            "spindle_federation_edus_received_total{edu_type=\"m.receipt\",result=\"accepted\"} 0"
+        ));
+        metrics.record_edu_received(EduType::Receipt, EduResult::Accepted);
+        metrics.record_edu_sent(EduType::of(Some("m.receipt")));
+        metrics.record_receipt_received(ReceiptResult::NotJoined);
+        let text = metrics.render();
+        assert!(text.contains(
+            "spindle_federation_edus_received_total{edu_type=\"m.receipt\",result=\"accepted\"} 1"
+        ));
+        assert!(text.contains("spindle_federation_edus_sent_total{edu_type=\"m.receipt\"} 1"));
+        assert!(
+            text.contains("spindle_federation_receipts_received_total{result=\"not_joined\"} 1")
+        );
+        assert_eq!(EduType::of(Some("io.example.whatever")), EduType::Other);
+    }
+
     #[test]
     fn the_responsiveness_series_register_and_move() {
         let metrics = Metrics::new();

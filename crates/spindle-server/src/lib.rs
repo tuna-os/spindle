@@ -44,6 +44,7 @@ pub mod push;
 pub mod push_rules;
 pub mod pushers;
 pub mod ratelimit;
+pub mod receipts;
 pub mod recovery;
 pub mod registration_tokens;
 pub mod rendezvous;

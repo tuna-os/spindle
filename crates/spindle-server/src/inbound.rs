@@ -450,10 +450,11 @@ pub(crate) fn join_candidates(
 /// is judged alone — hash and signature against the origin's published
 /// keys, then the same authorization predicate local events pass — and a
 /// refusal soft-fails into the per-PDU results without poisoning the
-/// batch. Of the EDUs, `m.typing` is applied — for the origin's own
-/// joined users only, so no server can put words in another's hands —
-/// and the rest are still accepted and dropped (receipts, presence and
-/// device lists arrive with later slices).
+/// batch. Of the EDUs, `m.typing` and `m.receipt` are applied — for the
+/// origin's own joined users only, so no server can put words in another's
+/// hands — keys, to-device messages and device lists go to
+/// `e2ee_federation`, and the rest (presence among them; see `receipts`)
+/// are accepted, counted and dropped.
 pub(crate) async fn send_transaction(
     state: AppState,
     headers: axum::http::HeaderMap,
@@ -538,29 +539,36 @@ pub(crate) async fn send_transaction(
         .iter()
         .take(100)
     {
-        if edu["edu_type"].as_str() != Some("m.typing") {
-            // Keys, to-device messages and device-list changes: the
-            // origin is the authority for all three, and each checks it.
-            crate::e2ee_federation::apply_edu(&state, &origin, edu).await;
-            continue;
-        }
-        let content = &edu["content"];
-        let (Some(room_id), Some(user_id), Some(typing)) = (
-            content["room_id"].as_str(),
-            content["user_id"].as_str(),
-            content["typing"].as_bool(),
-        ) else {
-            continue;
+        let edu_type = crate::metrics::EduType::of(edu["edu_type"].as_str());
+        let result = match edu_type {
+            crate::metrics::EduType::Typing => apply_typing(&state, &origin, &edu["content"]),
+            crate::metrics::EduType::Receipt => {
+                // A receipt for a cold room loads it: room work, so off
+                // the async workers like the PDUs above.
+                let state = state.clone();
+                let origin = origin.clone();
+                let content = edu["content"].clone();
+                crate::blocking::offload(
+                    std::sync::Arc::clone(&state.metrics),
+                    crate::metrics::BlockingTask::FederationSend,
+                    move || Ok(crate::receipts::apply_edu(&state, &origin, &content)),
+                )
+                .await
+                .unwrap_or(crate::metrics::EduResult::Ignored)
+            }
+            crate::metrics::EduType::DirectToDevice
+            | crate::metrics::EduType::DeviceListUpdate
+            | crate::metrics::EduType::SigningKeyUpdate => {
+                // Keys, to-device messages and device-list changes: the
+                // origin is the authority for all three, and each checks it.
+                crate::e2ee_federation::apply_edu(&state, &origin, edu).await;
+                crate::metrics::EduResult::Accepted
+            }
+            crate::metrics::EduType::Presence | crate::metrics::EduType::Other => {
+                crate::metrics::EduResult::Unsupported
+            }
         };
-        if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin.as_str()) {
-            continue;
-        }
-        if !state.rooms.is_joined(user_id, room_id).unwrap_or(false) {
-            continue;
-        }
-        state
-            .typing
-            .set(room_id, user_id, typing, crate::typing::DEFAULT_TIMEOUT);
+        state.metrics.record_edu_received(edu_type, result);
     }
 
     let response = json!({ "pdus": results });
@@ -572,6 +580,28 @@ pub(crate) async fn send_transaction(
     .map_err(|error| MatrixError::internal(&error.to_string()))?;
     state.rooms.wake_sync_waiters();
     Ok(Json(response))
+}
+
+/// Apply one inbound `m.typing` EDU: only about the origin's own joined
+/// users, so no server can put words in another's hands.
+fn apply_typing(state: &AppState, origin: &str, content: &Value) -> crate::metrics::EduResult {
+    let (Some(room_id), Some(user_id), Some(typing)) = (
+        content["room_id"].as_str(),
+        content["user_id"].as_str(),
+        content["typing"].as_bool(),
+    ) else {
+        return crate::metrics::EduResult::Malformed;
+    };
+    if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin) {
+        return crate::metrics::EduResult::Ignored;
+    }
+    if !state.rooms.is_joined(user_id, room_id).unwrap_or(false) {
+        return crate::metrics::EduResult::Ignored;
+    }
+    state
+        .typing
+        .set(room_id, user_id, typing, crate::typing::DEFAULT_TIMEOUT);
+    crate::metrics::EduResult::Accepted
 }
 
 /// `GET /_matrix/federation/v1/state/{roomId}?event_id=`
