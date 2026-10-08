@@ -10,6 +10,7 @@ pub mod account;
 pub mod account_data;
 pub mod accounts;
 pub mod admin;
+pub mod appservice_proxy;
 pub mod appservices;
 pub mod auth;
 pub mod authorize;

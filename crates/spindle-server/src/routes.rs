@@ -128,11 +128,14 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::openid::routes())
         .merge(crate::rendezvous::routes())
         .merge(crate::livekit::routes())
+        .merge(crate::appservice_proxy::routes())
         // SPEC: an endpoint the server does not recognize answers 404
         // M_UNRECOGNIZED — a JSON verdict, not a bare status. Clients (and
         // Complement's TestUnknownEndpoints) read the errcode to tell "this
         // server does not speak that" from "the thing was not found".
-        .fallback(unknown_endpoint)
+        // …unless an application service has claimed the path (MSC4512),
+        // in which case it is forwarded there.
+        .fallback(crate::appservice_proxy::proxy_or_unknown)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             federation_gate,
@@ -287,12 +290,12 @@ async fn federation_gate(
     if !state.config.federation.enabled
         && (path.starts_with("/_matrix/federation/") || path.starts_with("/_matrix/key/"))
     {
-        return unknown_endpoint().await.into_response();
+        return unknown_endpoint().into_response();
     }
     next.run(request).await
 }
 
-async fn unknown_endpoint() -> MatrixError {
+fn unknown_endpoint() -> MatrixError {
     MatrixError::new(
         StatusCode::NOT_FOUND,
         "M_UNRECOGNIZED",

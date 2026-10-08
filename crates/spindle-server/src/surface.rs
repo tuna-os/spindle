@@ -180,6 +180,9 @@ pub const UNSTABLE_FEATURES: &[(&str, bool)] = &[
     // on a send, the key on the event, and the section on `/sync`. What
     // MatrixRTC 2.0 makes `m.rtc.member`.
     ("org.matrix.msc4354", true),
+    // MSC4502's membership look-up, which lk-jwt-service asks as an
+    // application service before it mints a token for a room.
+    ("io.element.msc4502", true),
     // MSC3814's dehydrated devices. Element X checks this flag before it
     // offers to keep room keys across the last device being lost.
     ("org.matrix.msc3814", true),
