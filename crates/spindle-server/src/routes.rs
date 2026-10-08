@@ -6675,7 +6675,14 @@ async fn sliding_sync(
     axum::extract::Query(query): axum::extract::Query<SlidingQuery>,
     Json(request): Json<crate::sliding::SlidingRequest>,
 ) -> Result<Json<Value>, MatrixError> {
-    let since = sliding_position(&identity, query.pos.as_deref())?;
+    let (stream_pos, previous_windows) = match query.pos.as_deref() {
+        Some(pos) => {
+            let (stream, windows) = crate::sliding::decode_pos(pos);
+            (Some(stream), windows)
+        }
+        None => (None, None),
+    };
+    let since = sliding_position(&identity, stream_pos)?;
     let lists = request.decoded_lists().map_err(MatrixError::bad_json)?;
     let subscriptions = request
         .decoded_subscriptions()
@@ -6735,10 +6742,18 @@ async fn sliding_sync(
     // sent once, with the larger ask.
     let mut wanted: std::collections::HashMap<String, (Vec<(String, String)>, usize)> =
         std::collections::HashMap::new();
+    // Rooms in view now that were in no window this `pos` was answered for:
+    // the client has never been sent them, changed or not.
+    let mut newly_in_view: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (name, list) in &lists {
         let indices = crate::sliding::indices_in_view(&list.ranges, ordered.len());
         for &index in &indices {
             let room_id = &ordered[index].0;
+            if since.is_some()
+                && !crate::sliding::was_in_view(previous_windows.as_ref(), name, index)
+            {
+                newly_in_view.insert(room_id.clone());
+            }
             let entry = wanted
                 .entry(room_id.clone())
                 .or_insert_with(|| (Vec::new(), 0));
@@ -6769,8 +6784,10 @@ async fn sliding_sync(
     let in_view: Vec<String> = wanted.keys().cloned().collect();
     for (room_id, (required_state, timeline_limit)) in wanted {
         // Incrementally, silence about an unchanged room *is* the answer.
+        let newly = newly_in_view.contains(&room_id);
         if let Some(changed) = &changed
             && !changed.contains(&room_id)
+            && !newly
         {
             continue;
         }
@@ -6783,7 +6800,7 @@ async fn sliding_sync(
                 &room_id,
                 &required_state,
                 timeline_limit,
-                since.is_none(),
+                since.is_none() || newly,
             )?
         };
         rooms_out.insert(room_id, entry);
@@ -6799,7 +6816,10 @@ async fn sliding_sync(
     )?;
 
     Ok(Json(json!({
-        "pos": crate::tokens::Sync(position).to_string(),
+        "pos": crate::sliding::encode_pos(
+            &crate::tokens::Sync(position).to_string(),
+            &crate::sliding::windows_of(&lists),
+        ),
         "lists": lists_out,
         "rooms": rooms_out,
         "extensions": extensions,
