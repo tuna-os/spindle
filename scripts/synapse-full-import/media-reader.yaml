@@ -1,0 +1,40 @@
+# Read-only reader for the production Synapse media store. Created in ess
+# only because a PVC can be mounted only in its own namespace. The volume is
+# mounted read-only and the pod sets no fsGroup, so the kubelet changes no
+# ownership on it. Deleted as soon as the copy is done.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: spindle-media-reader
+  namespace: ess
+  labels: {app: spindle-media-reader, purpose: migration-read-only}
+spec:
+  nodeName: ip-10-20-1-11
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  restartPolicy: Never
+  activeDeadlineSeconds: 3600
+  dnsPolicy: None
+  dnsConfig:
+    nameservers: [127.0.0.1]
+  securityContext:
+    runAsUser: 10091
+    runAsGroup: 10091
+    runAsNonRoot: true
+    seccompProfile: {type: RuntimeDefault}
+  containers:
+  - name: reader
+    image: oci.element.io/synapse:v1.156.0
+    command: [sleep, "3600"]
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities: {drop: [ALL]}
+    resources:
+      requests: {cpu: 10m, memory: 32Mi}
+      limits: {cpu: 200m, memory: 128Mi}
+    volumeMounts:
+    - {name: media, mountPath: /media, readOnly: true}
+  volumes:
+  - name: media
+    persistentVolumeClaim: {claimName: synapse-media-preseed, readOnly: true}

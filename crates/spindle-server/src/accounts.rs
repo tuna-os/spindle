@@ -21,6 +21,12 @@ use serde::{Deserialize, Serialize};
 use spindle_core::keys::{self, Keyspace, room_prefix};
 use spindle_store::{Store, StoreError};
 
+static ERASURE_POLICY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn erasure_policy_key() -> Vec<u8> {
+    room_prefix(Keyspace::ErasurePolicy, "")
+}
+
 /// How many bytes of entropy an access token carries.
 ///
 /// 32 bytes is 256 bits, which is not guessable by anyone, ever. The token is
@@ -59,6 +65,13 @@ pub struct Account {
     /// and log out, and nothing else; a write answers `M_USER_SUSPENDED`.
     #[serde(default)]
     pub suspended: bool,
+    /// Erased (GDPR): the user asked for their data to be forgotten when
+    /// the account was deactivated. Carried from Synapse's `erased_users`
+    /// and set by a deactivation with `erase`. Spindle clears the profile
+    /// on erasure; it does not yet hide an erased user's events from
+    /// members who join later, which Synapse does (#576).
+    #[serde(default)]
+    pub erased: bool,
 }
 
 /// One logged-in device.
@@ -177,6 +190,43 @@ impl<'a, S: Store> Accounts<'a, S> {
             admin: false,
             locked: false,
             suspended: false,
+            erased: false,
+        };
+        self.store
+            .put(&account_key(localpart), &encode(&account)?)?;
+        Ok(account)
+    }
+
+    /// Register a new account whose password hash the caller already holds.
+    ///
+    /// The Synapse importer creates over a thousand accounts that nobody
+    /// signs in to with a password (the delegated identity provider owns
+    /// sign-in). It hashes one unguessable password once and gives every
+    /// such account that hash, rather than paying an Argon2 hash, and its
+    /// 19 MiB working set, per account.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountError::UserInUse`] if the localpart is taken,
+    /// [`AccountError::InvalidUsername`] for a bad localpart, or a storage
+    /// error.
+    pub fn register_hashed(
+        &self,
+        localpart: &str,
+        password_hash: &str,
+    ) -> Result<Account, AccountError> {
+        validate_localpart(localpart)?;
+        if self.account(localpart)?.is_some() {
+            return Err(AccountError::UserInUse);
+        }
+        let account = Account {
+            localpart: localpart.to_owned(),
+            password_hash: password_hash.to_owned(),
+            deactivated: false,
+            admin: false,
+            locked: false,
+            suspended: false,
+            erased: false,
         };
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
@@ -191,6 +241,11 @@ impl<'a, S: Store> Accounts<'a, S> {
     ///
     /// Returns a storage or decoding error.
     pub fn set_deactivated(&self, localpart: &str, deactivated: bool) -> Result<(), AccountError> {
+        // All account updates share the erasure lock so a concurrent
+        // flag/password write cannot restore an older erasure decision.
+        let _guard = ERASURE_POLICY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(mut account) = self.account(localpart)? else {
             return Ok(());
         };
@@ -198,6 +253,60 @@ impl<'a, S: Store> Accounts<'a, S> {
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
         Ok(())
+    }
+
+    /// Mark an account erased (or not), leaving everything else. An
+    /// unknown localpart is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or decoding error.
+    pub fn set_erased(&self, localpart: &str, erased: bool) -> Result<(), AccountError> {
+        let _guard = ERASURE_POLICY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(mut account) = self.account(localpart)? else {
+            return Ok(());
+        };
+        account.erased = erased;
+        let mut writes = vec![(account_key(localpart), encode(&account)?)];
+        if erased {
+            writes.push((erasure_policy_key(), vec![1]));
+        }
+        self.store
+            .commit(&writes, spindle_store::Durability::Group)?;
+        Ok(())
+    }
+
+    /// Whether client events may need erasure filtering. Once true, this
+    /// marker stays true; each sender's current account flag still decides.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or account decoding error.
+    pub fn erasure_active(&self) -> Result<bool, AccountError> {
+        let key = erasure_policy_key();
+        if let Some(value) = self.store.get(&key)? {
+            return Ok(value != [0]);
+        }
+        let _guard = ERASURE_POLICY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(value) = self.store.get(&key)? {
+            return Ok(value != [0]);
+        }
+        // Upgrade stores written before the marker existed. The same lock
+        // protects erasure writes so initialization cannot overwrite one.
+        let prefix = [keys::KEY_SCHEMA_VERSION, Keyspace::Account as u8];
+        let mut active = false;
+        for (_, bytes) in self.store.scan_prefix(&prefix)? {
+            if decode::<Account>(&bytes)?.erased {
+                active = true;
+                break;
+            }
+        }
+        self.store.put(&key, &[u8::from(active)])?;
+        Ok(active)
     }
 
     /// # Errors
@@ -458,6 +567,11 @@ impl<'a, S: Store> Accounts<'a, S> {
     ///
     /// Returns a storage or decoding error.
     pub fn set_admin(&self, localpart: &str, admin: bool) -> Result<bool, AccountError> {
+        // All account updates share the erasure lock so a concurrent
+        // flag/password write cannot restore an older erasure decision.
+        let _guard = ERASURE_POLICY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(mut account) = self.account(localpart)? else {
             return Ok(false);
         };
@@ -474,6 +588,11 @@ impl<'a, S: Store> Accounts<'a, S> {
     ///
     /// Returns a storage or decoding error.
     pub fn set_locked(&self, localpart: &str, locked: bool) -> Result<bool, AccountError> {
+        // All account updates share the erasure lock so a concurrent
+        // flag/password write cannot restore an older erasure decision.
+        let _guard = ERASURE_POLICY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(mut account) = self.account(localpart)? else {
             return Ok(false);
         };
@@ -490,6 +609,11 @@ impl<'a, S: Store> Accounts<'a, S> {
     ///
     /// Returns a storage or decoding error.
     pub fn set_suspended(&self, localpart: &str, suspended: bool) -> Result<bool, AccountError> {
+        // All account updates share the erasure lock so a concurrent
+        // flag/password write cannot restore an older erasure decision.
+        let _guard = ERASURE_POLICY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(mut account) = self.account(localpart)? else {
             return Ok(false);
         };
@@ -505,6 +629,11 @@ impl<'a, S: Store> Accounts<'a, S> {
     ///
     /// Returns a storage, decoding, or hashing error.
     pub fn set_password(&self, localpart: &str, password: &str) -> Result<bool, AccountError> {
+        // All account updates share the erasure lock so a concurrent
+        // flag/password write cannot restore an older erasure decision.
+        let _guard = ERASURE_POLICY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(mut account) = self.account(localpart)? else {
             return Ok(false);
         };
@@ -513,6 +642,39 @@ impl<'a, S: Store> Accounts<'a, S> {
             .hash_password_with_salt(password.as_bytes(), &salt)
             .map_err(|error| AccountError::Hashing(error.to_string()))?
             .to_string();
+        self.store
+            .put(&account_key(localpart), &encode(&account)?)?;
+        Ok(true)
+    }
+
+    /// Replace an account's password with a hash computed elsewhere
+    /// (#611): the path a Matrix Authentication Service's users take
+    /// into Spindle without anyone resetting a password. `false` for an
+    /// account that does not exist.
+    ///
+    /// The hash is checked by [`validate_password_hash`] before anything
+    /// is written, so a typo or a scheme this server cannot verify is a
+    /// refusal now rather than a user who can never sign in later.
+    ///
+    /// # Errors
+    ///
+    /// [`AccountError::InvalidHash`] for a hash this server will not
+    /// store, or a storage or decoding error.
+    pub fn set_password_hash(
+        &self,
+        localpart: &str,
+        password_hash: &str,
+    ) -> Result<bool, AccountError> {
+        validate_password_hash(password_hash)?;
+        // All account updates share the erasure lock so a concurrent
+        // flag/password write cannot restore an older erasure decision.
+        let _guard = ERASURE_POLICY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(mut account) = self.account(localpart)? else {
+            return Ok(false);
+        };
+        password_hash.clone_into(&mut account.password_hash);
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
         Ok(true)
@@ -685,10 +847,127 @@ fn validate_localpart(localpart: &str) -> Result<(), AccountError> {
     Ok(())
 }
 
+/// The most memory, in KiB, a stored hash may ask each verification for:
+/// 256 MiB. Verification keeps the largest workspace it has needed
+/// (`passwords.rs`), so an imported hash with an absurd `m` would pin that
+/// much memory for the life of the process; 13 times MAS's default (19 MiB)
+/// is generous for any real deployment and refuses the absurd.
+const MAX_HASH_MEMORY_KIB: u32 = 256 * 1024;
+
+/// The most passes, and lanes, a stored hash may ask for. Each pass is
+/// paid on every login; RFC 9106's recommendations sit far below this.
+const MAX_HASH_TIME_COST: u32 = 16;
+const MAX_HASH_LANES: u32 = 16;
+
+/// Check a PHC password hash before it is stored (#611).
+///
+/// Accepted: Argon2 in any of its three variants (`argon2id`, `argon2i`,
+/// `argon2d`), version 0x10 or 0x13, with exactly the `m`, `t` and `p`
+/// parameters, a salt and a hash — which is what MAS, Synapse-adjacent
+/// tooling and Spindle itself write. Refused, each for a reason:
+///
+/// - **Any other algorithm** (bcrypt, pbkdf2, scrypt…): verification here
+///   is Argon2 only, and a stored hash nothing can check is an account
+///   nobody can enter.
+/// - **Keyed (`keyid=`) or associated-data (`data=`) hashes**: they were
+///   computed with a secret pepper this server does not have, so they can
+///   never verify. Note the converse: a hash computed with a pepper that
+///   is *not* recorded in the string (MAS's `secret` scheme option) looks
+///   ordinary and is accepted, and then never verifies. Nothing in the
+///   string can reveal that; the operator has to know.
+/// - **Costs beyond the bounds above**: a denial of service waiting for
+///   the first login.
+///
+/// # Errors
+///
+/// [`AccountError::InvalidHash`] naming what was wrong. The message never
+/// echoes the hash.
+pub fn validate_password_hash(phc: &str) -> Result<(), AccountError> {
+    let invalid = |why: &str| Err(AccountError::InvalidHash(why.to_owned()));
+    let mut parts = phc.split('$');
+    if parts.next() != Some("") {
+        return invalid("not a PHC string: it must start with '$'");
+    }
+    let algorithm = parts.next().unwrap_or_default();
+    if !matches!(algorithm, "argon2id" | "argon2i" | "argon2d") {
+        return Err(AccountError::InvalidHash(format!(
+            "unsupported algorithm {algorithm:?}: only argon2id, argon2i and argon2d \
+             hashes can be verified here"
+        )));
+    }
+    let mut next = parts.next().unwrap_or_default();
+    if let Some(version) = next.strip_prefix("v=") {
+        if !matches!(version, "16" | "19") {
+            return invalid("unsupported Argon2 version: only v=16 and v=19 exist");
+        }
+        next = parts.next().unwrap_or_default();
+    }
+    let (mut memory, mut time, mut lanes) = (None, None, None);
+    for pair in next.split(',') {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let slot = match name {
+            "m" => &mut memory,
+            "t" => &mut time,
+            "p" => &mut lanes,
+            "keyid" | "data" => {
+                return invalid(
+                    "keyed or peppered Argon2 hashes (keyid/data) cannot be verified \
+                     without the secret they were made with",
+                );
+            }
+            _ => return invalid("unknown Argon2 parameter: only m, t and p are accepted"),
+        };
+        if slot.is_some() {
+            return invalid("an Argon2 parameter is repeated");
+        }
+        let Ok(number) = value.parse::<u32>() else {
+            return invalid("Argon2 parameters must be decimal numbers");
+        };
+        *slot = Some(number);
+    }
+    let (Some(memory), Some(time), Some(lanes)) = (memory, time, lanes) else {
+        return invalid("an Argon2 hash needs all of m, t and p");
+    };
+    if memory > MAX_HASH_MEMORY_KIB || time > MAX_HASH_TIME_COST || lanes > MAX_HASH_LANES {
+        return Err(AccountError::InvalidHash(format!(
+            "Argon2 costs out of bounds: m <= {MAX_HASH_MEMORY_KIB}, \
+             t <= {MAX_HASH_TIME_COST}, p <= {MAX_HASH_LANES}"
+        )));
+    }
+    if argon2::Params::new(memory, time, lanes, None).is_err() {
+        return invalid(
+            "Argon2 parameters out of range (m must be at least 8 * p, t and p at least 1)",
+        );
+    }
+    let (Some(salt), Some(hash), None) = (parts.next(), parts.next(), parts.next()) else {
+        return invalid("a PHC string ends with exactly a salt and a hash");
+    };
+    let b64 = |text: &str| {
+        !text.is_empty()
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/')
+    };
+    // Unpadded base64: four characters carry three bytes.
+    let decoded_len = |text: &str| text.len() * 3 / 4;
+    if !b64(salt) || decoded_len(salt) < 8 {
+        return invalid("the salt must be at least 8 bytes of unpadded base64");
+    }
+    if !b64(hash) || !(16..=64).contains(&decoded_len(hash)) {
+        return invalid("the hash must be 16 to 64 bytes of unpadded base64");
+    }
+    PasswordHash::new(phc)
+        .map(|_| ())
+        .map_err(|_| AccountError::InvalidHash("not a well-formed PHC string".to_owned()))
+}
+
 /// Why an account operation failed.
 #[derive(Debug)]
 pub enum AccountError {
     UserInUse,
+    /// A pre-computed password hash this server will not store; the
+    /// message says why without repeating the hash.
+    InvalidHash(String),
     /// A presented token is not live.
     UnknownToken,
     InvalidUsername,
@@ -707,6 +986,7 @@ impl std::fmt::Display for AccountError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UserInUse => write!(formatter, "that username is taken"),
+            Self::InvalidHash(why) => write!(formatter, "unusable password hash: {why}"),
             Self::UnknownToken => write!(formatter, "that token is not valid"),
             Self::InvalidUsername => write!(formatter, "that username is not valid"),
             Self::Storage(error) => write!(formatter, "storage: {error}"),
@@ -717,3 +997,164 @@ impl std::fmt::Display for AccountError {
 }
 
 impl std::error::Error for AccountError {}
+
+/// The Argon2id hash [`Accounts::register`] would store for `password`.
+///
+/// # Errors
+///
+/// Returns [`AccountError::Hashing`] if hashing fails.
+pub fn hash_password(password: &str) -> Result<String, AccountError> {
+    let salt = salt();
+    Ok(ReusableArgon2
+        .hash_password_with_salt(password.as_bytes(), &salt)
+        .map_err(|error| AccountError::Hashing(error.to_string()))?
+        .to_string())
+}
+
+#[cfg(test)]
+mod erasure_policy_tests {
+    use super::*;
+    use spindle_store::{FjallStore, ReadView};
+
+    fn put_account(store: &FjallStore, localpart: &str, erased: bool) {
+        let account: Account = serde_json::from_value(serde_json::json!({
+            "localpart":localpart,"password_hash":"unused","erased":erased
+        }))
+        .unwrap();
+        store
+            .put(&account_key(localpart), &encode(&account).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn an_upgraded_store_discovers_existing_erased_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        put_account(&store, "alice", false);
+        put_account(&store, "bob", true);
+        let accounts = Accounts::new(&store, "example.org");
+        assert!(accounts.erasure_active().unwrap());
+        assert_eq!(store.get(&erasure_policy_key()).unwrap(), Some(vec![1]));
+    }
+
+    #[test]
+    fn erasure_sets_a_durable_marker_without_clearing_it_on_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = FjallStore::open(dir.path()).unwrap();
+            put_account(&store, "alice", false);
+            let accounts = Accounts::new(&store, "example.org");
+            assert!(!accounts.erasure_active().unwrap());
+            accounts.set_erased("alice", true).unwrap();
+            assert!(accounts.erasure_active().unwrap());
+            assert!(accounts.account("alice").unwrap().unwrap().erased);
+            accounts.set_erased("alice", false).unwrap();
+            assert!(accounts.erasure_active().unwrap());
+            assert!(!accounts.account("alice").unwrap().unwrap().erased);
+        }
+        let store = FjallStore::open(dir.path()).unwrap();
+        assert!(
+            Accounts::new(&store, "example.org")
+                .erasure_active()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn setting_an_unknown_account_does_not_activate_erasure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        let accounts = Accounts::new(&store, "example.org");
+        accounts.set_erased("missing", true).unwrap();
+        assert!(!accounts.erasure_active().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod password_hash_tests {
+    use super::*;
+    use spindle_store::FjallStore;
+
+    /// A hash exactly as MAS writes it: argon2id with the `argon2` crate's
+    /// defaults (m=19456, t=2, p=1, 16-byte salt, 32-byte output), here
+    /// produced by an independent implementation (argon2-cffi) so the test
+    /// is not this crate agreeing with itself.
+    const MAS_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$bWFzLW1pZ3JhdGlvbi0xNg$\
+        CEd7EMaeQK2QDHVNURFc/tH0y2Ja5MduCcmz5Gs8uIo";
+    const MAS_PASSWORD: &str = "correct horse battery staple";
+
+    #[test]
+    fn a_mas_hash_imports_and_verifies_its_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        let accounts = Accounts::new(&store, "example.org");
+        accounts.register("alice", "the old password").unwrap();
+        assert!(accounts.set_password_hash("alice", MAS_HASH).unwrap());
+        assert!(accounts.verify_password("alice", MAS_PASSWORD).unwrap());
+        assert!(
+            !accounts
+                .verify_password("alice", "the old password")
+                .unwrap()
+        );
+        assert!(!accounts.verify_password("alice", "wrong").unwrap());
+        // An unknown account is reported, not created.
+        assert!(!accounts.set_password_hash("nobody", MAS_HASH).unwrap());
+        assert!(accounts.account("nobody").unwrap().is_none());
+    }
+
+    #[test]
+    fn every_argon2_variant_and_version_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        let accounts = Accounts::new(&store, "example.org");
+        accounts.register("bob", "unused").unwrap();
+        for hash in [
+            "$argon2i$v=19$m=1024,t=1,p=1$YW5vdGhlci1zYWx0LXh5eg$0+BS7rvFj8+YQIHROOQAxEN4+A++MGK2rhIClVQuGcc",
+            "$argon2d$v=19$m=1024,t=1,p=1$YW5vdGhlci1zYWx0LXh5eg$J+uc29iUySN8eBqcEre+bXDQeCIJv0JzmiJvPS/rZQY",
+            "$argon2id$v=16$m=1024,t=1,p=1$YW5vdGhlci1zYWx0LXh5eg$GGrtU/NvDOgxP3krYVaBmBJb0RH3jhw91wzzc4skbwE",
+        ] {
+            assert!(accounts.set_password_hash("bob", hash).unwrap(), "{hash}");
+            assert!(
+                accounts.verify_password("bob", "hunter2hunter2").unwrap(),
+                "{hash}"
+            );
+        }
+    }
+
+    #[test]
+    fn unusable_hashes_are_refused_before_anything_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        let accounts = Accounts::new(&store, "example.org");
+        accounts.register("carol", "her password").unwrap();
+        let salt = "bWFzLW1pZ3JhdGlvbi0xNg";
+        let out = "CEd7EMaeQK2QDHVNURFc/tH0y2Ja5MduCcmz5Gs8uIo";
+        for hash in [
+            String::new(),
+            "plaintext".to_owned(),
+            "$2b$12$abcdefghijklmnopqrstuuJ7nGq1k7h8yQ0e1lQ9n6S1d1x8Zb2K".to_owned(),
+            format!("$pbkdf2-sha256$i=1000${salt}${out}"),
+            format!("$scrypt$ln=16,r=8,p=1${salt}${out}"),
+            format!("$argon2id$v=19$m=19456,t=2,p=1,keyid=abc${salt}${out}"),
+            format!("$argon2id$v=19$m=19456,t=2,p=1,data=abc${salt}${out}"),
+            format!("$argon2id$v=18$m=19456,t=2,p=1${salt}${out}"),
+            format!("$argon2id$v=19$m=4194304,t=2,p=1${salt}${out}"),
+            format!("$argon2id$v=19$m=19456,t=100,p=1${salt}${out}"),
+            format!("$argon2id$v=19$m=19456,t=2${salt}${out}"),
+            format!("$argon2id$v=19$m=19456,m=1,t=2,p=1${salt}${out}"),
+            format!("$argon2id$v=19$m=4,t=2,p=1${salt}${out}"),
+            format!("$argon2id$v=19$m=19456,t=2,p=1$${out}"),
+            format!("$argon2id$v=19$m=19456,t=2,p=1${salt}$"),
+            format!("$argon2id$v=19$m=19456,t=2,p=1${salt}${out}$extra"),
+            format!("$argon2id$v=19$m=19456,t=2,p=1${salt}$!!notbase64!!"),
+        ] {
+            let error = accounts.set_password_hash("carol", &hash).unwrap_err();
+            assert!(matches!(error, AccountError::InvalidHash(_)), "{hash}");
+            assert!(
+                hash.is_empty() || !error.to_string().contains(&hash),
+                "the refusal must not echo the hash"
+            );
+        }
+        assert!(accounts.verify_password("carol", "her password").unwrap());
+    }
+}

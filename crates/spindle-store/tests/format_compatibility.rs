@@ -190,6 +190,12 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::Pusher, 0x2f),
         (Keyspace::MemberHistory, 0x30),
         (Keyspace::PushCursor, 0x31),
+        (Keyspace::ImportNotificationFence, 0x43),
+        (Keyspace::FederationGap, 0x44),
+        (Keyspace::FederationGapEvent, 0x45),
+        (Keyspace::FederationGapPosition, 0x46),
+        (Keyspace::FederationGapSpan, 0x47),
+        (Keyspace::PendingRedaction, 0x48),
         (Keyspace::PendingKnock, 0x32),
         (Keyspace::OpenIdToken, 0x33),
         (Keyspace::Sticky, 0x34),
@@ -203,6 +209,11 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::AccountDataStream, 0x3c),
         (Keyspace::SynapsePosition, 0x3e),
         (Keyspace::SynapseTopologicalPosition, 0x3f),
+        (Keyspace::BrowserSession, 0x50),
+        (Keyspace::EmailToken, 0x51),
+        (Keyspace::UserEmail, 0x52),
+        (Keyspace::EmailOwner, 0x53),
+        (Keyspace::RecoveryCodes, 0x54),
     ] {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(

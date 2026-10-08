@@ -26,12 +26,12 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**228 routes implemented; 0 known gaps in scope.**
+**248 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
 
-### Admin & moderation — 56 implemented, 0 planned
+### Admin & moderation — 60 implemented, 0 planned
 
 - `GET /_spindle/admin/v1/audit`
 - `GET /_spindle/admin/v1/event_reports`
@@ -55,6 +55,8 @@ neither implemented nor counted.
 - `GET /_spindle/admin/v1/users/{user_id}/devices`
 - `DELETE /_spindle/admin/v1/users/{user_id}/devices/{device_id}`
 - `GET /_spindle/admin/v1/users/{user_id}/joined_rooms`
+- `POST /_spindle/admin/v1/users/{user_id}/password_hash`
+- `POST /_spindle/admin/v1/users/{user_id}/reset_link`
 - `POST /_spindle/admin/v1/users/{user_id}/reset_password`
 - `GET /_spindle/admin/v1/whois/{user_id}`
 - `GET /_synapse/admin/v1/audit`
@@ -83,6 +85,8 @@ neither implemented nor counted.
 - `GET /_synapse/admin/v1/users/{user_id}/devices`
 - `DELETE /_synapse/admin/v1/users/{user_id}/devices/{device_id}`
 - `GET /_synapse/admin/v1/users/{user_id}/joined_rooms`
+- `POST /_synapse/admin/v1/users/{user_id}/password_hash`
+- `POST /_synapse/admin/v1/users/{user_id}/reset_link`
 - `POST /_synapse/admin/v1/users/{user_id}/reset_password`
 - `GET /_synapse/admin/v1/whois/{user_id}`
 - `GET /_synapse/admin/v2/users`
@@ -257,8 +261,9 @@ neither implemented nor counted.
 - `GET/PUT /_matrix/client/v3/profile/{user_id}/displayname`
 - `GET/PUT/DELETE /_matrix/client/v3/profile/{user_id}/{key}`
 
-### Accounts, devices & auth — 12 implemented, 0 planned
+### Accounts, devices & auth — 13 implemented, 0 planned
 
+- `GET /_matrix/client/v3/account/3pid`
 - `POST /_matrix/client/v3/account/deactivate`
 - `POST /_matrix/client/v3/account/password`
 - `GET /_matrix/client/v3/account/whoami`
@@ -272,7 +277,7 @@ neither implemented nor counted.
 - `POST /_matrix/client/v3/register`
 - `GET /_matrix/client/v3/register/available`
 
-### Server, discovery & operations — 29 implemented, 0 planned
+### Server, discovery & operations — 44 implemented, 0 planned
 
 - `GET /.well-known/matrix/client`
 - `GET /.well-known/matrix/server`
@@ -301,6 +306,21 @@ neither implemented nor counted.
 - `GET /_matrix/key/v2/server`
 - `POST /_matrix/media/v1/create`
 - `GET/PUT/DELETE /_synapse/client/rendezvous/{session_id}`
+- `GET /account`
+- `GET /account/`
+- `POST /account/deactivate`
+- `POST /account/emails/add`
+- `POST /account/emails/remove`
+- `GET/POST /account/emails/verify`
+- `GET/POST /account/login`
+- `POST /account/logout`
+- `POST /account/password`
+- `GET/POST /account/password/forgot`
+- `GET/POST /account/password/reset`
+- `POST /account/profile`
+- `GET/POST /account/recover`
+- `POST /account/recovery/generate`
+- `POST /account/sessions/end`
 - `GET /health`
 - `GET /ready`
 

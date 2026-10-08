@@ -21,12 +21,13 @@ use axum::extract::ConnectInfo;
 use std::net::SocketAddr;
 
 use crate::accounts::{AccountError, Accounts};
-use crate::auth::Authenticated;
+use crate::auth::{AccountAuthenticated, Authenticated};
 use crate::errors::MatrixError;
 use crate::inbound::{
     FederationStateQuery, federation_origin, join_candidates, merge_returned_signatures,
     sign_membership_template,
 };
+use crate::metrics::LoginResult;
 use crate::ratelimit::{FAILED_LOGIN_PER_ACCOUNT, FAILED_LOGIN_PER_SOURCE, REGISTER_PER_SOURCE};
 use crate::rooms::ReadScope;
 use crate::{AppState, surface};
@@ -110,12 +111,15 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::presence_routes::routes())
         .merge(room_routes())
         .merge(timeline_routes())
-        .merge(media_routes())
+        .merge(media_routes(state.media.max_upload_bytes()))
         .merge(discovery_routes())
         .merge(federation_read_routes())
         .merge(crate::mas::routes())
         .merge(crate::admin::routes())
         .merge(crate::oidc::routes())
+        .merge(crate::account::routes())
+        .merge(crate::email::routes())
+        .merge(crate::recovery::routes())
         .merge(crate::openid::routes())
         .merge(crate::rendezvous::routes())
         .merge(crate::livekit::routes())
@@ -754,7 +758,7 @@ fn timeline_routes() -> Router<AppState> {
 /// authenticated endpoints exist to impose. A client old enough to need them
 /// gets a 404, which is the truthful answer for a surface this server does not
 /// offer.
-fn media_routes() -> Router<AppState> {
+fn media_routes(max_upload_bytes: usize) -> Router<AppState> {
     Router::new()
         .route(
             "/_matrix/media/v3/upload",
@@ -762,7 +766,7 @@ fn media_routes() -> Router<AppState> {
                 // Axum's default body limit is 2 MiB, which would reject an
                 // upload before the handler ever saw it -- with a bare 413 and
                 // no Matrix error code. The server would then be advertising a
-                // 50 MiB limit in `/config` and enforcing 2 MiB, which is the
+                // configured limit in `/config` and enforcing 2 MiB, which is the
                 // worst kind of disagreement: the client is told the file is
                 // fine, sends it, and gets an opaque failure.
                 //
@@ -770,14 +774,14 @@ fn media_routes() -> Router<AppState> {
                 // `Media::put` is the thing that refuses, and refuses with
                 // `M_TOO_LARGE`.
                 .layer(axum::extract::DefaultBodyLimit::max(
-                    crate::media::MAX_UPLOAD + 1,
+                    max_upload_bytes.saturating_add(1),
                 )),
         )
         .route("/_matrix/media/v1/create", post(create_media))
         .route(
             "/_matrix/media/v3/upload/{server_name}/{media_id}",
             axum::routing::put(upload_reserved_media).layer(axum::extract::DefaultBodyLimit::max(
-                crate::media::MAX_UPLOAD + 1,
+                max_upload_bytes.saturating_add(1),
             )),
         )
         .route("/_matrix/media/v3/config", get(media_config))
@@ -877,10 +881,10 @@ async fn preview_url(
 }
 
 /// `GET /_matrix/media/v3/config` and its `/client/v1` twin.
-async fn media_config(State(_state): State<AppState>) -> Json<Value> {
+async fn media_config(State(state): State<AppState>) -> Json<Value> {
     // Stated rather than discovered: a client that knows the limit can refuse
     // a file before spending a minute sending it.
-    Json(json!({ "m.upload.size": crate::media::MAX_UPLOAD }))
+    Json(json!({ "m.upload.size": state.media.max_upload_bytes() }))
 }
 
 /// `GET /_matrix/client/v1/media/download/{server_name}/{media_id}`
@@ -1422,10 +1426,11 @@ async fn well_known_client(
             "account": format!("{}/account", delegated.issuer().trim_end_matches('/')),
         });
     } else if state.oidc.is_some() {
-        // The built-in provider is its own issuer; there is no account
-        // management UI to point at, so none is advertised.
+        // The built-in provider is its own issuer, and serves its own
+        // account pages (#607).
         body["org.matrix.msc2965.authentication"] = json!({
             "issuer": format!("{}/", crate::oidc::issuer(&state)),
+            "account": crate::account::management_uri(&state),
         });
     }
     // MSC4143 (which absorbed MSC4158): the MatrixRTC backend, named here
@@ -1482,16 +1487,27 @@ async fn well_known_server(
 }
 
 /// Liveness: the process is up.
+///
+/// Takes no state and no lock -- not the room registry, not a room --
+/// and must stay that way: it answers whenever a worker can poll it, and
+/// #614 is about making sure one always can, by keeping room work off the
+/// async workers. A liveness answer that waited on the work it is meant
+/// to see past would get a busy server killed.
 async fn health() -> StatusCode {
     StatusCode::OK
 }
 
 /// Readiness: the process can serve.
 ///
-/// Currently the same answer as liveness, which is honest only because nothing
-/// is initialised asynchronously yet. When storage opens here, this has to stop
-/// reporting ready before it is — a readiness probe that lies is worse than no
-/// readiness probe, because it takes traffic on the strength of the lie.
+/// Storage is open, the stream counters resumed and the signing key loaded
+/// before the listener accepts anything, so by the time this can answer at
+/// all the server can serve every request. It does **not** wait for the
+/// startup room warm-up (`spawn_room_warmup`): a room of a million events
+/// takes minutes to load, and holding a single-replica deployment out of
+/// rotation for that long is an outage bought to avoid a slow first
+/// request. A room not yet warm is loaded by the request that needs it,
+/// off the async workers. A readiness probe that lies is worse than none
+/// -- this one claims only what is true.
 async fn ready() -> StatusCode {
     StatusCode::OK
 }
@@ -1676,6 +1692,7 @@ async fn login(
         (&source_key, FAILED_LOGIN_PER_SOURCE),
     ] {
         if let Err(retry) = state.limiter.check(key, limit) {
+            record_password_login(&state, LoginResult::RateLimited);
             return Err(MatrixError::limit_exceeded(retry.as_millis()));
         }
     }
@@ -1684,12 +1701,17 @@ async fn login(
     // One message for a wrong password and for an unknown user. The
     // verification cost is already equal (see `verify_password`); saying
     // "no such user" here would give the difference back for free.
-    if !accounts
+    let verified = accounts
         .verify_password(&localpart, password)
-        .map_err(|error| internal(&error))?
-    {
+        .map_err(|error| {
+            record_password_login(&state, LoginResult::Error);
+            internal(&error)
+        })?;
+    if !verified {
+        record_password_login(&state, LoginResult::BadPassword);
         return Err(MatrixError::forbidden("invalid username or password"));
     }
+    record_password_login(&state, LoginResult::Success);
 
     // A correct login is not the traffic being defended against, and counting
     // it would lock out the legitimate users of a busy shared address first.
@@ -1706,6 +1728,12 @@ async fn login(
         .map_err(|error| internal(&error))?;
 
     Ok(Json(session_body(&accounts.user_id(&localpart), &session)))
+}
+
+fn record_password_login(state: &AppState, result: LoginResult) {
+    state
+        .metrics
+        .record_login(crate::metrics::LoginMethod::Password, result);
 }
 
 /// `POST /_matrix/client/v3/refresh`
@@ -2039,15 +2067,22 @@ async fn logout(
         .to_owned();
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     accounts.logout(&token).map_err(|error| internal(&error))?;
+    // Under delegation the token was vouched for by the provider and the
+    // verdict is cached; a logout that left it there would let the token
+    // keep working for the rest of the cache window (#615).
+    if let Some(delegated) = &state.delegated {
+        delegated.forget_token(&token);
+    }
     Ok(Json(json!({})))
 }
 
 /// `GET /_matrix/client/v3/account/whoami`
-async fn whoami(Authenticated(identity): Authenticated) -> Json<Value> {
-    Json(json!({
-        "user_id": identity.user_id,
-        "device_id": identity.device_id,
-    }))
+async fn whoami(AccountAuthenticated(identity): AccountAuthenticated) -> Json<Value> {
+    let mut body = json!({"user_id": identity.user_id});
+    if !identity.device_id.is_empty() {
+        body["device_id"] = json!(identity.device_id);
+    }
+    Json(body)
 }
 
 /// `POST /_matrix/client/v3/logout/all`
@@ -2063,6 +2098,9 @@ async fn logout_all(
     accounts
         .logout_everywhere(&localpart_of(&identity.user_id))
         .map_err(|error| internal(&error))?;
+    if let Some(delegated) = &state.delegated {
+        delegated.forget_user(&identity.user_id);
+    }
     Ok(Json(json!({})))
 }
 
@@ -3442,7 +3480,7 @@ async fn delete_profile_field(
 /// event — the propagation the spec asks for, and the step that carries a
 /// renamed user across federation, because member events fan out and
 /// profile rows do not.
-fn propagate_profile(state: &AppState, user_id: &str) -> Result<(), MatrixError> {
+pub(crate) fn propagate_profile(state: &AppState, user_id: &str) -> Result<(), MatrixError> {
     let profile = state
         .profiles
         .get(user_id)
@@ -4652,7 +4690,30 @@ async fn room_joined_members(
         .rooms
         .may_read(&identity.user_id, &room_id)
         .map_err(room_error)?;
-    let members = state.rooms.joined_members(&room_id).map_err(room_error)?;
+    let members = if state.rooms.erasure_active().map_err(room_error)? {
+        state
+            .rooms
+            .reader(&identity.user_id, &room_id)
+            .map_err(room_error)?
+            .members()
+            .map_err(room_error)?
+            .into_iter()
+            .filter(|event| event["content"]["membership"] == "join")
+            .filter_map(|event| {
+                event["state_key"].as_str().map(|user| {
+                    (
+                        user.to_owned(),
+                        json!({
+                            "display_name": event["content"]["displayname"],
+                            "avatar_url": event["content"]["avatar_url"]
+                        }),
+                    )
+                })
+            })
+            .collect()
+    } else {
+        state.rooms.joined_members(&room_id).map_err(room_error)?
+    };
     Ok(Json(json!({ "joined": members })))
 }
 
@@ -5483,7 +5544,13 @@ async fn room_summary(
         room_id_or_alias
     };
 
-    let summary = state.rooms.summary(&room_id).map_err(room_error)?;
+    let user_id = viewer
+        .as_ref()
+        .map_or("", |identity| identity.user_id.as_str());
+    let summary = state
+        .rooms
+        .summary_for(user_id, &room_id)
+        .map_err(room_error)?;
     let membership = match viewer {
         Some(identity) => {
             let joined = state.rooms.joined(&identity.user_id).map_err(room_error)?;
@@ -6639,13 +6706,24 @@ fn sync_resume(
 /// request carries its lists in full each time. The response sends a room in
 /// full (`initial: true`) on an initial request, and after that only the
 /// rooms the stream says changed — the one scan `changed_rooms` exists for.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the window-growth hotfix grew it past the line; split it with the next sliding change"
+)]
 async fn sliding_sync(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
     axum::extract::Query(query): axum::extract::Query<SlidingQuery>,
     Json(request): Json<crate::sliding::SlidingRequest>,
 ) -> Result<Json<Value>, MatrixError> {
-    let since = sliding_position(&identity, query.pos.as_deref())?;
+    let (stream_pos, previous_windows) = match query.pos.as_deref() {
+        Some(pos) => {
+            let (stream, windows) = crate::sliding::decode_pos(pos);
+            (Some(stream), windows)
+        }
+        None => (None, None),
+    };
+    let since = sliding_position(&identity, stream_pos)?;
     let lists = request.decoded_lists().map_err(MatrixError::bad_json)?;
     let subscriptions = request
         .decoded_subscriptions()
@@ -6655,11 +6733,73 @@ async fn sliding_sync(
     let position =
         sliding_long_poll(&state, since, timeout_ms, request.extensions.typing.on()).await;
 
+    // Everything below is synchronous room work -- for a cold room, a load
+    // from the store -- so it runs on the blocking pool, not on one of the
+    // handful of async workers the whole server shares (#614).
+    let worker_state = state.clone();
+    crate::blocking::offload(
+        std::sync::Arc::clone(&state.metrics),
+        crate::metrics::BlockingTask::SlidingSync,
+        move || {
+            sliding_answer(
+                &worker_state,
+                &identity,
+                &request,
+                SlidingInputs {
+                    since,
+                    position,
+                    previous_windows: previous_windows.as_ref(),
+                    lists: &lists,
+                    subscriptions: &subscriptions,
+                },
+            )
+        },
+    )
+    .await
+}
+
+/// How many cold rooms one sliding-sync request loads at once. Bounded:
+/// a load is CPU and I/O on cores the rest of the server shares, and four
+/// is past the two the production pod has.
+const WINDOW_LOAD_PARALLELISM: usize = 4;
+
+/// What [`sliding_answer`] needs beyond the request itself, decoded and
+/// positioned by the handler.
+#[derive(Clone, Copy)]
+struct SlidingInputs<'a> {
+    since: Option<u64>,
+    position: u64,
+    previous_windows: Option<&'a crate::sliding::Windows>,
+    lists: &'a [(String, crate::sliding::ListRequest)],
+    subscriptions: &'a [(String, crate::sliding::RoomSubscription)],
+}
+
+/// The body of a sliding-sync response, assembled synchronously.
+#[allow(clippy::too_many_lines)]
+fn sliding_answer(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    request: &crate::sliding::SlidingRequest,
+    inputs: SlidingInputs<'_>,
+) -> Result<Json<Value>, MatrixError> {
+    let SlidingInputs {
+        since,
+        position,
+        previous_windows,
+        lists,
+        subscriptions,
+    } = inputs;
+
     // The sorted room list: every joined room, newest activity first. The
     // sort is recomputed per request because it is what the ranges index
     // into, and a stale order would make the client's window show the wrong
     // rooms — the exact bug sliding sync exists to avoid.
-    let (ordered, invited) = sliding_room_order(&state, &identity)?;
+    let ordering = std::time::Instant::now();
+    let (ordered, invited) = sliding_room_order(state, identity)?;
+    state
+        .metrics
+        .observe_sync_phase(crate::metrics::SyncPhase::SlidingOrder, ordering.elapsed());
+    let assembling = std::time::Instant::now();
 
     // Every room this request may be answered with. A list window can only
     // produce rooms out of `ordered`, which came from the caller's own
@@ -6705,10 +6845,16 @@ async fn sliding_sync(
     // sent once, with the larger ask.
     let mut wanted: std::collections::HashMap<String, (Vec<(String, String)>, usize)> =
         std::collections::HashMap::new();
-    for (name, list) in &lists {
+    // Rooms in view now that were in no window this `pos` was answered for:
+    // the client has never been sent them, changed or not.
+    let mut newly_in_view: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (name, list) in lists {
         let indices = crate::sliding::indices_in_view(&list.ranges, ordered.len());
         for &index in &indices {
             let room_id = &ordered[index].0;
+            if since.is_some() && !crate::sliding::was_in_view(previous_windows, name, index) {
+                newly_in_view.insert(room_id.clone());
+            }
             let entry = wanted
                 .entry(room_id.clone())
                 .or_insert_with(|| (Vec::new(), 0));
@@ -6717,7 +6863,7 @@ async fn sliding_sync(
         }
         lists_out.insert(name.clone(), json!({ "count": ordered.len() }));
     }
-    for (room_id, subscription) in &subscriptions {
+    for (room_id, subscription) in subscriptions {
         // Silence rather than an error: a client that subscribed to a room it
         // has since left should get a response about its other rooms, not a
         // rejected request -- and a client fishing for a room it was never in
@@ -6737,39 +6883,66 @@ async fn sliding_sync(
     // The rooms in view, whether or not they changed: the room extensions
     // below answer for all of them.
     let in_view: Vec<String> = wanted.keys().cloned().collect();
+    // Every cold room about to be rendered is loaded first, several at once,
+    // rather than one after another as the loop below reaches it: after a
+    // restart a window of twenty cold rooms costs its slowest load, not the
+    // sum of all twenty (#614). Rooms answered silently, and invites (which
+    // have no log here to load), are left alone.
+    let cold: Vec<String> = in_view
+        .iter()
+        .filter(|room_id| {
+            !invited.contains(*room_id)
+                && (changed
+                    .as_ref()
+                    .is_none_or(|changed| changed.contains(*room_id))
+                    || newly_in_view.contains(*room_id))
+                && !state.rooms.is_resident(room_id)
+        })
+        .cloned()
+        .collect();
+    state.rooms.warm_all(&cold, WINDOW_LOAD_PARALLELISM);
     for (room_id, (required_state, timeline_limit)) in wanted {
         // Incrementally, silence about an unchanged room *is* the answer.
+        let newly = newly_in_view.contains(&room_id);
         if let Some(changed) = &changed
             && !changed.contains(&room_id)
+            && !newly
         {
             continue;
         }
         let entry = if invited.contains(&room_id) {
-            sliding_invite_entry(&state, &identity, &room_id)?
+            sliding_invite_entry(state, identity, &room_id)?
         } else {
             sliding_room_entry(
-                &state,
-                &identity,
+                state,
+                identity,
                 &room_id,
                 &required_state,
                 timeline_limit,
-                since.is_none(),
+                since.is_none() || newly,
             )?
         };
         rooms_out.insert(room_id, entry);
     }
 
     let extensions = sliding_extensions(
-        &state,
-        &identity,
+        state,
+        identity,
         &request.extensions,
         since,
         position,
         &in_view,
     )?;
+    state.metrics.observe_sync_phase(
+        crate::metrics::SyncPhase::SlidingAssemble,
+        assembling.elapsed(),
+    );
 
     Ok(Json(json!({
-        "pos": crate::tokens::Sync(position).to_string(),
+        "pos": crate::sliding::encode_pos(
+            &crate::tokens::Sync(position).to_string(),
+            &crate::sliding::windows_of(lists),
+        ),
         "lists": lists_out,
         "rooms": rooms_out,
         "extensions": extensions,
@@ -7121,36 +7294,31 @@ fn lazy_members_expanded(
         .collect()
 }
 
-fn sliding_room_entry(
+fn sliding_heroes(
+    state: &AppState,
+    reader: &crate::rooms::RoomReader<'_>,
+    roster: &crate::rooms::Roster,
+    viewer: &str,
+) -> Result<Vec<Value>, MatrixError> {
+    let mut heroes = roster.heroes.clone();
+    if state.rooms.erasure_active().map_err(room_error)? {
+        for hero in &mut heroes {
+            let member = reader
+                .state_event("m.room.member", &hero.user_id)
+                .map_err(room_error)?;
+            hero.displayname = member["displayname"].as_str().map(str::to_owned);
+            hero.avatar_url = member["avatar_url"].as_str().map(str::to_owned);
+        }
+    }
+    Ok(crate::sliding::heroes(&heroes, viewer))
+}
+
+fn sliding_required_state(
     state: &AppState,
     identity: &crate::accounts::Identity,
     room_id: &str,
     required_state: &[(String, String)],
-    timeline_limit: usize,
-    initial: bool,
-) -> Result<Value, MatrixError> {
-    let name = state
-        .rooms
-        .state_event_unscoped(room_id, "m.room.name", "")
-        .ok()
-        .and_then(|content| content["name"].as_str().map(str::to_owned));
-    let (events, limited, prev_batch) = if timeline_limit == 0 {
-        (Vec::new(), false, None)
-    } else {
-        state
-            .rooms
-            .timeline_tail_public(room_id, timeline_limit.min(50))
-            .map_err(room_error)?
-    };
-    let timeline = crate::sliding::Timeline {
-        events: events
-            .into_iter()
-            .map(|event| with_transaction_id(state, identity, event))
-            .collect(),
-        limited,
-        prev_batch: prev_batch.map(|li| crate::tokens::Pagination(li).to_string()),
-    };
-    let required_state = lazy_members_expanded(required_state, &timeline.events);
+) -> Result<Vec<Value>, MatrixError> {
     // A wildcard has to be answered by looking at everything; a list of
     // named keys does not. Element X asks for a handful of concrete keys
     // and gets sent the whole room state to filter down — a stored-body
@@ -7193,7 +7361,7 @@ fn sliding_room_entry(
                 let event_type = event["type"].as_str().unwrap_or_default();
                 let state_key = event["state_key"].as_str().unwrap_or_default();
                 crate::sliding::wants_state(
-                    &required_state,
+                    required_state,
                     &identity.user_id,
                     event_type,
                     state_key,
@@ -7201,12 +7369,56 @@ fn sliding_room_entry(
             })
             .collect()
     };
-    let roster = state.rooms.roster(room_id).map_err(room_error)?;
-    let avatar = state
+    state
         .rooms
-        .state_event_unscoped(room_id, "m.room.avatar", "")
+        .prune_erased_events(&identity.user_id, room_id, state_events)
+        .map_err(room_error)
+}
+
+fn sliding_room_entry(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    room_id: &str,
+    required_state: &[(String, String)],
+    timeline_limit: usize,
+    initial: bool,
+) -> Result<Value, MatrixError> {
+    let reader = state
+        .rooms
+        .reader(&identity.user_id, room_id)
+        .map_err(room_error)?;
+    let name = reader
+        .state_event("m.room.name", "")
+        .ok()
+        .and_then(|content| content["name"].as_str().map(str::to_owned));
+    let (events, limited, prev_batch) = if timeline_limit == 0 {
+        (Vec::new(), false, None)
+    } else {
+        state
+            .rooms
+            .timeline_tail_public(room_id, timeline_limit.min(50))
+            .map_err(room_error)?
+    };
+    let events = state
+        .rooms
+        .prune_erased_events(&identity.user_id, room_id, events)
+        .map_err(room_error)?;
+    let timeline = crate::sliding::Timeline {
+        events: events
+            .into_iter()
+            .map(|event| with_transaction_id(state, identity, event))
+            .collect(),
+        limited,
+        prev_batch: prev_batch.map(|li| crate::tokens::Pagination(li).to_string()),
+    };
+    let required_state = lazy_members_expanded(required_state, &timeline.events);
+    let state_events = sliding_required_state(state, identity, room_id, &required_state)?;
+    let roster = state.rooms.roster(room_id).map_err(room_error)?;
+    let avatar = reader
+        .state_event("m.room.avatar", "")
         .ok()
         .and_then(|content| content["url"].as_str().map(str::to_owned));
+    let heroes = sliding_heroes(state, &reader, &roster, &identity.user_id)?;
     let bump_stamp = state.rooms.last_activity(room_id).map_err(room_error)?;
     let unread = state
         .rooms
@@ -7219,7 +7431,7 @@ fn sliding_room_entry(
             avatar,
             joined_count: roster.joined.len(),
             invited_count: roster.invited.len(),
-            heroes: crate::sliding::heroes(&roster.heroes, &identity.user_id),
+            heroes,
             bump_stamp,
         },
         state_events,
@@ -7393,19 +7605,30 @@ async fn sync(
         crate::rooms::StateBlock::Deferred
     };
     let state_after = query.state_after();
+    // The read and the assembly are synchronous room work -- a cold room
+    // is a load from the store -- so both run on the blocking pool rather
+    // than on an async worker (#614). The long-poll between them is the
+    // one stretch that genuinely waits, and it stays async.
     let read = |since: Option<u64>| {
-        state
-            .rooms
-            .sync(
-                &identity.user_id,
-                since,
-                timeline_limit,
-                state_block,
-                state_after,
-            )
-            .map_err(room_error)
+        let state = state.clone();
+        let user_id = identity.user_id.clone();
+        crate::blocking::offload(
+            std::sync::Arc::clone(&state.metrics),
+            crate::metrics::BlockingTask::Sync,
+            move || {
+                let started = std::time::Instant::now();
+                let result = state
+                    .rooms
+                    .sync(&user_id, since, timeline_limit, state_block, state_after)
+                    .map_err(room_error);
+                state
+                    .metrics
+                    .observe_sync_phase(crate::metrics::SyncPhase::SyncRead, started.elapsed());
+                result
+            },
+        )
     };
-    let mut result = read(since)?;
+    let mut result = read(since).await?;
 
     // Long-poll, but only for an incremental sync: an initial sync always has
     // something to say, and blocking one would leave a first-time client
@@ -7426,27 +7649,55 @@ async fn sync(
                 () = state.rooms.wait_for_event(timeout) => {}
                 () = state.typing.wait(timeout) => {}
             }
-            result = read(Some(since))?;
+            result = read(Some(since)).await?;
         }
     }
 
-    let join = sync_join(
-        &state,
-        &identity,
-        result.rooms,
-        filter.as_ref(),
-        query.state_label(),
-        since,
-    )?;
+    let state_label = query.state_label();
+    let worker_state = state.clone();
+    crate::blocking::offload(
+        std::sync::Arc::clone(&state.metrics),
+        crate::metrics::BlockingTask::Sync,
+        move || {
+            let started = std::time::Instant::now();
+            let response = sync_answer(
+                &worker_state,
+                &identity,
+                result,
+                filter.as_ref(),
+                state_label,
+                resume,
+            );
+            worker_state
+                .metrics
+                .observe_sync_phase(crate::metrics::SyncPhase::SyncAssemble, started.elapsed());
+            response
+        },
+    )
+    .await
+}
 
-    let invite = sync_invite(&state, &identity, result.invited, filter.as_ref());
-    let knock = sync_knock(&state, &identity, result.knocked, filter.as_ref());
-    let leave = sync_leave(result.left, filter.as_ref());
+/// The body of a `/sync` response, assembled synchronously from what the
+/// read found.
+fn sync_answer(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    result: crate::rooms::SyncResult,
+    filter: Option<&crate::filters::Filter>,
+    state_label: &'static str,
+    resume: crate::tokens::Resume,
+) -> Result<axum::response::Response, MatrixError> {
+    let since = resume.position();
+    let join = sync_join(state, identity, result.rooms, filter, state_label, since)?;
+
+    let invite = sync_invite(state, identity, result.invited, filter);
+    let knock = sync_knock(state, identity, result.knocked, filter);
+    let leave = sync_leave(result.left, filter);
 
     let (to_device, device_changes, key_counts, unused_fallback) =
-        sync_device_sections(&state, &identity, resume, result.next_batch)?;
+        sync_device_sections(state, identity, resume, result.next_batch)?;
 
-    let global = sync_account_data(&state, &identity, filter.as_ref(), since, result.next_batch)?;
+    let global = sync_account_data(state, identity, filter, since, result.next_batch)?;
 
     // Assembled from pre-serialized parts rather than as one `Value`, so the
     // joined rooms' state blocks -- which `sync_join` may have taken straight
@@ -7476,7 +7727,7 @@ async fn sync(
     body.insert("account_data", raw(&json!({ "events": global }))?);
 
     let window = (since, result.next_batch);
-    if let Some(done) = finalised_delays(&state, &identity.user_id, filter.as_ref(), window)? {
+    if let Some(done) = finalised_delays(state, &identity.user_id, filter, window)? {
         body.insert("org.matrix.msc4140.finalised_delayed_events", raw(&done)?);
     }
 
@@ -7707,7 +7958,7 @@ fn sticky_section(
         .iter()
         .filter_map(|event| event["event_id"].as_str())
         .collect();
-    Ok(state
+    let events = state
         .rooms
         .sticky_events(room_id, if joined_now { None } else { since })
         .map_err(room_error)?
@@ -7717,7 +7968,11 @@ fn sticky_section(
             event["unsigned"]["msc4354_sticky_duration_ttl_ms"] = json!(ttl);
             event
         })
-        .collect())
+        .collect();
+    state
+        .rooms
+        .prune_erased_events(user_id, room_id, events)
+        .map_err(room_error)
 }
 
 fn sync_join(
@@ -8043,6 +8298,10 @@ fn relations(
         .relations(room_id, event_id, rel_type, event_type, from, limit)
         .map_err(room_error)?;
 
+    let chunk = state
+        .rooms
+        .prune_erased_events(user_id, room_id, chunk)
+        .map_err(room_error)?;
     let mut body = serde_json::Map::new();
     body.insert("chunk".to_owned(), Value::Array(chunk));
     // Absent when there is nothing more, which is how a client stops.
@@ -8557,6 +8816,10 @@ async fn room_threads(
         .threads(&room_id, &identity.user_id, participated_only, from, limit)
         .map_err(room_error)?;
 
+    let roots = state
+        .rooms
+        .prune_erased_events(&identity.user_id, &room_id, roots)
+        .map_err(room_error)?;
     let chunk: Vec<Value> = roots
         .into_iter()
         .map(|root| as_seen_by(&state, &room_id, &identity, root))
@@ -9124,6 +9387,14 @@ async fn room_messages(
         None => None,
     };
     let limit = query.limit.unwrap_or(10).clamp(1, 100);
+    // Paging back into a room whose history has a gap still being filled:
+    // put that room first in the backfill loop's queue (#619). The page
+    // itself is served from what is held now; it does not wait.
+    if matches!(direction, crate::rooms::Direction::Backward)
+        && state.rooms.has_open_gap(&room_id).unwrap_or(false)
+    {
+        state.backfill.poke(&room_id);
+    }
 
     let (events, next) = reader
         .page(
@@ -9378,6 +9649,7 @@ fn matches_term(summary: &crate::rooms::RoomSummary, term: &str) -> bool {
 /// failing.
 fn directory_page(
     state: &AppState,
+    user_id: &str,
     limit: Option<usize>,
     since: Option<&str>,
     term: Option<&str>,
@@ -9402,7 +9674,7 @@ fn directory_page(
     // whole listing down with it.
     let mut visible: Vec<crate::rooms::RoomSummary> = Vec::new();
     for room_id in &published {
-        let Ok(summary) = state.rooms.summary(room_id) else {
+        let Ok(summary) = state.rooms.summary_for(user_id, room_id) else {
             continue;
         };
         if term.is_some_and(|term| !matches_term(&summary, term)) {
@@ -9459,7 +9731,7 @@ async fn public_rooms(
     axum::extract::Query(query): axum::extract::Query<PublicRoomsQuery>,
 ) -> Result<Json<Value>, MatrixError> {
     refuse_remote_directory(query.server.as_ref(), &state.config.server.name)?;
-    directory_page(&state, query.limit, query.since.as_deref(), None, &[])
+    directory_page(&state, "", query.limit, query.since.as_deref(), None, &[])
 }
 
 /// `POST /_matrix/client/v3/publicRooms`
@@ -9469,12 +9741,13 @@ async fn public_rooms(
 /// attributable.
 async fn public_rooms_filtered(
     State(state): State<AppState>,
-    Authenticated(_identity): Authenticated,
+    Authenticated(identity): Authenticated,
     Json(request): Json<PublicRoomsRequest>,
 ) -> Result<Json<Value>, MatrixError> {
     refuse_remote_directory(request.server.as_ref(), &state.config.server.name)?;
     directory_page(
         &state,
+        &identity.user_id,
         request.limit,
         request.since.as_deref(),
         request.filter.generic_search_term.as_deref(),
@@ -9775,7 +10048,7 @@ async fn search(
             if let Some(wanted) = &criteria.event_context
                 && let Some(scope) = scopes.get(&hit.room_id)
             {
-                result["context"] = search_context(&state, hit, wanted, scope);
+                result["context"] = search_context(&state, &identity.user_id, hit, wanted, scope);
             }
             result
         })
@@ -9794,7 +10067,7 @@ async fn search(
     if criteria.include_state {
         room_events.insert(
             "state".to_owned(),
-            Value::Object(search_state(&state, &hits, &scopes)?),
+            Value::Object(search_state(&state, &identity.user_id, &hits, &scopes)?),
         );
     }
     Ok(Json(json!({
@@ -9836,7 +10109,7 @@ fn search_rooms(
         let matches = |event: &Value| search_matches(event, needle, keys, &criteria.filter);
         let (found, next) = state
             .rooms
-            .reader_with(&room_id, scope.clone())
+            .reader_with(user_id, &room_id, scope.clone())
             .search(cursor.get(&room_id).copied(), limit, &matches)
             .map_err(room_error)?;
         more |= next.is_some();
@@ -9986,7 +10259,7 @@ async fn notifications(
         };
         let (found, next) = state
             .rooms
-            .reader_with(&room_id, scope.clone())
+            .reader_with(&identity.user_id, &room_id, scope.clone())
             .search(cursor.get(&room_id).copied(), limit, &notifies)
             .map_err(room_error)?;
         more |= next.is_some();
@@ -10059,6 +10332,7 @@ fn render_notifications(
 /// one, exactly as `/state` answers.
 fn search_state(
     state: &AppState,
+    user_id: &str,
     hits: &[SearchHit],
     scopes: &BTreeMap<String, ReadScope>,
 ) -> Result<serde_json::Map<String, Value>, MatrixError> {
@@ -10074,7 +10348,7 @@ fn search_state(
         // carries that answer rather than asking again.
         let rendered = state
             .rooms
-            .reader_with(&hit.room_id, scope.clone())
+            .reader_with(user_id, &hit.room_id, scope.clone())
             .state_serialized()
             .map_err(room_error)?;
         let room_state = serde_json::from_str::<Value>(&rendered)
@@ -10089,6 +10363,7 @@ fn search_state(
 /// read is a hit without context rather than a failed search.
 fn search_context(
     state: &AppState,
+    user_id: &str,
     hit: &SearchHit,
     wanted: &SearchContext,
     scope: &ReadScope,
@@ -10097,7 +10372,7 @@ fn search_context(
     let after_limit = wanted.after_limit.unwrap_or(SEARCH_CONTEXT_EACH_SIDE);
     let Ok(context) = state
         .rooms
-        .reader_with(&hit.room_id, scope.clone())
+        .reader_with(user_id, &hit.room_id, scope.clone())
         .context(&hit.event.event_id, before_limit, after_limit)
     else {
         return Value::Null;
@@ -10324,6 +10599,9 @@ async fn deactivate_account(
     accounts
         .logout_everywhere(&localpart)
         .map_err(|error| internal(&error))?;
+    if let Some(delegated) = &state.delegated {
+        delegated.forget_user(&identity.user_id);
+    }
     state.rooms.wake_sync_waiters();
 
     // No identity server is contacted, so no third-party binding is removed.
@@ -10431,7 +10709,7 @@ fn hierarchy_visible(
     user: &str,
     room_id: &str,
 ) -> Option<crate::rooms::RoomSummary> {
-    let summary = state.rooms.summary(room_id).ok()?;
+    let summary = state.rooms.summary_for(user, room_id).ok()?;
     if state.rooms.is_joined(user, room_id).unwrap_or(false) {
         return Some(summary);
     }
@@ -10878,7 +11156,7 @@ async fn federation_public_rooms(
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
     federation_origin(&state, &headers, "GET", &uri, None).await?;
-    directory_page(&state, query.limit, query.since.as_deref(), None, &[])
+    directory_page(&state, "", query.limit, query.since.as_deref(), None, &[])
 }
 
 /// `POST /_matrix/federation/v1/publicRooms`
@@ -10901,6 +11179,7 @@ async fn federation_public_rooms_filtered(
         serde_json::from_value(body).map_err(|error| MatrixError::bad_json(error.to_string()))?;
     directory_page(
         &state,
+        "",
         filter.limit,
         filter.since.as_deref(),
         filter.filter.generic_search_term.as_deref(),

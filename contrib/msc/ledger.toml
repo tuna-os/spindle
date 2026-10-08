@@ -251,6 +251,14 @@ evidence = ["crates/spindle-server/tests/spec_wave2.rs"]
 notes = "POST /login/get_token behind the password UIA stage, m.login.token on /login, the m.get_login_token capability and the get_login_token flow flag. Tokens are single use and live two minutes."
 
 [[msc]]
+number = 4191
+title = "Account management deep-linking"
+status = "served"
+stable = ""
+evidence = ["crates/spindle-server/tests/account_management.rs"]
+notes = "Built-in provider only: account_management_uri and account_management_actions_supported in the discovery document and auth_metadata, both the session_* and device_* action spellings, ?action= and device_id= deep links. Under delegation the provider (MAS) advertises its own."
+
+[[msc]]
 number = 2666
 title = "Mutual rooms"
 status = "served"

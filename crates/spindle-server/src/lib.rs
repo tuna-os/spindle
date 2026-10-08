@@ -6,6 +6,7 @@
 //! table that builds the router, so claiming something unbuilt is a
 //! compile-or-test failure rather than a documentation drift.
 
+pub mod account;
 pub mod account_data;
 pub mod accounts;
 pub mod admin;
@@ -14,6 +15,7 @@ pub mod auth;
 pub mod authorize;
 pub mod backups;
 pub mod blobs;
+pub mod blocking;
 pub mod config;
 pub mod dehydrated;
 pub mod delayed;
@@ -21,6 +23,7 @@ pub mod delegated;
 pub mod devices;
 pub mod directory;
 pub mod e2ee_federation;
+pub mod email;
 pub mod errors;
 pub mod federation;
 pub mod filters;
@@ -41,6 +44,7 @@ pub mod push;
 pub mod push_rules;
 pub mod pushers;
 pub mod ratelimit;
+pub mod recovery;
 pub mod registration_tokens;
 pub mod rendezvous;
 pub mod rooms;
@@ -51,12 +55,14 @@ pub mod server_notices;
 pub mod shared_secret_registration;
 pub mod signing;
 pub mod sliding;
+pub mod state_res;
 pub mod state_res_v1;
 pub mod stream;
 pub mod surface;
 pub mod telemetry;
 pub mod tokens;
 pub mod typing;
+pub mod web;
 
 use std::sync::Arc;
 
@@ -103,6 +109,16 @@ pub struct AppState {
     /// creation. Process-local because a restart invalidates them.
     pub registration_nonces: Arc<shared_secret_registration::RegistrationNonces>,
     pub rendezvous: Arc<rendezvous::Rendezvous>,
+    /// One dependency recovery per room at a time, and the peers resting
+    /// after a 429 (`inbound::recovery`).
+    pub recovery: Arc<inbound::RecoveryGate>,
+    /// The background fill of recorded federation gaps, which a client
+    /// paging into one wakes (`inbound::backfill`).
+    pub backfill: Arc<inbound::GapBackfill>,
+    /// Where the built-in provider's mail goes (#608): the SMTP relay
+    /// `[email]` names, or what a test supplied. Absent, nothing is mailed
+    /// and the pages that would need it are not offered.
+    pub mailer: Option<Arc<dyn email::Mailer>>,
 }
 
 /// Why the application cannot be built. Both are startup-fatal on purpose:
@@ -115,6 +131,7 @@ pub enum AppError {
     FederationConfig(String),
     PushConfig(String),
     Appservice(String),
+    Email(String),
 }
 
 impl std::fmt::Display for AppError {
@@ -125,6 +142,7 @@ impl std::fmt::Display for AppError {
             Self::FederationConfig(why) => write!(formatter, "federation config: {why}"),
             Self::PushConfig(why) => write!(formatter, "push config: {why}"),
             Self::Appservice(why) => write!(formatter, "appservice registration: {why}"),
+            Self::Email(why) => write!(formatter, "email: {why}"),
         }
     }
 }
@@ -175,6 +193,218 @@ pub fn app_with_metrics(
     store: Arc<FjallStore>,
     metrics: Arc<metrics::Metrics>,
 ) -> Result<Router, AppError> {
+    let state = app_state(config, store, metrics)?;
+    spawn_delivery_loops(&state);
+    Ok(routes::router(state))
+}
+
+/// [`app_with_metrics`], also handing back the state the router serves,
+/// for tests that need to reach behind the HTTP surface -- to hold a
+/// room's lock, or ask which rooms are resident.
+///
+/// # Errors
+///
+/// As [`app`].
+#[doc(hidden)]
+pub fn app_with_state(
+    config: Config,
+    store: Arc<FjallStore>,
+    metrics: Arc<metrics::Metrics>,
+) -> Result<(Router, AppState), AppError> {
+    let state = app_state(config, store, metrics)?;
+    spawn_delivery_loops(&state);
+    Ok((routes::router(state.clone()), state))
+}
+
+/// [`app_with_metrics`], plus the startup warm-up `[storage]
+/// warm_concurrency` asks for: what the server binary runs.
+///
+/// Separate so that a test building an app gets exactly the rooms it
+/// touched resident and no background loads racing its assertions.
+///
+/// # Errors
+///
+/// As [`app`].
+pub fn app_warming(
+    config: Config,
+    store: Arc<FjallStore>,
+    metrics: Arc<metrics::Metrics>,
+) -> Result<Router, AppError> {
+    let concurrency = config.storage.warm_concurrency;
+    let state = app_state(config, store, metrics)?;
+    spawn_delivery_loops(&state);
+    spawn_room_warmup(&state.rooms, &state.metrics, concurrency);
+    Ok(routes::router(state))
+}
+
+/// Load every room a local user is joined to in the background, newest
+/// activity first, `concurrency` at a time, on the blocking pool (#614).
+///
+/// Readiness does not wait for this. A room of a million events takes
+/// minutes to load on the hardware this runs on, and a readiness gate
+/// on it would hold a single-replica deployment out of service for all
+/// of them -- an outage to avoid a slow first request. Requests for a
+/// room the warm-up has not reached yet still work: they load it
+/// themselves, off the async workers, and the warm-up skips it.
+/// `spindle_room_warmup_pending` says how far it has got.
+///
+/// Holds the rooms weakly between loads, so a shutdown is held up by at
+/// most the loads already in progress.
+pub fn spawn_room_warmup(
+    rooms: &Arc<rooms::Rooms>,
+    metrics: &Arc<metrics::Metrics>,
+    concurrency: usize,
+) {
+    if concurrency == 0 || tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    let rooms = Arc::downgrade(rooms);
+    let metrics = Arc::clone(metrics);
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let candidates = {
+            let rooms = rooms.clone();
+            tokio::task::spawn_blocking(move || {
+                rooms
+                    .upgrade()
+                    .map_or_else(|| Ok(Vec::new()), |rooms| rooms.warm_candidates())
+            })
+            .await
+        };
+        let candidates = match candidates {
+            Ok(Ok(candidates)) => candidates,
+            Ok(Err(error)) => {
+                tracing::warn!("room warm-up cannot list rooms: {error}");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!("room warm-up failed: {error}");
+                return;
+            }
+        };
+        let total = candidates.len();
+        metrics.set_warmup_pending(total as u64);
+        tracing::info!(rooms = total, concurrency, "warming rooms");
+        let queue = Arc::new(std::sync::Mutex::new(
+            candidates
+                .into_iter()
+                .collect::<std::collections::VecDeque<_>>(),
+        ));
+        let workers: Vec<_> = (0..concurrency.min(total.max(1)))
+            .map(|_| {
+                let queue = Arc::clone(&queue);
+                let rooms = rooms.clone();
+                let metrics = Arc::clone(&metrics);
+                tokio::task::spawn_blocking(move || warm_from(&queue, &rooms, &metrics))
+            })
+            .collect();
+        for worker in workers {
+            let _ = worker.await;
+        }
+        tracing::info!(
+            rooms = total,
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "room warm-up finished"
+        );
+    });
+}
+
+/// One warm-up worker: load rooms off the shared queue until it is empty
+/// or the server is gone.
+fn warm_from(
+    queue: &std::sync::Mutex<std::collections::VecDeque<String>>,
+    rooms: &std::sync::Weak<rooms::Rooms>,
+    metrics: &metrics::Metrics,
+) {
+    loop {
+        let Some(room_id) = queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+        else {
+            return;
+        };
+        let Some(rooms) = rooms.upgrade() else {
+            return;
+        };
+        let _in_flight = metrics.blocking_started(metrics::BlockingTask::RoomWarmup);
+        match rooms.warm(&room_id) {
+            Ok(()) => metrics.warmup_loaded(),
+            Err(error) => {
+                tracing::warn!(room = room_id, "room warm-up cannot load: {error}");
+                metrics.warmup_failed();
+            }
+        }
+    }
+}
+
+/// The federation client `[federation]` describes.
+fn federation_client(
+    config: &Config,
+    store: &Arc<FjallStore>,
+    key: &Arc<signing::ServerKey>,
+    metrics: &Arc<metrics::Metrics>,
+) -> Result<Arc<federation::Federation>, AppError> {
+    let client = federation::Federation::new(
+        Arc::clone(store),
+        config.server.name.clone(),
+        Arc::clone(key),
+        config.federation.insecure_http,
+        &config.federation.allow_internal,
+    )
+    .and_then(|client| client.with_trusted_key_servers(&config.federation.trusted_key_servers()))
+    .map_err(|error| AppError::FederationConfig(error.to_string()))?;
+    Ok(Arc::new(
+        client
+            .with_peers(&config.federation.peers)
+            .with_enabled(config.federation.enabled)
+            .with_metrics(Arc::clone(metrics)),
+    ))
+}
+
+/// Everything a handler needs, built from configuration.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one construction of the shared state, a field per subsystem"
+)]
+fn app_state(
+    config: Config,
+    store: Arc<FjallStore>,
+    metrics: Arc<metrics::Metrics>,
+) -> Result<AppState, AppError> {
+    let mailer = match &config.email {
+        Some(email) => Some(Arc::new(
+            email::SmtpMailer::new(email, &config.server.name).map_err(AppError::Email)?,
+        ) as Arc<dyn email::Mailer>),
+        None => None,
+    };
+    app_state_with(config, store, metrics, mailer)
+}
+
+/// [`app_with_metrics`], with the mail transport supplied rather than
+/// built from `[email]` — a test's [`email::MemoryMailer`], typically.
+/// The pages that send mail are offered whenever a mailer is present.
+///
+/// # Errors
+///
+/// As [`app`].
+pub fn app_with_mailer(
+    config: Config,
+    store: Arc<FjallStore>,
+    metrics: Arc<metrics::Metrics>,
+    mailer: Arc<dyn email::Mailer>,
+) -> Result<Router, AppError> {
+    let state = app_state_with(config, store, metrics, Some(mailer))?;
+    spawn_delivery_loops(&state);
+    Ok(routes::router(state))
+}
+
+fn app_state_with(
+    config: Config,
+    store: Arc<FjallStore>,
+    metrics: Arc<metrics::Metrics>,
+    mailer: Option<Arc<dyn email::Mailer>>,
+) -> Result<AppState, AppError> {
     let key =
         Arc::new(signing::ServerKey::load_or_create(store.as_ref()).map_err(AppError::Signing)?);
     let rooms = Arc::new(rooms::Rooms::with_metrics(
@@ -192,11 +422,10 @@ pub fn app_with_metrics(
     let store_for_backups = Arc::clone(&store);
     let account_data = Arc::new(account_data::AccountData::new(Arc::clone(&store)));
     let blobs = blobs_for(&config);
-    let media = Arc::new(media::Media::new(
-        Arc::clone(&store),
-        blobs,
-        config.server.name.clone(),
-    ));
+    let media = Arc::new(
+        media::Media::new(Arc::clone(&store), blobs, config.server.name.clone())
+            .with_max_upload_bytes(config.media.max_upload_bytes),
+    );
     let directory = Arc::new(directory::Directory::new(
         Arc::clone(&store),
         config.server.name.clone(),
@@ -214,19 +443,7 @@ pub fn app_with_metrics(
         )
         .map_err(|error| AppError::PreviewConfig(error.to_string()))?,
     );
-    let federation = Arc::new(
-        federation::Federation::new(
-            Arc::clone(&store),
-            config.server.name.clone(),
-            Arc::clone(&key),
-            config.federation.insecure_http,
-            &config.federation.allow_internal,
-        )
-        .map_err(|error| AppError::FederationConfig(error.to_string()))?
-        .with_peers(&config.federation.peers)
-        .with_enabled(config.federation.enabled)
-        .with_metrics(Arc::clone(&metrics)),
-    );
+    let federation = federation_client(&config, &store, &key, &metrics)?;
     let delegated = config
         .auth
         .delegated
@@ -268,10 +485,19 @@ pub fn app_with_metrics(
         push,
         registration_nonces: Arc::new(shared_secret_registration::RegistrationNonces::new()),
         rendezvous: Arc::new(rendezvous::Rendezvous::new()),
+        recovery: Arc::new(inbound::RecoveryGate::new()),
+        backfill: Arc::new(inbound::GapBackfill::new()),
         metrics,
+        mailer,
     };
-    spawn_delivery_loops(&state);
-    Ok(routes::router(state))
+    // Resident rooms are counted at scrape time, from the registry itself,
+    // rather than kept as a counter every admission path would have to
+    // remember to move. Weakly, so the registry never outlives the server.
+    let resident = Arc::downgrade(&state.rooms);
+    state
+        .metrics
+        .set_resident_rooms_probe(move || resident.upgrade()?.resident_count());
+    Ok(state)
 }
 
 /// The delivery loops that run for the life of the process. Spawned only
@@ -312,6 +538,22 @@ fn spawn_delivery_loops(state: &AppState) {
             Arc::downgrade(&state.store),
             Arc::downgrade(&state.federation),
             std::time::Duration::from_millis(state.config.federation.retry_base_ms),
+        ));
+    }
+    // Recorded federation gaps fill in the background, a chunk at a time
+    // (`inbound::backfill`); nothing to do with federation off.
+    if state.config.federation.enabled && state.config.federation.gap_backfill {
+        tokio::spawn(inbound::run_backfill(
+            inbound::BackfillSources {
+                rooms: Arc::downgrade(&state.rooms),
+                federation: Arc::downgrade(&state.federation),
+                key: Arc::downgrade(&state.key),
+                metrics: Arc::downgrade(&state.metrics),
+                recovery: Arc::downgrade(&state.recovery),
+                backfill: Arc::downgrade(&state.backfill),
+                server_name: state.config.server.name.clone(),
+            },
+            inbound::BackfillSettings::of(&state.config.federation),
         ));
     }
     // Push delivery shares the outbox's retry base for the same reason
