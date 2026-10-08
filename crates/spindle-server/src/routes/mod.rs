@@ -8,6 +8,8 @@
 use axum::Router;
 use crate::AppState;
 
+pub mod routes_legacy;
+
 // Phase 1: Establish module structure (this file)
 // Phase 2: Extract submodules one at a time
 //   - routes/accounts.rs (account + device endpoints)
@@ -39,7 +41,7 @@ use crate::AppState;
 pub fn router(state: AppState) -> Router {
     // Phase 1: Delegate to original routes.rs implementation.
     // Phase 2 will replace this with merging of extracted domain modules.
-    crate::routes_legacy::router(state)
+    routes_legacy::router(state)
 }
 
 /// List of all Matrix spec endpoints for documentation and testing.
