@@ -13,6 +13,7 @@ pub mod admin;
 pub mod admin_federation;
 pub mod admin_media;
 pub mod admin_tasks;
+pub mod admin_ui;
 pub mod appservice_proxy;
 pub mod appservices;
 pub mod auth;
