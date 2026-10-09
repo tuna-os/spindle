@@ -71,7 +71,7 @@ and the diff is the work the release brought.
 
 ## Served beyond the spec at this pin
 
-150 routes the pinned spec does not define: MSC surfaces under
+153 routes the pinned spec does not define: MSC surfaces under
 `unstable/`, the admin and MAS-compatibility APIs, and stable spellings
 newer than the pin. Each MSC route must be accounted for in
 `contrib/msc/ledger.toml`; `scripts/msc-ledger.py --check` enforces that.
@@ -105,6 +105,9 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_matrix/federation/v1/rtc/livekit/get_token`
 - `/_matrix/federation/v1/send_join/{}/{}`
 - `/_matrix/federation/v1/send_leave/{}/{}`
+- `/_spindle/admin/ui`
+- `/_spindle/admin/ui/app.js`
+- `/_spindle/admin/ui/styles.css`
 - `/_spindle/admin/v1/audit`
 - `/_spindle/admin/v1/event_reports`
 - `/_spindle/admin/v1/event_reports/{}`
