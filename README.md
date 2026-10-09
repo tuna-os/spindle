@@ -57,6 +57,8 @@ and it works unmodified — Spindle serves ordinary rooms of room versions 1 to
 CI gate fails if a config field exists in the code and not in that file.
 
 **Other commands:** `promote-admin` (mints the first admin offline),
+`set-password-hash` (imports Argon2 hashes, e.g. from MAS),
+`issue-reset-link` (a password-reset link that needs no mail),
 `backup` / `restore` / `verify-media`, `migrate`. See
 [docs/lifecycle.md](docs/lifecycle.md).
 
@@ -115,7 +117,7 @@ impossible and the exception path is dead code.
 | **M6** Differentiators | Not started | Hub mode, MLS |
 | **M7** MatrixRTC | Server side served | **MSC4140 delayed events** — the dead-man's switch that stops calls accumulating ghost participants, which no other Rust homeserver has — plus MSC4354 sticky events, MSC4143 transport discovery, a built-in LiveKit JWT service or the OpenID round trip for an external one, ringing and decline. Element Call's own Playwright suite runs with Spindle in Synapse's seat: thirteen specs pass, among them a two-party call with video through LiveKit and MatrixRTC 2.0 sticky-event membership with a rejoin after an improper leave. Ringing, churn, a restart mid-call and the federated call are what remains of the gate |
 
-**226 routes** and a **310-test Complement ratchet** in CI, over a workspace of
+**280 routes** and a **310-test Complement ratchet** in CI, over a workspace of
 100+ test suites. The first two are gated — the [dashboard](docs/dashboard.md)
 is parsed from the router and CI fails on drift, and the ratchet is a file every
 entry of which must pass — so what they say matches `main` rather than matching
@@ -197,6 +199,7 @@ The risks that would invalidate the headline claim are enumerated in
 | [docs/delegated-auth.md](docs/delegated-auth.md) | MSC3861, both ways — built-in provider or a real MAS |
 | [docs/metrics.md](docs/metrics.md) | What is exported, including the number the architecture is falsified by |
 | [docs/lifecycle.md](docs/lifecycle.md) | Backup, restore, migrations |
+| [docs/synapse-kubernetes-cutover.md](docs/synapse-kubernetes-cutover.md) | Reversible ESS/Kubernetes quiesce and the production cutover gates |
 | [docs/rate-limits.md](docs/rate-limits.md) | Every rate and cap, and the growth nothing bounds yet |
 | [docs/matrix-rtc.md](docs/matrix-rtc.md) | Calls end to end: the SFU, the JWT service built in or beside, and what a token cannot promise |
 | [docs/mesh-federation.md](docs/mesh-federation.md) | Federating with a Bluetooth mesh: the venue system, the loopback evidence, and the Neutrino gateway patch |

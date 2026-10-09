@@ -29,6 +29,9 @@ extend-ignore-re = [
 # another's". Renaming these to satisfy the checker would make the English
 # worse, not better.
 "anothers" = "anothers"
+# The SMTP greeting verb (RFC 5321 4.1.1.1), answered by the fake mail
+# server in the email tests alongside `EHLO`. A protocol word, not `HELLO`.
+"helo" = "helo"
 
 [default.extend-identifiers]
 # A CSS class in the comparisons page's animation: the pulsing ring.
@@ -38,6 +41,7 @@ extend-ignore-re = [
 # Vendored, generated, or measured: not ours to spell-check.
 extend-exclude = [
     "Cargo.lock",
+    "vendor/ruma-state-res/",
     "complement/allowlist.txt",
     "docs/benchmarks/data/*.json",
     "tmp/",

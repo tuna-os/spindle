@@ -88,9 +88,9 @@ number = 4140
 title = "Delayed events"
 status = "served"
 merged = true
-unstable = ["org.matrix.msc4140"]
-evidence = ["crates/spindle-server/tests/delayed_events.rs", "crates/spindle-server/tests/rtc_membership.rs"]
-notes = "All four endpoints, plus the token-less `/delayed_events/{delay_id}/{action}` form lk-jwt-service uses for delegated leave events; the dead-man's switch MatrixRTC members rely on."
+unstable = ["org.matrix.msc4140", "org.matrix.msc4140.stable"]
+evidence = ["crates/spindle-server/tests/delayed_events.rs", "crates/spindle-server/tests/delayed_events_merged.rs", "crates/spindle-server/tests/rtc_membership.rs"]
+notes = "Merged 2026-10-06 and served in the merged shape -- the `delayed_event` scheduling endpoint with its transaction, lookup by id after a delay has finished, 409 for an action that contradicts how it ended, both limits as `m.delayed_events` capabilities, 429 with Retry-After, the delay id in the sent event's `unsigned`, stable paths and `org.matrix.msc4140.stable` -- beside the unstable query-parameter form shipping clients call, and the token-less `/delayed_events/{delay_id}/{action}` older lk-jwt-service releases use."
 
 [[msc]]
 number = 4309
@@ -101,16 +101,17 @@ notes = "The org.matrix.msc4140.finalised_delayed_events sync section."
 
 [[msc]]
 number = 4075
-title = "MatrixRTC ringing (m.rtc.notification)"
+title = "MatrixRTC invites and notifications (m.rtc.invite)"
 status = "served"
-evidence = ["crates/spindle-server/tests/push_delivery.rs", "docs/rate-limits.md"]
-notes = "Rings are pushed and budgeted per sender (rings_per_minute)."
+evidence = ["crates/spindle-server/tests/push_delivery.rs", "crates/spindle-server/src/push_rules.rs", "docs/rate-limits.md"]
+notes = "Rings are pushed through the MSC's own default rules (`.org.matrix.msc4075.rule.rtc.invite_for_me` / `invite_for_room`, ring sound, ahead of the mention rules, as Synapse ships them), merged into rulesets stored before they existed, and budgeted per sender (rings_per_minute). The event keeps its unstable name `org.matrix.msc4075.rtc.notification`, which is what the MSC's own unstable table says."
 
 [[msc]]
 number = 4310
 title = "MatrixRTC ring decline"
-status = "served"
+status = "superseded"
 evidence = ["crates/spindle-server/tests/push_delivery.rs"]
+notes = "Closed as obsolete upstream: `m.rtc.decline` is now part of MSC4075, keeping `org.matrix.msc4310.rtc.decline` as its unstable name. Still served: a decline pushes nobody."
 
 [[msc]]
 number = 3757
@@ -252,6 +253,14 @@ evidence = ["crates/spindle-server/tests/spec_wave2.rs"]
 notes = "POST /login/get_token behind the password UIA stage, m.login.token on /login, the m.get_login_token capability and the get_login_token flow flag. Tokens are single use and live two minutes."
 
 [[msc]]
+number = 4191
+title = "Account management deep-linking"
+status = "served"
+stable = ""
+evidence = ["crates/spindle-server/tests/account_management.rs"]
+notes = "Built-in provider only: account_management_uri and account_management_actions_supported in the discovery document and auth_metadata, both the session_* and device_* action spellings, ?action= and device_id= deep links. Under delegation the provider (MAS) advertises its own."
+
+[[msc]]
 number = 2666
 title = "Mutual rooms"
 status = "served"
@@ -380,3 +389,27 @@ unstable = ["org.matrix.msc3881"]
 evidence = ["crates/spindle-server/tests/pushers.rs"]
 notes = "Pushers carry `enabled` and `device_id` under the unstable and the plain names; a disabled pusher stays registered and receives nothing."
 
+
+
+[[msc]]
+number = 4108
+title = "QR code login"
+status = "partial"
+unstable = ["org.matrix.msc4108"]
+evidence = ["crates/spindle-server/tests/rendezvous.rs"]
+notes = "Homeserver rendezvous mailbox with conditional reads and writes, expiry and capacity limits. OAuth device authorization and secure-channel negotiation belong to MAS and the clients; their integrated rehearsal is pending."
+
+[[msc]]
+number = 4502
+title = "Targeted and unrestricted room member queries (is_joined)"
+status = "served"
+unstable = ["io.element.msc4502"]
+evidence = ["crates/spindle-server/tests/appservice_proxy.rs"]
+notes = "`/rooms/{roomId}/is_joined` for one user or one server, to an application service whose registration grants the scope (`io.element.msc4502.scopes`) and to server admins. What lk-jwt-service 0.7 and later ask before minting a token."
+
+[[msc]]
+number = 4512
+title = "Delegating parts of the C-S and S-S API to application services"
+status = "served"
+evidence = ["crates/spindle-server/tests/appservice_proxy.rs"]
+notes = "A registration's `io.element.msc4512.proxy_prefix` / `proxy_url` claims a prefix under both APIs; requests there are authenticated and forwarded with the hs_token and X-Matrix-User-Identifier / X-Matrix-Origin, and `fed_proxy` sends the federation twin under the service's own prefix. How lk-jwt-service runs as the homeserver's sidecar and serves MSC4195's homeserver endpoints."

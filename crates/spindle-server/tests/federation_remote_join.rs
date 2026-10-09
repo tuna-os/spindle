@@ -1076,3 +1076,48 @@ async fn a_v6_room_does_not_honour_a_restricted_join_rule() {
     let (status, body) = local.join_via(&room, &bob, &remote.name).await;
     assert_eq!(status, 403, "a v6 restricted room admitted a join: {body}");
 }
+
+/// A third resident must fetch and verify both restricted-join signers.
+#[tokio::test]
+async fn a_third_server_receives_a_restricted_join_with_both_required_signatures() {
+    for version in ["8", "9", "10", "12"] {
+        let resident = Instance::start().await;
+        let joining = Instance::start().await;
+        let observer = Instance::start().await;
+        let alice = resident.register("alice").await;
+        let bob = joining.register("bob").await;
+        let carol = observer.register("carol").await;
+        let bob_id = format!("@bob:{}", joining.name);
+        let space = resident.public_room(&alice).await;
+        for (server, token) in [(&joining, &bob), (&observer, &carol)] {
+            let (status, body) = server.join_via(&space, token, &resident.name).await;
+            assert_eq!(status, 200, "v{version}: {body}");
+        }
+        let room = resident
+            .restricted_room_at_version(&alice, &space, Some(version))
+            .await;
+        let (status, body) = observer.join_via(&room, &carol, &resident.name).await;
+        assert_eq!(status, 200, "v{version}: {body}");
+        let (status, body) = joining.join_via(&room, &bob, &resident.name).await;
+        assert_eq!(status, 200, "v{version}: {body}");
+        assert!(
+            eventually(async || {
+                observer
+                    .joined_members(&room, &carol)
+                    .await
+                    .get(&bob_id)
+                    .is_some()
+            })
+            .await,
+            "v{version}: the third resident must accept the propagated join"
+        );
+        let event = observer.member_event(&room, &carol, &bob_id).await;
+        assert_eq!(event["content"]["membership"], "join");
+        assert_eq!(
+            event["content"]["join_authorised_via_users_server"],
+            format!("@alice:{}", resident.name)
+        );
+        let signatures = event["signatures"].as_object().unwrap();
+        assert!(signatures.contains_key(&resident.name) && signatures.contains_key(&joining.name));
+    }
+}

@@ -147,6 +147,78 @@ impl SlidingRequest {
     }
 }
 
+/// The windows a `pos` was answered for: each list's ranges, by name.
+///
+/// Stateless as this endpoint is, the stream position alone cannot say which
+/// rooms a client already holds. Element X grows its window across requests
+/// (rooms 0–19, then 0–99, …), and a room that enters the window without
+/// having changed would otherwise never be sent: silence about an unchanged
+/// room is only the right answer for a room the client was already sent.
+/// So `pos` carries the windows it answered, and a room in view now but in
+/// none of them is sent in full.
+///
+/// `None` means unknown — a `pos` minted before windows were recorded — and
+/// counts as having seen nothing, so such a client is re-sent every room in
+/// view once and heals without starting over.
+pub type Windows = std::collections::BTreeMap<String, Vec<(usize, usize)>>;
+
+/// The windows to record for this request's lists.
+#[must_use]
+pub fn windows_of(lists: &[(String, ListRequest)]) -> Windows {
+    lists
+        .iter()
+        .map(|(name, list)| (name.clone(), list.ranges.clone()))
+        .collect()
+}
+
+/// Whether `index` of list `name` was inside a window the client was answered
+/// for. Unknown windows cover nothing.
+#[must_use]
+pub fn was_in_view(previous: Option<&Windows>, name: &str, index: usize) -> bool {
+    previous
+        .and_then(|windows| windows.get(name))
+        .is_some_and(|ranges| {
+            ranges
+                .iter()
+                .any(|&(start, end)| start <= index && index <= end)
+        })
+}
+
+/// Append the windows to a stream-position token: `s42` becomes `s42.<hex>`,
+/// the hex being the windows' JSON. Hex keeps the token to characters every
+/// client passes through a query string untouched.
+#[must_use]
+pub fn encode_pos(stream: &str, windows: &Windows) -> String {
+    let json = serde_json::to_vec(windows).unwrap_or_default();
+    let mut token = String::with_capacity(stream.len() + 1 + json.len() * 2);
+    token.push_str(stream);
+    token.push('.');
+    for byte in json {
+        use std::fmt::Write as _;
+        let _ = write!(token, "{byte:02x}");
+    }
+    token
+}
+
+/// Split a `pos` into its stream-position token and the windows it recorded.
+/// A token without windows, or with undecodable ones, yields `None`: the
+/// stream position still stands, only the windows are unknown.
+#[must_use]
+pub fn decode_pos(pos: &str) -> (&str, Option<Windows>) {
+    let Some((stream, hex)) = pos.split_once('.') else {
+        return (pos, None);
+    };
+    let bytes: Option<Vec<u8>> = (0..hex.len())
+        .step_by(2)
+        .map(|at| {
+            hex.get(at..at + 2)
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+        })
+        .collect();
+    let windows = bytes.and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    (stream, windows)
+}
+
 /// Whether `required_state` asks for this `(type, state_key)`.
 ///
 /// `["*", "*"]` is everything; `["m.room.member", "*"]` is every member;
@@ -302,6 +374,36 @@ mod tests {
         assert_eq!(indices_in_view(&[(0, 0)], 0), Vec::<usize>::new());
         // Two ranges, overlapping: each index once.
         assert_eq!(indices_in_view(&[(0, 2), (2, 4)], 10), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn pos_round_trips_windows_and_reads_old_tokens() {
+        let mut windows = Windows::new();
+        windows.insert("all_rooms".to_owned(), vec![(0, 19)]);
+        let pos = encode_pos("s42", &windows);
+        assert!(pos.starts_with("s42."));
+        assert!(
+            pos.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.')
+        );
+        assert_eq!(decode_pos(&pos), ("s42", Some(windows)));
+        // A pos from before windows were recorded: position kept, windows unknown.
+        assert_eq!(decode_pos("s42"), ("s42", None));
+        // Garbage after the dot is unknown windows, not an error.
+        assert_eq!(decode_pos("s42.zz"), ("s42", None));
+    }
+
+    #[test]
+    fn a_growing_window_brings_new_rooms_into_view() {
+        let mut windows = Windows::new();
+        windows.insert("all_rooms".to_owned(), vec![(0, 19)]);
+        assert!(was_in_view(Some(&windows), "all_rooms", 0));
+        assert!(was_in_view(Some(&windows), "all_rooms", 19));
+        // Element X widens to 0–99: rooms 20 and up were never sent.
+        assert!(!was_in_view(Some(&windows), "all_rooms", 20));
+        // Another list, or unknown windows, covered nothing.
+        assert!(!was_in_view(Some(&windows), "invites", 0));
+        assert!(!was_in_view(None, "all_rooms", 0));
     }
 
     #[test]
