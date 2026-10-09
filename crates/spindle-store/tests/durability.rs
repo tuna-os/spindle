@@ -70,6 +70,12 @@ impl ReadView for FaultyStore {
 }
 
 impl Store for FaultyStore {
+    fn accepts_writes(&self) -> bool {
+        // The injected fault is the refusal: once the countdown reaches
+        // zero every commit fails, the way a dead disk refuses everything.
+        *self.commits_before_failure.borrow() > 0
+    }
+
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         self.data.borrow_mut().insert(key.to_vec(), value.to_vec());
         Ok(())

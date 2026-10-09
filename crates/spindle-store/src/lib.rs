@@ -27,7 +27,7 @@ pub mod codec;
 pub mod migrate;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 
 // fjall 3 renamed the two levels: what was a `Keyspace` (the whole store) is
@@ -361,6 +361,20 @@ pub trait Store: ReadView {
     /// Returns a backend error if the sync fails.
     fn sync(&self, durability: Durability) -> Result<(), StoreError>;
 
+    /// Whether this store can still accept a write.
+    ///
+    /// False from the first write or sync the backend refused, because the
+    /// backend then refuses every later one: the way back is to free the
+    /// space (or replace the disk) and reopen the directory, which for a
+    /// server is a restart. One-way on purpose. A probe that flapped back
+    /// to ready would route clients to a server whose next write fails.
+    ///
+    /// Read paths consult this before a write they can do without -- a
+    /// lazily initialized marker, a cache fill -- so a degraded store
+    /// takes writes out of rotation without taking reads down with them.
+    #[must_use]
+    fn accepts_writes(&self) -> bool;
+
     /// # Errors
     ///
     /// Returns a backend error if the flush fails.
@@ -542,6 +556,14 @@ pub struct FjallStore {
     journalled: AtomicU64,
     /// Shared by every writer, which is what lets their fsyncs become one.
     group: GroupCommit,
+    /// Set by the first write or sync the engine refuses, and never cleared.
+    ///
+    /// fjall poisons its database on a failed journal write or sync -- a
+    /// full disk is the ordinary way to get one -- and refuses every write
+    /// after it until the directory is reopened. Its public API has no way
+    /// to ask, short of attempting a write, so the store remembers, and the
+    /// server's readiness probe reads it (#21's disk-full drill).
+    write_refused: AtomicBool,
 }
 
 impl FjallStore {
@@ -595,6 +617,15 @@ impl FjallStore {
     #[must_use]
     pub fn written(&self) -> u64 {
         self.written.load(Ordering::Relaxed)
+    }
+
+    /// Pass `result` through, and latch [`Store::accepts_writes`] off if it
+    /// is an error.
+    fn latch<T>(&self, result: Result<T, StoreError>) -> Result<T, StoreError> {
+        if result.is_err() {
+            self.write_refused.store(true, Ordering::Release);
+        }
+        result
     }
 
     /// Rows written outside any batch since this store was opened.
@@ -684,6 +715,7 @@ impl FjallStore {
             unbatched: AtomicU64::new(0),
             journalled: AtomicU64::new(0),
             group: GroupCommit::default(),
+            write_refused: AtomicBool::new(false),
             db,
             partition,
         })
@@ -1012,8 +1044,12 @@ impl ReadView for FjallCheckpoint {
 }
 
 impl Store for FjallStore {
+    fn accepts_writes(&self) -> bool {
+        !self.write_refused.load(Ordering::Acquire)
+    }
+
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
-        self.partition.insert(key, value)?;
+        self.latch(self.partition.insert(key, value).map_err(StoreError::from))?;
         self.written.fetch_add(1, Ordering::Relaxed);
         self.unbatched.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -1024,12 +1060,16 @@ impl Store for FjallStore {
         // returns. The non-waiting variant queues the rotation, which for a
         // fixture generator means writing the directory before the segment
         // it is supposed to contain.
-        self.partition.rotate_memtable_and_wait()?;
+        self.latch(
+            self.partition
+                .rotate_memtable_and_wait()
+                .map_err(StoreError::from),
+        )?;
         Ok(())
     }
 
     fn delete(&self, key: &[u8]) -> Result<(), StoreError> {
-        self.partition.remove(key)?;
+        self.latch(self.partition.remove(key).map_err(StoreError::from))?;
         self.written.fetch_add(1, Ordering::Relaxed);
         self.unbatched.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -1060,7 +1100,12 @@ impl Store for FjallStore {
         }
         // Always `Buffer`: the bytes reach the journal and nothing is synced.
         // Which sync they get -- if any -- is `sync`'s decision.
-        batch.durability(Some(PersistMode::Buffer)).commit()?;
+        self.latch(
+            batch
+                .durability(Some(PersistMode::Buffer))
+                .commit()
+                .map_err(StoreError::from),
+        )?;
         // Rows, not batches: a batch of a hundred is a hundred rows to
         // merge and compact, and counting it as one would let a path claim
         // it writes less by bundling the same work.
@@ -1084,19 +1129,20 @@ impl Store for FjallStore {
             Durability::Relaxed => Ok(()),
             // Not coalesced: `strict` exists for deployments that want the
             // barrier they asked for, not the cheapest correct one.
-            Durability::Strict => {
-                self.db.persist(mode)?;
-                Ok(())
-            }
+            Durability::Strict => self.latch(self.db.persist(mode).map_err(StoreError::from)),
             // Take the next sync going -- ours to lead if nobody else is
-            // already running one.
-            Durability::Group => self.group.sync(&self.db, mode),
+            // already running one. The group hands the leader's failure to
+            // every follower, so each of them latches too.
+            Durability::Group => self.latch(self.group.sync(&self.db, mode)),
         }
     }
 
     fn flush(&self) -> Result<(), StoreError> {
-        self.db.persist(PersistMode::SyncAll)?;
-        Ok(())
+        self.latch(
+            self.db
+                .persist(PersistMode::SyncAll)
+                .map_err(StoreError::from),
+        )
     }
 }
 

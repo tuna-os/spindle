@@ -27,7 +27,7 @@ use spindle_core::{
     AppendError, EventId, EventInput, LogEntry, Pdu, RoomLog, Sideline, StateKey, StateResolver,
     StateRoot, StateSnapshot, is_state_dag,
 };
-use spindle_store::{Durability, FjallStore, RoomStore, StoreError};
+use spindle_store::{Durability, FjallStore, RoomStore, Store, StoreError};
 
 /// Native rooms are v11 (SPEC §11.6).
 pub const ROOM_VERSION: &str = "11";
@@ -5304,7 +5304,57 @@ impl Rooms {
         if self.store.journalled() != before {
             spindle_store::Store::sync(self.store.as_ref(), Durability::Group)?;
         }
+        // A write the store refused leaves this room's log ahead of it: the
+        // entry is appended in memory before its batch is committed, and a
+        // full disk refuses the batch. Kept, the entry is a head whose body
+        // was never stored, and every read that reaches it -- `/messages`
+        // first -- answers `M_NOT_FOUND` for a room that is fine (#21's
+        // disk-full drill). The store is the record, so the room goes back
+        // to it: dropped here, reloaded on the next ask.
+        //
+        // Only when the store has stopped taking writes. A refusal for any
+        // other reason (a forbidden event, a contested key) is decided
+        // before anything is appended, and evicting a healthy room under
+        // concurrent writers would be a race of its own making.
+        if done.is_err() && !self.store.accepts_writes() {
+            self.evict(room_id, &room);
+        }
         done
+    }
+
+    /// Forget everything held in memory for `room_id`, so the next ask
+    /// loads it from the store.
+    ///
+    /// `room` is the log the caller held: if the registry has already
+    /// moved on to a newer load, that one came from the store and stays.
+    /// The caches keyed by room alone go with it, because they were kept
+    /// warm by the same appends. The ones keyed by a state root prove
+    /// themselves current on every hit and need nothing.
+    fn evict(&self, room_id: &str, room: &Arc<RwLock<RoomLog>>) {
+        {
+            let mut open = self
+                .open
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if open
+                .get(room_id)
+                .is_some_and(|held| Arc::ptr_eq(held, room))
+            {
+                open.remove(room_id);
+            }
+        }
+        self.unread_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(room_id);
+        self.last_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(room_id);
+        self.state_heads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(room_id);
     }
 
     /// Build, sign, append and persist one event.

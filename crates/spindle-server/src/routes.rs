@@ -1556,10 +1556,22 @@ async fn health() -> StatusCode {
 /// takes minutes to load, and holding a single-replica deployment out of
 /// rotation for that long is an outage bought to avoid a slow first
 /// request. A room not yet warm is loaded by the request that needs it,
-/// off the async workers. A readiness probe that lies is worse than none
-/// -- this one claims only what is true.
-async fn ready() -> StatusCode {
-    StatusCode::OK
+/// off the async workers.
+///
+/// What it does wait on is the store: once the engine refuses a write (a
+/// full disk, a failing one) it refuses every write after it, and a server
+/// that answers `/sync` but fails every `/send` with a 500 is not one to
+/// route clients to. A readiness probe that lies is worse than none.
+///
+/// Liveness stays up on purpose. The process is fine and its disk is not;
+/// restarting it onto the same full disk only adds a crash loop to the page.
+/// The remedy is in `docs/lifecycle.md`, under "A full disk".
+async fn ready(State(state): State<AppState>) -> StatusCode {
+    if spindle_store::Store::accepts_writes(state.store.as_ref()) {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 /// The identifier half of a login request.

@@ -101,6 +101,12 @@ upkeep:
     @echo
     python3 scripts/spec-drift.py --preview | sed -n '/^## Client-Server/,/^## Served beyond/p' | grep -E '^(##|[0-9]+ of)'
 
+# #21's disk-full drill: fill a 64 MiB tmpfs (mounted with sudo) under the
+# store and under a server. SPINDLE_DISK_FULL_DIR names a small filesystem
+# to use instead, with no mount. docs/lifecycle.md says what it proves.
+drill-disk-full:
+    scripts/disk-full-drill.sh
+
 # Regenerate the pages CI holds to the code: docs/spec-gaps.md from the
 # router and the pinned spec, docs/mscs.md from contrib/msc/ledger.toml.
 regen:

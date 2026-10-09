@@ -305,8 +305,16 @@ impl<'a, S: Store> Accounts<'a, S> {
                 break;
             }
         }
-        self.store.put(&key, &[u8::from(active)])?;
-        Ok(active)
+        // The marker caches the scan. When the store has stopped taking
+        // writes the put fails, and failing the read because a cache fill
+        // failed would take reads down with writes (#21's disk-full
+        // drill). Serve the computed answer and leave the marker
+        // unwritten; the next read scans again.
+        match self.store.put(&key, &[u8::from(active)]) {
+            Ok(()) => Ok(active),
+            Err(_) if !self.store.accepts_writes() => Ok(active),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// # Errors
