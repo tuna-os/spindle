@@ -306,15 +306,15 @@ page, docs/p2p-calls.md, with the rig that proves it against this server.
 
 ## What is not here
 
-- **Remote users without the program on.** The federation twin mints for
-  a remote participant when the SFU program is on; when it is off, a
-  federated caller needs `lk-jwt-service`, external (option B) or as the
-  sidecar (option C), which mints on its own.
-- **Delegated leave without SFU events.** The probe records the hold, but
-  the release learns the drop from the SFU webhook. The supervised
-  sidecar points its webhooks here on generation; a remote deployment
-  must point its SFU at `/_spindle/rtc/livekit/sfu/webhook` by hand, or
-  crashed participants linger on their hour-long leave.
-- **The SFU and the relay themselves.** Their own documentation covers
-  them; this server mints for one and supervises the other's local
-  deployment, and never carries media.
+- **Remote users without the program on.** The federation twin mints
+  for a remote participant while the SFU program is on. While it is
+  off, a federated caller needs `lk-jwt-service`, external (option B)
+  or as the sidecar (option C), which mints on its own.
+- **Delegated leave without SFU events.** The probe records the hold.
+  The release learns the drop from the SFU webhook. The supervised
+  sidecar points its webhooks here on generation. A remote deployment
+  must point its SFU at `/_spindle/rtc/livekit/sfu/webhook` by hand.
+  Without that pointer, crashed participants keep an hour-long leave.
+- **The SFU and the relay themselves.** Their docs cover them. This
+  server mints for one and supervises the local deployment of the
+  other. It never carries media.

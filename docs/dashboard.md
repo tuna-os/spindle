@@ -26,12 +26,12 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**280 routes implemented; 0 known gaps in scope.**
+**289 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
 
-### Admin & moderation — 84 implemented, 0 planned
+### Admin & moderation — 86 implemented, 0 planned
 
 - `GET /_spindle/admin/v1/audit`
 - `GET /_spindle/admin/v1/event_reports`
@@ -53,6 +53,7 @@ neither implemented nor counted.
 - `GET /_spindle/admin/v1/rooms/{room_id}/state`
 - `GET /_spindle/admin/v1/rooms/{room_id}/state_at`
 - `GET /_spindle/admin/v1/rooms/{room_id}/timeline`
+- `GET/PUT /_spindle/admin/v1/rtc/sfu`
 - `GET /_spindle/admin/v1/scheduled_tasks`
 - `POST /_spindle/admin/v1/send_server_notice`
 - `GET /_spindle/admin/v1/server_version`
@@ -93,6 +94,7 @@ neither implemented nor counted.
 - `GET /_synapse/admin/v1/rooms/{room_id}/state`
 - `GET /_synapse/admin/v1/rooms/{room_id}/state_at`
 - `GET /_synapse/admin/v1/rooms/{room_id}/timeline`
+- `GET/PUT /_synapse/admin/v1/rtc/sfu`
 - `GET /_synapse/admin/v1/scheduled_tasks`
 - `POST /_synapse/admin/v1/send_server_notice`
 - `GET /_synapse/admin/v1/server_version`
@@ -145,7 +147,7 @@ neither implemented nor counted.
 - `POST /_matrix/client/v1/appservice/fed_proxy`
 - `POST /_matrix/client/v1/appservice/{appservice_id}/ping`
 
-### VoIP & MatrixRTC — 10 implemented, 0 planned
+### VoIP & MatrixRTC — 11 implemented, 0 planned
 
 - `GET /_matrix/client/unstable/org.matrix.msc4140/delayed_events`
 - `POST/GET /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}`
@@ -157,6 +159,7 @@ neither implemented nor counted.
 - `GET /_matrix/client/v3/voip/turnServer`
 - `GET /_matrix/federation/v1/openid/userinfo`
 - `POST /_spindle/rtc/livekit/sfu/get`
+- `POST /_spindle/rtc/livekit/sfu/webhook`
 
 ### Key backup — 5 implemented, 0 planned
 
@@ -166,8 +169,9 @@ neither implemented nor counted.
 - `POST/GET /_matrix/client/v3/room_keys/version`
 - `GET/PUT/DELETE /_matrix/client/v3/room_keys/version/{version}`
 
-### Federation — 27 implemented, 0 planned
+### Federation — 29 implemented, 0 planned
 
+- `POST /_matrix/federation/unstable/io.element.msc4195/rtc/livekit/get_token`
 - `GET /_matrix/federation/v1/backfill/{room_id}`
 - `GET /_matrix/federation/v1/event/{event_id}`
 - `GET /_matrix/federation/v1/event_auth/{room_id}/{event_id}`
@@ -181,6 +185,7 @@ neither implemented nor counted.
 - `GET/POST /_matrix/federation/v1/publicRooms`
 - `GET /_matrix/federation/v1/query/directory`
 - `GET /_matrix/federation/v1/query/profile`
+- `POST /_matrix/federation/v1/rtc/livekit/get_token`
 - `PUT /_matrix/federation/v1/send/{txn_id}`
 - `PUT /_matrix/federation/v1/send_join/{room_id}/{event_id}`
 - `PUT /_matrix/federation/v1/send_knock/{room_id}/{event_id}`
@@ -305,11 +310,13 @@ neither implemented nor counted.
 - `POST /_matrix/client/v3/register`
 - `GET /_matrix/client/v3/register/available`
 
-### Server, discovery & operations — 48 implemented, 0 planned
+### Server, discovery & operations — 52 implemented, 0 planned
 
 - `GET /.well-known/matrix/client`
 - `GET /.well-known/matrix/server`
 - `GET /.well-known/matrix/support`
+- `POST /_matrix/client/unstable/io.element.msc4195/rtc/livekit/delegate_delayed_leave`
+- `POST /_matrix/client/unstable/io.element.msc4195/rtc/livekit/get_token`
 - `GET /_matrix/client/unstable/io.element.msc4502/rooms/{room_id}/is_joined`
 - `POST /_matrix/client/unstable/io.element.msc4512/appservice/fed_proxy`
 - `GET/PUT/DELETE /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device`
@@ -330,6 +337,8 @@ neither implemented nor counted.
 - `GET/POST /_matrix/client/v3/publicRooms`
 - `GET /_matrix/client/v3/pushers`
 - `POST /_matrix/client/v3/pushers/set`
+- `POST /_matrix/client/v3/rtc/livekit/delegate_delayed_leave`
+- `POST /_matrix/client/v3/rtc/livekit/get_token`
 - `POST /_matrix/client/v3/user_directory/search`
 - `POST /_matrix/client/v3/users/{user_id}/report`
 - `GET /_matrix/client/versions`
