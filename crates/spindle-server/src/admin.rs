@@ -1377,8 +1377,30 @@ fn invalid_param(message: impl Into<String>) -> MatrixError {
     MatrixError::new(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", message)
 }
 
+/// Synapse's alias search, `LOWER(canonical_alias) LIKE '#%term%:%'`: the
+/// term must fall in the alias's localpart, before a `:`. A search for a
+/// server name therefore does not match every alias on that server.
+fn alias_matches(alias: &str, needle: &str) -> bool {
+    alias
+        .to_lowercase()
+        .strip_prefix('#')
+        .and_then(|rest| {
+            rest.find(needle)
+                .map(|at| rest[at + needle.len()..].contains(':'))
+        })
+        .unwrap_or(false)
+}
+
 /// Synapse's room orderings: the field each sorts on, and whether it
 /// sorts ascending before `dir=b` flips it.
+///
+/// These are Synapse's defaults (`get_rooms_paginate`): the counts and the
+/// room version sort descending by default, so `dir=b` lists the
+/// *smallest* rooms first, and the text columns sort ascending, so
+/// `name&dir=b` puts unnamed rooms first, as `PostgreSQL` does with `NULL`
+/// in a descending sort. Text compares byte by byte, as under the `C`
+/// collation Synapse requires, so the room version `"6"` sorts above
+/// `"12"`. Element Admin sends no `order_by`, and gets `name` ascending.
 fn room_order(order_by: &str) -> Option<(&'static str, bool)> {
     Some(match order_by {
         "name" | "alphabetical" => ("name", true),
@@ -1459,13 +1481,12 @@ async fn list_rooms(
         };
         let matches = needle.as_deref().is_none_or(|needle| {
             room_id == query.search_term.as_deref().unwrap_or_default()
-                || [&room["name"], &room["canonical_alias"]]
-                    .iter()
-                    .any(|field| {
-                        field
-                            .as_str()
-                            .is_some_and(|value| value.to_lowercase().contains(needle))
-                    })
+                || room["name"]
+                    .as_str()
+                    .is_some_and(|name| name.to_lowercase().contains(needle))
+                || room["canonical_alias"]
+                    .as_str()
+                    .is_some_and(|alias| alias_matches(alias, needle))
         }) && query
             .public_rooms
             .is_none_or(|public| room["public"] == public)
