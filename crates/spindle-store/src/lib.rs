@@ -361,6 +361,20 @@ pub trait Store: ReadView {
     /// Returns a backend error if the sync fails.
     fn sync(&self, durability: Durability) -> Result<(), StoreError>;
 
+    /// Whether this store can still accept a write.
+    ///
+    /// False from the first write or sync the backend refused, because the
+    /// backend then refuses every later one: the way back is to free the
+    /// space (or replace the disk) and reopen the directory, which for a
+    /// server is a restart. One-way on purpose. A probe that flapped back
+    /// to ready would route clients to a server whose next write fails.
+    ///
+    /// Read paths consult this before a write they can do without -- a
+    /// lazily initialized marker, a cache fill -- so a degraded store
+    /// takes writes out of rotation without taking reads down with them.
+    #[must_use]
+    fn accepts_writes(&self) -> bool;
+
     /// # Errors
     ///
     /// Returns a backend error if the flush fails.
@@ -605,19 +619,7 @@ impl FjallStore {
         self.written.load(Ordering::Relaxed)
     }
 
-    /// Whether this store can still accept a write.
-    ///
-    /// False from the first write or sync the engine refused, because the
-    /// engine then refuses every later one: the way back is to free the
-    /// space (or replace the disk) and reopen the directory, which for a
-    /// server is a restart. One-way on purpose. A probe that flapped back
-    /// to ready would route clients to a server whose next write fails.
-    #[must_use]
-    pub fn accepts_writes(&self) -> bool {
-        !self.write_refused.load(Ordering::Acquire)
-    }
-
-    /// Pass `result` through, and latch [`Self::accepts_writes`] off if it
+    /// Pass `result` through, and latch [`Store::accepts_writes`] off if it
     /// is an error.
     fn latch<T>(&self, result: Result<T, StoreError>) -> Result<T, StoreError> {
         if result.is_err() {
@@ -1042,6 +1044,10 @@ impl ReadView for FjallCheckpoint {
 }
 
 impl Store for FjallStore {
+    fn accepts_writes(&self) -> bool {
+        !self.write_refused.load(Ordering::Acquire)
+    }
+
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         self.latch(self.partition.insert(key, value).map_err(StoreError::from))?;
         self.written.fetch_add(1, Ordering::Relaxed);

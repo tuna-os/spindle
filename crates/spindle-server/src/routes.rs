@@ -1567,7 +1567,7 @@ async fn health() -> StatusCode {
 /// restarting it onto the same full disk only adds a crash loop to the page.
 /// The remedy is in `docs/lifecycle.md`, under "A full disk".
 async fn ready(State(state): State<AppState>) -> StatusCode {
-    if state.store.accepts_writes() {
+    if spindle_store::Store::accepts_writes(state.store.as_ref()) {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
