@@ -168,6 +168,8 @@ struct Harness {
     store: Arc<FjallStore>,
     key: ServerKey,
     peer: Peer,
+    /// A second server in the room, which relays the first peer's events.
+    relay: Option<Peer>,
     room: String,
     version: RoomVersionId,
     head: (String, Value),
@@ -184,6 +186,14 @@ impl Drop for Harness {
 
 impl Harness {
     async fn new(version: u8) -> Self {
+        Self::build(version, false).await
+    }
+
+    async fn with_relay(version: u8) -> Self {
+        Self::build(version, true).await
+    }
+
+    async fn build(version: u8, with_relay: bool) -> Self {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
         let key = ServerKey::load_or_create(store.as_ref()).unwrap();
@@ -204,6 +214,16 @@ impl Harness {
                 &serde_json::Map::new(),
             )
             .unwrap();
+        let relay = if with_relay {
+            let relay = Peer::new().await;
+            let carol = format!("@carol:{}", relay.name);
+            Rooms::new(Arc::clone(&store), relay.name.clone())
+                .set_membership(&room, &carol, &carol, "join", None, relay.key.pair())
+                .unwrap();
+            Some(relay)
+        } else {
+            None
+        };
         let remote = Rooms::new(Arc::clone(&store), peer.name.clone());
         let bob = format!("@bob:{}", peer.name);
         let joined = remote
@@ -244,6 +264,7 @@ impl Harness {
             store,
             key,
             peer,
+            relay,
             room,
             version,
             head,
@@ -268,12 +289,16 @@ impl Harness {
     }
 
     async fn push(&self, event: &(String, Value)) -> Value {
+        self.push_from(&self.peer, event).await
+    }
+
+    async fn push_from(&self, origin: &Peer, event: &(String, Value)) -> Value {
         let uri = "/_matrix/federation/v1/send/recovery-test";
         let body =
-            json!({"origin":self.peer.name,"origin_server_ts":now(),"pdus":[event.1],"edus":[]});
+            json!({"origin":origin.name,"origin_server_ts":now(),"pdus":[event.1],"edus":[]});
         let response = reqwest::Client::new()
             .put(format!("http://{}{uri}", self.address))
-            .header("authorization", self.peer.transaction_header(uri, &body))
+            .header("authorization", origin.transaction_header(uri, &body))
             .header("content-type", "application/json")
             .body(body.to_string())
             .send()
@@ -477,4 +502,28 @@ async fn an_invalid_pushed_event_does_not_fetch_dependencies() {
             .iter()
             .all(|call| call == "keys")
     );
+}
+
+#[tokio::test]
+async fn recovery_for_a_relayed_event_asks_the_origin_that_relayed_it() {
+    // #631: the origin that relays an event holds its history, so recovery
+    // asks the origin first, as for its own events. The sender's server is
+    // asked only for its keys.
+    let harness = Harness::with_relay(11).await;
+    let relay = harness.relay.as_ref().unwrap();
+    let first = harness.message(&harness.head, "first");
+    let latest = harness.message(&first, "latest");
+    *relay.window.lock().unwrap() = vec![first.1.clone()];
+    let response = harness.push_from(relay, &latest).await;
+    assert_eq!(response["pdus"][&latest.0], json!({}), "{response}");
+    assert!(harness.held(&first.0) && harness.held(&latest.0));
+    let asked = |peer: &Peer| {
+        peer.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "missing")
+    };
+    assert!(asked(relay));
+    assert!(!asked(&harness.peer));
 }
