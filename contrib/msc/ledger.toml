@@ -264,7 +264,7 @@ notes = "Built-in provider only: account_management_uri and account_management_a
 number = 2666
 title = "Mutual rooms"
 status = "served"
-stable = ""
+stable = "1.19"
 evidence = ["crates/spindle-server/tests/spec_wave2.rs"]
 notes = "GET /_matrix/client/v1/mutual_rooms, one page: the rooms both users are joined to."
 

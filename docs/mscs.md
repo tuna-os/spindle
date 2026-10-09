@@ -17,7 +17,7 @@ what became of each proposal.
 | [MSC2246](https://github.com/matrix-org/matrix-spec-proposals/pull/2246) | Asynchronous media uploads | v1.7 | — | `spec_wave2.rs` | POST /media/v1/create mints the mxc:// URI; PUT /media/v3/upload/{server}/{id} fills it once; a reader in between gets 504 M_NOT_YET_UPLOADED. Reservations lapse after 24 hours, twenty live per user. |
 | [MSC2409](https://github.com/matrix-org/matrix-spec-proposals/pull/2409) | Appservices receive to-device messages and ephemeral events | v1.13 | — | `appservice_transactions.rs` |  |
 | [MSC2659](https://github.com/matrix-org/matrix-spec-proposals/pull/2659) | Appservice ping | v1.7 | — | `appservice_ping.rs` |  |
-| [MSC2666](https://github.com/matrix-org/matrix-spec-proposals/pull/2666) | Mutual rooms | — | — | `spec_wave2.rs` | GET /_matrix/client/v1/mutual_rooms, one page: the rooms both users are joined to. |
+| [MSC2666](https://github.com/matrix-org/matrix-spec-proposals/pull/2666) | Mutual rooms | v1.19 | — | `spec_wave2.rs` | GET /_matrix/client/v1/mutual_rooms, one page: the rooms both users are joined to. |
 | [MSC2675](https://github.com/matrix-org/matrix-spec-proposals/pull/2675) | Serverside aggregations of relations | v1.3 | — | `aggregation.rs` |  |
 | [MSC2965](https://github.com/matrix-org/matrix-spec-proposals/pull/2965) | OAuth 2.0 server metadata discovery | v1.15 | — | `delegated_auth.rs` | Served at /v1/auth_metadata and the unstable path js-sdk asks first. |
 | [MSC2967](https://github.com/matrix-org/matrix-spec-proposals/pull/2967) | OAuth 2.0 API scopes | v1.15 | — | `delegated_auth.rs` | The v1.15 scope spelling and the draft one older clients still send. |
