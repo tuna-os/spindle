@@ -1,0 +1,129 @@
+# One Synapse lab server (the witness drill-a, or drill-b before the
+# cut-over), with its TLS front and a netwatch sidecar in the same pod.
+# drill.sh fills in:
+#   __APP__          drill-a | drill-b
+#   __SERVER_NAME__  witness.lab | reilly.asia
+#   __FED_HOST__     matrix.witness.lab | matrix.reilly.asia
+#   __PEER_IP__      the other server's front (ClusterIP)
+#   __PG_IP__        the rehearsal-pg ClusterIP
+#   __DATA__         volume for the media store: emptyDir (drill-a) or the
+#                    drill-b-data PVC (drill-b; backed up at the seal)
+#
+# Isolation (the CNI does not enforce NetworkPolicy and the namespace's
+# PodSecurity level forbids NET_ADMIN, so there is no in-pod firewall):
+#   - the only resolver is drill-resolver (10.111.63.10), which knows the
+#     four lab names and refuses everything else; there is no cluster DNS
+#     and no search domain
+#   - the database is reached through hostAliases, not DNS
+#   - Synapse's own whitelist, IP blocklist and custom CA (synapse.yaml)
+#   - netwatch logs every socket that is not loopback, inbound, the
+#     database, the resolver or the peer's front
+#   - ClusterIP Service only, no Ingress/NodePort/LoadBalancer
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: __APP__
+  labels: {app: __APP__, part-of: federation-drill}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: __APP__}
+  template:
+    metadata:
+      labels: {app: __APP__, part-of: federation-drill, server: synapse}
+    spec:
+      # The scheduler must place the pod (not nodeName) so the local-path
+      # PVC binds; it is the node the rehearsal database runs on.
+      nodeSelector: {kubernetes.io/hostname: ip-10-20-1-11}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["10.111.63.10"]
+        searches: []
+        options: [{name: ndots, value: "1"}, {name: attempts, value: "1"}, {name: timeout, value: "2"}]
+      hostAliases:
+      - ip: "__PG_IP__"
+        hostnames: [rehearsal-pg]
+      securityContext:
+        runAsUser: 10093
+        runAsGroup: 10093
+        fsGroup: 10093
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: front
+        image: nginxinc/nginx-unprivileged:1.27-alpine
+        env:
+        - {name: SERVER_NAME, value: "__SERVER_NAME__"}
+        - {name: FED_HOST, value: "__FED_HOST__"}
+        - {name: FED_UPSTREAM, value: "127.0.0.1:8009"}
+        - {name: NGINX_ENVSUBST_FILTER, value: "^(SERVER_NAME|FED_HOST|FED_UPSTREAM)$"}
+        ports:
+        - {name: https, containerPort: 8443}
+        resources:
+          requests: {cpu: 10m, memory: 32Mi}
+          limits: {memory: 128Mi}
+        securityContext:
+          runAsUser: 101
+          runAsGroup: 101
+          allowPrivilegeEscalation: false
+          capabilities: {drop: [ALL]}
+        volumeMounts:
+        - {name: front, mountPath: /etc/nginx/templates, readOnly: true}
+        - {name: tls, mountPath: /tls, readOnly: true}
+      - name: synapse
+        image: oci.element.io/synapse:v1.156.0
+        command: [python3, -m, synapse.app.homeserver, -c, /conf/homeserver.yaml, -c, /secrets/secrets.yaml]
+        env:
+        - name: PGPASSWORD
+          valueFrom: {secretKeyRef: {name: rehearsal-pg, key: POSTGRES_PASSWORD}}
+        ports:
+        - {name: client, containerPort: 8008}
+        readinessProbe:
+          httpGet: {path: /health, port: 8008}
+          periodSeconds: 5
+          failureThreshold: 120
+        resources:
+          requests: {cpu: 200m, memory: 512Mi}
+          limits: {cpu: "1", memory: 2Gi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: [ALL]}
+        volumeMounts:
+        - {name: conf, mountPath: /conf, readOnly: true}
+        - {name: secrets, mountPath: /secrets, readOnly: true}
+        - {name: tls, mountPath: /tls, readOnly: true}
+        - {name: data, mountPath: /data}
+      - name: netwatch
+        image: oci.element.io/synapse:v1.156.0
+        command: [python3, -u, /netwatch/netwatch.py]
+        env:
+        - {name: ALLOWED, value: "database=__PG_IP__:5432,resolver=10.111.63.10:53,peer=__PEER_IP__:443"}
+        - {name: LISTEN_PORTS, value: "8008,8443"}
+        resources:
+          requests: {cpu: 10m, memory: 32Mi}
+          limits: {memory: 128Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: [ALL]}
+        volumeMounts:
+        - {name: netwatch, mountPath: /netwatch, readOnly: true}
+      volumes:
+      - name: conf
+        configMap: {name: __APP__-config}
+      - name: front
+        configMap:
+          name: drill-front
+          items: [{key: front.conf.template, path: default.conf.template}]
+      - name: netwatch
+        configMap:
+          name: drill-front
+          items: [{key: netwatch.py, path: netwatch.py}]
+      - name: secrets
+        secret: {secretName: __APP__-secrets}
+      - name: tls
+        secret: {secretName: __APP__-tls}
+      - name: data
+        __DATA__

@@ -200,6 +200,39 @@ impl Devices {
         Ok(())
     }
 
+    /// Store one fallback key with its `used` flag as another server held it.
+    ///
+    /// [`Self::upload_fallback_keys`] always clears the flag, which is right
+    /// for a client's upload. An import copies a key the old server may
+    /// already have handed out, and a used key reported as unused would stop
+    /// the device from rotating it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the write fails.
+    pub fn restore_fallback_key(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        key_id: &str,
+        key: &Value,
+        used: bool,
+    ) -> Result<(), StoreError> {
+        let algorithm = key_id.split(':').next().unwrap_or(key_id);
+        Store::put(
+            self.store.as_ref(),
+            &keys::device_scoped(
+                Keyspace::FallbackKeys,
+                user_id,
+                device_id,
+                algorithm.as_bytes(),
+            ),
+            json!({ "key_id": key_id, "key": key, "used": used })
+                .to_string()
+                .as_bytes(),
+        )
+    }
+
     /// The algorithms whose fallback key has not yet been handed out.
     ///
     /// `/sync` reports this so a device knows when to rotate: a used

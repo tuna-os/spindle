@@ -1,0 +1,18 @@
+# First seal. The drain check printed 'stream lag to witness.lab=1' 60 times and then went on.
+# That metric was wrong: the newest event was local-only. destination_rooms showed 0 unsent
+# PDUs for witness.lab at the seal. drill.sh now checks destination_rooms (see seal-pass2.txt).
+deployment.apps/drill-b scaled
+pod/drill-b-54684f8c8b-f9t9n condition met
+NOTICE:  database "drill_b_seal" does not exist, skipping
+DROP DATABASE
+CREATE DATABASE
+seal: database drill_b -> drill_b_seal at 20261003T213519Z
+Warning: would violate PodSecurity "restricted:latest": allowPrivilegeEscalation != false (container "op" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (container "op" must set securityContext.capabilities.drop=["ALL"]), runAsNonRoot != true (pod or container "op" must set securityContext.runAsNonRoot=true), seccompProfile (pod or container "op" must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
+4.0K	/d/seal
+ce8d6fae78155b2a
+All commands and output from this session will be recorded in container logs, including credentials and sensitive information passed through the command prompt.
+If you don't see a command prompt, try pressing enter.
+warning: couldn't attach to pod/drill-b-data-op, falling back to streaming logs: unable to upgrade connection: container op not found in pod drill-b-data-op_spindle-rehearsal
+4.0K	/d/seal
+ce8d6fae78155b2a
+pod "drill-b-data-op" deleted from spindle-rehearsal namespace

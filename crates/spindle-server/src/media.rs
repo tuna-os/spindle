@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use spindle_core::keys;
 use spindle_store::{FjallStore, ReadView, Store, StoreError};
 
-/// The largest upload accepted, in bytes.
+/// The default largest upload accepted, in bytes.
 ///
 /// A limit the server states rather than discovers: `/config` advertises it,
 /// so a client can refuse a file before spending a minute sending it.
@@ -163,6 +163,7 @@ pub struct Media {
     store: Arc<FjallStore>,
     blobs: crate::blobs::Blobs,
     server_name: String,
+    max_upload_bytes: usize,
 }
 
 impl Media {
@@ -176,14 +177,28 @@ impl Media {
             store,
             blobs,
             server_name: server_name.into(),
+            max_upload_bytes: MAX_UPLOAD,
         }
+    }
+
+    /// Use the configured cap for uploads and remote media caching.
+    #[must_use]
+    pub fn with_max_upload_bytes(mut self, max_upload_bytes: usize) -> Self {
+        self.max_upload_bytes = max_upload_bytes;
+        self
+    }
+
+    /// The same limit advertised by the media configuration endpoints.
+    #[must_use]
+    pub const fn max_upload_bytes(&self) -> usize {
+        self.max_upload_bytes
     }
 
     /// Store `bytes`, returning the new media ID.
     ///
     /// # Errors
     ///
-    /// Returns [`MediaError::TooLarge`] past [`MAX_UPLOAD`], or
+    /// Returns [`MediaError::TooLarge`] past [`Self::max_upload_bytes`], or
     /// [`MediaError`] if the blob or its record cannot be written.
     pub async fn put(
         &self,
@@ -192,10 +207,10 @@ impl Media {
         filename: Option<&str>,
         uploaded_by: &str,
     ) -> Result<String, MediaError> {
-        if bytes.len() > MAX_UPLOAD {
+        if bytes.len() > self.max_upload_bytes {
             return Err(MediaError::TooLarge {
                 size: bytes.len(),
-                limit: MAX_UPLOAD,
+                limit: self.max_upload_bytes,
             });
         }
         let hash = blake3::hash(bytes).to_hex().to_string();
@@ -217,6 +232,43 @@ impl Media {
             &serde_json::to_vec(&record)?,
         )?;
         Ok(media_id)
+    }
+
+    /// Store `bytes` under a media ID another server already handed out.
+    ///
+    /// The Synapse importer uses this: every `mxc://` URI in the imported
+    /// history names a media ID Synapse chose, and the import keeps those
+    /// IDs so the URIs still resolve. The size cap does not apply, because
+    /// the file was already accepted once and refusing it now would lose it.
+    /// Repeating the call with the same bytes writes the same record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the blob or its record cannot be written.
+    #[cfg(feature = "synapse-import")]
+    pub async fn put_imported(
+        &self,
+        media_id: &str,
+        bytes: &[u8],
+        content_type: &str,
+        filename: Option<&str>,
+        uploaded_by: &str,
+    ) -> Result<String, MediaError> {
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        self.blobs.put(&hash, bytes).await?;
+        let record = MediaRecord {
+            hash: hash.clone(),
+            content_type: content_type.to_owned(),
+            filename: filename.map(str::to_owned),
+            size: bytes.len(),
+            uploaded_by: uploaded_by.to_owned(),
+        };
+        Store::put(
+            self.store.as_ref(),
+            &keys::media(media_id),
+            &serde_json::to_vec(&record)?,
+        )?;
+        Ok(hash)
     }
 
     /// Mint a media ID ahead of its bytes (`POST /_matrix/media/v1/create`,
@@ -280,7 +332,7 @@ impl Media {
     /// [`MediaError::AlreadyUploaded`] when the ID already has bytes,
     /// [`MediaError::Unknown`] when no live reservation stands,
     /// [`MediaError::NotReserver`] when someone else reserved it,
-    /// [`MediaError::TooLarge`] past [`MAX_UPLOAD`], or [`MediaError`] if
+    /// [`MediaError::TooLarge`] past [`Self::max_upload_bytes`], or [`MediaError`] if
     /// the blob or its record cannot be written.
     pub async fn put_reserved(
         &self,
@@ -299,10 +351,10 @@ impl Media {
         if reservation.user_id != uploaded_by {
             return Err(MediaError::NotReserver(media_id.to_owned()));
         }
-        if bytes.len() > MAX_UPLOAD {
+        if bytes.len() > self.max_upload_bytes {
             return Err(MediaError::TooLarge {
                 size: bytes.len(),
-                limit: MAX_UPLOAD,
+                limit: self.max_upload_bytes,
             });
         }
         let hash = blake3::hash(bytes).to_hex().to_string();
@@ -339,7 +391,7 @@ impl Media {
     ///
     /// # Errors
     ///
-    /// Returns [`MediaError::TooLarge`] past [`MAX_UPLOAD`], or
+    /// Returns [`MediaError::TooLarge`] past [`Self::max_upload_bytes`], or
     /// [`MediaError`] if the blob or its record cannot be written.
     pub async fn put_remote(
         &self,
@@ -349,10 +401,10 @@ impl Media {
         content_type: &str,
         filename: Option<&str>,
     ) -> Result<(), MediaError> {
-        if bytes.len() > MAX_UPLOAD {
+        if bytes.len() > self.max_upload_bytes {
             return Err(MediaError::TooLarge {
                 size: bytes.len(),
-                limit: MAX_UPLOAD,
+                limit: self.max_upload_bytes,
             });
         }
         let hash = blake3::hash(bytes).to_hex().to_string();
@@ -541,6 +593,57 @@ impl Media {
         Ok(("image/png".to_owned(), bytes))
     }
 
+    /// Every media record, with its ID: what the admin API lists a user's
+    /// uploads from. Remote media cached here is included, under its
+    /// [`Self::remote_id`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the store cannot be scanned or a record
+    /// cannot be decoded.
+    pub fn records(&self) -> Result<Vec<(String, MediaRecord)>, MediaError> {
+        let mut out = Vec::new();
+        for (key, value) in ReadView::scan_prefix(self.store.as_ref(), &keys::media_all())? {
+            if let Some(id) = keys::media_id(&key) {
+                out.push((id, serde_json::from_slice(&value)?));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete `media_id`: its record, and its bytes and cached thumbnails
+    /// unless another record holds the same bytes. Returns whether there
+    /// was anything to delete.
+    ///
+    /// The record goes first, so from that moment the media is not served
+    /// even if removing the bytes then fails; the bytes left behind are an
+    /// orphan the media audit can find, never media that still answers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the store or the blob backend fails.
+    pub async fn delete(&self, media_id: &str) -> Result<bool, MediaError> {
+        let Some(record) = self.record(media_id)? else {
+            return Ok(false);
+        };
+        Store::delete(self.store.as_ref(), &keys::media(media_id))?;
+        let shared = self
+            .records()?
+            .iter()
+            .any(|(_, other)| other.hash == record.hash);
+        if !shared {
+            for (width, height) in THUMBNAIL_LADDER {
+                for method in ["crop", "scale"] {
+                    let cache_key = format!("{}-{width}x{height}-{method}", record.hash);
+                    let cache_hash = blake3::hash(cache_key.as_bytes()).to_hex().to_string();
+                    self.blobs.delete(&cache_hash).await?;
+                }
+            }
+            self.blobs.delete(&record.hash).await?;
+        }
+        Ok(true)
+    }
+
     /// The `mxc://` URI for one of this server's media IDs.
     #[must_use]
     pub fn mxc(&self, media_id: &str) -> String {
@@ -560,14 +663,16 @@ impl Media {
 /// gets less than it asked for unless it asked for more than the largest rung.
 /// A fixed ladder bounds the cache at a handful of files per upload.
 fn normalize_dimensions(width: u32, height: u32) -> (u32, u32) {
-    const LADDER: [(u32, u32); 5] = [(32, 32), (96, 96), (320, 240), (640, 480), (800, 600)];
-    for (rung_width, rung_height) in LADDER {
+    for (rung_width, rung_height) in THUMBNAIL_LADDER {
         if width <= rung_width && height <= rung_height {
             return (rung_width, rung_height);
         }
     }
     (800, 600)
 }
+
+/// The thumbnail sizes this server makes; every cached thumbnail is one.
+const THUMBNAIL_LADDER: [(u32, u32); 5] = [(32, 32), (96, 96), (320, 240), (640, 480), (800, 600)];
 
 /// An opaque, unguessable media ID.
 ///

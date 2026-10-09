@@ -27,6 +27,8 @@ const MAS_TOKEN: &str = "mat_alice_access_token";
 struct Provider {
     url: Arc<Mutex<String>>,
     introspections: Arc<Mutex<Vec<(String, String)>>>,
+    /// Tokens whose session the provider has ended: introspected inactive.
+    revoked: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl Provider {
@@ -70,7 +72,25 @@ impl Provider {
                             .lock()
                             .unwrap()
                             .push((authorization, body.clone()));
-                        if body.contains(&format!("token={MAS_TOKEN}")) {
+                        let token = form_urlencoded::parse(body.as_bytes())
+                            .find(|(key, _)| key == "token").map(|(_, value)| value.into_owned()).unwrap_or_default();
+                        if state.revoked.lock().unwrap().contains(&token) {
+                            return axum::Json(json!({ "active": false }));
+                        }
+                        let scopes = match token.as_str() {
+                            "mat_admin_access_token" => Some("urn:matrix:org.matrix.msc2967.client:api:* urn:synapse:admin:* urn:mas:admin"),
+                            "mat_stable_admin_access_token" => Some("urn:matrix:client:api:* urn:synapse:admin:* urn:mas:admin"),
+                            "mat_stable_access_token" => Some("urn:matrix:client:api:* urn:matrix:client:device:STABLEDEV"),
+                            "mat_multiple_devices" => Some("urn:matrix:client:api:* urn:matrix:client:device:ONE urn:matrix:client:device:TWO"),
+                            "mat_mas_admin_only" => Some("urn:matrix:client:api:* urn:mas:admin"),
+                            "mat_empty_device" => Some("urn:matrix:client:api:* urn:matrix:client:device:"),
+                            _ => None,
+                        };
+                        if token == "mat_compatibility_access_token" {
+                            axum::Json(json!({ "active": true, "username": "alice", "scope": "urn:matrix:client:api:*", "device_id": "COMPATDEV" }))
+                        } else if let Some(scope) = scopes {
+                            axum::Json(json!({ "active": true, "username": "alice", "scope": scope }))
+                        } else if token == MAS_TOKEN {
                             axum::Json(json!({
                                 "active": true,
                                 "username": "alice",
@@ -93,18 +113,34 @@ impl Provider {
     fn introspections(&self) -> Vec<(String, String)> {
         self.introspections.lock().unwrap().clone()
     }
+
+    /// End a session the way MAS does: its token introspects inactive.
+    fn revoke(&self, token: &str) {
+        self.revoked.lock().unwrap().insert(token.to_owned());
+    }
 }
 
 struct Instance {
     _dir: TempDir,
     _reg_dir: TempDir,
     name: String,
+    store: Arc<FjallStore>,
     client: reqwest::Client,
 }
 
 impl Instance {
     /// `provider` of `None` starts a plain local-auth instance.
     async fn start(provider: Option<&str>) -> Instance {
+        Self::start_with(
+            provider,
+            "client_id = \"spindle\"\nclient_secret = \"hush\"\n",
+        )
+        .await
+    }
+
+    /// As [`Self::start`], with `credentials` as the `[auth.delegated]`
+    /// lines that say how introspection authenticates.
+    async fn start_with(provider: Option<&str>, credentials: &str) -> Instance {
         let reg_dir = TempDir::new().unwrap();
         let reg_path = reg_dir.path().join("bridge.yaml");
         std::fs::write(
@@ -123,8 +159,7 @@ impl Instance {
         let auth = provider.map_or(String::new(), |url| {
             format!(
                 "[auth.delegated]\nissuer = \"{url}\"\n\
-                 introspection_endpoint = \"{url}/oauth2/introspect\"\n\
-                 client_id = \"spindle\"\nclient_secret = \"hush\"\n"
+                 introspection_endpoint = \"{url}/oauth2/introspect\"\n{credentials}"
             )
         });
         let config = spindle_server::Config::parse(&format!(
@@ -133,7 +168,7 @@ impl Instance {
             reg_path.display()
         ))
         .unwrap();
-        let app = spindle_server::app(config, store).expect("the app builds");
+        let app = spindle_server::app(config, store.clone()).expect("the app builds");
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -141,6 +176,7 @@ impl Instance {
             _dir: dir,
             _reg_dir: reg_dir,
             name,
+            store,
             client: reqwest::Client::new(),
         }
     }
@@ -296,7 +332,11 @@ async fn device_deletion_needs_no_uia_the_user_cannot_complete() {
         )
         .await;
     assert_eq!(status, 200, "no UIA challenge under delegation: {body}");
-    let (status, _) = server
+    // The device is really gone, and so is the cached verdict that named
+    // it: a token bound to a deleted device is refused on sight, the check
+    // Synapse makes on every request (#615), rather than serving on until
+    // the introspection cache expires.
+    let (status, body) = server
         .request(
             reqwest::Method::GET,
             "/_matrix/client/v3/devices/MASDEV1",
@@ -304,7 +344,8 @@ async fn device_deletion_needs_no_uia_the_user_cannot_complete() {
             None,
         )
         .await;
-    assert_eq!(status, 404, "and the device is really gone");
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(body["errcode"], "M_UNKNOWN_TOKEN");
 }
 
 #[tokio::test]
@@ -370,4 +411,394 @@ async fn legacy_auth_is_the_providers_business_now() {
         )
         .await;
     assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+async fn introspection_can_present_the_homeserver_secret_the_way_synapse_does() {
+    // Synapse's `matrix_authentication_service` section has no client of
+    // its own at MAS: it introspects with the shared `matrix.secret` as a
+    // bearer token, and MAS accepts that from its homeserver. A MAS set up
+    // that way (Element Server Suite's default) must work unchanged.
+    let (provider, url) = Provider::serve().await;
+    let server =
+        Instance::start_with(Some(&url), "homeserver_secret = \"shared-matrix-secret\"\n").await;
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(MAS_TOKEN),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["device_id"], "MASDEV1", "{body}");
+    let introspections = provider.introspections();
+    assert_eq!(introspections.len(), 1);
+    assert_eq!(introspections[0].0, "Bearer shared-matrix-secret");
+}
+
+#[test]
+fn introspection_needs_some_credential() {
+    let base = "[server]\nname = \"example.org\"\n[auth.delegated]\n\
+                issuer = \"http://mas/\"\nintrospection_endpoint = \"http://mas/oauth2/introspect\"\n";
+    // Neither a client pair nor the homeserver secret: nothing to present.
+    assert!(spindle_server::Config::parse(base).is_err());
+    // Half a client pair is a typo, not a choice.
+    assert!(
+        spindle_server::Config::parse(&format!(
+            "{base}client_id = \"x\"\nhomeserver_secret = \"s\"\n"
+        ))
+        .is_err()
+    );
+    assert!(spindle_server::Config::parse(&format!("{base}homeserver_secret = \"s\"\n")).is_ok());
+    assert!(
+        spindle_server::Config::parse(&format!("{base}client_id = \"x\"\nclient_secret = \"y\"\n"))
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn delegated_admin_scope_is_a_token_capability_without_a_device() {
+    let (provider, url) = Provider::serve().await;
+    let server = Instance::start(Some(&url)).await;
+    let admin = "mat_admin_access_token";
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/server_version",
+            Some(admin),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let accounts = spindle_server::accounts::Accounts::new(server.store.as_ref(), &server.name);
+    assert!(!accounts.account("alice").unwrap().unwrap().admin);
+    assert!(accounts.devices_of("alice").unwrap().is_empty());
+    // Reusing the cached verdict on a client endpoint cannot invent a device.
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/keys/upload",
+            Some(admin),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 401, "{body}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/server_version",
+            Some(admin),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(provider.introspections().len(), 1);
+    // A different token for this same user cannot inherit the first token's scope.
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(MAS_TOKEN),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/server_version",
+            Some(MAS_TOKEN),
+            None,
+        )
+        .await;
+    assert_eq!(status, 403, "{body}");
+    assert!(!accounts.account("alice").unwrap().unwrap().admin);
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v2/users",
+            Some(admin),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    accounts.set_locked("alice", true).unwrap();
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/server_version",
+            Some(admin),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 403,
+        "account hold applies to a cached admin token: {body}"
+    );
+}
+
+#[tokio::test]
+async fn delegated_scopes_accept_stable_names_and_reject_ambiguous_devices() {
+    let (_provider, url) = Provider::serve().await;
+    let server = Instance::start(Some(&url)).await;
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some("mat_stable_access_token"),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["device_id"], "STABLEDEV");
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some("mat_compatibility_access_token"),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["device_id"], "COMPATDEV");
+    for token in [
+        "mat_multiple_devices",
+        "mat_empty_device",
+        "mat_mas_admin_only",
+    ] {
+        let (status, body) = server
+            .request(
+                reqwest::Method::GET,
+                "/_synapse/admin/v1/server_version",
+                Some(token),
+                None,
+            )
+            .await;
+        assert_eq!(status, 401, "{token}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn delegated_admin_whoami_identifies_an_account_without_inventing_a_device() {
+    for token in ["mat_admin_access_token", "mat_stable_admin_access_token"] {
+        let (provider, url) = Provider::serve().await;
+        let server = Instance::start(Some(&url)).await;
+        let (status, body) = server
+            .request(
+                reqwest::Method::GET,
+                "/_matrix/client/v3/account/whoami",
+                Some(token),
+                None,
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "Element Admin reads whoami before opening its console: {body}"
+        );
+        assert_eq!(body["user_id"], format!("@alice:{}", server.name));
+        assert!(
+            body.get("device_id").is_none(),
+            "whoami must omit an absent device: {body}"
+        );
+        let accounts = spindle_server::accounts::Accounts::new(server.store.as_ref(), &server.name);
+        assert!(accounts.devices_of("alice").unwrap().is_empty());
+        assert!(!accounts.account("alice").unwrap().unwrap().admin);
+        let (status, body) = server
+            .request(
+                reqwest::Method::POST,
+                "/_matrix/client/v3/keys/upload",
+                Some(token),
+                Some(&json!({})),
+            )
+            .await;
+        assert_eq!(
+            status, 401,
+            "account-only authentication cannot upload device keys: {body}"
+        );
+        let (status, body) = server
+            .request(
+                reqwest::Method::GET,
+                "/_synapse/admin/v2/users",
+                Some(token),
+                None,
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "the same token still grants admin routes: {body}"
+        );
+        assert_eq!(
+            provider.introspections().len(),
+            1,
+            "one shared cached verdict"
+        );
+    }
+}
+
+#[tokio::test]
+async fn delegated_account_identity_checks_scopes_and_cached_account_holds() {
+    let (_provider, url) = Provider::serve().await;
+    let server = Instance::start(Some(&url)).await;
+    for token in [
+        "inactive",
+        "mat_mas_admin_only",
+        "mat_multiple_devices",
+        "mat_empty_device",
+    ] {
+        let (status, body) = server
+            .request(
+                reqwest::Method::GET,
+                "/_matrix/client/v3/account/whoami",
+                Some(token),
+                None,
+            )
+            .await;
+        assert_eq!(status, 401, "bad account scope must remain invalid: {body}");
+    }
+    let token = "mat_admin_access_token";
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let accounts = spindle_server::accounts::Accounts::new(server.store.as_ref(), &server.name);
+    accounts.set_locked("alice", true).unwrap();
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 401,
+        "a cached provider verdict cannot bypass a local lock: {body}"
+    );
+    assert_eq!(body["errcode"], "M_USER_LOCKED");
+    accounts.set_locked("alice", false).unwrap();
+    accounts.set_deactivated("alice", true).unwrap();
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 401,
+        "a cached provider verdict cannot bypass deactivation: {body}"
+    );
+    assert_eq!(body["errcode"], "M_UNKNOWN_TOKEN");
+    assert!(accounts.devices_of("alice").unwrap().is_empty());
+}
+
+const MAS_SECRET: &str = "shared-matrix-secret-for-revocation";
+
+async fn whoami(server: &Instance, token: &str) -> (u16, Value) {
+    server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(token),
+            None,
+        )
+        .await
+}
+
+/// #615: a logout this server serves ends the token here at once, not when
+/// the introspection cache would have let the verdict expire.
+#[tokio::test]
+async fn a_logout_evicts_the_cached_verdict() {
+    let (provider, url) = Provider::serve().await;
+    let server = Instance::start(Some(&url)).await;
+
+    assert_eq!(whoami(&server, MAS_TOKEN).await.0, 200);
+    assert_eq!(provider.introspections().len(), 1);
+
+    // The provider ends the session as part of the logout; the verdict
+    // cached a moment ago still says active.
+    provider.revoke(MAS_TOKEN);
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/logout",
+            Some(MAS_TOKEN),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = whoami(&server, MAS_TOKEN).await;
+    assert_eq!(status, 401, "a logged-out token must stop working: {body}");
+    assert_eq!(body["errcode"], "M_UNKNOWN_TOKEN");
+    assert_eq!(
+        provider.introspections().len(),
+        2,
+        "the provider was asked again rather than the cache trusted"
+    );
+}
+
+/// #615, the production path: MAS serves the logout itself, ends the
+/// session and calls `delete_device`. That call is the only word of it this
+/// server gets, and it must end every cached verdict for the device.
+#[tokio::test]
+async fn mas_deleting_the_device_evicts_its_tokens() {
+    let (provider, url) = Provider::serve().await;
+    let server = Instance::start_with(
+        Some(&url),
+        &format!("client_id = \"spindle\"\nclient_secret = \"hush\"\nhomeserver_secret = \"{MAS_SECRET}\"\n"),
+    )
+    .await;
+
+    assert_eq!(whoami(&server, MAS_TOKEN).await.0, 200);
+    // A second, unrelated session of the same user on another device.
+    assert_eq!(whoami(&server, "mat_stable_access_token").await.0, 200);
+    assert_eq!(provider.introspections().len(), 2);
+
+    provider.revoke(MAS_TOKEN);
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            "/_synapse/mas/delete_device",
+            Some(MAS_SECRET),
+            Some(&json!({ "localpart": "alice", "device_id": "MASDEV1" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = whoami(&server, MAS_TOKEN).await;
+    assert_eq!(
+        status, 401,
+        "the deleted device's token must stop working: {body}"
+    );
+    assert_eq!(body["errcode"], "M_UNKNOWN_TOKEN");
+
+    // The other device's verdict is untouched and still served from cache.
+    let before = provider.introspections().len();
+    assert_eq!(whoami(&server, "mat_stable_access_token").await.0, 200);
+    assert_eq!(provider.introspections().len(), before, "still cached");
+}
+
+/// The belt to the braces above: a cached verdict whose device row has gone
+/// by any route at all is refused, as Synapse refuses it.
+#[tokio::test]
+async fn a_cached_verdict_for_a_vanished_device_is_refused() {
+    let (_provider, url) = Provider::serve().await;
+    let server = Instance::start(Some(&url)).await;
+
+    assert_eq!(whoami(&server, MAS_TOKEN).await.0, 200);
+    spindle_server::accounts::Accounts::new(server.store.as_ref(), &server.name)
+        .delete_device("alice", "MASDEV1")
+        .unwrap();
+
+    let (status, body) = whoami(&server, MAS_TOKEN).await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(body["errcode"], "M_UNKNOWN_TOKEN");
 }

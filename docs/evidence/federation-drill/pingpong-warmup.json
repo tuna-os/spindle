@@ -1,0 +1,63 @@
+{
+  "all_ok": true,
+  "at": "2026-10-03T21:25:09Z",
+  "label": "warmup",
+  "rooms": {
+    "encrypted-v10": {
+      "A_to_B_event": "$RlHk58lQmzJqRTw31ccqzA8pQGPWlzfY5jKlOeJQXrk",
+      "A_to_B_s": 0.52,
+      "B_to_A_event": "$5ja_DqxFkGaOZS8PkQQz7957Owh045q1ojMAkL7RmJI",
+      "B_to_A_s": 0.52,
+      "ok": true
+    },
+    "fork-v10": {
+      "A_to_B_event": "$GM4JdKk5ht2lBbOjIBTpEKsxN9xANpZwse9XsspeKpE",
+      "A_to_B_s": 0.52,
+      "B_to_A_event": "$wsuXu_Cb58OP2rmYAD9c3SoeT3mO_kHO9gt8aie69X0",
+      "B_to_A_s": 0.52,
+      "ok": true
+    },
+    "history-v10": {
+      "A_to_B_event": "$flRhrhZ-GKVSEFM5DrDmlePFr5hOiaeBmWhuXwteJrk",
+      "A_to_B_s": 0.52,
+      "B_to_A_event": "$Ezb4XvKvk6uWMzuKljIy4QcS18t0zg_A98TwIj1dvZ4",
+      "B_to_A_s": 0.52,
+      "ok": true
+    },
+    "v1": {
+      "A_to_B_event": "$17910627134otwqA:witness.lab",
+      "A_to_B_s": 0.52,
+      "B_to_A_event": "$179106271319GDALS:reilly.asia",
+      "B_to_A_s": 0.52,
+      "ok": true
+    },
+    "v10-general": {
+      "A_to_B_event": "$e7iZO5jhtqBMHW7umydiuP1yBGer7nIWsb1WaoK5uPM",
+      "A_to_B_s": 0.53,
+      "B_to_A_event": "$RR-vRz7Xr1k7vsQ1y3gFWTIBTXoIf9ByOOM9Rw5z1as",
+      "B_to_A_s": 0.52,
+      "ok": true
+    },
+    "v12-witness-created": {
+      "A_to_B_event": "$pfmfZqtKS1d-6Dgx9axNcjquKpyjNq-L2RiMqhiiThM",
+      "A_to_B_s": 0.53,
+      "B_to_A_event": "$rKVtUvm_FgxhqJOOzaVrQeCTml1c-PZjb3H799qJ3qo",
+      "B_to_A_s": 0.53,
+      "ok": true
+    },
+    "v6": {
+      "A_to_B_event": "$j9evfv6LGjFqUhkfqaC8rO4SevZsyN6mNEpmC-S_J-8",
+      "A_to_B_s": 0.52,
+      "B_to_A_event": "$Z7AysxTWMVonK1HmaTMroFg829-zA-n0NtfM-SiRM40",
+      "B_to_A_s": 0.52,
+      "ok": true
+    },
+    "v9": {
+      "A_to_B_event": "$tcmM9R8Bs3Yli5DfgyFGfHCPuu2SsAxftCLo9yAYlKs",
+      "A_to_B_s": 0.52,
+      "B_to_A_event": "$bc7249GGbBZQIybaO6ybe1HBiuiooGXQ1fJFKDIXgJM",
+      "B_to_A_s": 0.52,
+      "ok": true
+    }
+  }
+}

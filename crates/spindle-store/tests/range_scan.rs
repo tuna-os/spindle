@@ -82,3 +82,55 @@ fn a_prefix_with_no_rows_yields_nothing() {
     let (_dir, store) = seeded();
     assert!(store.scan_from(&[3], &[3]).unwrap().is_empty());
 }
+
+#[test]
+fn the_last_entry_before_a_point_reads_one_row_and_stays_in_its_prefix() {
+    let (_dir, store) = seeded();
+    let index_of = |row: Option<(Vec<u8>, Vec<u8>)>| {
+        row.map(|(key, _)| (key[0], u64::from_be_bytes(key[1..].try_into().unwrap())))
+    };
+    let before = store.scanned();
+    assert_eq!(
+        index_of(store.last_before(&[1], &key(1, 7)).unwrap()),
+        Some((1, 6))
+    );
+    assert_eq!(store.scanned() - before, 1);
+    let mut between = key(1, 4);
+    between.push(0);
+    assert_eq!(
+        index_of(store.last_before(&[1], &between).unwrap()),
+        Some((1, 4))
+    );
+    assert_eq!(
+        index_of(store.last_before(&[1], &[1, 0xff]).unwrap()),
+        Some((1, 9))
+    );
+    assert_eq!(store.last_before(&[1], &key(1, 0)).unwrap(), None);
+    assert_eq!(store.last_before(&[2], &key(2, 0)).unwrap(), None);
+    assert_eq!(store.last_before(&[2], &[1]).unwrap(), None);
+    assert_eq!(store.last_before(&[2], &[2]).unwrap(), None);
+    assert_eq!(
+        index_of(store.last_before(&[2], &[3]).unwrap()),
+        Some((2, 9))
+    );
+    assert_eq!(
+        index_of(store.last_before(&[1], &[3]).unwrap()),
+        Some((1, 9))
+    );
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(
+        index_of(snapshot.last_before(&[1], &[3]).unwrap()),
+        Some((1, 9))
+    );
+    store.put(&key(1, 10), &[10]).unwrap();
+    assert_eq!(
+        index_of(snapshot.last_before(&[1], &[2]).unwrap()),
+        Some((1, 9))
+    );
+    assert_eq!(
+        index_of(store.last_before(&[1], &[2]).unwrap()),
+        Some((1, 10))
+    );
+    assert_eq!(snapshot.last_before(&[2], &key(2, 0)).unwrap(), None);
+    assert_eq!(snapshot.last_before(&[2], &[1]).unwrap(), None);
+}

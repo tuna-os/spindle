@@ -1,0 +1,4 @@
+2026-10-03T22:08:19.196713Z DEBUG request{otel.name=GET /_matrix/federation/v1/event/{event_id} http.request.method=GET http.route=/_matrix/federation/v1/event/{event_id}}: federation auth refused: refused: key fetch: error sending request for url (https://witness.lab:8448/_matrix/key/v2/server)
+2026-10-03T22:08:19.204021Z DEBUG request{otel.name=GET /_matrix/federation/v1/event/{event_id} http.request.method=GET http.route=/_matrix/federation/v1/event/{event_id}}: federation auth refused: refused: witness.lab could not be fetched from recently
+2026-10-03T22:08:19.208060Z DEBUG request{otel.name=GET /_matrix/federation/v1/event/{event_id} http.request.method=GET http.route=/_matrix/federation/v1/event/{event_id}}: federation auth refused: refused: witness.lab could not be fetched from recently
+184
