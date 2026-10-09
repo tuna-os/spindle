@@ -22,6 +22,12 @@ pub struct MatrixError {
     /// `M_USER_LOCKED` carries `soft_logout: true`: the session is kept,
     /// the client is to stop using it until the lock lifts.
     pub soft_logout: bool,
+    /// `M_INCOMPATIBLE_ROOM_VERSION` names the version the asker would have
+    /// needed (federation `make_join`/`make_knock`).
+    pub room_version: Option<String>,
+    /// Further keys an error code defines beside `errcode` and `error`,
+    /// such as the limit MSC4140's delay-too-large names.
+    pub extra: Option<Box<serde_json::Map<String, serde_json::Value>>>,
 }
 
 impl MatrixError {
@@ -33,6 +39,8 @@ impl MatrixError {
             error: error.into(),
             retry_after_ms: None,
             soft_logout: false,
+            room_version: None,
+            extra: None,
         }
     }
 
@@ -46,6 +54,22 @@ impl MatrixError {
             error: "this account is locked".to_owned(),
             retry_after_ms: None,
             soft_logout: true,
+            room_version: None,
+            extra: None,
+        }
+    }
+
+    /// `M_INCOMPATIBLE_ROOM_VERSION`, naming the room's version as the spec
+    /// requires for that code.
+    #[must_use]
+    pub fn incompatible_room_version(version: &str) -> Self {
+        Self {
+            room_version: Some(version.to_owned()),
+            ..Self::new(
+                StatusCode::BAD_REQUEST,
+                "M_INCOMPATIBLE_ROOM_VERSION",
+                format!("this room is version {version}"),
+            )
         }
     }
 
@@ -103,6 +127,8 @@ impl MatrixError {
             error: format!("too many requests; retry in {retry_after_ms}ms"),
             retry_after_ms: Some(retry_after_ms),
             soft_logout: false,
+            room_version: None,
+            extra: None,
         }
     }
 
@@ -149,6 +175,25 @@ impl IntoResponse for MatrixError {
         if self.soft_logout {
             body.insert("soft_logout".to_owned(), json!(true));
         }
-        (self.status, Json(serde_json::Value::Object(body))).into_response()
+        if let Some(version) = self.room_version {
+            body.insert("room_version".to_owned(), json!(version));
+        }
+        if let Some(extra) = self.extra {
+            for (key, value) in *extra {
+                body.entry(key).or_insert(value);
+            }
+        }
+        let mut response = (self.status, Json(serde_json::Value::Object(body))).into_response();
+        // The header beside the body field: HTTP clients and proxies read
+        // `Retry-After`, and MSC4140 names it for a refused schedule. Whole
+        // seconds, rounded up, so a client that honours it is never early.
+        if let Some(retry) = self.retry_after_ms
+            && let Ok(value) = axum::http::HeaderValue::from_str(&retry.div_ceil(1000).to_string())
+        {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, value);
+        }
+        response
     }
 }

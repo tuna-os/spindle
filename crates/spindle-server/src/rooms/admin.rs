@@ -259,6 +259,34 @@ impl RoomAdmin<'_> {
         Ok((out, next))
     }
 
+    /// How many state entries the room's current state holds: the
+    /// `state_events` count Synapse's room listing reports, read from the
+    /// state trie without loading a single event body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] for a room that does not exist.
+    pub fn state_entry_count(&self, room_id: &str) -> Result<usize, RoomError> {
+        self.rooms.with_room_read(room_id, |_, log| {
+            Ok(log
+                .current_state()
+                .map_or(0, spindle_core::StateSnapshot::len))
+        })
+    }
+
+    /// Lift an administrative block. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the store cannot be written.
+    pub fn clear_room_block(&self, room_id: &str) -> Result<(), RoomError> {
+        spindle_store::Store::delete(
+            self.rooms.store.as_ref(),
+            &spindle_core::keys::room_block(room_id),
+        )?;
+        Ok(())
+    }
+
     /// Record an administrative block. The row's presence is the block;
     /// the record says who and when for the audit trail.
     ///
@@ -314,6 +342,27 @@ impl RoomAdmin<'_> {
             &spindle_core::keys::purge_watermark(room_id),
             &mark.to_be_bytes(),
         )?;
+        // A filled federation gap's segment sits just below its anchor, so
+        // a cutoff at or above the anchor takes the segment's bodies too.
+        let mut victims = victims;
+        for (anchor, (lo, hi)) in self.rooms.gap_spans(room_id)? {
+            if anchor > before_li {
+                continue;
+            }
+            for event_id in self.rooms.gap_segment_ids(room_id, anchor, lo, hi)? {
+                let body = match self
+                    .rooms
+                    .read_event(room_id, &EventId::new(event_id.as_str()))
+                {
+                    Ok(body) => body,
+                    Err(RoomError::MissingBody(_)) => continue,
+                    Err(error) => return Err(error),
+                };
+                if body.get("state_key").is_none() {
+                    victims.push(event_id);
+                }
+            }
+        }
         let mut purged = 0;
         for event_id in &victims {
             let key = event_body_key(room_id, event_id);

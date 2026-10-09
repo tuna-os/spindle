@@ -217,3 +217,18 @@ pub const OPENID_TOKEN_PER_USER: Limit = Limit::new(20, Duration::from_secs(60))
 /// is for. One token joins one call; a client needs a fresh one only when
 /// it rejoins or its token's window closes.
 pub const LIVEKIT_TOKEN_PER_USER: Limit = Limit::new(20, Duration::from_secs(60));
+
+/// Confirmation emails one account may ask for (#608).
+///
+/// Each is a mail to an address the account only claims to own, so the
+/// budget is what stops the add-address form being a way to send this
+/// server's mail to strangers.
+pub const EMAIL_PER_USER: Limit = Limit::new(5, Duration::from_secs(60 * 60));
+
+/// Forgot-password requests per source address (#608).
+pub const RESET_REQUEST_PER_SOURCE: Limit = Limit::new(5, Duration::from_secs(15 * 60));
+
+/// Forgot-password requests per email address (#608), whether or not it
+/// belongs to anyone — a limit that applied only to known addresses would
+/// be the enumeration oracle the uniform page exists to deny.
+pub const RESET_REQUEST_PER_ADDRESS: Limit = Limit::new(3, Duration::from_secs(60 * 60));

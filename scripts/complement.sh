@@ -31,6 +31,12 @@ set -euo pipefail
 # Bump deliberately, with the allowlist re-baselined in the same commit.
 COMPLEMENT_REV=b465a032c6948c25b80e6f6111f236c1287fe780
 PACKAGES=("./tests/csapi" "./tests")
+# COMPLEMENT_PACKAGES overrides the list (space separated), e.g.
+# "./tests/spindle" for this repository's own tests in complement/tests,
+# which are copied into the checkout below as package `spindle`.
+if [[ -n "${COMPLEMENT_PACKAGES:-}" ]]; then
+    read -r -a PACKAGES <<< "$COMPLEMENT_PACKAGES"
+fi
 
 results="${1:-tmp/complement-results.jsonl}"
 toplevel="$(git rev-parse --show-toplevel)"
@@ -70,6 +76,11 @@ if [[ -z "${COMPLEMENT_SRC:-}" ]]; then
     git -C "$COMPLEMENT_SRC" fetch --quiet origin "$COMPLEMENT_REV"
     git -C "$COMPLEMENT_SRC" checkout --quiet "$COMPLEMENT_REV"
 fi
+
+# This repository's own Complement tests (#563): built against the pinned
+# upstream harness, unmodified, as one more package in the checkout.
+mkdir -p "$COMPLEMENT_SRC/tests/spindle"
+cp "$toplevel"/complement/tests/*.go "$COMPLEMENT_SRC/tests/spindle/"
 
 # `go test` exiting nonzero is expected — failing tests are data, not an
 # error; the gate is scripts/complement-check.py against the allowlist.

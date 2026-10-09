@@ -7,7 +7,11 @@
 //! exactly the open interval between what the peer has and what it is
 //! holding, preferring the events nearest the ones it is holding when the
 //! gap outgrows the limit; and both reads are gated on the asking server
-//! having a joined member.
+//! having a joined member. What all three reads serve, `/event` included,
+//! is the PDU as signed, with no client-side `event_id` added.
+
+#[path = "support/federation_auth.rs"]
+mod federation_auth;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -156,6 +160,7 @@ fn now_millis() -> u64 {
 struct Harness {
     _dir: TempDir,
     app: axum::Router,
+    store: Arc<FjallStore>,
 }
 
 impl Harness {
@@ -167,8 +172,12 @@ impl Harness {
              [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n",
         )
         .unwrap();
-        let app = spindle_server::app(config, store).expect("the app builds");
-        Self { _dir: dir, app }
+        let app = spindle_server::app(config, store.clone()).expect("the app builds");
+        Self {
+            _dir: dir,
+            app,
+            store,
+        }
     }
 
     async fn call(&self, request: Request<Body>) -> (StatusCode, Value) {
@@ -259,17 +268,20 @@ impl Harness {
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let head = self.head_event(&room, alice).await;
-        let join = peer.event(&json!({
-            "type": "m.room.member",
-            "state_key": peer.user(),
-            "sender": peer.user(),
-            "room_id": room,
-            "content": { "membership": "join" },
-            "origin_server_ts": now_millis(),
-            "depth": 10,
-            "prev_events": [head],
-            "auth_events": [],
-        }));
+        let join = peer.event(&federation_auth::with_auth_events(
+            &self.store,
+            json!({
+                "type": "m.room.member",
+                "state_key": peer.user(),
+                "sender": peer.user(),
+                "room_id": room,
+                "content": { "membership": "join" },
+                "origin_server_ts": now_millis(),
+                "depth": 10,
+                "prev_events": [head],
+                "auth_events": [],
+            }),
+        ));
         let body = json!({ "origin": peer.name, "origin_server_ts": now_millis(), "pdus": [join] });
         let header = peer.put_header("/_matrix/federation/v1/send/join1", &body);
         let (status, response) = self
@@ -463,4 +475,84 @@ async fn unknown_reference_points_are_handled_not_500s() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["events"], json!([]));
+}
+
+/// The event ID a PDU hashes to (room version 11, the default here).
+fn reference_id(pdu: &Value) -> String {
+    let ruma::CanonicalJsonValue::Object(canonical) =
+        ruma::CanonicalJsonValue::try_from(pdu.clone()).unwrap()
+    else {
+        unreachable!()
+    };
+    format!(
+        "${}",
+        ruma::signatures::reference_hash(&canonical, &RoomVersionId::V11.rules().unwrap()).unwrap()
+    )
+}
+
+/// What a peer pulls is the PDU as it was signed, not the client view of
+/// it. From room version 3 an event's ID is its hash and not a field of
+/// it, and Synapse refuses a PDU that carries `event_id` (`v2/v3 events
+/// must not have an explicit event_id`): the migration drill (#563) found
+/// every event served by `/event`, `/backfill` and `/get_missing_events`
+/// carrying one, so a Synapse peer could pull no history from this server.
+/// Each PDU must have no `event_id`, and must hash to the ID it was asked
+/// for or listed under.
+#[tokio::test]
+async fn pulled_history_is_pdus_that_hash_to_their_ids() {
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.shared_room(&alice, &peer).await;
+    let first = harness.say(&room, &alice, "one").await;
+    let second = harness.say(&room, &alice, "two").await;
+    let last = harness.say(&room, &alice, "three").await;
+
+    let (status, event) = harness
+        .federation_get(&peer, &format!("/_matrix/federation/v1/event/{second}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{event}");
+    let (status, backfill) = harness
+        .federation_get(
+            &peer,
+            &format!("/_matrix/federation/v1/backfill/{room}?v={last}&limit=3"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{backfill}");
+    let (status, missing) = harness
+        .federation_post(
+            &peer,
+            &format!("/_matrix/federation/v1/get_missing_events/{room}"),
+            &json!({ "earliest_events": [first], "latest_events": [last], "limit": 10 }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{missing}");
+
+    for (what, pdus, expected) in [
+        ("event", &event["pdus"], vec![second.clone()]),
+        (
+            "backfill",
+            &backfill["pdus"],
+            vec![last.clone(), second.clone(), first.clone()],
+        ),
+        (
+            "get_missing_events",
+            &missing["events"],
+            vec![second.clone()],
+        ),
+    ] {
+        let ids: Vec<String> = pdus
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pdu| {
+                assert!(
+                    pdu.get("event_id").is_none(),
+                    "{what} served a client event, not a PDU: {pdu}"
+                );
+                reference_id(pdu)
+            })
+            .collect();
+        assert_eq!(ids, expected, "{what}");
+    }
 }

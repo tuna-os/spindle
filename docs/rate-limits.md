@@ -61,7 +61,7 @@ if abuse ever needs one, and it belongs in `[ratelimit]` beside `enabled`.
 
 | What | Cap | Configured by | Refusal |
 |---|---|---|---|
-| Media upload body | 50 MiB (`media::MAX_UPLOAD`) | fixed; advertised by `/media/config` | 413 `M_TOO_LARGE` |
+| Media upload body | 50 MiB by default | `[media] max_upload_bytes`; advertised by `/media/config` | 413 `M_TOO_LARGE` |
 | Filters held per user | 1,000 | `[limits] filters_per_user` | 400 `M_LIMIT_EXCEEDED` |
 | Account-data types per user (global + per-room) | 20,000 | `[limits] account_data_per_user` | 400 `M_LIMIT_EXCEEDED`; rewriting an existing type is free |
 | One-time keys held per device | 1,000 | `[limits] one_time_keys_per_device` | 400 `M_LIMIT_EXCEEDED`; counts held plus the batch offered |

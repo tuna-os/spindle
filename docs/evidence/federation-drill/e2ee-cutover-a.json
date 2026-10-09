@@ -1,0 +1,17 @@
+{
+  "by_label_outcome": {
+    "post-A2:decrypted": 10,
+    "post-A:decrypted": 10,
+    "post-B:decrypted": 10,
+    "pre-A:decrypted": 15,
+    "pre-B:decrypted": 15
+  },
+  "device": "AJKDSGSBSX",
+  "events": 60,
+  "failures": [],
+  "homeserver": "http://drill-a:8008/",
+  "how": "same device",
+  "pass": true,
+  "room": "!jJwQBRazJPYfrvvkys:reilly.asia",
+  "user": "@witness:witness.lab"
+}
