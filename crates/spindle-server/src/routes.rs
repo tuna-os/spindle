@@ -4388,6 +4388,49 @@ async fn join(
     room_id: &str,
     servers: &[String],
 ) -> Result<Json<Value>, MatrixError> {
+    // #342: a server with no joined member in a room is not a resident of
+    // it, even when it still holds a copy because everyone local left. The
+    // copy's state is one no resident will defend (peers fan out only to
+    // servers with a joined or invited member), so answering the join from
+    // it authorizes against stale rules. A known-but-unresident room goes
+    // remote like an unknown one; an unknown room reads back no members
+    // and takes the same path. A pending invite is the exception: it is a
+    // live grant from a resident, so the local path that honors it stays.
+    // A locally blocked room is answered locally too: the block is this
+    // server's own administrative state, which no resident across
+    // federation knows or enforces, so asking one could let a blocked
+    // user back in wherever the resident admits.
+    let resident = state
+        .rooms
+        .joined_member_ids(room_id)
+        .map(|ids| {
+            ids.iter().any(|id| {
+                id.split_once(':').map(|(_, domain)| domain)
+                    == Some(state.config.server.name.as_str())
+            })
+        })
+        .unwrap_or(false);
+    // Either record counts: the pending index feeds `/sync`, while the
+    // room's own member event is what authorization reads, and the two
+    // can disagree mid-flight.
+    let invited = state
+        .rooms
+        .pending_invite(user_id, room_id)
+        .map(|invite| invite.is_some())
+        .unwrap_or(false)
+        || state
+            .rooms
+            .state_event_full(room_id, "m.room.member", user_id)
+            .map(|event| event["content"]["membership"] == "invite")
+            .unwrap_or(false);
+    let blocked = state
+        .rooms
+        .room_block(room_id)
+        .map(|record| record.is_some())
+        .unwrap_or(false);
+    if !resident && !invited && !blocked {
+        return join_remote(state, user_id, room_id, servers).await;
+    }
     match state.rooms.set_membership_with(
         room_id,
         user_id,
@@ -4508,6 +4551,15 @@ async fn join_remote(
         let mut join = join;
         merge_returned_signatures(&mut join, &response["event"]);
 
+        // #342: the room may already be held here with a stale copy, which
+        // is exactly how an unresident join reaches this path. The seeder
+        // below only takes fresh rooms, while the resident has already
+        // made the decision, so a held room records through the local
+        // path instead.
+        if let Some(answer) = record_held_join(state, user_id, room_id) {
+            return answer;
+        }
+
         let arrays =
             |key: &str| -> Vec<Value> { response[key].as_array().cloned().unwrap_or_default() };
         // A stock room answers with `state` and `auth_chain`; a state-DAG
@@ -4551,6 +4603,38 @@ fn record_join_history(state: &AppState, room_id: &str, join: &Value, join_id: &
             tracing::warn!(%error, %room_id, %server, "cannot record the history a join left out");
         }
     }
+}
+
+/// #342: record a resident-accepted remote join through the local path
+/// when this server already holds the room. The outcomes equal today's
+/// local answer wherever the resident admits, while a refusal already
+/// returned to the caller above. `None` means the room is not held here
+/// and the caller should seed it fresh from the resident's answer.
+fn record_held_join(
+    state: &AppState,
+    user_id: &str,
+    room_id: &str,
+) -> Option<Result<Json<Value>, MatrixError>> {
+    if state.rooms.joined_member_ids(room_id).is_err() {
+        return None;
+    }
+    Some(
+        match state.rooms.set_membership_with(
+            room_id,
+            user_id,
+            user_id,
+            "join",
+            None,
+            &member_profile(state, user_id),
+            state.key.pair(),
+        ) {
+            Ok(_) => {
+                state.rooms.wake_sync_waiters();
+                Ok(Json(json!({ "room_id": room_id })))
+            }
+            Err(error) => Err(room_error(error)),
+        },
+    )
 }
 
 /// `POST /_matrix/client/v3/rooms/{room_id}/leave`

@@ -805,6 +805,65 @@ async fn the_whole_restricted_room_sequence_holds_across_two_servers() {
     }
 }
 
+/// #342: a server that holds a room's copy but has no joined member left
+/// in it is not a resident, so a join goes to a resident instead of being
+/// answered from the stale copy. Here the copy says public while the
+/// resident has moved to invite-only: the join must come back refused.
+#[tokio::test]
+async fn a_join_goes_remote_once_no_local_member_is_left() {
+    let remote = Instance::start().await;
+    let local = Instance::start().await;
+    let alice = remote.register("alice").await;
+    let room = remote.public_room(&alice).await;
+
+    // The local server joins, then leaves: it holds the copy but has no
+    // joined member left in it.
+    let first = local.register("first").await;
+    assert_eq!(local.join_via(&room, &first, &remote.name).await.0, 200);
+    let (status, body) = local
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/rooms/{room}/leave"),
+            Some(&first),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "leaving: {body}");
+    let first_id = format!("@first:{}", local.name);
+    // The resident must see the leave first: while it still counts a
+    // joined member here, the rule change below would fan out to the
+    // stale copy and the test would prove nothing.
+    assert!(
+        eventually(async || {
+            remote
+                .joined_members(&room, &alice)
+                .await
+                .get(first_id.as_str())
+                .is_none()
+        })
+        .await,
+        "the resident sees the leave"
+    );
+
+    // The resident moves to invite-only. With no member left locally,
+    // nothing carries this to the stale copy.
+    let (status, body) = remote
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.join_rules"),
+            Some(&alice),
+            Some(&json!({ "join_rule": "invite" })),
+        )
+        .await;
+    assert_eq!(status, 200, "restricting the room: {body}");
+
+    // Answered from the stale copy this would be 200. Asked of the
+    // resident it is refused.
+    let second = local.register("second").await;
+    let (status, body) = local.join_via(&room, &second, &remote.name).await;
+    assert_eq!(status, 403, "the resident refuses: {body}");
+}
+
 #[tokio::test]
 async fn a_room_at_a_version_this_server_creates_is_one_it_can_also_join() {
     let remote = Instance::start().await;
