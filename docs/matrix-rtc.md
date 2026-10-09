@@ -253,6 +253,15 @@ override; `spindle.toml` and `spindle-othersite.toml` stand in for
 the same ratchet shape as Complement's. The `element-call-e2e` job in
 `.github/workflows/compliance.yml` runs it nightly and on demand.
 
+Beside upstream's specs run this server's own, in
+`contrib/element-call/specs/` (copied into the checkout as
+`playwright/spindle/`, driven through upstream's fixtures unchanged): a
+five-party call with joins, a clean leave, a rejoin, simultaneous
+arrivals and departures and a participant killed mid-call; a homeserver
+restart mid-call in both membership modes, after which the call must
+still be up and a crash must still expire; a ring the caller abandons;
+and a call across the rig's two Spindles in both modes.
+
 ## Calls with no SFU
 
 A room of a handful of people can call peer to peer, full mesh, with no

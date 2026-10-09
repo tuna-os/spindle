@@ -1607,6 +1607,16 @@ over-the-wire equivalent: it is a startup cost internal to each server.
 Spindle's figure stands in the section above; Synapse reloads its pending
 delays with one query at start-up and was not measured here.
 
+The same steps on a GitHub runner (run 37853447544, at the commit before
+the tick changed, so Spindle's firing there is the one-second loop's)
+agree on the parts that did not move: Spindle's restart 0.38 ms p50 at
+every size against Synapse's 2.64 / 2.68 / 5.37 ms, and Synapse again not
+delivering the thousand-member case (620 of 1,000 missing at two minutes).
+Its Synapse firing figures were higher than the pod's (88 / 220 ms p50 at
+10 / 100) -- the runner is a different host, which is why the tables
+above come from one sitting on one host and this paragraph only confirms
+their shape.
+
 `scripts/delayed-events-benchmark.py --base <url> --label <name>` against
 `scripts/bench-servers.sh up` reproduces it; the temporary
 `delayed-events-vs-synapse` job on the M7 completion branch ran the same

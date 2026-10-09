@@ -43,3 +43,15 @@ spa-call-sticky.spec.ts :: One to One rejoin after improper leave does not crash
 widget/voice-call-dm.spec.ts :: Decline a new video call in DM as widget
 widget/voice-call-dm.spec.ts :: Start a new video call in DM as widget
 widget/voice-call-dm.spec.ts :: Start a new voice call in DM as widget
+#
+# Recorded on the M7 completion branch (workflow run 37853447544,
+# element-call pin a03f23e, chromium): Spindle's own specs
+# (contrib/element-call/specs/), the scenarios #41 names that no upstream
+# spec drives. Twenty-two of twenty-two passed; the state-events restart
+# case passed on its retry, as the checker counts it.
+spindle/federated-call.spec.ts :: Federated call between two Spindles (2_0)
+spindle/federated-call.spec.ts :: Federated call between two Spindles (compat)
+spindle/five-party-churn.spec.ts :: Five-party call with participants joining, leaving, rejoining and dying throughout
+spindle/restart-mid-call.spec.ts :: Call survives a homeserver restart and a later crash still expires (state events)
+spindle/restart-mid-call.spec.ts :: Call survives a homeserver restart and a later crash still expires (sticky events)
+spindle/ring-abandon.spec.ts :: Caller abandons a ringing DM call and the callee stops ringing
