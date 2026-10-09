@@ -76,7 +76,12 @@ bench-sitting group rounds="3":
       scripts/bench-sitting.sh --group {{group}} --rounds {{rounds}}
 
 # The whole thing from a bare checkout.
-bench group rounds="3": bench-field bench-build (bench-sitting group rounds) bench-render
+bench group rounds="3": bench-field bench-build (bench-sitting group rounds) bench-render (bench-gate group)
+
+# #42's three parity lines, judged on one committed sitting. Fails on a
+# separated loss; reports the workloads still unmeasured either way.
+bench-gate group:
+    python3 scripts/parity-gate.py docs/benchmarks/data {{group}}
 
 # The site, from the committed results, into site/.
 bench-render:
