@@ -7,9 +7,10 @@
 //! is served here, and it is complete for a single server.
 //!
 //! It is **not** wired into `/sync`'s `presence` block and it is **not**
-//! federated. Both are real features and neither is pretended at: a client
-//! polling `GET /presence/{user}/status` gets the truth, and a client
-//! waiting for presence to arrive on `/sync` waits forever, which is why
+//! federated (why not yet: `receipts`' module docs, #624). Both are real
+//! features and neither is pretended at: a client polling
+//! `GET /presence/{user}/status` gets the truth, and a client waiting for
+//! presence to arrive on `/sync` waits forever, which is why
 //! `filters.rs` still says this server has no presence to filter. The
 //! alternative -- an empty `presence` block on every sync -- would look like
 //! "nobody is online" rather than "this server does not tell you", and a

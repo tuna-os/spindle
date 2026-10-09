@@ -813,3 +813,99 @@ fn a_recovered_auth_body_cannot_reuse_a_resolution_from_before_its_arrival() {
     );
     assert_eq!(graph.lock().unwrap().generation, 1);
 }
+
+/// An event the auth checks refuse inside resolution is counted, not
+/// warned about (#626), and the resolution still answers.
+#[test]
+fn a_rejection_inside_resolution_is_counted() {
+    let base = Room::new(RoomVersionId::V10);
+    // Carol holds power 0 against a `state_default` of 50, so her topic
+    // fails the auth check at the partially resolved state.
+    let mut left = base.fork("left");
+    left.add(
+        CAROL,
+        "m.room.topic",
+        Some(""),
+        &json!({ "topic": "carol" }),
+        100,
+    );
+    let mut right = base.fork("right");
+    let bobs = right.add(
+        BOB,
+        "m.room.topic",
+        Some(""),
+        &json!({ "topic": "bob" }),
+        101,
+    );
+    let mut room = base.clone();
+    room.absorb(&left);
+    room.absorb(&right);
+    let rules = room.rules();
+    let log = RoomLog::new();
+    let body = |id: &str| room.bodies.get(id).cloned();
+    let graph = Mutex::new(AuthGraph::default());
+    let cache = ResolutionCache::default();
+    let mut resolver = RoomResolver::new(&rules, &room.id, &log, &body, &graph, &cache);
+    let states = [left.snapshot(), right.snapshot()];
+    let answer = resolver.resolve(&states).unwrap();
+    assert_eq!(
+        answer.get(&StateKey::new("m.room.topic", "")),
+        Some(bobs.as_str())
+    );
+    assert_eq!(resolver.stats.resolutions, 1);
+    assert!(resolver.stats.rejections >= 1, "{:?}", resolver.stats);
+    // The same fork again is the cache's, and refuses nothing anew.
+    let rejections = resolver.stats.rejections;
+    resolver.resolve(&states).unwrap();
+    assert_eq!(resolver.stats.resolutions, 1);
+    assert_eq!(resolver.stats.cache_hits, 1);
+    assert_eq!(resolver.stats.rejections, rejections);
+}
+
+/// The fork a room keeps asking about stays cached however many other
+/// resolutions the server computes meanwhile (#626): eviction is least
+/// recently used, not first in.
+#[test]
+fn a_resolution_in_use_survives_a_full_cache() {
+    let cache = ResolutionCache::default();
+    let policy = [7_u8; 32];
+    let state = |index: usize| {
+        StateSnapshot::new().apply(
+            StateKey::new("m.room.topic", ""),
+            format!("$t{index}").as_str(),
+        )
+    };
+    let hot = ResolutionCache::key(&[state(0), state(1)], policy);
+    cache.put(hot.clone(), state(0));
+    for index in 2..2_000 {
+        cache.put(
+            ResolutionCache::key(&[state(0), state(index)], policy),
+            state(index),
+        );
+        assert!(cache.get(&hot).is_some(), "evicted after {index} inserts");
+    }
+    assert_eq!(cache.len(), super::RESOLUTION_CACHE_CAPACITY);
+    // What nobody asked for again went first.
+    assert!(
+        cache
+            .get(&ResolutionCache::key(&[state(0), state(2)], policy))
+            .is_none()
+    );
+}
+
+/// The key is the set of roots: order and repetition of the inputs do not
+/// change the question.
+#[test]
+fn the_cache_key_is_the_set_of_input_roots() {
+    let one = StateSnapshot::new().apply(StateKey::new("m.room.topic", ""), "$a");
+    let two = StateSnapshot::new().apply(StateKey::new("m.room.topic", ""), "$b");
+    let policy = [1_u8; 32];
+    assert_eq!(
+        ResolutionCache::key(&[one.clone(), two.clone()], policy),
+        ResolutionCache::key(&[two.clone(), one.clone(), two.clone()], policy)
+    );
+    assert_ne!(
+        ResolutionCache::key(&[one.clone(), two.clone()], policy),
+        ResolutionCache::key(&[one, two], [2_u8; 32])
+    );
+}

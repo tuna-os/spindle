@@ -190,16 +190,80 @@ impl Rooms {
         event_id: &str,
         thread_id: Option<&str>,
     ) -> Result<(), RoomError> {
+        self.set_receipt_among(
+            room_id,
+            user_id,
+            receipt_type,
+            &[event_id],
+            thread_id,
+            now_ms(),
+        )
+        .map(|_| ())
+    }
+
+    /// Record a receipt a peer sent in an `m.receipt` EDU.
+    ///
+    /// Stored exactly as a local receipt is -- same key, same record, same
+    /// stream mark -- so classic `/sync` and the sliding-sync receipts
+    /// extension serve it without knowing where it came from. The spec
+    /// lets one receipt name several events; the one this room places
+    /// latest wins, and events this server does not hold are skipped
+    /// rather than refusing the receipt. `ts` is the reader's own clock,
+    /// clamped to ours so a peer cannot date a receipt in the future.
+    /// Returns the event the receipt was placed on.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_receipt`]: [`RoomError::Forbidden`] for a reader who
+    /// is not joined, [`RoomError::MissingBody`] when none of the events is
+    /// one this room holds.
+    pub fn set_remote_receipt(
+        &self,
+        room_id: &str,
+        user_id: &str,
+        receipt_type: &str,
+        event_ids: &[&str],
+        thread_id: Option<&str>,
+        ts: u64,
+    ) -> Result<String, RoomError> {
+        self.set_receipt_among(
+            room_id,
+            user_id,
+            receipt_type,
+            event_ids,
+            thread_id,
+            ts.min(now_ms()),
+        )
+    }
+
+    fn set_receipt_among(
+        &self,
+        room_id: &str,
+        user_id: &str,
+        receipt_type: &str,
+        event_ids: &[&str],
+        thread_id: Option<&str>,
+        ts: u64,
+    ) -> Result<String, RoomError> {
         if !self.is_joined(user_id, room_id)? {
             return Err(RoomError::Forbidden(format!(
                 "{user_id} is not in {room_id}"
             )));
         }
-        let li = self
-            .with_room(room_id, |_, log| {
-                Ok(log.get(&EventId::new(event_id)).map(|entry| entry.li.get()))
-            })?
-            .ok_or_else(|| RoomError::MissingBody(event_id.to_owned()))?;
+        let placed = self.with_room(room_id, |_, log| {
+            Ok(event_ids
+                .iter()
+                .filter_map(|event_id| {
+                    log.get(&EventId::new(*event_id))
+                        .map(|entry| (entry.li.get(), *event_id))
+                })
+                .max_by_key(|(li, _)| *li))
+        })?;
+        let Some((li, event_id)) = placed else {
+            return Err(RoomError::MissingBody(
+                event_ids.first().copied().unwrap_or_default().to_owned(),
+            ));
+        };
 
         spindle_store::Store::put(
             self.store.as_ref(),
@@ -207,12 +271,43 @@ impl Rooms {
             &ReceiptRecord {
                 event_id: event_id.to_owned(),
                 li,
-                ts: now_ms(),
+                ts,
             }
             .encode(),
         )?;
         self.mark_receipt(room_id, user_id);
-        Ok(())
+        Ok(event_id.to_owned())
+    }
+
+    /// Every receipt one reader holds in a room, as `(receipt_type,
+    /// event_id, ts, thread_id)`: what an incremental `/sync` re-sends for
+    /// a reader whose receipt moved. One prefix scan of that reader's rows,
+    /// not the room's.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the records cannot be read.
+    #[allow(clippy::type_complexity, reason = "one row per receipt")]
+    pub fn user_receipts(
+        &self,
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<Vec<(String, String, u64, Option<String>)>, RoomError> {
+        let prefix = receipt_key(room_id, user_id, "", None);
+        let mut receipts = Vec::new();
+        for (key, value) in spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)? {
+            let Ok(tail) = std::str::from_utf8(&key[prefix.len()..]) else {
+                continue;
+            };
+            let (receipt_type, thread) = match tail.split_once('\0') {
+                Some((receipt_type, thread)) => (receipt_type, Some(thread.to_owned())),
+                None => (tail, None),
+            };
+            if let Some(record) = ReceiptRecord::decode(&value) {
+                receipts.push((receipt_type.to_owned(), record.event_id, record.ts, thread));
+            }
+        }
+        Ok(receipts)
     }
 
     /// How many events a user has not read, and where they read up to.
@@ -315,7 +410,9 @@ impl Rooms {
                         if entry.state_key.is_some() {
                             continue;
                         }
-                        below.push((entry.li.get(), rooms.read_sender(room_id, &entry.event_id)?));
+                        if let Some(sender) = rooms.read_sender(room_id, &entry.event_id)? {
+                            below.push((entry.li.get(), sender));
+                        }
                     }
                 }
                 let mut cache = rooms
@@ -384,7 +481,9 @@ impl Rooms {
         for (li, event_id) in pending.iter().rev() {
             match self.read_event(room_id, &EventId::new(event_id.as_str())) {
                 Ok(json) => {
-                    if json["sender"] != user_id {
+                    // A dummy event (#626) is not something to read, so no
+                    // rule of the reader's may make it notify.
+                    if json["sender"] != user_id && !super::extremities::is_dummy_event(&json) {
                         events.push((*li, json));
                     }
                 }

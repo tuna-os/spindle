@@ -144,6 +144,7 @@ type Destinations = ([u8; 32], Arc<Vec<String>>);
 
 mod admin;
 mod erasure;
+pub mod extremities;
 mod federation;
 mod gaps;
 mod read;
@@ -186,7 +187,7 @@ pub struct Rooms {
     /// Continuwuity across two sittings. A sort key is one i64; it lives
     /// in memory and is refreshed by the append that changes it.
     last_activity: Mutex<HashMap<String, i64>>,
-    /// `(room, user)` -> the stream position allocated when that user last
+    /// room -> user -> the stream position allocated when that user last
     /// sent a receipt in that room. A receipt is not an event and writes
     /// no stream row, so nothing about the room moves when one lands --
     /// and yet the reader's own unread counts just changed, and a sliding
@@ -195,7 +196,11 @@ pub struct Rooms {
     /// notification-count test waited four seconds for the new count and
     /// gave up; it was waiting on the next message. Positions on the same
     /// counter events use, so `since` orders receipts and events together.
-    receipt_marks: Mutex<HashMap<(String, String), u64>>,
+    ///
+    /// Keyed room first, so classic `/sync` can ask who in one room moved
+    /// their receipt since its token without walking every room's readers;
+    /// a federated reader's receipt is marked exactly as a local one is.
+    receipt_marks: Mutex<HashMap<String, HashMap<String, u64>>>,
     /// The rendered `/state` body per room, keyed by the state root it was
     /// rendered from.
     ///
@@ -265,6 +270,9 @@ pub struct Rooms {
     /// Resolutions already computed, keyed by the roots of the states they
     /// resolved (`state_res::ResolutionCache`).
     resolutions: crate::state_res::ResolutionCache,
+    /// Extremity merging's bookkeeping (`extremities`): rooms an append left
+    /// forked since the last pass, and when each room was last merged.
+    extremities: extremities::Tracker,
     /// The server-global order `/sync` needs (SPEC §10.2). The linear index
     /// orders events within one room; nothing orders them across rooms, so
     /// this is the one counter that exists purely because a per-room order is
@@ -481,6 +489,7 @@ impl Rooms {
             state_heads: Mutex::new(HashMap::new()),
             auth_graphs: Mutex::new(HashMap::new()),
             resolutions: crate::state_res::ResolutionCache::default(),
+            extremities: extremities::Tracker::default(),
             // Resumed, not reset. A counter that restarted at zero would
             // re-issue stream ids already on disk, overwriting the entries
             // they point at -- the same shape of bug as a room registry that
@@ -3660,8 +3669,40 @@ impl Rooms {
         self.receipt_marks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert((room_id.to_owned(), user_id.to_owned()), position);
+            .entry(room_id.to_owned())
+            .or_default()
+            .insert(user_id.to_owned(), position);
         self.wake_sync_waiters();
+    }
+
+    /// Of `rooms`, the readers in each whose receipt moved at a position in
+    /// `(since, until]`: what an incremental `/sync` owes the client as an
+    /// `m.receipt` ephemeral event. Rooms where nobody moved are absent.
+    pub fn receipt_readers_since<'a>(
+        &self,
+        rooms: impl IntoIterator<Item = &'a str>,
+        since: u64,
+        until: u64,
+    ) -> HashMap<String, Vec<String>> {
+        let marks = self
+            .receipt_marks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out = HashMap::new();
+        for room_id in rooms {
+            let Some(readers) = marks.get(room_id) else {
+                continue;
+            };
+            let moved: Vec<String> = readers
+                .iter()
+                .filter(|(_, position)| **position > since && **position <= until)
+                .map(|(reader, _)| reader.clone())
+                .collect();
+            if !moved.is_empty() {
+                out.insert(room_id.to_owned(), moved);
+            }
+        }
+        out
     }
 
     /// Of `rooms`, the ones `user_id` sent a receipt in at a position in
@@ -3683,7 +3724,8 @@ impl Rooms {
             .into_iter()
             .filter(|room_id| {
                 marks
-                    .get(&((*room_id).to_owned(), user_id.to_owned()))
+                    .get(*room_id)
+                    .and_then(|readers| readers.get(user_id))
                     .is_some_and(|position| *position > since && *position <= until)
             })
             .map(str::to_owned)
@@ -4584,29 +4626,33 @@ impl Rooms {
         // a backlog holds it for as long as that takes -- is read from the
         // store too: the store holds every entry the log does, and the sort
         // key is not worth queueing behind an ingest for.
+        //
+        // An `org.matrix.dummy_event` (#626) is not activity: it merges
+        // forks, and a quiet room that receives one must keep its place in
+        // the room list, as Synapse's bump stamps leave it out. So the newest
+        // entry that is not one dates the room, looked for at most
+        // `ACTIVITY_LOOKBACK` entries back from the head.
         let in_memory = self
             .resident(room_id)
             .and_then(|room| match room.try_read() {
-                Ok(log) => Some(Self::head_in_memory(&log)),
+                Ok(log) => Some(Self::tail_in_memory(&log)),
                 Err(std::sync::TryLockError::Poisoned(log)) => {
-                    Some(Self::head_in_memory(&log.into_inner()))
+                    Some(Self::tail_in_memory(&log.into_inner()))
                 }
                 Err(std::sync::TryLockError::WouldBlock) => None,
             });
-        let head = match in_memory {
-            Some(head) => head,
-            None => self.head_in_store(room_id)?,
-        };
-        let activity = match head {
-            None => 0,
-            Some((event_id, rejected)) => {
-                if rejected {
-                    return Err(RoomError::MissingBody(event_id));
-                }
-                self.read_event(room_id, &EventId::new(event_id.as_str()))?["origin_server_ts"]
-                    .as_i64()
-                    .unwrap_or(0)
-            }
+        let activity = if let Some(tail) = in_memory {
+            let mut tail = tail.into_iter();
+            self.activity_of(room_id, || Ok(tail.next()))?
+        } else {
+            let mut end: Option<Vec<u8>> = None;
+            self.activity_of(room_id, || {
+                let Some((head, key)) = self.head_in_store(room_id, end.as_deref())? else {
+                    return Ok(None);
+                };
+                end = Some(key);
+                Ok(Some(head))
+            })?
         };
         // Filled only if still empty: an append that landed while this was
         // reading has already stored a fresher key, and must not be
@@ -4619,30 +4665,81 @@ impl Rooms {
             .or_insert(activity))
     }
 
-    /// The head entry of a resident log: its event id, and whether that
-    /// event is historically rejected (and so has no body to show).
-    fn head_in_memory(log: &RoomLog) -> Option<(String, bool)> {
-        log.entries().next_back().map(|entry| {
-            (
-                entry.event_id.as_str().to_owned(),
-                log.historically_rejected(&entry.event_id),
-            )
-        })
+    /// The timestamp of the newest entry `next` yields, newest first, that
+    /// is not an `org.matrix.dummy_event`. Looks at most
+    /// [`ACTIVITY_LOOKBACK`] entries back; a tail of nothing but dummy
+    /// events is dated by the oldest of them looked at, and an empty room
+    /// is dated zero.
+    fn activity_of(
+        &self,
+        room_id: &str,
+        mut next: impl FnMut() -> Result<Option<TailEntry>, RoomError>,
+    ) -> Result<i64, RoomError> {
+        let mut oldest_dummy = None;
+        for _ in 0..ACTIVITY_LOOKBACK {
+            let Some(entry) = next()? else {
+                break;
+            };
+            if entry.rejected {
+                return Err(RoomError::MissingBody(entry.event_id));
+            }
+            let body = self.read_event(room_id, &EventId::new(entry.event_id.as_str()))?;
+            let ts = body["origin_server_ts"].as_i64().unwrap_or(0);
+            if entry.state || !extremities::is_dummy_event(&body) {
+                return Ok(ts);
+            }
+            oldest_dummy = Some(ts);
+        }
+        Ok(oldest_dummy.unwrap_or(0))
     }
 
-    /// [`Self::head_in_memory`] for a room that is not resident, read from
-    /// the store without restoring the room.
+    /// The newest [`ACTIVITY_LOOKBACK`] entries of a resident log, newest
+    /// first, ending early at a state event (which cannot be a dummy event).
+    fn tail_in_memory(log: &RoomLog) -> Vec<TailEntry> {
+        let mut tail = Vec::new();
+        for entry in log.entries().rev().take(ACTIVITY_LOOKBACK) {
+            let state = entry.state_key.is_some();
+            tail.push(TailEntry {
+                event_id: entry.event_id.as_str().to_owned(),
+                rejected: log.historically_rejected(&entry.event_id),
+                state,
+            });
+            if state {
+                break;
+            }
+        }
+        tail
+    }
+
+    /// The newest entry of a room's stored log below `end` (the head when
+    /// `None`), read without restoring the room, with its row key so the
+    /// caller can step further back.
     ///
     /// The log keyspace is ordered by linear index -- the encoding is
     /// order-preserving across the sign boundary, which is what lets a
     /// restore scan it straight into a log -- so the room's last row is the
     /// entry a restored log would hold at its head.
-    fn head_in_store(&self, room_id: &str) -> Result<Option<(String, bool)>, RoomError> {
+    fn head_in_store(
+        &self,
+        room_id: &str,
+        end: Option<&[u8]>,
+    ) -> Result<Option<(TailEntry, Vec<u8>)>, RoomError> {
         let store = self.store.as_ref();
         let prefix = spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::Log, room_id);
-        let mut end = prefix.clone();
-        end.extend_from_slice(&[0xff; 9]);
-        let Some((_, value)) = spindle_store::ReadView::last_before(store, &prefix, &end)? else {
+        let stepping_back = end.is_some();
+        let end = end.map_or_else(
+            || {
+                let mut end = prefix.clone();
+                end.extend_from_slice(&[0xff; 9]);
+                end
+            },
+            <[u8]>::to_vec,
+        );
+        let Some((key, value)) = spindle_store::ReadView::last_before(store, &prefix, &end)? else {
+            if stepping_back {
+                // Stepped back past the first row: nothing older.
+                return Ok(None);
+            }
             // No entries: an empty room, or no room at all -- which a load
             // would have told apart by the room's metadata, so this does too.
             let meta =
@@ -4659,7 +4756,14 @@ impl Rooms {
             &spindle_core::keys::historical_rejection(room_id, &record.event_id),
         )?
         .is_some();
-        Ok(Some((record.event_id, rejected)))
+        Ok(Some((
+            TailEntry {
+                event_id: record.event_id,
+                rejected,
+                state: record.state_key.is_some(),
+            },
+            key,
+        )))
     }
 
     /// Which of `rooms` had at least one event in the stream range
@@ -4702,6 +4806,48 @@ impl Rooms {
         limit: usize,
     ) -> Result<(Vec<Value>, bool, Option<i64>), RoomError> {
         self.timeline_tail(room_id, limit)
+    }
+
+    /// [`Self::timeline_tail_public`] without `org.matrix.dummy_event`s
+    /// (#626): the newest `limit` events a room list may preview. A dummy
+    /// event merges forks and says nothing, so a client asking for one event
+    /// to show under the room's name must get the message before it.
+    ///
+    /// Looks [`TIMELINE_DUMMY_SLACK`] events past `limit` to find them; dummy
+    /// events are at most one per room per merge interval, so a longer run
+    /// is a room with nothing else to show. The window begins at its oldest
+    /// kept event, so paging back from it reaches every event left out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room or an event cannot be read.
+    pub fn timeline_tail_for_preview(
+        &self,
+        room_id: &str,
+        limit: usize,
+    ) -> Result<(Vec<Value>, bool, Option<i64>), RoomError> {
+        let (events, more) = self.messages(room_id, None, limit + TIMELINE_DUMMY_SLACK)?;
+        let oldest = events.last().map(|event| event.li);
+        let mut kept = Vec::with_capacity(limit);
+        let mut cut = false;
+        // Newest first.
+        for event in events {
+            if extremities::is_dummy_event(&event.json) {
+                continue;
+            }
+            if kept.len() == limit {
+                cut = true;
+                break;
+            }
+            kept.push(event);
+        }
+        let first = kept.last().map(|event| event.li).or(oldest);
+        let mut out: Vec<Value> = kept
+            .into_iter()
+            .map(|event| stamp(event.json, &event.event_id))
+            .collect();
+        out.reverse();
+        Ok((out, more.is_some() || cut, first))
     }
 
     fn membership_rooms(&self, user_id: &str, wanted: &[u8]) -> Result<Vec<String>, RoomError> {
@@ -5392,10 +5538,14 @@ impl Rooms {
         let started = std::time::Instant::now();
         let result = work(log, &mut resolver, &mut load);
         let stats = resolver.stats;
+        self.metrics
+            .record_state_res(stats.resolutions, stats.cache_hits, stats.rejections);
         if stats.resolutions > 0 {
             tracing::info!(
                 room = room_id,
                 elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                rejected = stats.rejections,
+                forward_extremities = log.forward_extremities().len(),
                 auth_graph = graph
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5467,6 +5617,11 @@ impl Rooms {
         previous_tips: &BTreeSet<EventId>,
     ) -> Result<(), RoomError> {
         if log.forward_extremities().len() > 1 {
+            // Every append to a forked room re-resolves its current state
+            // over every extremity. A fork no peer's event merges -- tips this
+            // server holds that no remote event cites -- costs that on every
+            // append for good, so it is noted for the merge pass (#626).
+            self.extremities.note_forked(room_id);
             match self.resolve_in(log, room_id, |log, resolver, load| {
                 log.resolve_current(resolver, load)
             }) {
@@ -6096,7 +6251,8 @@ impl Rooms {
         // Keep the unread index current while it is warm. Only if cached:
         // a cold room's index is built from the log on first use, so there
         // is nothing to maintain until someone asks.
-        if input.state_key.is_none() {
+        // A dummy event is not something to read (#626): it never counts.
+        if input.state_key.is_none() && input.event_type != extremities::DUMMY_EVENT_TYPE {
             let mut cache = self
                 .unread_index
                 .lock()
@@ -6128,13 +6284,16 @@ impl Rooms {
         // sort key, so the sliding-sync room list never re-reads a body
         // for it. Unconditional: an absent entry is filled lazily, a
         // present one must not go stale.
-        self.last_activity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                room_id.to_owned(),
-                input.json["origin_server_ts"].as_i64().unwrap_or(0),
-            );
+        // A dummy event (#626) is not activity, and leaves the key alone.
+        if input.event_type != extremities::DUMMY_EVENT_TYPE {
+            self.last_activity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    room_id.to_owned(),
+                    input.json["origin_server_ts"].as_i64().unwrap_or(0),
+                );
+        }
 
         // The signed JSON is stored beside the log entry, in the entry's own
         // batch. The log holds ordering and state; the event body is what a
@@ -6453,26 +6612,59 @@ impl Rooms {
     /// the rest of the body. The unread index reads this for every event it
     /// indexes and nothing else, and the event's content is most of its
     /// size.
-    fn read_sender(&self, room_id: &str, event_id: &EventId) -> Result<String, RoomError> {
+    ///
+    /// `None` for an `org.matrix.dummy_event`, which the unread index leaves
+    /// out (#626).
+    fn read_sender(&self, room_id: &str, event_id: &EventId) -> Result<Option<String>, RoomError> {
         #[derive(serde::Deserialize)]
         struct Sender<'a> {
             #[serde(borrow, default)]
             sender: Option<std::borrow::Cow<'a, str>>,
+            #[serde(borrow, default, rename = "type")]
+            kind: Option<std::borrow::Cow<'a, str>>,
         }
         let raw = spindle_store::ReadView::get(
             self.store.as_ref(),
             &event_body_key(room_id, event_id.as_str()),
         )?
         .ok_or_else(|| RoomError::MissingBody(event_id.as_str().to_owned()))?;
-        if let Ok(Sender { sender }) = serde_json::from_slice::<Sender<'_>>(&raw) {
-            return Ok(sender.map(std::borrow::Cow::into_owned).unwrap_or_default());
+        if let Ok(Sender { sender, kind }) = serde_json::from_slice::<Sender<'_>>(&raw) {
+            if kind.as_deref() == Some(extremities::DUMMY_EVENT_TYPE) {
+                return Ok(None);
+            }
+            return Ok(Some(
+                sender.map(std::borrow::Cow::into_owned).unwrap_or_default(),
+            ));
         }
         // Whatever the narrow read refuses -- a sender that is not a
         // string, a repeated key -- is answered the way the whole-body
         // read answers it, errors included.
         let event: Value = serde_json::from_slice(&raw)?;
-        Ok(event["sender"].as_str().unwrap_or("").to_owned())
+        if extremities::is_dummy_event(&event) {
+            return Ok(None);
+        }
+        Ok(Some(event["sender"].as_str().unwrap_or("").to_owned()))
     }
+}
+
+/// How far back from a room's head [`Rooms::last_activity`] looks past
+/// `org.matrix.dummy_event`s for the event that dates the room. Merges are
+/// at most one per room per `[rooms] dummy_event_interval_secs`, and any
+/// other event ends the walk, so a longer run means a room nobody else has
+/// spoken in for that many intervals.
+const ACTIVITY_LOOKBACK: usize = 16;
+
+/// How many events past its limit [`Rooms::timeline_tail_for_preview`]
+/// reads to find what the dummy events it leaves out displaced.
+const TIMELINE_DUMMY_SLACK: usize = 4;
+
+/// One entry near a room's head, as [`Rooms::last_activity`] reads it.
+struct TailEntry {
+    event_id: String,
+    /// Historically rejected: there is no body to date it by.
+    rejected: bool,
+    /// A state event, which is never a dummy event.
+    state: bool,
 }
 
 /// One cold load in flight ([`Rooms::room_or_load`]): its outcome once it

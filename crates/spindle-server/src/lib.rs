@@ -44,6 +44,7 @@ pub mod push;
 pub mod push_rules;
 pub mod pushers;
 pub mod ratelimit;
+pub mod receipts;
 pub mod recovery;
 pub mod registration_tokens;
 pub mod rendezvous;
@@ -530,6 +531,15 @@ fn spawn_delivery_loops(state: &AppState) {
         Arc::downgrade(&state.rooms),
         Arc::downgrade(&state.key),
         std::time::Duration::from_secs(1),
+    ));
+    // Forks no event merges are merged with dummy events, and the census
+    // behind `spindle_rooms_by_forward_extremities` is taken, once a minute
+    // -- Synapse's cadence for the same job (#626).
+    tokio::spawn(rooms::extremities::merge_loop(
+        Arc::downgrade(&state.rooms),
+        Arc::downgrade(&state.key),
+        rooms::extremities::MergePolicy::of(&state.config.rooms),
+        std::time::Duration::from_secs(60),
     ));
     // Disabled federation leaves queued rows in the outbox and never starts
     // the drain that would only be refused, row by row.
