@@ -1488,7 +1488,7 @@ async fn well_known_client(
     // before it has a token to ask with. Omitted entirely when nothing is
     // configured -- an empty array here would be a positive claim to have
     // no backend, where absence is "this server does not answer that".
-    let foci = rtc_transports(&state.config);
+    let foci = rtc_transports(&state);
     if !foci.is_empty() {
         body["org.matrix.msc4143.rtc_foci"] = Value::Array(foci);
     }
@@ -9222,11 +9222,22 @@ async fn voip_turn_server(
 /// built-in `LiveKit` service (#38), listed first when `[rtc.livekit]` is
 /// set: it is this server's own, and a deployment that configured it did
 /// so to use it.
-fn rtc_transports(config: &crate::Config) -> Vec<Value> {
-    crate::livekit::service_url(config)
-        .map(|url| json!({ "type": "livekit", "livekit_service_url": url }))
+fn rtc_transports(state: &AppState) -> Vec<Value> {
+    // The built-in service advertises only while the program is on. Off —
+    // by switch or by absence — reads exactly like unconfigured: the
+    // operator's `foci` alone, or the empty list, and well-known omitting
+    // the key when that list is empty.
+    let builtin = if crate::livekit::effective_enabled(&state.config, &state.store) {
+        crate::livekit::service_url(&state.config)
+            .map(|url| json!({ "type": "livekit", "livekit_service_url": url }))
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    builtin
         .into_iter()
-        .chain(config.rtc.foci.iter().map(|focus| {
+        .chain(state.config.rtc.foci.iter().map(|focus| {
             json!({
                 "type": focus.kind,
                 "livekit_service_url": focus.livekit_service_url,
@@ -9255,7 +9266,7 @@ async fn rtc_transports_endpoint(
     State(state): State<AppState>,
     Authenticated(_identity): Authenticated,
 ) -> Json<Value> {
-    Json(json!({ "rtc_transports": rtc_transports(&state.config) }))
+    Json(json!({ "rtc_transports": rtc_transports(&state) }))
 }
 
 /// The TURN REST password: base64 of HMAC-SHA1 over the username.

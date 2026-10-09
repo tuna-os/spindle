@@ -124,6 +124,10 @@ pub struct AppState {
     /// `[email]` names, or what a test supplied. Absent, nothing is mailed
     /// and the pages that would need it are not offered.
     pub mailer: Option<Arc<dyn email::Mailer>>,
+    /// The SFU sidecar supervisor: the local model's child process, watched
+    /// and restarted. Present in every state — the remote model and the
+    /// unconfigured server simply report through it rather than spawn.
+    pub sfu: Arc<livekit::SfuSupervisor>,
 }
 
 /// Why the application cannot be built. Both are startup-fatal on purpose:
@@ -461,6 +465,8 @@ fn app_state_with(
     let push =
         Arc::new(push::Gateway::new(&config.push.allow_internal).map_err(AppError::PushConfig)?);
     let delayed_caps = config.delayed_events.clone();
+    let config_for_sfu = config.clone();
+    let store_for_sfu = Arc::clone(&store);
     let state = AppState {
         config: Arc::new(config),
         store,
@@ -497,6 +503,7 @@ fn app_state_with(
         backfill: Arc::new(inbound::GapBackfill::new()),
         metrics,
         mailer,
+        sfu: livekit::SfuSupervisor::new(config_for_sfu, store_for_sfu),
     };
     // Resident rooms are counted at scrape time, from the registry itself,
     // rather than kept as a counter every admission path would have to
