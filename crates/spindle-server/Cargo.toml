@@ -88,3 +88,7 @@ harness = false
 [[bench]]
 name = "ring_latency"
 harness = false
+
+[[bench]]
+name = "call_churn"
+harness = false

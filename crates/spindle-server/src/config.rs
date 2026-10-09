@@ -293,6 +293,11 @@ pub struct DelayedEventsConfig {
     /// in: a legitimate Matrix RTC client sits at one.
     #[serde(default = "default_max_per_room")]
     pub max_per_room: usize,
+    /// The most delays one user may have pending across every room:
+    /// MSC4140's `max_scheduled`, which the server must enforce and
+    /// advertises in `/capabilities`.
+    #[serde(default = "default_max_per_user")]
+    pub max_per_user: usize,
 }
 
 impl Default for DelayedEventsConfig {
@@ -300,6 +305,7 @@ impl Default for DelayedEventsConfig {
         Self {
             max_delay_ms: default_max_delay_ms(),
             max_per_room: default_max_per_room(),
+            max_per_user: default_max_per_user(),
         }
     }
 }
@@ -310,6 +316,10 @@ const fn default_max_delay_ms() -> u64 {
 
 const fn default_max_per_room() -> usize {
     crate::delayed::DEFAULT_MAX_PER_ROOM
+}
+
+const fn default_max_per_user() -> usize {
+    crate::delayed::DEFAULT_MAX_PER_USER
 }
 
 /// `[rooms]`: keeping rooms' forward extremities merged (#626).
@@ -1206,6 +1216,33 @@ impl Config {
         Self::parse(&text)
     }
 
+    /// The MSC4140 caps: each must be positive, for the reason given where
+    /// they are checked.
+    fn validate_delayed_events(&self) -> Result<(), ConfigError> {
+        if self.delayed_events.max_delay_ms == 0 {
+            return Err(ConfigError::Invalid {
+                field: "delayed_events.max_delay_ms",
+                message: "must be greater than zero; a zero cap refuses every delayed event"
+                    .to_owned(),
+            });
+        }
+        if self.delayed_events.max_per_room == 0 {
+            return Err(ConfigError::Invalid {
+                field: "delayed_events.max_per_room",
+                message: "must be greater than zero; a zero cap refuses every delayed event"
+                    .to_owned(),
+            });
+        }
+        if self.delayed_events.max_per_user == 0 {
+            return Err(ConfigError::Invalid {
+                field: "delayed_events.max_per_user",
+                message: "must be greater than zero; a zero cap refuses every delayed event"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// `[federation]`: no listener on a server told not to federate, each
     /// peer URL is a scheme, host and port, and a patience cap is never
     /// shorter than the base it caps.
@@ -1313,20 +1350,7 @@ impl Config {
         // mean "unlimited", it means every schedule is refused and the
         // dead-man's switch silently stops working. An operator who typed
         // it meant something else, so say so rather than starting.
-        if self.delayed_events.max_delay_ms == 0 {
-            return Err(ConfigError::Invalid {
-                field: "delayed_events.max_delay_ms",
-                message: "must be greater than zero; a zero cap refuses every delayed event"
-                    .to_owned(),
-            });
-        }
-        if self.delayed_events.max_per_room == 0 {
-            return Err(ConfigError::Invalid {
-                field: "delayed_events.max_per_room",
-                message: "must be greater than zero; a zero cap refuses every delayed event"
-                    .to_owned(),
-            });
-        }
+        self.validate_delayed_events()?;
         self.validate_rooms()?;
         self.validate_peers()?;
         // A ring budget of zero is not "unlimited" either: it refuses every

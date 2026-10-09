@@ -164,6 +164,10 @@ pub const UNSTABLE_FEATURES: &[(&str, bool)] = &[
     // expected to fall back to leaving a stale membership behind. So the
     // advertisement is not decoration: it changes what clients do.
     ("org.matrix.msc4140", true),
+    // MSC4140 is merged, and the stable endpoints it names are served
+    // beside the unstable ones: this is the MSC's own flag for "use them"
+    // until a spec version that contains it is advertised.
+    ("org.matrix.msc4140.stable", true),
     // MSC4143's MatrixRTC discovery. Advertised unconditionally, because
     // the flag answers "does this server serve /rtc/transports", not "does
     // it have a backend to name": the endpoint is served either way and
@@ -176,6 +180,9 @@ pub const UNSTABLE_FEATURES: &[(&str, bool)] = &[
     // on a send, the key on the event, and the section on `/sync`. What
     // MatrixRTC 2.0 makes `m.rtc.member`.
     ("org.matrix.msc4354", true),
+    // MSC4502's membership look-up, which lk-jwt-service asks as an
+    // application service before it mints a token for a room.
+    ("io.element.msc4502", true),
     // MSC3814's dehydrated devices. Element X checks this flag before it
     // offers to keep room keys across the last device being lost.
     ("org.matrix.msc3814", true),
