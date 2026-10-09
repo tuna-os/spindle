@@ -4526,6 +4526,19 @@ async fn join_remote(
             .rooms
             .join_remote(room_id, &seed_state, &seed_rest, &join, &join_id)
             .map_err(room_error)?;
+        // `send_join` brings state, not history. The history before the
+        // join is a federation gap, which the backfill loop fills in the
+        // background (#461). The join stands whether or not that works.
+        match state
+            .rooms
+            .record_join_gap(room_id, &join, &join_id, server)
+        {
+            Ok(true) => state.backfill.poke(room_id),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, %room_id, %server, "cannot record the history a join left out");
+            }
+        }
         state.rooms.wake_sync_waiters();
         return Ok(Json(json!({ "room_id": room_id })));
     }

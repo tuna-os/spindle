@@ -284,14 +284,30 @@ impl Instance {
 
 /// Poll until `check` returns true or two seconds pass — federation
 /// delivery is asynchronous by design.
-async fn eventually(mut check: impl AsyncFnMut() -> bool) -> bool {
-    for _ in 0..40 {
+async fn eventually(check: impl AsyncFnMut() -> bool) -> bool {
+    eventually_within(40, check).await
+}
+
+/// Poll every 50 ms, up to `polls` times, until `check` returns true.
+async fn eventually_within(polls: u32, mut check: impl AsyncFnMut() -> bool) -> bool {
+    for _ in 0..polls {
         if check().await {
             return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     false
+}
+
+/// Whether `text` reaches the joining member's backward pagination. The
+/// history before a remote join is backfilled in the background (#461).
+/// The loop waits a pacing interval of one second before its first chunk,
+/// so this waits up to fifteen seconds.
+async fn history_arrives(local: &Instance, room: &str, token: &str, text: &str) -> bool {
+    eventually_within(300, async || {
+        local.messages(room, token).await.contains(&text.to_owned())
+    })
+    .await
 }
 
 #[tokio::test]
@@ -390,13 +406,11 @@ async fn a_user_joins_a_room_on_another_server_and_both_sides_converge() {
     assert_eq!(topic["topic"], "the room's real topic");
 
     // `send_join` carries state and auth, but no timeline. The joining
-    // server follows it with backfill so pagination reaches messages from
-    // before the join.
+    // server backfills the history before the join, so pagination reaches
+    // it. Alice's two newer member events are seeded state, and the walk
+    // passes through them to reach the message.
     assert!(
-        local
-            .messages(&room, &bob)
-            .await
-            .contains(&"before".to_owned()),
+        history_arrives(&local, &room, &bob, "before").await,
         "pre-join history is available to the joining member"
     );
 
@@ -447,12 +461,53 @@ async fn version_ten_remote_join_backfills_without_version_substitution() {
     let (status, body) = local.join_via(&room, &bob, &remote.name).await;
     assert_eq!(status, 200, "{body}");
     assert!(
-        local
-            .messages(&room, &bob)
-            .await
-            .contains(&"version ten history".to_owned()),
+        history_arrives(&local, &room, &bob, "version ten history").await,
         "v10 history is verified and stored under v10 rules"
     );
+}
+
+/// The commonest join: an invite, then the join. The join's only
+/// predecessor is the invite, which `send_join` seeds as current state.
+/// The history before the invite is still fetched, in order.
+#[tokio::test]
+async fn a_join_after_an_invite_brings_the_history_before_the_invite() {
+    let remote = Instance::start().await;
+    let local = Instance::start().await;
+    let alice = remote.register("alice").await;
+    let bob = local.register("bob").await;
+
+    let (status, body) = remote
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(&json!({ "preset": "private_chat" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    for text in ["first", "second", "third"] {
+        remote.say(&room, &alice, text).await;
+    }
+    let (status, body) = remote
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/rooms/{room}/invite"),
+            Some(&alice),
+            Some(&json!({ "user_id": format!("@bob:{}", local.name) })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = local.join_via(&room, &bob, &remote.name).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        history_arrives(&local, &room, &bob, "first").await,
+        "the history before the invite reaches the joiner"
+    );
+    // Backward pagination: newest first, with nothing invented between.
+    let history = local.messages(&room, &bob).await;
+    assert_eq!(history, ["third", "second", "first"], "{history:?}");
 }
 
 #[tokio::test]
@@ -850,6 +905,10 @@ async fn join_exchange_and_redact_at(version: &str) {
 
     let (status, body) = local.join_via(&room, &bob, &remote.name).await;
     assert_eq!(status, 200, "v{version}: {body}");
+    assert!(
+        history_arrives(&local, &room, &bob, &before).await,
+        "v{version}: the history before the join is backfilled"
+    );
     let (status, create) = local
         .request(
             reqwest::Method::GET,
