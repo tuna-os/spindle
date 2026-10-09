@@ -71,7 +71,7 @@ and the diff is the work the release brought.
 
 ## Served beyond the spec at this pin
 
-109 routes the pinned spec does not define: MSC surfaces under
+133 routes the pinned spec does not define: MSC surfaces under
 `unstable/`, the admin and MAS-compatibility APIs, and stable spellings
 newer than the pin. Each MSC route must be accounted for in
 `contrib/msc/ledger.toml`; `scripts/msc-ledger.py --check` enforces that.
@@ -94,25 +94,35 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_spindle/admin/v1/audit`
 - `/_spindle/admin/v1/event_reports`
 - `/_spindle/admin/v1/event_reports/{}`
+- `/_spindle/admin/v1/federation/destinations`
+- `/_spindle/admin/v1/federation/destinations/{}`
+- `/_spindle/admin/v1/federation/destinations/{}/reset_connection`
+- `/_spindle/admin/v1/federation/destinations/{}/rooms`
+- `/_spindle/admin/v1/media/{}/{}`
 - `/_spindle/admin/v1/registration_tokens`
 - `/_spindle/admin/v1/registration_tokens/new`
 - `/_spindle/admin/v1/registration_tokens/{}`
 - `/_spindle/admin/v1/rooms`
 - `/_spindle/admin/v1/rooms/{}`
+- `/_spindle/admin/v1/rooms/{}/block`
 - `/_spindle/admin/v1/rooms/{}/make_room_admin`
 - `/_spindle/admin/v1/rooms/{}/members`
 - `/_spindle/admin/v1/rooms/{}/purge_history`
 - `/_spindle/admin/v1/rooms/{}/state`
 - `/_spindle/admin/v1/rooms/{}/state_at`
 - `/_spindle/admin/v1/rooms/{}/timeline`
+- `/_spindle/admin/v1/scheduled_tasks`
 - `/_spindle/admin/v1/send_server_notice`
 - `/_spindle/admin/v1/server_version`
+- `/_spindle/admin/v1/username_available`
 - `/_spindle/admin/v1/users`
 - `/_spindle/admin/v1/users/{}`
+- `/_spindle/admin/v1/users/{}/admin`
 - `/_spindle/admin/v1/users/{}/deactivate`
 - `/_spindle/admin/v1/users/{}/devices`
 - `/_spindle/admin/v1/users/{}/devices/{}`
 - `/_spindle/admin/v1/users/{}/joined_rooms`
+- `/_spindle/admin/v1/users/{}/media`
 - `/_spindle/admin/v1/users/{}/password_hash`
 - `/_spindle/admin/v1/users/{}/reset_link`
 - `/_spindle/admin/v1/users/{}/reset_password`
@@ -122,6 +132,11 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_synapse/admin/v1/deactivate/{}`
 - `/_synapse/admin/v1/event_reports`
 - `/_synapse/admin/v1/event_reports/{}`
+- `/_synapse/admin/v1/federation/destinations`
+- `/_synapse/admin/v1/federation/destinations/{}`
+- `/_synapse/admin/v1/federation/destinations/{}/reset_connection`
+- `/_synapse/admin/v1/federation/destinations/{}/rooms`
+- `/_synapse/admin/v1/media/{}/{}`
 - `/_synapse/admin/v1/purge_history/{}`
 - `/_synapse/admin/v1/register`
 - `/_synapse/admin/v1/registration_tokens`
@@ -130,28 +145,37 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_synapse/admin/v1/reset_password/{}`
 - `/_synapse/admin/v1/rooms`
 - `/_synapse/admin/v1/rooms/{}`
+- `/_synapse/admin/v1/rooms/{}/block`
 - `/_synapse/admin/v1/rooms/{}/make_room_admin`
 - `/_synapse/admin/v1/rooms/{}/members`
 - `/_synapse/admin/v1/rooms/{}/purge_history`
 - `/_synapse/admin/v1/rooms/{}/state`
 - `/_synapse/admin/v1/rooms/{}/state_at`
 - `/_synapse/admin/v1/rooms/{}/timeline`
+- `/_synapse/admin/v1/scheduled_tasks`
 - `/_synapse/admin/v1/send_server_notice`
 - `/_synapse/admin/v1/server_version`
+- `/_synapse/admin/v1/username_available`
 - `/_synapse/admin/v1/users`
 - `/_synapse/admin/v1/users/{}`
+- `/_synapse/admin/v1/users/{}/admin`
 - `/_synapse/admin/v1/users/{}/deactivate`
 - `/_synapse/admin/v1/users/{}/devices`
 - `/_synapse/admin/v1/users/{}/devices/{}`
 - `/_synapse/admin/v1/users/{}/joined_rooms`
+- `/_synapse/admin/v1/users/{}/media`
 - `/_synapse/admin/v1/users/{}/password_hash`
 - `/_synapse/admin/v1/users/{}/reset_link`
 - `/_synapse/admin/v1/users/{}/reset_password`
 - `/_synapse/admin/v1/whois/{}`
+- `/_synapse/admin/v2/rooms/delete_status/{}`
+- `/_synapse/admin/v2/rooms/{}`
+- `/_synapse/admin/v2/rooms/{}/delete_status`
 - `/_synapse/admin/v2/users`
 - `/_synapse/admin/v2/users/{}`
 - `/_synapse/admin/v2/users/{}/delete_devices`
 - `/_synapse/admin/v2/users/{}/devices`
+- `/_synapse/admin/v2/users/{}/devices/{}`
 - `/_synapse/client/rendezvous/{}`
 - `/_synapse/mas/allow_cross_signing_reset`
 - `/_synapse/mas/delete_device`

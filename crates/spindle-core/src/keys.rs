@@ -465,6 +465,11 @@ pub enum Keyspace {
     /// `localpart` -> the account's one-time recovery codes, each as a
     /// salt and the BLAKE3 digest of salt and code; never the codes.
     RecoveryCodes = 0x54,
+    /// `task_id` -> one administrative background task (a room deletion
+    /// started through Synapse's v2 `DELETE /rooms/{roomId}`) and how it
+    /// ended, as `GET /scheduled_tasks` reports it. Numbered from 0x58 to
+    /// leave 0x55.. to the built-in provider's keyspaces.
+    AdminTask = 0x58,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -559,6 +564,20 @@ pub fn event_report(seq: u64) -> Vec<u8> {
 #[must_use]
 pub fn event_reports_prefix() -> Vec<u8> {
     vec![KEY_SCHEMA_VERSION, Keyspace::EventReport as u8]
+}
+
+/// One administrative background task.
+#[must_use]
+pub fn admin_task(task_id: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::AdminTask as u8];
+    key.extend_from_slice(task_id.as_bytes());
+    key
+}
+
+/// Every administrative background task.
+#[must_use]
+pub fn admin_tasks_prefix() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::AdminTask as u8]
 }
 
 /// One dynamically registered OAuth 2.0 client.

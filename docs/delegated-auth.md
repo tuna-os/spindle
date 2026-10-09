@@ -33,9 +33,18 @@ With `[auth.delegated]` configured:
   device scope. Element Admin needs this access. This permission
   stays on the token and does not set the account's permanent `admin`
   flag. A token without a device cannot use device-dependent client
-  endpoints. Spindle accepts stable `urn:matrix:client:*` scopes and
-  scope names from MSC2967. The `urn:mas:admin` scope alone does not
-  grant access to Spindle's admin API.
+  endpoints. It can still call `/whoami`, read profiles, and read
+  media, which is what Element Admin needs to show users and avatars.
+  Spindle accepts stable `urn:matrix:client:*` scopes and scope names
+  from MSC2967. The `urn:mas:admin` scope alone does not grant access
+  to Spindle's admin API.
+- Element Admin 0.1.12 sends these requests to the homeserver: the
+  room list, room details, members, room deletion (v2) with its
+  `scheduled_tasks` status, federation destinations, and the server
+  version. It sends all user, session, email, and registration-token
+  requests to MAS. `crates/spindle-server/tests/element_admin.rs`
+  replays the homeserver requests and checks each response against
+  the schema that the console uses.
 - The `/_synapse/mas/*` provisioning surface opens (only with
   `homeserver_secret` set, and only to its holder): MAS uses it to
   create users, manage devices, set display names, and deactivate
