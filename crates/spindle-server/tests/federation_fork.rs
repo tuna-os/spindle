@@ -32,6 +32,9 @@
 //! time it was checked it failed -- the read answered with the linearly
 //! previous entry's state, which after a fork is one branch's.
 
+#[path = "support/federation_auth.rs"]
+mod federation_auth;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -234,6 +237,7 @@ struct Harness {
     _dir: TempDir,
     app: axum::Router,
     metrics: Arc<Metrics>,
+    store: Arc<FjallStore>,
 }
 
 impl Harness {
@@ -246,12 +250,13 @@ impl Harness {
         )
         .unwrap();
         let metrics = Arc::new(Metrics::new());
-        let app = spindle_server::app_with_metrics(config, store, Arc::clone(&metrics))
+        let app = spindle_server::app_with_metrics(config, store.clone(), Arc::clone(&metrics))
             .expect("the app builds");
         Self {
             _dir: dir,
             app,
             metrics,
+            store,
         }
     }
 
@@ -556,17 +561,20 @@ impl Harness {
         assert_eq!(status, StatusCode::OK, "the invite was refused: {body}");
 
         let head = self.head_event(&room, &alice).await;
-        let join = peer.event(json!({
-            "type": "m.room.member",
-            "state_key": peer.user(),
-            "sender": peer.user(),
-            "room_id": room,
-            "content": { "membership": "join" },
-            "origin_server_ts": now_millis(),
-            "depth": 10,
-            "prev_events": [head],
-            "auth_events": [],
-        }));
+        let join = peer.event(federation_auth::with_auth_events(
+            &self.store,
+            json!({
+                "type": "m.room.member",
+                "state_key": peer.user(),
+                "sender": peer.user(),
+                "room_id": room,
+                "content": { "membership": "join" },
+                "origin_server_ts": now_millis(),
+                "depth": 10,
+                "prev_events": [head],
+                "auth_events": [],
+            }),
+        ));
         self.inject(peer, "join", join).await;
 
         // The peer needs power to write state, or every state PDU below is
@@ -594,6 +602,7 @@ impl Harness {
 
     /// A state PDU from the peer that names `stale` as its only parent.
     fn stale_state(
+        &self,
         peer: &Peer,
         room: &str,
         stale: &str,
@@ -601,31 +610,37 @@ impl Harness {
         state_key: &str,
         content: &Value,
     ) -> Value {
-        peer.event(json!({
-            "type": event_type,
-            "state_key": state_key,
-            "sender": peer.user(),
-            "room_id": room,
-            "content": content,
-            "origin_server_ts": now_millis(),
-            "depth": 11,
-            "prev_events": [stale],
-            "auth_events": [],
-        }))
+        peer.event(federation_auth::with_auth_events(
+            &self.store,
+            json!({
+                "type": event_type,
+                "state_key": state_key,
+                "sender": peer.user(),
+                "room_id": room,
+                "content": content,
+                "origin_server_ts": now_millis(),
+                "depth": 11,
+                "prev_events": [stale],
+                "auth_events": [],
+            }),
+        ))
     }
 
     /// A message PDU from the peer that names `stale` as its only parent.
-    fn stale_message(peer: &Peer, room: &str, stale: &str, text: &str) -> Value {
-        peer.event(json!({
-            "type": "m.room.message",
-            "sender": peer.user(),
-            "room_id": room,
-            "content": { "msgtype": "m.text", "body": text },
-            "origin_server_ts": now_millis(),
-            "depth": 11,
-            "prev_events": [stale],
-            "auth_events": [],
-        }))
+    fn stale_message(&self, peer: &Peer, room: &str, stale: &str, text: &str) -> Value {
+        peer.event(federation_auth::with_auth_events(
+            &self.store,
+            json!({
+                "type": "m.room.message",
+                "sender": peer.user(),
+                "room_id": room,
+                "content": { "msgtype": "m.text", "body": text },
+                "origin_server_ts": now_millis(),
+                "depth": 11,
+                "prev_events": [stale],
+                "auth_events": [],
+            }),
+        ))
     }
 }
 
@@ -650,7 +665,7 @@ async fn a_fork_of_two_messages_costs_no_resolution() {
     // Our branch.
     assert_eq!(harness.say(&room, &alice, "ours").await, StatusCode::OK);
     // Theirs, naming the head as it was before ours — the fork.
-    let pdu = Harness::stale_message(&peer, &room, &fork_point, "theirs");
+    let pdu = harness.stale_message(&peer, &room, &fork_point, "theirs");
     harness.inject(&peer, "fork1", pdu).await;
 
     // The merge: one more local append, naming both extremities.
@@ -685,17 +700,16 @@ async fn a_fork_of_two_messages_costs_no_resolution() {
     }
 }
 
-/// Each branch writes a state slot the other never held: SPEC §9.2 case 2.
+/// Each branch writes a state slot the other never held.
 ///
-/// This is the fork the whole design rests on — the one Spindle claims to
-/// merge without running state resolution, and the one
-/// `state_res_comparison` benchmarks. Here it arrives over the wire.
+/// A value and an absent slot disagree under Matrix's rules. Both writes
+/// must survive the room-version resolver and the room must stay writable.
 #[tokio::test]
 #[allow(
     clippy::await_holding_lock,
     reason = "serializing the tests is the job"
 )]
-async fn a_fork_on_slots_neither_branch_held_merges_without_resolution() {
+async fn a_fork_on_new_slots_uses_room_version_resolution() {
     let _guard = COUNTERS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -711,7 +725,7 @@ async fn a_fork_on_slots_neither_branch_held_merges_without_resolution() {
             .await,
         StatusCode::OK
     );
-    let pdu = Harness::stale_state(
+    let pdu = harness.stale_state(
         &peer,
         &room,
         &fork_point,
@@ -725,8 +739,8 @@ async fn a_fork_on_slots_neither_branch_held_merges_without_resolution() {
     assert_eq!(harness.say(&room, &alice, "after").await, StatusCode::OK);
     let delta = Cases::read(&harness.metrics).since(before);
     assert_eq!(
-        delta.contested, 0,
-        "a disjoint-slot fork took the state-resolution path: {delta:?}"
+        delta.contested, 1,
+        "different parent states must use the room-version resolver: {delta:?}"
     );
 
     // Convergence: the merged state carries *both* branches' writes. Taking
@@ -738,25 +752,9 @@ async fn a_fork_on_slots_neither_branch_held_merges_without_resolution() {
     assert!(state.contains_key("m.room.name/"), "{state:?}");
 }
 
-/// Both branches write the *same* slot: SPEC §9.2 case 3.
-///
-/// This is the expensive case, and today it is not resolved: bounded
-/// resolution exists in `spindle-core` but is not yet wired into ingest
-/// (#16). What the server does instead is the subject of this test.
-///
-/// Before #225 the merge was refused, and because every later local append
-/// named the same two extremities, refused *permanently*: one concurrent
-/// edit from a peer made the room unwritable for every local user, with no
-/// path out. The server must not wedge on a fork it cannot fold. It keeps
-/// authoring on its linear head, sets the contested branch aside for the
-/// resolver, and says so: the case-3 counter moves exactly once for the
-/// fork -- not once per send while it stays open -- because §18.3's target
-/// is meaningless if the expensive path can be taken without being counted,
-/// and equally meaningless if one fork is counted as many.
-///
-/// What must hold either way: the room is not corrupted. Whichever branch
-/// survives, the room still reads a consistent state and still holds one of
-/// the two topics rather than neither.
+/// Both branches write the same slot. The room-version resolver picks
+/// one authorized value and keeps the room writable, while the contested
+/// counter records the merge once. Every read must agree with that result.
 #[tokio::test]
 #[allow(
     clippy::await_holding_lock,
@@ -776,7 +774,7 @@ async fn a_fork_on_the_same_slot_is_counted_once_and_leaves_the_room_writable() 
             .await,
         StatusCode::OK
     );
-    let pdu = Harness::stale_state(
+    let pdu = harness.stale_state(
         &peer,
         &room,
         &fork_point,
@@ -841,9 +839,8 @@ async fn a_fork_on_the_same_slot_is_counted_once_and_leaves_the_room_writable() 
 ///
 /// The same fork as the test above — our branch writes the topic, theirs
 /// writes the name — with one difference: both slots already had a value at
-/// the fork point. Nothing is in conflict either way. Matrix's own state
-/// resolution builds its conflicted set from events that differ from the
-/// base, so a key only one branch moved is unconflicted there too.
+/// the fork point. The parent states disagree on both slots, so Matrix's
+/// resolver examines both candidates and preserves each authorized write.
 ///
 /// `merge_states` used to disagree, because it unioned the parents' *full*
 /// snapshots: the branch that left the topic alone still contributed the old
@@ -887,7 +884,7 @@ async fn a_disjoint_fork_on_preexisting_slots_merges_and_leaves_the_room_writabl
             .await,
         StatusCode::OK
     );
-    let pdu = Harness::stale_state(
+    let pdu = harness.stale_state(
         &peer,
         &room,
         &fork_point,
@@ -903,8 +900,8 @@ async fn a_disjoint_fork_on_preexisting_slots_merges_and_leaves_the_room_writabl
 
     assert_eq!(merged, StatusCode::OK, "the disjoint fork was refused");
     assert_eq!(
-        delta.contested, 0,
-        "a fork with an empty conflicted set took the state-resolution path: {delta:?}"
+        delta.contested, 1,
+        "different parent states must use the room-version resolver: {delta:?}"
     );
 
     // Both branches' writes survived. Taking either parent's state wholesale
@@ -988,7 +985,7 @@ async fn a_fork_on_the_power_levels_is_set_aside_and_the_head_decides_who_may_wr
         .await;
     assert_eq!(status, StatusCode::OK);
     // Theirs, from the same fork point, leaves charlie at zero.
-    let pdu = Harness::stale_state(
+    let pdu = harness.stale_state(
         &peer,
         &room,
         &fork_point,
@@ -1100,7 +1097,7 @@ async fn a_fork_on_one_membership_is_set_aside_and_the_head_is_what_is_enforced(
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     // Theirs, from the fork point: a ban.
-    let pdu = Harness::stale_state(
+    let pdu = harness.stale_state(
         &peer,
         &room,
         &fork_point,
@@ -1218,7 +1215,7 @@ async fn a_disjoint_fork_over_several_slots_merges_and_every_state_read_agrees()
 
     // Theirs: two other slots, the second building on the first, so the
     // peer's branch is two events deep like ours.
-    let pdu = Harness::stale_state(
+    let pdu = harness.stale_state(
         &peer,
         &room,
         &fork_point,
@@ -1227,7 +1224,7 @@ async fn a_disjoint_fork_over_several_slots_merges_and_every_state_read_agrees()
         &json!({ "name": "theirs" }),
     );
     let their_name = injected_id(&harness.inject(&peer, "multi_name", pdu).await);
-    let pdu = Harness::stale_state(
+    let pdu = harness.stale_state(
         &peer,
         &room,
         &their_name,
@@ -1243,8 +1240,8 @@ async fn a_disjoint_fork_over_several_slots_merges_and_every_state_read_agrees()
 
     assert_eq!(merged, StatusCode::OK, "the disjoint fork was refused");
     assert_eq!(
-        delta.contested, 0,
-        "a disjoint fork took the state-resolution path: {delta:?}"
+        delta.contested, 1,
+        "different parent states must use the room-version resolver: {delta:?}"
     );
 
     // All four writes survived, each as the event that made it.
@@ -1306,7 +1303,7 @@ async fn a_partition_heals_into_one_state_the_client_and_the_peer_read_alike() {
 
     // Theirs, delivered when the partition heals: a state change and a
     // message on top of it, both unaware of ours.
-    let pdu = Harness::stale_state(
+    let pdu = harness.stale_state(
         &peer,
         &room,
         &partition_point,
@@ -1315,7 +1312,7 @@ async fn a_partition_heals_into_one_state_the_client_and_the_peer_read_alike() {
         &json!({ "name": "theirs" }),
     );
     let their_name = injected_id(&harness.inject(&peer, "heal_name", pdu).await);
-    let pdu = Harness::stale_message(&peer, &room, &their_name, "theirs");
+    let pdu = harness.stale_message(&peer, &room, &their_name, "theirs");
     let their_message = injected_id(&harness.inject(&peer, "heal_message", pdu).await);
 
     // The heal: the next local event names both branches.
@@ -1325,8 +1322,8 @@ async fn a_partition_heals_into_one_state_the_client_and_the_peer_read_alike() {
 
     assert_eq!(merged, StatusCode::OK, "the healed partition was refused");
     assert_eq!(
-        delta.contested, 0,
-        "healing a disjoint partition took the state-resolution path: {delta:?}"
+        delta.contested, 1,
+        "different parent states must use the room-version resolver: {delta:?}"
     );
     let signed = harness.federation_event(&peer, &heal).await;
     let parents: std::collections::BTreeSet<String> = signed["prev_events"]

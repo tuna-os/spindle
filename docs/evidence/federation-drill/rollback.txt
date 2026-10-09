@@ -1,0 +1,16 @@
+deployment.apps "drill-b" deleted from spindle-rehearsal namespace
+pod/drill-b-6b484d5f68-65hgp condition met
+DROP DATABASE
+CREATE DATABASE
+restored: database, media store, key unchanged
+warning: couldn't attach to pod/drill-b-data-op, falling back to streaming logs: unable to upgrade connection: container op not found in pod drill-b-data-op_spindle-rehearsal
+restored: database, media store, key unchanged
+pod "drill-b-data-op" deleted from spindle-rehearsal namespace
+configmap/drill-front unchanged
+service/drill-a unchanged
+service/drill-b unchanged
+persistentvolumeclaim/drill-b-data unchanged
+configmap/drill-b-config unchanged
+deployment.apps/drill-b created
+Waiting for deployment "drill-b" rollout to finish: 0 of 1 updated replicas are available...
+deployment "drill-b" successfully rolled out

@@ -118,6 +118,12 @@ struct Instance {
     _dir: TempDir,
     name: String,
     client: reqwest::Client,
+    #[cfg(feature = "synapse-import")]
+    store: Arc<FjallStore>,
+    #[cfg(feature = "synapse-import")]
+    server: tokio::task::JoinHandle<()>,
+    #[cfg(feature = "synapse-import")]
+    import_proof: Option<spindle_server::import::synapse::notifications::Proof>,
 }
 
 impl Instance {
@@ -131,10 +137,31 @@ impl Instance {
 
     /// `ratelimit` is the `[ratelimit]` section's body.
     async fn start_with_config(allow_loopback: bool, ratelimit: &str) -> Instance {
+        Self::start_with_push(allow_loopback, ratelimit, true).await
+    }
+
+    async fn start_with_push(
+        allow_loopback: bool,
+        ratelimit: &str,
+        push_enabled: bool,
+    ) -> Instance {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        #[cfg(feature = "synapse-import")]
+        let import_proof = if push_enabled {
+            None
+        } else {
+            spindle_server::import::synapse::notifications::begin(
+                &store,
+                "push-delivery-fixture",
+                None,
+                false,
+                false,
+            )
+            .unwrap()
+        };
         let allow = if allow_loopback {
             "allow_internal = [\"127.0.0.0/8\"]\n"
         } else {
@@ -142,18 +169,52 @@ impl Instance {
         };
         let config = spindle_server::Config::parse(&format!(
             "[server]\nname = \"{name}\"\n[ratelimit]\n{ratelimit}\
-             [federation]\nretry_base_ms = 25\n[push]\n{allow}"
+             [federation]\nretry_base_ms = 25\n[push]\nenabled = {push_enabled}\n{allow}"
         ))
         .unwrap();
-        let app = spindle_server::app(config, store).expect("the app builds");
-        tokio::spawn(async move {
+        let app = spindle_server::app(config, Arc::clone(&store)).expect("the app builds");
+        let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
+        #[cfg(not(feature = "synapse-import"))]
+        drop(server);
         Instance {
             _dir: dir,
             name,
             client: reqwest::Client::new(),
+            #[cfg(feature = "synapse-import")]
+            store,
+            #[cfg(feature = "synapse-import")]
+            server,
+            #[cfg(feature = "synapse-import")]
+            import_proof,
         }
+    }
+
+    #[cfg(feature = "synapse-import")]
+    async fn finish_import_and_enable_push(&mut self) -> u64 {
+        self.server.abort();
+        let _ = (&mut self.server).await;
+        let rooms = spindle_server::rooms::Rooms::new(Arc::clone(&self.store), &self.name);
+        let boundary = rooms.stream_position();
+        let done = spindle_server::import::synapse::notifications::complete(
+            &self.store,
+            self.import_proof.as_ref().unwrap(),
+            boundary,
+        )
+        .unwrap();
+        spindle_server::import::synapse::notifications::validate(&self.store, &done).unwrap();
+        self.import_proof = Some(done);
+        drop(rooms);
+        let listener = tokio::net::TcpListener::bind(&self.name).await.unwrap();
+        let config = spindle_server::Config::parse(&format!(
+            "[server]\nname = {:?}\n[ratelimit]\nenabled = false\n[push]\nallow_internal = [\"127.0.0.0/8\"]\n", self.name,
+        )).unwrap();
+        let app = spindle_server::app(config, Arc::clone(&self.store)).unwrap();
+        self.server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        boundary
     }
 
     async fn request(
@@ -471,9 +532,9 @@ async fn a_ring_reaches_who_it_mentions_at_high_priority_and_a_decline_reaches_n
     tokio::time::sleep(Duration::from_millis(300)).await;
     let before = gateway.deliveries().len();
 
-    // MSC4075: a ring is routed by `m.mentions`, so the default mention
-    // rule is what makes a fresh account's phone ring -- with a highlight,
-    // which is what makes the gateway wake the device.
+    // MSC4075: a ring is routed by `m.mentions`, through the ring rules
+    // that sit ahead of the mention rules -- with the ring sound, which is
+    // what makes the gateway wake the device and the phone ring.
     let ring = json!({
         "application": {
             "type": "m.call",
@@ -496,7 +557,7 @@ async fn a_ring_reaches_who_it_mentions_at_high_priority_and_a_decline_reaches_n
     let devices = notification["devices"].as_array().unwrap();
     assert_eq!(devices.len(), 1);
     assert_eq!(devices[0]["pushkey"], "bobkey");
-    assert_eq!(devices[0]["tweaks"]["highlight"], true);
+    assert_eq!(devices[0]["tweaks"]["sound"], "ring", "{notification}");
     // Carol was not mentioned: her phone stays quiet.
     gateway.settle(before + 1).await;
 
@@ -678,4 +739,32 @@ async fn a_disabled_pusher_receives_nothing() {
         "and now they are"
     );
     gateway.settle(2).await;
+}
+
+#[cfg(feature = "synapse-import")]
+#[tokio::test]
+async fn fresh_import_boundary_skips_historical_pushes_but_delivers_next_live_message() {
+    let (gateway, url) = Gateway::serve().await;
+    let mut hs = Instance::start_with_push(true, "enabled = false\n", false).await;
+    let (alice, _) = hs.register("migration-alice").await;
+    let (bob, bob_id) = hs.register("migration-bob").await;
+    let (status, body) = hs.set_pusher(&bob, "bobkey", json!({"url": url})).await;
+    assert_eq!(status, 200, "{body}");
+    let room = hs.create_room(&alice, &[&bob_id]).await;
+    hs.join(&bob, &room).await;
+    let historical = hs.say(&alice, &room, "imported historical message").await;
+    gateway.settle(0).await;
+    let boundary = hs.finish_import_and_enable_push().await;
+    assert!(boundary > 0);
+    gateway.settle(0).await;
+    let live = hs.say(&alice, &room, "new live message").await;
+    let deliveries = gateway.wait_for(1).await;
+    assert_eq!(deliveries[0]["notification"]["event_id"], live);
+    assert_ne!(deliveries[0]["notification"]["event_id"], historical);
+    gateway.settle(1).await;
+    spindle_server::import::synapse::notifications::validate(
+        &hs.store,
+        hs.import_proof.as_ref().unwrap(),
+    )
+    .unwrap();
 }

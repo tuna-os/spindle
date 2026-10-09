@@ -21,12 +21,13 @@ use axum::extract::ConnectInfo;
 use std::net::SocketAddr;
 
 use crate::accounts::{AccountError, Accounts};
-use crate::auth::Authenticated;
+use crate::auth::{AccountAuthenticated, Authenticated};
 use crate::errors::MatrixError;
 use crate::inbound::{
     FederationStateQuery, federation_origin, join_candidates, merge_returned_signatures,
     sign_membership_template,
 };
+use crate::metrics::LoginResult;
 use crate::ratelimit::{FAILED_LOGIN_PER_ACCOUNT, FAILED_LOGIN_PER_SOURCE, REGISTER_PER_SOURCE};
 use crate::rooms::ReadScope;
 use crate::{AppState, surface};
@@ -66,6 +67,11 @@ pub const MOUNTED: &[&str] = &[
     "/_spindle/rtc/livekit/sfu/get",
     "/_matrix/client/unstable/org.matrix.msc4140/delayed_events",
     "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}",
+    "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}",
+    "/_matrix/client/unstable/org.matrix.msc4140/rooms/{room_id}/delayed_event/{event_type}/{txn_id}",
+    "/_matrix/client/v3/rooms/{room_id}/delayed_event/{event_type}/{txn_id}",
+    "/_matrix/client/v1/delayed_events/{delay_id}",
+    "/_matrix/client/v1/delayed_events/{delay_id}/{action}",
     "/_matrix/client/v3/rooms/{room_id}/state",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}",
     "/_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}",
@@ -109,19 +115,34 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::presence_routes::routes())
         .merge(room_routes())
         .merge(timeline_routes())
-        .merge(media_routes())
+        .merge(delayed_routes())
+        .merge(media_routes(state.media.max_upload_bytes()))
         .merge(discovery_routes())
         .merge(federation_read_routes())
         .merge(crate::mas::routes())
         .merge(crate::admin::routes())
+        .merge(crate::admin_tasks::routes())
+        .merge(crate::admin_federation::routes())
+        .merge(crate::admin_media::routes())
         .merge(crate::oidc::routes())
+        .merge(crate::account::routes())
+        .merge(crate::email::routes())
+        .merge(crate::recovery::routes())
         .merge(crate::openid::routes())
+        .merge(crate::rendezvous::routes())
         .merge(crate::livekit::routes())
+        .merge(crate::appservice_proxy::routes())
         // SPEC: an endpoint the server does not recognize answers 404
         // M_UNRECOGNIZED — a JSON verdict, not a bare status. Clients (and
         // Complement's TestUnknownEndpoints) read the errcode to tell "this
         // server does not speak that" from "the thing was not found".
-        .fallback(unknown_endpoint)
+        // …unless an application service has claimed the path (MSC4512),
+        // in which case it is forwarded there.
+        .fallback(crate::appservice_proxy::proxy_or_unknown)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            federation_gate,
+        ))
         .layer(axum::middleware::from_fn(cors))
         .layer(axum::middleware::from_fn_with_state(state.clone(), observe))
         .with_state(state);
@@ -207,11 +228,16 @@ async fn observe(
         next.run(request).instrument(span.clone()).await
     };
     span.record("http.response.status_code", response.status().as_u16());
+    let long_poll = response
+        .extensions()
+        .get::<crate::metrics::LongPoll>()
+        .is_some();
     state.metrics.observe_request(
         &route,
         &method,
         response.status().as_u16(),
         started.elapsed(),
+        long_poll,
     );
     response
 }
@@ -246,13 +272,33 @@ async fn cors(
     );
     headers.insert(
         "access-control-allow-headers",
-        axum::http::HeaderValue::from_static("X-Requested-With, Content-Type, Authorization"),
+        axum::http::HeaderValue::from_static(
+            "X-Requested-With, Content-Type, Authorization, If-Match, If-None-Match",
+        ),
     );
     response
 }
 
 /// Any `/_matrix` path no route above claimed.
-async fn unknown_endpoint() -> MatrixError {
+/// Answer the server-server API as unknown when `[federation] enabled` is
+/// off. A server that does not federate has no federation surface: nothing
+/// on the network can ask it to sign, join or serve anything as its
+/// `server_name`.
+async fn federation_gate(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = request.uri().path();
+    if !state.config.federation.enabled
+        && (path.starts_with("/_matrix/federation/") || path.starts_with("/_matrix/key/"))
+    {
+        return unknown_endpoint().into_response();
+    }
+    next.run(request).await
+}
+
+fn unknown_endpoint() -> MatrixError {
     MatrixError::new(
         StatusCode::NOT_FOUND,
         "M_UNRECOGNIZED",
@@ -608,6 +654,47 @@ fn room_routes() -> Router<AppState> {
         )
 }
 
+/// MSC4140's delayed events: scheduling, lookup and management, under the
+/// stable paths the merged MSC names and the unstable ones shipping clients
+/// call.
+fn delayed_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc4140/delayed_events",
+            get(delayed_events),
+        )
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}",
+            post(delayed_event_action).get(delayed_event_lookup),
+        )
+        // MSC4140 as merged: scheduling through an endpoint of its own, and
+        // the stable management and lookup paths, beside the unstable ones
+        // shipping clients call.
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc4140/rooms/{room_id}/delayed_event/{event_type}/{txn_id}",
+            axum::routing::put(delayed_event_put_unstable),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/delayed_event/{event_type}/{txn_id}",
+            axum::routing::put(delayed_event_put_stable),
+        )
+        .route(
+            "/_matrix/client/v1/delayed_events/{delay_id}",
+            get(delayed_event_lookup),
+        )
+        .route(
+            "/_matrix/client/v1/delayed_events/{delay_id}/{action}",
+            post(delayed_event_action_stable),
+        )
+        // The current MSC4140 shape: the action in the path and no access
+        // token, so a delegate (lk-jwt-service) can keep a leave event
+        // pending, or send it, for a client that has gone away.
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}",
+            post(delayed_event_action_by_id),
+        )
+}
+
 /// Everything that reads or writes a room's log, and its state.
 fn timeline_routes() -> Router<AppState> {
     Router::new()
@@ -675,14 +762,6 @@ fn timeline_routes() -> Router<AppState> {
             "/_matrix/client/unstable/org.matrix.msc4143/rtc/transports",
             get(rtc_transports_endpoint),
         )
-        .route(
-            "/_matrix/client/unstable/org.matrix.msc4140/delayed_events",
-            get(delayed_events),
-        )
-        .route(
-            "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}",
-            post(delayed_event_action),
-        )
         .route("/_matrix/client/v3/rooms/{room_id}/state", get(room_state))
         // Two routes, because the spec has two forms and a router cannot
         // match an empty trailing segment: `/state/m.room.topic` means the
@@ -721,7 +800,7 @@ fn timeline_routes() -> Router<AppState> {
 /// authenticated endpoints exist to impose. A client old enough to need them
 /// gets a 404, which is the truthful answer for a surface this server does not
 /// offer.
-fn media_routes() -> Router<AppState> {
+fn media_routes(max_upload_bytes: usize) -> Router<AppState> {
     Router::new()
         .route(
             "/_matrix/media/v3/upload",
@@ -729,7 +808,7 @@ fn media_routes() -> Router<AppState> {
                 // Axum's default body limit is 2 MiB, which would reject an
                 // upload before the handler ever saw it -- with a bare 413 and
                 // no Matrix error code. The server would then be advertising a
-                // 50 MiB limit in `/config` and enforcing 2 MiB, which is the
+                // configured limit in `/config` and enforcing 2 MiB, which is the
                 // worst kind of disagreement: the client is told the file is
                 // fine, sends it, and gets an opaque failure.
                 //
@@ -737,14 +816,14 @@ fn media_routes() -> Router<AppState> {
                 // `Media::put` is the thing that refuses, and refuses with
                 // `M_TOO_LARGE`.
                 .layer(axum::extract::DefaultBodyLimit::max(
-                    crate::media::MAX_UPLOAD + 1,
+                    max_upload_bytes.saturating_add(1),
                 )),
         )
         .route("/_matrix/media/v1/create", post(create_media))
         .route(
             "/_matrix/media/v3/upload/{server_name}/{media_id}",
             axum::routing::put(upload_reserved_media).layer(axum::extract::DefaultBodyLimit::max(
-                crate::media::MAX_UPLOAD + 1,
+                max_upload_bytes.saturating_add(1),
             )),
         )
         .route("/_matrix/media/v3/config", get(media_config))
@@ -844,16 +923,16 @@ async fn preview_url(
 }
 
 /// `GET /_matrix/media/v3/config` and its `/client/v1` twin.
-async fn media_config(State(_state): State<AppState>) -> Json<Value> {
+async fn media_config(State(state): State<AppState>) -> Json<Value> {
     // Stated rather than discovered: a client that knows the limit can refuse
     // a file before spending a minute sending it.
-    Json(json!({ "m.upload.size": crate::media::MAX_UPLOAD }))
+    Json(json!({ "m.upload.size": state.media.max_upload_bytes() }))
 }
 
 /// `GET /_matrix/client/v1/media/download/{server_name}/{media_id}`
 async fn download_media(
     State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
+    AccountAuthenticated(identity): AccountAuthenticated,
     axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
 ) -> Result<axum::response::Response, MatrixError> {
     serve_media(&state, &identity, &server_name, &media_id).await
@@ -867,7 +946,7 @@ async fn download_media(
 /// `.exe` in someone's downloads folder.
 async fn download_media_named(
     State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
+    AccountAuthenticated(identity): AccountAuthenticated,
     axum::extract::Path((server_name, media_id, _file_name)): axum::extract::Path<(
         String,
         String,
@@ -1094,10 +1173,12 @@ struct ThumbnailQuery {
 /// `GET /_matrix/client/v1/media/thumbnail/{server_name}/{media_id}`
 ///
 /// Authenticated, and open to any account holding the URI, for the reason
-/// [`serve_media`] gives (ADR 0003).
+/// [`serve_media`] gives (ADR 0003). An account-level session is enough —
+/// Element Admin's device-less admin token renders avatars through this —
+/// since reading media acts on no device.
 async fn thumbnail_media(
     State(state): State<AppState>,
-    Authenticated(_identity): Authenticated,
+    AccountAuthenticated(_identity): AccountAuthenticated,
     axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
     axum::extract::Query(query): axum::extract::Query<ThumbnailQuery>,
 ) -> Result<axum::response::Response, MatrixError> {
@@ -1320,8 +1401,14 @@ async fn versions() -> Json<Value> {
 /// treats a missing capability as "unknown, assume the default", whereas an
 /// empty `available` map is a positive claim that no room version works. Until
 /// rooms exist (#7) the honest thing is to say nothing, not to say none.
-async fn capabilities() -> Json<Value> {
+async fn capabilities(State(state): State<AppState>) -> Json<Value> {
     let mut capabilities = serde_json::Map::new();
+    // MSC4140: both limits, which the server must enforce and so must
+    // state, under the stable name and the unstable one clients read today.
+    let (max_delay_ms, max_scheduled) = state.delayed.limits();
+    let delayed = json!({ "max_delay_ms": max_delay_ms, "max_scheduled": max_scheduled });
+    capabilities.insert("m.delayed_events".to_owned(), delayed.clone());
+    capabilities.insert("org.matrix.msc4140.delayed_events".to_owned(), delayed);
     if let Some(default) = surface::DEFAULT_ROOM_VERSION {
         let available: serde_json::Map<String, Value> = surface::ROOM_VERSIONS
             .iter()
@@ -1389,10 +1476,11 @@ async fn well_known_client(
             "account": format!("{}/account", delegated.issuer().trim_end_matches('/')),
         });
     } else if state.oidc.is_some() {
-        // The built-in provider is its own issuer; there is no account
-        // management UI to point at, so none is advertised.
+        // The built-in provider is its own issuer, and serves its own
+        // account pages (#607).
         body["org.matrix.msc2965.authentication"] = json!({
             "issuer": format!("{}/", crate::oidc::issuer(&state)),
+            "account": crate::account::management_uri(&state),
         });
     }
     // MSC4143 (which absorbed MSC4158): the MatrixRTC backend, named here
@@ -1449,16 +1537,27 @@ async fn well_known_server(
 }
 
 /// Liveness: the process is up.
+///
+/// Takes no state and no lock -- not the room registry, not a room --
+/// and must stay that way: it answers whenever a worker can poll it, and
+/// #614 is about making sure one always can, by keeping room work off the
+/// async workers. A liveness answer that waited on the work it is meant
+/// to see past would get a busy server killed.
 async fn health() -> StatusCode {
     StatusCode::OK
 }
 
 /// Readiness: the process can serve.
 ///
-/// Currently the same answer as liveness, which is honest only because nothing
-/// is initialised asynchronously yet. When storage opens here, this has to stop
-/// reporting ready before it is — a readiness probe that lies is worse than no
-/// readiness probe, because it takes traffic on the strength of the lie.
+/// Storage is open, the stream counters resumed and the signing key loaded
+/// before the listener accepts anything, so by the time this can answer at
+/// all the server can serve every request. It does **not** wait for the
+/// startup room warm-up (`spawn_room_warmup`): a room of a million events
+/// takes minutes to load, and holding a single-replica deployment out of
+/// rotation for that long is an outage bought to avoid a slow first
+/// request. A room not yet warm is loaded by the request that needs it,
+/// off the async workers. A readiness probe that lies is worse than none
+/// -- this one claims only what is true.
 async fn ready() -> StatusCode {
     StatusCode::OK
 }
@@ -1643,6 +1742,7 @@ async fn login(
         (&source_key, FAILED_LOGIN_PER_SOURCE),
     ] {
         if let Err(retry) = state.limiter.check(key, limit) {
+            record_password_login(&state, LoginResult::RateLimited);
             return Err(MatrixError::limit_exceeded(retry.as_millis()));
         }
     }
@@ -1651,12 +1751,17 @@ async fn login(
     // One message for a wrong password and for an unknown user. The
     // verification cost is already equal (see `verify_password`); saying
     // "no such user" here would give the difference back for free.
-    if !accounts
+    let verified = accounts
         .verify_password(&localpart, password)
-        .map_err(|error| internal(&error))?
-    {
+        .map_err(|error| {
+            record_password_login(&state, LoginResult::Error);
+            internal(&error)
+        })?;
+    if !verified {
+        record_password_login(&state, LoginResult::BadPassword);
         return Err(MatrixError::forbidden("invalid username or password"));
     }
+    record_password_login(&state, LoginResult::Success);
 
     // A correct login is not the traffic being defended against, and counting
     // it would lock out the legitimate users of a busy shared address first.
@@ -1673,6 +1778,12 @@ async fn login(
         .map_err(|error| internal(&error))?;
 
     Ok(Json(session_body(&accounts.user_id(&localpart), &session)))
+}
+
+fn record_password_login(state: &AppState, result: LoginResult) {
+    state
+        .metrics
+        .record_login(crate::metrics::LoginMethod::Password, result);
 }
 
 /// `POST /_matrix/client/v3/refresh`
@@ -2006,15 +2117,22 @@ async fn logout(
         .to_owned();
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     accounts.logout(&token).map_err(|error| internal(&error))?;
+    // Under delegation the token was vouched for by the provider and the
+    // verdict is cached; a logout that left it there would let the token
+    // keep working for the rest of the cache window (#615).
+    if let Some(delegated) = &state.delegated {
+        delegated.forget_token(&token);
+    }
     Ok(Json(json!({})))
 }
 
 /// `GET /_matrix/client/v3/account/whoami`
-async fn whoami(Authenticated(identity): Authenticated) -> Json<Value> {
-    Json(json!({
-        "user_id": identity.user_id,
-        "device_id": identity.device_id,
-    }))
+async fn whoami(AccountAuthenticated(identity): AccountAuthenticated) -> Json<Value> {
+    let mut body = json!({"user_id": identity.user_id});
+    if !identity.device_id.is_empty() {
+        body["device_id"] = json!(identity.device_id);
+    }
+    Json(body)
 }
 
 /// `POST /_matrix/client/v3/logout/all`
@@ -2030,6 +2148,9 @@ async fn logout_all(
     accounts
         .logout_everywhere(&localpart_of(&identity.user_id))
         .map_err(|error| internal(&error))?;
+    if let Some(delegated) = &state.delegated {
+        delegated.forget_user(&identity.user_id);
+    }
     Ok(Json(json!({})))
 }
 
@@ -3119,29 +3240,14 @@ async fn create_room(
             request.preset.as_deref(),
             &request.invite,
             &initial_state,
-            // Honour a version this server advertises; ignore one it does
-            // not. Both halves are deliberate, and they are deliberate for
-            // different reasons.
-            //
-            // Honouring the advertised ones is a correctness fix, not a
-            // feature. `/capabilities` now lists v12 as available, and a
-            // client reads that list precisely so it can ask for something
-            // on it. Handing back v11 with a 200 would be the exact lie
-            // #201 removed from `make_join` -- worse here, because
-            // advertising v12 is what invites the request.
-            //
-            // Ignoring the rest preserves today's behaviour rather than
-            // endorsing it. An unadvertised version is still silently
-            // substituted, which is also a lie, but a pre-existing one:
-            // 30 allowlisted Complement tests create rooms at v7/v8/v9 to
-            // reach knock and restricted-join features and quietly receive
-            // the v11 room that happens to have them. Refusing those is a
-            // scope decision about which versions this server carries --
-            // #178 -- not something to change while fixing v12.
-            request
-                .room_version
-                .as_deref()
-                .filter(|version| crate::surface::supports_room_version(version)),
+            // The version asked for, refused with M_UNSUPPORTED_ROOM_VERSION
+            // when this server does not serve it. This used to substitute
+            // v11 for any unlisted version, which let Complement's v7 knock
+            // and v8 restricted-join tests pass on a room of the wrong
+            // version; with those versions served there is nothing left
+            // that the substitution kept working, and the spec asks for
+            // the refusal.
+            request.room_version.as_deref(),
             request.creation_content.as_ref(),
             request.power_level_content_override.as_ref(),
             &member_profile(&state, &identity.user_id),
@@ -3424,7 +3530,7 @@ async fn delete_profile_field(
 /// event — the propagation the spec asks for, and the step that carries a
 /// renamed user across federation, because member events fan out and
 /// profile rows do not.
-fn propagate_profile(state: &AppState, user_id: &str) -> Result<(), MatrixError> {
+pub(crate) fn propagate_profile(state: &AppState, user_id: &str) -> Result<(), MatrixError> {
     let profile = state
         .profiles
         .get(user_id)
@@ -3618,15 +3724,20 @@ async fn invite_user(
 
     // What comes back must be the same event, co-signature aside — and the
     // reference hash proves it, because signatures are outside the hash.
+    // (A v1/v2 ID is not the hash, so the hash is compared to the hash of
+    // what was sent, and the ID to the ID.)
     let cosigned = response["event"].clone();
-    let same = ruma::CanonicalJsonValue::try_from(cosigned.clone())
-        .ok()
-        .and_then(|value| match value {
-            ruma::CanonicalJsonValue::Object(object) => Some(object),
-            _ => None,
-        })
-        .and_then(|object| spindle_core::version::reference_hash(&object, &version).ok())
-        .is_some_and(|hash| format!("${hash}") == event_id);
+    let object = |value: &Value| match ruma::CanonicalJsonValue::try_from(value.clone()) {
+        Ok(ruma::CanonicalJsonValue::Object(object)) => Some(object),
+        _ => None,
+    };
+    let same = match (object(&cosigned), object(&event)) {
+        (Some(theirs), Some(ours)) => {
+            spindle_core::version::same_event(&theirs, &ours, &version)
+                && spindle_core::version::event_id(&ours, &version).is_ok_and(|id| id == event_id)
+        }
+        _ => false,
+    };
     if !same {
         return Err(MatrixError::new(
             StatusCode::BAD_GATEWAY,
@@ -4572,22 +4683,19 @@ async fn room_members(
     axum::extract::Path(room_id): axum::extract::Path<String>,
     axum::extract::Query(query): axum::extract::Query<MembersQuery>,
 ) -> Result<Json<Value>, MatrixError> {
-    let at = query
-        .at
-        .as_deref()
-        .map(|token| {
-            token
-                .parse::<crate::tokens::Sync>()
-                .map(|token| token.0)
-                .map_err(|error| {
-                    MatrixError::new(
-                        StatusCode::BAD_REQUEST,
-                        "M_INVALID_PARAM",
-                        error.to_string(),
-                    )
-                })
-        })
-        .transpose()?;
+    // A Synapse stream token kept across the migration (Element Web keeps
+    // its sync accumulator's tokens) asks about a point this server cannot
+    // place; the members as they are now is the honest nearest answer, and
+    // a 400 would leave the room's member list empty (#568).
+    let at = crate::tokens::Sync::resume(query.at.as_deref())
+        .map_err(|error| {
+            MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                error.to_string(),
+            )
+        })?
+        .position();
     let reader = state
         .rooms
         .reader(&identity.user_id, &room_id)
@@ -4632,7 +4740,30 @@ async fn room_joined_members(
         .rooms
         .may_read(&identity.user_id, &room_id)
         .map_err(room_error)?;
-    let members = state.rooms.joined_members(&room_id).map_err(room_error)?;
+    let members = if state.rooms.erasure_active().map_err(room_error)? {
+        state
+            .rooms
+            .reader(&identity.user_id, &room_id)
+            .map_err(room_error)?
+            .members()
+            .map_err(room_error)?
+            .into_iter()
+            .filter(|event| event["content"]["membership"] == "join")
+            .filter_map(|event| {
+                event["state_key"].as_str().map(|user| {
+                    (
+                        user.to_owned(),
+                        json!({
+                            "display_name": event["content"]["displayname"],
+                            "avatar_url": event["content"]["avatar_url"]
+                        }),
+                    )
+                })
+            })
+            .collect()
+    } else {
+        state.rooms.joined_members(&room_id).map_err(room_error)?
+    };
     Ok(Json(json!({ "joined": members })))
 }
 
@@ -4687,9 +4818,29 @@ struct SyncQuery {
 }
 
 impl SyncQuery {
-    /// Whether to label the state block `state_after` (MSC4222).
+    /// Whether to send the state after the timeline (MSC4222).
     fn state_after(&self) -> bool {
-        self.use_state_after.or(self.unstable_use_state_after) == Some(true)
+        self.state_label() != "state"
+    }
+
+    /// The key the joined room's state block goes under.
+    ///
+    /// The response field is spelled the way the request flag was. A
+    /// client that asked with the unstable flag reads only the unstable
+    /// field: matrix-js-sdk, and so Element Web, sends
+    /// `org.matrix.msc4222.use_state_after=true` on every sync and reads
+    /// `org.matrix.msc4222.state_after`, falling back to `state`. Answering
+    /// it with the stable `state_after` left it with no state at all: every
+    /// room read as version 1, unnamed, and unencrypted, so its composer
+    /// offered to send in plaintext into an encrypted room.
+    fn state_label(&self) -> &'static str {
+        if self.use_state_after == Some(true) {
+            "state_after"
+        } else if self.use_state_after.is_none() && self.unstable_use_state_after == Some(true) {
+            "org.matrix.msc4222.state_after"
+        } else {
+            "state"
+        }
     }
 }
 
@@ -5043,7 +5194,10 @@ fn ruleset_of(state: &AppState, user_id: &str) -> Result<Value, MatrixError> {
         .account_data
         .get(user_id, "", crate::push_rules::TYPE)
         .map_err(|error| account_data_error(&error))?
-        .unwrap_or_else(|| crate::push_rules::defaults(user_id)))
+        .map_or_else(
+            || crate::push_rules::defaults(user_id),
+            |stored| crate::push_rules::with_defaults(stored, user_id),
+        ))
 }
 
 fn save_ruleset(state: &AppState, user_id: &str, ruleset: &Value) -> Result<(), MatrixError> {
@@ -5443,7 +5597,13 @@ async fn room_summary(
         room_id_or_alias
     };
 
-    let summary = state.rooms.summary(&room_id).map_err(room_error)?;
+    let user_id = viewer
+        .as_ref()
+        .map_or("", |identity| identity.user_id.as_str());
+    let summary = state
+        .rooms
+        .summary_for(user_id, &room_id)
+        .map_err(room_error)?;
     let membership = match viewer {
         Some(identity) => {
             let joined = state.rooms.joined(&identity.user_id).map_err(room_error)?;
@@ -5938,16 +6098,18 @@ async fn key_changes(
     Authenticated(identity): Authenticated,
     axum::extract::Query(query): axum::extract::Query<KeyChangesQuery>,
 ) -> Result<Json<Value>, MatrixError> {
-    let from = query
-        .from
-        .parse::<crate::tokens::Sync>()
-        .map_err(|error| MatrixError::bad_json(error.to_string()))?
-        .0;
-    let to = query
-        .to
-        .parse::<crate::tokens::Sync>()
-        .map_err(|error| MatrixError::bad_json(error.to_string()))?
-        .0;
+    // A Synapse token from before the migration is a point this server
+    // cannot place: as `from` it widens the window to everything, which
+    // costs the client a few key downloads and loses no change; as `to` it
+    // is now (#568).
+    let resume = |token: &str| {
+        crate::tokens::Sync::resume(Some(token))
+            .map_err(|error| MatrixError::bad_json(error.to_string()))
+    };
+    let from = resume(&query.from)?.position().unwrap_or(0);
+    let to = resume(&query.to)?
+        .position()
+        .unwrap_or_else(|| state.rooms.stream_position());
     let changed = visible_device_changes(&state, &identity, from, to)?;
     Ok(Json(json!({ "changed": changed, "left": [] })))
 }
@@ -6541,41 +6703,172 @@ struct SlidingQuery {
     timeout: Option<u64>,
 }
 
+/// The stream position a sliding sync `pos` names.
+///
+/// A `pos` this server did not mint -- the one a client kept from the
+/// homeserver this one replaced -- is MSC4186's `M_UNKNOWN_POS`: the answer
+/// a client is built to handle, by dropping the position and starting the
+/// connection over. Anything else (a 400 `M_BAD_JSON`) is an error it
+/// retries with the same `pos`, forever.
+fn sliding_position(
+    identity: &crate::accounts::Identity,
+    pos: Option<&str>,
+) -> Result<Option<u64>, MatrixError> {
+    match crate::tokens::Sync::resume(pos)
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?
+    {
+        crate::tokens::Resume::Foreign => {
+            tracing::info!(
+                user_id = %identity.user_id,
+                "sliding sync pos from another server; answering M_UNKNOWN_POS"
+            );
+            Err(MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_UNKNOWN_POS",
+                "unknown position; start the connection over without `pos`",
+            ))
+        }
+        resume => Ok(resume.position()),
+    }
+}
+
+/// Where a `/sync` resumes from.
+///
+/// A token another homeserver minted (a client that synced against the
+/// server this one replaced) is answered as an initial sync: every room in
+/// full, timelines limited, so the client rebuilds rather than retrying a
+/// position that no longer exists. See `tokens::Resume`.
+fn sync_resume(
+    identity: &crate::accounts::Identity,
+    since: Option<&str>,
+) -> Result<crate::tokens::Resume, MatrixError> {
+    let resume = crate::tokens::Sync::resume(since)
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?;
+    if resume == crate::tokens::Resume::Foreign {
+        tracing::info!(
+            user_id = %identity.user_id,
+            "sync token from another server; answering as an initial sync"
+        );
+    }
+    Ok(resume)
+}
+
 /// `POST /_matrix/client/unstable/org.matrix.simplified_msc3575/sync`
 ///
 /// Stateless (`sliding.rs` explains why): `pos` is a stream position, and the
 /// request carries its lists in full each time. The response sends a room in
 /// full (`initial: true`) on an initial request, and after that only the
 /// rooms the stream says changed — the one scan `changed_rooms` exists for.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the window-growth hotfix grew it past the line; split it with the next sliding change"
+)]
 async fn sliding_sync(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
     axum::extract::Query(query): axum::extract::Query<SlidingQuery>,
     Json(request): Json<crate::sliding::SlidingRequest>,
-) -> Result<Json<Value>, MatrixError> {
-    let since = match query.pos.as_deref() {
-        Some(token) => Some(
-            token
-                .parse::<crate::tokens::Sync>()
-                .map_err(|error| MatrixError::bad_json(error.to_string()))?
-                .0,
-        ),
-        None => None,
+) -> Result<axum::response::Response, MatrixError> {
+    let (stream_pos, previous_windows) = match query.pos.as_deref() {
+        Some(pos) => {
+            let (stream, windows) = crate::sliding::decode_pos(pos);
+            (Some(stream), windows)
+        }
+        None => (None, None),
     };
+    let since = sliding_position(&identity, stream_pos)?;
     let lists = request.decoded_lists().map_err(MatrixError::bad_json)?;
     let subscriptions = request
         .decoded_subscriptions()
         .map_err(MatrixError::bad_json)?;
 
     let timeout_ms = request.timeout.or(query.timeout).unwrap_or(0).min(60_000);
+    // Timed apart from the rest (#625): a request that may wait its
+    // timeout on purpose is not latency anybody should be paged about.
+    let long_poll = since.is_some() && timeout_ms > 0;
     let position =
         sliding_long_poll(&state, since, timeout_ms, request.extensions.typing.on()).await;
+
+    // Everything below is synchronous room work -- for a cold room, a load
+    // from the store -- so it runs on the blocking pool, not on one of the
+    // handful of async workers the whole server shares (#614).
+    let worker_state = state.clone();
+    crate::blocking::offload(
+        std::sync::Arc::clone(&state.metrics),
+        crate::metrics::BlockingTask::SlidingSync,
+        move || {
+            sliding_answer(
+                &worker_state,
+                &identity,
+                &request,
+                SlidingInputs {
+                    since,
+                    position,
+                    previous_windows: previous_windows.as_ref(),
+                    lists: &lists,
+                    subscriptions: &subscriptions,
+                },
+            )
+        },
+    )
+    .await
+    .map(|body| mark_long_poll(body.into_response(), long_poll))
+}
+
+/// Tag a sync response that was allowed to long-poll, so the request
+/// middleware times it under its own series (#625).
+fn mark_long_poll(
+    mut response: axum::response::Response,
+    long_poll: bool,
+) -> axum::response::Response {
+    if long_poll {
+        response.extensions_mut().insert(crate::metrics::LongPoll);
+    }
+    response
+}
+
+/// How many cold rooms one sliding-sync request loads at once. Bounded:
+/// a load is CPU and I/O on cores the rest of the server shares, and four
+/// is past the two the production pod has.
+const WINDOW_LOAD_PARALLELISM: usize = 4;
+
+/// What [`sliding_answer`] needs beyond the request itself, decoded and
+/// positioned by the handler.
+#[derive(Clone, Copy)]
+struct SlidingInputs<'a> {
+    since: Option<u64>,
+    position: u64,
+    previous_windows: Option<&'a crate::sliding::Windows>,
+    lists: &'a [(String, crate::sliding::ListRequest)],
+    subscriptions: &'a [(String, crate::sliding::RoomSubscription)],
+}
+
+/// The body of a sliding-sync response, assembled synchronously.
+#[allow(clippy::too_many_lines)]
+fn sliding_answer(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    request: &crate::sliding::SlidingRequest,
+    inputs: SlidingInputs<'_>,
+) -> Result<Json<Value>, MatrixError> {
+    let SlidingInputs {
+        since,
+        position,
+        previous_windows,
+        lists,
+        subscriptions,
+    } = inputs;
 
     // The sorted room list: every joined room, newest activity first. The
     // sort is recomputed per request because it is what the ranges index
     // into, and a stale order would make the client's window show the wrong
     // rooms — the exact bug sliding sync exists to avoid.
-    let (ordered, invited) = sliding_room_order(&state, &identity)?;
+    let ordering = std::time::Instant::now();
+    let (ordered, invited) = sliding_room_order(state, identity)?;
+    state
+        .metrics
+        .observe_sync_phase(crate::metrics::SyncPhase::SlidingOrder, ordering.elapsed());
+    let assembling = std::time::Instant::now();
 
     // Every room this request may be answered with. A list window can only
     // produce rooms out of `ordered`, which came from the caller's own
@@ -6621,10 +6914,16 @@ async fn sliding_sync(
     // sent once, with the larger ask.
     let mut wanted: std::collections::HashMap<String, (Vec<(String, String)>, usize)> =
         std::collections::HashMap::new();
-    for (name, list) in &lists {
+    // Rooms in view now that were in no window this `pos` was answered for:
+    // the client has never been sent them, changed or not.
+    let mut newly_in_view: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (name, list) in lists {
         let indices = crate::sliding::indices_in_view(&list.ranges, ordered.len());
         for &index in &indices {
             let room_id = &ordered[index].0;
+            if since.is_some() && !crate::sliding::was_in_view(previous_windows, name, index) {
+                newly_in_view.insert(room_id.clone());
+            }
             let entry = wanted
                 .entry(room_id.clone())
                 .or_insert_with(|| (Vec::new(), 0));
@@ -6633,7 +6932,7 @@ async fn sliding_sync(
         }
         lists_out.insert(name.clone(), json!({ "count": ordered.len() }));
     }
-    for (room_id, subscription) in &subscriptions {
+    for (room_id, subscription) in subscriptions {
         // Silence rather than an error: a client that subscribed to a room it
         // has since left should get a response about its other rooms, not a
         // rejected request -- and a client fishing for a room it was never in
@@ -6653,39 +6952,66 @@ async fn sliding_sync(
     // The rooms in view, whether or not they changed: the room extensions
     // below answer for all of them.
     let in_view: Vec<String> = wanted.keys().cloned().collect();
+    // Every cold room about to be rendered is loaded first, several at once,
+    // rather than one after another as the loop below reaches it: after a
+    // restart a window of twenty cold rooms costs its slowest load, not the
+    // sum of all twenty (#614). Rooms answered silently, and invites (which
+    // have no log here to load), are left alone.
+    let cold: Vec<String> = in_view
+        .iter()
+        .filter(|room_id| {
+            !invited.contains(*room_id)
+                && (changed
+                    .as_ref()
+                    .is_none_or(|changed| changed.contains(*room_id))
+                    || newly_in_view.contains(*room_id))
+                && !state.rooms.is_resident(room_id)
+        })
+        .cloned()
+        .collect();
+    state.rooms.warm_all(&cold, WINDOW_LOAD_PARALLELISM);
     for (room_id, (required_state, timeline_limit)) in wanted {
         // Incrementally, silence about an unchanged room *is* the answer.
+        let newly = newly_in_view.contains(&room_id);
         if let Some(changed) = &changed
             && !changed.contains(&room_id)
+            && !newly
         {
             continue;
         }
         let entry = if invited.contains(&room_id) {
-            sliding_invite_entry(&state, &identity, &room_id)?
+            sliding_invite_entry(state, identity, &room_id)?
         } else {
             sliding_room_entry(
-                &state,
-                &identity,
+                state,
+                identity,
                 &room_id,
                 &required_state,
                 timeline_limit,
-                since.is_none(),
+                since.is_none() || newly,
             )?
         };
         rooms_out.insert(room_id, entry);
     }
 
     let extensions = sliding_extensions(
-        &state,
-        &identity,
+        state,
+        identity,
         &request.extensions,
-        since,
-        position,
+        (since, position),
         &in_view,
+        &newly_in_view,
     )?;
+    state.metrics.observe_sync_phase(
+        crate::metrics::SyncPhase::SlidingAssemble,
+        assembling.elapsed(),
+    );
 
     Ok(Json(json!({
-        "pos": crate::tokens::Sync(position).to_string(),
+        "pos": crate::sliding::encode_pos(
+            &crate::tokens::Sync(position).to_string(),
+            &crate::sliding::windows_of(lists),
+        ),
         "lists": lists_out,
         "rooms": rooms_out,
         "extensions": extensions,
@@ -6724,19 +7050,20 @@ async fn sliding_long_poll(
 
 /// The `extensions` object of a sliding-sync response.
 ///
-/// The room extensions (account data, receipts, typing) answer for every
-/// room in view, changed or not. Stateless as this endpoint is, there is no
-/// record of what a client was last told, and a receipt or a typing change
-/// bumps no stream position; repeating a window's worth is the answer that
+/// The account data and typing extensions answer for every room in view,
+/// changed or not. Stateless as this endpoint is, there is no record of
+/// what a client was last told, and an account-data or typing change bumps
+/// no stream position; repeating a window's worth is the answer that
 /// cannot silently drop one, the same trade classic sync makes for room
-/// account data.
+/// account data. Receipts do bump one (`Rooms::mark_receipt`), so their
+/// extension is incremental: see [`receipts_extension`].
 fn sliding_extensions(
     state: &AppState,
     identity: &crate::accounts::Identity,
     extensions: &crate::sliding::Extensions,
-    since: Option<u64>,
-    position: u64,
+    (since, position): (Option<u64>, u64),
     in_view: &[String],
+    newly_in_view: &std::collections::HashSet<String>,
 ) -> Result<Value, MatrixError> {
     let mut out = serde_json::Map::new();
     if !extensions.any() {
@@ -6764,7 +7091,7 @@ fn sliding_extensions(
     if extensions.receipts.on() {
         out.insert(
             "receipts".to_owned(),
-            receipts_extension(state, identity, in_view)?,
+            receipts_extension(state, identity, in_view, (since, position), newly_in_view)?,
         );
     }
     if extensions.typing.on() {
@@ -6791,15 +7118,11 @@ fn to_device_extension(
     extension: &crate::sliding::ToDeviceExtension,
     position: u64,
 ) -> Result<Value, MatrixError> {
-    let acknowledged = match extension.since.as_deref() {
-        Some(token) => Some(
-            token
-                .parse::<crate::tokens::Sync>()
-                .map_err(|error| MatrixError::bad_json(error.to_string()))?
-                .0,
-        ),
-        None => None,
-    };
+    // Another server's to-device token acknowledges nothing here: every
+    // pending message is delivered, which is the side to err on.
+    let acknowledged = crate::tokens::Sync::resume(extension.since.as_deref())
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?
+        .position();
     let mut events = state
         .devices
         .take_pending(&identity.user_id, &identity.device_id, acknowledged)
@@ -6863,36 +7186,44 @@ fn account_data_extension(
 
 /// The receipts extension: one `m.receipt` event per room in view that has
 /// any, keyed by event then by type then by reader, as the spec shapes it.
-/// A private receipt is shown to its owner and nobody else.
+/// A private receipt (and the `m.fully_read` marker) is shown to its owner
+/// and nobody else. Receipts from other servers are in the same rows.
+///
+/// Incremental once the client has seen a room (#624): with federated
+/// readers a large room holds a receipt per member, and resending every
+/// one of them on every request priced each long-poll at the room's size.
+/// A room the client has not been sent yet -- the first request, or one
+/// newly in a window -- gets the caller's own receipts and the newest
+/// [`crate::receipts::MAX_INITIAL_RECEIPTS`] of everyone else's; after that,
+/// the receipts of readers who moved since `pos`.
 fn receipts_extension(
     state: &AppState,
     identity: &crate::accounts::Identity,
     in_view: &[String],
+    (since, position): (Option<u64>, u64),
+    newly_in_view: &std::collections::HashSet<String>,
 ) -> Result<Value, MatrixError> {
+    let moved = since.map(|since| {
+        state
+            .rooms
+            .receipt_readers_since(in_view.iter().map(String::as_str), since, position)
+    });
     let mut rooms = serde_json::Map::new();
     for room_id in in_view {
-        let mut content: serde_json::Map<String, Value> = serde_json::Map::new();
-        for (user, receipt_type, event_id, ts, thread) in
-            state.rooms.room_receipts(room_id).map_err(room_error)?
-        {
-            if receipt_type == "m.read.private" && user != identity.user_id {
-                continue;
+        let rows = match &moved {
+            Some(moved) if !newly_in_view.contains(room_id) => {
+                let Some(readers) = moved.get(room_id) else {
+                    continue;
+                };
+                readers_receipts(state, room_id, readers)?
             }
-            let mut data = json!({ "ts": ts });
-            if let Some(thread) = thread {
-                data["thread_id"] = json!(thread);
-            }
-            content
-                .entry(event_id)
-                .or_insert_with(|| json!({}))
-                .as_object_mut()
-                .expect("inserted as an object")
-                .entry(receipt_type)
-                .or_insert_with(|| json!({}))
-                .as_object_mut()
-                .expect("inserted as an object")
-                .insert(user, data);
-        }
+            _ => crate::receipts::newest(
+                state.rooms.room_receipts(room_id).map_err(room_error)?,
+                &identity.user_id,
+                crate::receipts::MAX_INITIAL_RECEIPTS,
+            ),
+        };
+        let content = crate::receipts::event_content(rows, &identity.user_id);
         if !content.is_empty() {
             rooms.insert(
                 room_id.clone(),
@@ -7041,36 +7372,31 @@ fn lazy_members_expanded(
         .collect()
 }
 
-fn sliding_room_entry(
+fn sliding_heroes(
+    state: &AppState,
+    reader: &crate::rooms::RoomReader<'_>,
+    roster: &crate::rooms::Roster,
+    viewer: &str,
+) -> Result<Vec<Value>, MatrixError> {
+    let mut heroes = roster.heroes.clone();
+    if state.rooms.erasure_active().map_err(room_error)? {
+        for hero in &mut heroes {
+            let member = reader
+                .state_event("m.room.member", &hero.user_id)
+                .map_err(room_error)?;
+            hero.displayname = member["displayname"].as_str().map(str::to_owned);
+            hero.avatar_url = member["avatar_url"].as_str().map(str::to_owned);
+        }
+    }
+    Ok(crate::sliding::heroes(&heroes, viewer))
+}
+
+fn sliding_required_state(
     state: &AppState,
     identity: &crate::accounts::Identity,
     room_id: &str,
     required_state: &[(String, String)],
-    timeline_limit: usize,
-    initial: bool,
-) -> Result<Value, MatrixError> {
-    let name = state
-        .rooms
-        .state_event_unscoped(room_id, "m.room.name", "")
-        .ok()
-        .and_then(|content| content["name"].as_str().map(str::to_owned));
-    let (events, limited, prev_batch) = if timeline_limit == 0 {
-        (Vec::new(), false, None)
-    } else {
-        state
-            .rooms
-            .timeline_tail_public(room_id, timeline_limit.min(50))
-            .map_err(room_error)?
-    };
-    let timeline = crate::sliding::Timeline {
-        events: events
-            .into_iter()
-            .map(|event| with_transaction_id(state, identity, event))
-            .collect(),
-        limited,
-        prev_batch: prev_batch.map(|li| crate::tokens::Pagination(li).to_string()),
-    };
-    let required_state = lazy_members_expanded(required_state, &timeline.events);
+) -> Result<Vec<Value>, MatrixError> {
     // A wildcard has to be answered by looking at everything; a list of
     // named keys does not. Element X asks for a handful of concrete keys
     // and gets sent the whole room state to filter down — a stored-body
@@ -7113,7 +7439,7 @@ fn sliding_room_entry(
                 let event_type = event["type"].as_str().unwrap_or_default();
                 let state_key = event["state_key"].as_str().unwrap_or_default();
                 crate::sliding::wants_state(
-                    &required_state,
+                    required_state,
                     &identity.user_id,
                     event_type,
                     state_key,
@@ -7121,12 +7447,56 @@ fn sliding_room_entry(
             })
             .collect()
     };
-    let roster = state.rooms.roster(room_id).map_err(room_error)?;
-    let avatar = state
+    state
         .rooms
-        .state_event_unscoped(room_id, "m.room.avatar", "")
+        .prune_erased_events(&identity.user_id, room_id, state_events)
+        .map_err(room_error)
+}
+
+fn sliding_room_entry(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    room_id: &str,
+    required_state: &[(String, String)],
+    timeline_limit: usize,
+    initial: bool,
+) -> Result<Value, MatrixError> {
+    let reader = state
+        .rooms
+        .reader(&identity.user_id, room_id)
+        .map_err(room_error)?;
+    let name = reader
+        .state_event("m.room.name", "")
+        .ok()
+        .and_then(|content| content["name"].as_str().map(str::to_owned));
+    let (events, limited, prev_batch) = if timeline_limit == 0 {
+        (Vec::new(), false, None)
+    } else {
+        state
+            .rooms
+            .timeline_tail_for_preview(room_id, timeline_limit.min(50))
+            .map_err(room_error)?
+    };
+    let events = state
+        .rooms
+        .prune_erased_events(&identity.user_id, room_id, events)
+        .map_err(room_error)?;
+    let timeline = crate::sliding::Timeline {
+        events: events
+            .into_iter()
+            .map(|event| with_transaction_id(state, identity, event))
+            .collect(),
+        limited,
+        prev_batch: prev_batch.map(|li| crate::tokens::Pagination(li).to_string()),
+    };
+    let required_state = lazy_members_expanded(required_state, &timeline.events);
+    let state_events = sliding_required_state(state, identity, room_id, &required_state)?;
+    let roster = state.rooms.roster(room_id).map_err(room_error)?;
+    let avatar = reader
+        .state_event("m.room.avatar", "")
         .ok()
         .and_then(|content| content["url"].as_str().map(str::to_owned));
+    let heroes = sliding_heroes(state, &reader, &roster, &identity.user_id)?;
     let bump_stamp = state.rooms.last_activity(room_id).map_err(room_error)?;
     let unread = state
         .rooms
@@ -7139,7 +7509,7 @@ fn sliding_room_entry(
             avatar,
             joined_count: roster.joined.len(),
             invited_count: roster.invited.len(),
-            heroes: crate::sliding::heroes(&roster.heroes, &identity.user_id),
+            heroes,
             bump_stamp,
         },
         state_events,
@@ -7189,6 +7559,28 @@ fn visible_device_changes(
     Ok(visible)
 }
 
+/// The asker and everyone joined to a room the asker is joined to: the
+/// widest device-list change set the asker may be told about, for a sync
+/// that resumes from another server's token (`tokens::Resume::Foreign`).
+fn everyone_sharing_a_room(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+) -> Result<Vec<String>, MatrixError> {
+    let mut everyone = std::collections::BTreeSet::new();
+    everyone.insert(identity.user_id.clone());
+    for room_id in state.rooms.joined(&identity.user_id).map_err(room_error)? {
+        everyone.extend(
+            state
+                .rooms
+                .joined_member_ids(&room_id)
+                .map_err(room_error)?
+                .iter()
+                .cloned(),
+        );
+    }
+    Ok(everyone.into_iter().collect())
+}
+
 /// The E2EE sections of a `/sync` response, fetched before assembly.
 ///
 /// To-device messages come first and destructively (`since` acknowledges the
@@ -7202,7 +7594,7 @@ fn visible_device_changes(
 fn sync_device_sections(
     state: &AppState,
     identity: &crate::accounts::Identity,
-    since: Option<u64>,
+    resume: crate::tokens::Resume,
     next_batch: u64,
 ) -> Result<
     (
@@ -7215,11 +7607,19 @@ fn sync_device_sections(
 > {
     let to_device = state
         .devices
-        .take_pending(&identity.user_id, &identity.device_id, since)
+        .take_pending(&identity.user_id, &identity.device_id, resume.position())
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    let device_changes = match since {
-        Some(since) => visible_device_changes(state, identity, since, next_batch)?,
-        None => Vec::new(),
+    let device_changes = match resume {
+        crate::tokens::Resume::From(since) => {
+            visible_device_changes(state, identity, since, next_batch)?
+        }
+        crate::tokens::Resume::Start => Vec::new(),
+        // The client believes this is an incremental sync, so it will not
+        // re-query keys the way a fresh login does. Device changes made on
+        // the old server between its last sync and the switch are in a
+        // stream this server never saw; naming everyone it shares a room
+        // with makes it re-query them, rather than encrypt to a stale list.
+        crate::tokens::Resume::Foreign => everyone_sharing_a_room(state, identity)?,
     };
     let key_counts = state
         .devices
@@ -7242,15 +7642,8 @@ async fn sync(
     Authenticated(identity): Authenticated,
     axum::extract::Query(query): axum::extract::Query<SyncQuery>,
 ) -> Result<axum::response::Response, MatrixError> {
-    let since = match query.since.as_deref() {
-        Some(token) => Some(
-            token
-                .parse::<crate::tokens::Sync>()
-                .map_err(|error| MatrixError::bad_json(error.to_string()))?
-                .0,
-        ),
-        None => None,
-    };
+    let resume = sync_resume(&identity, query.since.as_deref())?;
+    let since = resume.position();
     let filter = requested_filter(&state, &identity.user_id, query.filter.as_deref())?;
     // A filter's own timeline limit outranks the query parameter: the client
     // set both, and the filter is the more specific of the two.
@@ -7290,23 +7683,35 @@ async fn sync(
         crate::rooms::StateBlock::Deferred
     };
     let state_after = query.state_after();
+    // The read and the assembly are synchronous room work -- a cold room
+    // is a load from the store -- so both run on the blocking pool rather
+    // than on an async worker (#614). The long-poll between them is the
+    // one stretch that genuinely waits, and it stays async.
     let read = |since: Option<u64>| {
-        state
-            .rooms
-            .sync(
-                &identity.user_id,
-                since,
-                timeline_limit,
-                state_block,
-                state_after,
-            )
-            .map_err(room_error)
+        let state = state.clone();
+        let user_id = identity.user_id.clone();
+        crate::blocking::offload(
+            std::sync::Arc::clone(&state.metrics),
+            crate::metrics::BlockingTask::Sync,
+            move || {
+                let started = std::time::Instant::now();
+                let result = state
+                    .rooms
+                    .sync(&user_id, since, timeline_limit, state_block, state_after)
+                    .map_err(room_error);
+                state
+                    .metrics
+                    .observe_sync_phase(crate::metrics::SyncPhase::SyncRead, started.elapsed());
+                result
+            },
+        )
     };
-    let mut result = read(since)?;
+    let mut result = read(since).await?;
 
     // Long-poll, but only for an incremental sync: an initial sync always has
     // something to say, and blocking one would leave a first-time client
     // staring at nothing for the whole timeout.
+    let long_poll = since.is_some() && query.timeout.unwrap_or(0) > 0;
     if let Some(since) = since {
         let timeout = std::time::Duration::from_millis(query.timeout.unwrap_or(0).min(60_000));
         // A side stream (account data, to-device messages, receipts) can
@@ -7323,27 +7728,63 @@ async fn sync(
                 () = state.rooms.wait_for_event(timeout) => {}
                 () = state.typing.wait(timeout) => {}
             }
-            result = read(Some(since))?;
+            result = read(Some(since)).await?;
         }
     }
 
+    let state_label = query.state_label();
+    let worker_state = state.clone();
+    crate::blocking::offload(
+        std::sync::Arc::clone(&state.metrics),
+        crate::metrics::BlockingTask::Sync,
+        move || {
+            let started = std::time::Instant::now();
+            let response = sync_answer(
+                &worker_state,
+                &identity,
+                result,
+                filter.as_ref(),
+                state_label,
+                resume,
+            );
+            worker_state
+                .metrics
+                .observe_sync_phase(crate::metrics::SyncPhase::SyncAssemble, started.elapsed());
+            response
+        },
+    )
+    .await
+    .map(|response| mark_long_poll(response, long_poll))
+}
+
+/// The body of a `/sync` response, assembled synchronously from what the
+/// read found.
+fn sync_answer(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    result: crate::rooms::SyncResult,
+    filter: Option<&crate::filters::Filter>,
+    state_label: &'static str,
+    resume: crate::tokens::Resume,
+) -> Result<axum::response::Response, MatrixError> {
+    let since = resume.position();
     let join = sync_join(
-        &state,
-        &identity,
+        state,
+        identity,
         result.rooms,
-        filter.as_ref(),
-        state_after,
-        since,
+        filter,
+        state_label,
+        (since, result.next_batch),
     )?;
 
-    let invite = sync_invite(&state, &identity, result.invited, filter.as_ref());
-    let knock = sync_knock(&state, &identity, result.knocked, filter.as_ref());
-    let leave = sync_leave(result.left, filter.as_ref());
+    let invite = sync_invite(state, identity, result.invited, filter);
+    let knock = sync_knock(state, identity, result.knocked, filter);
+    let leave = sync_leave(result.left, filter);
 
     let (to_device, device_changes, key_counts, unused_fallback) =
-        sync_device_sections(&state, &identity, since, result.next_batch)?;
+        sync_device_sections(state, identity, resume, result.next_batch)?;
 
-    let global = sync_account_data(&state, &identity, filter.as_ref(), since, result.next_batch)?;
+    let global = sync_account_data(state, identity, filter, since, result.next_batch)?;
 
     // Assembled from pre-serialized parts rather than as one `Value`, so the
     // joined rooms' state blocks -- which `sync_join` may have taken straight
@@ -7373,7 +7814,7 @@ async fn sync(
     body.insert("account_data", raw(&json!({ "events": global }))?);
 
     let window = (since, result.next_batch);
-    if let Some(done) = finalised_delays(&state, &identity.user_id, filter.as_ref(), window)? {
+    if let Some(done) = finalised_delays(state, &identity.user_id, filter, window)? {
         body.insert("org.matrix.msc4140.finalised_delayed_events", raw(&done)?);
     }
 
@@ -7403,7 +7844,7 @@ fn finalised_delays(
     user_id: &str,
     filter: Option<&crate::filters::Filter>,
     (since, next_batch): (Option<u64>, u64),
-) -> Result<Option<Vec<crate::delayed::FinalisedDelay>>, MatrixError> {
+) -> Result<Option<Vec<Value>>, MatrixError> {
     if !filter.is_none_or(crate::filters::Filter::wants_finalised_delayed_events) {
         return Ok(None);
     }
@@ -7411,7 +7852,12 @@ fn finalised_delays(
         .delayed
         .finalised_between(user_id, since, next_batch)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    Ok((!finalised.is_empty()).then_some(finalised))
+    Ok((!finalised.is_empty()).then(|| {
+        finalised
+            .iter()
+            .map(crate::delayed::FinalisedDelay::sync_view)
+            .collect()
+    }))
 }
 
 /// The account-level account data a sync carries, defaults included.
@@ -7439,7 +7885,9 @@ fn sync_account_data(
     for event in &mut global {
         if event["type"] == crate::push_rules::TYPE {
             let ruleset = event["content"].take();
-            event["content"] = json!({ "global": ruleset });
+            event["content"] = json!({
+                "global": crate::push_rules::with_defaults(ruleset, &identity.user_id),
+            });
         }
     }
     // A user who has never edited a rule still has a ruleset, and a client
@@ -7604,7 +8052,7 @@ fn sticky_section(
         .iter()
         .filter_map(|event| event["event_id"].as_str())
         .collect();
-    Ok(state
+    let events = state
         .rooms
         .sticky_events(room_id, if joined_now { None } else { since })
         .map_err(room_error)?
@@ -7614,18 +8062,45 @@ fn sticky_section(
             event["unsigned"]["msc4354_sticky_duration_ttl_ms"] = json!(ttl);
             event
         })
-        .collect())
+        .collect();
+    state
+        .rooms
+        .prune_erased_events(user_id, room_id, events)
+        .map_err(room_error)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "every section of one joined room, in the order the response holds them"
+)]
 fn sync_join(
     state: &AppState,
     identity: &crate::accounts::Identity,
     rooms: Vec<crate::rooms::SyncRoom>,
     filter: Option<&crate::filters::Filter>,
-    state_after: bool,
-    since: Option<u64>,
+    state_label: &'static str,
+    (since, until): (Option<u64>, u64),
 ) -> Result<BTreeMap<String, Box<RawValue>>, MatrixError> {
     let mut join: BTreeMap<String, Box<RawValue>> = BTreeMap::new();
+    let joined = state.rooms.joined(&identity.user_id).map_err(room_error)?;
+    // Readers whose receipt moved inside this sync's window, local or
+    // federated, per room: what an incremental sync owes as `m.receipt`.
+    let moved_receipts = since.map(|since| {
+        state
+            .rooms
+            .receipt_readers_since(joined.iter().map(String::as_str), since, until)
+    });
+    let receipts_for = |room_id: &str, timeline: &[Value]| {
+        sync_receipts(
+            state,
+            identity,
+            room_id,
+            moved_receipts
+                .as_ref()
+                .map(|moved| moved.get(room_id).map_or(&[][..], Vec::as_slice)),
+            timeline,
+        )
+    };
     for room in rooms {
         if filter.is_some_and(|f| !f.allows_room(&room.room_id)) {
             continue;
@@ -7648,6 +8123,7 @@ fn sync_join(
         let typing = state.typing.event(&room.room_id);
         let room_filter = filter.map(|filter| &filter.room);
         let events = sync_timeline(state, identity, room_filter, room.events);
+        let receipts = receipts_for(&room.room_id, &events)?;
         let mut room_state = crate::filters::Filter::apply(
             room_filter.and_then(|room| room.state.as_ref()),
             room.state,
@@ -7708,17 +8184,14 @@ fn sync_join(
         } else {
             raw(&json!({ "events": room_state }))?
         };
-        entry.insert(
-            if state_after { "state_after" } else { "state" },
-            state_json,
-        );
+        entry.insert(state_label, state_json);
         entry.insert("account_data", raw(&json!({ "events": room_data }))?);
         entry.insert(
             "ephemeral",
             raw(&json!({
                 "events": crate::filters::Filter::apply(
                     room_filter.and_then(|room| room.ephemeral.as_ref()),
-                    typing.map(|event| vec![event]).unwrap_or_default(),
+                    typing.into_iter().chain(receipts).collect(),
                 ),
             }))?,
         );
@@ -7732,23 +8205,119 @@ fn sync_join(
         join.insert(room.room_id, raw(&entry)?);
     }
 
-    // A room where the only news is that someone is typing has no timeline
-    // events, so `Rooms::sync` leaves it out -- correctly, since it knows
-    // nothing about typing. Adding it back here is what keeps typing out of
-    // the log layer entirely.
-    for room_id in state.rooms.joined(&identity.user_id).map_err(room_error)? {
-        if join.contains_key(&room_id) || filter.is_some_and(|f| !f.allows_room(&room_id)) {
+    sync_ephemeral_only(
+        state,
+        identity,
+        filter,
+        &joined,
+        moved_receipts.as_ref(),
+        &mut join,
+    )?;
+    Ok(join)
+}
+
+/// A room where the only news is that someone is typing, or that a
+/// receipt moved, has no timeline events, so `Rooms::sync` leaves it out
+/// -- correctly, since it knows nothing about either. Adding it back here
+/// is what keeps both out of the log layer entirely.
+fn sync_ephemeral_only(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    filter: Option<&crate::filters::Filter>,
+    joined: &[String],
+    moved_receipts: Option<&std::collections::HashMap<String, Vec<String>>>,
+    join: &mut BTreeMap<String, Box<RawValue>>,
+) -> Result<(), MatrixError> {
+    for room_id in joined {
+        if join.contains_key(room_id) || filter.is_some_and(|f| !f.allows_room(room_id)) {
             continue;
         }
-        let Some(typing) = state.typing.event(&room_id) else {
-            continue;
+        // An initial sync spoke about every room already; only an
+        // incremental one has receipt-only rooms to add.
+        let receipts = match moved_receipts.and_then(|moved| moved.get(room_id)) {
+            Some(readers) => sync_receipts(state, identity, room_id, Some(readers), &[])?,
+            None => None,
         };
+        let events: Vec<Value> = state
+            .typing
+            .event(room_id)
+            .into_iter()
+            .chain(receipts)
+            .collect();
+        let events = crate::filters::Filter::apply(
+            filter.and_then(|filter| filter.room.ephemeral.as_ref()),
+            events,
+        );
+        if events.is_empty() {
+            continue;
+        }
         join.insert(
-            room_id,
-            raw(&json!({ "ephemeral": { "events": [typing] } }))?,
+            room_id.clone(),
+            raw(&json!({ "ephemeral": { "events": events } }))?,
         );
     }
-    Ok(join)
+    Ok(())
+}
+
+/// The `m.receipt` event one room's `/sync` entry carries, if any.
+///
+/// Incrementally (`moved` is `Some`), the receipts of every reader whose
+/// receipt moved in the window -- local or from another server. On an
+/// initial sync, the receipts on the events in the timeline being sent
+/// plus the caller's own (others capped at the newest
+/// [`crate::receipts::MAX_INITIAL_RECEIPTS`]): what a client draws read
+/// markers on, without shipping a ten-thousand-member room's whole receipt
+/// table on login.
+fn sync_receipts(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    room_id: &str,
+    moved: Option<&[String]>,
+    timeline: &[Value],
+) -> Result<Option<Value>, MatrixError> {
+    let rows: Vec<crate::receipts::ReceiptRow> = match moved {
+        Some([]) => return Ok(None),
+        Some(readers) => readers_receipts(state, room_id, readers)?,
+        None => {
+            let shown: std::collections::HashSet<&str> = timeline
+                .iter()
+                .filter_map(|event| event["event_id"].as_str())
+                .collect();
+            crate::receipts::newest(
+                state
+                    .rooms
+                    .room_receipts(room_id)
+                    .map_err(room_error)?
+                    .into_iter()
+                    .filter(|(user, _, event_id, _, _)| {
+                        *user == identity.user_id || shown.contains(event_id.as_str())
+                    }),
+                &identity.user_id,
+                crate::receipts::MAX_INITIAL_RECEIPTS,
+            )
+        }
+    };
+    let content = crate::receipts::event_content(rows, &identity.user_id);
+    Ok((!content.is_empty()).then(|| json!({ "type": "m.receipt", "content": content })))
+}
+
+/// Every receipt the named readers hold in a room, as rows.
+fn readers_receipts(
+    state: &AppState,
+    room_id: &str,
+    readers: &[String],
+) -> Result<Vec<crate::receipts::ReceiptRow>, MatrixError> {
+    let mut rows = Vec::new();
+    for reader in readers {
+        for (receipt_type, event_id, ts, thread) in state
+            .rooms
+            .user_receipts(room_id, reader)
+            .map_err(room_error)?
+        {
+            rows.push((reader.clone(), receipt_type, event_id, ts, thread));
+        }
+    }
+    Ok(rows)
 }
 
 /// `POST /_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}`
@@ -7777,6 +8346,16 @@ async fn set_receipt(
             request.thread_id.as_deref(),
         )
         .map_err(room_error)?;
+    // The room's other servers hear about a public receipt in their next
+    // transaction (#624); a private one never leaves.
+    crate::receipts::federate(
+        &state,
+        &room_id,
+        &identity.user_id,
+        &receipt_type,
+        &event_id,
+        request.thread_id.as_deref(),
+    );
     Ok(Json(json!({})))
 }
 
@@ -7814,6 +8393,15 @@ async fn read_markers(
                 .rooms
                 .set_receipt(&room_id, &identity.user_id, receipt_type, event_id, None)
                 .map_err(room_error)?;
+            // `m.read` federates; `m.fully_read` is the reader's own.
+            crate::receipts::federate(
+                &state,
+                &room_id,
+                &identity.user_id,
+                receipt_type,
+                event_id,
+                None,
+            );
         }
     }
     Ok(Json(json!({})))
@@ -7930,14 +8518,10 @@ fn relations(
     // reads as much of a private room as `/messages` does.
     may_read_room(state, user_id, room_id)?;
     // The same `t`-tagged pagination token `/messages` uses, because it is the
-    // same thing: a position in this room's linear index.
+    // same thing: a position in this room's linear index. A Synapse token
+    // this room cannot place starts again from the newest (#568).
     let from = match query.from.as_deref() {
-        Some(token) => Some(
-            token
-                .parse::<crate::tokens::Pagination>()
-                .map_err(|error| MatrixError::bad_json(error.to_string()))?
-                .0,
-        ),
+        Some(token) => room_page_token(state, room_id, token)?,
         None => None,
     };
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
@@ -7947,6 +8531,10 @@ fn relations(
         .relations(room_id, event_id, rel_type, event_type, from, limit)
         .map_err(room_error)?;
 
+    let chunk = state
+        .rooms
+        .prune_erased_events(user_id, room_id, chunk)
+        .map_err(room_error)?;
     let mut body = serde_json::Map::new();
     body.insert("chunk".to_owned(), Value::Array(chunk));
     // Absent when there is nothing more, which is how a client stops.
@@ -8056,7 +8644,14 @@ struct DelayQuery {
 }
 
 /// Turn a delay failure into the response a client can act on.
-fn delay_error(error: crate::delayed::DelayError) -> MatrixError {
+///
+/// The error codes are MSC4140's as merged. `stable` picks the spelling of
+/// the one code the MSC gives an unstable form: a delay past the cap is
+/// `M_DELAY_TOO_LARGE` on the stable endpoint and
+/// `ORG.MATRIX.MSC4140_DELAY_TOO_LARGE` on the unstable ones, with the cap
+/// itself beside it under the key Synapse has always sent it as, which is
+/// the one key a client could read to retry with less.
+fn delay_error_as(error: crate::delayed::DelayError, stable: bool) -> MatrixError {
     use crate::delayed::DelayError;
     match error {
         DelayError::NotFound => MatrixError::new(
@@ -8064,59 +8659,141 @@ fn delay_error(error: crate::delayed::DelayError) -> MatrixError {
             "M_NOT_FOUND",
             "no such delayed event",
         ),
-        // `M_INVALID_PARAM` with the limit in the message: a client that
-        // asked for too long can retry with less, but only if it is told
-        // what "too long" is.
-        DelayError::TooLong { limit_ms } => MatrixError::new(
+        DelayError::TooLong { limit_ms } => {
+            let mut extra = serde_json::Map::new();
+            extra.insert("org.matrix.msc4140.max_delay".to_owned(), json!(limit_ms));
+            MatrixError {
+                extra: Some(Box::new(extra)),
+                ..MatrixError::new(
+                    StatusCode::BAD_REQUEST,
+                    if stable {
+                        "M_DELAY_TOO_LARGE"
+                    } else {
+                        "ORG.MATRIX.MSC4140_DELAY_TOO_LARGE"
+                    },
+                    format!("the maximum delay is {limit_ms}ms"),
+                )
+            }
+        }
+        // 429 with the wait until the caller's first pending delay is due:
+        // nothing about the request was wrong, and the same request works
+        // once one of the delays it already holds fires or is cancelled.
+        DelayError::TooMany { retry_after_ms, .. } => MatrixError {
+            error: error.to_string(),
+            ..MatrixError::limit_exceeded(retry_after_ms)
+        },
+        DelayError::NotPositive => MatrixError::new(
             StatusCode::BAD_REQUEST,
             "M_INVALID_PARAM",
-            format!("the maximum delay is {limit_ms}ms"),
+            "a delay must be a whole number of milliseconds greater than zero",
         ),
-        // `M_LIMIT_EXCEEDED` rather than `M_INVALID_PARAM`: nothing about the
-        // request was wrong, and the same request will work once one of this
-        // caller's pending delays in this room fires or is cancelled.
-        DelayError::TooMany { limit } => MatrixError::new(
-            StatusCode::BAD_REQUEST,
-            "M_LIMIT_EXCEEDED",
-            format!("at most {limit} delayed events may be pending in one room"),
+        DelayError::Conflict => MatrixError::new(
+            StatusCode::CONFLICT,
+            "M_UNKNOWN",
+            "the delayed event has already finished, and not in the way asked for",
         ),
         DelayError::Store(inner) => MatrixError::internal(&inner.to_string()),
     }
+}
+
+/// [`delay_error_as`] for the unstable endpoints, which is all of them but
+/// the stable scheduling one.
+fn delay_error(error: crate::delayed::DelayError) -> MatrixError {
+    delay_error_as(error, false)
+}
+
+/// One delay as MSC4140's lookup reports it, pending or finished.
+fn delay_info(event: &crate::delayed::DelayedEvent) -> Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("delay_id".to_owned(), json!(event.delay_id));
+    entry.insert("room_id".to_owned(), json!(event.room_id));
+    entry.insert("type".to_owned(), json!(event.event_type));
+    if let Some(state_key) = &event.state_key {
+        entry.insert("state_key".to_owned(), json!(state_key));
+    }
+    let since = event.fire_at_ms.saturating_sub(event.delay_ms);
+    entry.insert("delay_ms".to_owned(), json!(event.delay_ms));
+    entry.insert("delayed_since_ts".to_owned(), json!(since));
+    // The names the list endpoint has always used, kept beside the merged
+    // ones: they are what Synapse sends and what shipping clients read.
+    entry.insert("delay".to_owned(), json!(event.delay_ms));
+    entry.insert("running_since".to_owned(), json!(since));
+    entry.insert("content".to_owned(), event.content.clone());
+    Value::Object(entry)
+}
+
+/// The same for a delay that has finished, with how it finished.
+fn finalised_info(record: &crate::delayed::FinalisedDelay) -> Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("delay_id".to_owned(), json!(record.delay_id));
+    entry.insert("room_id".to_owned(), json!(record.room_id));
+    entry.insert("type".to_owned(), json!(record.event_type));
+    if let Some(state_key) = &record.state_key {
+        entry.insert("state_key".to_owned(), json!(state_key));
+    }
+    entry.insert("delay_ms".to_owned(), json!(record.delay_ms));
+    entry.insert(
+        "delayed_since_ts".to_owned(),
+        json!(record.delayed_since_ts),
+    );
+    entry.insert("content".to_owned(), record.content.clone());
+    let mut finalised = serde_json::Map::new();
+    if let Some(event_id) = &record.event_id {
+        finalised.insert("event_id".to_owned(), json!(event_id));
+    }
+    if let Some(error) = &record.error {
+        finalised.insert(
+            "error".to_owned(),
+            json!({
+                "errcode": record.errcode.as_deref().unwrap_or("M_UNKNOWN"),
+                "error": error,
+            }),
+        );
+    }
+    finalised.insert("finalised_ts".to_owned(), json!(record.finalised_ts));
+    entry.insert("finalised".to_owned(), Value::Object(finalised));
+    Value::Object(entry)
 }
 
 /// `GET /_matrix/client/unstable/org.matrix.msc4140/delayed_events`
 ///
 /// What this caller is still waiting on. Scoped to the caller: a delay is a
 /// pending action taken in their name, and whose it is is the only sensible
-/// unit here.
+/// unit here. Not in MSC4140 as merged (MSC4486 takes it on), and kept
+/// because Synapse serves it and clients call it.
 async fn delayed_events(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
 ) -> Result<Json<Value>, MatrixError> {
     let pending = state.delayed.list(&identity.user_id).map_err(delay_error)?;
-    let chunk: Vec<Value> = pending
-        .into_iter()
-        .map(|event| {
-            let mut entry = serde_json::Map::new();
-            entry.insert("delay_id".to_owned(), json!(event.delay_id));
-            entry.insert("room_id".to_owned(), json!(event.room_id));
-            entry.insert("type".to_owned(), json!(event.event_type));
-            if let Some(state_key) = event.state_key {
-                entry.insert("state_key".to_owned(), json!(state_key));
-            }
-            entry.insert("delay".to_owned(), json!(event.delay_ms));
-            // When the current window started, which is the one field a
-            // client could not have computed for itself and the one it needs
-            // in order to decide whether to restart.
-            entry.insert(
-                "running_since".to_owned(),
-                json!(event.fire_at_ms.saturating_sub(event.delay_ms)),
-            );
-            entry.insert("content".to_owned(), event.content);
-            Value::Object(entry)
-        })
-        .collect();
+    let chunk: Vec<Value> = pending.iter().map(delay_info).collect();
     Ok(Json(json!({ "delayed_events": chunk })))
+}
+
+/// `GET /_matrix/client/v1/delayed_events/{delay_id}`, and its unstable
+/// alias.
+///
+/// One delay of the caller's, pending or finished: MSC4140's way for a
+/// client that was away to learn whether its delay was sent, cancelled or
+/// refused, and why. Another user's delay is not found, exactly as one that
+/// never existed.
+async fn delayed_event_lookup(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(delay_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    match state.delayed.get(&delay_id, &identity.user_id) {
+        Ok(event) => Ok(Json(delay_info(&event))),
+        Err(crate::delayed::DelayError::NotFound) => {
+            match state.delayed.outcome(&delay_id).map_err(delay_error)? {
+                Some((owner, record)) if owner == identity.user_id => {
+                    Ok(Json(finalised_info(&record)))
+                }
+                _ => Err(delay_error(crate::delayed::DelayError::NotFound)),
+            }
+        }
+        Err(error) => Err(delay_error(error)),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -8126,11 +8803,10 @@ struct DelayActionRequest {
 
 /// `POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}`
 ///
-/// `restart` is the one that matters: it is the heartbeat a live client sends
-/// to say "not yet", and it re-applies the *original* delay rather than what
-/// remained. A restart that shortened the window each time would converge on
-/// firing while the client was still there, which is the opposite of what
-/// restarting means.
+/// The earliest shape of the management endpoint, with the action in the
+/// body; matrix-js-sdk still falls back to it. `restart` is the one that
+/// matters: it is the heartbeat a live client sends to say "not yet", and
+/// it re-applies the *original* delay rather than what remained.
 async fn delayed_event_action(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
@@ -8143,54 +8819,320 @@ async fn delayed_event_action(
             request.action
         ))
     })?;
-    let to_send = state
+    act_on_delay(&state, &delay_id, Some(&identity.user_id), action, false)
+}
+
+/// Apply `action` to a delay -- the caller's when `owner` names them, the
+/// holder of the id's otherwise -- and do what follows from it: send the
+/// event for `send`, record the outcome for `cancel`.
+///
+/// `stable` picks how an action that contradicts a finished delay is
+/// refused. MSC4140 as merged says 409, and the stable endpoint says so.
+/// The unstable endpoints keep the 404 they have always given, because the
+/// clients calling them were built against it: matrix-js-sdk before October
+/// 2026 treats a 409 on `restart` or `cancel` as unrecoverable and ends the
+/// call, and lk-jwt-service before 0.7 retries a 409 until its deadline
+/// where a 404 tells it the delay is gone. Synapse answers 404 there too.
+fn act_on_delay(
+    state: &AppState,
+    delay_id: &str,
+    owner: Option<&str>,
+    action: crate::delayed::Action,
+    stable: bool,
+) -> Result<Json<Value>, MatrixError> {
+    let pending = state
         .delayed
-        .act(&delay_id, &identity.user_id, action)
-        .map_err(delay_error)?;
-    if let Some(event) = to_send {
-        let sent = match &event.state_key {
-            Some(state_key) => state.rooms.set_state(
-                &event.room_id,
-                &event.sender,
-                state.key.pair(),
-                &event.event_type,
-                state_key,
-                &event.content,
-            ),
-            None => state.rooms.send(
-                &event.room_id,
-                &event.sender,
-                state.key.pair(),
-                &event.event_type,
-                &event.content,
-            ),
-        };
-        // MSC4309, for the same reason the fire loop records its outcome:
-        // this device learns the result from the response, but the user's
-        // *other* devices are exactly as uninformed as if the delay had
-        // fired on its own. A failure to record must not fail the send that
-        // already happened, so it is logged rather than returned.
-        let record = crate::delayed::FinalisedDelay {
-            delay_id: event.delay_id.clone(),
-            room_id: event.room_id.clone(),
-            event_type: event.event_type.clone(),
-            state_key: event.state_key.clone(),
-            event_id: sent.as_ref().ok().cloned(),
-            error: sent.as_ref().err().map(ToString::to_string),
-        };
-        if let Err(error) =
-            state
-                .delayed
-                .finalise(&event.sender, state.rooms.stream_position(), &record)
-        {
-            tracing::warn!(
-                delay_id = %event.delay_id,
-                "a delayed event was sent but its outcome was not recorded: {error}"
-            );
+        .pending(delay_id)
+        .filter(|event| owner.is_none_or(|owner| event.sender == owner));
+    let acted = match owner {
+        Some(owner) => state.delayed.act(delay_id, owner, action),
+        None => state.delayed.act_by_id(delay_id, action),
+    }
+    .map_err(|error| match error {
+        crate::delayed::DelayError::Conflict if !stable => {
+            delay_error(crate::delayed::DelayError::NotFound)
         }
-        sent.map_err(room_error)?;
+        other => delay_error(other),
+    })?;
+    if let Some(event) = acted {
+        send_delayed_now(state, &event)?;
+    } else if action == crate::delayed::Action::Cancel {
+        // A cancel is kept as an outcome like any other, so a lookup can
+        // report it and a repeated cancel is the success it should be. Not
+        // when the delay had already finished: that cancel changed nothing.
+        if let Some(event) = pending {
+            record_cancel(state, &event);
+        }
     }
     Ok(Json(json!({})))
+}
+
+/// Keep a cancellation as the delay's outcome.
+fn record_cancel(state: &AppState, event: &crate::delayed::DelayedEvent) {
+    let record = crate::delayed::FinalisedDelay::cancelled(event);
+    if let Err(error) =
+        state
+            .delayed
+            .finalise(&event.sender, state.rooms.stream_position(), &record)
+    {
+        tracing::warn!(
+            delay_id = %event.delay_id,
+            "a delayed event was cancelled but its outcome was not recorded: {error}"
+        );
+    }
+}
+
+/// Send a delayed event now, on its owner's behalf, and record the outcome
+/// for MSC4309 -- the `send` action, from either route.
+///
+/// Sticky if it was scheduled sticky: `MatrixRTC` 2.0's leave is a sticky
+/// delayed event, and a delegate that sends it early (lk-jwt-service, when
+/// the participant drops off the SFU) must deliver the same event the fire
+/// loop would have, or clients that track membership through the sticky
+/// map never see the participant go.
+///
+/// A send that is refused leaves the delay scheduled and answers with the
+/// refusal, as MSC4140 asks: whatever refused it may have changed by its
+/// deadline, and the client may retry until then.
+fn send_delayed_now(
+    state: &AppState,
+    event: &crate::delayed::DelayedEvent,
+) -> Result<(), MatrixError> {
+    let sent = match &event.state_key {
+        Some(state_key) => state.rooms.set_state_sticky(
+            &event.room_id,
+            &event.sender,
+            state.key.pair(),
+            &event.event_type,
+            state_key,
+            &event.content,
+            event.sticky_ms,
+        ),
+        None => state.rooms.send_sticky(
+            &event.room_id,
+            &event.sender,
+            state.key.pair(),
+            &event.event_type,
+            &event.content,
+            event.sticky_ms,
+        ),
+    };
+    let event_id = match sent {
+        Ok(event_id) => event_id,
+        Err(error) => {
+            if let Err(store) = state.delayed.reinstate(event) {
+                tracing::warn!(
+                    delay_id = %event.delay_id,
+                    "a refused delayed send could not be put back: {store}"
+                );
+            }
+            return Err(room_error(error));
+        }
+    };
+    // MSC4309, for the same reason the fire loop records its outcome:
+    // this device learns the result from the response, but the user's
+    // *other* devices are exactly as uninformed as if the delay had
+    // fired on its own. A failure to record must not fail the send that
+    // already happened, so it is logged rather than returned.
+    let record = crate::delayed::FinalisedDelay::of(event, Ok(event_id));
+    if let Err(error) =
+        state
+            .delayed
+            .finalise(&event.sender, state.rooms.stream_position(), &record)
+    {
+        tracing::warn!(
+            delay_id = %event.delay_id,
+            "a delayed event was sent but its outcome was not recorded: {error}"
+        );
+    }
+    Ok(())
+}
+
+/// `POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}`
+///
+/// An access token is optional here. With one, the delay must be the
+/// caller's, as on the stable endpoint -- which is how lk-jwt-service 0.8
+/// calls it, as the user, through its application service. Without one the
+/// delay ID is the capability (see [`crate::delayed::Delayed::act_by_id`]),
+/// which is how earlier releases call it to restart a delegated leave while
+/// the participant is still on the SFU and send it when they are not;
+/// answering that 404 makes the service drop the delegation, and the leave
+/// fires while the caller is still in the call.
+async fn delayed_event_action_by_id(
+    State(state): State<AppState>,
+    crate::auth::MaybeAuthenticated(identity): crate::auth::MaybeAuthenticated,
+    axum::extract::Path((delay_id, action)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    let action = crate::delayed::Action::parse(&action).ok_or_else(|| {
+        MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_UNRECOGNIZED",
+            format!("no delayed-event action {action:?}"),
+        )
+    })?;
+    act_on_delay(
+        &state,
+        &delay_id,
+        identity.as_ref().map(|identity| identity.user_id.as_str()),
+        action,
+        false,
+    )
+}
+
+/// `POST /_matrix/client/v1/delayed_events/{delay_id}/{action}`
+///
+/// MSC4140 as merged: authenticated, and scoped to the delay's owner.
+async fn delayed_event_action_stable(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((delay_id, action)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    let action = crate::delayed::Action::parse(&action).ok_or_else(|| {
+        MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_UNRECOGNIZED",
+            format!("no delayed-event action {action:?}"),
+        )
+    })?;
+    act_on_delay(&state, &delay_id, Some(&identity.user_id), action, true)
+}
+
+/// The body of MSC4140's scheduling endpoint.
+#[derive(Debug, Deserialize)]
+struct DelayedEventBody {
+    delay_ms: Value,
+    content: Option<Value>,
+    state_key: Option<Value>,
+    /// MSC4354's sticky duration, accepted in the body as well as the query,
+    /// as Synapse does until the MSCs settle on one.
+    #[serde(rename = "org.matrix.msc4354.sticky_duration_ms")]
+    sticky: Option<u64>,
+}
+
+/// `PUT /_matrix/client/v3/rooms/{room_id}/delayed_event/{event_type}/{txn_id}`,
+/// and its unstable alias under `org.matrix.msc4140`.
+///
+/// MSC4140 as merged schedules through an endpoint of its own, with the
+/// delay, the content and (for a state event) the state key in the body,
+/// rather than through a query parameter on `/send` and `/state` -- which
+/// stay served, because that is what shipping clients call. It is a
+/// transaction like `/send`: a retried request returns the delay it made
+/// the first time, rather than scheduling a second one, which for a
+/// participant's leave would be a second leave nobody restarts.
+fn schedule_delayed_event(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    (room_id, event_type, txn_id): (String, String, String),
+    query: &DelayQuery,
+    body: DelayedEventBody,
+    stable: bool,
+) -> Result<Json<Value>, MatrixError> {
+    let delay_ms = body
+        .delay_ms
+        .as_u64()
+        .filter(|delay| *delay > 0)
+        .ok_or_else(|| {
+            MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                "delay_ms must be a whole number of milliseconds greater than zero",
+            )
+        })?;
+    let content = match body.content {
+        Some(Value::Object(content)) => Value::Object(content),
+        Some(_) => {
+            return Err(MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                "content must be an object",
+            ));
+        }
+        None => return Err(MatrixError::missing_param("content is required")),
+    };
+    let state_key = match body.state_key {
+        None => None,
+        Some(Value::String(state_key)) => Some(state_key),
+        Some(_) => {
+            return Err(MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                "state_key must be a string",
+            ));
+        }
+    };
+    let sticky = match (query.sticky, body.sticky) {
+        (Some(query), Some(body)) if query != body => {
+            return Err(MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                "conflicting values given for org.matrix.msc4354.sticky_duration_ms",
+            ));
+        }
+        (query, body) => query.or(body),
+    };
+    let key = delayed_transaction_key(identity, &txn_id);
+    if let Ok(Some(stored)) = spindle_store::ReadView::get(state.store.as_ref(), &key)
+        && let Ok(delay_id) = String::from_utf8(stored)
+    {
+        return Ok(Json(json!({ "delay_id": delay_id })));
+    }
+    if !state
+        .rooms
+        .is_joined(&identity.user_id, &room_id)
+        .unwrap_or(false)
+    {
+        return Err(MatrixError::forbidden(format!(
+            "{} is not in {room_id}",
+            identity.user_id
+        )));
+    }
+    let delay_id = state
+        .delayed
+        .schedule(
+            &room_id,
+            &identity.user_id,
+            &event_type,
+            state_key.as_deref(),
+            &content,
+            delay_ms,
+            sticky,
+        )
+        .map_err(|error| delay_error_as(error, stable))?;
+    spindle_store::Store::put(state.store.as_ref(), &key, delay_id.as_bytes())
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    Ok(Json(json!({ "delay_id": delay_id })))
+}
+
+/// Where a scheduling transaction is remembered: the device's transaction
+/// row, in a namespace of its own. The spec scopes a transaction ID to one
+/// device and one endpoint, so the same ID on `/send` is a different
+/// transaction and must not answer with a delay.
+fn delayed_transaction_key(identity: &crate::accounts::Identity, txn_id: &str) -> Vec<u8> {
+    spindle_core::keys::transaction(
+        &identity.user_id,
+        &identity.device_id,
+        &format!("\u{0}msc4140/{txn_id}"),
+    )
+}
+
+async fn delayed_event_put_unstable(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(path): axum::extract::Path<(String, String, String)>,
+    axum::extract::Query(query): axum::extract::Query<DelayQuery>,
+    Json(body): Json<DelayedEventBody>,
+) -> Result<Json<Value>, MatrixError> {
+    schedule_delayed_event(&state, &identity, path, &query, body, false)
+}
+
+async fn delayed_event_put_stable(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(path): axum::extract::Path<(String, String, String)>,
+    axum::extract::Query(query): axum::extract::Query<DelayQuery>,
+    Json(body): Json<DelayedEventBody>,
+) -> Result<Json<Value>, MatrixError> {
+    schedule_delayed_event(&state, &identity, path, &query, body, true)
 }
 
 /// `GET /_matrix/client/v3/voip/turnServer`
@@ -8400,14 +9342,19 @@ async fn room_threads(
         }
     };
     // The same `t`-tagged token the rest of the room's pagination uses: this
-    // is a position in the same linear index.
+    // is a position in the same linear index. Synapse's `/threads` tokens
+    // are `{depth}_{stream}`; one kept across the migration starts the
+    // list again from the newest thread rather than failing (#568).
+    let synapse_threads_token = |token: &str| {
+        token.split_once('_').is_some_and(|(depth, stream)| {
+            [depth, stream]
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        })
+    };
     let from = match query.from.as_deref() {
-        Some(token) => Some(
-            token
-                .parse::<crate::tokens::Pagination>()
-                .map_err(|error| MatrixError::bad_json(error.to_string()))?
-                .0,
-        ),
+        Some(token) if synapse_threads_token(token) => None,
+        Some(token) => room_page_token(&state, &room_id, token)?,
         None => None,
     };
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
@@ -8417,6 +9364,10 @@ async fn room_threads(
         .threads(&room_id, &identity.user_id, participated_only, from, limit)
         .map_err(room_error)?;
 
+    let roots = state
+        .rooms
+        .prune_erased_events(&identity.user_id, &room_id, roots)
+        .map_err(room_error)?;
     let chunk: Vec<Value> = roots
         .into_iter()
         .map(|root| as_seen_by(&state, &room_id, &identity, root))
@@ -8688,6 +9639,11 @@ pub(crate) fn room_error(error: crate::rooms::RoomError) -> MatrixError {
         // is the same explanation a federating peer would give. A generic
         // "forbidden" would make a client's bug report useless.
         crate::rooms::RoomError::Forbidden(rule) => MatrixError::forbidden(rule),
+        crate::rooms::RoomError::UnsupportedVersion(version) => MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_UNSUPPORTED_ROOM_VERSION",
+            format!("this server does not support room version {version}"),
+        ),
         // #225: this was a 500 with an empty body, which told a client
         // nothing and an operator nothing. It is not an internal error --
         // the server is working correctly and the *room* is in a state it
@@ -8772,7 +9728,9 @@ fn with_transaction_id(
     }
     let key = spindle_core::keys::transaction_echo(&identity.user_id, event_id);
     let Ok(Some(raw)) = spindle_store::ReadView::get(state.store.as_ref(), &key) else {
-        return event;
+        // No transaction: perhaps a delay sent it, which MSC4140 stamps in
+        // the transaction's place.
+        return with_delay_id(state, identity, event);
     };
     let Some((device_id, txn_id)) = spindle_core::keys::transaction_echo_parts(&raw) else {
         return event;
@@ -8787,6 +9745,42 @@ fn with_transaction_id(
             .as_object_mut()
     }) {
         unsigned.insert("transaction_id".to_owned(), Value::String(txn_id));
+    }
+    event
+}
+
+/// Stamp MSC4140's delay ID on an event the reader sent through a delay.
+///
+/// For the sender only, on every device: the delay is the user's, not one
+/// device's, and any of their clients may be the one watching for it.
+fn with_delay_id(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    mut event: Value,
+) -> Value {
+    let Some(event_id) = event["event_id"].as_str() else {
+        return event;
+    };
+    if event["sender"].as_str() != Some(identity.user_id.as_str()) {
+        return event;
+    }
+    let key = spindle_core::keys::delay_echo(&identity.user_id, event_id);
+    let Ok(Some(raw)) = spindle_store::ReadView::get(state.store.as_ref(), &key) else {
+        return event;
+    };
+    let Ok(delay_id) = String::from_utf8(raw) else {
+        return event;
+    };
+    if let Some(unsigned) = event.as_object_mut().and_then(|object| {
+        object
+            .entry("unsigned")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+    }) {
+        unsigned.insert(
+            "org.matrix.msc4140.delay_id".to_owned(),
+            Value::String(delay_id),
+        );
     }
     event
 }
@@ -8884,7 +9878,41 @@ async fn send_event(
 #[derive(Debug, Deserialize)]
 struct MessagesQuery {
     from: Option<String>,
+    to: Option<String>,
+    dir: Option<String>,
     limit: Option<usize>,
+}
+
+/// What a room-pagination token names, as a gap in `room_id`'s linear
+/// index: ours directly, a Synapse one through the positions the importer
+/// recorded (#568).
+///
+/// `Ok(None)` is a Synapse token this room has no positions for -- a room
+/// that was not imported, or one imported before positions were kept. The
+/// caller decides what that falls back to; it is not a 400, because the
+/// client kept the token honestly, and refusing it leaves the client unable
+/// to scroll past what it had cached, every time it tries.
+fn room_page_token(
+    state: &AppState,
+    room_id: &str,
+    token: &str,
+) -> Result<Option<i64>, MatrixError> {
+    match crate::tokens::Pagination::resume(token)
+        .map_err(|error| MatrixError::bad_json(error.to_string()))?
+    {
+        crate::tokens::PageFrom::Ours(position) => Ok(Some(position)),
+        crate::tokens::PageFrom::Synapse(position) => {
+            match state
+                .rooms
+                .synapse_gap(room_id, position)
+                .map_err(room_error)?
+            {
+                Some(crate::rooms::SynapseGap::At(gap)) => Ok(Some(gap)),
+                Some(crate::rooms::SynapseGap::BeforeAll) => Ok(Some(i64::MIN)),
+                None => Ok(None),
+            }
+        }
+    }
 }
 
 /// `GET /_matrix/client/v3/rooms/{room_id}/messages`
@@ -8892,6 +9920,13 @@ struct MessagesQuery {
 /// The pagination token is the linear index, which is what SPEC 10.2's
 /// "tokens are opaque to clients" buys: the ordering already exists, so there
 /// is nothing to sort at read time and nothing to maintain alongside.
+///
+/// A token is a gap: `t{p}` sits just below the entry at `p`. `dir=b` pages
+/// down from it and `dir=f` up from it, so `/context`'s `end` and a forward
+/// page's `end` are where the next forward page starts, and the two
+/// directions agree on what one token means. Forward paging is what a
+/// client does from a permalink, a reply, a search hit or a notification:
+/// Element X's focused timeline is `/context` and then `dir=f` (#568).
 async fn room_messages(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
@@ -8902,18 +9937,61 @@ async fn room_messages(
         .rooms
         .reader(&identity.user_id, &room_id)
         .map_err(room_error)?;
+    // The spec requires `dir`; a request without one is still read as
+    // backward, which is what every caller that left it out meant.
+    let direction = match query.dir.as_deref() {
+        Some("f") => crate::rooms::Direction::Forward,
+        Some("b") | None => crate::rooms::Direction::Backward,
+        Some(other) => {
+            return Err(MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                format!("dir must be 'f' or 'b', not {other:?}"),
+            ));
+        }
+    };
     let from = match query.from.as_deref() {
-        Some(token) => Some(
-            token
-                .parse::<crate::tokens::Pagination>()
-                .map_err(|error| MatrixError::bad_json(error.to_string()))?
-                .0,
-        ),
+        Some(token) => match room_page_token(&state, &room_id, token)? {
+            Some(position) => Some(position),
+            // A Synapse token with no recorded position. Going back, page
+            // from the head: the client is handed events it may already
+            // hold, drops them, and carries on with our `end` from there
+            // -- a longer scroll, never a lost one. Going forward, there
+            // is no telling where it was, so the page is empty and says
+            // it has reached the live end, which a forward walk then
+            // follows from `/sync`.
+            None => match direction {
+                crate::rooms::Direction::Backward => None,
+                crate::rooms::Direction::Forward => Some(i64::MAX),
+            },
+        },
+        None => None,
+    };
+    // `to` bounds the page; one this room cannot place bounds nothing.
+    let to = match query.to.as_deref() {
+        Some(token) => room_page_token(&state, &room_id, token)?,
         None => None,
     };
     let limit = query.limit.unwrap_or(10).clamp(1, 100);
+    // Paging back into a room whose history has a gap still being filled:
+    // put that room first in the backfill loop's queue (#619). The page
+    // itself is served from what is held now; it does not wait.
+    if matches!(direction, crate::rooms::Direction::Backward)
+        && state.rooms.has_open_gap(&room_id).unwrap_or(false)
+    {
+        state.backfill.poke(&room_id);
+    }
 
-    let (events, next) = reader.messages(from, limit).map_err(room_error)?;
+    let (events, next) = reader
+        .page(
+            crate::rooms::Page {
+                from,
+                to,
+                direction,
+            },
+            limit,
+        )
+        .map_err(room_error)?;
 
     let chunk: Vec<Value> = events
         .iter()
@@ -8930,13 +10008,21 @@ async fn room_messages(
     body.insert("chunk".to_owned(), Value::Array(chunk));
     // Where this chunk began. Without a `from` that is the room's head, which
     // is one past the newest event -- not the literal string "end", which is
-    // what this sent before and which no client could page from.
-    let start =
-        from.unwrap_or_else(|| events.first().map_or(0, |event| event.li.saturating_add(1)));
-    body.insert(
-        "start".to_owned(),
-        json!(crate::tokens::Pagination(start).to_string()),
-    );
+    // what this sent before and which no client could page from. Forward,
+    // it is the room's beginning. With a `from`, it is that token as the
+    // client sent it, which the spec asks for and which keeps a Synapse
+    // token the client's own.
+    let start = match query.from {
+        Some(token) => token,
+        None => crate::tokens::Pagination(match direction {
+            crate::rooms::Direction::Backward => {
+                events.first().map_or(0, |event| event.li.saturating_add(1))
+            }
+            crate::rooms::Direction::Forward => events.first().map_or(0, |event| event.li),
+        })
+        .to_string(),
+    };
+    body.insert("start".to_owned(), json!(start));
     // Absent when there is nothing more, which is how a client knows to stop.
     if let Some(next) = next {
         body.insert(
@@ -9149,6 +10235,7 @@ fn matches_term(summary: &crate::rooms::RoomSummary, term: &str) -> bool {
 /// failing.
 fn directory_page(
     state: &AppState,
+    user_id: &str,
     limit: Option<usize>,
     since: Option<&str>,
     term: Option<&str>,
@@ -9173,7 +10260,7 @@ fn directory_page(
     // whole listing down with it.
     let mut visible: Vec<crate::rooms::RoomSummary> = Vec::new();
     for room_id in &published {
-        let Ok(summary) = state.rooms.summary(room_id) else {
+        let Ok(summary) = state.rooms.summary_for(user_id, room_id) else {
             continue;
         };
         if term.is_some_and(|term| !matches_term(&summary, term)) {
@@ -9230,7 +10317,7 @@ async fn public_rooms(
     axum::extract::Query(query): axum::extract::Query<PublicRoomsQuery>,
 ) -> Result<Json<Value>, MatrixError> {
     refuse_remote_directory(query.server.as_ref(), &state.config.server.name)?;
-    directory_page(&state, query.limit, query.since.as_deref(), None, &[])
+    directory_page(&state, "", query.limit, query.since.as_deref(), None, &[])
 }
 
 /// `POST /_matrix/client/v3/publicRooms`
@@ -9240,12 +10327,13 @@ async fn public_rooms(
 /// attributable.
 async fn public_rooms_filtered(
     State(state): State<AppState>,
-    Authenticated(_identity): Authenticated,
+    Authenticated(identity): Authenticated,
     Json(request): Json<PublicRoomsRequest>,
 ) -> Result<Json<Value>, MatrixError> {
     refuse_remote_directory(request.server.as_ref(), &state.config.server.name)?;
     directory_page(
         &state,
+        &identity.user_id,
         request.limit,
         request.since.as_deref(),
         request.filter.generic_search_term.as_deref(),
@@ -9546,7 +10634,7 @@ async fn search(
             if let Some(wanted) = &criteria.event_context
                 && let Some(scope) = scopes.get(&hit.room_id)
             {
-                result["context"] = search_context(&state, hit, wanted, scope);
+                result["context"] = search_context(&state, &identity.user_id, hit, wanted, scope);
             }
             result
         })
@@ -9565,7 +10653,7 @@ async fn search(
     if criteria.include_state {
         room_events.insert(
             "state".to_owned(),
-            Value::Object(search_state(&state, &hits, &scopes)?),
+            Value::Object(search_state(&state, &identity.user_id, &hits, &scopes)?),
         );
     }
     Ok(Json(json!({
@@ -9607,7 +10695,7 @@ fn search_rooms(
         let matches = |event: &Value| search_matches(event, needle, keys, &criteria.filter);
         let (found, next) = state
             .rooms
-            .reader_with(&room_id, scope.clone())
+            .reader_with(user_id, &room_id, scope.clone())
             .search(cursor.get(&room_id).copied(), limit, &matches)
             .map_err(room_error)?;
         more |= next.is_some();
@@ -9757,7 +10845,7 @@ async fn notifications(
         };
         let (found, next) = state
             .rooms
-            .reader_with(&room_id, scope.clone())
+            .reader_with(&identity.user_id, &room_id, scope.clone())
             .search(cursor.get(&room_id).copied(), limit, &notifies)
             .map_err(room_error)?;
         more |= next.is_some();
@@ -9830,6 +10918,7 @@ fn render_notifications(
 /// one, exactly as `/state` answers.
 fn search_state(
     state: &AppState,
+    user_id: &str,
     hits: &[SearchHit],
     scopes: &BTreeMap<String, ReadScope>,
 ) -> Result<serde_json::Map<String, Value>, MatrixError> {
@@ -9845,7 +10934,7 @@ fn search_state(
         // carries that answer rather than asking again.
         let rendered = state
             .rooms
-            .reader_with(&hit.room_id, scope.clone())
+            .reader_with(user_id, &hit.room_id, scope.clone())
             .state_serialized()
             .map_err(room_error)?;
         let room_state = serde_json::from_str::<Value>(&rendered)
@@ -9860,6 +10949,7 @@ fn search_state(
 /// read is a hit without context rather than a failed search.
 fn search_context(
     state: &AppState,
+    user_id: &str,
     hit: &SearchHit,
     wanted: &SearchContext,
     scope: &ReadScope,
@@ -9868,7 +10958,7 @@ fn search_context(
     let after_limit = wanted.after_limit.unwrap_or(SEARCH_CONTEXT_EACH_SIDE);
     let Ok(context) = state
         .rooms
-        .reader_with(&hit.room_id, scope.clone())
+        .reader_with(user_id, &hit.room_id, scope.clone())
         .context(&hit.event.event_id, before_limit, after_limit)
     else {
         return Value::Null;
@@ -10095,6 +11185,9 @@ async fn deactivate_account(
     accounts
         .logout_everywhere(&localpart)
         .map_err(|error| internal(&error))?;
+    if let Some(delegated) = &state.delegated {
+        delegated.forget_user(&identity.user_id);
+    }
     state.rooms.wake_sync_waiters();
 
     // No identity server is contacted, so no third-party binding is removed.
@@ -10202,7 +11295,7 @@ fn hierarchy_visible(
     user: &str,
     room_id: &str,
 ) -> Option<crate::rooms::RoomSummary> {
-    let summary = state.rooms.summary(room_id).ok()?;
+    let summary = state.rooms.summary_for(user, room_id).ok()?;
     if state.rooms.is_joined(user, room_id).unwrap_or(false) {
         return Some(summary);
     }
@@ -10649,7 +11742,7 @@ async fn federation_public_rooms(
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
     federation_origin(&state, &headers, "GET", &uri, None).await?;
-    directory_page(&state, query.limit, query.since.as_deref(), None, &[])
+    directory_page(&state, "", query.limit, query.since.as_deref(), None, &[])
 }
 
 /// `POST /_matrix/federation/v1/publicRooms`
@@ -10672,6 +11765,7 @@ async fn federation_public_rooms_filtered(
         serde_json::from_value(body).map_err(|error| MatrixError::bad_json(error.to_string()))?;
     directory_page(
         &state,
+        "",
         filter.limit,
         filter.since.as_deref(),
         filter.filter.generic_search_term.as_deref(),

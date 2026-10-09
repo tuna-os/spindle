@@ -149,6 +149,18 @@ const TABLE: &[Route] = &[
         path: "/_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}",
         reach: Reach::Refused,
     },
+    // MSC4140's scheduling endpoint: a stranger may not hold a delay in a
+    // room they could not send to now.
+    Route {
+        method: "PUT",
+        path: "/_matrix/client/unstable/org.matrix.msc4140/rooms/{room_id}/delayed_event/{event_type}/{txn_id}",
+        reach: Reach::Refused,
+    },
+    Route {
+        method: "PUT",
+        path: "/_matrix/client/v3/rooms/{room_id}/delayed_event/{event_type}/{txn_id}",
+        reach: Reach::Refused,
+    },
     Route {
         method: "PUT",
         path: "/_matrix/client/v3/rooms/{room_id}/redact/{event_id}/{txn_id}",
@@ -448,7 +460,9 @@ fn body_for(route: &Route, event: &str) -> Option<Value> {
         return None;
     }
     let path = route.path;
-    Some(if path.contains("/send/") {
+    Some(if path.contains("/delayed_event/") {
+        json!({ "delay_ms": 60_000, "content": { "msgtype": "m.text", "body": "later, from outside" } })
+    } else if path.contains("/send/") {
         json!({ "msgtype": "m.text", "body": "hello from outside" })
     } else if path.contains("/state/") {
         json!({ "name": "renamed from outside" })

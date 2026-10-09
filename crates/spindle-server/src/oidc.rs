@@ -16,10 +16,11 @@
 //! the front door — discovery, client registration, an authorization
 //! page, PKCE — and the house behind it is unchanged.
 //!
-//! What is deliberately absent: upstream identity providers, SSO, email flows,
-//! account management UI. Those are what a real MAS is for, and the
-//! docs say so; this is the floor that makes a single-node deployment
-//! whole, not a MAS replacement.
+//! Around that front door sit the pages a user reaches from their client
+//! (#607, `account.rs`): profile, password, sessions, deactivation — and
+//! a browser session, so a second client's sign-in is "Continue as …"
+//! rather than the password again. Upstream identity providers (#610)
+//! are still absent; `docs/delegated-auth.md` describes where they hook in.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -27,8 +28,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Form, Query, State};
-use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,9 @@ use spindle_store::{ReadView, Store};
 use crate::AppState;
 use crate::accounts::Accounts;
 use crate::errors::MatrixError;
+use crate::metrics::{GrantResult, LoginMethod, LoginResult, TokenGrant};
+use crate::routes::ClientAddr;
+use crate::web::{self, FormTargets, escape, hidden, urlencode};
 
 /// An RFC 6749 error: `{"error": code, "error_description": …}` with
 /// the right status. The callers of `/oauth2/*` are OAuth libraries
@@ -154,7 +158,7 @@ pub fn routes() -> Router<AppState> {
 /// The provider, or the 404 an undelegated non-provider answers. The
 /// same refusal shape as every other unconfigured feature: absence,
 /// not a stub.
-fn provider(state: &AppState) -> Result<&BuiltinOidc, MatrixError> {
+pub(crate) fn provider(state: &AppState) -> Result<&BuiltinOidc, MatrixError> {
     state.oidc.as_deref().ok_or_else(|| {
         MatrixError::new(
             StatusCode::NOT_FOUND,
@@ -164,14 +168,14 @@ fn provider(state: &AppState) -> Result<&BuiltinOidc, MatrixError> {
     })
 }
 
-/// Where this provider says it lives — the client-facing base URL.
+/// Where this provider says it lives, without the trailing slash:
+/// `auth.oidc_issuer` when configured (#609), the client-facing base URL
+/// otherwise. Every URL the discovery document advertises is built on
+/// this, so a deployment that moves the issuer to its own host moves
+/// every endpoint with it.
 #[must_use]
 pub fn issuer(state: &AppState) -> String {
-    state
-        .config
-        .client_base_url()
-        .trim_end_matches('/')
-        .to_owned()
+    state.config.oidc_issuer_base()
 }
 
 /// The discovery document, served at the well-known path and relayed
@@ -190,6 +194,11 @@ pub fn metadata(state: &AppState) -> Value {
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "token_endpoint_auth_methods_supported": ["none"],
         "code_challenge_methods_supported": ["S256"],
+        "prompt_values_supported": ["login"],
+        // MSC4191: where a client sends its user to manage the account,
+        // and which of the pages it may deep-link to with `?action=`.
+        "account_management_uri": crate::account::management_uri(state),
+        "account_management_actions_supported": crate::account::ACTIONS_SUPPORTED,
     })
 }
 
@@ -275,6 +284,51 @@ struct AuthorizeParams {
     #[serde(default = "default_response_mode")]
     response_mode: String,
     response_type: Option<String>,
+    /// OIDC's `prompt`: `login` asks for the password even when a browser
+    /// session could continue. Anything else is ignored.
+    prompt: Option<String>,
+}
+
+impl AuthorizeParams {
+    /// The authorization request as a query string, for a link back to
+    /// the same request (the consent page's "use another account").
+    fn query(&self, prompt: Option<&str>) -> String {
+        let mut query = form_urlencoded::Serializer::new(String::new());
+        query
+            .append_pair("client_id", &self.client_id)
+            .append_pair("redirect_uri", &self.redirect_uri)
+            .append_pair("scope", &self.scope)
+            .append_pair("code_challenge", &self.code_challenge)
+            .append_pair("code_challenge_method", &self.code_challenge_method)
+            .append_pair("response_mode", &self.response_mode)
+            .append_pair("response_type", "code");
+        if let Some(value) = &self.state {
+            query.append_pair("state", value);
+        }
+        if let Some(prompt) = prompt {
+            query.append_pair("prompt", prompt);
+        }
+        query.finish()
+    }
+
+    /// The authorization request as hidden form fields.
+    fn hidden_fields(&self) -> String {
+        let mut fields = String::new();
+        fields.push_str(&hidden("client_id", &self.client_id));
+        fields.push_str(&hidden("redirect_uri", &self.redirect_uri));
+        fields.push_str(&hidden("scope", &self.scope));
+        fields.push_str(&hidden("code_challenge", &self.code_challenge));
+        fields.push_str(&hidden(
+            "code_challenge_method",
+            &self.code_challenge_method,
+        ));
+        fields.push_str(&hidden("response_mode", &self.response_mode));
+        fields.push_str(&hidden("response_type", "code"));
+        if let Some(value) = &self.state {
+            fields.push_str(&hidden("state", value));
+        }
+        fields
+    }
 }
 
 fn default_challenge_method() -> String {
@@ -358,21 +412,101 @@ fn device_id_of(scope: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// `GET /oauth2/authorize` — the login page.
+/// `GET /oauth2/authorize` — the login page, or "Continue as …".
 ///
 /// Plain HTML, no scripts: the page's whole job is to carry the
 /// authorization parameters through a password prompt. Values are
 /// HTML-escaped on the way in; they came from a URL a stranger built.
+/// A browser already signed in here (by an earlier authorization or the
+/// account pages) is offered the account it is signed in as instead,
+/// unless the client asked for `prompt=login`.
 async fn authorize_page(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<AuthorizeParams>,
-) -> Result<Html<String>, OAuthError> {
+) -> Result<Response, OAuthError> {
     provider(&state)?;
     check_authorize(&state, &params)?;
-    let client_name = load_client(&state, &params.client_id)?
+    let client_name = client_name(&state, &params.client_id)?;
+    if params.prompt.as_deref() != Some("login")
+        && let Some(session) = web::browser_session(&state, &headers)?
+    {
+        return Ok(web::html(
+            StatusCode::OK,
+            FormTargets::Redirecting,
+            consent_page(&state, &params, &client_name, &session),
+        ));
+    }
+    Ok(login_response(
+        &state,
+        &headers,
+        StatusCode::OK,
+        &params,
+        &client_name,
+        None,
+    ))
+}
+
+fn client_name(state: &AppState, client_id: &str) -> Result<String, MatrixError> {
+    Ok(load_client(state, client_id)?
         .and_then(|client| client.client_name)
-        .unwrap_or_else(|| "an application".to_owned());
-    Ok(Html(login_page(&state, &params, &client_name, None)))
+        .unwrap_or_else(|| "an application".to_owned()))
+}
+
+/// The host a code would be sent to, shown so the person can tell an
+/// impostor's registration from the client they meant.
+fn redirect_host(redirect_uri: &str) -> &str {
+    redirect_uri
+        .split_once("://")
+        .map_or(redirect_uri, |(_, rest)| rest)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+}
+
+fn consent_page(
+    state: &AppState,
+    params: &AuthorizeParams,
+    client_name: &str,
+    session: &web::BrowserSession,
+) -> String {
+    let user_id =
+        Accounts::new(state.store.as_ref(), &state.config.server.name).user_id(&session.localpart);
+    let body = format!(
+        "<h1>Continue to {client}?</h1>\
+         <p><strong>{client}</strong> (<code>{host}</code>) is asking to sign in as you.</p>\
+         <p>You are signed in as <strong>{user}</strong>.</p>\
+         <form method=\"post\" action=\"/oauth2/authorize\">{fields}{csrf}\
+         <button type=\"submit\">Continue as {user}</button></form>\
+         <p><a href=\"/oauth2/authorize?{other}\">Use a different account</a></p>",
+        client = escape(client_name),
+        host = escape(redirect_host(&params.redirect_uri)),
+        user = escape(&user_id),
+        fields = params.hidden_fields(),
+        csrf = hidden("csrf", &session.csrf),
+        other = escape(&params.query(Some("login"))),
+    );
+    web::page(state, "Continue", &body)
+}
+
+fn login_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    status: StatusCode,
+    params: &AuthorizeParams,
+    client_name: &str,
+    error: Option<&str>,
+) -> Response {
+    let (csrf, set_csrf) = web::signed_out_csrf(state, headers);
+    let response = web::html(
+        status,
+        FormTargets::Redirecting,
+        login_page(state, params, client_name, error, &csrf),
+    );
+    match set_csrf {
+        Some(cookie) => web::with_cookie(response, &cookie),
+        None => response,
+    }
 }
 
 fn login_page(
@@ -380,62 +514,45 @@ fn login_page(
     params: &AuthorizeParams,
     client_name: &str,
     error: Option<&str>,
+    csrf: &str,
 ) -> String {
-    let hidden = |name: &str, value: &str| {
-        format!(
-            "<input type=\"hidden\" name=\"{}\" value=\"{}\">",
-            escape(name),
-            escape(value)
-        )
-    };
-    let mut fields = String::new();
-    fields.push_str(&hidden("client_id", &params.client_id));
-    fields.push_str(&hidden("redirect_uri", &params.redirect_uri));
-    fields.push_str(&hidden("scope", &params.scope));
-    fields.push_str(&hidden("code_challenge", &params.code_challenge));
-    fields.push_str(&hidden(
-        "code_challenge_method",
-        &params.code_challenge_method,
-    ));
-    fields.push_str(&hidden("response_mode", &params.response_mode));
-    fields.push_str(&hidden("response_type", "code"));
-    if let Some(value) = &params.state {
-        fields.push_str(&hidden("state", value));
-    }
     let notice = error.map_or(String::new(), |message| {
         format!("<p class=\"error\">{}</p>", escape(message))
     });
-    format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <title>Sign in — {server}</title>\
-         <style>body{{font-family:system-ui,sans-serif;display:grid;place-items:center;\
-         min-height:100vh;margin:0;background:#f4f4f4}}form{{background:#fff;\
-         padding:2rem;border-radius:8px;box-shadow:0 1px 4px rgba(0,0,0,.15);\
-         display:flex;flex-direction:column;gap:.75rem;min-width:280px}}\
-         input{{padding:.5rem;font-size:1rem}}button{{padding:.6rem;font-size:1rem}}\
-         .error{{color:#b00;margin:0}}</style></head><body>\
-         <form method=\"post\" action=\"/oauth2/authorize\">\
+    let forgot = crate::recovery::recovery_links(state);
+    let body = format!(
+        "<form method=\"post\" action=\"/oauth2/authorize\">\
          <h1>Sign in to {server}</h1>\
-         <p>{client} is asking to sign in as you.</p>{notice}{fields}\
+         <p>{client} (<code>{host}</code>) is asking to sign in as you.</p>{notice}{fields}{csrf}\
          <input name=\"username\" placeholder=\"Username\" autocomplete=\"username\" required>\
          <input name=\"password\" type=\"password\" placeholder=\"Password\" \
          autocomplete=\"current-password\" required>\
-         <button type=\"submit\">Sign in</button></form></body></html>",
+         <button type=\"submit\">Sign in</button></form>{forgot}",
         server = escape(&state.config.server.name),
         client = escape(client_name),
+        host = escape(redirect_host(&params.redirect_uri)),
         notice = notice,
-        fields = fields,
-    )
+        fields = params.hidden_fields(),
+        csrf = hidden("login_csrf", csrf),
+    );
+    web::page(state, "Sign in", &body)
 }
 
 /// The login form's fields — the authorization parameters spelled out
 /// rather than `#[serde(flatten)]`, which form-urlencoded
-/// deserialization does not reliably support.
+/// deserialization does not reliably support. `username` and
+/// `password` are absent on the "Continue as …" form, which carries the
+/// browser session's `csrf` instead.
 #[derive(Deserialize)]
 struct AuthorizeForm {
-    username: String,
-    password: String,
+    username: Option<String>,
+    password: Option<String>,
+    csrf: Option<String>,
+    /// The double-submit token of the password form. Optional so that a
+    /// client driving the form without cookies (the pre-#607 flow) still
+    /// signs in: a login form is not a state change a third party can
+    /// profit from forcing, since it needs the victim's own password.
+    login_csrf: Option<String>,
     client_id: String,
     redirect_uri: String,
     scope: String,
@@ -459,45 +576,68 @@ impl AuthorizeForm {
             code_challenge_method: self.code_challenge_method.clone(),
             response_mode: self.response_mode.clone(),
             response_type: self.response_type.clone(),
+            prompt: None,
         }
     }
 }
 
-/// `POST /oauth2/authorize` — check the password, mint a code, redirect.
+/// `POST /oauth2/authorize` — check the password (or the browser
+/// session), mint a code, redirect.
+///
+/// The password is counted against the same per-account and per-source
+/// budgets as the client API's login, before the Argon2 work. A correct
+/// password also starts a browser session, so the account pages and the
+/// next client's authorization find the user signed in.
 async fn authorize(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    source: ClientAddr,
     Form(form): Form<AuthorizeForm>,
 ) -> Result<Response, OAuthError> {
     let oidc = provider(&state)?;
     let params = form.params();
     check_authorize(&state, &params)?;
-    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
-    let localpart = form.username.trim().to_lowercase();
-    let localpart = localpart
-        .strip_prefix('@')
-        .and_then(|rest| rest.split_once(':'))
-        .map_or(localpart.as_str(), |(name, _)| name)
-        .to_owned();
-    let good = accounts
-        .verify_password(&localpart, &form.password)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    if !good {
-        // Back to the form, not an OAuth error: a typo'd password is the
-        // human's business, and the flow is still alive.
-        let client_name = load_client(&state, &params.client_id)?
-            .and_then(|client| client.client_name)
-            .unwrap_or_else(|| "an application".to_owned());
-        return Ok((
-            StatusCode::UNAUTHORIZED,
-            Html(login_page(
-                &state,
-                &params,
-                &client_name,
-                Some("That username and password did not match."),
-            )),
+    let client_name = client_name(&state, &params.client_id)?;
+    let form_error = |status: StatusCode, message: &str| {
+        login_response(
+            &state,
+            &headers,
+            status,
+            &params,
+            &client_name,
+            Some(message),
         )
-            .into_response());
-    }
+    };
+
+    let (localpart, new_session) = if let (None, Some(csrf)) = (&form.password, &form.csrf) {
+        // "Continue as …": the browser session is the credential, and its
+        // CSRF secret proves the form is the one this server rendered.
+        let Some(session) = web::browser_session(&state, &headers)? else {
+            return Ok(form_error(
+                StatusCode::UNAUTHORIZED,
+                "Your sign-in has expired. Please sign in again.",
+            ));
+        };
+        if !session.csrf_ok(Some(csrf)) {
+            return Ok(form_error(
+                StatusCode::FORBIDDEN,
+                "That form has expired. Please sign in again.",
+            ));
+        }
+        state
+            .metrics
+            .record_login(LoginMethod::OidcSession, LoginResult::Success);
+        (session.localpart, None)
+    } else {
+        match password_sign_in(&state, &headers, &source.to_string(), &form)? {
+            Ok(localpart) => {
+                let cookie = web::start_browser_session(&state, &localpart)?;
+                (localpart, Some(cookie))
+            }
+            Err((status, message)) => return Ok(form_error(status, message)),
+        }
+    };
+
     let device_id = device_id_of(&params.scope)
         .ok_or_else(|| MatrixError::internal("checked scope lost its device"))?;
     let code = random_hex(32);
@@ -528,7 +668,69 @@ async fn authorize(
         '?'
     };
     let target = format!("{}{separator}{fragment_or_query}", params.redirect_uri);
-    Ok(Redirect::to(&target).into_response())
+    let response = Redirect::to(&target).into_response();
+    Ok(match new_session {
+        Some(cookie) => web::with_cookie(response, &cookie),
+        None => response,
+    })
+}
+
+/// The password half of the authorization form: the localpart it signs
+/// in, or the status and message to re-render the form with. Counted
+/// against the shared attempt budget before the Argon2 work.
+fn password_sign_in(
+    state: &AppState,
+    headers: &HeaderMap,
+    source: &str,
+    form: &AuthorizeForm,
+) -> Result<Result<String, (StatusCode, &'static str)>, OAuthError> {
+    let (Some(username), Some(password)) = (&form.username, &form.password) else {
+        return Ok(Err((
+            StatusCode::BAD_REQUEST,
+            "Enter your username and password.",
+        )));
+    };
+    if form.login_csrf.is_some() && !web::signed_out_csrf_ok(headers, form.login_csrf.as_deref()) {
+        return Ok(Err((
+            StatusCode::FORBIDDEN,
+            "That form has expired. Please try again.",
+        )));
+    }
+    let localpart = web::localpart_of(username);
+    if web::spend_password_attempt(state, &localpart, source).is_err() {
+        state
+            .metrics
+            .record_login(LoginMethod::Oidc, LoginResult::RateLimited);
+        return Ok(Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many attempts. Wait a minute and try again.",
+        )));
+    }
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let good = accounts
+        .verify_password(&localpart, password)
+        .map_err(|error| {
+            state
+                .metrics
+                .record_login(LoginMethod::Oidc, LoginResult::Error);
+            MatrixError::internal(&error.to_string())
+        })?;
+    if !good {
+        // Back to the form, not an OAuth error: a typo'd password is the
+        // human's business, and the flow is still alive.
+        state
+            .metrics
+            .record_login(LoginMethod::Oidc, LoginResult::BadPassword);
+        return Ok(Err((
+            StatusCode::UNAUTHORIZED,
+            "That username and password did not match.",
+        )));
+    }
+    web::forget_password_attempts(state, &localpart, source);
+    state
+        .metrics
+        .record_login(LoginMethod::Oidc, LoginResult::Success);
+    Ok(Ok(localpart))
 }
 
 #[derive(Deserialize)]
@@ -552,6 +754,29 @@ async fn token(
     Form(request): Form<TokenRequest>,
 ) -> Result<Json<Value>, OAuthError> {
     let oidc = provider(&state)?;
+    let grant = match request.grant_type.as_str() {
+        "authorization_code" => Some(TokenGrant::AuthorizationCode),
+        "refresh_token" => Some(TokenGrant::RefreshToken),
+        _ => None,
+    };
+    let outcome = grant_token(&state, oidc, &request);
+    if let Some(grant) = grant {
+        let result = match &outcome {
+            Ok(_) => GrantResult::Success,
+            Err(error) if error.code == "invalid_grant" => GrantResult::InvalidGrant,
+            Err(error) if error.code == "invalid_request" => GrantResult::InvalidRequest,
+            Err(_) => GrantResult::Error,
+        };
+        state.metrics.record_token_grant(grant, result);
+    }
+    outcome
+}
+
+fn grant_token(
+    state: &AppState,
+    oidc: &BuiltinOidc,
+    request: &TokenRequest,
+) -> Result<Json<Value>, OAuthError> {
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     match request.grant_type.as_str() {
         "authorization_code" => {
@@ -697,16 +922,4 @@ pub(crate) fn base64url_unpadded(bytes: &[u8]) -> String {
         }
     }
     out
-}
-
-fn escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-fn urlencode(value: &str) -> String {
-    form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }

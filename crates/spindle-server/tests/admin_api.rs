@@ -138,6 +138,30 @@ fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
             reqwest::Method::POST,
             "/_synapse/admin/v1/purge_history/!r:x".to_owned(),
         ),
+        (
+            reqwest::Method::GET,
+            format!("/_synapse/admin/v2/users/{user}/devices/DEV"),
+        ),
+        (
+            reqwest::Method::PUT,
+            format!("/_synapse/admin/v2/users/{user}/devices/DEV"),
+        ),
+        (
+            reqwest::Method::DELETE,
+            format!("/_synapse/admin/v2/users/{user}/devices/DEV"),
+        ),
+        (
+            reqwest::Method::DELETE,
+            "/_synapse/admin/v2/rooms/!r:x".to_owned(),
+        ),
+        (
+            reqwest::Method::GET,
+            "/_synapse/admin/v2/rooms/!r:x/delete_status".to_owned(),
+        ),
+        (
+            reqwest::Method::GET,
+            "/_synapse/admin/v2/rooms/delete_status/abc".to_owned(),
+        ),
     ]);
     for prefix in ["/_spindle/admin/v1", "/_synapse/admin/v1"] {
         routes.extend([
@@ -152,6 +176,14 @@ fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
             (
                 reqwest::Method::POST,
                 format!("{prefix}/users/{user}/reset_password"),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("{prefix}/users/{user}/password_hash"),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("{prefix}/users/{user}/reset_link"),
             ),
             (
                 reqwest::Method::GET,
@@ -214,6 +246,47 @@ fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
             (reqwest::Method::GET, format!("{prefix}/event_reports")),
             (reqwest::Method::GET, format!("{prefix}/event_reports/1")),
             (reqwest::Method::GET, format!("{prefix}/audit")),
+            (
+                reqwest::Method::GET,
+                format!("{prefix}/users/{user}/devices/DEV"),
+            ),
+            (
+                reqwest::Method::PUT,
+                format!("{prefix}/users/{user}/devices/DEV"),
+            ),
+            (reqwest::Method::GET, format!("{prefix}/users/{user}/admin")),
+            (reqwest::Method::PUT, format!("{prefix}/users/{user}/admin")),
+            (
+                reqwest::Method::GET,
+                format!("{prefix}/username_available?username=x"),
+            ),
+            (reqwest::Method::GET, format!("{prefix}/rooms/!r:x/block")),
+            (reqwest::Method::PUT, format!("{prefix}/rooms/!r:x/block")),
+            (reqwest::Method::DELETE, format!("{prefix}/event_reports/1")),
+            (reqwest::Method::GET, format!("{prefix}/scheduled_tasks")),
+            (
+                reqwest::Method::GET,
+                format!("{prefix}/federation/destinations"),
+            ),
+            (
+                reqwest::Method::GET,
+                format!("{prefix}/federation/destinations/peer"),
+            ),
+            (
+                reqwest::Method::GET,
+                format!("{prefix}/federation/destinations/peer/rooms"),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("{prefix}/federation/destinations/peer/reset_connection"),
+            ),
+            (reqwest::Method::GET, format!("{prefix}/users/{user}/media")),
+            (
+                reqwest::Method::DELETE,
+                format!("{prefix}/users/{user}/media"),
+            ),
+            (reqwest::Method::GET, format!("{prefix}/media/x/y")),
+            (reqwest::Method::DELETE, format!("{prefix}/media/x/y")),
         ]);
     }
     routes
@@ -575,7 +648,7 @@ async fn rooms_fixture(server: &Instance) -> (String, String, String) {
             reqwest::Method::POST,
             "/_matrix/client/v3/createRoom",
             Some(&admin_token),
-            Some(&json!({ "name": "Operations", "preset": "public_chat" })),
+            Some(&json!({ "name": "Operations", "preset": "public_chat", "visibility": "public" })),
         )
         .await;
     assert_eq!(status, 200, "{body}");
@@ -641,6 +714,7 @@ async fn the_room_listing_orders_filters_and_paginates() {
     assert_eq!(body["rooms"][1]["room_id"], unnamed.as_str(), "{body}");
     assert_eq!(body["rooms"][0]["name"], "Operations", "{body}");
     assert_eq!(body["rooms"][0]["joined_members"], 2, "{body}");
+    // `public` is Synapse's: in this server's room directory.
     assert_eq!(body["rooms"][0]["public"], true, "{body}");
     assert_eq!(body["rooms"][1]["public"], false, "{body}");
     assert!(body["rooms"][0]["version"].is_string(), "{body}");
@@ -1358,6 +1432,67 @@ async fn make_room_admin_authors_a_real_event() {
     assert_eq!(body["entries"][0]["detail"]["user_id"], alice.as_str());
 }
 
+/// Room versions before 10 allow power levels written as strings, and the
+/// rooms a migration brings over have them. Read as absent, every level fell
+/// back to `users_default`, and no local user had the power to author.
+#[tokio::test]
+async fn make_room_admin_reads_string_power_levels_in_a_v6_room() {
+    let server = Instance::start().await;
+    let admin_token = server.register("root").await;
+    server.promote("root");
+    let alice_token = server.register("alice").await;
+    let operator = server.user("root");
+    let alice = server.user("alice");
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/createRoom",
+            Some(&admin_token),
+            Some(&json!({ "preset": "public_chat", "room_version": "6" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/join/{room}"),
+            Some(&alice_token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    // A v6 power levels event may state every level as a string; the auth
+    // rules of the version accept it.
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.power_levels"),
+            Some(&admin_token),
+            Some(&json!({
+                "users": { operator.as_str(): "100" },
+                "users_default": "0",
+                "events": { "m.room.power_levels": "100" },
+                "state_default": "50",
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "a v6 room refused string power levels: {body}");
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_spindle/admin/v1/rooms/{room}/make_room_admin"),
+            Some(&admin_token),
+            Some(&json!({ "user_id": alice })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["power_level"], 100, "{body}");
+}
+
 #[tokio::test]
 async fn make_room_admin_says_so_when_nobody_local_can_author() {
     let server = Instance::start().await;
@@ -1502,7 +1637,8 @@ async fn event_reports_list_newest_first_and_paginate() {
         .await;
     assert_eq!(status, 200, "{page}");
     assert_eq!(page["event_reports"].as_array().unwrap().len(), 1, "{page}");
-    assert_eq!(page["next_token"], "1", "{page}");
+    // An integer, as Synapse's event report paging is.
+    assert_eq!(page["next_token"], 1, "{page}");
     let (_, page) = server
         .request(
             reqwest::Method::GET,
@@ -1671,4 +1807,912 @@ async fn synapse_spellings_reach_the_same_handlers() {
         )
         .await;
     assert_eq!(user["deactivated"], true, "{user}");
+}
+
+/// #611: an Argon2 hash computed elsewhere (here, exactly as MAS writes
+/// one) becomes the account's password; an unusable one is refused with
+/// the account untouched; the audit log records the act, never the hash.
+#[tokio::test]
+async fn an_imported_password_hash_signs_the_user_in() {
+    const MAS_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$bWFzLW1pZ3JhdGlvbi0xNg$CEd7EMaeQK2QDHVNURFc/tH0y2Ja5MduCcmz5Gs8uIo";
+    let server = Instance::start().await;
+    let admin_token = server.register("root").await;
+    server.promote("root");
+    let victim_token = server.register("migrated").await;
+    let victim = server.user("migrated");
+    let path = format!("/_spindle/admin/v1/users/{victim}/password_hash");
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &path,
+            Some(&admin_token),
+            Some(&json!({ "password_hash": "$2b$12$notargon" })),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["errcode"], "M_INVALID_PARAM", "{body}");
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &path,
+            Some(&admin_token),
+            Some(&json!({ "password_hash": MAS_HASH })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let login = |password: &'static str| {
+        json!({
+            "type": "m.login.password",
+            "identifier": { "type": "m.id.user", "user": "migrated" },
+            "password": password,
+        })
+    };
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/login",
+            None,
+            Some(&login("correct horse battery staple")),
+        )
+        .await;
+    assert_eq!(status, 200, "the MAS password signs in: {body}");
+    let (status, _) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/login",
+            None,
+            Some(&login("hunter2hunter2")),
+        )
+        .await;
+    assert_eq!(status, 403, "the old password is gone");
+    // Sessions survive by default: a migration is not a sign-out.
+    let (status, _) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(&victim_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    let (_, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_spindle/admin/v1/audit?action=set_password_hash",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(body["total"], 1, "{body}");
+    assert_eq!(
+        body["entries"][0]["detail"]["algorithm"], "argon2id",
+        "{body}"
+    );
+    assert!(
+        !body.to_string().contains("CEd7EMae") && !body.to_string().contains("bWFzLW1p"),
+        "the hash leaked into the audit log: {body}"
+    );
+}
+
+/// Without the built-in provider there is no page for a reset link to
+/// open, so none is issued.
+#[tokio::test]
+async fn reset_links_need_the_builtin_provider() {
+    let server = Instance::start().await;
+    let admin_token = server.register("root").await;
+    server.promote("root");
+    server.register("alice").await;
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!(
+                "/_spindle/admin/v1/users/{}/reset_link",
+                server.user("alice")
+            ),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 404, "{body}");
+}
+
+/// The users group in Synapse's shapes, as synadm and the admin panels
+/// read them: every field of a user, a device, and the listing's filters,
+/// orderings and paging.
+#[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one walk through the group")]
+async fn users_and_devices_answer_in_synapses_shapes() {
+    let server = Instance::start().await;
+    let admin_token = server.register("root").await;
+    server.promote("root");
+    let alice_token = server.register("alice").await;
+    server.register("bob").await;
+    let alice = server.user("alice");
+    let get = |path: String| {
+        let server = &server;
+        let token = admin_token.clone();
+        async move {
+            let (status, body) = server
+                .request(reqwest::Method::GET, &path, Some(&token), None)
+                .await;
+            assert_eq!(status, 200, "{path}: {body}");
+            body
+        }
+    };
+
+    let listed = get("/_synapse/admin/v2/users".to_owned()).await;
+    for user in listed["users"].as_array().unwrap() {
+        for field in [
+            "name",
+            "user_type",
+            "is_guest",
+            "admin",
+            "deactivated",
+            "erased",
+            "shadow_banned",
+            "displayname",
+            "avatar_url",
+            "creation_ts",
+            "approved",
+            "locked",
+            "suspended",
+            "last_seen_ts",
+        ] {
+            assert!(user.get(field).is_some(), "{field} missing from {user}");
+        }
+    }
+    // Name ascending by default, descending with `dir=b`.
+    let names = |body: &Value| -> Vec<String> {
+        body["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|user| user["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(
+        names(&listed),
+        [
+            server.user("alice"),
+            server.user("bob"),
+            server.user("root")
+        ]
+    );
+    let backwards = get("/_synapse/admin/v2/users?dir=b".to_owned()).await;
+    assert_eq!(
+        names(&backwards),
+        [
+            server.user("root"),
+            server.user("bob"),
+            server.user("alice")
+        ]
+    );
+    let admins = get("/_synapse/admin/v2/users?admins=true".to_owned()).await;
+    assert_eq!(names(&admins), [server.user("root")]);
+    // `name` matches the display name too, case-insensitively.
+    server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_synapse/admin/v2/users/{alice}"),
+            Some(&admin_token),
+            Some(&json!({ "displayname": "Wonderland" })),
+        )
+        .await;
+    let by_name = get("/_synapse/admin/v2/users?name=WONDER".to_owned()).await;
+    assert_eq!(names(&by_name), std::slice::from_ref(&alice));
+    let page = get("/_synapse/admin/v2/users?limit=2".to_owned()).await;
+    assert_eq!(page["next_token"], "2", "{page}");
+    assert_eq!(page["total"], 3, "{page}");
+    let (status, _) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v2/users?order_by=height",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 400);
+
+    // The detail adds third-party IDs and the rest.
+    let detail = get(format!("/_synapse/admin/v2/users/{alice}")).await;
+    for field in [
+        "threepids",
+        "external_ids",
+        "appservice_id",
+        "consent_version",
+    ] {
+        assert!(detail.get(field).is_some(), "{field} missing from {detail}");
+    }
+
+    // A device, listed, read, renamed.
+    let devices = get(format!("/_synapse/admin/v2/users/{alice}/devices")).await;
+    let device = &devices["devices"][0];
+    for field in [
+        "device_id",
+        "display_name",
+        "last_seen_ip",
+        "last_seen_ts",
+        "last_seen_user_agent",
+        "user_id",
+    ] {
+        assert!(device.get(field).is_some(), "{field} missing from {device}");
+    }
+    let device_id = device["device_id"].as_str().unwrap().to_owned();
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_synapse/admin/v2/users/{alice}/devices/{device_id}"),
+            Some(&admin_token),
+            Some(&json!({ "display_name": "Alice's laptop" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let one = get(format!(
+        "/_synapse/admin/v2/users/{alice}/devices/{device_id}"
+    ))
+    .await;
+    assert_eq!(one["display_name"], "Alice's laptop", "{one}");
+    assert_eq!(one["user_id"], alice.as_str(), "{one}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v2/users/{alice}/devices/NOPE"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 404, "{body}");
+
+    // The admin flag, which an admin cannot take from themselves.
+    let flag = get(format!("/_synapse/admin/v1/users/{alice}/admin")).await;
+    assert_eq!(flag, json!({ "admin": false }));
+    let root = server.user("root");
+    let (status, _) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_synapse/admin/v1/users/{root}/admin"),
+            Some(&admin_token),
+            Some(&json!({ "admin": false })),
+        )
+        .await;
+    assert_eq!(status, 400, "self-demotion");
+
+    // Username availability.
+    let free = get("/_synapse/admin/v1/username_available?username=carol".to_owned()).await;
+    assert_eq!(free, json!({ "available": true }));
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/username_available?username=alice",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["errcode"], "M_USER_IN_USE", "{body}");
+
+    // A password set through PUT signs the user out, as Synapse does.
+    let (status, _) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_synapse/admin/v2/users/{alice}"),
+            Some(&admin_token),
+            Some(&json!({ "password": "a-new-password-1" })),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, _) = server
+        .request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(&alice_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 401, "signed out by the password change");
+
+    // Locking through PUT, and the listing filter for it.
+    server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_synapse/admin/v2/users/{alice}"),
+            Some(&admin_token),
+            Some(&json!({ "locked": true })),
+        )
+        .await;
+    let locked = get("/_synapse/admin/v2/users?locked=true".to_owned()).await;
+    assert_eq!(names(&locked), [alice]);
+}
+
+/// Media: a user's uploads, one item, and deletion that takes the bytes.
+#[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one walk through the group")]
+async fn user_media_lists_and_deletes() {
+    let server = Instance::start().await;
+    let admin_token = server.register("root").await;
+    server.promote("root");
+    let alice_token = server.register("alice").await;
+    let alice = server.user("alice");
+    let mut uploaded = Vec::new();
+    for name in ["one.txt", "two.txt"] {
+        let response = server
+            .client
+            .post(format!(
+                "http://{}/_matrix/media/v3/upload?filename={name}",
+                server.name
+            ))
+            .header("authorization", format!("Bearer {alice_token}"))
+            .header("content-type", "text/plain")
+            .body(format!("contents of {name}"))
+            .send()
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+        let mxc = body["content_uri"].as_str().unwrap().to_owned();
+        uploaded.push(mxc.rsplit('/').next().unwrap().to_owned());
+    }
+
+    let (status, listing) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v1/users/{alice}/media"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{listing}");
+    assert_eq!(listing["total"], 2, "{listing}");
+    let item = &listing["media"][0];
+    for field in [
+        "media_id",
+        "media_type",
+        "media_length",
+        "upload_name",
+        "created_ts",
+        "last_access_ts",
+        "quarantined_by",
+        "safe_from_quarantine",
+    ] {
+        assert!(item.get(field).is_some(), "{field} missing from {item}");
+    }
+
+    let server_name = server.name.clone();
+    let (status, info) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v1/media/{server_name}/{}", uploaded[0]),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{info}");
+    assert_eq!(info["media_info"]["user_id"], alice.as_str(), "{info}");
+    assert_eq!(info["media_info"]["upload_name"], "one.txt", "{info}");
+
+    let (status, deleted) = server
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/_synapse/admin/v1/media/{server_name}/{}", uploaded[0]),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{deleted}");
+    assert_eq!(
+        deleted,
+        json!({ "deleted_media": [uploaded[0]], "total": 1 })
+    );
+    let response = server
+        .client
+        .get(format!(
+            "http://{}/_matrix/client/v1/media/download/{server_name}/{}",
+            server.name, uploaded[0]
+        ))
+        .header("authorization", format!("Bearer {alice_token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 404, "deleted media is gone");
+    let (status, _) = server
+        .request(
+            reqwest::Method::DELETE,
+            "/_synapse/admin/v1/media/elsewhere.example/abc",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 400, "remote media is the other server's to delete");
+
+    let (status, deleted) = server
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/_synapse/admin/v1/users/{alice}/media"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{deleted}");
+    assert_eq!(deleted["total"], 1, "{deleted}");
+}
+
+/// Event reports filter, page by integer token, and can be dismissed;
+/// rooms can be blocked and unblocked without being deleted.
+#[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one walk through the group")]
+async fn reports_dismiss_and_rooms_block_in_synapses_shapes() {
+    let server = Instance::start().await;
+    let (admin_token, room, _, _) = reports_fixture(&server).await;
+    let (status, reports) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/event_reports?dir=f",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{reports}");
+    let first = reports["event_reports"][0]["id"].as_u64().unwrap();
+    let (_, newest) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/event_reports",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert!(
+        newest["event_reports"][0]["id"].as_u64().unwrap() > first,
+        "{newest}"
+    );
+    let (_, filtered) = server
+        .request(
+            reqwest::Method::GET,
+            &format!(
+                "/_synapse/admin/v1/event_reports?event_sender_user_id={}",
+                server.user("nobody")
+            ),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(filtered["total"], 0, "{filtered}");
+
+    let (status, _) = server
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/_synapse/admin/v1/event_reports/{first}"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, _) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v1/event_reports/{first}"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 404, "a dismissed report is gone");
+
+    let block_path = format!("/_synapse/admin/v1/rooms/{room}/block");
+    let (_, block) = server
+        .request(reqwest::Method::GET, &block_path, Some(&admin_token), None)
+        .await;
+    assert_eq!(block, json!({ "block": false }));
+    let (status, block) = server
+        .request(
+            reqwest::Method::PUT,
+            &block_path,
+            Some(&admin_token),
+            Some(&json!({ "block": true })),
+        )
+        .await;
+    assert_eq!(status, 200, "{block}");
+    assert_eq!(block, json!({ "block": true }));
+    let (_, block) = server
+        .request(reqwest::Method::GET, &block_path, Some(&admin_token), None)
+        .await;
+    assert_eq!(block["block"], true, "{block}");
+    assert_eq!(block["user_id"], server.user("root"), "{block}");
+    let (_, block) = server
+        .request(
+            reqwest::Method::PUT,
+            &block_path,
+            Some(&admin_token),
+            Some(&json!({ "block": false })),
+        )
+        .await;
+    assert_eq!(block, json!({ "block": false }));
+}
+
+/// Five rooms that differ in every column Synapse's room listing sorts on:
+/// sizes 5, 3, 2, 1 and 0; two unnamed rooms (so `NULL` placement and the
+/// room-ID tie-break both show); room versions whose byte order differs
+/// from their numeric order; and different creators, join rules, history
+/// visibility, guest access, encryption, federation and publication.
+#[allow(clippy::too_many_lines, reason = "one room per block, five rooms")]
+async fn ordering_fixture(server: &Instance) -> (String, Vec<(&'static str, String)>) {
+    let root = server.register("root").await;
+    server.promote("root");
+    let mut tokens = std::collections::HashMap::new();
+    for user in ["alice", "bob", "carol", "dave", "erin"] {
+        tokens.insert(user, server.register(user).await);
+    }
+    let create = |creator: &'static str, body: Value| {
+        let token = tokens[creator].clone();
+        async move {
+            let (status, created) = server
+                .request(
+                    reqwest::Method::POST,
+                    "/_matrix/client/v3/createRoom",
+                    Some(&token),
+                    Some(&body),
+                )
+                .await;
+            assert_eq!(status, 200, "{created}");
+            created["room_id"].as_str().unwrap().to_owned()
+        }
+    };
+    let join = |user: &'static str, room: String| {
+        let token = tokens[user].clone();
+        async move {
+            let (status, body) = server
+                .request(
+                    reqwest::Method::POST,
+                    &format!("/_matrix/client/v3/join/{room}"),
+                    Some(&token),
+                    Some(&json!({})),
+                )
+                .await;
+            assert_eq!(status, 200, "{user} joins {room}: {body}");
+        }
+    };
+
+    let zebra = create(
+        "alice",
+        json!({
+            "name": "Zebra crossing", "room_version": "6", "preset": "public_chat",
+            "visibility": "public", "room_alias_name": "zebra",
+            "initial_state": [
+                {"type": "m.room.history_visibility", "state_key": "", "content": {"history_visibility": "world_readable"}},
+                {"type": "m.room.guest_access", "state_key": "", "content": {"guest_access": "can_join"}},
+            ],
+        }),
+    )
+    .await;
+    for user in ["bob", "carol", "dave", "erin"] {
+        join(user, zebra.clone()).await;
+    }
+    let apple = create(
+        "bob",
+        json!({
+            "name": "apple", "room_version": "10", "preset": "public_chat",
+            "initial_state": [{"type": "m.room.encryption", "state_key": "",
+                               "content": {"algorithm": "m.megolm.v1.aes-sha2"}}],
+        }),
+    )
+    .await;
+    join("carol", apple.clone()).await;
+    let lonely = create(
+        "carol",
+        json!({
+            "room_version": "11", "room_alias_name": "middle",
+            "creation_content": {"m.federate": false},
+        }),
+    )
+    .await;
+    let mango = create(
+        "dave",
+        json!({"name": "Mango", "room_version": "12", "topic": "fruit"}),
+    )
+    .await;
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/rooms/{mango}/leave"),
+            Some(&tokens["dave"]),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let crowd = create(
+        "erin",
+        json!({
+            "room_version": "12", "preset": "public_chat",
+            "initial_state": [{"type": "m.room.join_rules", "state_key": "",
+                               "content": {"join_rule": "public"}},
+                              {"type": "m.room.history_visibility", "state_key": "",
+                               "content": {"history_visibility": "invited"}}],
+        }),
+    )
+    .await;
+    join("alice", crowd.clone()).await;
+    join("bob", crowd.clone()).await;
+    (
+        root,
+        vec![
+            ("zebra", zebra),
+            ("apple", apple),
+            ("lonely", lonely),
+            ("mango", mango),
+            ("crowd", crowd),
+        ],
+    )
+}
+
+/// Synapse's ordering, written out independently of the server: the
+/// column, whether it sorts ascending by default, `dir=b` flipping it,
+/// `NULL` last ascending and first descending (`PostgreSQL`), byte order for
+/// text (the `C` collation Synapse requires), and the room ID as the tie
+/// break in the same direction.
+#[derive(PartialEq, PartialOrd)]
+enum SortKey {
+    Number(u64),
+    Text(String),
+    Flag(bool),
+}
+
+fn synapse_order(rows: &[Value], order_by: &str, dir: &str) -> Vec<String> {
+    let (column, ascending) = match order_by {
+        "name" | "alphabetical" => ("name", true),
+        "size" | "joined_members" => ("joined_members", false),
+        "joined_local_members" => ("joined_local_members", false),
+        "version" => ("version", false),
+        "state_events" => ("state_events", false),
+        other => (other, true),
+    };
+    let ascending = if dir == "b" { !ascending } else { ascending };
+    let key = |row: &Value| -> Option<SortKey> {
+        match &row[column] {
+            Value::Number(n) => Some(SortKey::Number(n.as_u64().unwrap())),
+            Value::String(s) => Some(SortKey::Text(s.clone())),
+            Value::Bool(b) => Some(SortKey::Flag(*b)),
+            _ => None,
+        }
+    };
+    let mut sorted: Vec<&Value> = rows.iter().collect();
+    sorted.sort_by(|a, b| {
+        let by_column = match (key(a), key(b)) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap(),
+        };
+        let order = by_column.then_with(|| {
+            a["room_id"]
+                .as_str()
+                .unwrap()
+                .cmp(b["room_id"].as_str().unwrap())
+        });
+        if ascending { order } else { order.reverse() }
+    });
+    sorted
+        .iter()
+        .map(|row| row["room_id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Every `order_by` Synapse accepts, in both directions, against rooms that
+/// differ in every column: the exact order, and paging through it two at a
+/// time with Synapse's `offset`, `next_batch` and `prev_batch`.
+#[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one table of expectations")]
+async fn room_listing_orders_exactly_as_synapse_for_every_column_and_direction() {
+    let server = Instance::start().await;
+    let (token, rooms) = ordering_fixture(&server).await;
+    let id = |name: &str| {
+        rooms
+            .iter()
+            .find(|(label, _)| *label == name)
+            .unwrap()
+            .1
+            .clone()
+    };
+    let label = |room_id: &str| {
+        rooms
+            .iter()
+            .find(|(_, id)| id == room_id)
+            .map_or("?", |(label, _)| *label)
+    };
+    let list = |query: String| {
+        let server = &server;
+        let token = token.clone();
+        async move {
+            let (status, body) = server
+                .request(
+                    reqwest::Method::GET,
+                    &format!("/_synapse/admin/v1/rooms{query}"),
+                    Some(&token),
+                    None,
+                )
+                .await;
+            assert_eq!(status, 200, "{query}: {body}");
+            body
+        }
+    };
+    let all = list("?limit=100".to_owned()).await;
+    let rows = all["rooms"].as_array().unwrap().clone();
+    assert_eq!(rows.len(), 5, "{all}");
+    let row = |name: &str| rows.iter().find(|r| r["room_id"] == id(name)).unwrap();
+    // The fixture really does differ where the orderings look.
+    let sizes: Vec<_> = ["zebra", "crowd", "apple", "lonely", "mango"]
+        .iter()
+        .map(|name| row(name)["joined_members"].as_u64().unwrap())
+        .collect();
+    assert_eq!(sizes, [5, 3, 2, 1, 0]);
+    assert_eq!(row("lonely")["name"], Value::Null);
+    assert_eq!(row("crowd")["name"], Value::Null);
+    assert_eq!(row("lonely")["federatable"], false);
+    assert_eq!(row("zebra")["public"], true);
+    assert_eq!(row("apple")["encryption"], "m.megolm.v1.aes-sha2");
+
+    // Spelled out, for the columns an operator sorts by most, so a mistake
+    // shared by the server and the oracle above still fails.
+    let named = |names: &[&str]| -> Vec<String> { names.iter().map(|n| id(n)).collect() };
+    let (unnamed_first, unnamed_second) = {
+        let (a, b) = (id("lonely"), id("crowd"));
+        if a < b {
+            ("lonely", "crowd")
+        } else {
+            ("crowd", "lonely")
+        }
+    };
+    let spelled: Vec<(&str, &str, Vec<String>)> = vec![
+        (
+            "joined_members",
+            "f",
+            named(&["zebra", "crowd", "apple", "lonely", "mango"]),
+        ),
+        (
+            "joined_members",
+            "b",
+            named(&["mango", "lonely", "apple", "crowd", "zebra"]),
+        ),
+        (
+            "size",
+            "f",
+            named(&["zebra", "crowd", "apple", "lonely", "mango"]),
+        ),
+        (
+            "joined_local_members",
+            "f",
+            named(&["zebra", "crowd", "apple", "lonely", "mango"]),
+        ),
+        (
+            "joined_local_members",
+            "b",
+            named(&["mango", "lonely", "apple", "crowd", "zebra"]),
+        ),
+        // Byte order: uppercase before lowercase, unnamed last; reversed,
+        // unnamed first with their room IDs descending.
+        (
+            "name",
+            "f",
+            named(&["mango", "zebra", "apple", unnamed_first, unnamed_second]),
+        ),
+        (
+            "name",
+            "b",
+            named(&[unnamed_second, unnamed_first, "apple", "zebra", "mango"]),
+        ),
+        // Text, descending by default: "6" > "12" > "11" > "10".
+        ("version", "f", {
+            let (twelve_a, twelve_b) = if id("mango") > id("crowd") {
+                ("mango", "crowd")
+            } else {
+                ("crowd", "mango")
+            };
+            named(&["zebra", twelve_a, twelve_b, "lonely", "apple"])
+        }),
+    ];
+    for (order_by, dir, expected) in &spelled {
+        let body = list(format!("?limit=100&order_by={order_by}&dir={dir}")).await;
+        let got: Vec<String> = body["rooms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["room_id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            got.iter().map(|r| label(r)).collect::<Vec<_>>(),
+            expected.iter().map(|r| label(r)).collect::<Vec<_>>(),
+            "{order_by} dir={dir}"
+        );
+    }
+
+    for order_by in [
+        "alphabetical",
+        "size",
+        "name",
+        "canonical_alias",
+        "joined_members",
+        "joined_local_members",
+        "version",
+        "creator",
+        "encryption",
+        "federatable",
+        "public",
+        "join_rules",
+        "guest_access",
+        "history_visibility",
+        "state_events",
+    ] {
+        for dir in ["f", "b"] {
+            let expected = synapse_order(&rows, order_by, dir);
+            let body = list(format!("?limit=100&order_by={order_by}&dir={dir}")).await;
+            let got: Vec<String> = body["rooms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["room_id"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(
+                got.iter().map(|r| label(r)).collect::<Vec<_>>(),
+                expected.iter().map(|r| label(r)).collect::<Vec<_>>(),
+                "{order_by} dir={dir}"
+            );
+
+            // Two at a time: the same order, no overlap, Synapse's offsets.
+            let mut walked = Vec::new();
+            let mut from = 0_u64;
+            loop {
+                let page = list(format!(
+                    "?limit=2&from={from}&order_by={order_by}&dir={dir}"
+                ))
+                .await;
+                assert_eq!(page["offset"], from, "{order_by} {dir}: {page}");
+                assert_eq!(page["total_rooms"], 5, "{order_by} {dir}: {page}");
+                if from == 0 {
+                    assert!(page.get("prev_batch").is_none(), "{page}");
+                } else {
+                    assert_eq!(page["prev_batch"], from.saturating_sub(2), "{page}");
+                }
+                walked.extend(
+                    page["rooms"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|r| r["room_id"].as_str().unwrap().to_owned()),
+                );
+                match page.get("next_batch") {
+                    Some(next) => {
+                        assert_eq!(next, &json!(from + 2), "{page}");
+                        from += 2;
+                    }
+                    None => break,
+                }
+            }
+            assert_eq!(walked, expected, "{order_by} dir={dir} paged");
+        }
+    }
+
+    // Synapse's search: name anywhere, alias only in its localpart, room ID
+    // exactly.
+    let search = |term: String| {
+        let list = &list;
+        async move {
+            let body = list(format!("?search_term={term}")).await;
+            body["rooms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["room_id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(search("CROSS".to_owned()).await, [id("zebra")]);
+    assert_eq!(search("middl".to_owned()).await, [id("lonely")]);
+    // The alias is `#middle:127.0.0.1:<port>`; its last part is not in the
+    // localpart, so it does not match, as on a server named `reilly.asia`.
+    let port = server.name.rsplit(':').next().unwrap().to_owned();
+    assert!(
+        search(port).await.is_empty(),
+        "the end of the server name is not in any alias's localpart"
+    );
 }

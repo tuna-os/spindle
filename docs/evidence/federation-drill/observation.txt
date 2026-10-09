@@ -1,0 +1,27 @@
+observation start 2026-10-03T22:55:22Z
+2026-10-03T23:01:30Z round 1 pingpong(all_ok,max_s)=False 99 statechange_ok_rooms=-
+2026-10-03T23:03:37Z round 2 pingpong(all_ok,max_s)=True 0.52 statechange_ok_rooms=-
+2026-10-03T23:05:44Z round 3 pingpong(all_ok,max_s)=True 0.51 statechange_ok_rooms=-
+2026-10-03T23:07:51Z round 4 pingpong(all_ok,max_s)=True 0.52 statechange_ok_rooms=-
+2026-10-03T23:14:18Z round 5 pingpong(all_ok,max_s)=True 0.51 statechange_ok_rooms=['encrypted-v10', 'history-v10', 'v10-general', 'v6', 'v9']
+2026-10-03T23:16:24Z round 6 pingpong(all_ok,max_s)=True 0.51 statechange_ok_rooms=-
+2026-10-03T23:18:32Z round 7 pingpong(all_ok,max_s)=True 1.01 statechange_ok_rooms=-
+2026-10-03T23:20:38Z round 8 pingpong(all_ok,max_s)=True 0.51 statechange_ok_rooms=-
+2026-10-03T23:22:45Z round 9 pingpong(all_ok,max_s)=True 0.52 statechange_ok_rooms=-
+2026-10-03T23:29:11Z round 10 pingpong(all_ok,max_s)=True 0.51 statechange_ok_rooms=['encrypted-v10', 'history-v10', 'v10-general', 'v6', 'v9']
+2026-10-03T23:31:18Z round 11 pingpong(all_ok,max_s)=True 0.51 statechange_ok_rooms=-
+2026-10-03T23:33:25Z round 12 pingpong(all_ok,max_s)=True 0.51 statechange_ok_rooms=-
+2026-10-03T23:35:32Z round 13 pingpong(all_ok,max_s)=True 1.02 statechange_ok_rooms=-
+2026-10-03T23:37:39Z round 14 pingpong(all_ok,max_s)=True 0.51 statechange_ok_rooms=-
+2026-10-03T23:44:05Z round 15 pingpong(all_ok,max_s)=True 0.51 statechange_ok_rooms=['encrypted-v10', 'history-v10', 'v10-general', 'v6', 'v9']
+2026-10-03T23:46:11Z round 16 pingpong(all_ok,max_s)=True 0.51 statechange_ok_rooms=-
+2026-10-03T23:48:18Z round 17 pingpong(all_ok,max_s)=True 0.51 statechange_ok_rooms=-
+2026-10-03T23:50:25Z round 18 pingpong(all_ok,max_s)=True 1.02 statechange_ok_rooms=-
+2026-10-03T23:52:32Z round 19 pingpong(all_ok,max_s)=True 0.51 statechange_ok_rooms=-
+2026-10-03T23:58:57Z round 20 pingpong(all_ok,max_s)=True 0.51 statechange_ok_rooms=['encrypted-v10', 'history-v10', 'v10-general', 'v6', 'v9']
+2026-10-04T00:01:04Z round 21 pingpong(all_ok,max_s)=True 0.52 statechange_ok_rooms=-
+2026-10-04T00:03:11Z round 22 pingpong(all_ok,max_s)=True 0.51 statechange_ok_rooms=-
+2026-10-04T00:05:18Z round 23 pingpong(all_ok,max_s)=True 1.02 statechange_ok_rooms=-
+2026-10-04T00:07:25Z round 24 pingpong(all_ok,max_s)=True 0.53 statechange_ok_rooms=-
+2026-10-04T00:13:52Z round 25 pingpong(all_ok,max_s)=True 0.52 statechange_ok_rooms=['encrypted-v10', 'history-v10', 'v10-general', 'v6', 'v9']
+observation end 2026-10-04T00:15:52Z

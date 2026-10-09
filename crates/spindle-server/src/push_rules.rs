@@ -78,6 +78,39 @@ fn overrides(user_id: &str) -> Value {
             json!([event_match("type", "m.room.member")]),
             json!([]),
         ),
+        // MSC4075's MatrixRTC invites: a ring that names the user, or the
+        // whole room from someone allowed to, rings -- ahead of the mention
+        // rules, so a room set to mentions-only still rings for a call the
+        // user is invited to, and a ring can be silenced apart from other
+        // mentions. Synapse's placement and its unstable IDs, which are the
+        // ones Element reads and offers as settings.
+        rule(
+            ".org.matrix.msc4075.rule.rtc.invite_for_me",
+            true,
+            json!([
+                event_match("type", crate::push::RING_UNSTABLE),
+                {
+                    "kind": "event_property_contains",
+                    "key": r"content.m\.mentions.user_ids",
+                    "value": user_id,
+                },
+            ]),
+            notify_with_sound("ring"),
+        ),
+        rule(
+            ".org.matrix.msc4075.rule.rtc.invite_for_room",
+            true,
+            json!([
+                event_match("type", crate::push::RING_UNSTABLE),
+                {
+                    "kind": "event_property_is",
+                    "key": r"content.m\.mentions.room",
+                    "value": true,
+                },
+                { "kind": "sender_notification_permission", "key": "room" },
+            ]),
+            notify_with_sound("ring"),
+        ),
         rule(
             ".m.rule.is_user_mention",
             true,
@@ -188,6 +221,52 @@ fn underrides() -> Value {
             json!(["notify"]),
         ),
     ])
+}
+
+/// `stored` with every server-default rule it lacks put back in its place.
+///
+/// A ruleset is stored whole once its owner edits a rule, which froze it at
+/// the defaults of that day: a rule the server added afterwards -- MSC4075's
+/// ring rules are the case that found this -- never reached anyone who had
+/// ever touched a setting, which on a server migrated from Synapse is
+/// everyone. A server-default rule cannot be deleted, only disabled, so one
+/// that is missing is always one that is newer than the ruleset, and adding
+/// it changes nothing the user chose. It goes beside its neighbours in the
+/// default order, ahead of the next default rule the ruleset has, so the
+/// priority the spec gives it holds.
+#[must_use]
+pub fn with_defaults(mut stored: Value, user_id: &str) -> Value {
+    let defaults = defaults(user_id);
+    for kind in KINDS {
+        let Some(wanted) = defaults[kind].as_array() else {
+            continue;
+        };
+        if !stored[kind].is_array() {
+            stored[kind] = Value::Array(Vec::new());
+        }
+        for (index, rule) in wanted.iter().enumerate() {
+            let Some(rule_id) = rule["rule_id"].as_str() else {
+                continue;
+            };
+            if position(&stored, kind, rule_id).is_some() {
+                continue;
+            }
+            let at = wanted
+                .iter()
+                .skip(index + 1)
+                .find_map(|next| position(&stored, kind, next["rule_id"].as_str()?))
+                .or_else(|| {
+                    wanted[..index].iter().rev().find_map(|previous| {
+                        position(&stored, kind, previous["rule_id"].as_str()?).map(|at| at + 1)
+                    })
+                });
+            if let Some(rules) = stored[kind].as_array_mut() {
+                let at = at.unwrap_or(rules.len()).min(rules.len());
+                rules.insert(at, rule.clone());
+            }
+        }
+    }
+    stored
 }
 
 /// Built by moving `conditions` and `actions` into the map rather than through
@@ -372,13 +451,12 @@ fn condition_holds(condition: &Value, event: &Value, context: &Context<'_>) -> b
             .is_some_and(|is| member_count_is(is, context.member_count)),
         Some("sender_notification_permission") => {
             let key = condition["key"].as_str().unwrap_or_default();
-            let required = context.power_levels["notifications"][key]
-                .as_i64()
-                .unwrap_or(50);
+            // Room versions before 10 allow a level written as a string.
+            let level_of = crate::rooms::power_level;
+            let required = level_of(&context.power_levels["notifications"][key]).unwrap_or(50);
             let sender = event["sender"].as_str().unwrap_or_default();
-            let level = context.power_levels["users"][sender]
-                .as_i64()
-                .or_else(|| context.power_levels["users_default"].as_i64())
+            let level = level_of(&context.power_levels["users"][sender])
+                .or_else(|| level_of(&context.power_levels["users_default"]))
                 .unwrap_or(0);
             level >= required
         }
@@ -516,6 +594,101 @@ mod tests {
         })
     }
 
+    /// MSC4075: a ring that names the user rings, with the ring sound and
+    /// ahead of the mention rule; one for the room rings everyone when the
+    /// sender may notify the room; one that names somebody else is silent.
+    #[test]
+    fn a_ring_rings_who_it_invites() {
+        let ruleset = defaults("@bob:example.org");
+        let levels = json!({ "users": { "@alice:example.org": 100 } });
+        let ring = |mentions: Value| {
+            json!({
+                "type": "org.matrix.msc4075.rtc.notification",
+                "sender": "@alice:example.org",
+                "content": { "m.mentions": mentions, "sender_ts": 1, "lifetime": 90_000 },
+            })
+        };
+        let rings = json!(["notify", { "set_tweak": "sound", "value": "ring" }]);
+        assert_eq!(
+            evaluate(
+                &ruleset,
+                &ring(json!({ "user_ids": ["@bob:example.org"] })),
+                &context(&levels, 3)
+            ),
+            Some(rings.as_array().unwrap().clone())
+        );
+        assert_eq!(
+            evaluate(
+                &ruleset,
+                &ring(json!({ "room": true })),
+                &context(&levels, 3)
+            ),
+            Some(rings.as_array().unwrap().clone())
+        );
+        let unprivileged = json!({ "users": {} });
+        assert_ne!(
+            evaluate(
+                &ruleset,
+                &ring(json!({ "room": true })),
+                &context(&unprivileged, 3)
+            ),
+            Some(rings.as_array().unwrap().clone()),
+            "a sender who may not notify the room cannot ring it"
+        );
+        assert_ne!(
+            evaluate(
+                &ruleset,
+                &ring(json!({ "user_ids": ["@carol:example.org"] })),
+                &context(&levels, 3)
+            ),
+            Some(rings.as_array().unwrap().clone())
+        );
+    }
+
+    /// A ruleset stored before a default rule existed gains it, in its
+    /// place, without losing anything its owner changed.
+    #[test]
+    fn a_stored_ruleset_gains_the_defaults_added_since() {
+        let user = "@bob:example.org";
+        let mut stored = defaults(user);
+        let overrides = stored["override"].as_array_mut().unwrap();
+        overrides.retain(|rule| {
+            !rule["rule_id"]
+                .as_str()
+                .unwrap()
+                .starts_with(".org.matrix.msc4075.")
+        });
+        // The owner's own edits: a rule of theirs at the front, and a
+        // default silenced.
+        overrides.insert(
+            0,
+            json!({ "rule_id": "mine", "default": false, "enabled": true,
+                    "conditions": [], "actions": [] }),
+        );
+        stored["underride"][3]["enabled"] = json!(false);
+
+        let merged = with_defaults(stored.clone(), user);
+        let ids: Vec<&str> = merged["override"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|rule| rule["rule_id"].as_str().unwrap())
+            .collect();
+        let at = |id: &str| ids.iter().position(|candidate| *candidate == id).unwrap();
+        assert_eq!(ids[0], "mine");
+        assert!(at(".org.matrix.msc4075.rule.rtc.invite_for_me") < at(".m.rule.is_user_mention"));
+        assert_eq!(
+            at(".org.matrix.msc4075.rule.rtc.invite_for_me") + 1,
+            at(".org.matrix.msc4075.rule.rtc.invite_for_room")
+        );
+        assert_eq!(merged["underride"][3]["enabled"], false, "an edit was lost");
+        assert_eq!(
+            with_defaults(merged.clone(), user),
+            merged,
+            "a ruleset that has every default is left alone"
+        );
+    }
+
     fn context(power_levels: &Value, member_count: usize) -> Context<'_> {
         Context {
             user_id: "@alice:example.org",
@@ -601,6 +774,33 @@ mod tests {
                 .as_deref()
                 .is_some_and(|actions| actions.iter().any(|a| a["set_tweak"] == "sound")),
             "{rings:?}"
+        );
+    }
+
+    /// Rooms before v10 may state levels as strings, and an `@room` from a
+    /// moderator in such a room is still a moderator's `@room`. Read as a
+    /// missing level it fell back to 0 and never highlighted.
+    #[test]
+    fn a_room_mention_reads_string_power_levels_from_a_legacy_room() {
+        let ruleset = defaults("@alice:example.org");
+        let mut at_room = message("@bob:example.org", "everyone");
+        at_room["content"]["m.mentions"] = json!({ "room": true });
+        let levels = json!({
+            "users": { "@bob:example.org": " 50 " },
+            "notifications": { "room": "+50" },
+        });
+        assert!(
+            evaluate(&ruleset, &at_room, &context(&levels, 3))
+                .as_deref()
+                .is_some_and(is_highlight)
+        );
+        let too_low = json!({ "users": { "@bob:example.org": "10" } });
+        let actions = evaluate(&ruleset, &at_room, &context(&too_low, 3));
+        assert!(
+            actions
+                .as_deref()
+                .is_some_and(|actions| !is_highlight(actions)),
+            "{actions:?}"
         );
     }
 
