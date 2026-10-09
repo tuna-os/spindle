@@ -29,6 +29,8 @@ reqwest.workspace = true
 sha2.workspace = true
 sha1.workspace = true
 hmac.workspace = true
+hickory-resolver.workspace = true
+lettre.workspace = true
 blake3.workspace = true
 image.workspace = true
 rand.workspace = true
@@ -46,6 +48,7 @@ tracing-subscriber.workspace = true
 tower.workspace = true
 
 rusqlite = { workspace = true, optional = true }
+postgres = { workspace = true, optional = true }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace"] }
 tracing-opentelemetry = "0.34"
 opentelemetry = "0.33"
@@ -54,9 +57,12 @@ opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "trace"] }
 [features]
 # Off by default: the reader is a one-shot migration path, and neither the
 # server binary nor the hot CI gate should pay a C compile for it.
-synapse-import = ["dep:rusqlite"]
+synapse-import = ["dep:postgres", "dep:rusqlite"]
+# Enable the production-corpus replay harness.
+corpus-replay = []
 
 [dev-dependencies]
+tokio-rustls = "0.26"
 # `state-res` so the tests can judge our events with the same implementation a
 # federating peer would (ADR 0002: ruma judges, it never builds our side).
 ruma = { workspace = true, features = ["state-res", "events"] }
@@ -81,4 +87,8 @@ harness = false
 
 [[bench]]
 name = "ring_latency"
+harness = false
+
+[[bench]]
+name = "call_churn"
 harness = false

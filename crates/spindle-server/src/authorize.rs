@@ -38,6 +38,10 @@ pub struct StoredEvent {
     state_key: Option<String>,
     prev_events: Vec<OwnedEventId>,
     auth_events: Vec<OwnedEventId>,
+    redacts: Option<OwnedEventId>,
+    depth: i64,
+    rejected: bool,
+    preserved_rejection: bool,
 }
 
 impl StoredEvent {
@@ -55,6 +59,50 @@ impl StoredEvent {
     pub fn parse_in(event_id: &str, room_id: &str, json: &Value) -> Result<Self, String> {
         let named = json["room_id"].as_str().unwrap_or(room_id);
         Self::parse_with_room_id(event_id, named, json)
+    }
+
+    /// Parse an existing auth event containing legacy power-level user IDs.
+    ///
+    /// Synapse has persisted power-level maps with IDs that ruma cannot parse
+    /// (for example a bridge ID on `*`). Keep their levels and equality in an
+    /// authorization-only copy so one such entry does not invalidate every
+    /// other user's authorization. Signed JSON is never changed. Newly received
+    /// candidates continue to use `parse_in`, including its original content.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error, or refuses a compatibility-ID collision.
+    pub fn parse_auth_in(event_id: &str, room_id: &str, json: &Value) -> Result<Self, String> {
+        let mut event = Self::parse_in(event_id, room_id, json)?;
+        if event.event_type != TimelineEventType::RoomPowerLevels {
+            return Ok(event);
+        }
+        let Some(users) = json["content"]["users"].as_object() else {
+            return Ok(event);
+        };
+        let invalid: Vec<_> = users
+            .keys()
+            .filter(|id| OwnedUserId::try_from(id.as_str()).is_err())
+            .collect();
+        if invalid.is_empty() {
+            return Ok(event);
+        }
+        let mut content = json["content"].clone();
+        let Some(mapped) = content["users"].as_object_mut() else {
+            return Err("power-level users changed shape".into());
+        };
+        for id in invalid {
+            let substitute = legacy_power_user_id(id);
+            if mapped.contains_key(&substitute) {
+                return Err("legacy power-level compatibility ID collision".into());
+            }
+            if let Some(level) = mapped.remove(id) {
+                mapped.insert(substitute, level);
+            }
+        }
+        event.content = serde_json::value::to_raw_value(&content)
+            .map_err(|error| format!("content: {error}"))?;
+        Ok(event)
     }
 
     /// Parse persisted event JSON.
@@ -87,13 +135,26 @@ impl StoredEvent {
                 .ok_or_else(|| format!("`{field}` is missing or not an array"))?
                 .iter()
                 .map(|id| {
-                    let id = id
-                        .as_str()
-                        .ok_or_else(|| format!("`{field}` holds a non-string"))?;
+                    // A bare ID from v3; an `[id, hashes]` pair in v1/v2.
+                    let id = match id {
+                        Value::Array(pair) => pair.first().and_then(Value::as_str),
+                        other => other.as_str(),
+                    }
+                    .ok_or_else(|| format!("`{field}` holds a non-reference"))?;
                     OwnedEventId::try_from(id).map_err(|error| format!("`{field}`: {error}"))
                 })
                 .collect()
         };
+        // The redaction target: top level before v11, in content from v11
+        // (MSC2174). The v1/v2 rules read it -- a redaction is allowed when
+        // its target's ID names the redacter's own server -- so a stored
+        // event that hid it would refuse a redaction those rules admit.
+        let redacts = json["redacts"]
+            .as_str()
+            .or_else(|| json["content"]["redacts"].as_str())
+            .map(OwnedEventId::try_from)
+            .transpose()
+            .map_err(|error| format!("redacts: {error}"))?;
 
         Ok(Self {
             event_id: OwnedEventId::try_from(event_id)
@@ -119,7 +180,49 @@ impl StoredEvent {
             } else {
                 Vec::new()
             },
+            redacts,
+            depth: json["depth"].as_i64().unwrap_or(0),
+            rejected: false,
+            preserved_rejection: false,
         })
+    }
+
+    /// The event's signed `depth`, which only room version 1's state
+    /// resolution reads (it orders conflicted events by it).
+    #[must_use]
+    pub fn depth(&self) -> i64 {
+        self.depth
+    }
+
+    /// Preserve a former homeserver's imported rejection decision.
+    #[must_use]
+    pub fn with_preserved_rejection(mut self, preserved: bool) -> Self {
+        self.preserved_rejection = preserved;
+        self
+    }
+
+    /// Whether operator-selected historical rejection policy skips this candidate.
+    #[must_use]
+    pub fn preserved_rejection(&self) -> bool {
+        self.preserved_rejection
+    }
+
+    /// The same event, marked rejected or not.
+    ///
+    /// A rejected event is still stored -- a later event may name it -- but
+    /// the auth rules must not count it: state resolution's iterative auth
+    /// checks skip a rejected auth event, and an event whose auth events
+    /// include a rejected one is itself rejected.
+    #[must_use]
+    pub fn with_rejected(mut self, rejected: bool) -> Self {
+        self.rejected = rejected;
+        self
+    }
+
+    /// The event's `auth_events`, as stored.
+    #[must_use]
+    pub fn auth_event_ids(&self) -> &[OwnedEventId] {
+        &self.auth_events
     }
 }
 
@@ -154,10 +257,10 @@ impl Event for StoredEvent {
         Box::new(self.auth_events.iter())
     }
     fn redacts(&self) -> Option<&Self::Id> {
-        None
+        self.redacts.as_ref()
     }
     fn rejected(&self) -> bool {
-        false
+        self.rejected || self.preserved_rejection
     }
 }
 
@@ -188,4 +291,174 @@ pub fn authorize(
     by_state: impl Fn(&StateEventType, &str) -> Option<StoredEvent>,
 ) -> Result<(), String> {
     check_state_dependent_auth_rules(rules, candidate.clone(), by_state)
+}
+
+/// Same stable representation used by the Synapse importer for legacy IDs.
+fn legacy_power_user_id(id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(id.as_bytes());
+    let hex: String = digest
+        .iter()
+        .take(10)
+        .flat_map(|byte| {
+            [
+                char::from(HEX[usize::from(byte >> 4)]),
+                char::from(HEX[usize::from(byte & 15)]),
+            ]
+        })
+        .collect();
+    let server = id
+        .split_once(':')
+        .map(|(_, server)| server)
+        .filter(|server| <&ruma::ServerName>::try_from(*server).is_ok())
+        .unwrap_or("compat.invalid");
+    format!("@spindle-compat-{hex}:{server}")
+}
+
+#[cfg(test)]
+mod legacy_power_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn body(kind: &str, sender: &str, key: &str, content: Value) -> Value {
+        let mut event = json!({"room_id":"!room:example.org", "type":kind, "sender":sender,
+            "state_key":key, "origin_server_ts":1,
+            "prev_events":[], "auth_events":[]});
+        event["content"] = content;
+        event
+    }
+
+    #[test]
+    fn legacy_power_entry_preserves_auth_without_changing_signed_json() {
+        for version in ["10", "11"] {
+            let create = body(
+                "m.room.create",
+                "@admin:example.org",
+                "",
+                json!({"creator":"@admin:example.org", "room_version":version}),
+            );
+            let member = body(
+                "m.room.member",
+                "@admin:example.org",
+                "@admin:example.org",
+                json!({"membership":"join"}),
+            );
+            let powers = body(
+                "m.room.power_levels",
+                "@admin:example.org",
+                "",
+                json!({"users":{"@admin:example.org":100,"@bridge:*":50}}),
+            );
+            let original = powers.clone();
+            let candidate = StoredEvent::parse_in(
+                "$acl",
+                "!room:example.org",
+                &body(
+                    "m.room.server_acl",
+                    "@admin:example.org",
+                    "",
+                    json!({"allow":["*"]}),
+                ),
+            )
+            .unwrap();
+            let rules = ruma::RoomVersionId::try_from(version)
+                .unwrap()
+                .rules()
+                .unwrap();
+            let check = |compat| {
+                authorize(&rules.authorization, &candidate, |kind, _key| {
+                    let (id, value) = match kind {
+                        StateEventType::RoomCreate => ("$create", &create),
+                        StateEventType::RoomMember => ("$member", &member),
+                        StateEventType::RoomPowerLevels => ("$powers", &powers),
+                        _ => return None,
+                    };
+                    if compat {
+                        StoredEvent::parse_auth_in(id, "!room:example.org", value).ok()
+                    } else {
+                        StoredEvent::parse_in(id, "!room:example.org", value).ok()
+                    }
+                })
+            };
+            assert!(check(false).is_err());
+            assert!(check(true).is_ok());
+            assert_eq!(powers, original);
+            // Receiving a new malformed power event still checks its original map.
+            let malformed =
+                StoredEvent::parse_in("$newpowers", "!room:example.org", &powers).unwrap();
+            assert!(
+                authorize(&rules.authorization, &malformed, |kind, _key| {
+                    let (id, value) = match kind {
+                        StateEventType::RoomCreate => ("$create", &create),
+                        StateEventType::RoomMember => ("$member", &member),
+                        StateEventType::RoomPowerLevels => ("$powers", &powers),
+                        _ => return None,
+                    };
+                    StoredEvent::parse_auth_in(id, "!room:example.org", value).ok()
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_entries_still_protect_higher_power_levels() {
+        let create = body(
+            "m.room.create",
+            "@owner:example.org",
+            "",
+            json!({"creator":"@owner:example.org", "room_version":"11"}),
+        );
+        let member = body(
+            "m.room.member",
+            "@admin:example.org",
+            "@admin:example.org",
+            json!({"membership":"join"}),
+        );
+        let powers = body(
+            "m.room.power_levels",
+            "@owner:example.org",
+            "",
+            json!({"users":{"@admin:example.org":50,"@bridge:*":100},
+                "events":{"m.room.power_levels":50}}),
+        );
+        let proposed = body(
+            "m.room.power_levels",
+            "@admin:example.org",
+            "",
+            json!({"users":{"@admin:example.org":50},
+                "events":{"m.room.power_levels":50}}),
+        );
+        let candidate =
+            StoredEvent::parse_in("$newpowers", "!room:example.org", &proposed).unwrap();
+        let rules = ruma::RoomVersionId::try_from("11")
+            .unwrap()
+            .rules()
+            .unwrap();
+        assert!(
+            authorize(&rules.authorization, &candidate, |kind, _key| {
+                let (id, value) = match kind {
+                    StateEventType::RoomCreate => ("$create", &create),
+                    StateEventType::RoomMember => ("$member", &member),
+                    StateEventType::RoomPowerLevels => ("$powers", &powers),
+                    _ => return None,
+                };
+                StoredEvent::parse_auth_in(id, "!room:example.org", value).ok()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_collision_is_refused_instead_of_overwriting_a_power_level() {
+        let substitute = legacy_power_user_id("@bridge:*");
+        let powers = body(
+            "m.room.power_levels",
+            "@admin:example.org",
+            "",
+            json!({"users":{"@bridge:*":100, substitute:0}}),
+        );
+        assert!(StoredEvent::parse_auth_in("$powers", "!room:example.org", &powers).is_err());
+    }
 }

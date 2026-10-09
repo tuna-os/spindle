@@ -1,0 +1,11 @@
+seal: destinations in backoff=0, rooms with unsent PDUs=0
+deployment.apps/drill-b scaled
+pod/drill-b-54684f8c8b-bfjc6 condition met
+DROP DATABASE
+CREATE DATABASE
+seal: database drill_b -> drill_b_seal at 20261003T221124Z
+4.0K	/d/seal
+ce8d6fae78155b2a
+4.0K	/d/seal
+ce8d6fae78155b2a
+pod "drill-b-data-op" deleted from spindle-rehearsal namespace

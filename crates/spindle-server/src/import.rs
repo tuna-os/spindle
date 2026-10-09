@@ -30,7 +30,7 @@
 //! copies of this logic. The reader that fills a `SourceRoom` from Synapse's
 //! own tables lands separately.
 
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 
 /// Reading a `SourceRoom` out of a Synapse database.
 ///
@@ -82,6 +82,10 @@ pub struct SourceRoom {
     /// compared against. [`Outcome::seeded_from_source`] records which of the
     /// two happened, so a report can say so.
     pub state_after_root: Option<StateMap>,
+    /// Synapse's forward extremities (`event_forward_extremities`): the
+    /// events whose resolved states make the room's current state. Empty
+    /// means "the planned events no other planned event names as a parent".
+    pub forward_extremities: Vec<String>,
 }
 
 /// An event the plan leaves out, and why.
@@ -119,6 +123,13 @@ pub struct Step {
     pub depth: u64,
     /// The first step, which the log is seeded with rather than appended to.
     pub seed: bool,
+    /// The event names a parent the import does not hold. Only
+    /// [`plan_resolving`] keeps such an event; its state comes from the
+    /// source rather than from folding parents.
+    pub gap: bool,
+    /// The last step, seeded with the source's current state; see
+    /// [`mark_head_from_source`].
+    pub head: bool,
 }
 
 /// An ordering the log can replay, plus everything it left behind.
@@ -241,6 +252,12 @@ pub enum ImportError {
     NoHeadState {
         room_id: String,
     },
+    /// An event needed the source's state and the source had none.
+    NoSourceState {
+        room_id: String,
+        event_id: String,
+        why: String,
+    },
 }
 
 impl std::fmt::Display for ImportError {
@@ -258,6 +275,14 @@ impl std::fmt::Display for ImportError {
             Self::NoHeadState { room_id } => {
                 write!(formatter, "{room_id}: no state for the log's own head")
             }
+            Self::NoSourceState {
+                room_id,
+                event_id,
+                why,
+            } => write!(
+                formatter,
+                "{room_id}: {event_id} needs Synapse's state and there is none: {why}"
+            ),
         }
     }
 }
@@ -345,8 +370,19 @@ fn prune_frayed<'a>(
 ) -> Vec<&'a SourceEvent> {
     let mut origins: Vec<&'a SourceEvent> = Vec::new();
     let mut dropped: HashSet<&'a str> = HashSet::new();
+    let mut children: HashMap<&'a str, Vec<&'a str>> = HashMap::new();
 
     for event in included.values() {
+        for parent in event
+            .prev_events
+            .iter()
+            .filter(|parent| included.contains_key(parent.as_str()))
+        {
+            children
+                .entry(parent)
+                .or_default()
+                .push(event.event_id.as_str());
+        }
         let known = event
             .prev_events
             .iter()
@@ -373,24 +409,23 @@ fn prune_frayed<'a>(
         return origins;
     }
 
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for event in included.values() {
-            if dropped.contains(event.event_id.as_str()) {
-                continue;
-            }
-            if let Some(behind) = event
-                .prev_events
-                .iter()
-                .find(|parent| dropped.contains(parent.as_str()))
-            {
-                dropped.insert(event.event_id.as_str());
+    // Walk the reverse edges once. The previous whole-map fixed-point scan was
+    // correct but quadratic for a long history behind one frayed event -- a
+    // very ordinary shape in a large federated room with a retention gap.
+    let mut first_dropped: Vec<&str> = dropped.iter().copied().collect();
+    first_dropped.sort_unstable();
+    for descendants in children.values_mut() {
+        descendants.sort_unstable();
+    }
+    let mut pending: VecDeque<&str> = first_dropped.into();
+    while let Some(behind) = pending.pop_front() {
+        for event_id in children.get(behind).into_iter().flatten().copied() {
+            if dropped.insert(event_id) {
                 excluded.push(Excluded::Orphaned {
-                    event_id: event.event_id.clone(),
-                    behind: behind.clone(),
+                    event_id: event_id.to_owned(),
+                    behind: behind.to_owned(),
                 });
-                changed = true;
+                pending.push_back(event_id);
             }
         }
     }
@@ -430,6 +465,10 @@ fn toposort(included: &HashMap<&str, &SourceEvent>) -> Vec<Step> {
 
     let mut steps = Vec::with_capacity(included.len());
     while let Some(Ready(event)) = ready.pop() {
+        let gap = event
+            .prev_events
+            .iter()
+            .any(|parent| !included.contains_key(parent.as_str()));
         steps.push(Step {
             input: EventInput {
                 event_id: EventId::new(event.event_id.clone()),
@@ -442,6 +481,8 @@ fn toposort(included: &HashMap<&str, &SourceEvent>) -> Vec<Step> {
             },
             depth: event.depth,
             seed: false,
+            gap,
+            head: false,
         });
         for child in children
             .get(event.event_id.as_str())
@@ -555,7 +596,900 @@ pub fn plan(room: &SourceRoom) -> Result<Plan, PlanError> {
     })
 }
 
-fn snapshot_from(map: &StateMap) -> StateSnapshot {
+/// Where an import gets the state a log cannot fold for itself.
+///
+/// [`replay_resolving`] asks for it, and the full importer answers from
+/// Synapse's state groups and the room version's resolver.
+pub trait SourceState {
+    /// The state after `event_id`, as the source resolved it.
+    ///
+    /// # Errors
+    ///
+    /// A description of why the source has no state for the event.
+    fn state_after(&mut self, event_id: &str) -> Result<StateMap, String>;
+
+    /// The source's state after `event_id` on the named slots only.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::state_after`].
+    fn state_after_keys(
+        &mut self,
+        event_id: &str,
+        keys: &[(String, String)],
+    ) -> Result<StateMap, String> {
+        let mut state = self.state_after(event_id)?;
+        state.retain(|key, _| keys.contains(key));
+        Ok(state)
+    }
+
+    /// The room version's resolution of `sets` (the states after an event's
+    /// parents, or after the room's forward extremities). `None` when this
+    /// source has no resolver, and the log's own fold is used instead.
+    fn resolve(&mut self, _sets: &[&StateSnapshot]) -> Option<Result<Resolution, String>> {
+        None
+    }
+
+    /// Report bounded replay progress while large rooms are still being derived.
+    fn replay_progress(&mut self, _position: usize, _total: usize) {}
+
+    /// Start a new fixed-point pass. A disk-backed source must stop exposing
+    /// the previous pass's supplied states before deriving this pass's states.
+    ///
+    /// # Errors
+    ///
+    /// A failure to initialize temporary state storage.
+    fn begin_replay_pass(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Save a supplied state outside the returned map when needed. `true`
+    /// retains it in the outcome; `false` means the source saved it and will
+    /// provide it through `SynapseSource::read_settled` during the write.
+    ///
+    /// # Errors
+    ///
+    /// A failed save. Replay must fail before the room is written.
+    fn retain_settled(&mut self, _event_id: &str, _state: &Settled) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    /// How the source arrived at the state of `event_id`: from its
+    /// parents, or from somewhere else. A source that cannot tell says
+    /// [`Continuity::Derived`], and the import trusts the derivation.
+    fn continuity(&mut self, _event_id: &str, _parents: &[EventId], _is_state: bool) -> Continuity {
+        Continuity::Derived
+    }
+}
+
+/// How Synapse arrived at an event's state, read from its state groups.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Continuity {
+    /// The state before the event is a parent's state group.
+    Derived,
+    /// The state before the event is a delta on a parent's group: Synapse
+    /// resolved the parents.
+    Resolved,
+    /// The state before the event is neither: Synapse took it from
+    /// elsewhere (a peer's `/state_ids` when the event arrived before its
+    /// parents did). The import compares in full.
+    Elsewhere,
+    /// The group is a full snapshot with no edge, so the derivation cannot
+    /// be read from the graph. The import compares in full.
+    Unknown,
+}
+
+/// What the room version's resolver settled for a set of states.
+#[derive(Clone, Debug, Default)]
+pub struct Resolution {
+    /// Every slot the sets disagreed on.
+    pub contested: Vec<StateKey>,
+    /// The slots whose resolved value differs from the first set's: the
+    /// value, or `None` when the resolved state has no such slot.
+    pub slots: Vec<(StateKey, Option<String>)>,
+}
+
+/// The state an event is written with, when it is not the log's own fold.
+#[derive(Clone, Debug)]
+pub struct Settled {
+    pub state: StateSnapshot,
+    /// The slots to persist beside the seed (bodies to store, memberships
+    /// to index): the full state for Synapse's state, only the changed
+    /// slots for a resolver's answer.
+    pub slots: StateMap,
+    pub reason: String,
+}
+
+/// The room version's resolver against Synapse at one fork.
+#[derive(Clone, Debug)]
+pub struct ForkCheck {
+    pub event_id: String,
+    pub contested: usize,
+    /// Slots where the resolver and Synapse disagree. Empty: they agree.
+    pub disagreements: Vec<Divergence>,
+}
+
+/// Order a room for an import that takes the source's state where Spindle
+/// cannot derive it.
+///
+/// [`plan`] refuses a room with more than one starting point and leaves out
+/// every event that names a parent the import does not hold. Both are gaps
+/// in the history Synapse retained: a backfill that stopped, or events
+/// fetched one at a time. Synapse still resolved the state at each of those
+/// events, and it keeps that state in its state groups. This plan keeps
+/// every such event and marks it `gap`, and the replay seeds it with the
+/// source's state instead of refusing it. Only outliers and rejected events
+/// are left out.
+///
+/// The seed is `m.room.create` when the import holds it, and otherwise the
+/// earliest starting point, which needs `state_after_root` as in [`plan`].
+///
+/// # Errors
+///
+/// Returns [`PlanError`] when the room has nothing importable, a cycle, or a
+/// horizon start with no state supplied for it.
+pub fn plan_resolving(room: &SourceRoom) -> Result<Plan, PlanError> {
+    let mut excluded = Vec::new();
+    let included = timeline(room, &mut excluded);
+    if included.is_empty() {
+        return Err(PlanError::NoEvents {
+            room_id: room.room_id.clone(),
+        });
+    }
+    let origin = included
+        .values()
+        .filter(|event| {
+            !event
+                .prev_events
+                .iter()
+                .any(|parent| included.contains_key(parent.as_str()))
+        })
+        .min_by_key(|event| {
+            (
+                !(event.event_type == "m.room.create" && event.prev_events.is_empty()),
+                event.depth,
+                event.stream_ordering,
+                event.event_id.as_str(),
+            )
+        })
+        .copied();
+    let Some(origin) = origin else {
+        return Err(cycle_error(&room.room_id, &included, &[]));
+    };
+    let seeded_from_source =
+        !(origin.event_type == "m.room.create" && origin.prev_events.is_empty());
+    if seeded_from_source && room.state_after_root.is_none() {
+        return Err(PlanError::NoRootState {
+            room_id: room.room_id.clone(),
+            root: origin.event_id.clone(),
+        });
+    }
+
+    let mut steps = toposort(&included);
+    if steps.len() != included.len() {
+        return Err(cycle_error(&room.room_id, &included, &steps));
+    }
+    // The seed has no parent inside the import, so moving it to the front
+    // keeps every parent before its children.
+    if let Some(index) = steps
+        .iter()
+        .position(|step| step.input.event_id.as_str() == origin.event_id)
+    {
+        let mut seed = steps.remove(index);
+        seed.seed = true;
+        seed.gap = false;
+        steps.insert(0, seed);
+    }
+    excluded.sort_by(|left, right| left.event_id().cmp(right.event_id()));
+    Ok(Plan {
+        room_id: room.room_id.clone(),
+        steps,
+        excluded,
+        seeded_from_source,
+    })
+}
+
+/// Why a head step takes the source's current state.
+pub const HEAD_REASON: &str =
+    "head: Synapse's current state, resolved over its forward extremities";
+
+/// Why a step took the room version's resolution of its parents.
+pub const RESOLVED_REASON: &str = "resolved: the room version's resolver over the parents' states";
+
+/// Why the head took the room version's resolution of the extremities.
+pub const HEAD_RESOLVED_REASON: &str =
+    "head: the room version's resolver over the forward extremities";
+
+/// Why a step took Synapse's state where the resolver disagreed.
+pub const DISAGREED_REASON: &str =
+    "resolver disagrees with Synapse: Synapse's state taken on the disagreeing slots";
+
+/// Why a step took Synapse's state where Synapse did not derive it from
+/// the event's parents.
+pub const ELSEWHERE_REASON: &str = "Synapse's state here is not derived from the event's parents (taken from a peer): Synapse's state";
+
+/// Why a step names a parent the import does not hold.
+pub const GAP_REASON: &str = "a parent is outside the retained history";
+
+/// Make the last step of a plan take the source's current state.
+///
+/// Spindle's current state is the state after the last entry of its log.
+/// Synapse's is the resolution of every forward extremity. Without a
+/// resolver, the import seeds the last event with Synapse's current state
+/// when the two differ, and says so in the report.
+pub fn mark_head_from_source(step: &mut Step) {
+    step.head = true;
+}
+
+/// Whether an append the log refused can take a supplied state instead.
+///
+/// A contested fork needs the Matrix state resolver, which Spindle's log
+/// does not carry (SPEC §9.2); a parent outside the import or outside the
+/// resident window has no state to fold.
+#[must_use]
+pub fn takes_source_state(error: &AppendError) -> bool {
+    matches!(
+        error,
+        AppendError::NeedsStateResolution { .. }
+            | AppendError::StateNotResident { .. }
+            | AppendError::UnknownPredecessor(_)
+    )
+}
+
+/// What [`replay_resolving`] produced.
+#[derive(Clone, Debug)]
+pub struct ResolvedOutcome {
+    pub outcome: Outcome,
+    /// Events written with a supplied state rather than the log's own
+    /// fold, and why.
+    pub from_source: Vec<(String, String)>,
+    /// The state each of those events is written with, for the write that
+    /// follows (only when the source has a resolver).
+    pub settled: HashMap<String, Settled>,
+    /// Every fork the resolver settled, checked against Synapse.
+    pub forks: Vec<ForkCheck>,
+    /// How many replay passes it took until the log's fold agreed with the
+    /// derived state on every event it was left to fold.
+    pub passes: usize,
+    /// Events whose derived state was compared in full with Synapse's,
+    /// because Synapse's state graph did not show it derived from the
+    /// parents.
+    pub full_checks: usize,
+}
+
+/// [`replay`] over [`plan_resolving`]: the import derives each event's
+/// state, and the final state is compared with the source's current state.
+///
+/// With a resolver ([`SourceState::resolve`]) an event whose parents'
+/// states differ takes the room version's resolution of them, checked
+/// against Synapse's state for the same event, and the room's head takes
+/// the resolution of Synapse's forward extremities. The log folds every
+/// other event; where its fold is not the derived state, or it refuses the
+/// fork, the event is written with the derived state instead. Only an
+/// event with a parent outside the retained history takes Synapse's state,
+/// because nothing else knows the state there.
+///
+/// Without a resolver the log folds what it can and Synapse's state fills
+/// the rest.
+///
+/// # Errors
+///
+/// Returns [`ImportError`] when the room cannot be ordered, the log refuses
+/// an event for a reason the source cannot answer, or the source has no
+/// state for an event that needs it.
+pub fn replay_resolving(
+    room: &SourceRoom,
+    source: &mut dyn SourceState,
+    head_from_source: bool,
+) -> Result<ResolvedOutcome, ImportError> {
+    let mut plan = plan_resolving(room)?;
+    if head_from_source && let Some(last) = plan.steps.last_mut() {
+        mark_head_from_source(last);
+    }
+    let mut marks: HashSet<String> = HashSet::new();
+    let mut passes = 0;
+    loop {
+        passes += 1;
+        eprintln!(
+            "replay-pass start: room={} pass={passes} head_from_source={head_from_source} retained_marks={}",
+            room.room_id,
+            marks.len()
+        );
+        let (mut result, new_marks) = replay_pass(room, &plan, source, &marks)?;
+        eprintln!(
+            "replay-pass end: room={} pass={passes} head_from_source={head_from_source} new_marks={} retained_marks={} divergence={}",
+            room.room_id,
+            new_marks.len(),
+            marks.len(),
+            result.outcome.divergence.len()
+        );
+        // A fold that disagreed downstream of a fold that was already wrong
+        // may be a knock-on effect, so a pass is repeated with every mark so
+        // far until no new one appears.
+        if new_marks.is_empty() {
+            result.passes = passes;
+            return Ok(result);
+        }
+        if passes >= 8 {
+            return Err(ImportError::NoSourceState {
+                room_id: room.room_id.clone(),
+                event_id: new_marks.into_iter().next().unwrap_or_default(),
+                why: "the log's fold did not settle in 8 passes".to_owned(),
+            });
+        }
+        marks.extend(new_marks);
+    }
+}
+
+/// The derived state for one step, before it is appended.
+struct Want {
+    state: Option<StateSnapshot>,
+    /// Set when the state is not what the log would fold.
+    reason: Option<&'static str>,
+    slots: Option<StateMap>,
+}
+
+fn key_pair(key: &StateKey) -> (String, String) {
+    (
+        key.event_type().as_str().to_owned(),
+        key.state_key().to_owned(),
+    )
+}
+
+/// One pass of [`replay_resolving`]. `marks` are the events to write with
+/// the derived state; the second value is the events the log folded
+/// wrongly (or refused) in this pass.
+#[allow(clippy::too_many_lines)]
+fn replay_pass(
+    room: &SourceRoom,
+    plan: &Plan,
+    source: &mut dyn SourceState,
+    marks: &HashSet<String>,
+) -> Result<(ResolvedOutcome, HashSet<String>), ImportError> {
+    let room_id = room.room_id.as_str();
+    let mut log = RoomLog::new();
+    let mut head: Option<EventId> = None;
+    let mut from_source = Vec::new();
+    let mut settled: HashMap<String, Settled> = HashMap::new();
+    let mut forks = Vec::new();
+    let mut new_marks = HashSet::new();
+    let refused = |event_id: &str, error: AppendError| ImportError::Append {
+        room_id: room_id.to_owned(),
+        event_id: event_id.to_owned(),
+        error,
+    };
+    let no_state = |event_id: &str, why: String| ImportError::NoSourceState {
+        room_id: room_id.to_owned(),
+        event_id: event_id.to_owned(),
+        why,
+    };
+
+    source
+        .begin_replay_pass()
+        .map_err(|why| no_state("", why))?;
+
+    // The state after each event, derived independently of the log, kept
+    // while a later step still names the event as a parent, or while it is
+    // a forward extremity (which the head resolves).
+    let index: HashMap<&str, usize> = plan
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(position, step)| (step.input.event_id.as_str(), position))
+        .collect();
+    let mut last_use: HashMap<&str, usize> = HashMap::new();
+    for (position, step) in plan.steps.iter().enumerate() {
+        for parent in &step.input.prev_events {
+            if index.contains_key(parent.as_str()) {
+                let slot = last_use.entry(parent.as_str()).or_insert(position);
+                *slot = (*slot).max(position);
+            }
+        }
+    }
+    let extremities: Vec<&str> = if room.forward_extremities.is_empty() {
+        plan.steps
+            .iter()
+            .map(|step| step.input.event_id.as_str())
+            .filter(|id| !last_use.contains_key(id))
+            .collect()
+    } else {
+        room.forward_extremities
+            .iter()
+            .map(String::as_str)
+            .filter(|id| index.contains_key(id))
+            .collect()
+    };
+    let keep: HashSet<&str> = extremities.iter().copied().collect();
+    let mut derived: HashMap<&str, StateSnapshot> = HashMap::new();
+    // The state after the step before, which a seed shares structure with.
+    let mut previous: Option<StateSnapshot> = None;
+    let mut resolver_present = true;
+    let mut full_checks = 0;
+    let last_position = plan.steps.len().saturating_sub(1);
+
+    for (position, step) in plan.steps.iter().enumerate() {
+        if position % 1_000 == 0 {
+            source.replay_progress(position, plan.steps.len());
+        }
+        let event_id = step.input.event_id.as_str();
+        let apply_own = |state: StateSnapshot| match step.input.state_key.clone() {
+            Some(key) => state.apply(key, event_id.to_owned()),
+            None => state,
+        };
+
+        // 1. The state this event should have, derived where possible.
+        let mut want = if step.seed {
+            Want {
+                state: Some(match &room.state_after_root {
+                    Some(map) => snapshot_from(map),
+                    None => apply_own(StateSnapshot::new()),
+                }),
+                reason: None,
+                slots: None,
+            }
+        } else if step.gap {
+            let map = source
+                .state_after(event_id)
+                .map_err(|why| no_state(event_id, why))?;
+            let base = step
+                .input
+                .prev_events
+                .iter()
+                .find_map(|parent| derived.get(parent.as_str()))
+                .or(previous.as_ref());
+            let (state, slots) = snapshot_over(base, &map);
+            Want {
+                state: Some(state),
+                reason: Some(GAP_REASON),
+                slots: Some(slots),
+            }
+        } else {
+            let parents: Vec<&StateSnapshot> = step
+                .input
+                .prev_events
+                .iter()
+                .filter_map(|parent| derived.get(parent.as_str()))
+                .collect();
+            let first = parents.first().copied();
+            match first {
+                _ if parents.len() != step.input.prev_events.len() => Want {
+                    state: None,
+                    reason: None,
+                    slots: None,
+                },
+                None => Want {
+                    state: None,
+                    reason: None,
+                    slots: None,
+                },
+                Some(first) if parents.iter().all(|state| state.root() == first.root()) => Want {
+                    state: Some(apply_own(first.clone())),
+                    reason: None,
+                    slots: None,
+                },
+                Some(first) => match source.resolve(&parents) {
+                    None => {
+                        resolver_present = false;
+                        Want {
+                            state: None,
+                            reason: None,
+                            slots: None,
+                        }
+                    }
+                    Some(Err(why)) => {
+                        return Err(no_state(event_id, format!("resolver: {why}")));
+                    }
+                    Some(Ok(resolution)) => {
+                        if std::env::var("SPINDLE_IMPORT_DEBUG_EVENT")
+                            .is_ok_and(|id| id == event_id)
+                        {
+                            debug_fork(source, step, &parents, &resolution);
+                        }
+                        let mut state = apply_own(apply_slots(first, &resolution.slots));
+                        // Check the resolver against Synapse on every slot
+                        // the parents contested, and the event's own.
+                        let mut keys: Vec<(String, String)> =
+                            resolution.contested.iter().map(key_pair).collect();
+                        if let Some(own) = &step.input.state_key {
+                            keys.push(key_pair(own));
+                        }
+                        keys.sort_unstable();
+                        keys.dedup();
+                        let synapse = source
+                            .state_after_keys(event_id, &keys)
+                            .map_err(|why| no_state(event_id, why))?;
+                        let disagreements: Vec<Divergence> = keys
+                            .iter()
+                            .filter_map(|slot| {
+                                let key = StateKey::new(slot.0.clone(), slot.1.clone());
+                                let ours = state.get(&key).map(str::to_owned);
+                                let theirs = synapse.get(slot).cloned();
+                                (ours != theirs).then_some(Divergence {
+                                    key,
+                                    spindle: ours,
+                                    synapse: theirs,
+                                })
+                            })
+                            .collect();
+                        let mut reason = RESOLVED_REASON;
+                        if !disagreements.is_empty() {
+                            // Synapse's answer is what the room's peers and
+                            // clients hold; the disagreement is reported.
+                            let fixes: Vec<(StateKey, Option<String>)> = disagreements
+                                .iter()
+                                .map(|slot| (slot.key.clone(), slot.synapse.clone()))
+                                .collect();
+                            state = apply_slots(&state, &fixes);
+                            reason = DISAGREED_REASON;
+                        }
+                        let mut changed = StateMap::new();
+                        for (key, _, value) in first.diff(&state) {
+                            if let Some(value) = value {
+                                changed.insert(key_pair(key), value.to_owned());
+                            }
+                        }
+                        forks.push(ForkCheck {
+                            event_id: event_id.to_owned(),
+                            contested: resolution.contested.len(),
+                            disagreements,
+                        });
+                        Want {
+                            state: Some(state),
+                            reason: Some(reason),
+                            slots: Some(changed),
+                        }
+                    }
+                },
+            }
+        };
+
+        // 1b. Where Synapse's state graph does not show this event's state
+        // derived from its parents, compare in full; where they differ,
+        // Synapse's state is the one the room's peers hold.
+        if !step.seed
+            && !step.gap
+            && let Some(state) = &want.state
+        {
+            let continuity = source.continuity(
+                event_id,
+                &step.input.prev_events,
+                step.input.state_key.is_some(),
+            );
+            if matches!(continuity, Continuity::Elsewhere | Continuity::Unknown) {
+                full_checks += 1;
+                let map = source
+                    .state_after(event_id)
+                    .map_err(|why| no_state(event_id, why))?;
+                if !same_state(state, &map) {
+                    let (state, slots) = snapshot_over(Some(state), &map);
+                    want = Want {
+                        state: Some(state),
+                        reason: Some(ELSEWHERE_REASON),
+                        slots: Some(slots),
+                    };
+                }
+            }
+        }
+
+        // 2. The head: the resolution of every forward extremity.
+        if position == last_position && !step.seed && resolver_present {
+            let mut sets: Vec<&StateSnapshot> = Vec::new();
+            for extremity in &extremities {
+                if *extremity == event_id {
+                    if let Some(state) = &want.state {
+                        sets.push(state);
+                    }
+                } else if let Some(state) = derived.get(extremity) {
+                    sets.push(state);
+                }
+            }
+            let head_state = match sets.as_slice() {
+                [] => None,
+                [only] => Some((*only).clone()),
+                [first, ..] => match source.resolve(&sets) {
+                    Some(Ok(resolution)) => Some(apply_slots(first, &resolution.slots)),
+                    Some(Err(why)) => {
+                        return Err(no_state(event_id, format!("resolver at the head: {why}")));
+                    }
+                    None => None,
+                },
+            };
+            if let Some(head_state) = head_state
+                && want
+                    .state
+                    .as_ref()
+                    .is_none_or(|natural| natural.root() != head_state.root())
+            {
+                let mut slots = StateMap::new();
+                let base = want
+                    .state
+                    .clone()
+                    .or_else(|| previous.clone())
+                    .unwrap_or_default();
+                for (key, _, value) in base.diff(&head_state) {
+                    if let Some(value) = value {
+                        slots.insert(key_pair(key), value.to_owned());
+                    }
+                }
+                want = Want {
+                    state: Some(head_state),
+                    reason: Some(HEAD_RESOLVED_REASON),
+                    slots: Some(slots),
+                };
+            }
+        }
+
+        // An explicitly requested final head represents the source room's
+        // current state, not the historical state after this PDU. Keep the
+        // historical derivation/checks above intact; override only this last
+        // entry after extremity resolution, and persist it as a supplied seed.
+        if position == last_position && step.head && !step.seed {
+            let base = want.state.as_ref().or(previous.as_ref());
+            let (state, mut slots) = snapshot_over(base, &room.current_state);
+            // Keep body references already supplied by historical comparison
+            // or fork resolution, but only if the authoritative head retains them.
+            if let Some(prior) = want.slots.take() {
+                slots.extend(
+                    prior
+                        .into_iter()
+                        .filter(|(key, value)| room.current_state.get(key) == Some(value)),
+                );
+            }
+            want = Want {
+                state: Some(state),
+                reason: Some(HEAD_REASON),
+                slots: Some(slots),
+            };
+        }
+
+        // 3. Append: seeded where the state is supplied, folded otherwise.
+        let seed_with = |log: &mut RoomLog, state: StateSnapshot| {
+            log.append_seeded(step.input.clone(), state, step.depth)
+                .map(|entry| entry.event_id.clone())
+                .map_err(|error| refused(event_id, error))
+        };
+        let seeded = !step.seed
+            && want.state.is_some()
+            && (want.reason.is_some_and(|reason| reason != RESOLVED_REASON)
+                || marks.contains(event_id));
+        let entry = if step.seed {
+            seed_with(&mut log, want.state.clone().unwrap_or_default())?
+        } else if seeded {
+            let state = want.state.clone().unwrap_or_default();
+            let reason = want.reason.unwrap_or(RESOLVED_REASON);
+            from_source.push((event_id.to_owned(), reason.to_owned()));
+            let supplied = Settled {
+                state: state.clone(),
+                slots: want.slots.clone().unwrap_or_default(),
+                reason: reason.to_owned(),
+            };
+            if source
+                .retain_settled(event_id, &supplied)
+                .map_err(|why| no_state(event_id, why))?
+            {
+                settled.insert(event_id.to_owned(), supplied);
+            }
+            seed_with(&mut log, state)?
+        } else if let Some(state) = want.state.clone() {
+            // The log may fold this event itself; check that it reaches the
+            // derived state, and mark it to be seeded when it does not.
+            match log.append_remote(step.input.clone()) {
+                Ok(entry) => {
+                    let id = entry.event_id.clone();
+                    if log
+                        .state_after_event(&id)
+                        .is_none_or(|folded| folded.root() != state.root())
+                    {
+                        new_marks.insert(event_id.to_owned());
+                    }
+                    id
+                }
+                Err(error) if takes_source_state(&error) => {
+                    new_marks.insert(event_id.to_owned());
+                    seed_with(&mut log, state)?
+                }
+                Err(error) => return Err(refused(event_id, error)),
+            }
+        } else if step.head {
+            // No resolver: Synapse's current state.
+            from_source.push((event_id.to_owned(), HEAD_REASON.to_owned()));
+            seed_with(&mut log, snapshot_from(&room.current_state))?
+        } else {
+            match log.append_remote(step.input.clone()) {
+                Ok(entry) => entry.event_id.clone(),
+                Err(error) if takes_source_state(&error) => {
+                    let map = source
+                        .state_after(event_id)
+                        .map_err(|why| no_state(event_id, why))?;
+                    from_source.push((event_id.to_owned(), format!("{error:?}")));
+                    seed_with(&mut log, snapshot_from(&map))?
+                }
+                Err(error) => return Err(refused(event_id, error)),
+            }
+        };
+
+        // 4. Keep the derived state while it is still needed.
+        let actual = match want.state {
+            Some(state) => Some(state),
+            None => log.state_after_event(&entry).cloned(),
+        };
+        if let Some(state) = &actual
+            && (last_use.contains_key(event_id) || keep.contains(event_id))
+        {
+            derived.insert(event_id, state.clone());
+        }
+        previous = actual;
+        for parent in &step.input.prev_events {
+            let parent = parent.as_str();
+            if last_use.get(parent) == Some(&position) && !keep.contains(parent) {
+                derived.remove(parent);
+            }
+        }
+        head = Some(entry);
+    }
+
+    let head = head.ok_or_else(|| ImportError::NoHeadState {
+        room_id: room_id.to_owned(),
+    })?;
+    let state = log
+        .state_after_event(&head)
+        .ok_or_else(|| ImportError::NoHeadState {
+            room_id: room_id.to_owned(),
+        })?;
+    Ok((
+        ResolvedOutcome {
+            outcome: Outcome {
+                room_id: room_id.to_owned(),
+                imported: plan.steps.len(),
+                divergence: compare(state, &room.current_state),
+                excluded: plan.excluded.clone(),
+                seeded_from_source: plan.seeded_from_source,
+            },
+            from_source,
+            settled,
+            forks,
+            passes: 0,
+            full_checks,
+        },
+        new_marks,
+    ))
+}
+
+/// Print, for one fork, how each parent's derived state differs from the
+/// source's state for that parent, and what the resolver contested. Set
+/// `SPINDLE_IMPORT_DEBUG_EVENT` to the event ID to investigate a
+/// disagreement.
+fn debug_fork(
+    source: &mut dyn SourceState,
+    step: &Step,
+    parents: &[&StateSnapshot],
+    resolution: &Resolution,
+) {
+    eprintln!(
+        "debug {}: contested {:?}",
+        step.input.event_id.as_str(),
+        resolution
+            .contested
+            .iter()
+            .map(|key| format!("{}|{}", key.event_type().as_str(), key.state_key()))
+            .collect::<Vec<_>>()
+    );
+    for (parent, state) in step.input.prev_events.iter().zip(parents) {
+        match source.state_after(parent.as_str()) {
+            Ok(map) => {
+                let theirs = snapshot_from(&map);
+                let diff = state.diff(&theirs);
+                eprintln!(
+                    "debug   parent {}: {} slots differ from the source",
+                    parent.as_str(),
+                    diff.len()
+                );
+                for (key, ours, theirs) in diff.iter().take(10) {
+                    eprintln!(
+                        "debug     {}|{} ours={ours:?} source={theirs:?}",
+                        key.event_type().as_str(),
+                        key.state_key()
+                    );
+                }
+            }
+            Err(why) => eprintln!("debug   parent {}: no source state: {why}", parent.as_str()),
+        }
+    }
+    if let Some(Ok(theirs)) = {
+        let maps: Vec<StateSnapshot> = step
+            .input
+            .prev_events
+            .iter()
+            .filter_map(|parent| source.state_after(parent.as_str()).ok())
+            .map(|map| snapshot_from(&map))
+            .collect();
+        let refs: Vec<&StateSnapshot> = maps.iter().collect();
+        source.resolve(&refs)
+    } {
+        eprintln!(
+            "debug   resolver over the source's parent states changes {:?}",
+            theirs
+                .slots
+                .iter()
+                .map(|(key, value)| format!(
+                    "{}|{} -> {value:?}",
+                    key.event_type().as_str(),
+                    key.state_key()
+                ))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// `map` as a snapshot that shares structure with `base`, and the slots
+/// where it differs from `base` (the ones a seed has to persist).
+///
+/// Building each seed's state from nothing gave every gap in a room of
+/// tens of thousands of members a trie of its own, and the import held
+/// all of them.
+fn snapshot_over(base: Option<&StateSnapshot>, map: &StateMap) -> (StateSnapshot, StateMap) {
+    let Some(base) = base else {
+        return (snapshot_from(map), map.clone());
+    };
+    let mut changed = StateMap::new();
+    let mut added = 0_usize;
+    for ((kind, state_key), value) in map {
+        match base.get(&StateKey::new(kind.clone(), state_key.clone())) {
+            Some(held) if held == value => {}
+            Some(_) => {
+                changed.insert((kind.clone(), state_key.clone()), value.clone());
+            }
+            None => {
+                added += 1;
+                changed.insert((kind.clone(), state_key.clone()), value.clone());
+            }
+        }
+    }
+    let mut state = base.clone();
+    if base.len() + added != map.len() {
+        // Drop missing slots along their trie paths, retaining all shared
+        // nodes. Rebuilding each seed retained a full trie at every gap.
+        let mut missing = Vec::new();
+        base.for_each(|key, _| {
+            if !map.contains_key(&key_pair(key)) {
+                missing.push(key.clone());
+            }
+        });
+        for key in missing {
+            state = state.remove(&key);
+        }
+    }
+    for ((kind, state_key), value) in &changed {
+        state = state.apply(
+            StateKey::new(kind.clone(), state_key.clone()),
+            value.clone(),
+        );
+    }
+    (state, changed)
+}
+
+/// Whether a snapshot holds exactly `map`.
+fn same_state(state: &StateSnapshot, map: &StateMap) -> bool {
+    state.len() == map.len()
+        && map.iter().all(|((kind, key), value)| {
+            state.get(&StateKey::new(kind.clone(), key.clone())) == Some(value.as_str())
+        })
+}
+
+/// `state` with `slots` applied; a `None` value removes the slot.
+#[must_use]
+pub fn apply_slots(state: &StateSnapshot, slots: &[(StateKey, Option<String>)]) -> StateSnapshot {
+    let mut next = state.clone();
+    for (key, value) in slots {
+        next = match value {
+            Some(value) => next.apply(key.clone(), value.clone()),
+            None => next.remove(key),
+        };
+    }
+    next
+}
+
+pub(crate) fn snapshot_from(map: &StateMap) -> StateSnapshot {
     let mut snapshot = StateSnapshot::new();
     for ((event_type, state_key), event_id) in map {
         snapshot = snapshot.apply(
@@ -564,6 +1498,281 @@ fn snapshot_from(map: &StateMap) -> StateSnapshot {
         );
     }
     snapshot
+}
+
+/// Why a validated rehearsal could not be persisted.
+#[cfg(feature = "synapse-import")]
+#[derive(Debug)]
+pub enum PersistError {
+    Replay(ImportError),
+    Divergent { room_id: String, slots: usize },
+    MissingBody(String),
+    BodyMismatch(String),
+    Room(crate::rooms::RoomError),
+}
+
+#[cfg(feature = "synapse-import")]
+impl std::fmt::Display for PersistError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Replay(error) => write!(formatter, "{error}"),
+            Self::Divergent { room_id, slots } => {
+                write!(formatter, "{room_id}: {slots} state slots diverge")
+            }
+            Self::MissingBody(event_id) => write!(formatter, "missing JSON body for {event_id}"),
+            Self::BodyMismatch(event_id) => {
+                write!(
+                    formatter,
+                    "Synapse metadata and JSON disagree for {event_id}"
+                )
+            }
+            Self::Room(error) => write!(formatter, "persisting rehearsal: {error}"),
+        }
+    }
+}
+
+#[cfg(feature = "synapse-import")]
+impl std::error::Error for PersistError {}
+
+/// Validate every source row, then persist one room into an isolated store.
+///
+/// This is intentionally a rehearsal path, not yet the production cutover
+/// writer: storage failures can leave a prefix behind until resumable room
+/// checkpoints land. Call it only with an empty disposable store.
+///
+/// # Errors
+///
+/// Returns [`PersistError`] if replay diverges, source JSON disagrees with
+/// normalized metadata, or the target store cannot persist the validated log.
+#[cfg(feature = "synapse-import")]
+pub fn persist_rehearsal(
+    rooms: &crate::rooms::Rooms,
+    source: &SourceRoom,
+    bodies: &BTreeMap<String, serde_json::Value>,
+) -> Result<Outcome, PersistError> {
+    let outcome = replay(source).map_err(PersistError::Replay)?;
+    if !outcome.clean() {
+        return Err(PersistError::Divergent {
+            room_id: source.room_id.clone(),
+            slots: outcome.divergence.len(),
+        });
+    }
+    let plan = plan(source).map_err(|error| PersistError::Replay(error.into()))?;
+    let events: HashMap<&str, &SourceEvent> = source
+        .events
+        .iter()
+        .map(|event| (event.event_id.as_str(), event))
+        .collect();
+    for step in &plan.steps {
+        let event_id = step.input.event_id.as_str();
+        let body = bodies
+            .get(event_id)
+            .ok_or_else(|| PersistError::MissingBody(event_id.to_owned()))?;
+        let Some(event) = events.get(event_id) else {
+            return Err(PersistError::BodyMismatch(event_id.to_owned()));
+        };
+        check_body(event, body)?;
+    }
+
+    rooms
+        .persist_synapse_plan(&plan, source.state_after_root.as_ref(), bodies)
+        .map_err(PersistError::Room)?;
+    let rejected: Vec<String> = source
+        .events
+        .iter()
+        .filter(|event| event.rejected)
+        .map(|event| event.event_id.clone())
+        .collect();
+    let rejected_bodies = rejected
+        .iter()
+        .filter_map(|id| bodies.get(id).map(|body| (id.clone(), body.clone())))
+        .collect();
+    let accepted: HashSet<&str> = plan
+        .steps
+        .iter()
+        .map(|step| step.input.event_id.as_str())
+        .collect();
+    let required_auth: HashSet<String> = bodies
+        .values()
+        .flat_map(|body| crate::rooms::edge_ids(&body["auth_events"]))
+        .collect();
+    let auth_bodies = source
+        .events
+        .iter()
+        .filter(|event| {
+            (event.state_key.is_some() || required_auth.contains(&event.event_id))
+                && !accepted.contains(event.event_id.as_str())
+        })
+        .filter_map(|event| {
+            bodies
+                .get(&event.event_id)
+                .map(|body| (event.event_id.clone(), body.clone()))
+        })
+        .collect();
+    rooms
+        .persist_imported_auth_pdus(&source.room_id, &auth_bodies)
+        .map_err(PersistError::Room)?;
+    rooms
+        .preserve_imported_rejections(&source.room_id, &rejected, &rejected_bodies)
+        .map_err(PersistError::Room)?;
+    Ok(outcome)
+}
+
+/// Event bodies and resolved state from the source, for the room writer.
+#[cfg(feature = "synapse-import")]
+pub trait SynapseSource: SourceState {
+    /// The signed JSON of `event_id`, as the source stored it.
+    fn body(&mut self, event_id: &str) -> Option<serde_json::Value>;
+
+    /// The state the replay settled for `event_id`, when it is to be
+    /// written with a supplied state rather than the log's fold.
+    fn settled(&mut self, _event_id: &str) -> Option<Settled> {
+        None
+    }
+
+    /// Read a supplied state without turning failed disk reads into absence.
+    /// Absence allows the ordinary fold; a failed read must refuse that write.
+    ///
+    /// # Errors
+    ///
+    /// A failed or corrupt supplied-state read.
+    fn read_settled(&mut self, event_id: &str) -> Result<Option<Settled>, String> {
+        Ok(self.settled(event_id))
+    }
+}
+
+/// A source held in memory: what a test, or a caller that already read
+/// everything, hands the room writer.
+#[cfg(feature = "synapse-import")]
+#[derive(Default)]
+pub struct MemorySource {
+    pub bodies: HashMap<String, serde_json::Value>,
+    pub states: HashMap<String, StateMap>,
+}
+
+#[cfg(feature = "synapse-import")]
+impl SourceState for MemorySource {
+    fn state_after(&mut self, event_id: &str) -> Result<StateMap, String> {
+        self.states
+            .get(event_id)
+            .cloned()
+            .ok_or_else(|| format!("no state for {event_id}"))
+    }
+}
+
+#[cfg(feature = "synapse-import")]
+impl SynapseSource for MemorySource {
+    fn body(&mut self, event_id: &str) -> Option<serde_json::Value> {
+        self.bodies.get(event_id).cloned()
+    }
+}
+
+/// Append one chunk of a validated plan to the target, resuming if the room
+/// already holds some of it. See `Rooms::persist_synapse_steps`.
+///
+/// Returns how many events were appended, and which took the source's state.
+///
+/// # Errors
+///
+/// Returns [`PersistError::Room`] if a body is missing or the write fails.
+#[cfg(feature = "synapse-import")]
+pub fn persist_chunk(
+    rooms: &crate::rooms::Rooms,
+    room_id: &str,
+    steps: &[Step],
+    state_after_root: Option<&StateMap>,
+    source: &mut dyn SynapseSource,
+) -> Result<(usize, Vec<(String, String)>), PersistError> {
+    rooms
+        .persist_synapse_steps(room_id, steps, state_after_root, source)
+        .map_err(PersistError::Room)
+}
+
+/// Apply a room's imported redactions and sync it. See
+/// `Rooms::finish_synapse_room`.
+///
+/// # Errors
+///
+/// Returns [`PersistError::Room`] if a target cannot be rewritten.
+#[cfg(feature = "synapse-import")]
+pub fn finish_room(
+    rooms: &crate::rooms::Rooms,
+    room_id: &str,
+    redactions: &[(String, String)],
+) -> Result<usize, PersistError> {
+    rooms
+        .finish_synapse_room(room_id, redactions)
+        .map_err(PersistError::Room)
+}
+
+/// Check that an event's signed JSON says what Synapse's normalized rows say.
+///
+/// The plan is built from `events` and `event_edges`; the log stores the
+/// JSON. If the two disagree about the type, the state key or the parents,
+/// the order the plan chose is not the order the stored events describe.
+///
+/// # Errors
+///
+/// Returns [`PersistError::BodyMismatch`] when they disagree.
+#[cfg(feature = "synapse-import")]
+pub fn check_body(event: &SourceEvent, body: &serde_json::Value) -> Result<(), PersistError> {
+    let body_state_key = body.get("state_key").and_then(serde_json::Value::as_str);
+    // Compared as sets: `event_edges` has no order column, so the rows come
+    // back in whatever order the database chooses.
+    let mut body_parents: Vec<&str> = body
+        .get("prev_events")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|parent| {
+            // Room versions 1 and 2 name a parent as `[event_id, hashes]`.
+            parent
+                .as_str()
+                .or_else(|| parent.get(0).and_then(serde_json::Value::as_str))
+        })
+        .collect();
+    body_parents.sort_unstable();
+    let mut row_parents: Vec<&str> = event.prev_events.iter().map(String::as_str).collect();
+    row_parents.sort_unstable();
+    if body.get("type").and_then(serde_json::Value::as_str) != Some(event.event_type.as_str())
+        || body_state_key != event.state_key.as_deref()
+        || body_parents != row_parents
+    {
+        return Err(PersistError::BodyMismatch(event.event_id.clone()));
+    }
+    Ok(())
+}
+
+/// Every `(target, redaction)` pair among the planned events.
+///
+/// A redaction names its target in `content.redacts` from room version 11
+/// and in the top-level `redacts` before that.
+#[cfg(feature = "synapse-import")]
+#[must_use]
+pub fn redactions_in<'v>(
+    steps: &[Step],
+    body_of: &dyn Fn(&str) -> Option<&'v serde_json::Value>,
+) -> Vec<(String, String)> {
+    steps
+        .iter()
+        .filter_map(|step| {
+            let event_id = step.input.event_id.as_str();
+            redaction_target(body_of(event_id)?)
+                .map(|target| (target.to_owned(), event_id.to_owned()))
+        })
+        .collect()
+}
+
+/// The event a redaction removes, or `None` for any other event.
+#[cfg(feature = "synapse-import")]
+#[must_use]
+pub fn redaction_target(body: &serde_json::Value) -> Option<&str> {
+    if body["type"].as_str() != Some("m.room.redaction") {
+        return None;
+    }
+    body["content"]["redacts"]
+        .as_str()
+        .or_else(|| body["redacts"].as_str())
 }
 
 /// Compare the state Spindle folded forward with the state Synapse reports.
@@ -613,7 +1822,8 @@ pub fn compare(state: &StateSnapshot, current_state: &StateMap) -> Vec<Divergenc
 /// # Errors
 ///
 /// Returns [`ImportError`] when the room cannot be ordered or the log refuses
-/// an event the plan offered it.
+/// an event the plan offered it. A fork with different parent states needs
+/// the full importer's room-version resolver; topology alone cannot resolve it.
 pub fn replay(room: &SourceRoom) -> Result<Outcome, ImportError> {
     let plan = plan(room)?;
     let mut log = RoomLog::new();
@@ -667,4 +1877,291 @@ pub fn replay(room: &SourceRoom) -> Result<Outcome, ImportError> {
         excluded: plan.excluded,
         seeded_from_source: plan.seeded_from_source,
     })
+}
+
+#[cfg(test)]
+mod seed_sharing_tests {
+    use super::*;
+
+    #[test]
+    fn a_gap_removing_one_member_shares_the_existing_room_trie() {
+        let mut map = StateMap::new();
+        for index in 0..10_000 {
+            map.insert(
+                ("m.room.member".to_owned(), format!("@u{index}:example.org")),
+                format!("$e{index}"),
+            );
+        }
+        let base = snapshot_from(&map);
+        map.remove(&("m.room.member".to_owned(), "@u3000:example.org".to_owned()));
+        let (seed, changed) = snapshot_over(Some(&base), &map);
+        assert_eq!(seed.root(), snapshot_from(&map).root());
+        assert!(
+            changed.is_empty(),
+            "removal needs no replacement event bodies"
+        );
+        assert!(seed.delta_nodes(Some(&base)).len() <= 52);
+    }
+}
+
+#[cfg(test)]
+mod head_source_tests {
+    use super::*;
+    const REMOTE: &str = "@remote:example.invalid";
+    const HISTORICAL: &str = "@historical:example.invalid";
+    struct FixtureSource {
+        historical_merge: StateMap,
+        full_compare_last: bool,
+        resolver_calls: usize,
+        read_snapshots: Vec<StateMap>,
+    }
+    impl SourceState for FixtureSource {
+        fn state_after(&mut self, event: &str) -> Result<StateMap, String> {
+            if event != "$merge" {
+                return Err("fixture only holds historical merge state".into());
+            }
+            let historical = self.historical_merge.clone();
+            self.read_snapshots.push(historical.clone());
+            Ok(historical)
+        }
+        fn state_after_keys(
+            &mut self,
+            event: &str,
+            keys: &[(String, String)],
+        ) -> Result<StateMap, String> {
+            let mut historical = self.state_after(event)?;
+            historical.retain(|key, _| keys.contains(key));
+            Ok(historical)
+        }
+        fn resolve(&mut self, sets: &[&StateSnapshot]) -> Option<Result<Resolution, String>> {
+            self.resolver_calls += 1;
+            assert_eq!(sets.len(), 2);
+            assert_eq!(
+                sets[0].get(&StateKey::new("m.room.topic", "")),
+                Some("$topic_a")
+            );
+            assert_eq!(
+                sets[1].get(&StateKey::new("m.room.topic", "")),
+                Some("$topic_b")
+            );
+            for set in sets {
+                assert_eq!(
+                    set.len(),
+                    2,
+                    "historical parent is create+its own topic only"
+                );
+                assert!(set.get(&StateKey::new("m.room.member", REMOTE)).is_none());
+                assert!(
+                    set.get(&StateKey::new("m.room.member", HISTORICAL))
+                        .is_none()
+                );
+            }
+            Some(Ok(Resolution {
+                contested: vec![StateKey::new("m.room.topic", "")],
+                slots: vec![(
+                    StateKey::new("m.room.topic", ""),
+                    Some("$topic_a".to_owned()),
+                )],
+            }))
+        }
+        fn continuity(&mut self, event: &str, _parents: &[EventId], _is_state: bool) -> Continuity {
+            if self.full_compare_last && event == "$merge" {
+                Continuity::Unknown
+            } else {
+                Continuity::Derived
+            }
+        }
+    }
+    fn event(
+        id: &str,
+        kind: &str,
+        state_key: Option<&str>,
+        parents: &[&str],
+        depth: u64,
+    ) -> SourceEvent {
+        SourceEvent {
+            event_id: id.into(),
+            event_type: kind.into(),
+            state_key: state_key.map(str::to_owned),
+            prev_events: parents.iter().copied().map(str::to_owned).collect(),
+            depth,
+            stream_ordering: i64::try_from(depth).unwrap_or(i64::MAX),
+            outlier: false,
+            rejected: false,
+        }
+    }
+    fn fixture(full_compare: bool) -> (SourceRoom, FixtureSource) {
+        let mut historical = StateMap::from([
+            (("m.room.create".into(), String::new()), "$create".into()),
+            (("m.room.topic".into(), String::new()), "$topic_a".into()),
+        ]);
+        if full_compare {
+            historical.insert(
+                ("m.room.member".into(), HISTORICAL.into()),
+                "$historical_member".into(),
+            );
+        }
+        let mut current = historical.clone();
+        current.insert(
+            ("m.room.member".into(), REMOTE.into()),
+            "$current_only_outlier".into(),
+        );
+        let mut events = vec![
+            event("$create", "m.room.create", Some(""), &[], 1),
+            event("$topic_a", "m.room.topic", Some(""), &["$create"], 2),
+            event("$topic_b", "m.room.topic", Some(""), &["$create"], 3),
+            event(
+                "$merge",
+                "m.room.message",
+                None,
+                &["$topic_a", "$topic_b"],
+                4,
+            ),
+        ];
+        let mut outlier = event(
+            "$current_only_outlier",
+            "m.room.member",
+            Some(REMOTE),
+            &["$create"],
+            5,
+        );
+        outlier.outlier = true;
+        events.push(outlier);
+        if full_compare {
+            let mut old = event(
+                "$historical_member",
+                "m.room.member",
+                Some(HISTORICAL),
+                &["$create"],
+                6,
+            );
+            old.outlier = true;
+            events.push(old);
+        }
+        (
+            SourceRoom {
+                room_id: "!head-regression:example.invalid".into(),
+                events,
+                current_state: current,
+                state_after_root: None,
+                forward_extremities: vec!["$merge".into()],
+            },
+            FixtureSource {
+                historical_merge: historical,
+                full_compare_last: full_compare,
+                resolver_calls: 0,
+                read_snapshots: Vec::new(),
+            },
+        )
+    }
+    fn check(full_compare: bool) {
+        let (room, mut source) = fixture(full_compare);
+        let historical_before = source.state_after("$merge").expect("historical getter");
+        assert!(!historical_before.contains_key(&("m.room.member".to_owned(), REMOTE.to_owned())));
+        let plan_before = plan_resolving(&room).expect("plan");
+        let parents_before: Vec<_> = plan_before
+            .steps
+            .iter()
+            .map(|s| s.input.prev_events.clone())
+            .collect();
+        let old = replay_resolving(&room, &mut source, false).expect("natural replay");
+        assert!(!old.outcome.clean());
+        assert_eq!(old.outcome.divergence.len(), 1);
+        let repaired = replay_resolving(&room, &mut source, true).expect("forced head replay");
+        assert!(repaired.outcome.clean());
+        assert_eq!(repaired.outcome.imported, 4);
+        assert!(
+            repaired
+                .outcome
+                .excluded
+                .iter()
+                .any(|e| matches!(e,Excluded::Outlier(id) if id=="$current_only_outlier"))
+        );
+        let seed = repaired
+            .settled
+            .get("$merge")
+            .expect("head must be saved for persistence");
+        assert_eq!(seed.reason, HEAD_REASON);
+        assert_eq!(
+            seed.slots
+                .get(&("m.room.member".to_owned(), REMOTE.to_owned()))
+                .map(String::as_str),
+            Some("$current_only_outlier")
+        );
+        if full_compare {
+            assert_eq!(
+                seed.slots
+                    .get(&("m.room.member".to_owned(), HISTORICAL.to_owned()))
+                    .map(String::as_str),
+                Some("$historical_member")
+            );
+            assert_eq!(
+                seed.slots.len(),
+                2,
+                "keep historical supplied body AND new current-only body"
+            );
+        } else {
+            assert_eq!(seed.slots.len(), 1);
+        }
+        for ((kind, key), value) in &room.current_state {
+            assert_eq!(
+                seed.state.get(&StateKey::new(kind.clone(), key.clone())),
+                Some(value.as_str())
+            );
+        }
+        assert_eq!(
+            repaired.from_source,
+            vec![("$merge".to_owned(), HEAD_REASON.to_owned())]
+        );
+        let historical_after = source
+            .state_after("$merge")
+            .expect("historical getter after replay");
+        assert_eq!(
+            historical_after, historical_before,
+            "getter semantics never mutated into room.current_state"
+        );
+        assert!(
+            source
+                .read_snapshots
+                .iter()
+                .all(|s| s == &historical_before)
+        );
+        assert_eq!(source.historical_merge, historical_before);
+        let plan_after = plan_resolving(&room).expect("unchanged plan");
+        assert_eq!(
+            parents_before,
+            plan_after
+                .steps
+                .iter()
+                .map(|s| s.input.prev_events.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+    #[test]
+    fn derived_historical_merge_is_preserved_and_current_only_outlier_stays_out_of_timeline() {
+        check(false);
+    }
+    #[test]
+    fn unknown_historical_merge_keeps_supplied_historical_and_current_only_body_deltas() {
+        check(true);
+    }
+
+    #[test]
+    fn singleton_first_seed_with_unpersisted_current_only_state_stays_divergent() {
+        let (mut room, mut source) = fixture(false);
+        room.events
+            .retain(|event| event.event_id == "$create" || event.outlier);
+        room.forward_extremities = vec!["$create".to_owned()];
+        room.current_state
+            .remove(&("m.room.topic".to_owned(), String::new()));
+        let result = replay_resolving(&room, &mut source, true).expect("root replay");
+        assert!(
+            !result.outcome.clean(),
+            "first seed uses root persistence, not settled head persistence"
+        );
+        assert_eq!(result.outcome.imported, 1);
+        assert!(result.settled.is_empty());
+        assert!(result.from_source.is_empty());
+        assert_eq!(result.outcome.divergence.len(), 1);
+    }
 }

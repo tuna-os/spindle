@@ -195,13 +195,36 @@ async fn the_unstable_spelling_works_too() {
     let alice = harness.register("alice").await;
     let room = harness.create_room(&alice).await;
 
+    //
+    // The answer is spelled the way the question was. matrix-js-sdk (and so
+    // Element Web) sends the unstable flag on every sync and reads only
+    // `org.matrix.msc4222.state_after`, falling back to `state`; answered
+    // with the stable `state_after` it saw no state at all, and showed every
+    // room as an unnamed, unencrypted room version 1.
     let sync = harness
         .sync(&alice, "?org.matrix.msc4222.use_state_after=true")
         .await;
+    let joined = &sync["rooms"]["join"][&room];
+    let events = joined["org.matrix.msc4222.state_after"]["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no unstable state_after block: {sync}"));
     assert!(
-        sync["rooms"]["join"][&room]["state_after"].is_object(),
+        events.iter().any(|event| event["type"] == "m.room.create"),
         "{sync}"
     );
+    assert!(joined["state_after"].is_null(), "{sync}");
+    assert!(joined["state"].is_null(), "{sync}");
+
+    // Both flags: the stable one decides, and the stable field answers.
+    let sync = harness
+        .sync(
+            &alice,
+            "?use_state_after=true&org.matrix.msc4222.use_state_after=true",
+        )
+        .await;
+    let joined = &sync["rooms"]["join"][&room];
+    assert!(joined["state_after"].is_object(), "{sync}");
+    assert!(joined["org.matrix.msc4222.state_after"].is_null(), "{sync}");
 
     // And it is advertised, which is what a client checks before sending it.
     let (_, versions) = harness.get("/_matrix/client/versions", &alice).await;

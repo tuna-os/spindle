@@ -55,6 +55,241 @@ pub enum Origin {
     Federated,
 }
 
+/// What became of one PDU a peer pushed in a transaction.
+///
+/// Five outcomes are the receipt checks' own verdicts; `refused` is
+/// everything refused before them -- a bad signature, a foreign sender, an
+/// unknown room -- so the series add up to every PDU received.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PduOutcome {
+    /// Appended to the timeline through the ordinary receipt checks,
+    /// directly or after its predecessors were recovered.
+    Accepted,
+    /// Appended across a gap on a peer's `/state_ids` (see `inbound::gap`).
+    GapAccepted,
+    /// Kept out of the timeline: fails only against the current state.
+    SoftFailed,
+    /// Kept out of the timeline: fails against its auth events or the
+    /// state before it.
+    Rejected,
+    /// Its predecessors or auth events are missing and could neither be
+    /// recovered nor bridged.
+    RefusedMissingDeps,
+    /// Refused before any receipt check.
+    Refused,
+}
+
+impl PduOutcome {
+    const ALL: [Self; 6] = [
+        Self::Accepted,
+        Self::GapAccepted,
+        Self::SoftFailed,
+        Self::Rejected,
+        Self::RefusedMissingDeps,
+        Self::Refused,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::GapAccepted => "gap_accepted",
+            Self::SoftFailed => "soft_failed",
+            Self::Rejected => "rejected",
+            Self::RefusedMissingDeps => "refused_missing_deps",
+            Self::Refused => "refused",
+        }
+    }
+}
+
+/// How one predecessor recovery attempt against one peer ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryResult {
+    /// Every missing predecessor and auth event was recovered.
+    Recovered,
+    /// The gap is wider than the event or byte budget.
+    BudgetExceeded,
+    /// The peer failed to answer, or answered with an error.
+    PeerError,
+    /// The peer answered 429, or was still cooling down from one.
+    RateLimited,
+    /// The attempt ran out of time.
+    Timeout,
+    /// What the peer sent failed verification or authorization.
+    Invalid,
+}
+
+impl RecoveryResult {
+    const ALL: [Self; 6] = [
+        Self::Recovered,
+        Self::BudgetExceeded,
+        Self::PeerError,
+        Self::RateLimited,
+        Self::Timeout,
+        Self::Invalid,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Recovered => "recovered",
+            Self::BudgetExceeded => "budget_exceeded",
+            Self::PeerError => "peer_error",
+            Self::RateLimited => "rate_limited",
+            Self::Timeout => "timeout",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+/// Why an event body was fetched from a peer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FetchKind {
+    /// A missing predecessor (`get_missing_events` or `/event`).
+    Predecessor,
+    /// A missing auth event of a pushed or recovered event.
+    Auth,
+    /// A state or auth-chain event named by `/state_ids` for a gap.
+    GapState,
+}
+
+impl FetchKind {
+    const ALL: [Self; 3] = [Self::Predecessor, Self::Auth, Self::GapState];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Predecessor => "predecessor",
+            Self::Auth => "auth",
+            Self::GapState => "gap_state",
+        }
+    }
+}
+
+/// How one attempt to accept an event across a gap ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GapResult {
+    /// The event was appended on the peer's state.
+    Accepted,
+    /// The state or its auth chain exceeded the gap budget.
+    BudgetExceeded,
+    /// No participating server answered `/state_ids` usefully.
+    PeerError,
+    /// Every candidate answered 429 or was cooling down from one.
+    RateLimited,
+    /// The attempt ran out of time.
+    Timeout,
+    /// The state, an event in it, or the event itself failed verification
+    /// or authorization: refused, fail closed.
+    Invalid,
+    /// Not attempted: the room has had its window's worth of gap
+    /// acceptances (the amplification guard, `[federation]
+    /// gap_acceptances_per_room`).
+    CappedRoom,
+    /// Not attempted: the origin has had its window's worth of gap
+    /// acceptances across all rooms (`gap_acceptances_per_origin`).
+    CappedOrigin,
+}
+
+impl GapResult {
+    const ALL: [Self; 8] = [
+        Self::Accepted,
+        Self::BudgetExceeded,
+        Self::PeerError,
+        Self::RateLimited,
+        Self::Timeout,
+        Self::Invalid,
+        Self::CappedRoom,
+        Self::CappedOrigin,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::BudgetExceeded => "budget_exceeded",
+            Self::PeerError => "peer_error",
+            Self::RateLimited => "rate_limited",
+            Self::Timeout => "timeout",
+            Self::Invalid => "invalid",
+            Self::CappedRoom => "capped_room",
+            Self::CappedOrigin => "capped_origin",
+        }
+    }
+}
+
+/// How one backfill chunk for a recorded federation gap ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackfillChunk {
+    /// Events were verified, checked and stored below the gap event.
+    Filled,
+    /// The walk met history this server holds: the gap is closed and its
+    /// marker removed.
+    Completed,
+    /// No participating server answered usefully.
+    PeerError,
+    /// Every candidate answered 429 or was cooling down from one.
+    RateLimited,
+    /// An event, its auth chain or the state the peer named failed
+    /// verification or authorization: nothing from the chunk was stored.
+    Invalid,
+    /// The gap outgrew the backfill budget and was left truncated.
+    Truncated,
+}
+
+impl BackfillChunk {
+    const ALL: [Self; 6] = [
+        Self::Filled,
+        Self::Completed,
+        Self::PeerError,
+        Self::RateLimited,
+        Self::Invalid,
+        Self::Truncated,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Filled => "filled",
+            Self::Completed => "completed",
+            Self::PeerError => "peer_error",
+            Self::RateLimited => "rate_limited",
+            Self::Invalid => "invalid",
+            Self::Truncated => "truncated",
+        }
+    }
+}
+
+/// What became of one event a gap backfill handled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackfillEvent {
+    /// Fetched from a peer as part of a gap's history (before any check).
+    Fetched,
+    /// Stored into the gap's segment of the timeline.
+    Inserted,
+    /// Walked through but kept out of the timeline: it failed its auth
+    /// events or the state before it.
+    Rejected,
+    /// Named by the history but served by no participating server -- a
+    /// peer leaves out what it rejected -- and stepped over.
+    Skipped,
+}
+
+impl BackfillEvent {
+    const ALL: [Self; 4] = [Self::Fetched, Self::Inserted, Self::Rejected, Self::Skipped];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fetched => "fetched",
+            Self::Inserted => "inserted",
+            Self::Rejected => "rejected",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+/// Position of a label value in its `ALL` table, which is the counter's
+/// slot. A linear search over at most six values, and it cannot drift from
+/// the table the renderer walks.
+fn slot<T: PartialEq + Copy>(all: &[T], value: T) -> usize {
+    all.iter().position(|each| *each == value).unwrap_or(0)
+}
+
 /// Every counter, gauge and histogram this server exposes.
 ///
 /// One per server: `spindle_server::app` makes it and hands the same
@@ -64,10 +299,12 @@ pub enum Origin {
 /// paying for stronger ordering on the append hot path to make a number
 /// that is sampled every 15 seconds marginally fresher would be a poor
 /// trade.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Metrics {
     fork_cases: [AtomicU64; 3],
     events: [AtomicU64; 2],
+    /// `[soft-failed, rejected]` PDUs kept out of the timeline.
+    sidelined: [AtomicU64; 2],
     /// `[exclusive, shared]` acquisitions of one room's lock.
     room_locks: [AtomicU64; 2],
     /// `[exclusive, shared]` acquisitions of the registry that finds rooms.
@@ -78,12 +315,472 @@ pub struct Metrics {
     federation_queue: RwLock<Vec<(String, u64)>>,
     sync_subscribers: AtomicU64,
     sync_lag: Family,
+    /// Inbound PDUs by what became of them ([`PduOutcome`]).
+    pdu_outcomes: [AtomicU64; PduOutcome::ALL.len()],
+    /// Predecessor recovery attempts by result ([`RecoveryResult`]).
+    recovery_attempts: [AtomicU64; RecoveryResult::ALL.len()],
+    recovery_latency: Family,
+    /// Bodies fetched from peers by recovery or gap acceptance ([`FetchKind`]).
+    recovery_fetched: [AtomicU64; FetchKind::ALL.len()],
+    /// Gap acceptance attempts by result ([`GapResult`]).
+    gap_acceptances: [AtomicU64; GapResult::ALL.len()],
+    state_ids_latency: Family,
+    /// Cold room loads, by [`RoomSize`]: a count and how long each took.
+    cold_loads: [AtomicU64; RoomSize::ALL.len()],
+    cold_load_latency: [Histogram; RoomSize::ALL.len()],
+    /// How the server counts the rooms it holds open, and the last
+    /// answer it gave (served when the registry is busy at scrape time).
+    resident_rooms: ResidentProbe,
+    /// Time spent waiting to acquire `[registry exclusive, registry shared,
+    /// room exclusive, room shared]`.
+    lock_waits: [Histogram; 4],
+    /// The sync handlers' phases, by [`SyncPhase`].
+    sync_phases: [Histogram; SyncPhase::ALL.len()],
+    /// Work moved off the async workers that has not finished, by
+    /// [`BlockingTask`].
+    blocking_in_flight: [AtomicU64; BlockingTask::ALL.len()],
+    /// Outbound federation transactions by [`TxnResult`], with their
+    /// durations.
+    outbound_txns: [AtomicU64; TxnResult::ALL.len()],
+    outbound_txn_latency: [Histogram; TxnResult::ALL.len()],
+    /// Rooms the startup warm-up has still to load, and has loaded.
+    warmup_pending: AtomicU64,
+    warmup_loaded: AtomicU64,
+    /// Gap backfill chunks by result ([`BackfillChunk`]).
+    backfill_chunks: [AtomicU64; BackfillChunk::ALL.len()],
+    backfill_latency: Family,
+    /// Events a gap backfill handled, by what became of them.
+    backfill_events: [AtomicU64; BackfillEvent::ALL.len()],
+    /// Recorded federation gaps not yet filled (a gauge).
+    gaps_remaining: AtomicU64,
+    /// Peer signing-key lookups and event signature failures.
+    keys: KeyMetrics,
+    auth: AuthCounters,
+    /// Federation EDUs in and out, and inbound receipts by result.
+    edus: EduMetrics,
+    /// State resolution's work and the forks that cause it (#626).
+    state_res: StateResMetrics,
+}
+
+/// State resolution, and the forward extremities that make it necessary.
+#[derive(Debug, Default)]
+struct StateResMetrics {
+    /// Resolutions computed, and answered from the cache.
+    resolutions: AtomicU64,
+    cache_hits: AtomicU64,
+    /// Candidates the iterative auth checks refused inside a resolution.
+    rejections: AtomicU64,
+    /// `org.matrix.dummy_event`s authored to merge extremities, `[sent,
+    /// failed]`.
+    dummy_events: [AtomicU64; 2],
+    /// Resident rooms by forward-extremity count, by
+    /// [`EXTREMITY_BUCKETS`], as the last census found them.
+    extremity_buckets: [AtomicU64; 4],
+}
+
+/// The labels of `spindle_rooms_by_forward_extremities`, in index order.
+pub const EXTREMITY_BUCKETS: [&str; 4] = ["1", "2-5", "6-10", ">10"];
+
+/// Which [`EXTREMITY_BUCKETS`] entry `count` extremities fall in. A room
+/// with none (empty) is counted with the rooms that have one.
+#[must_use]
+pub fn extremity_bucket(count: usize) -> usize {
+    match count {
+        0..=1 => 0,
+        2..=5 => 1,
+        6..=10 => 2,
+        _ => 3,
+    }
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            fork_cases: Default::default(),
+            events: Default::default(),
+            sidelined: Default::default(),
+            room_locks: Default::default(),
+            registry_locks: Default::default(),
+            append_latency: Family::default(),
+            http_latency: Family::default(),
+            http_requests: RwLock::default(),
+            federation_queue: RwLock::default(),
+            sync_subscribers: AtomicU64::new(0),
+            sync_lag: Family::default(),
+            pdu_outcomes: Default::default(),
+            recovery_attempts: Default::default(),
+            recovery_latency: Family::default(),
+            recovery_fetched: Default::default(),
+            gap_acceptances: Default::default(),
+            state_ids_latency: Family::default(),
+            cold_loads: Default::default(),
+            cold_load_latency: std::array::from_fn(|_| Histogram::with_bounds(&SLOW_BUCKETS)),
+            resident_rooms: ResidentProbe::default(),
+            lock_waits: std::array::from_fn(|_| Histogram::with_bounds(&SLOW_BUCKETS)),
+            sync_phases: std::array::from_fn(|_| Histogram::with_bounds(&SLOW_BUCKETS)),
+            blocking_in_flight: Default::default(),
+            outbound_txns: Default::default(),
+            outbound_txn_latency: std::array::from_fn(|_| Histogram::with_bounds(&SLOW_BUCKETS)),
+            warmup_pending: AtomicU64::new(0),
+            warmup_loaded: AtomicU64::new(0),
+            backfill_chunks: Default::default(),
+            backfill_latency: Family::default(),
+            backfill_events: Default::default(),
+            gaps_remaining: AtomicU64::new(0),
+            keys: KeyMetrics::default(),
+            auth: AuthCounters::default(),
+            edus: EduMetrics::default(),
+            state_res: StateResMetrics::default(),
+        }
+    }
 }
 
 impl Metrics {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+/// A room's size, coarsely, as a label.
+///
+/// Never the room id: that label would mint a series per room the server
+/// has ever loaded, which is the cardinality #166 rules out. What an
+/// operator needs from a slow load is how big the room was, and five
+/// decades answer that.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoomSize {
+    Under1k,
+    Under10k,
+    Under100k,
+    Under1m,
+    AtLeast1m,
+}
+
+impl RoomSize {
+    pub const ALL: [Self; 5] = [
+        Self::Under1k,
+        Self::Under10k,
+        Self::Under100k,
+        Self::Under1m,
+        Self::AtLeast1m,
+    ];
+
+    /// The bucket a room of `events` log entries falls in.
+    #[must_use]
+    pub fn of(events: usize) -> Self {
+        match events {
+            0..1_000 => Self::Under1k,
+            1_000..10_000 => Self::Under10k,
+            10_000..100_000 => Self::Under100k,
+            100_000..1_000_000 => Self::Under1m,
+            _ => Self::AtLeast1m,
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Under1k => "lt_1k",
+            Self::Under10k => "lt_10k",
+            Self::Under100k => "lt_100k",
+            Self::Under1m => "lt_1m",
+            Self::AtLeast1m => "ge_1m",
+        }
+    }
+}
+
+/// One timed phase of a sync handler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncPhase {
+    /// Sliding sync: sorting the caller's rooms by recency.
+    SlidingOrder,
+    /// Sliding sync: building the entries for the rooms in view.
+    SlidingAssemble,
+    /// Classic `/sync`: reading what changed.
+    SyncRead,
+    /// Classic `/sync`: building the response from it.
+    SyncAssemble,
+}
+
+impl SyncPhase {
+    pub const ALL: [Self; 4] = [
+        Self::SlidingOrder,
+        Self::SlidingAssemble,
+        Self::SyncRead,
+        Self::SyncAssemble,
+    ];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn labels(self) -> (&'static str, &'static str) {
+        match self {
+            Self::SlidingOrder => ("sliding", "order"),
+            Self::SlidingAssemble => ("sliding", "assemble"),
+            Self::SyncRead => ("sync", "read"),
+            Self::SyncAssemble => ("sync", "assemble"),
+        }
+    }
+}
+
+/// Work this server moves off the async worker threads (#614).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockingTask {
+    /// A sliding-sync request's room work (`spawn_blocking`).
+    SlidingSync,
+    /// A classic `/sync` request's room work (`spawn_blocking`).
+    Sync,
+    /// One room loaded by the startup warm-up (`spawn_blocking`).
+    RoomWarmup,
+    /// An inbound federation transaction's PDUs (`spawn_blocking`).
+    FederationSend,
+    /// A cold room load reached from async code (`block_in_place`).
+    ColdLoad,
+    /// A wait for a contended room lock (`block_in_place`).
+    LockWait,
+}
+
+impl BlockingTask {
+    pub const ALL: [Self; 6] = [
+        Self::SlidingSync,
+        Self::Sync,
+        Self::RoomWarmup,
+        Self::FederationSend,
+        Self::ColdLoad,
+        Self::LockWait,
+    ];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SlidingSync => "sliding_sync",
+            Self::Sync => "sync",
+            Self::RoomWarmup => "room_warmup",
+            Self::FederationSend => "federation_send",
+            Self::ColdLoad => "cold_load",
+            Self::LockWait => "lock_wait",
+        }
+    }
+}
+
+/// How one outbound federation transaction ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TxnResult {
+    /// The peer acknowledged it.
+    Success,
+    /// The peer answered, with something other than success.
+    HttpError,
+    /// The peer did not answer in time.
+    Timeout,
+    /// Anything else: unresolvable, unreachable, unsignable.
+    Error,
+}
+
+impl TxnResult {
+    pub const ALL: [Self; 4] = [Self::Success, Self::HttpError, Self::Timeout, Self::Error];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::HttpError => "http_error",
+            Self::Timeout => "timeout",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// Which lock a wait was for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LockKind {
+    /// The registry that maps room ids to their locks: server-wide.
+    Registry,
+    /// One room's log.
+    Room,
+}
+
+type ProbeFn = Box<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// A gauge read at scrape time from whoever owns the number.
+#[derive(Default)]
+struct ResidentProbe {
+    probe: RwLock<Option<ProbeFn>>,
+    last: AtomicU64,
+}
+
+impl std::fmt::Debug for ResidentProbe {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResidentProbe")
+            .field("last", &self.last)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Metrics {
+    /// Record one cold room load: a room this process had not opened,
+    /// read and restored from the store.
+    pub fn observe_cold_load(&self, size: RoomSize, elapsed: Duration) {
+        self.cold_loads[size.index()].fetch_add(1, Ordering::Relaxed);
+        self.cold_load_latency[size.index()].observe(elapsed);
+    }
+
+    /// Read the cold-load counter, for tests that assert it moved.
+    #[must_use]
+    pub fn cold_loads(&self, size: RoomSize) -> u64 {
+        self.cold_loads[size.index()].load(Ordering::Relaxed)
+    }
+
+    /// Cold loads of every size, for tests.
+    #[must_use]
+    pub fn cold_loads_total(&self) -> u64 {
+        RoomSize::ALL
+            .iter()
+            .map(|size| self.cold_loads(*size))
+            .sum()
+    }
+
+    /// Say how to count resident rooms. The probe answers `None` when it
+    /// cannot read without waiting, and the scrape then serves the last
+    /// answer it had rather than queue behind the registry.
+    pub fn set_resident_rooms_probe(
+        &self,
+        probe: impl Fn() -> Option<u64> + Send + Sync + 'static,
+    ) {
+        if let Ok(mut slot) = self.resident_rooms.probe.write() {
+            *slot = Some(Box::new(probe));
+        }
+    }
+
+    /// The resident-room gauge as a scrape would render it.
+    #[must_use]
+    pub fn resident_rooms(&self) -> u64 {
+        if let Ok(probe) = self.resident_rooms.probe.read()
+            && let Some(probe) = probe.as_ref()
+            && let Some(count) = probe()
+        {
+            self.resident_rooms.last.store(count, Ordering::Relaxed);
+            return count;
+        }
+        self.resident_rooms.last.load(Ordering::Relaxed)
+    }
+
+    /// Record how long a lock took to acquire.
+    pub fn observe_lock_wait(&self, kind: LockKind, exclusive: bool, elapsed: Duration) {
+        let index = match kind {
+            LockKind::Registry => 0,
+            LockKind::Room => 2,
+        } + usize::from(!exclusive);
+        self.lock_waits[index].observe(elapsed);
+    }
+
+    /// Lock waits recorded for `kind`, for tests.
+    #[must_use]
+    pub fn lock_waits(&self, kind: LockKind) -> u64 {
+        let base = match kind {
+            LockKind::Registry => 0,
+            LockKind::Room => 2,
+        };
+        self.lock_waits[base].count.load(Ordering::Relaxed)
+            + self.lock_waits[base + 1].count.load(Ordering::Relaxed)
+    }
+
+    /// Record one sync handler phase.
+    pub fn observe_sync_phase(&self, phase: SyncPhase, elapsed: Duration) {
+        self.sync_phases[phase.index()].observe(elapsed);
+    }
+
+    /// Phases recorded, for tests.
+    #[must_use]
+    pub fn sync_phases(&self, phase: SyncPhase) -> u64 {
+        self.sync_phases[phase.index()]
+            .count
+            .load(Ordering::Relaxed)
+    }
+
+    /// One piece of work has left the async workers. The returned guard
+    /// marks it finished when dropped, so a panic cannot leak the gauge.
+    #[must_use]
+    pub fn blocking_started(&self, task: BlockingTask) -> BlockingGuard<'_> {
+        self.blocking_in_flight[task.index()].fetch_add(1, Ordering::Relaxed);
+        BlockingGuard {
+            gauge: &self.blocking_in_flight[task.index()],
+        }
+    }
+
+    /// Work in flight for `task`, for tests.
+    #[must_use]
+    pub fn blocking_in_flight(&self, task: BlockingTask) -> u64 {
+        self.blocking_in_flight[task.index()].load(Ordering::Relaxed)
+    }
+
+    /// Record how one outbound federation transaction ended.
+    pub fn observe_outbound_txn(&self, result: TxnResult, elapsed: Duration) {
+        self.outbound_txns[result.index()].fetch_add(1, Ordering::Relaxed);
+        self.outbound_txn_latency[result.index()].observe(elapsed);
+    }
+
+    /// Outbound transactions by result, for tests.
+    #[must_use]
+    pub fn outbound_txns(&self, result: TxnResult) -> u64 {
+        self.outbound_txns[result.index()].load(Ordering::Relaxed)
+    }
+
+    /// The warm-up has `pending` rooms left to load.
+    pub fn set_warmup_pending(&self, pending: u64) {
+        self.warmup_pending.store(pending, Ordering::Relaxed);
+    }
+
+    /// The warm-up loaded one more room.
+    pub fn warmup_loaded(&self) {
+        self.warmup_loaded.fetch_add(1, Ordering::Relaxed);
+        let _ = self
+            .warmup_pending
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            });
+    }
+
+    /// The warm-up gave up on one room; it is no longer pending.
+    pub fn warmup_failed(&self) {
+        let _ = self
+            .warmup_pending
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            });
+    }
+
+    /// Rooms the warm-up has loaded, for tests.
+    #[must_use]
+    pub fn warmup_loaded_count(&self) -> u64 {
+        self.warmup_loaded.load(Ordering::Relaxed)
+    }
+}
+
+/// Decrements a [`BlockingTask`] gauge when dropped.
+#[derive(Debug)]
+pub struct BlockingGuard<'a> {
+    gauge: &'a AtomicU64,
+}
+
+impl Drop for BlockingGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .gauge
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            });
     }
 }
 
@@ -166,16 +863,81 @@ impl Metrics {
         self.fork_cases[ForkCase::StateContested.index()].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a received PDU kept for the DAG but out of the timeline: one
+    /// that failed the auth checks against its auth events or the state
+    /// before it (`rejected`), or only against the room's current state
+    /// (soft-failed). A peer whose events keep landing here disagrees with
+    /// this server about the room's state, which is the thing to look at.
+    pub fn record_sidelined(&self, rejected: bool) {
+        self.sidelined[usize::from(rejected)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record what one batch of state resolution did: resolutions computed,
+    /// answered from the cache, and candidates refused by the auth checks.
+    pub fn record_state_res(&self, resolutions: u64, cache_hits: u64, rejections: u64) {
+        let counters = &self.state_res;
+        counters
+            .resolutions
+            .fetch_add(resolutions, Ordering::Relaxed);
+        counters.cache_hits.fetch_add(cache_hits, Ordering::Relaxed);
+        counters.rejections.fetch_add(rejections, Ordering::Relaxed);
+    }
+
+    /// `(resolutions, cache hits, rejections)` so far, for tests.
+    #[must_use]
+    pub fn state_res_counts(&self) -> (u64, u64, u64) {
+        let counters = &self.state_res;
+        (
+            counters.resolutions.load(Ordering::Relaxed),
+            counters.cache_hits.load(Ordering::Relaxed),
+            counters.rejections.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Record one attempt to author an `org.matrix.dummy_event`.
+    pub fn record_dummy_event(&self, sent: bool) {
+        self.state_res.dummy_events[usize::from(!sent)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(sent, failed)` dummy events so far, for tests.
+    #[must_use]
+    pub fn dummy_event_counts(&self) -> (u64, u64) {
+        (
+            self.state_res.dummy_events[0].load(Ordering::Relaxed),
+            self.state_res.dummy_events[1].load(Ordering::Relaxed),
+        )
+    }
+
+    /// Replace the forward-extremity census, indexed as
+    /// [`EXTREMITY_BUCKETS`].
+    pub fn set_extremity_buckets(&self, buckets: [u64; 4]) {
+        for (slot, value) in self.state_res.extremity_buckets.iter().zip(buckets) {
+            slot.store(value, Ordering::Relaxed);
+        }
+    }
+
+    /// The forward-extremity census, for tests.
+    #[must_use]
+    pub fn extremity_buckets(&self) -> [u64; 4] {
+        std::array::from_fn(|index| self.state_res.extremity_buckets[index].load(Ordering::Relaxed))
+    }
+
     /// The exposition, in the Prometheus text format.
     #[must_use]
     pub fn render(&self) -> String {
         let mut out = String::with_capacity(2048);
         render_build_info(&mut out);
         self.render_appends(&mut out);
+        self.render_state_res(&mut out);
         self.render_room_locks(&mut out);
         self.render_http(&mut out);
         self.render_federation(&mut out);
+        self.render_inbound(&mut out);
+        self.render_keys(&mut out);
+        self.render_edus(&mut out);
         self.render_sync(&mut out);
+        self.render_responsiveness(&mut out);
+        self.render_auth(&mut out);
         out
     }
 }
@@ -228,6 +990,19 @@ impl Metrics {
         }
 
         out.push_str(
+            "# HELP spindle_pdus_sidelined_total Received events kept out of the timeline \
+         by the checks on receipt of a PDU.\n\
+         # TYPE spindle_pdus_sidelined_total counter\n",
+        );
+        for (verdict, index) in [("soft_failed", 0), ("rejected", 1)] {
+            let _ = writeln!(
+                out,
+                "spindle_pdus_sidelined_total{{verdict=\"{verdict}\"}} {}",
+                self.sidelined[index].load(Ordering::Relaxed)
+            );
+        }
+
+        out.push_str(
             "# HELP spindle_append_duration_seconds Time to commit one event to a room log.\n\
          # TYPE spindle_append_duration_seconds histogram\n",
         );
@@ -239,6 +1014,61 @@ impl Metrics {
                     &format!("durability=\"{}\"", escape(durability)),
                 );
             }
+        }
+    }
+
+    /// State resolution's work, and the forks that cause it (#626).
+    fn render_state_res(&self, out: &mut String) {
+        let counters = &self.state_res;
+        out.push_str(
+            "# HELP spindle_state_res_resolutions_total State resolutions, by whether \
+             the resolution cache answered.\n\
+             # TYPE spindle_state_res_resolutions_total counter\n",
+        );
+        for (cached, counter) in [
+            ("false", &counters.resolutions),
+            ("true", &counters.cache_hits),
+        ] {
+            let _ = writeln!(
+                out,
+                "spindle_state_res_resolutions_total{{cached=\"{cached}\"}} {}",
+                counter.load(Ordering::Relaxed)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_state_res_rejections_total Events refused by the auth \
+             checks inside state resolution. Expected; a steady rate means a fork \
+             is being resolved again and again.\n\
+             # TYPE spindle_state_res_rejections_total counter\n",
+        );
+        let _ = writeln!(
+            out,
+            "spindle_state_res_rejections_total {}",
+            counters.rejections.load(Ordering::Relaxed)
+        );
+        out.push_str(
+            "# HELP spindle_dummy_events_total org.matrix.dummy_event sends that \
+             merge a room's forward extremities, by result.\n\
+             # TYPE spindle_dummy_events_total counter\n",
+        );
+        for (index, result) in ["sent", "failed"].into_iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "spindle_dummy_events_total{{result=\"{result}\"}} {}",
+                counters.dummy_events[index].load(Ordering::Relaxed)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_rooms_by_forward_extremities Resident rooms by how many \
+             forward extremities they have, at the last census.\n\
+             # TYPE spindle_rooms_by_forward_extremities gauge\n",
+        );
+        for (index, bucket) in EXTREMITY_BUCKETS.into_iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "spindle_rooms_by_forward_extremities{{extremities=\"{bucket}\"}} {}",
+                counters.extremity_buckets[index].load(Ordering::Relaxed)
+            );
         }
     }
 
@@ -271,7 +1101,7 @@ impl Metrics {
 
     fn render_http(&self, out: &mut String) {
         out.push_str(
-        "# HELP spindle_http_request_duration_seconds Time to serve one request, by matched route.\n\
+        "# HELP spindle_http_request_duration_seconds Time to serve one request, by matched route; a sync allowed to long-poll is under its route with \" (long-poll)\" appended.\n\
          # TYPE spindle_http_request_duration_seconds histogram\n",
     );
         if let Ok(read) = self.http_latency.read() {
@@ -347,6 +1177,140 @@ impl Metrics {
     }
 }
 
+impl Metrics {
+    /// The #614 set: cold loads, residency, lock waits, sync phases, work
+    /// off the async workers, outbound transactions and the warm-up. Every
+    /// series is fixed by code and rendered at zero, so a dashboard reads
+    /// "none happened" rather than "no data".
+    #[allow(clippy::too_many_lines, reason = "one flat list of series")]
+    fn render_responsiveness(&self, out: &mut String) {
+        out.push_str(
+            "# HELP spindle_room_cold_loads_total Rooms restored from the store, by size.\n\
+             # TYPE spindle_room_cold_loads_total counter\n",
+        );
+        for size in RoomSize::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_room_cold_loads_total{{size=\"{}\"}} {}",
+                size.label(),
+                self.cold_loads[size.index()].load(Ordering::Relaxed)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_room_cold_load_duration_seconds Time to restore one room \
+             from the store, by size.\n\
+             # TYPE spindle_room_cold_load_duration_seconds histogram\n",
+        );
+        for size in RoomSize::ALL {
+            self.cold_load_latency[size.index()].render_into(
+                out,
+                "spindle_room_cold_load_duration_seconds",
+                &format!("size=\"{}\"", size.label()),
+            );
+        }
+
+        out.push_str(
+            "# HELP spindle_rooms_resident Rooms held open in memory.\n\
+             # TYPE spindle_rooms_resident gauge\n",
+        );
+        let _ = writeln!(out, "spindle_rooms_resident {}", self.resident_rooms());
+
+        out.push_str(
+            "# HELP spindle_lock_wait_seconds Time spent acquiring the room registry \
+             and room locks.\n\
+             # TYPE spindle_lock_wait_seconds histogram\n",
+        );
+        for (index, (lock, mode)) in [
+            ("registry", "exclusive"),
+            ("registry", "shared"),
+            ("room", "exclusive"),
+            ("room", "shared"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            self.lock_waits[index].render_into(
+                out,
+                "spindle_lock_wait_seconds",
+                &format!("lock=\"{lock}\",mode=\"{mode}\""),
+            );
+        }
+
+        out.push_str(
+            "# HELP spindle_sync_phase_duration_seconds Time in each phase of a sync \
+             request.\n\
+             # TYPE spindle_sync_phase_duration_seconds histogram\n",
+        );
+        for phase in SyncPhase::ALL {
+            let (endpoint, name) = phase.labels();
+            self.sync_phases[phase.index()].render_into(
+                out,
+                "spindle_sync_phase_duration_seconds",
+                &format!("endpoint=\"{endpoint}\",phase=\"{name}\""),
+            );
+        }
+
+        out.push_str(
+            "# HELP spindle_blocking_tasks_in_flight Work moved off the async workers \
+             and not yet finished.\n\
+             # TYPE spindle_blocking_tasks_in_flight gauge\n",
+        );
+        for task in BlockingTask::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_blocking_tasks_in_flight{{task=\"{}\"}} {}",
+                task.label(),
+                self.blocking_in_flight[task.index()].load(Ordering::Relaxed)
+            );
+        }
+
+        out.push_str(
+            "# HELP spindle_federation_outbound_transactions_total Outbound federation \
+             transactions, by result.\n\
+             # TYPE spindle_federation_outbound_transactions_total counter\n",
+        );
+        for result in TxnResult::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_outbound_transactions_total{{result=\"{}\"}} {}",
+                result.label(),
+                self.outbound_txns[result.index()].load(Ordering::Relaxed)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_federation_outbound_transaction_duration_seconds Time to \
+             deliver one outbound federation transaction, by result.\n\
+             # TYPE spindle_federation_outbound_transaction_duration_seconds histogram\n",
+        );
+        for result in TxnResult::ALL {
+            self.outbound_txn_latency[result.index()].render_into(
+                out,
+                "spindle_federation_outbound_transaction_duration_seconds",
+                &format!("result=\"{}\"", result.label()),
+            );
+        }
+
+        out.push_str(
+            "# HELP spindle_room_warmup_pending Rooms the startup warm-up has still to load.\n\
+             # TYPE spindle_room_warmup_pending gauge\n",
+        );
+        let _ = writeln!(
+            out,
+            "spindle_room_warmup_pending {}",
+            self.warmup_pending.load(Ordering::Relaxed)
+        );
+        out.push_str(
+            "# HELP spindle_room_warmup_loaded_total Rooms the startup warm-up has loaded.\n\
+             # TYPE spindle_room_warmup_loaded_total counter\n",
+        );
+        let _ = writeln!(
+            out,
+            "spindle_room_warmup_loaded_total {}",
+            self.warmup_loaded.load(Ordering::Relaxed)
+        );
+    }
+}
+
 /// Bucket bounds, in seconds.
 ///
 /// Weighted to where SPEC §18.3 puts its targets — local send p50 under
@@ -358,6 +1322,26 @@ const BUCKETS: [f64; 12] = [
     0.000_5, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
 ];
 
+/// Appended to a route's `spindle_http_request_duration_seconds` label for
+/// a request that was allowed to long-poll: a classic `/sync` or sliding
+/// sync with a `since`/`pos` and a non-zero `timeout`.
+pub const LONG_POLL_SUFFIX: &str = " (long-poll)";
+
+/// A response extension a sync handler sets when its request was allowed
+/// to long-poll; the request middleware reads it to pick the series.
+#[derive(Clone, Copy, Debug)]
+pub struct LongPoll;
+
+/// Bucket bounds for the slow things, in seconds: cold room loads, lock
+/// waits behind them, and whole sync phases. #614 measured a first sliding
+/// sync at 105 s and a liveness stall of 95 s; the default set tops out at
+/// 2.5 s and would have put every one of those in `+Inf`, which says
+/// "slow" and not how slow.
+const SLOW_BUCKETS: [f64; 16] = [
+    0.000_1, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+    120.0,
+];
+
 /// A Prometheus histogram: per-bucket counts, a sum and a total.
 ///
 /// Counts are per-bucket here and made cumulative at render, which is
@@ -365,7 +1349,8 @@ const BUCKETS: [f64; 12] = [
 /// touching every bucket above the observation on the hot path.
 #[derive(Debug)]
 struct Histogram {
-    buckets: [AtomicU64; BUCKETS.len()],
+    bounds: &'static [f64],
+    buckets: Box<[AtomicU64]>,
     /// Microseconds, so the sum needs no float atomic. Rendered as
     /// seconds, which is the unit the metric name promises.
     sum_micros: AtomicU64,
@@ -373,11 +1358,10 @@ struct Histogram {
 }
 
 impl Histogram {
-    const fn new() -> Self {
-        #[allow(clippy::declare_interior_mutable_const)]
-        const ZERO: AtomicU64 = AtomicU64::new(0);
+    fn with_bounds(bounds: &'static [f64]) -> Self {
         Self {
-            buckets: [ZERO; BUCKETS.len()],
+            bounds,
+            buckets: bounds.iter().map(|_| AtomicU64::new(0)).collect(),
             sum_micros: AtomicU64::new(0),
             count: AtomicU64::new(0),
         }
@@ -388,10 +1372,11 @@ impl Histogram {
     /// cast that has to be reasoned about.
     fn observe(&self, elapsed: Duration) {
         let seconds = elapsed.as_secs_f64();
-        let slot = BUCKETS
+        let slot = self
+            .bounds
             .iter()
             .position(|bound| seconds <= *bound)
-            .unwrap_or(BUCKETS.len());
+            .unwrap_or(self.bounds.len());
         if let Some(bucket) = self.buckets.get(slot) {
             bucket.fetch_add(1, Ordering::Relaxed);
         }
@@ -407,8 +1392,8 @@ impl Histogram {
     fn render_into(&self, out: &mut String, name: &str, labels: &str) {
         let mut cumulative = 0;
         let separator = if labels.is_empty() { "" } else { "," };
-        for (index, bound) in BUCKETS.iter().enumerate() {
-            cumulative += self.buckets[index].load(Ordering::Relaxed);
+        for (bound, bucket) in self.bounds.iter().zip(self.buckets.iter()) {
+            cumulative += bucket.load(Ordering::Relaxed);
             let _ = writeln!(
                 out,
                 "{name}_bucket{{{labels}{separator}le=\"{bound}\"}} {cumulative}"
@@ -441,6 +1426,10 @@ impl Histogram {
 type Family = RwLock<HashMap<String, Histogram>>;
 
 fn observe_in(family: &Family, key: &str, elapsed: Duration) {
+    observe_in_buckets(family, key, elapsed, &BUCKETS);
+}
+
+fn observe_in_buckets(family: &Family, key: &str, elapsed: Duration, bounds: &'static [f64]) {
     if let Ok(read) = family.read()
         && let Some(histogram) = read.get(key)
     {
@@ -450,7 +1439,7 @@ fn observe_in(family: &Family, key: &str, elapsed: Duration) {
     if let Ok(mut write) = family.write() {
         write
             .entry(key.to_owned())
-            .or_insert_with(Histogram::new)
+            .or_insert_with(|| Histogram::with_bounds(bounds))
             .observe(elapsed);
     }
 }
@@ -471,8 +1460,34 @@ impl Metrics {
     /// never the raw URI: the raw path carries room and user IDs, and a
     /// label taking values from the request would let any caller mint
     /// series until the scrape falls over.
-    pub fn observe_request(&self, route: &str, method: &str, status: u16, elapsed: Duration) {
-        observe_in(&self.http_latency, route, elapsed);
+    ///
+    /// The latency uses [`SLOW_BUCKETS`]: #625 found `/keys/query` and
+    /// sliding sync with a p95 of exactly 2.5 s, the old top bucket, which
+    /// says "somewhere above" and nothing more. A request that was allowed
+    /// to long-poll (`long_poll`) is timed under its route with
+    /// [`LONG_POLL_SUFFIX`] appended, so a sync that waited its 30 s on
+    /// purpose sits in a series of its own instead of being every
+    /// dashboard's p95. Still the `route` label -- the dashboard groups by
+    /// it -- and still bounded: one extra value per long-polling route.
+    /// The request counter keeps the plain template.
+    pub fn observe_request(
+        &self,
+        route: &str,
+        method: &str,
+        status: u16,
+        elapsed: Duration,
+        long_poll: bool,
+    ) {
+        if long_poll {
+            observe_in_buckets(
+                &self.http_latency,
+                &format!("{route}{LONG_POLL_SUFFIX}"),
+                elapsed,
+                &SLOW_BUCKETS,
+            );
+        } else {
+            observe_in_buckets(&self.http_latency, route, elapsed, &SLOW_BUCKETS);
+        }
         let key = format!("{route}\u{1}{method}\u{1}{status}");
         if let Ok(read) = self.http_requests.read()
             && let Some(counter) = read.get(&key)
@@ -557,6 +1572,689 @@ impl Metrics {
     }
 }
 
+impl Metrics {
+    /// Record what became of one PDU a peer pushed.
+    pub fn record_pdu(&self, outcome: PduOutcome) {
+        self.pdu_outcomes[slot(&PduOutcome::ALL, outcome)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one predecessor recovery attempt against one peer, and how
+    /// long it took.
+    pub fn record_recovery(&self, result: RecoveryResult, elapsed: Duration) {
+        self.recovery_attempts[slot(&RecoveryResult::ALL, result)].fetch_add(1, Ordering::Relaxed);
+        observe_in_buckets(
+            &self.recovery_latency,
+            result.label(),
+            elapsed,
+            &SLOW_BUCKETS,
+        );
+    }
+
+    /// Record event bodies fetched from a peer by recovery or a gap.
+    pub fn record_fetched(&self, kind: FetchKind, count: u64) {
+        self.recovery_fetched[slot(&FetchKind::ALL, kind)].fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Record one attempt to accept an event across a gap.
+    pub fn record_gap(&self, result: GapResult) {
+        self.gap_acceptances[slot(&GapResult::ALL, result)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one `/state_ids` request, by `ok`, `rate_limited` or `error`.
+    pub fn observe_state_ids(&self, result: &'static str, elapsed: Duration) {
+        observe_in_buckets(&self.state_ids_latency, result, elapsed, &SLOW_BUCKETS);
+    }
+
+    /// Record one gap backfill chunk, and how long it took.
+    pub fn record_backfill_chunk(&self, result: BackfillChunk, elapsed: Duration) {
+        self.backfill_chunks[slot(&BackfillChunk::ALL, result)].fetch_add(1, Ordering::Relaxed);
+        observe_in_buckets(
+            &self.backfill_latency,
+            result.label(),
+            elapsed,
+            &SLOW_BUCKETS,
+        );
+    }
+
+    /// Record events a gap backfill fetched, inserted or kept out.
+    pub fn record_backfill_events(&self, kind: BackfillEvent, count: u64) {
+        self.backfill_events[slot(&BackfillEvent::ALL, kind)].fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Set the number of recorded gaps not yet filled. A gauge: the
+    /// backfill loop counts the markers and says how many there are.
+    pub fn set_gaps_remaining(&self, gaps: u64) {
+        self.gaps_remaining.store(gaps, Ordering::Relaxed);
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn backfill_chunk_count(&self, result: BackfillChunk) -> u64 {
+        self.backfill_chunks[slot(&BackfillChunk::ALL, result)].load(Ordering::Relaxed)
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn backfill_event_count(&self, kind: BackfillEvent) -> u64 {
+        self.backfill_events[slot(&BackfillEvent::ALL, kind)].load(Ordering::Relaxed)
+    }
+
+    /// Read the gauge, for tests that assert it moved.
+    #[must_use]
+    pub fn gaps_remaining(&self) -> u64 {
+        self.gaps_remaining.load(Ordering::Relaxed)
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn pdu_count(&self, outcome: PduOutcome) -> u64 {
+        self.pdu_outcomes[slot(&PduOutcome::ALL, outcome)].load(Ordering::Relaxed)
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn recovery_count(&self, result: RecoveryResult) -> u64 {
+        self.recovery_attempts[slot(&RecoveryResult::ALL, result)].load(Ordering::Relaxed)
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn fetched_count(&self, kind: FetchKind) -> u64 {
+        self.recovery_fetched[slot(&FetchKind::ALL, kind)].load(Ordering::Relaxed)
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn gap_count(&self, result: GapResult) -> u64 {
+        self.gap_acceptances[slot(&GapResult::ALL, result)].load(Ordering::Relaxed)
+    }
+
+    /// Inbound federation: PDU outcomes, dependency recovery, gaps.
+    ///
+    /// Every label is a fixed enum value: no room, event or server name,
+    /// so a peer cannot mint series by sending us things.
+    fn render_inbound(&self, out: &mut String) {
+        out.push_str(
+            "# HELP spindle_federation_pdus_received_total PDUs peers pushed, by outcome.\n\
+         # TYPE spindle_federation_pdus_received_total counter\n",
+        );
+        for outcome in PduOutcome::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_pdus_received_total{{result=\"{}\"}} {}",
+                outcome.label(),
+                self.pdu_count(outcome)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_federation_recovery_attempts_total Missing-dependency \
+         recovery attempts against one peer, by result.\n\
+         # TYPE spindle_federation_recovery_attempts_total counter\n",
+        );
+        for result in RecoveryResult::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_recovery_attempts_total{{result=\"{}\"}} {}",
+                result.label(),
+                self.recovery_count(result)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_federation_recovery_duration_seconds Time one recovery \
+         attempt took, by result.\n\
+         # TYPE spindle_federation_recovery_duration_seconds histogram\n",
+        );
+        if let Ok(read) = self.recovery_latency.read() {
+            for (result, histogram) in read.iter() {
+                histogram.render_into(
+                    out,
+                    "spindle_federation_recovery_duration_seconds",
+                    &format!("result=\"{}\"", escape(result)),
+                );
+            }
+        }
+        out.push_str(
+            "# HELP spindle_federation_recovery_events_fetched_total Event bodies \
+         fetched from peers to fill missing dependencies, by kind.\n\
+         # TYPE spindle_federation_recovery_events_fetched_total counter\n",
+        );
+        for kind in FetchKind::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_recovery_events_fetched_total{{kind=\"{}\"}} {}",
+                kind.label(),
+                self.fetched_count(kind)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_federation_gap_acceptances_total Attempts to accept a PDU \
+         across a history gap on a peer's state, by result.\n\
+         # TYPE spindle_federation_gap_acceptances_total counter\n",
+        );
+        for result in GapResult::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_gap_acceptances_total{{result=\"{}\"}} {}",
+                result.label(),
+                self.gap_count(result)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_federation_state_ids_duration_seconds Time one /state_ids \
+         request took, by result.\n\
+         # TYPE spindle_federation_state_ids_duration_seconds histogram\n",
+        );
+        if let Ok(read) = self.state_ids_latency.read() {
+            for (result, histogram) in read.iter() {
+                histogram.render_into(
+                    out,
+                    "spindle_federation_state_ids_duration_seconds",
+                    &format!("result=\"{}\"", escape(result)),
+                );
+            }
+        }
+        self.render_backfill(out);
+    }
+
+    /// Gap backfill: chunks, events, the gaps still open, chunk duration.
+    fn render_backfill(&self, out: &mut String) {
+        out.push_str(
+            "# HELP spindle_federation_backfill_chunks_total Gap backfill chunks, \
+         by result.\n\
+         # TYPE spindle_federation_backfill_chunks_total counter\n",
+        );
+        for result in BackfillChunk::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_backfill_chunks_total{{result=\"{}\"}} {}",
+                result.label(),
+                self.backfill_chunk_count(result)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_federation_backfill_events_total Events a gap backfill \
+         fetched, inserted, kept out of the timeline, or stepped over.\n\
+         # TYPE spindle_federation_backfill_events_total counter\n",
+        );
+        for kind in BackfillEvent::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_backfill_events_total{{result=\"{}\"}} {}",
+                kind.label(),
+                self.backfill_event_count(kind)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_federation_gaps_remaining Recorded federation gaps \
+         whose history is not yet backfilled.\n\
+         # TYPE spindle_federation_gaps_remaining gauge\n",
+        );
+        let _ = writeln!(
+            out,
+            "spindle_federation_gaps_remaining {}",
+            self.gaps_remaining()
+        );
+        out.push_str(
+            "# HELP spindle_federation_backfill_duration_seconds Time one gap \
+         backfill chunk took, by result.\n\
+         # TYPE spindle_federation_backfill_duration_seconds histogram\n",
+        );
+        if let Ok(read) = self.backfill_latency.read() {
+            for (result, histogram) in read.iter() {
+                histogram.render_into(
+                    out,
+                    "spindle_federation_backfill_duration_seconds",
+                    &format!("result=\"{}\"", escape(result)),
+                );
+            }
+        }
+    }
+}
+
+/// Which door a sign-in came through.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoginMethod {
+    /// `POST /_matrix/client/v3/login` with `m.login.password`.
+    Password,
+    /// The built-in provider's authorization page, with a password.
+    Oidc,
+    /// The built-in provider's authorization page, continuing an existing
+    /// browser session ("Continue as …") rather than re-entering a password.
+    OidcSession,
+    /// The account-management sign-in page.
+    Account,
+}
+
+impl LoginMethod {
+    const ALL: [Self; 4] = [Self::Password, Self::Oidc, Self::OidcSession, Self::Account];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Password => "password",
+            Self::Oidc => "oidc",
+            Self::OidcSession => "oidc_session",
+            Self::Account => "account",
+        }
+    }
+}
+
+/// How a sign-in ended. `BadPassword` covers an unknown user too: the
+/// server does not distinguish them anywhere else, and a metric that did
+/// would be the enumeration oracle the login path refuses to be.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoginResult {
+    Success,
+    BadPassword,
+    RateLimited,
+    Error,
+}
+
+impl LoginResult {
+    const ALL: [Self; 4] = [
+        Self::Success,
+        Self::BadPassword,
+        Self::RateLimited,
+        Self::Error,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::BadPassword => "bad_password",
+            Self::RateLimited => "rate_limited",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// An OAuth 2.0 token-endpoint grant type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TokenGrant {
+    AuthorizationCode,
+    RefreshToken,
+}
+
+impl TokenGrant {
+    const ALL: [Self; 2] = [Self::AuthorizationCode, Self::RefreshToken];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::AuthorizationCode => "authorization_code",
+            Self::RefreshToken => "refresh_token",
+        }
+    }
+}
+
+/// How a token grant ended, in RFC 6749's terms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GrantResult {
+    Success,
+    /// A code or refresh token that is unknown, spent, expired, or fails
+    /// PKCE or the client binding.
+    InvalidGrant,
+    /// A malformed request: a missing field.
+    InvalidRequest,
+    Error,
+}
+
+impl GrantResult {
+    const ALL: [Self; 4] = [
+        Self::Success,
+        Self::InvalidGrant,
+        Self::InvalidRequest,
+        Self::Error,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::InvalidGrant => "invalid_grant",
+            Self::InvalidRequest => "invalid_request",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// A change a user made through the account-management pages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccountAction {
+    Profile,
+    PasswordChange,
+    SessionEnd,
+    Deactivate,
+    EmailAdd,
+    EmailVerify,
+    EmailRemove,
+    CrossSigningReset,
+    RecoveryCodes,
+}
+
+impl AccountAction {
+    const ALL: [Self; 9] = [
+        Self::Profile,
+        Self::PasswordChange,
+        Self::SessionEnd,
+        Self::Deactivate,
+        Self::EmailAdd,
+        Self::EmailVerify,
+        Self::EmailRemove,
+        Self::CrossSigningReset,
+        Self::RecoveryCodes,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Profile => "profile",
+            Self::PasswordChange => "password_change",
+            Self::SessionEnd => "session_end",
+            Self::Deactivate => "deactivate",
+            Self::EmailAdd => "email_add",
+            Self::EmailVerify => "email_verify",
+            Self::EmailRemove => "email_remove",
+            Self::CrossSigningReset => "cross_signing_reset",
+            Self::RecoveryCodes => "recovery_codes",
+        }
+    }
+}
+
+/// Which mail the server sent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmailKind {
+    PasswordReset,
+    Verification,
+}
+
+impl EmailKind {
+    const ALL: [Self; 2] = [Self::PasswordReset, Self::Verification];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::PasswordReset => "password_reset",
+            Self::Verification => "verification",
+        }
+    }
+}
+
+/// How a forgotten password was recovered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PasswordRecoveryMethod {
+    /// A reset link: mailed to a confirmed address, or issued by an
+    /// administrator. One label for both, because a dead link cannot say
+    /// which it was; `spindle_password_resets_total` and
+    /// `spindle_reset_links_issued_total` count each kind's issuance.
+    ResetLink,
+    /// One of the account's one-time recovery codes.
+    RecoveryCode,
+}
+
+impl PasswordRecoveryMethod {
+    const ALL: [Self; 2] = [Self::ResetLink, Self::RecoveryCode];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ResetLink => "reset_link",
+            Self::RecoveryCode => "recovery_code",
+        }
+    }
+}
+
+/// How a recovery attempt ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PasswordRecoveryResult {
+    Success,
+    /// A dead link, or a username and code that did not match.
+    Rejected,
+    RateLimited,
+}
+
+impl PasswordRecoveryResult {
+    const ALL: [Self; 3] = [Self::Success, Self::Rejected, Self::RateLimited];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Rejected => "rejected",
+            Self::RateLimited => "rate_limited",
+        }
+    }
+}
+
+/// The authentication counters (#607/#608's observability).
+///
+/// Every label is one of the enums above, so the series set is fixed at
+/// compile time: no username, address, client or device ever becomes a
+/// label value, which is both the cardinality rule and the privacy one.
+#[derive(Debug, Default)]
+struct AuthCounters {
+    logins: [[AtomicU64; 4]; 4],
+    grants: [[AtomicU64; 4]; 2],
+    /// `[requested, completed]`.
+    resets: [AtomicU64; 2],
+    /// `[kind][sent, failed]`.
+    emails: [[AtomicU64; 2]; 2],
+    account_actions: [AtomicU64; 9],
+    /// `[method][result]` password recoveries.
+    recoveries: [[AtomicU64; 3]; 2],
+    /// Reset links issued by an administrator through the API.
+    reset_links_issued: AtomicU64,
+}
+
+fn index_of<T: PartialEq + Copy>(all: &[T], value: T) -> usize {
+    all.iter().position(|item| *item == value).unwrap_or(0)
+}
+
+impl Metrics {
+    /// Record one sign-in attempt and how it ended.
+    pub fn record_login(&self, method: LoginMethod, result: LoginResult) {
+        self.auth.logins[index_of(&LoginMethod::ALL, method)][index_of(&LoginResult::ALL, result)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one token-endpoint grant and how it ended.
+    pub fn record_token_grant(&self, grant: TokenGrant, result: GrantResult) {
+        self.auth.grants[index_of(&TokenGrant::ALL, grant)][index_of(&GrantResult::ALL, result)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a password reset requested — counted per form submission,
+    /// whether or not the address belonged to anyone, because the page
+    /// cannot say either and neither may the metric.
+    pub fn record_password_reset_requested(&self) {
+        self.auth.resets[0].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a password reset completed with a valid token.
+    pub fn record_password_reset_completed(&self) {
+        self.auth.resets[1].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one email handed to the mail transport, and whether it took it.
+    pub fn record_email(&self, kind: EmailKind, sent: bool) {
+        self.auth.emails[index_of(&EmailKind::ALL, kind)][usize::from(!sent)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one completed account-management action.
+    pub fn record_account_action(&self, action: AccountAction) {
+        self.auth.account_actions[index_of(&AccountAction::ALL, action)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one password-recovery attempt and how it ended.
+    pub fn record_password_recovery(
+        &self,
+        method: PasswordRecoveryMethod,
+        result: PasswordRecoveryResult,
+    ) {
+        self.auth.recoveries[index_of(&PasswordRecoveryMethod::ALL, method)]
+            [index_of(&PasswordRecoveryResult::ALL, result)]
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a reset link an administrator issued through the API. The
+    /// offline CLI has no running server to count it, and says so in the
+    /// audit trail it does have: its own output.
+    pub fn record_reset_link_issued(&self) {
+        self.auth.reset_links_issued.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read one recovery counter, for tests that assert it moved.
+    #[must_use]
+    pub fn password_recovery_count(
+        &self,
+        method: PasswordRecoveryMethod,
+        result: PasswordRecoveryResult,
+    ) -> u64 {
+        self.auth.recoveries[index_of(&PasswordRecoveryMethod::ALL, method)]
+            [index_of(&PasswordRecoveryResult::ALL, result)]
+        .load(Ordering::Relaxed)
+    }
+
+    /// Read the admin reset-link counter.
+    #[must_use]
+    pub fn reset_links_issued(&self) -> u64 {
+        self.auth.reset_links_issued.load(Ordering::Relaxed)
+    }
+
+    /// Read one sign-in counter, for tests that assert it moved.
+    #[must_use]
+    pub fn login_count(&self, method: LoginMethod, result: LoginResult) -> u64 {
+        self.auth.logins[index_of(&LoginMethod::ALL, method)][index_of(&LoginResult::ALL, result)]
+            .load(Ordering::Relaxed)
+    }
+
+    /// Read one grant counter, for tests that assert it moved.
+    #[must_use]
+    pub fn token_grant_count(&self, grant: TokenGrant, result: GrantResult) -> u64 {
+        self.auth.grants[index_of(&TokenGrant::ALL, grant)][index_of(&GrantResult::ALL, result)]
+            .load(Ordering::Relaxed)
+    }
+
+    /// Read the reset counters, `(requested, completed)`.
+    #[must_use]
+    pub fn password_reset_counts(&self) -> (u64, u64) {
+        (
+            self.auth.resets[0].load(Ordering::Relaxed),
+            self.auth.resets[1].load(Ordering::Relaxed),
+        )
+    }
+
+    /// Read one email counter, for tests that assert it moved.
+    #[must_use]
+    pub fn email_count(&self, kind: EmailKind, sent: bool) -> u64 {
+        self.auth.emails[index_of(&EmailKind::ALL, kind)][usize::from(!sent)]
+            .load(Ordering::Relaxed)
+    }
+
+    /// Read one account-action counter, for tests that assert it moved.
+    #[must_use]
+    pub fn account_action_count(&self, action: AccountAction) -> u64 {
+        self.auth.account_actions[index_of(&AccountAction::ALL, action)].load(Ordering::Relaxed)
+    }
+
+    fn render_auth(&self, out: &mut String) {
+        out.push_str(
+            "# HELP spindle_auth_logins_total Sign-in attempts, by door and outcome.\n\
+             # TYPE spindle_auth_logins_total counter\n",
+        );
+        for method in LoginMethod::ALL {
+            for result in LoginResult::ALL {
+                let _ = writeln!(
+                    out,
+                    "spindle_auth_logins_total{{method=\"{}\",result=\"{}\"}} {}",
+                    method.label(),
+                    result.label(),
+                    self.login_count(method, result)
+                );
+            }
+        }
+        out.push_str(
+            "# HELP spindle_oauth_token_grants_total Built-in provider token-endpoint \
+             grants, by grant type and outcome.\n\
+             # TYPE spindle_oauth_token_grants_total counter\n",
+        );
+        for grant in TokenGrant::ALL {
+            for result in GrantResult::ALL {
+                let _ = writeln!(
+                    out,
+                    "spindle_oauth_token_grants_total{{grant=\"{}\",result=\"{}\"}} {}",
+                    grant.label(),
+                    result.label(),
+                    self.token_grant_count(grant, result)
+                );
+            }
+        }
+        out.push_str(
+            "# HELP spindle_password_resets_total Password resets by email, requested \
+             and completed.\n\
+             # TYPE spindle_password_resets_total counter\n",
+        );
+        let (requested, completed) = self.password_reset_counts();
+        let _ = writeln!(
+            out,
+            "spindle_password_resets_total{{stage=\"requested\"}} {requested}"
+        );
+        let _ = writeln!(
+            out,
+            "spindle_password_resets_total{{stage=\"completed\"}} {completed}"
+        );
+        out.push_str(
+            "# HELP spindle_emails_sent_total Emails handed to the mail transport, by \
+             kind and whether it accepted them.\n\
+             # TYPE spindle_emails_sent_total counter\n",
+        );
+        for kind in EmailKind::ALL {
+            for (sent, result) in [(true, "sent"), (false, "failed")] {
+                let _ = writeln!(
+                    out,
+                    "spindle_emails_sent_total{{kind=\"{}\",result=\"{result}\"}} {}",
+                    kind.label(),
+                    self.email_count(kind, sent)
+                );
+            }
+        }
+        out.push_str(
+            "# HELP spindle_account_actions_total Changes made through the \
+             account-management pages, by action.\n\
+             # TYPE spindle_account_actions_total counter\n",
+        );
+        for action in AccountAction::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_account_actions_total{{action=\"{}\"}} {}",
+                action.label(),
+                self.account_action_count(action)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_password_recoveries_total Forgotten-password recoveries, by \
+             method and outcome.\n\
+             # TYPE spindle_password_recoveries_total counter\n",
+        );
+        for method in PasswordRecoveryMethod::ALL {
+            for result in PasswordRecoveryResult::ALL {
+                let _ = writeln!(
+                    out,
+                    "spindle_password_recoveries_total{{method=\"{}\",result=\"{}\"}} {}",
+                    method.label(),
+                    result.label(),
+                    self.password_recovery_count(method, result)
+                );
+            }
+        }
+        out.push_str(
+            "# HELP spindle_reset_links_issued_total Password-reset links issued by an \
+             administrator through the admin API.\n\
+             # TYPE spindle_reset_links_issued_total counter\n",
+        );
+        let _ = writeln!(
+            out,
+            "spindle_reset_links_issued_total {}",
+            self.reset_links_issued()
+        );
+    }
+}
+
 /// Escape a label value per the exposition format.
 fn escape(value: &str) -> String {
     value
@@ -576,6 +2274,409 @@ impl Metrics {
     #[must_use]
     pub fn event_count(&self, origin: Origin) -> u64 {
         self.events[origin.index()].load(Ordering::Relaxed)
+    }
+}
+
+/// Where one lookup of a peer's signing keys was answered from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeySource {
+    /// The peer's own `/_matrix/key/v2/server`.
+    Direct,
+    /// A trusted notary's `/_matrix/key/v2/query`.
+    Notary,
+    /// What this server already held.
+    Cache,
+}
+
+impl KeySource {
+    const ALL: [Self; 3] = [Self::Direct, Self::Notary, Self::Cache];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Notary => "notary",
+            Self::Cache => "cache",
+        }
+    }
+
+    /// The results that mean something for this source.
+    fn results(self) -> &'static [KeyFetchResult] {
+        match self {
+            Self::Direct | Self::Notary => &[
+                KeyFetchResult::Ok,
+                KeyFetchResult::Error,
+                KeyFetchResult::Invalid,
+                KeyFetchResult::Throttled,
+            ],
+            Self::Cache => &[KeyFetchResult::Hit, KeyFetchResult::Miss],
+        }
+    }
+}
+
+/// How one key lookup from one [`KeySource`] ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyFetchResult {
+    /// A document was fetched and verified.
+    Ok,
+    /// The source could not be reached, or answered with an error.
+    Error,
+    /// The source answered, and what it answered did not verify.
+    Invalid,
+    /// Not asked: it was asked, or failed, too recently.
+    Throttled,
+    /// The cache held a usable key.
+    Hit,
+    /// The cache did not.
+    Miss,
+}
+
+impl KeyFetchResult {
+    const ALL: [Self; 6] = [
+        Self::Ok,
+        Self::Error,
+        Self::Invalid,
+        Self::Throttled,
+        Self::Hit,
+        Self::Miss,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::Invalid => "invalid",
+            Self::Throttled => "throttled",
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+        }
+    }
+}
+
+/// Why a received event's signatures did not verify.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignatureFailure {
+    /// No key at all for a server whose signature is required, or none
+    /// under the key IDs it signed with.
+    NoKey,
+    /// The key is known, but was not valid when the event says it was
+    /// signed (`valid_until_ts`, or a retired key's `expired_ts`).
+    ExpiredKey,
+    /// A key was found and the signature does not verify with it.
+    BadSignature,
+    /// A server whose signature is required did not sign.
+    MissingSignature,
+    /// The event or its signatures are not well formed.
+    Malformed,
+}
+
+impl SignatureFailure {
+    const ALL: [Self; 5] = [
+        Self::NoKey,
+        Self::ExpiredKey,
+        Self::BadSignature,
+        Self::MissingSignature,
+        Self::Malformed,
+    ];
+
+    /// The label value, also used in refusal messages.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NoKey => "no_key",
+            Self::ExpiredKey => "expired_key",
+            Self::BadSignature => "bad_signature",
+            Self::MissingSignature => "missing_signature",
+            Self::Malformed => "malformed",
+        }
+    }
+}
+
+/// Key lookups by source and result, and signature failures by reason.
+/// Fixed enum labels only: no server name, so a peer cannot mint series.
+#[derive(Debug, Default)]
+struct KeyMetrics {
+    fetches: [[AtomicU64; KeyFetchResult::ALL.len()]; KeySource::ALL.len()],
+    signature_failures: [AtomicU64; SignatureFailure::ALL.len()],
+}
+
+impl Metrics {
+    /// Record one lookup of a peer's signing keys.
+    pub fn record_key_fetch(&self, source: KeySource, result: KeyFetchResult) {
+        self.keys.fetches[slot(&KeySource::ALL, source)][slot(&KeyFetchResult::ALL, result)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one received event refused for its signatures.
+    pub fn record_signature_failure(&self, reason: SignatureFailure) {
+        self.keys.signature_failures[slot(&SignatureFailure::ALL, reason)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn key_fetch_count(&self, source: KeySource, result: KeyFetchResult) -> u64 {
+        self.keys.fetches[slot(&KeySource::ALL, source)][slot(&KeyFetchResult::ALL, result)]
+            .load(Ordering::Relaxed)
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn signature_failure_count(&self, reason: SignatureFailure) -> u64 {
+        self.keys.signature_failures[slot(&SignatureFailure::ALL, reason)].load(Ordering::Relaxed)
+    }
+
+    fn render_keys(&self, out: &mut String) {
+        out.push_str(
+            "# HELP spindle_federation_key_fetches_total Lookups of a peer's signing \
+         keys, by where they were answered from and how.\n\
+         # TYPE spindle_federation_key_fetches_total counter\n",
+        );
+        for source in KeySource::ALL {
+            for result in source.results() {
+                let _ = writeln!(
+                    out,
+                    "spindle_federation_key_fetches_total{{source=\"{}\",result=\"{}\"}} {}",
+                    source.label(),
+                    result.label(),
+                    self.key_fetch_count(source, *result)
+                );
+            }
+        }
+        out.push_str(
+            "# HELP spindle_federation_signature_failures_total Received events \
+         refused because their signatures did not verify, by reason.\n\
+         # TYPE spindle_federation_signature_failures_total counter\n",
+        );
+        for reason in SignatureFailure::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_signature_failures_total{{reason=\"{}\"}} {}",
+                reason.label(),
+                self.signature_failure_count(reason)
+            );
+        }
+    }
+}
+
+/// The kind of an EDU a transaction carried, as a label.
+///
+/// The spec's types this server knows by name; anything else a peer
+/// invents is `other`, so the label set is fixed by the code (#166).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EduType {
+    Typing,
+    Receipt,
+    Presence,
+    DirectToDevice,
+    DeviceListUpdate,
+    SigningKeyUpdate,
+    Other,
+}
+
+impl EduType {
+    pub const ALL: [Self; 7] = [
+        Self::Typing,
+        Self::Receipt,
+        Self::Presence,
+        Self::DirectToDevice,
+        Self::DeviceListUpdate,
+        Self::SigningKeyUpdate,
+        Self::Other,
+    ];
+
+    /// The label for an `edu_type` string as it arrived or went out.
+    #[must_use]
+    pub fn of(edu_type: Option<&str>) -> Self {
+        match edu_type {
+            Some("m.typing") => Self::Typing,
+            Some("m.receipt") => Self::Receipt,
+            Some("m.presence") => Self::Presence,
+            Some("m.direct_to_device") => Self::DirectToDevice,
+            Some("m.device_list_update") => Self::DeviceListUpdate,
+            Some("m.signing_key_update" | "org.matrix.signing_key_update") => {
+                Self::SigningKeyUpdate
+            }
+            _ => Self::Other,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Typing => "m.typing",
+            Self::Receipt => "m.receipt",
+            Self::Presence => "m.presence",
+            Self::DirectToDevice => "m.direct_to_device",
+            Self::DeviceListUpdate => "m.device_list_update",
+            Self::SigningKeyUpdate => "m.signing_key_update",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// What became of one inbound EDU.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EduResult {
+    /// Applied, at least in part. For to-device, device-list and
+    /// signing-key EDUs: handed to the handler, which runs its own checks.
+    Accepted,
+    /// Well-formed, but nothing in it was applied: a user not on the
+    /// origin, a reader not in the room, an event this server lacks.
+    Ignored,
+    /// Not the shape the spec gives this EDU type.
+    Malformed,
+    /// A type this server does not act on (presence, unknown types).
+    Unsupported,
+}
+
+impl EduResult {
+    pub const ALL: [Self; 4] = [
+        Self::Accepted,
+        Self::Ignored,
+        Self::Malformed,
+        Self::Unsupported,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Ignored => "ignored",
+            Self::Malformed => "malformed",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// What became of one receipt inside an inbound `m.receipt` EDU.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReceiptResult {
+    /// Stored, and served to local clients from now on.
+    Accepted,
+    /// The reader is not one of the origin's users.
+    ForeignUser,
+    /// The reader is not joined to the room (or the room is unknown here).
+    NotJoined,
+    /// None of the events the receipt names is one this server holds.
+    UnknownEvent,
+    /// A receipt type that does not federate (`m.read.private`, anything
+    /// but `m.read`).
+    UnsupportedType,
+    /// Missing or oversized fields.
+    Malformed,
+    /// Past the per-EDU bound; dropped unread.
+    OverLimit,
+}
+
+impl ReceiptResult {
+    pub const ALL: [Self; 7] = [
+        Self::Accepted,
+        Self::ForeignUser,
+        Self::NotJoined,
+        Self::UnknownEvent,
+        Self::UnsupportedType,
+        Self::Malformed,
+        Self::OverLimit,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::ForeignUser => "foreign_user",
+            Self::NotJoined => "not_joined",
+            Self::UnknownEvent => "unknown_event",
+            Self::UnsupportedType => "unsupported_type",
+            Self::Malformed => "malformed",
+            Self::OverLimit => "over_limit",
+        }
+    }
+}
+
+/// EDUs in and out of federation transactions. Fixed enum labels only.
+#[derive(Debug, Default)]
+struct EduMetrics {
+    received: [[AtomicU64; EduResult::ALL.len()]; EduType::ALL.len()],
+    sent: [AtomicU64; EduType::ALL.len()],
+    receipts: [AtomicU64; ReceiptResult::ALL.len()],
+}
+
+impl Metrics {
+    /// Record one EDU a peer's transaction carried, and what became of it.
+    pub fn record_edu_received(&self, edu_type: EduType, result: EduResult) {
+        self.edus.received[slot(&EduType::ALL, edu_type)][slot(&EduResult::ALL, result)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one EDU put into an outbound transaction.
+    pub fn record_edu_sent(&self, edu_type: EduType) {
+        self.edus.sent[slot(&EduType::ALL, edu_type)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record what became of one receipt inside an inbound `m.receipt`.
+    pub fn record_receipt_received(&self, result: ReceiptResult) {
+        self.edus.receipts[slot(&ReceiptResult::ALL, result)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn edu_received_count(&self, edu_type: EduType, result: EduResult) -> u64 {
+        self.edus.received[slot(&EduType::ALL, edu_type)][slot(&EduResult::ALL, result)]
+            .load(Ordering::Relaxed)
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn edu_sent_count(&self, edu_type: EduType) -> u64 {
+        self.edus.sent[slot(&EduType::ALL, edu_type)].load(Ordering::Relaxed)
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn receipt_received_count(&self, result: ReceiptResult) -> u64 {
+        self.edus.receipts[slot(&ReceiptResult::ALL, result)].load(Ordering::Relaxed)
+    }
+
+    fn render_edus(&self, out: &mut String) {
+        out.push_str(
+            "# HELP spindle_federation_edus_received_total EDUs peers sent in \
+         transactions, by type and what became of them.\n\
+         # TYPE spindle_federation_edus_received_total counter\n",
+        );
+        for edu_type in EduType::ALL {
+            for result in EduResult::ALL {
+                let _ = writeln!(
+                    out,
+                    "spindle_federation_edus_received_total{{edu_type=\"{}\",result=\"{}\"}} {}",
+                    edu_type.label(),
+                    result.label(),
+                    self.edu_received_count(edu_type, result)
+                );
+            }
+        }
+        out.push_str(
+            "# HELP spindle_federation_edus_sent_total EDUs put into outbound \
+         transactions, by type.\n\
+         # TYPE spindle_federation_edus_sent_total counter\n",
+        );
+        for edu_type in EduType::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_edus_sent_total{{edu_type=\"{}\"}} {}",
+                edu_type.label(),
+                self.edu_sent_count(edu_type)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_federation_receipts_received_total Read receipts inside \
+         inbound m.receipt EDUs, by what became of each.\n\
+         # TYPE spindle_federation_receipts_received_total counter\n",
+        );
+        for result in ReceiptResult::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_receipts_received_total{{result=\"{}\"}} {}",
+                result.label(),
+                self.receipt_received_count(result)
+            );
+        }
     }
 }
 
@@ -615,6 +2716,311 @@ mod tests {
         assert_eq!(metrics.sync_subscribers(), 0);
     }
 
+    /// Each inbound federation counter moves on its own label, and the
+    /// exposition renders every label even at zero.
+    #[test]
+    fn inbound_federation_counters_move_and_render() {
+        let metrics = Metrics::new();
+        let text = metrics.render();
+        for outcome in PduOutcome::ALL {
+            assert!(
+                text.contains(&format!(
+                    "spindle_federation_pdus_received_total{{result=\"{}\"}} 0",
+                    outcome.label()
+                )),
+                "{text}"
+            );
+        }
+        for result in GapResult::ALL {
+            assert!(
+                text.contains(&format!(
+                    "spindle_federation_gap_acceptances_total{{result=\"{}\"}} 0",
+                    result.label()
+                )),
+                "{text}"
+            );
+        }
+
+        metrics.record_pdu(PduOutcome::GapAccepted);
+        metrics.record_pdu(PduOutcome::GapAccepted);
+        metrics.record_pdu(PduOutcome::RefusedMissingDeps);
+        metrics.record_recovery(RecoveryResult::RateLimited, Duration::from_millis(30));
+        metrics.record_recovery(RecoveryResult::BudgetExceeded, Duration::from_secs(12));
+        metrics.record_fetched(FetchKind::GapState, 7);
+        metrics.record_fetched(FetchKind::Predecessor, 2);
+        metrics.record_gap(GapResult::Accepted);
+        metrics.observe_state_ids("ok", Duration::from_millis(400));
+
+        assert_eq!(metrics.pdu_count(PduOutcome::GapAccepted), 2);
+        assert_eq!(metrics.pdu_count(PduOutcome::RefusedMissingDeps), 1);
+        assert_eq!(metrics.pdu_count(PduOutcome::Accepted), 0);
+        assert_eq!(metrics.recovery_count(RecoveryResult::RateLimited), 1);
+        assert_eq!(metrics.recovery_count(RecoveryResult::BudgetExceeded), 1);
+        assert_eq!(metrics.recovery_count(RecoveryResult::Recovered), 0);
+        assert_eq!(metrics.fetched_count(FetchKind::GapState), 7);
+        assert_eq!(metrics.fetched_count(FetchKind::Predecessor), 2);
+        assert_eq!(metrics.fetched_count(FetchKind::Auth), 0);
+        assert_eq!(metrics.gap_count(GapResult::Accepted), 1);
+
+        let text = metrics.render();
+        for line in [
+            "spindle_federation_pdus_received_total{result=\"gap_accepted\"} 2",
+            "spindle_federation_recovery_attempts_total{result=\"rate_limited\"} 1",
+            "spindle_federation_recovery_events_fetched_total{kind=\"gap_state\"} 7",
+            "spindle_federation_gap_acceptances_total{result=\"accepted\"} 1",
+            // Twelve seconds lands in the ten-to-thirty bucket, which the
+            // append buckets could not have told apart from an hour.
+            "spindle_federation_recovery_duration_seconds_bucket{result=\"budget_exceeded\",le=\"10\"} 0",
+            "spindle_federation_recovery_duration_seconds_bucket{result=\"budget_exceeded\",le=\"30\"} 1",
+            "spindle_federation_state_ids_duration_seconds_count{result=\"ok\"} 1",
+        ] {
+            assert!(text.contains(line), "missing {line:?} in {text}");
+        }
+    }
+
+    /// The #614 series exist at zero, move when recorded, and carry no
+    /// label a caller could grow.
+    /// #625: a request slower than 2.5 s lands in a bucket that says how
+    /// slow, and a long-poll is timed under a series of its own.
+    #[test]
+    fn http_latency_reaches_past_two_and_a_half_seconds_and_splits_long_polls() {
+        let metrics = Metrics::new();
+        let route = "/_matrix/client/v3/keys/query";
+        metrics.observe_request(route, "POST", 200, Duration::from_secs(7), false);
+        let sync = "/_matrix/client/v3/sync";
+        metrics.observe_request(sync, "GET", 200, Duration::from_secs(30), true);
+        metrics.observe_request(sync, "GET", 200, Duration::from_millis(3), false);
+        let text = metrics.render();
+        let name = "spindle_http_request_duration_seconds_bucket";
+        assert!(
+            text.contains(&format!("{name}{{route=\"{route}\",le=\"5\"}} 0")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{name}{{route=\"{route}\",le=\"10\"}} 1")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{name}{{route=\"{route}\",le=\"120\"}} 1")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "{name}{{route=\"{sync}{LONG_POLL_SUFFIX}\",le=\"30\"}} 1"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{name}{{route=\"{sync}\",le=\"120\"}} 1")),
+            "the plain sync series holds only the request that did not wait: {text}"
+        );
+        // The request counter keeps the plain template for both.
+        assert!(
+            text.contains(&format!(
+                "spindle_http_requests_total{{route=\"{sync}\",method=\"GET\",status=\"200\"}} 2"
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn edu_series_are_present_at_zero_and_move() {
+        let metrics = Metrics::new();
+        let text = metrics.render();
+        assert!(text.contains(
+            "spindle_federation_edus_received_total{edu_type=\"m.receipt\",result=\"accepted\"} 0"
+        ));
+        metrics.record_edu_received(EduType::Receipt, EduResult::Accepted);
+        metrics.record_edu_sent(EduType::of(Some("m.receipt")));
+        metrics.record_receipt_received(ReceiptResult::NotJoined);
+        let text = metrics.render();
+        assert!(text.contains(
+            "spindle_federation_edus_received_total{edu_type=\"m.receipt\",result=\"accepted\"} 1"
+        ));
+        assert!(text.contains("spindle_federation_edus_sent_total{edu_type=\"m.receipt\"} 1"));
+        assert!(
+            text.contains("spindle_federation_receipts_received_total{result=\"not_joined\"} 1")
+        );
+        assert_eq!(EduType::of(Some("io.example.whatever")), EduType::Other);
+    }
+
+    #[test]
+    fn the_responsiveness_series_register_and_move() {
+        let metrics = Metrics::new();
+        let text = metrics.render();
+        for name in [
+            "spindle_room_cold_loads_total",
+            "spindle_room_cold_load_duration_seconds",
+            "spindle_rooms_resident",
+            "spindle_lock_wait_seconds",
+            "spindle_sync_phase_duration_seconds",
+            "spindle_blocking_tasks_in_flight",
+            "spindle_federation_outbound_transactions_total",
+            "spindle_federation_outbound_transaction_duration_seconds",
+            "spindle_room_warmup_pending",
+            "spindle_room_warmup_loaded_total",
+        ] {
+            assert!(text.contains(&format!("# HELP {name} ")), "{text}");
+            assert!(text.contains(&format!("# TYPE {name} ")), "{text}");
+        }
+        assert!(text.contains("spindle_room_cold_loads_total{size=\"ge_1m\"} 0"));
+        assert!(text.contains("spindle_rooms_resident 0"));
+
+        metrics.observe_cold_load(RoomSize::of(1_010_000), Duration::from_secs(90));
+        metrics.observe_cold_load(RoomSize::of(12), Duration::from_millis(3));
+        assert_eq!(metrics.cold_loads(RoomSize::AtLeast1m), 1);
+        assert_eq!(metrics.cold_loads(RoomSize::Under1k), 1);
+        assert_eq!(RoomSize::of(999), RoomSize::Under1k);
+        assert_eq!(RoomSize::of(1_000), RoomSize::Under10k);
+        assert_eq!(RoomSize::of(87_000), RoomSize::Under100k);
+        assert_eq!(RoomSize::of(999_999), RoomSize::Under1m);
+
+        metrics.set_resident_rooms_probe(|| Some(7));
+        metrics.observe_lock_wait(LockKind::Room, false, Duration::from_millis(2));
+        metrics.observe_sync_phase(SyncPhase::SlidingOrder, Duration::from_millis(4));
+        metrics.observe_outbound_txn(TxnResult::Timeout, Duration::from_secs(30));
+        metrics.set_warmup_pending(3);
+        metrics.warmup_loaded();
+        {
+            let _guard = metrics.blocking_started(BlockingTask::SlidingSync);
+            assert_eq!(metrics.blocking_in_flight(BlockingTask::SlidingSync), 1);
+            assert!(
+                metrics
+                    .render()
+                    .contains("spindle_blocking_tasks_in_flight{task=\"sliding_sync\"} 1")
+            );
+        }
+        assert_eq!(metrics.blocking_in_flight(BlockingTask::SlidingSync), 0);
+
+        let text = metrics.render();
+        assert!(
+            text.contains("spindle_room_cold_loads_total{size=\"ge_1m\"} 1"),
+            "{text}"
+        );
+        // 90 s lands in the 120 s bucket, not +Inf: the slow bounds exist
+        // so a minutes-long load is still measured.
+        assert!(
+            text.contains(
+                "spindle_room_cold_load_duration_seconds_bucket{size=\"ge_1m\",le=\"120\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "spindle_room_cold_load_duration_seconds_bucket{size=\"ge_1m\",le=\"60\"} 0"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("spindle_rooms_resident 7"), "{text}");
+        assert!(
+            text.contains("spindle_lock_wait_seconds_count{lock=\"room\",mode=\"shared\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "spindle_sync_phase_duration_seconds_count{endpoint=\"sliding\",phase=\"order\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("spindle_federation_outbound_transactions_total{result=\"timeout\"} 1"),
+            "{text}"
+        );
+        assert!(text.contains("spindle_room_warmup_pending 2"), "{text}");
+        assert!(
+            text.contains("spindle_room_warmup_loaded_total 1"),
+            "{text}"
+        );
+        // No room id, no destination, nothing from a request in any of them.
+        for line in text.lines().filter(|line| {
+            line.starts_with("spindle_room_cold") || line.starts_with("spindle_lock_wait")
+        }) {
+            assert!(!line.contains('!'), "a room id leaked into a label: {line}");
+        }
+    }
+
+    /// Each auth counter moves its own series and no other, and every
+    /// series renders at zero before anything happens.
+    #[test]
+    fn auth_counters_move_their_own_series() {
+        let metrics = Metrics::new();
+        let text = metrics.render();
+        for line in [
+            "spindle_auth_logins_total{method=\"oidc\",result=\"rate_limited\"} 0",
+            "spindle_oauth_token_grants_total{grant=\"refresh_token\",result=\"invalid_grant\"} 0",
+            "spindle_password_resets_total{stage=\"completed\"} 0",
+            "spindle_emails_sent_total{kind=\"verification\",result=\"failed\"} 0",
+            "spindle_account_actions_total{action=\"deactivate\"} 0",
+        ] {
+            assert!(text.contains(line), "{line} missing from {text}");
+        }
+        metrics.record_login(LoginMethod::Oidc, LoginResult::RateLimited);
+        metrics.record_token_grant(TokenGrant::RefreshToken, GrantResult::InvalidGrant);
+        metrics.record_password_reset_requested();
+        metrics.record_password_reset_completed();
+        metrics.record_email(EmailKind::Verification, false);
+        metrics.record_account_action(AccountAction::Deactivate);
+        assert_eq!(
+            metrics.login_count(LoginMethod::Oidc, LoginResult::RateLimited),
+            1
+        );
+        assert_eq!(
+            metrics.login_count(LoginMethod::Oidc, LoginResult::Success),
+            0
+        );
+        assert_eq!(
+            metrics.login_count(LoginMethod::Password, LoginResult::RateLimited),
+            0
+        );
+        assert_eq!(
+            metrics.token_grant_count(TokenGrant::RefreshToken, GrantResult::InvalidGrant),
+            1
+        );
+        assert_eq!(metrics.password_reset_counts(), (1, 1));
+        assert_eq!(metrics.email_count(EmailKind::Verification, false), 1);
+        assert_eq!(metrics.email_count(EmailKind::Verification, true), 0);
+        assert_eq!(metrics.account_action_count(AccountAction::Deactivate), 1);
+        let text = metrics.render();
+        for line in [
+            "spindle_auth_logins_total{method=\"oidc\",result=\"rate_limited\"} 1",
+            "spindle_oauth_token_grants_total{grant=\"refresh_token\",result=\"invalid_grant\"} 1",
+            "spindle_password_resets_total{stage=\"requested\"} 1",
+            "spindle_emails_sent_total{kind=\"verification\",result=\"failed\"} 1",
+            "spindle_account_actions_total{action=\"deactivate\"} 1",
+        ] {
+            assert!(text.contains(line), "{line} missing from {text}");
+        }
+    }
+
+    #[test]
+    fn rooms_are_bucketed_by_forward_extremities() {
+        let buckets: Vec<usize> = [0, 1, 2, 5, 6, 10, 11, 500]
+            .into_iter()
+            .map(extremity_bucket)
+            .collect();
+        assert_eq!(buckets, [0, 0, 1, 1, 2, 2, 3, 3]);
+        let metrics = Metrics::new();
+        metrics.set_extremity_buckets([4, 3, 2, 1]);
+        metrics.record_state_res(2, 5, 7);
+        metrics.record_dummy_event(true);
+        metrics.record_dummy_event(false);
+        metrics.record_dummy_event(true);
+        let text = metrics.render();
+        for line in [
+            "spindle_rooms_by_forward_extremities{extremities=\"1\"} 4",
+            "spindle_rooms_by_forward_extremities{extremities=\"2-5\"} 3",
+            "spindle_rooms_by_forward_extremities{extremities=\"6-10\"} 2",
+            "spindle_rooms_by_forward_extremities{extremities=\">10\"} 1",
+            "spindle_state_res_resolutions_total{cached=\"false\"} 2",
+            "spindle_state_res_resolutions_total{cached=\"true\"} 5",
+            "spindle_state_res_rejections_total 7",
+            "spindle_dummy_events_total{result=\"sent\"} 2",
+            "spindle_dummy_events_total{result=\"failed\"} 1",
+        ] {
+            assert!(text.contains(line), "{line} missing from {text}");
+        }
+    }
+
     /// The exposition is the contract, so it is asserted rather than eyeballed.
     #[test]
     fn the_exposition_is_well_formed() {
@@ -623,6 +3029,10 @@ mod tests {
             "spindle_build_info",
             "spindle_events_appended_total",
             "spindle_fork_resolutions_total",
+            "spindle_state_res_resolutions_total",
+            "spindle_state_res_rejections_total",
+            "spindle_dummy_events_total",
+            "spindle_rooms_by_forward_extremities",
         ] {
             assert!(text.contains(&format!("# HELP {name} ")), "{text}");
             assert!(text.contains(&format!("# TYPE {name} ")), "{text}");

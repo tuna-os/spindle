@@ -118,12 +118,26 @@ impl Instance {
     /// section that arrives without it is not usable by a client even when
     /// the membership is right.
     async fn room_named(&self, token: &str, name: &str, rule: &str) -> String {
+        self.room_named_at(token, name, rule, None).await
+    }
+
+    async fn room_named_at(
+        &self,
+        token: &str,
+        name: &str,
+        rule: &str,
+        version: Option<&str>,
+    ) -> String {
+        let mut create = json!({ "name": name });
+        if let Some(version) = version {
+            create["room_version"] = json!(version);
+        }
         let (status, body) = self
             .request(
                 reqwest::Method::POST,
                 "/_matrix/client/v3/createRoom",
                 Some(token),
-                Some(&json!({ "name": name })),
+                Some(&create),
             )
             .await;
         assert_eq!(status, 200, "{body}");
@@ -402,6 +416,54 @@ async fn a_knock_restricted_room_elsewhere_takes_the_knock() {
     let (status, member) = resident.member_state(&room, &alice, &bob_id).await;
     assert_eq!(status, 200, "{member}");
     assert_eq!(member["membership"], json!("knock"), "{member}");
+}
+
+/// Knocking arrived in room version 7, which is the version Complement's
+/// knock tests create. The handshake runs at that version, not at a
+/// substituted one.
+#[tokio::test]
+async fn a_v7_room_elsewhere_takes_the_knock() {
+    let resident = Instance::start().await;
+    let asking = Instance::start().await;
+
+    let alice = resident.register("alice").await;
+    let room = resident
+        .room_named_at(&alice, "Version seven", "knock", Some("7"))
+        .await;
+
+    let bob = asking.register("bob").await;
+    let bob_id = format!("@bob:{}", asking.name);
+    let (status, body) = asking
+        .knock_via(&room, &bob, &resident.name, Some("v7 knock"))
+        .await;
+    assert_eq!(status, 200, "the v7 knock was refused: {body}");
+    let (status, member) = resident.member_state(&room, &alice, &bob_id).await;
+    assert_eq!(status, 200, "{member}");
+    assert_eq!(member["membership"], json!("knock"), "{member}");
+
+    let (status, body) = resident.invite(&room, &alice, &bob_id).await;
+    assert_eq!(status, 200, "the v7 knock could not be answered: {body}");
+}
+
+/// Before v7 a room cannot be knocked on, whatever its join rule says: the
+/// version's rules refuse a knock membership outright. The resident says so
+/// at `make_knock`, and the knocker sees the room's own 403.
+#[tokio::test]
+async fn a_v6_room_refuses_a_knock_from_elsewhere() {
+    let resident = Instance::start().await;
+    let asking = Instance::start().await;
+
+    let alice = resident.register("alice").await;
+    let room = resident
+        .room_named_at(&alice, "Version six", "knock", Some("6"))
+        .await;
+
+    let bob = asking.register("bob").await;
+    let (status, body) = asking
+        .knock_via(&room, &bob, &resident.name, Some("v6 knock"))
+        .await;
+    assert_eq!(status, 403, "a v6 room took a knock: {body}");
+    assert_eq!(body["errcode"], json!("M_FORBIDDEN"), "{body}");
 }
 
 /// The answer arrives over federation and supersedes the question.
