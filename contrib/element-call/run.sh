@@ -27,10 +27,17 @@
 # own `*.spec.ts` pattern, and the federated-call spec contains an interactive
 # `page.pause()`, so both remain opt-in until upstream makes them unattended.
 # Restricted-SFU stays out: it changes which SFU a user may reach rather than exercising homeserver behaviour.
+#
+# Beside upstream's specs run Spindle's own (contrib/element-call/specs/,
+# copied into the checkout as playwright/spindle/): the scenarios #41 names
+# that no upstream spec drives -- five-party churn, a homeserver restart
+# mid-call, a ring the caller abandons, and the federated call across the
+# two Spindles. They use upstream's fixtures and helpers unchanged, and the
+# ratchet names them `spindle/<file> :: <title>` like any other spec.
 set -euo pipefail
 
 ELEMENT_CALL_REV=a03f23e7206fa7d45911ec3da6af988452804614
-DEFAULT_SPECS="landing.spec.ts access.spec.ts create-call.spec.ts spa-call-sticky.spec.ts reconnect.spec.ts sfu-reconnect-bug.spec.ts errors.spec.ts widget/voice-call-dm.spec.ts"
+DEFAULT_SPECS="landing.spec.ts access.spec.ts create-call.spec.ts spa-call-sticky.spec.ts reconnect.spec.ts sfu-reconnect-bug.spec.ts errors.spec.ts widget/voice-call-dm.spec.ts spindle/ring-abandon.spec.ts spindle/five-party-churn.spec.ts spindle/restart-mid-call.spec.ts spindle/federated-call.spec.ts"
 
 results="${1:-tmp/element-call-results.json}"
 toplevel="$(git rev-parse --show-toplevel)"
@@ -56,6 +63,10 @@ fi
 cd "$ELEMENT_CALL_SRC"
 echo "element-call: $(git rev-parse HEAD) with $SPINDLE_IMAGE as both homeservers"
 
+# Spindle's own specs, beside upstream's and driven by the same config.
+rm -rf playwright/spindle
+cp -r "$contrib/specs" playwright/spindle
+
 # Upstream's stack, with the override last so it wins.
 compose=(docker compose -f docker-compose-dev.yml -f docker-compose-playwright.yml \
     -f "$contrib/docker-compose-spindle.yml")
@@ -64,6 +75,11 @@ cleanup() {
     "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
+# What restart-mid-call.spec.ts runs to bounce the first homeserver: the
+# same container, SIGTERM and start, so its store survives as a deployed
+# server's would.
+SPINDLE_RESTART_HOMESERVER="cd $(printf %q "$PWD") && ${compose[*]} restart synapse"
+export SPINDLE_RESTART_HOMESERVER
 "${compose[@]}" pull --ignore-buildable --quiet || true
 "${compose[@]}" up -d
 

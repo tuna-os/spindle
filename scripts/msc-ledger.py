@@ -78,7 +78,11 @@ def check(entries: list[dict]) -> int:
     problems: list[str] = []
 
     for flag in advertised_flags():
-        number = msc_of(flag)
+        # A flag an entry claims under `unstable` belongs to that entry,
+        # whatever number its spelling carries: MSC4186 kept MSC3575's
+        # `org.matrix.simplified_msc3575`.
+        claimed = [e for e in entries if flag in e.get("unstable", [])]
+        number = claimed[0]["number"] if claimed else msc_of(flag)
         entry = by_number.get(number) if number else None
         if number is None:
             # Vendor flags (im.nheko.summary) are matched by the `unstable`

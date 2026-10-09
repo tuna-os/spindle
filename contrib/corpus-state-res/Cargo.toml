@@ -1,0 +1,24 @@
+[package]
+name = "corpus-state-res"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Replay a Synapse database's contested forks through Spindle's live ingest path (#563)"
+
+# Not a workspace member: a one-off evidence harness with a Postgres client,
+# neither of which belongs in the server's dependency tree or its CI.
+[workspace]
+
+[dependencies]
+spindle-server = { path = "../../crates/spindle-server", features = ["corpus-replay"] }
+spindle-core = { path = "../../crates/spindle-core" }
+spindle-store = { path = "../../crates/spindle-store" }
+postgres = "0.19"
+serde_json = "1"
+tempfile = "3"
+
+ruma = { version = "0.17", features = ["state-res"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[patch.crates-io]
+ruma-state-res = { path = "../../vendor/ruma-state-res" }

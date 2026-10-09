@@ -1,0 +1,10 @@
+room !UpTFCotHHetkcMTxeM:reilly.asia: room_events=26
+room !WpvjQmNLGeVSCrQGXP:reilly.asia: room_events=3275
+room !eGAKNOtIYJgTECIGGK:reilly.asia: room_events=24
+room !gllblumXbTgEdNUayt:reilly.asia: room_events=24
+room !jJwQBRazJPYfrvvkys:reilly.asia: room_events=42
+room !yQ1SqzDiKYxp7_hzwIb62xffSR822Ao6IWuCwgsOdLI: room_events=15
+user @drill-b1:reilly.asia: account_data=8 device_keys=1 cross_signing_keys=3 signatures=1 skipped_signatures=0 backup_versions=1 backup_sessions=3
+user @drill-b2:reilly.asia: account_data=0 device_keys=0 cross_signing_keys=0 signatures=0 skipped_signatures=0 backup_versions=0 backup_sessions=0
+rehearsal ready: rooms=6 users=2
+rehearsal only: no media, remote cached keys, receipts, pushers, or federation cutover
