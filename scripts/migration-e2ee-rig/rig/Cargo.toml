@@ -1,0 +1,31 @@
+[package]
+name = "mig-rig"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Seeds and verifies E2EE history for the Synapse -> Spindle migration rig"
+
+# Standalone: not a member of the Spindle workspace, so building the server
+# never builds this and this never builds the server.
+[workspace]
+
+[dependencies]
+# matrix-sdk at the same release contrib/rust-sdk pins. Default features are
+# off on purpose: `automatic-room-key-forwarding` would let a fresh device
+# obtain keys by gossip, and `verify` must prove the keys came from the
+# server-side backup.
+matrix-sdk = { version = "=0.18.0", default-features = false, features = ["e2e-encryption", "sqlite", "bundled-sqlite"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+debug = false
+strip = true

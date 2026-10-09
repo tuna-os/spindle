@@ -1,0 +1,298 @@
+# Dark (isolated) single-process Synapse for the E2EE migration rig.
+#
+# It runs on a COPY of a production database (synapse_dark) with the
+# production server_name and signing key, so it must never reach the Matrix
+# federation, a push gateway, an identity server, MAS or anything else.
+# Isolation is layered because the cluster CNI does not enforce
+# NetworkPolicy:
+#
+#   1. federation_domain_whitelist: [] and federation_sender_instances: []
+#      (nothing is sent, nothing is fetched over federation)
+#   2. pusher_instances: [], push.enabled: false, no email/identity
+#      server/appservices/URL previews/trusted key servers
+#   3. ip_range_blacklist covers 0.0.0.0/0 and ::/0, which Synapse applies to
+#      every outbound HTTP client it owns (federation, push, previews)
+#   4. the pod has no usable DNS (nameserver 127.0.0.1); the database is
+#      reached through a hostAliases entry rendered by rig.sh
+#   5. the only listener serves the client API; there is no federation
+#      listener, no Ingress, NodePort or LoadBalancer
+#   6. the netwatch sidecar shares the pod network namespace and logs every
+#      socket whose remote end is not the database or an inbound client
+#
+# __PG_IP__ is replaced by rig.sh with the rehearsal-pg ClusterIP.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dark-synapse-config
+  labels: {app: dark-synapse, part-of: spindle-mig-rig}
+data:
+  homeserver.yaml: |
+    server_name: reilly.asia
+    public_baseurl: http://dark-synapse.spindle-rehearsal.svc.cluster.local:8008/
+    pid_file: /tmp/homeserver.pid
+    log_config: /conf/log_config.yaml
+    signing_key_path: /secrets/signing.key
+    report_stats: false
+    enable_metrics: false
+
+    listeners:
+    - port: 8008
+      tls: false
+      type: http
+      x_forwarded: false
+      bind_addresses: ["0.0.0.0"]
+      resources:
+      - names: [client]
+        compress: false
+
+    database:
+      name: psycopg2
+      allow_unsafe_locale: true
+      args:
+        user: postgres
+        dbname: synapse_dark
+        host: rehearsal-pg
+        port: 5432
+        cp_min: 2
+        cp_max: 10
+        application_name: dark-synapse
+
+    # --- isolation: federation ------------------------------------------
+    federation_domain_whitelist: []
+    federation_sender_instances: []
+    trusted_key_servers: []
+    suppress_key_server_warning: true
+    allow_public_rooms_over_federation: false
+    allow_profile_lookup_over_federation: false
+    allow_device_name_lookup_over_federation: false
+    serve_server_wellknown: false
+
+    # --- isolation: push, email, identity, appservices, previews ---------
+    pusher_instances: []
+    push:
+      enabled: false
+    url_preview_enabled: false
+    app_service_config_files: []
+    # no `email:` section, no default_identity_server, no oidc_providers,
+    # no matrix_authentication_service (MAS delegation is off), no redis.
+
+    # --- isolation: every outbound HTTP client Synapse owns -------------
+    ip_range_blacklist:
+    - '0.0.0.0/0'
+    - '::/0'
+    ip_range_whitelist: []
+    url_preview_ip_range_blacklist:
+    - '0.0.0.0/0'
+    - '::/0'
+
+    # --- local behaviour --------------------------------------------------
+    enable_registration: false
+    password_config:
+      enabled: true
+    presence:
+      enabled: false
+    room_list_publication_rules:
+    - action: deny
+    media_store_path: /media/media_store
+    max_upload_size: 10M
+    # The seed client sends ~100 events in a burst.
+    rc_message: {per_second: 1000, burst_count: 1000}
+    rc_login:
+      address: {per_second: 100, burst_count: 100}
+      account: {per_second: 100, burst_count: 100}
+      failed_attempts: {per_second: 100, burst_count: 100}
+    rc_joins:
+      local: {per_second: 100, burst_count: 100}
+      remote: {per_second: 1, burst_count: 1}
+    rc_invites:
+      per_room: {per_second: 100, burst_count: 100}
+      per_user: {per_second: 100, burst_count: 100}
+    rc_key_requests: {per_second: 1000, burst_count: 1000}
+    rc_admin_redaction: {per_second: 100, burst_count: 100}
+  log_config.yaml: |
+    version: 1
+    formatters:
+      precise:
+        format: '%(asctime)s - %(name)s - %(lineno)d - %(levelname)s - %(request)s - %(message)s'
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: precise
+    loggers:
+      synapse.storage.SQL: {level: INFO}
+      # Anything that would leave the pod logs at DEBUG so an attempt is
+      # visible even when it is refused before a socket is opened.
+      synapse.http.matrixfederationclient: {level: DEBUG}
+      synapse.http.client: {level: DEBUG}
+      synapse.federation: {level: DEBUG}
+      synapse.crypto.keyring: {level: DEBUG}
+      synapse.push: {level: DEBUG}
+    root:
+      level: INFO
+      handlers: [console]
+    disable_existing_loggers: false
+  netwatch.py: |
+    """Log every socket in this pod's network namespace whose remote end is
+    not loopback, the database, or an inbound client connection.
+
+    Shares the pod network namespace with Synapse, so /proc/net/* is the
+    pod's socket table. Prints one JSON line per newly-seen remote endpoint
+    and a heartbeat with running totals every 60 s."""
+    import json, os, socket, struct, sys, time
+
+    ALLOWED_DB = os.environ.get("ALLOWED_DB", "")  # "ip:port"
+    LISTEN_PORTS = {8008}
+    TCP_STATES = {"01": "ESTABLISHED", "02": "SYN_SENT", "03": "SYN_RECV",
+                  "04": "FIN_WAIT1", "05": "FIN_WAIT2", "06": "TIME_WAIT",
+                  "07": "CLOSE", "08": "CLOSE_WAIT", "09": "LAST_ACK",
+                  "0A": "LISTEN", "0B": "CLOSING"}
+
+    def addr4(h):
+        ip, port = h.split(":")
+        return socket.inet_ntoa(struct.pack("<I", int(ip, 16))), int(port, 16)
+
+    def addr6(h):
+        ip, port = h.split(":")
+        raw = b"".join(struct.pack("<I", int(ip[i:i + 8], 16)) for i in range(0, 32, 8))
+        a = socket.inet_ntop(socket.AF_INET6, raw)
+        if a.startswith("::ffff:"):
+            a = a[7:]
+        return a, int(port, 16)
+
+    def sockets():
+        for proto, conv in (("tcp", addr4), ("tcp6", addr6), ("udp", addr4), ("udp6", addr6)):
+            try:
+                lines = open(f"/proc/net/{proto}").read().splitlines()[1:]
+            except OSError:
+                continue
+            for line in lines:
+                f = line.split()
+                (lip, lport), (rip, rport) = conv(f[1]), conv(f[2])
+                yield proto, lip, lport, rip, rport, TCP_STATES.get(f[3], f[3])
+
+    def classify(proto, lip, lport, rip, rport, state):
+        if rport == 0 or rip in ("0.0.0.0", "::"):
+            return None  # listening / unconnected
+        if rip.startswith("127.") or rip == "::1":
+            return "loopback"
+        if f"{rip}:{rport}" == ALLOWED_DB:
+            return "database"
+        if proto.startswith("tcp") and lport in LISTEN_PORTS:
+            return "inbound-client"
+        return "OUTBOUND"
+
+    seen, totals, last_beat = set(), {}, 0.0
+    print(json.dumps({"netwatch": "start", "allowed_db": ALLOWED_DB}), flush=True)
+    while True:
+        for s in sockets():
+            kind = classify(*s)
+            if kind is None:
+                continue
+            key = (kind, s[0], s[3], s[4]) if kind != "inbound-client" else (kind, s[3])
+            if key not in seen:
+                seen.add(key)
+                totals[kind] = totals.get(kind, 0) + 1
+                print(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                  "new": kind, "proto": s[0], "local": f"{s[1]}:{s[2]}",
+                                  "remote": f"{s[3]}:{s[4]}", "state": s[5]}), flush=True)
+        now = time.time()
+        if now - last_beat >= 60:
+            last_beat = now
+            print(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                              "heartbeat": True, "distinct": totals,
+                              "outbound": totals.get("OUTBOUND", 0)}), flush=True)
+        time.sleep(1)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dark-synapse
+  labels: {app: dark-synapse, part-of: spindle-mig-rig}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: dark-synapse}
+  template:
+    metadata:
+      labels: {app: dark-synapse, part-of: spindle-mig-rig}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # No usable resolver: nothing outside the pod can even be named.
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["127.0.0.1"]
+        searches: []
+        options: [{name: ndots, value: "1"}, {name: attempts, value: "1"}, {name: timeout, value: "1"}]
+      hostAliases:
+      - ip: "__PG_IP__"
+        hostnames: [rehearsal-pg]
+      securityContext:
+        runAsUser: 10091
+        runAsGroup: 10091
+        fsGroup: 10091
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: synapse
+        image: oci.element.io/synapse:v1.156.0
+        command: [python3, -m, synapse.app.homeserver, -c, /conf/homeserver.yaml, -c, /secrets/secrets.yaml]
+        env:
+        # libpq reads the database password from the environment, so the
+        # config files carry no database credential.
+        - name: PGPASSWORD
+          valueFrom: {secretKeyRef: {name: rehearsal-pg, key: POSTGRES_PASSWORD}}
+        ports:
+        - {name: client, containerPort: 8008}
+        readinessProbe:
+          httpGet: {path: /health, port: 8008}
+          periodSeconds: 10
+          failureThreshold: 60
+        resources:
+          requests: {cpu: 250m, memory: 1Gi}
+          limits: {memory: 4Gi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: [ALL]}
+        volumeMounts:
+        - {name: conf, mountPath: /conf, readOnly: true}
+        - {name: secrets, mountPath: /secrets, readOnly: true}
+        - {name: media, mountPath: /media}
+      - name: netwatch
+        image: oci.element.io/synapse:v1.156.0
+        command: [python3, -u, /conf/netwatch.py]
+        env:
+        - {name: ALLOWED_DB, value: "__PG_IP__:5432"}
+        resources:
+          requests: {cpu: 10m, memory: 32Mi}
+          limits: {memory: 128Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: [ALL]}
+        volumeMounts:
+        - {name: conf, mountPath: /conf, readOnly: true}
+      volumes:
+      - name: conf
+        configMap: {name: dark-synapse-config}
+      - name: secrets
+        secret:
+          secretName: dark-synapse-secrets
+          items:
+          - {key: secrets.yaml, path: secrets.yaml}
+          - {key: signing.key, path: signing.key}
+      - name: media
+        emptyDir: {sizeLimit: 2Gi}
+---
+# In-namespace client access only (ClusterIP, client API port only). There
+# is deliberately no Ingress, NodePort or LoadBalancer.
+apiVersion: v1
+kind: Service
+metadata:
+  name: dark-synapse
+  labels: {app: dark-synapse, part-of: spindle-mig-rig}
+spec:
+  type: ClusterIP
+  selector: {app: dark-synapse}
+  ports:
+  - {name: client, port: 8008, targetPort: 8008}
