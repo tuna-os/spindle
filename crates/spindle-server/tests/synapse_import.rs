@@ -67,6 +67,7 @@ fn room(events: Vec<SourceEvent>, state: StateMap) -> SourceRoom {
         events,
         current_state: state,
         state_after_root: None,
+        forward_extremities: Vec::new(),
     }
 }
 
@@ -255,6 +256,28 @@ fn a_frayed_event_and_everything_behind_it_are_named() {
     );
 }
 
+/// A production-sized tail behind a retention gap is walked once, not by
+/// rescanning the entire room for every newly orphaned event.
+#[test]
+fn a_long_frayed_tail_is_pruned_as_one_linear_walk() {
+    let mut events = vec![
+        create("$create"),
+        message("$merge", &["$create", "$missing"]),
+    ];
+    let mut parent = "$merge".to_owned();
+    for index in 0..4_096 {
+        let event_id = format!("$after-{index}");
+        events.push(message(&event_id, &[&parent]));
+        parent = event_id;
+    }
+    let source = room(events, current_state(&[("m.room.create", "", "$create")]));
+
+    let outcome = replay(&source).expect("the retained root still imports");
+
+    assert_eq!(outcome.imported, 1);
+    assert_eq!(outcome.excluded.len(), 4_097);
+}
+
 /// Two disconnected starting points are refused, not half-imported.
 ///
 /// Only one event can seed a log, so the second would name parents the log
@@ -416,14 +439,11 @@ fn a_horizon_start_with_state_imports_and_says_the_check_is_weaker() {
     );
 }
 
-/// A fork over two different state slots replays and both writes survive.
-///
-/// Synapse rooms fork routinely, and this is the arrangement that regressed
-/// once already (#225): two branches writing *different* keys that already
-/// held values looked contested and were refused. An import is where that
-/// surfaces as a room that cannot be moved at all.
+/// Topology alone cannot resolve a fork whose parent states disagree.
+/// The full importer supplies the room version, signed bodies, and Matrix
+/// resolver; the versionless replay helper must refuse to invent a result.
 #[test]
-fn a_fork_on_separate_state_slots_replays() {
+fn a_fork_on_separate_state_slots_requires_a_room_version_resolver() {
     let source = room(
         vec![
             create("$create"),
@@ -441,10 +461,14 @@ fn a_fork_on_separate_state_slots_replays() {
         ]),
     );
 
-    let outcome = replay(&source).expect("a forked room imports");
-
-    assert_eq!(outcome.imported, 6);
-    assert!(outcome.clean(), "{:?}", outcome.divergence);
+    assert!(matches!(
+        replay(&source),
+        Err(ImportError::Append {
+            event_id,
+            error: spindle_core::AppendError::NeedsStateResolution { .. },
+            ..
+        }) if event_id == "$merge"
+    ));
 }
 
 /// A room with nothing importable in it says so rather than reporting success.

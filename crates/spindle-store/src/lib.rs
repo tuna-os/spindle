@@ -40,11 +40,12 @@ use fjall::{
     KeyspaceCreateOptions as PartitionCreateOptions, PersistMode, Readable,
 };
 use spindle_core::{
-    CONTENT_DIGEST_VERSION, EventId, RestoreError, RestoredEntry, RestoredLog, RoomLog, StateRoot,
+    CONTENT_DIGEST_VERSION, EventId, LogRestore, RestoreError, RestoredEntry, RestoredLog, RoomLog,
+    RuntimeRestoredLog, StateRoot,
     keys::{KEY_SCHEMA_VERSION, Keyspace, content_addressed, room_li, room_prefix, store_marker},
 };
 
-use crate::codec::{CodecError, EntryRecord, RECORD_VERSION, RoomRecord};
+use crate::codec::{CodecError, EntryRecord, RECORD_VERSION, RoomRecord, SidelinedRecord};
 
 /// How hard a commit tries to be on disk before it is acknowledged.
 ///
@@ -152,6 +153,10 @@ mod durability_tests {
 /// One key and its value, as read back from a scan.
 pub type Record = (Vec<u8>, Vec<u8>);
 
+/// What [`ReadView::visit_prefix`] calls with each key and value; an error
+/// stops the scan and is returned from it.
+pub type RowVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> Result<(), StoreError> + 'a;
+
 /// The ordered key-value operations the log needs.
 ///
 /// Narrow on purpose: every hot operation is a point lookup or a sorted range
@@ -169,6 +174,28 @@ pub trait ReadView {
     ///
     /// Returns a backend error if the scan fails.
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<Record>, StoreError>;
+
+    /// Visit every entry whose key starts with `prefix`, in key order,
+    /// without collecting them.
+    ///
+    /// [`Self::scan_prefix`] copies the whole range into memory before the
+    /// caller sees its first row. For a room restore that is the room's
+    /// entire log, held twice -- once as rows, once decoded -- at the
+    /// moment memory is scarcest. A visitor sees each row while the backend
+    /// still owns it and stops the scan by returning an error.
+    ///
+    /// The default collects through [`Self::scan_prefix`], so a backend
+    /// gets the semantics for free and the memory saving by overriding it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the scan fails, or the visitor's error.
+    fn visit_prefix(&self, prefix: &[u8], visit: &mut RowVisitor<'_>) -> Result<(), StoreError> {
+        for (key, value) in self.scan_prefix(prefix)? {
+            visit(&key, &value)?;
+        }
+        Ok(())
+    }
 
     /// Entries whose key starts with `prefix` *and* sorts at or after
     /// `start`, in key order.
@@ -830,6 +857,17 @@ impl ReadView for FjallStore {
         Ok(out)
     }
 
+    fn visit_prefix(&self, prefix: &[u8], visit: &mut RowVisitor<'_>) -> Result<(), StoreError> {
+        let mut visited = 0_u64;
+        let result = self.partition.prefix(prefix).try_for_each(|pair| {
+            let (key, value) = pair.into_inner()?;
+            visited += 1;
+            visit(&key, &value)
+        });
+        self.scanned.fetch_add(visited, Ordering::Relaxed);
+        result
+    }
+
     fn scan_from(&self, prefix: &[u8], start: &[u8]) -> Result<Vec<Record>, StoreError> {
         let mut out = Vec::new();
         for pair in self.partition.range(start.to_vec()..) {
@@ -911,6 +949,15 @@ impl ReadView for FjallCheckpoint {
             out.push((key.to_vec(), value.to_vec()));
         }
         Ok(out)
+    }
+
+    fn visit_prefix(&self, prefix: &[u8], visit: &mut RowVisitor<'_>) -> Result<(), StoreError> {
+        self.0.prefix(&self.1, prefix).try_for_each(|pair| {
+            let (key, value) = pair
+                .into_inner()
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+            visit(&key, &value)
+        })
     }
 
     fn scan_from(&self, prefix: &[u8], start: &[u8]) -> Result<Vec<Record>, StoreError> {
@@ -1204,6 +1251,93 @@ mod group_commit_tests {
     }
 }
 
+/// Rows above which a restore reads and checks on two threads.
+const PIPELINE_ROWS: usize = 16_384;
+
+/// Rows handed from the reading thread to the checking one at a time.
+const PIPELINE_BATCH: usize = 4_096;
+
+/// Stream `prefix` into `restore` on two threads: this one reads and
+/// decodes rows, a scoped worker checks and accepts them, in order.
+///
+/// Reading a row (the store's iteration, the decode, the allocations) and
+/// accepting it (the chain hash, the event index) cost about the same, and
+/// on a large room each is most of a second, so overlapping them is most of
+/// the remaining win. Nothing about the checks changes: every row still
+/// passes through [`LogRestore::push`], one at a time, in ascending order,
+/// on one thread. Bounded: at most a few batches are in flight.
+///
+/// The error reported is the one a single-threaded restore would report.
+/// A row is only decoded after every row before it was, and every decoded
+/// row is handed over before the scan's own error is: so a check failing
+/// on an earlier row wins over a decode failing on a later one.
+fn pipelined(
+    view: &dyn ReadView,
+    prefix: &[u8],
+    restore: LogRestore,
+    profile: &mut RestoreProfile,
+) -> Result<LogRestore, StoreError> {
+    std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::sync_channel::<Vec<RestoredEntry>>(4);
+        let worker = std::thread::Builder::new()
+            .name("spindle-restore".to_owned())
+            .spawn_scoped(scope, move || {
+                let mut restore = restore;
+                for batch in receive {
+                    for entry in batch {
+                        restore.push(entry)?;
+                    }
+                }
+                Ok::<_, RestoreError>(restore)
+            })
+            .map_err(|error| StoreError::Backend(format!("cannot start a restore: {error}")))?;
+        let mut batch = Vec::with_capacity(PIPELINE_BATCH);
+        let scanned = view.visit_prefix(prefix, &mut |_, value| {
+            profile.row_bytes += value.len() as u64;
+            batch.push(EntryRecord::decode_restored(value)?);
+            if batch.len() == PIPELINE_BATCH {
+                let full = std::mem::replace(&mut batch, Vec::with_capacity(PIPELINE_BATCH));
+                // The worker has stopped on an error of its own, which is
+                // reported below; there is no point reading further.
+                send.send(full)
+                    .map_err(|_| StoreError::Backend("restore stopped".to_owned()))?;
+            }
+            Ok(())
+        });
+        if !batch.is_empty() {
+            let _ = send.send(batch);
+        }
+        drop(send);
+        let checked = match worker.join() {
+            Ok(checked) => checked,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        let restore = checked?;
+        scanned?;
+        Ok(restore)
+    })
+}
+
+/// Where one room restore spent its time ([`RoomStore::load_runtime_profiled`]).
+///
+/// Reported by the server for slow cold loads, so a slow one says which
+/// part was slow instead of only that it was.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RestoreProfile {
+    /// Log rows read.
+    pub rows: usize,
+    /// Their encoded size, in bytes.
+    pub row_bytes: u64,
+    /// Reading, decoding and checking every row: order, uniqueness, chain.
+    pub records: std::time::Duration,
+    /// Hydrating and verifying the resident window's and every tip's state.
+    pub roots: std::time::Duration,
+    /// Restoring soft-failed and rejected events with their states.
+    pub sidelined: std::time::Duration,
+    /// Restoring imported historical rejection markers.
+    pub rejections: std::time::Duration,
+}
+
 /// Persist a room's log, and read it back.
 pub struct RoomStore<'a, S: Store> {
     store: &'a S,
@@ -1327,6 +1461,136 @@ impl<'a, S: Store> RoomStore<'a, S> {
         }
     }
 
+    /// Journal a soft-failed or rejected event: its record, the state
+    /// nodes its state adds over `previous` (a parent's state, which is
+    /// already stored), the room's metadata and the caller's records, in
+    /// one batch. Like [`Self::journal_entry_with`], the sync is the
+    /// caller's.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the batch cannot be journalled.
+    pub fn journal_sidelined(
+        &self,
+        entry: &spindle_core::SidelinedEntry,
+        state: &spindle_core::StateSnapshot,
+        previous: Option<&spindle_core::StateSnapshot>,
+        log: &RoomLog,
+        extra: &[Record],
+    ) -> Result<(), StoreError> {
+        let mut writes = vec![
+            (
+                spindle_core::keys::sidelined(&self.room_id, entry.event_id.as_str()),
+                SidelinedRecord::from_entry(entry).encode(),
+            ),
+            (
+                room_prefix(Keyspace::RoomMeta, &self.room_id),
+                Self::meta(log).encode(),
+            ),
+        ];
+        for (address, node) in state.delta_nodes(previous) {
+            writes.push((
+                content_addressed(Keyspace::StateNode, address.as_bytes()),
+                node,
+            ));
+        }
+        writes.extend_from_slice(extra);
+        self.store.commit_deferred(&writes)
+    }
+
+    /// Put the room's sidelined events back into a restored log, each with
+    /// its state rehydrated from the stored trie.
+    fn restore_sidelined(&self, log: &mut RoomLog) -> Result<(), StoreError> {
+        let prefix = room_prefix(Keyspace::Sidelined, &self.room_id);
+        let mut load_node = |address: &StateRoot| {
+            self.store
+                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
+                .ok()
+                .flatten()
+        };
+        for (_, value) in self.store.scan_prefix(&prefix)? {
+            let entry = SidelinedRecord::decode(&value)?.to_entry()?;
+            let state = spindle_core::StateSnapshot::rehydrate(entry.state_root, &mut load_node)
+                .unwrap_or_default();
+            log.restore_sidelined(entry, state);
+        }
+        Ok(())
+    }
+
+    fn restore_sidelined_checked(&self, log: &mut RoomLog) -> Result<(), StoreError> {
+        let prefix = room_prefix(Keyspace::Sidelined, &self.room_id);
+        let mut load_node = |address: &StateRoot| {
+            self.store
+                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
+                .ok()
+                .flatten()
+        };
+        for (_, value) in self.store.scan_prefix(&prefix)? {
+            let entry = SidelinedRecord::decode(&value)?.to_entry()?;
+            let state = spindle_core::StateSnapshot::rehydrate(entry.state_root, &mut load_node)
+                .map_err(|_| RestoreError::UnreadableSidelined(entry.event_id.clone()))?;
+            log.restore_sidelined(entry, state);
+        }
+        Ok(())
+    }
+
+    /// Commit imported historical rejection decisions and their PDU records.
+    ///
+    /// The markers never become timeline entries. In-memory decisions are
+    /// published only after the atomic durable write succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error, or refuses an ID already in the accepted log.
+    pub fn commit_historical_rejections(
+        &self,
+        log: &mut RoomLog,
+        ids: &[EventId],
+        extra: &[Record],
+        durability: Durability,
+    ) -> Result<(), StoreError> {
+        let mut writes = extra.to_vec();
+        for id in ids {
+            if log.get(id).is_some() {
+                return Err(StoreError::Backend(
+                    "historical rejection is already in the accepted log".into(),
+                ));
+            }
+            writes.push((
+                spindle_core::keys::historical_rejection(&self.room_id, id.as_str()),
+                vec![1],
+            ));
+        }
+        self.store.commit(&writes, durability)?;
+        for id in ids {
+            log.preserve_historical_rejection(id.clone());
+        }
+        Ok(())
+    }
+
+    /// Restore imported rejection markers without treating them as timeline entries.
+    fn restore_historical_rejections(&self, log: &mut RoomLog) -> Result<(), StoreError> {
+        let prefix = room_prefix(Keyspace::HistoricalRejection, &self.room_id);
+        for (key, value) in self.store.scan_prefix(&prefix)? {
+            if value != [1] {
+                return Err(CodecError::Malformed(value.first().copied().unwrap_or(0)).into());
+            }
+            let id = key.get(prefix.len()..).ok_or(CodecError::Truncated)?;
+            let id = std::str::from_utf8(id).map_err(|_| CodecError::NotUtf8)?;
+            if id.is_empty() {
+                return Err(CodecError::Truncated.into());
+            }
+            let id = EventId::new(id);
+            if log.get(&id).is_some() {
+                return Err(StoreError::Backend(
+                    "historical rejection overlaps accepted log".into(),
+                ));
+            }
+            log.preserve_historical_rejection(id);
+        }
+        Ok(())
+    }
+
     fn meta(log: &RoomLog) -> RoomRecord {
         RoomRecord {
             next_forward: log.next_forward(),
@@ -1376,6 +1640,12 @@ impl<'a, S: Store> RoomStore<'a, S> {
             &room_prefix(Keyspace::RoomMeta, &self.room_id),
             &Self::meta(log).encode(),
         )?;
+        for id in log.historical_rejections() {
+            self.store.put(
+                &spindle_core::keys::historical_rejection(&self.room_id, id.as_str()),
+                &[1],
+            )?;
+        }
         self.store.flush()
     }
 
@@ -1393,14 +1663,16 @@ impl<'a, S: Store> RoomStore<'a, S> {
         let Some((meta, entries)) = self.read_records()? else {
             return Ok(None);
         };
-        Ok(Some(RoomLog::restore(
+        let mut restored = RoomLog::restore(
             entries,
             meta.next_forward,
             meta.next_backward,
             meta.forward_extremities
                 .into_iter()
                 .map(|id| EventId::new(id.as_str())),
-        )?))
+        )?;
+        self.restore_historical_rejections(&mut restored.log)?;
+        Ok(Some(restored))
     }
 
     fn read_records(&self) -> Result<Option<(RoomRecord, Vec<RestoredEntry>)>, StoreError> {
@@ -1440,6 +1712,112 @@ impl<'a, S: Store> RoomStore<'a, S> {
         Ok(Some((meta, entries)))
     }
 
+    /// Read the room's metadata and stream its log into a [`LogRestore`],
+    /// through one frozen view (see [`Self::read_records`] for why one).
+    ///
+    /// Each row is decoded as the scan reaches it and handed straight to
+    /// the restore, which checks its order, its uniqueness and its chain
+    /// link before the next row is read. Nothing holds the room's rows as
+    /// rows: the only copy of the log this builds is the log.
+    fn stream_records(&self) -> Result<Option<(LogRestore, RestoreProfile)>, StoreError> {
+        let started = std::time::Instant::now();
+        let snapshot = self.store.snapshot();
+        let view: &dyn ReadView = snapshot.as_deref().unwrap_or(self.store);
+        let Some(raw_meta) = view.get(&room_prefix(Keyspace::RoomMeta, &self.room_id))? else {
+            return Ok(None);
+        };
+        let meta = RoomRecord::decode(&raw_meta)?;
+        // The occupied positions are contiguous, so the counters bound the
+        // row count. Only a reservation hint: `LogRestore` caps it.
+        let expected = usize::try_from(
+            meta.next_forward
+                .saturating_sub(meta.next_backward)
+                .saturating_sub(1),
+        )
+        .unwrap_or(0);
+        let mut restore = LogRestore::new(
+            meta.next_forward,
+            meta.next_backward,
+            meta.forward_extremities
+                .into_iter()
+                .map(|id| EventId::new(id.as_str())),
+            expected,
+        );
+        let mut profile = RestoreProfile::default();
+        let prefix = room_prefix(Keyspace::Log, &self.room_id);
+        let restore = if expected >= PIPELINE_ROWS {
+            pipelined(view, &prefix, restore, &mut profile)?
+        } else {
+            view.visit_prefix(&prefix, &mut |_, value| {
+                profile.row_bytes += value.len() as u64;
+                restore.push(EntryRecord::decode_restored(value)?)?;
+                Ok(())
+            })?;
+            restore
+        };
+        profile.rows = restore.len();
+        profile.records = started.elapsed();
+        Ok(Some((restore, profile)))
+    }
+
+    /// Runtime restoration checks all ordered metadata/chain and selected
+    /// roots only. Older roots are checked on demand, not declared verified.
+    ///
+    /// # Errors
+    /// Returns an error for unreadable records, chain, tips or selected roots.
+    pub fn load_runtime(&self) -> Result<Option<RuntimeRestoredLog>, StoreError> {
+        Ok(self.load_runtime_profiled()?.map(|(restored, _)| restored))
+    }
+
+    /// [`Self::load_runtime`], reporting where the time went.
+    ///
+    /// # Errors
+    /// As [`Self::load_runtime`].
+    pub fn load_runtime_profiled(
+        &self,
+    ) -> Result<Option<(RuntimeRestoredLog, RestoreProfile)>, StoreError> {
+        let Some((restore, mut profile)) = self.stream_records()? else {
+            return Ok(None);
+        };
+        let mut load_node = |address: &StateRoot| {
+            self.store
+                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
+                .ok()
+                .flatten()
+        };
+        let started = std::time::Instant::now();
+        let mut restored = restore.finish_runtime(&mut load_node)?;
+        profile.roots = started.elapsed();
+        let started = std::time::Instant::now();
+        self.restore_sidelined_checked(&mut restored.log)?;
+        profile.sidelined = started.elapsed();
+        let started = std::time::Instant::now();
+        self.restore_historical_rejections(&mut restored.log)?;
+        profile.rejections = started.elapsed();
+        Ok(Some((restored, profile)))
+    }
+
+    /// Validate every persisted root and chain, including historical roots
+    /// that runtime restoration deliberately leaves unmaterialized.
+    ///
+    /// # Errors
+    /// Returns an error for unreadable records, chain, tips or any state root.
+    pub fn load_exhaustive(&self) -> Result<Option<RestoredLog>, StoreError> {
+        let Some((restore, _)) = self.stream_records()? else {
+            return Ok(None);
+        };
+        let mut load_node = |address: &StateRoot| {
+            self.store
+                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
+                .ok()
+                .flatten()
+        };
+        let mut restored = restore.finish_exhaustive(&mut load_node)?;
+        self.restore_sidelined_checked(&mut restored.log)?;
+        self.restore_historical_rejections(&mut restored.log)?;
+        Ok(Some(restored))
+    }
+
     /// Rebuild the log from storage.
     ///
     /// Returns `Ok(None)` when the room has no metadata, which is how an unknown
@@ -1461,7 +1839,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 .flatten()
         };
 
-        let restored = RoomLog::restore_with_state(
+        let mut restored = RoomLog::restore_with_state(
             entries,
             meta.next_forward,
             meta.next_backward,
@@ -1470,6 +1848,8 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 .map(|id| EventId::new(id.as_str())),
             &mut load_node,
         )?;
+        self.restore_sidelined(&mut restored.log)?;
+        self.restore_historical_rejections(&mut restored.log)?;
         Ok(Some(restored))
     }
 }

@@ -16,6 +16,8 @@ pub struct Config {
     #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
+    pub media: MediaConfig,
+    #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
     pub ratelimit: RateLimitConfig,
@@ -41,10 +43,154 @@ pub struct Config {
     pub push: PushConfig,
     #[serde(default)]
     pub registration: RegistrationConfig,
+    #[serde(default)]
+    pub rooms: RoomsConfig,
     /// Absent means this server sends no notices and the admin endpoint
     /// says so.
     #[serde(default)]
     pub server_notices: Option<ServerNoticesConfig>,
+    /// Outgoing mail for the built-in provider (#608). Absent, nothing
+    /// is ever mailed: no addresses on accounts, no forgotten-password
+    /// link.
+    #[serde(default)]
+    pub email: Option<EmailConfig>,
+}
+
+/// How to reach the SMTP relay.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum EmailTls {
+    /// Plain connection upgraded with `STARTTLS`, which is required; port
+    /// 587 by default.
+    #[default]
+    Starttls,
+    /// TLS from the first byte ("SMTPS"); port 465 by default.
+    Tls,
+    /// No TLS at all; port 25 by default. Only for a relay on the same
+    /// host or a private network, and refused with credentials.
+    None,
+}
+
+/// `[email]`: the SMTP relay the built-in provider's mail goes through.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmailConfig {
+    /// The `From:` of every message, e.g. `Example <noreply@example.org>`.
+    pub from: String,
+    pub smtp_host: String,
+    /// Defaults by `tls`: 587, 465 or 25.
+    #[serde(default)]
+    pub smtp_port: Option<u16>,
+    #[serde(default)]
+    pub tls: EmailTls,
+    #[serde(default)]
+    pub username: Option<String>,
+    /// The relay password, inline. Prefer `password_file`.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// A file holding the relay password (trailing newline ignored), so the
+    /// secret can be mounted rather than written into the config.
+    #[serde(default)]
+    pub password_file: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for EmailConfig {
+    /// Everything but the password, which is never printed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EmailConfig")
+            .field("from", &self.from)
+            .field("smtp_host", &self.smtp_host)
+            .field("smtp_port", &self.smtp_port)
+            .field("tls", &self.tls)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("password_file", &self.password_file)
+            .finish()
+    }
+}
+
+impl EmailConfig {
+    /// The port to connect to: as configured, or the one `tls` implies.
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        self.smtp_port.unwrap_or(match self.tls {
+            EmailTls::Starttls => 587,
+            EmailTls::Tls => 465,
+            EmailTls::None => 25,
+        })
+    }
+
+    /// The relay password, from wherever it was configured.
+    ///
+    /// # Errors
+    ///
+    /// When `password_file` cannot be read — naming the file, never the
+    /// contents.
+    pub fn resolve_password(&self) -> Result<String, String> {
+        if let Some(path) = &self.password_file {
+            return std::fs::read_to_string(path)
+                .map(|text| text.trim_end_matches(['\r', '\n']).to_owned())
+                .map_err(|error| format!("email.password_file {}: {error}", path.display()));
+        }
+        Ok(self.password.clone().unwrap_or_default())
+    }
+
+    fn validate(&self, builtin_oidc: bool) -> Result<(), ConfigError> {
+        let invalid = |field: &'static str, message: &str| {
+            Err(ConfigError::Invalid {
+                field,
+                message: message.to_owned(),
+            })
+        };
+        if !builtin_oidc {
+            return invalid(
+                "email",
+                "is used by the built-in provider's pages and needs auth.builtin_oidc = true",
+            );
+        }
+        let (Some((name, domain)), false) = (
+            self.from
+                .rsplit_once('<')
+                .map_or(self.from.as_str(), |(_, rest)| rest.trim_end_matches('>'))
+                .split_once('@'),
+            self.from.contains(['\r', '\n']),
+        ) else {
+            return invalid(
+                "email.from",
+                "must be an address, e.g. \"Example <noreply@example.org>\"",
+            );
+        };
+        if name.trim().is_empty() || domain.trim().is_empty() {
+            return invalid(
+                "email.from",
+                "must be an address, e.g. \"Example <noreply@example.org>\"",
+            );
+        }
+        if self.smtp_host.trim().is_empty() || self.smtp_host.contains(['/', ' ', ':']) {
+            return invalid(
+                "email.smtp_host",
+                "must be a host name (the port is smtp_port)",
+            );
+        }
+        if self.smtp_port == Some(0) {
+            return invalid("email.smtp_port", "must not be zero");
+        }
+        if self.password.is_some() && self.password_file.is_some() {
+            return invalid("email.password", "set password or password_file, not both");
+        }
+        let has_password = self.password.is_some() || self.password_file.is_some();
+        if self.username.is_some() != has_password {
+            return invalid("email.username", "username and a password go together");
+        }
+        if self.tls == EmailTls::None && self.username.is_some() {
+            return invalid(
+                "email.tls",
+                "\"none\" would send the relay password in clear; use starttls or tls",
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Who may register.
@@ -147,6 +293,11 @@ pub struct DelayedEventsConfig {
     /// in: a legitimate Matrix RTC client sits at one.
     #[serde(default = "default_max_per_room")]
     pub max_per_room: usize,
+    /// The most delays one user may have pending across every room:
+    /// MSC4140's `max_scheduled`, which the server must enforce and
+    /// advertises in `/capabilities`.
+    #[serde(default = "default_max_per_user")]
+    pub max_per_user: usize,
 }
 
 impl Default for DelayedEventsConfig {
@@ -154,6 +305,7 @@ impl Default for DelayedEventsConfig {
         Self {
             max_delay_ms: default_max_delay_ms(),
             max_per_room: default_max_per_room(),
+            max_per_user: default_max_per_user(),
         }
     }
 }
@@ -164,6 +316,59 @@ const fn default_max_delay_ms() -> u64 {
 
 const fn default_max_per_room() -> usize {
     crate::delayed::DEFAULT_MAX_PER_ROOM
+}
+
+const fn default_max_per_user() -> usize {
+    crate::delayed::DEFAULT_MAX_PER_USER
+}
+
+/// `[rooms]`: keeping rooms' forward extremities merged (#626).
+///
+/// A fork that no event cites again makes every append to its room
+/// re-resolve the room's state. Synapse merges such forks by sending an
+/// `org.matrix.dummy_event` from a local member, and these settings decide
+/// when Spindle does the same (`rooms::extremities`).
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoomsConfig {
+    /// Send dummy events to merge forks at all.
+    #[serde(default = "default_true")]
+    pub dummy_events: bool,
+    /// Merge a room with more forward extremities than this. Synapse's
+    /// `dummy_events_threshold`, and the same default.
+    #[serde(default = "default_max_forward_extremities")]
+    pub max_forward_extremities: usize,
+    /// Merge a room that an append left forked once its oldest forward
+    /// extremity is this many seconds old. A young fork usually merges by
+    /// itself, and an old one in a busy room never will.
+    #[serde(default = "default_stale_forward_extremity_secs")]
+    pub stale_forward_extremity_secs: u64,
+    /// The fewest seconds between two dummy events in one room.
+    #[serde(default = "default_dummy_event_interval_secs")]
+    pub dummy_event_interval_secs: u64,
+}
+
+impl Default for RoomsConfig {
+    fn default() -> Self {
+        Self {
+            dummy_events: true,
+            max_forward_extremities: default_max_forward_extremities(),
+            stale_forward_extremity_secs: default_stale_forward_extremity_secs(),
+            dummy_event_interval_secs: default_dummy_event_interval_secs(),
+        }
+    }
+}
+
+const fn default_max_forward_extremities() -> usize {
+    10
+}
+
+const fn default_stale_forward_extremity_secs() -> u64 {
+    3_600
+}
+
+const fn default_dummy_event_interval_secs() -> u64 {
+    300
 }
 
 /// Caps on what one account may make this server keep (#268).
@@ -399,11 +604,21 @@ pub struct AuthConfig {
     /// The built-in OIDC provider (#159): this server issues its own
     /// authorization codes and sessions over the accounts it already
     /// holds, so Element X's OIDC-native login works from one binary
-    /// with nothing else deployed. The floor, not a MAS replacement —
-    /// upstream identity providers, SSO and account management are what
+    /// with nothing else deployed. It also serves the account management
+    /// pages (#607) and, with `[email]`, address confirmation and password
+    /// reset (#608); upstream identity providers (#610) are still what
     /// `[auth.delegated]` and a real MAS are for.
     #[serde(default)]
     pub builtin_oidc: bool,
+    /// The built-in provider's issuer, when it should differ from the
+    /// client base URL (#609) — e.g. `https://auth.example.org/` to keep
+    /// the issuer a retired MAS used, so clients that stored it keep
+    /// working. An origin only: the provider's routes are served at the
+    /// root of whichever host reaches this process, so a path here would
+    /// advertise endpoints nothing serves. Absent, the issuer is the
+    /// client base URL, as before.
+    #[serde(default)]
+    pub oidc_issuer: Option<String>,
 }
 
 /// The delegated provider, named explicitly rather than discovered at
@@ -621,10 +836,158 @@ pub struct FederationConfig {
     /// PEM private key for `tls_cert`.
     #[serde(default)]
     pub tls_key: Option<std::path::PathBuf>,
+    /// Fill recorded federation gaps in the background (SPEC §6.5): the
+    /// history between this server's old head and an event it accepted
+    /// across a gap is fetched with `/backfill`, verified and stored so
+    /// `/messages` and `/context` serve it. Off leaves the gaps recorded.
+    #[serde(default = "default_true")]
+    pub gap_backfill: bool,
+    /// Events asked for per `/backfill` request, and so the most one chunk
+    /// stores. One `/state_ids` round trip is made per chunk.
+    #[serde(default = "default_gap_backfill_chunk")]
+    pub gap_backfill_chunk: usize,
+    /// Pause between two backfill chunks, milliseconds. What keeps a
+    /// 10k-event gap filling over minutes instead of competing with
+    /// request handling for the store and the peer's patience.
+    #[serde(default = "default_gap_backfill_interval_ms")]
+    pub gap_backfill_interval_ms: u64,
+    /// How often an idle backfill loop looks for gaps, milliseconds. A
+    /// client paging into a gap wakes it at once.
+    #[serde(default = "default_gap_backfill_idle_ms")]
+    pub gap_backfill_idle_ms: u64,
+    /// Base delay before a gap whose last chunk failed is tried again,
+    /// milliseconds. Doubles per consecutive failure, up to an hour.
+    #[serde(default = "default_gap_backfill_retry_ms")]
+    pub gap_backfill_retry_ms: u64,
+    /// Events one gap may backfill before it is left truncated. Bounds
+    /// what a gap whose history never meets ours can make this server
+    /// fetch and store.
+    #[serde(default = "default_gap_backfill_max_events")]
+    pub gap_backfill_max_events: usize,
+    /// Gap acceptances one room may make per window
+    /// (`gap_acceptance_window_secs`). A gap acceptance can fetch up to
+    /// 20k state and auth events, so this caps what one room's PDUs can
+    /// make this server fetch.
+    #[serde(default = "default_gap_acceptances_per_room")]
+    pub gap_acceptances_per_room: usize,
+    /// Gap acceptances one origin may trigger per window, across rooms.
+    #[serde(default = "default_gap_acceptances_per_origin")]
+    pub gap_acceptances_per_origin: usize,
+    /// The window both gap acceptance caps count over, seconds.
+    #[serde(default = "default_gap_acceptance_window_secs")]
+    pub gap_acceptance_window_secs: u64,
+    /// Notary servers asked for a peer's keys when the peer itself cannot
+    /// answer: it is down, gone, or no longer publishes the key an old
+    /// event was signed with. Each entry is a server name, or a table
+    /// `{ server_name = "...", verify_keys = { "ed25519:id" = "base64" } }`
+    /// pinning the keys the notary must sign its answers with.
+    ///
+    /// Unset means `["matrix.org"]`, Synapse's default -- except with
+    /// `insecure_http`, where it means none: a test rig has no business
+    /// asking a public notary, and could only ask it over plain http.
+    /// `[]` turns the fallback off.
+    ///
+    /// **Trust:** a notary is trusted to say what keys another server had.
+    /// Every document it returns must still carry that server's own
+    /// signature made with a key inside the document, so a notary alone
+    /// cannot mint a key for a server -- but a notary colluding with
+    /// whoever holds a server's (old or stolen) key can make events signed
+    /// with it verify here after the server itself stopped publishing it.
+    /// Without `verify_keys`, the notary's own keys are fetched from it
+    /// directly over TLS, as Synapse does when its warning is suppressed.
+    #[serde(default)]
+    pub trusted_key_servers: Option<Vec<TrustedKeyServer>>,
+}
+
+/// One notary in `[federation] trusted_key_servers`: a bare server name,
+/// or a name with the keys its answers must be signed with.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum TrustedKeyServer {
+    Name(String),
+    Pinned {
+        server_name: String,
+        /// Key ID (`ed25519:...`) to unpadded base64 public key. At least
+        /// one of the notary's signatures must be by one of these.
+        #[serde(default)]
+        verify_keys: Option<std::collections::BTreeMap<String, String>>,
+    },
+}
+
+impl TrustedKeyServer {
+    /// The notary's server name.
+    #[must_use]
+    pub fn server_name(&self) -> &str {
+        match self {
+            Self::Name(name)
+            | Self::Pinned {
+                server_name: name, ..
+            } => name,
+        }
+    }
+
+    /// The pinned keys, if any were configured.
+    #[must_use]
+    pub fn verify_keys(&self) -> Option<&std::collections::BTreeMap<String, String>> {
+        match self {
+            Self::Name(_) => None,
+            Self::Pinned { verify_keys, .. } => verify_keys.as_ref(),
+        }
+    }
+}
+
+/// The notary used when `trusted_key_servers` is not set: Synapse's.
+pub const DEFAULT_TRUSTED_KEY_SERVER: &str = "matrix.org";
+
+impl FederationConfig {
+    /// The notaries in effect: the configured list, or the default one
+    /// (none on an `insecure_http` test rig).
+    #[must_use]
+    pub fn trusted_key_servers(&self) -> Vec<TrustedKeyServer> {
+        match &self.trusted_key_servers {
+            Some(servers) => servers.clone(),
+            None if self.insecure_http => Vec::new(),
+            None => vec![TrustedKeyServer::Name(
+                DEFAULT_TRUSTED_KEY_SERVER.to_owned(),
+            )],
+        }
+    }
 }
 
 fn default_retry_base_ms() -> u64 {
     1000
+}
+
+const fn default_gap_backfill_chunk() -> usize {
+    100
+}
+
+const fn default_gap_backfill_interval_ms() -> u64 {
+    1000
+}
+
+const fn default_gap_backfill_idle_ms() -> u64 {
+    30_000
+}
+
+const fn default_gap_backfill_retry_ms() -> u64 {
+    30_000
+}
+
+const fn default_gap_backfill_max_events() -> usize {
+    100_000
+}
+
+const fn default_gap_acceptances_per_room() -> usize {
+    10
+}
+
+const fn default_gap_acceptances_per_origin() -> usize {
+    30
+}
+
+const fn default_gap_acceptance_window_secs() -> u64 {
+    600
 }
 
 impl Default for FederationConfig {
@@ -638,6 +1001,16 @@ impl Default for FederationConfig {
             bind: None,
             tls_cert: None,
             tls_key: None,
+            gap_backfill: true,
+            gap_backfill_chunk: default_gap_backfill_chunk(),
+            gap_backfill_interval_ms: default_gap_backfill_interval_ms(),
+            gap_backfill_idle_ms: default_gap_backfill_idle_ms(),
+            gap_backfill_retry_ms: default_gap_backfill_retry_ms(),
+            gap_backfill_max_events: default_gap_backfill_max_events(),
+            gap_acceptances_per_room: default_gap_acceptances_per_room(),
+            gap_acceptances_per_origin: default_gap_acceptances_per_origin(),
+            gap_acceptance_window_secs: default_gap_acceptance_window_secs(),
+            trusted_key_servers: None,
         }
     }
 }
@@ -705,6 +1078,40 @@ pub struct StorageConfig {
     /// media request before a byte moves.
     #[serde(default)]
     pub s3: Option<S3Config>,
+    /// How many rooms the server loads at once in the background after it
+    /// starts, so the first requests after a restart do not each pay for a
+    /// cold load (#614). `0` turns the warm-up off. Kept low on purpose:
+    /// the warm-up competes for the same cores as the traffic it is
+    /// warming for, and two is enough to keep one giant room from holding
+    /// up every other.
+    #[serde(default = "default_warm_concurrency")]
+    pub warm_concurrency: usize,
+}
+
+fn default_warm_concurrency() -> usize {
+    2
+}
+
+/// Media upload limits, advertised to clients and enforced on both upload paths.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaConfig {
+    /// Largest accepted upload, in bytes. Set this to the source server's cap
+    /// when migrating so existing clients retain their upload allowance.
+    #[serde(default = "default_max_upload_bytes")]
+    pub max_upload_bytes: usize,
+}
+
+fn default_max_upload_bytes() -> usize {
+    crate::media::MAX_UPLOAD
+}
+
+impl Default for MediaConfig {
+    fn default() -> Self {
+        Self {
+            max_upload_bytes: default_max_upload_bytes(),
+        }
+    }
 }
 
 impl Default for StorageConfig {
@@ -712,6 +1119,7 @@ impl Default for StorageConfig {
         Self {
             path: default_data_dir(),
             s3: None,
+            warm_concurrency: default_warm_concurrency(),
         }
     }
 }
@@ -786,6 +1194,7 @@ impl Config {
             message: error.to_string(),
         })?;
         config.validate()?;
+        config.validate_media()?;
         if let Some(delegated) = &config.auth.delegated {
             delegated.validate()?;
         }
@@ -807,6 +1216,33 @@ impl Config {
         Self::parse(&text)
     }
 
+    /// The MSC4140 caps: each must be positive, for the reason given where
+    /// they are checked.
+    fn validate_delayed_events(&self) -> Result<(), ConfigError> {
+        if self.delayed_events.max_delay_ms == 0 {
+            return Err(ConfigError::Invalid {
+                field: "delayed_events.max_delay_ms",
+                message: "must be greater than zero; a zero cap refuses every delayed event"
+                    .to_owned(),
+            });
+        }
+        if self.delayed_events.max_per_room == 0 {
+            return Err(ConfigError::Invalid {
+                field: "delayed_events.max_per_room",
+                message: "must be greater than zero; a zero cap refuses every delayed event"
+                    .to_owned(),
+            });
+        }
+        if self.delayed_events.max_per_user == 0 {
+            return Err(ConfigError::Invalid {
+                field: "delayed_events.max_per_user",
+                message: "must be greater than zero; a zero cap refuses every delayed event"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// `[federation]`: no listener on a server told not to federate, each
     /// peer URL is a scheme, host and port, and a patience cap is never
     /// shorter than the base it caps.
@@ -818,6 +1254,40 @@ impl Config {
                 field: "federation.bind",
                 message: "must be unset while federation.enabled = false".to_owned(),
             });
+        }
+        for notary in self.federation.trusted_key_servers() {
+            let name = notary.server_name();
+            if ruma::OwnedServerName::try_from(name).is_err() || name == self.server.name {
+                return Err(ConfigError::Invalid {
+                    field: "federation.trusted_key_servers",
+                    message: format!("{name:?} is not another server's name"),
+                });
+            }
+            for (key_id, key) in notary.verify_keys().into_iter().flatten() {
+                let version_ok = key_id.strip_prefix("ed25519:").is_some_and(|version| {
+                    !version.is_empty()
+                        && version
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                });
+                let key_ok = ruma::serde::Base64::<ruma::serde::base64::Standard>::parse(key)
+                    .is_ok_and(|key| key.as_bytes().len() == 32);
+                if !version_ok || !key_ok {
+                    return Err(ConfigError::Invalid {
+                        field: "federation.trusted_key_servers.verify_keys",
+                        message: format!("{name}: {key_id} is not an ed25519 key ID and key"),
+                    });
+                }
+            }
+            if notary
+                .verify_keys()
+                .is_some_and(std::collections::BTreeMap::is_empty)
+            {
+                return Err(ConfigError::Invalid {
+                    field: "federation.trusted_key_servers.verify_keys",
+                    message: format!("{name}: an empty pin would trust no key; omit it instead"),
+                });
+            }
         }
         for (name, peer) in &self.federation.peers {
             let url = reqwest::Url::parse(&peer.url).map_err(|error| ConfigError::Invalid {
@@ -852,25 +1322,36 @@ impl Config {
         Ok(())
     }
 
+    fn validate_rooms(&self) -> Result<(), ConfigError> {
+        // One extremity is a room with no fork; a threshold below two would
+        // send a dummy event into a room after every fork, however young.
+        if self.rooms.max_forward_extremities < 2 {
+            return Err(ConfigError::Invalid {
+                field: "rooms.max_forward_extremities",
+                message: "must be at least 2".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_media(&self) -> Result<(), ConfigError> {
+        if self.media.max_upload_bytes == 0 || self.media.max_upload_bytes == usize::MAX {
+            return Err(ConfigError::Invalid {
+                field: "media.max_upload_bytes",
+                message: "must be greater than zero and leave room for the HTTP rejection sentinel"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         // Both caps are the reason #36 asks for them: a zero here does not
         // mean "unlimited", it means every schedule is refused and the
         // dead-man's switch silently stops working. An operator who typed
         // it meant something else, so say so rather than starting.
-        if self.delayed_events.max_delay_ms == 0 {
-            return Err(ConfigError::Invalid {
-                field: "delayed_events.max_delay_ms",
-                message: "must be greater than zero; a zero cap refuses every delayed event"
-                    .to_owned(),
-            });
-        }
-        if self.delayed_events.max_per_room == 0 {
-            return Err(ConfigError::Invalid {
-                field: "delayed_events.max_per_room",
-                message: "must be greater than zero; a zero cap refuses every delayed event"
-                    .to_owned(),
-            });
-        }
+        self.validate_delayed_events()?;
+        self.validate_rooms()?;
         self.validate_peers()?;
         // A ring budget of zero is not "unlimited" either: it refuses every
         // ring, and a call nobody can be summoned to is a feature silently
@@ -932,14 +1413,9 @@ impl Config {
                 message: format!("{:?} is not an address:port", self.server.bind),
             });
         }
-        // One identity authority is the point of both modes; a server
-        // with two would mint accounts nobody can say who owns.
-        if self.auth.builtin_oidc && self.auth.delegated.is_some() {
-            return Err(ConfigError::Invalid {
-                field: "auth.builtin_oidc",
-                message: "cannot be combined with auth.delegated — pick one identity authority"
-                    .to_owned(),
-            });
+        self.validate_builtin_oidc()?;
+        if let Some(email) = &self.email {
+            email.validate(self.auth.builtin_oidc)?;
         }
         // Two credential schemes would mean the server picks one silently,
         // and an operator who configured both has already told us they are
@@ -1048,6 +1524,70 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// The built-in provider's settings: never beside delegation, and
+    /// `auth.oidc_issuer` meaningful only with the provider and an http(s)
+    /// origin with nothing after the host.
+    fn validate_builtin_oidc(&self) -> Result<(), ConfigError> {
+        // One identity authority is the point of both modes; a server
+        // with two would mint accounts nobody can say who owns.
+        if self.auth.builtin_oidc && self.auth.delegated.is_some() {
+            return Err(ConfigError::Invalid {
+                field: "auth.builtin_oidc",
+                message: "cannot be combined with auth.delegated — pick one identity authority"
+                    .to_owned(),
+            });
+        }
+        let Some(issuer) = self.auth.oidc_issuer.as_deref() else {
+            return Ok(());
+        };
+        if !self.auth.builtin_oidc {
+            return Err(ConfigError::Invalid {
+                field: "auth.oidc_issuer",
+                message: "names the built-in provider's issuer and needs \
+                          auth.builtin_oidc = true (a delegated provider's issuer is \
+                          auth.delegated.issuer)"
+                    .to_owned(),
+            });
+        }
+        let rest = issuer
+            .strip_prefix("https://")
+            .or_else(|| issuer.strip_prefix("http://"));
+        let Some(rest) = rest else {
+            return Err(ConfigError::Invalid {
+                field: "auth.oidc_issuer",
+                message: format!("{issuer:?} is not an http(s) URL"),
+            });
+        };
+        let host = rest.strip_suffix('/').unwrap_or(rest);
+        if host.is_empty()
+            || host.contains(['/', '?', '#', '@', ' ', '\\'])
+            || host.chars().any(char::is_control)
+        {
+            return Err(ConfigError::Invalid {
+                field: "auth.oidc_issuer",
+                message: format!(
+                    "{issuer:?} must be an origin such as \"https://auth.example.org/\" — \
+                     the provider's endpoints live at the root of the host, so a path, \
+                     query or credentials here would advertise URLs nothing serves"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// The built-in provider's issuer without its trailing slash: the
+    /// base every advertised endpoint URL is built on. `auth.oidc_issuer`
+    /// when set, the client base URL otherwise.
+    #[must_use]
+    pub fn oidc_issuer_base(&self) -> String {
+        self.auth
+            .oidc_issuer
+            .clone()
+            .unwrap_or_else(|| self.client_base_url())
+            .trim_end_matches('/')
+            .to_owned()
     }
 
     /// What clients should be told to connect to.

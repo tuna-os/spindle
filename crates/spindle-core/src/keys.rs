@@ -401,12 +401,91 @@ pub enum Keyspace {
     /// latest account-data write. Kept beside [`Self::AccountData`] rather
     /// than inside its value so existing stored JSON remains its own format.
     AccountDataStream = 0x3c,
+    /// `(room_id, event_id)` -> a soft-failed or rejected event held for
+    /// the room's DAG but kept out of its timeline (`spindle_core::Sideline`):
+    /// its parents, depth, verdict and the root of the state after it.
+    Sidelined = 0x3d,
+    /// Preserved rejection decisions from imported Synapse history. 0x40
+    /// is reserved for the account-erasure policy marker.
+    HistoricalRejection = 0x41,
+    /// Imported auth PDUs retained outside the accepted client timeline.
+    ImportedAuthOnly = 0x42,
+    /// Fresh offline-import notification boundary, separate from the live cursor.
+    ImportNotificationFence = 0x43,
+    /// `(room_id, event_id)` -> a federation gap: a forward event accepted
+    /// on a peer's `/state_ids` because its predecessors could not be
+    /// recovered, with the predecessors it named that this server lacks.
+    /// What a later backfill reads to know where history is missing.
+    FederationGap = 0x44,
+    /// `(room_id, position)` -> one event of a filled federation gap: its
+    /// ID and the root of the state after it. History backfilled into the
+    /// *middle* of a room's timeline -- between the head this server held
+    /// and an event accepted across a gap -- has no linear index of its
+    /// own (SPEC §6.5), so it lives in a band of positions below every
+    /// linear index, keyed so that one gap's events sort together and in
+    /// order; `/messages` stitches them in just below the gap event.
+    FederationGapEvent = 0x45,
+    /// `(room_id, event_id)` -> the position of a backfilled gap event,
+    /// the inverse of [`Self::FederationGapEvent`]: what `/context` and a
+    /// redaction look an event up by.
+    FederationGapPosition = 0x46,
+    /// `(room_id, anchor li)` -> the range of positions a gap's backfilled
+    /// events occupy below the event accepted across it. Outlives the
+    /// [`Self::FederationGap`] marker, which is deleted once the gap is
+    /// filled; this is what pagination reads to know a segment is there.
+    FederationGapSpan = 0x47,
+    /// `(room_id, target event_id)` -> the redaction naming an event this
+    /// server did not hold when the redaction arrived, in a room with a gap
+    /// still open: applied when backfill brings the target in, so history
+    /// filled late is never served unredacted.
+    PendingRedaction = 0x48,
     /// `(room_id, synapse_stream_ordering)` -> the linear index the
     /// importer gave that event (#568). Lets a Synapse pagination token
     /// a client kept across the migration name a place in this room.
     SynapsePosition = 0x3e,
     /// Imported Synapse room order, keyed by depth and stream.
     SynapseTopologicalPosition = 0x3f,
+    /// Global marker: accounts may carry an erasure policy.
+    ErasurePolicy = 0x40,
+    /// The built-in provider's browser sessions (#607): the BLAKE3 digest
+    /// of the session cookie -> who it signs in, its CSRF secret and when
+    /// it lapses. The digest, never the cookie, so a copy of the store
+    /// signs nobody in. Numbered from 0x50 to leave 0x44.. to the
+    /// importer's and federation's keyspaces.
+    BrowserSession = 0x50,
+    /// An emailed link (#608): the BLAKE3 digest of its token -> what it
+    /// does (verify an address, reset a password), for whom, and when it
+    /// lapses. Deleted when used.
+    EmailToken = 0x51,
+    /// `(localpart, address)` -> a confirmed email address on an account.
+    UserEmail = 0x52,
+    /// `address` -> the localpart it is confirmed on: the reverse of
+    /// [`Keyspace::UserEmail`], so an address belongs to one account.
+    EmailOwner = 0x53,
+    /// `localpart` -> the account's one-time recovery codes, each as a
+    /// salt and the BLAKE3 digest of salt and code; never the codes.
+    RecoveryCodes = 0x54,
+    /// `task_id` -> one administrative background task (a room deletion
+    /// started through Synapse's v2 `DELETE /rooms/{roomId}`) and how it
+    /// ended, as `GET /scheduled_tasks` reports it. Numbered from 0x58 to
+    /// leave 0x55.. to the built-in provider's keyspaces.
+    AdminTask = 0x58,
+    /// `delay_id` -> the user and stream position of its
+    /// [`Self::FinalisedDelay`] row.
+    ///
+    /// MSC4140 as merged keeps a finished delay answerable by id: a `GET`
+    /// reports how it ended, and an action repeated after the fact succeeds
+    /// when it agrees with that ending and is refused with 409 when it does
+    /// not. The id is all the token-less management route has, so without
+    /// this a finished delay is a scan of every user's history away.
+    /// Written and pruned with the row it points at.
+    FinalisedDelayById = 0x55,
+    /// `(user_id, event_id)` -> the `delay_id` that event was sent from.
+    ///
+    /// MSC4140 puts the delay id in the `unsigned` of the event a delay
+    /// became, for its sender only -- the same shape as
+    /// [`Self::TransactionEcho`], and read at the same point.
+    DelayEcho = 0x56,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -430,6 +509,12 @@ pub fn profile(user_id: &str) -> Vec<u8> {
 #[must_use]
 pub fn push_cursor() -> Vec<u8> {
     vec![KEY_SCHEMA_VERSION, Keyspace::PushCursor as u8]
+}
+
+/// The durable proof that a fresh offline import owns its notification boundary.
+#[must_use]
+pub fn import_notification_fence() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::ImportNotificationFence as u8]
 }
 
 /// One `OpenID` token's row: its expiry, then the digest of the token.
@@ -495,6 +580,20 @@ pub fn event_report(seq: u64) -> Vec<u8> {
 #[must_use]
 pub fn event_reports_prefix() -> Vec<u8> {
     vec![KEY_SCHEMA_VERSION, Keyspace::EventReport as u8]
+}
+
+/// One administrative background task.
+#[must_use]
+pub fn admin_task(task_id: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::AdminTask as u8];
+    key.extend_from_slice(task_id.as_bytes());
+    key
+}
+
+/// Every administrative background task.
+#[must_use]
+pub fn admin_tasks_prefix() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::AdminTask as u8]
 }
 
 /// One dynamically registered OAuth 2.0 client.
@@ -592,6 +691,72 @@ pub fn room_prefix(keyspace: Keyspace, room_id: &str) -> Vec<u8> {
     key.push(keyspace as u8);
     key.extend_from_slice(&len.to_be_bytes());
     key.extend_from_slice(room);
+    key
+}
+
+/// One sidelined event's row ([`Keyspace::Sidelined`]).
+#[must_use]
+pub fn sidelined(room_id: &str, event_id: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::Sidelined, room_id);
+    key.extend_from_slice(event_id.as_bytes());
+    key
+}
+
+/// A preserved historical rejection, scoped to its room.
+#[must_use]
+pub fn historical_rejection(room_id: &str, event_id: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::HistoricalRejection, room_id);
+    key.extend_from_slice(event_id.as_bytes());
+    key
+}
+
+/// One federation gap marker ([`Keyspace::FederationGap`]).
+#[must_use]
+pub fn federation_gap(room_id: &str, event_id: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::FederationGap, room_id);
+    key.extend_from_slice(event_id.as_bytes());
+    key
+}
+
+/// One backfilled gap event's row ([`Keyspace::FederationGapEvent`]),
+/// ordered by position within the room.
+#[must_use]
+pub fn federation_gap_event(room_id: &str, position: i64) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::FederationGapEvent, room_id);
+    key.extend_from_slice(&order_preserving(position));
+    key
+}
+
+/// A backfilled gap event's position ([`Keyspace::FederationGapPosition`]).
+#[must_use]
+pub fn federation_gap_position(room_id: &str, event_id: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::FederationGapPosition, room_id);
+    key.extend_from_slice(event_id.as_bytes());
+    key
+}
+
+/// The span of one filled gap ([`Keyspace::FederationGapSpan`]), keyed by
+/// the linear index of the event accepted across it.
+#[must_use]
+pub fn federation_gap_span(room_id: &str, anchor: i64) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::FederationGapSpan, room_id);
+    key.extend_from_slice(&order_preserving(anchor));
+    key
+}
+
+/// A redaction waiting for its target ([`Keyspace::PendingRedaction`]).
+#[must_use]
+pub fn pending_redaction(room_id: &str, target: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::PendingRedaction, room_id);
+    key.extend_from_slice(target.as_bytes());
+    key
+}
+
+/// An imported auth PDU held outside the accepted timeline.
+#[must_use]
+pub fn imported_auth_only(room_id: &str, event_id: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::ImportedAuthOnly, room_id);
+    key.extend_from_slice(event_id.as_bytes());
     key
 }
 
@@ -892,6 +1057,64 @@ pub fn media_reservation(media_id: &str) -> Vec<u8> {
     let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::MediaReservation as u8];
     key.extend_from_slice(media_id.as_bytes());
     key
+}
+
+/// One browser session's row, by the digest of its cookie
+/// ([`Keyspace::BrowserSession`]).
+#[must_use]
+pub fn browser_session(digest: &[u8; 32]) -> Vec<u8> {
+    let mut key = browser_session_prefix();
+    key.extend_from_slice(digest);
+    key
+}
+
+/// The prefix every browser-session row shares.
+#[must_use]
+pub fn browser_session_prefix() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::BrowserSession as u8]
+}
+
+/// One emailed link's row, by the digest of its token
+/// ([`Keyspace::EmailToken`]).
+#[must_use]
+pub fn email_token(digest: &[u8; 32]) -> Vec<u8> {
+    let mut key = email_token_prefix();
+    key.extend_from_slice(digest);
+    key
+}
+
+/// The prefix every emailed-link row shares.
+#[must_use]
+pub fn email_token_prefix() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::EmailToken as u8]
+}
+
+/// One confirmed address of one account ([`Keyspace::UserEmail`]).
+#[must_use]
+pub fn user_email(localpart: &str, address: &str) -> Vec<u8> {
+    let mut key = user_email_prefix(localpart);
+    key.extend_from_slice(address.as_bytes());
+    key
+}
+
+/// Every confirmed address of one account.
+#[must_use]
+pub fn user_email_prefix(localpart: &str) -> Vec<u8> {
+    room_prefix(Keyspace::UserEmail, localpart)
+}
+
+/// Who an address is confirmed on ([`Keyspace::EmailOwner`]).
+#[must_use]
+pub fn email_owner(address: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::EmailOwner as u8];
+    key.extend_from_slice(address.as_bytes());
+    key
+}
+
+/// One account's recovery-code row ([`Keyspace::RecoveryCodes`]).
+#[must_use]
+pub fn recovery_codes(localpart: &str) -> Vec<u8> {
+    room_prefix(Keyspace::RecoveryCodes, localpart)
 }
 
 /// The row for one single-use login token.
@@ -1279,6 +1502,44 @@ pub fn finalised_delay_position(user_id: &str, key: &[u8]) -> Option<u64> {
     let rest = key.strip_prefix(prefix.as_slice())?;
     let bytes: [u8; 8] = rest.get(..8)?.try_into().ok()?;
     Some(u64::from_be_bytes(bytes))
+}
+
+/// The by-id row for one finalised delay ([`Keyspace::FinalisedDelayById`]).
+#[must_use]
+pub fn finalised_delay_by_id(delay_id: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::FinalisedDelayById as u8];
+    key.extend_from_slice(delay_id.as_bytes());
+    key
+}
+
+/// The value of a [`finalised_delay_by_id`] row: the user, length-prefixed,
+/// then the position of their [`finalised_delay`] row.
+#[must_use]
+pub fn finalised_delay_by_id_value(user_id: &str, position: u64) -> Vec<u8> {
+    let (len, user) = framed(user_id.as_bytes());
+    let mut value = Vec::with_capacity(2 + user.len() + 8);
+    value.extend_from_slice(&len.to_be_bytes());
+    value.extend_from_slice(user);
+    value.extend_from_slice(&position.to_be_bytes());
+    value
+}
+
+/// Read a [`finalised_delay_by_id_value`] back: `(user_id, position)`.
+#[must_use]
+pub fn finalised_delay_by_id_parts(value: &[u8]) -> Option<(String, u64)> {
+    let len = usize::from(u16::from_be_bytes(value.get(..2)?.try_into().ok()?));
+    let user = String::from_utf8(value.get(2..2 + len)?.to_vec()).ok()?;
+    let position: [u8; 8] = value.get(2 + len..2 + len + 8)?.try_into().ok()?;
+    Some((user, u64::from_be_bytes(position)))
+}
+
+/// The echo row naming the delay one event was sent from
+/// ([`Keyspace::DelayEcho`]).
+#[must_use]
+pub fn delay_echo(user_id: &str, event_id: &str) -> Vec<u8> {
+    let mut key = user_prefix(Keyspace::DelayEcho, user_id);
+    key.extend_from_slice(event_id.as_bytes());
+    key
 }
 
 /// One user's presence row.

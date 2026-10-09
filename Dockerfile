@@ -11,9 +11,13 @@
 # an operator's image should not carry.
 
 FROM rust:1.98-bookworm AS build
+# Extra cargo features, empty for the release image. The Synapse migration
+# rehearsal image passes FEATURES=synapse-import.
+ARG FEATURES=""
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p spindle-server --bin spindle --locked
+RUN cargo build --release -p spindle-server --bin spindle --locked \
+    ${FEATURES:+--features "$FEATURES"}
 
 FROM debian:bookworm-slim
 RUN apt-get update \

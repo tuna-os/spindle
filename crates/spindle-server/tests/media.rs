@@ -22,10 +22,14 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
+        Self::with_config("")
+    }
+
+    fn with_config(extra: &str) -> Self {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
         let config = spindle_server::Config::parse(&format!(
-            "[server]\nname = \"example.org\"\n[storage]\npath = \"{}\"\n[ratelimit]\nenabled = false\n",
+            "[server]\nname = \"example.org\"\n[storage]\npath = \"{}\"\n[ratelimit]\nenabled = false\n{extra}",
             dir.path().display()
         ))
         .unwrap();
@@ -136,6 +140,96 @@ fn header(headers: &axum::http::HeaderMap, name: &str) -> String {
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_owned()
+}
+
+#[tokio::test]
+async fn configured_limit_applies_to_both_upload_paths_and_config_endpoints() {
+    let harness = Harness::with_config("[media]\nmax_upload_bytes=3\n");
+    let token = harness.register("limit-user").await;
+    for endpoint in [
+        "/_matrix/media/v3/config",
+        "/_matrix/client/v1/media/config",
+    ] {
+        let (status, body) = harness
+            .call(
+                Request::builder()
+                    .uri(endpoint)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["m.upload.size"], 3);
+    }
+    let (status, _) = harness
+        .upload(&token, "application/octet-stream", None, b"123")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = harness
+        .upload(&token, "application/octet-stream", None, b"1234")
+        .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body["errcode"], "M_TOO_LARGE");
+    let (status, created) = harness
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/_matrix/media/v1/create")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let media_id = created["content_uri"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("mxc://example.org/")
+        .unwrap();
+    for (bytes, expected) in [
+        (b"1234".as_slice(), StatusCode::PAYLOAD_TOO_LARGE),
+        (b"123".as_slice(), StatusCode::OK),
+    ] {
+        let (status, body) = harness
+            .call(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/_matrix/media/v3/upload/example.org/{media_id}"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from(bytes.to_vec()))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, expected, "{body}");
+        if expected == StatusCode::PAYLOAD_TOO_LARGE {
+            assert_eq!(body["errcode"], "M_TOO_LARGE");
+        }
+    }
+    // Extractor rejection remains bounded for bodies beyond the handler sentinel.
+    let (status, _) = harness
+        .upload(&token, "application/octet-stream", None, b"12345")
+        .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn a_migrated_100_mib_limit_accepts_uploads_above_the_default() {
+    let harness = Harness::with_config("[media]\nmax_upload_bytes=104857600\n");
+    let token = harness.register("large-limit-user").await;
+    let payload = vec![7; 100 * 1024 * 1024];
+    let (status, body) = harness
+        .upload(&token, "application/octet-stream", None, &payload)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut over_limit = payload;
+    over_limit.push(8);
+    let (status, body) = harness
+        .upload(&token, "application/octet-stream", None, &over_limit)
+        .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["errcode"], "M_TOO_LARGE");
 }
 
 #[tokio::test]

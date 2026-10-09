@@ -33,7 +33,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: 1.90.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -59,7 +59,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: 1.90.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -296,6 +296,77 @@ jobs:
           path: tmp/complement-results.jsonl
           if-no-files-found: ignore
 
+  # Contested forks against a real Synapse (#563, ADR 0005): Complement's
+  # fake server forks a room six ways -- power levels, a ban against the
+  # banned member's write, a join against a join-rule change -- sends the
+  # branches to Spindle (hs1) and Synapse (hs2) in opposite orders, and the
+  # two must end on the same state. Run homogeneously first, Spindle on both
+  # ends, so a failure says which pairing broke. Per pull request, unlike the
+  # full interop run: it is five rooms, not the suite, and agreeing with
+  # Synapse on a fork is a property every change to ingest has to keep.
+  state-resolution-interop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 'stable'
+          cache: false
+
+      - name: Cache the Complement checkout and Go build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            tmp/complement-src
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: complement-${{ runner.os }}-${{ hashFiles('scripts/complement.sh') }}
+          restore-keys: complement-${{ runner.os }}-
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build the Complement image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: complement/Dockerfile
+          tags: complement-spindle:latest
+          load: true
+          cache-from: type=gha,scope=complement-image
+
+      - name: Spindle beside Spindle
+        env:
+          GOPROXY: https://proxy.golang.org|direct
+          COMPLEMENT_IMAGE: complement-spindle:latest
+          COMPLEMENT_PACKAGES: ./tests/spindle
+          COMPLEMENT_RUN: TestContestedForkResolvesLikeThePeer
+        run: scripts/complement.sh tmp/state-res-homogeneous.jsonl
+
+      - name: Spindle beside Synapse
+        env:
+          GOPROXY: https://proxy.golang.org|direct
+          COMPLEMENT_IMAGE: complement-spindle:latest
+          COMPLEMENT_INTEROP_IMAGE: ghcr.io/element-hq/synapse/complement-synapse:latest
+          COMPLEMENT_INTEROP_HS: hs2
+          COMPLEMENT_PACKAGES: ./tests/spindle
+          COMPLEMENT_RUN: TestContestedForkResolvesLikeThePeer
+        run: scripts/complement.sh tmp/state-res-interop.jsonl
+
+      - name: Require every room version to agree
+        run: |
+          python3 scripts/complement-require.py TestContestedForkResolvesLikeThePeer \
+            tmp/state-res-homogeneous.jsonl tmp/state-res-interop.jsonl
+
+      - name: Keep the ledgers
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: state-resolution-interop
+          path: tmp/state-res-*.jsonl
+          if-no-files-found: ignore
+
   # Heterogeneous federation against a real Synapse (docs/conformance-testing.md
   # §5.1, #16): the suite above, unchanged, with Element's Complement image
   # of Synapse on the other end of the wire. Report-only, as tuwunel runs
@@ -474,7 +545,7 @@ jobs:
   element-call-e2e:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -525,7 +596,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: 1.90.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -563,7 +634,7 @@ jobs:
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: 1.90.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -635,7 +706,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: 1.90.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -663,7 +734,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: 1.90.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -689,7 +760,7 @@ jobs:
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: 1.90.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -708,7 +779,7 @@ jobs:
         run: cargo build --release -p spindle-server --bin spindle
       # The SDK's floor is above this repository's pin; a second toolchain
       # for its build alone, named to the rig rather than changing the pin.
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: 1.93.0
       - name: Run the suite against Spindle
@@ -731,7 +802,7 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: 1.90.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
