@@ -4345,6 +4345,28 @@ impl Rooms {
         Ok(out)
     }
 
+    /// Every `(li, stream id)` pair this room has in the reverse stream
+    /// index, in stream order: where each of its events sits in the
+    /// server-wide order. `/notifications` orders across rooms by it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the index cannot be read.
+    pub fn stream_rows(&self, room_id: &str) -> Result<Vec<(i64, u64)>, RoomError> {
+        let rows = spindle_store::ReadView::scan_prefix(
+            self.store.as_ref(),
+            &spindle_core::keys::room_stream_prefix(room_id),
+        )?;
+        Ok(rows
+            .iter()
+            .filter_map(|(key, raw)| {
+                let stream_id = spindle_core::keys::room_stream_from_key(key)?;
+                let li = i64::from_be_bytes(<[u8; 8]>::try_from(raw.as_slice()).ok()?);
+                Some((li, stream_id))
+            })
+            .collect())
+    }
+
     /// Where the room stood when the server handed out sync token
     /// `position`: the room's own index of its newest event at or before
     /// that stream position, or `None` if nothing of the room's had entered
