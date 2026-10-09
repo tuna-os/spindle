@@ -121,6 +121,9 @@ pub fn router(state: AppState) -> Router {
         .merge(federation_read_routes())
         .merge(crate::mas::routes())
         .merge(crate::admin::routes())
+        .merge(crate::admin_tasks::routes())
+        .merge(crate::admin_federation::routes())
+        .merge(crate::admin_media::routes())
         .merge(crate::oidc::routes())
         .merge(crate::account::routes())
         .merge(crate::email::routes())
@@ -929,7 +932,7 @@ async fn media_config(State(state): State<AppState>) -> Json<Value> {
 /// `GET /_matrix/client/v1/media/download/{server_name}/{media_id}`
 async fn download_media(
     State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
+    AccountAuthenticated(identity): AccountAuthenticated,
     axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
 ) -> Result<axum::response::Response, MatrixError> {
     serve_media(&state, &identity, &server_name, &media_id).await
@@ -943,7 +946,7 @@ async fn download_media(
 /// `.exe` in someone's downloads folder.
 async fn download_media_named(
     State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
+    AccountAuthenticated(identity): AccountAuthenticated,
     axum::extract::Path((server_name, media_id, _file_name)): axum::extract::Path<(
         String,
         String,
@@ -1170,10 +1173,12 @@ struct ThumbnailQuery {
 /// `GET /_matrix/client/v1/media/thumbnail/{server_name}/{media_id}`
 ///
 /// Authenticated, and open to any account holding the URI, for the reason
-/// [`serve_media`] gives (ADR 0003).
+/// [`serve_media`] gives (ADR 0003). An account-level session is enough —
+/// Element Admin's device-less admin token renders avatars through this —
+/// since reading media acts on no device.
 async fn thumbnail_media(
     State(state): State<AppState>,
-    Authenticated(_identity): Authenticated,
+    AccountAuthenticated(_identity): AccountAuthenticated,
     axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
     axum::extract::Query(query): axum::extract::Query<ThumbnailQuery>,
 ) -> Result<axum::response::Response, MatrixError> {

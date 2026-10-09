@@ -26,35 +26,45 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**256 routes implemented; 0 known gaps in scope.**
+**280 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
 
-### Admin & moderation — 60 implemented, 0 planned
+### Admin & moderation — 84 implemented, 0 planned
 
 - `GET /_spindle/admin/v1/audit`
 - `GET /_spindle/admin/v1/event_reports`
-- `GET /_spindle/admin/v1/event_reports/{report_id}`
+- `GET/DELETE /_spindle/admin/v1/event_reports/{report_id}`
+- `GET /_spindle/admin/v1/federation/destinations`
+- `GET /_spindle/admin/v1/federation/destinations/{destination}`
+- `POST /_spindle/admin/v1/federation/destinations/{destination}/reset_connection`
+- `GET /_spindle/admin/v1/federation/destinations/{destination}/rooms`
+- `GET/DELETE /_spindle/admin/v1/media/{server_name}/{media_id}`
 - `GET /_spindle/admin/v1/registration_tokens`
 - `POST /_spindle/admin/v1/registration_tokens/new`
 - `GET/PUT/DELETE /_spindle/admin/v1/registration_tokens/{token}`
 - `GET /_spindle/admin/v1/rooms`
 - `GET/DELETE /_spindle/admin/v1/rooms/{room_id}`
+- `GET/PUT /_spindle/admin/v1/rooms/{room_id}/block`
 - `POST /_spindle/admin/v1/rooms/{room_id}/make_room_admin`
 - `GET /_spindle/admin/v1/rooms/{room_id}/members`
 - `POST /_spindle/admin/v1/rooms/{room_id}/purge_history`
 - `GET /_spindle/admin/v1/rooms/{room_id}/state`
 - `GET /_spindle/admin/v1/rooms/{room_id}/state_at`
 - `GET /_spindle/admin/v1/rooms/{room_id}/timeline`
+- `GET /_spindle/admin/v1/scheduled_tasks`
 - `POST /_spindle/admin/v1/send_server_notice`
 - `GET /_spindle/admin/v1/server_version`
+- `GET /_spindle/admin/v1/username_available`
 - `GET /_spindle/admin/v1/users`
 - `GET/PUT /_spindle/admin/v1/users/{user_id}`
+- `GET/PUT /_spindle/admin/v1/users/{user_id}/admin`
 - `POST /_spindle/admin/v1/users/{user_id}/deactivate`
 - `GET /_spindle/admin/v1/users/{user_id}/devices`
-- `DELETE /_spindle/admin/v1/users/{user_id}/devices/{device_id}`
+- `GET/PUT/DELETE /_spindle/admin/v1/users/{user_id}/devices/{device_id}`
 - `GET /_spindle/admin/v1/users/{user_id}/joined_rooms`
+- `GET/DELETE /_spindle/admin/v1/users/{user_id}/media`
 - `POST /_spindle/admin/v1/users/{user_id}/password_hash`
 - `POST /_spindle/admin/v1/users/{user_id}/reset_link`
 - `POST /_spindle/admin/v1/users/{user_id}/reset_password`
@@ -62,7 +72,12 @@ neither implemented nor counted.
 - `GET /_synapse/admin/v1/audit`
 - `POST /_synapse/admin/v1/deactivate/{user_id}`
 - `GET /_synapse/admin/v1/event_reports`
-- `GET /_synapse/admin/v1/event_reports/{report_id}`
+- `GET/DELETE /_synapse/admin/v1/event_reports/{report_id}`
+- `GET /_synapse/admin/v1/federation/destinations`
+- `GET /_synapse/admin/v1/federation/destinations/{destination}`
+- `POST /_synapse/admin/v1/federation/destinations/{destination}/reset_connection`
+- `GET /_synapse/admin/v1/federation/destinations/{destination}/rooms`
+- `GET/DELETE /_synapse/admin/v1/media/{server_name}/{media_id}`
 - `POST /_synapse/admin/v1/purge_history/{room_id}`
 - `GET/POST /_synapse/admin/v1/register`
 - `GET /_synapse/admin/v1/registration_tokens`
@@ -71,28 +86,37 @@ neither implemented nor counted.
 - `POST /_synapse/admin/v1/reset_password/{user_id}`
 - `GET /_synapse/admin/v1/rooms`
 - `GET/DELETE /_synapse/admin/v1/rooms/{room_id}`
+- `GET/PUT /_synapse/admin/v1/rooms/{room_id}/block`
 - `POST /_synapse/admin/v1/rooms/{room_id}/make_room_admin`
 - `GET /_synapse/admin/v1/rooms/{room_id}/members`
 - `POST /_synapse/admin/v1/rooms/{room_id}/purge_history`
 - `GET /_synapse/admin/v1/rooms/{room_id}/state`
 - `GET /_synapse/admin/v1/rooms/{room_id}/state_at`
 - `GET /_synapse/admin/v1/rooms/{room_id}/timeline`
+- `GET /_synapse/admin/v1/scheduled_tasks`
 - `POST /_synapse/admin/v1/send_server_notice`
 - `GET /_synapse/admin/v1/server_version`
+- `GET /_synapse/admin/v1/username_available`
 - `GET /_synapse/admin/v1/users`
 - `GET/PUT /_synapse/admin/v1/users/{user_id}`
+- `GET/PUT /_synapse/admin/v1/users/{user_id}/admin`
 - `POST /_synapse/admin/v1/users/{user_id}/deactivate`
 - `GET /_synapse/admin/v1/users/{user_id}/devices`
-- `DELETE /_synapse/admin/v1/users/{user_id}/devices/{device_id}`
+- `GET/PUT/DELETE /_synapse/admin/v1/users/{user_id}/devices/{device_id}`
 - `GET /_synapse/admin/v1/users/{user_id}/joined_rooms`
+- `GET/DELETE /_synapse/admin/v1/users/{user_id}/media`
 - `POST /_synapse/admin/v1/users/{user_id}/password_hash`
 - `POST /_synapse/admin/v1/users/{user_id}/reset_link`
 - `POST /_synapse/admin/v1/users/{user_id}/reset_password`
 - `GET /_synapse/admin/v1/whois/{user_id}`
+- `GET /_synapse/admin/v2/rooms/delete_status/{delete_id}`
+- `DELETE /_synapse/admin/v2/rooms/{room_id}`
+- `GET /_synapse/admin/v2/rooms/{room_id}/delete_status`
 - `GET /_synapse/admin/v2/users`
 - `GET/PUT /_synapse/admin/v2/users/{user_id}`
 - `POST /_synapse/admin/v2/users/{user_id}/delete_devices`
 - `GET /_synapse/admin/v2/users/{user_id}/devices`
+- `GET/PUT/DELETE /_synapse/admin/v2/users/{user_id}/devices/{device_id}`
 
 ### Delegated auth & OIDC — 19 implemented, 0 planned
 

@@ -132,6 +132,33 @@ pub struct Federation {
     notary_asked: std::sync::Mutex<HashMap<String, Instant>>,
     /// Notary queries in the current minute: `(minute began, count)`.
     notary_budget: std::sync::Mutex<(Instant, u32)>,
+    /// How delivery to each destination has gone since this process
+    /// started, as the outbox loop reports it: what the admin API's
+    /// `federation/destinations` shows (Synapse's `destinations` table).
+    delivery: std::sync::Mutex<HashMap<String, DeliveryHealth>>,
+    /// Destinations an administrator asked to retry now
+    /// (`reset_connection`); the outbox loop drops their backoff on its
+    /// next pass.
+    delivery_resets: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+/// How delivery to one destination stands, in the terms of Synapse's
+/// `destinations` table so the admin API can report it in that shape.
+///
+/// Process-local: a restart forgets a destination's failures and retries
+/// it at once, which is what the outbox loop does anyway.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeliveryHealth {
+    /// When the last failed attempt was made, in ms; 0 while healthy.
+    pub retry_last_ts: u64,
+    /// How long the outbox waits before the next attempt, in ms; 0 while
+    /// healthy.
+    pub retry_interval: u64,
+    /// When the current run of failures began; `None` while healthy.
+    pub failure_ts: Option<u64>,
+    /// The outbox sequence number of the newest PDU the destination
+    /// acknowledged, if it acknowledged any since this process started.
+    pub last_successful_stream_ordering: Option<u64>,
 }
 
 /// One trusted key server, and the keys its answers must carry if the
@@ -513,6 +540,8 @@ impl Federation {
             fetched: std::sync::Mutex::new(HashMap::new()),
             notary_asked: std::sync::Mutex::new(HashMap::new()),
             notary_budget: std::sync::Mutex::new((Instant::now(), 0)),
+            delivery: std::sync::Mutex::new(HashMap::new()),
+            delivery_resets: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -771,6 +800,83 @@ impl Federation {
             edus.extend(pending);
         }
         edus
+    }
+
+    /// How delivery to every destination attempted since this process
+    /// started stands.
+    #[must_use]
+    pub fn delivery_health(&self) -> HashMap<String, DeliveryHealth> {
+        self.delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Record that `destination` acknowledged a transaction. `last_seq` is
+    /// the outbox sequence of the newest PDU in it, `None` for EDUs only.
+    pub fn record_delivery_success(&self, destination: &str, last_seq: Option<u64>) {
+        let mut delivery = self
+            .delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let health = delivery.entry(destination.to_owned()).or_default();
+        health.retry_last_ts = 0;
+        health.retry_interval = 0;
+        health.failure_ts = None;
+        if let Some(seq) = last_seq {
+            health.last_successful_stream_ordering = Some(
+                health
+                    .last_successful_stream_ordering
+                    .map_or(seq, |previous| previous.max(seq)),
+            );
+        }
+    }
+
+    /// Record a failed attempt at `destination`, and how long the outbox
+    /// now waits before the next one.
+    pub fn record_delivery_failure(&self, destination: &str, retry_in: Duration) {
+        let now = now_millis();
+        let mut delivery = self
+            .delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let health = delivery.entry(destination.to_owned()).or_default();
+        health.failure_ts.get_or_insert(now);
+        health.retry_last_ts = now;
+        health.retry_interval = u64::try_from(retry_in.as_millis()).unwrap_or(u64::MAX);
+    }
+
+    /// Clear `destination`'s backoff so the outbox tries it on its next
+    /// pass: Synapse's admin `reset_connection`. Returns whether this
+    /// server had any record of the destination.
+    pub fn reset_delivery(&self, destination: &str) -> bool {
+        let known = {
+            let mut delivery = self
+                .delivery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            delivery.get_mut(destination).is_some_and(|health| {
+                health.retry_last_ts = 0;
+                health.retry_interval = 0;
+                health.failure_ts = None;
+                true
+            })
+        };
+        self.delivery_resets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(destination.to_owned());
+        known
+    }
+
+    /// The destinations whose backoff an administrator cleared since the
+    /// last call.
+    fn take_delivery_resets(&self) -> Vec<String> {
+        self.delivery_resets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+            .collect()
     }
 
     /// The destinations with EDUs waiting.
@@ -2492,6 +2598,9 @@ pub async fn drain_outbox(
             let (Some(store), Some(federation)) = (store.upgrade(), federation.upgrade()) else {
                 return;
             };
+            for destination in federation.take_delivery_resets() {
+                backoff.remove(&destination);
+            }
             // The registry is not something the store's close waits on,
             // so holding it across a send is as harmless as the request.
             (
@@ -2526,6 +2635,15 @@ pub async fn drain_outbox(
                         let _ = Store::delete(store.as_ref(), key);
                     }
                     backoff.remove(&destination);
+                    if let Some(federation) = federation.upgrade() {
+                        let last_seq = keys
+                            .iter()
+                            .filter_map(|key| key.get(key.len().saturating_sub(8)..))
+                            .filter_map(|bytes| bytes.try_into().ok())
+                            .map(u64::from_be_bytes)
+                            .max();
+                        federation.record_delivery_success(&destination, last_seq);
+                    }
                 }
                 Err(error) => {
                     tracing::debug!("outbox to {destination}: {error}");
@@ -2538,6 +2656,7 @@ pub async fn drain_outbox(
                         failures,
                         federation.peer_max_backoff(&destination),
                     );
+                    federation.record_delivery_failure(&destination, delay);
                     backoff.insert(destination, (failures, Instant::now() + delay));
                 }
             }

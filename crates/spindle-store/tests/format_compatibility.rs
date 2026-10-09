@@ -214,6 +214,7 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::UserEmail, 0x52),
         (Keyspace::EmailOwner, 0x53),
         (Keyspace::RecoveryCodes, 0x54),
+        (Keyspace::AdminTask, 0x58),
         (Keyspace::FinalisedDelayById, 0x55),
         (Keyspace::DelayEcho, 0x56),
     ] {
