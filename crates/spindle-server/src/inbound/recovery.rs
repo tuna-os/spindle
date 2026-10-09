@@ -470,15 +470,24 @@ fn signature_refusal(
 
 /// Judge one pushed PDU, recovering or bridging its dependencies when it
 /// names history this server lacks, and count what became of it.
+///
+/// `origin_keys` are the origin's keys. The PDU can come from a user on
+/// any server: the origin can relay the events of other servers (#631).
+/// The signatures in the PDU, not the origin, identify the sender's
+/// server: `verify` gets the keys of each server that the room version
+/// requires.
 pub(super) async fn receive(
     state: &AppState,
     origin: &str,
-    signer: &str,
-    provided_keys: Option<&PeerKeys>,
+    origin_keys: Option<&PeerKeys>,
     pdu: &Value,
 ) -> (String, Result<(), String>) {
-    let (id, outcome, result) = Box::pin(judge(state, origin, signer, provided_keys, pdu)).await;
-    state.metrics.record_pdu(outcome);
+    let relayed = pdu["sender"]
+        .as_str()
+        .and_then(|sender| sender.split_once(':'))
+        .is_some_and(|(_, domain)| domain != origin);
+    let (id, outcome, result) = Box::pin(judge(state, origin, origin_keys, pdu)).await;
+    state.metrics.record_pdu(outcome, relayed);
     (id, result)
 }
 
@@ -513,22 +522,9 @@ fn unheld_room_version(state: &AppState, room_id: &str, pdu: &Value) -> Option<R
 async fn judge(
     state: &AppState,
     origin: &str,
-    signer: &str,
-    provided_keys: Option<&PeerKeys>,
+    origin_keys: Option<&PeerKeys>,
     pdu: &Value,
 ) -> (String, PduOutcome, Result<(), String>) {
-    if pdu["sender"]
-        .as_str()
-        .and_then(|sender| sender.split_once(':'))
-        .map(|(_, domain)| domain)
-        != Some(signer)
-    {
-        return (
-            "$foreign-sender".to_owned(),
-            PduOutcome::Refused,
-            Err("the sender does not live on the origin".to_owned()),
-        );
-    }
     let Some(room_id) = pdu["room_id"].as_str() else {
         return (
             "$malformed".to_owned(),
@@ -556,9 +552,11 @@ async fn judge(
         },
         Err(_) => super::room_version_of(state, pdu),
     };
+    // The room is known before any key is fetched. Thus a relayed PDU
+    // cannot cause key fetches for a room this server does not hold.
     let mut keys = HashMap::new();
-    if let Some(provided) = provided_keys {
-        keys.insert(signer.to_owned(), provided.clone());
+    if let Some(provided) = origin_keys {
+        keys.insert(origin.to_owned(), provided.clone());
     }
     let event = match verify(&Peers::of(state), room_id, &version, pdu, None, &mut keys).await {
         Ok(event) => event,

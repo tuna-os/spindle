@@ -4,8 +4,10 @@
 //! signed with its own key, exactly as a homeserver would, and delivers
 //! them through `PUT /send/{txnId}`. What must hold: a valid event lands
 //! and is readable over the CS API like any local one; every invalid PDU
-//! (bad signature, foreign sender, unauthorized, unknown room or parents)
-//! soft-fails alone without poisoning its batch; and a retried
+//! (bad signature, unauthorized, unknown room or parents)
+//! soft-fails alone; an event the origin relays for another server
+//! verifies by the signature of that server. Each bad PDU
+//! fails without poisoning its batch; and a retried
 //! transaction answers what the first delivery answered, exactly once.
 
 #[path = "support/federation_auth.rs"]
@@ -19,6 +21,7 @@ use axum::http::{Request, StatusCode};
 use ruma::RoomVersionId;
 use ruma::signatures::{Ed25519KeyPair, hash_and_sign_event};
 use serde_json::{Value, json};
+use spindle_server::metrics::{Metrics, PduOutcome};
 use spindle_store::FjallStore;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -144,6 +147,7 @@ struct Harness {
     _dir: TempDir,
     app: axum::Router,
     store: Arc<FjallStore>,
+    metrics: Arc<Metrics>,
 }
 
 impl Harness {
@@ -155,11 +159,14 @@ impl Harness {
              [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n",
         )
         .unwrap();
-        let app = spindle_server::app(config, store.clone()).expect("the app builds");
+        let metrics = Arc::new(Metrics::new());
+        let app = spindle_server::app_with_metrics(config, store.clone(), Arc::clone(&metrics))
+            .expect("the app builds");
         Self {
             _dir: dir,
             app,
             store,
+            metrics,
         }
     }
 
@@ -496,31 +503,184 @@ async fn bad_pdus_soft_fail_alone_and_good_neighbours_still_land() {
     assert!(members["joined"].get(peer.user()).is_some(), "{members}");
 }
 
+/// The result for the one PDU of a transaction.
+fn only_result(body: &Value) -> &Value {
+    let results = body["pdus"].as_object().unwrap();
+    assert_eq!(results.len(), 1, "{body}");
+    results.values().next().unwrap()
+}
+
+/// A room where both peers' users have joined, each through its own server.
+async fn room_with_two_peers(
+    harness: &Harness,
+    alice: &str,
+    origin: &Peer,
+    other: &Peer,
+) -> String {
+    let (room, _) = harness.room_with_invite(alice, &origin.user()).await;
+    let (status, body) = harness
+        .send(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room}/invite"),
+            alice,
+            &json!({ "user_id": other.user() }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let head = harness.head_event(&room, alice).await;
+    let join = join_event(&harness.store, origin, &room, &head);
+    let (_, body) = harness.deliver(origin, "join-origin", vec![join]).await;
+    assert_eq!(only_result(&body), &json!({}), "{body}");
+    let head = harness.head_event(&room, alice).await;
+    let join = join_event(&harness.store, other, &room, &head);
+    let (_, body) = harness.deliver(other, "join-other", vec![join]).await;
+    assert_eq!(only_result(&body), &json!({}), "{body}");
+    room
+}
+
 #[tokio::test]
-async fn a_sender_from_another_server_is_refused() {
-    let peer = Peer::start().await;
+async fn a_relayed_pdu_signed_by_its_senders_server_is_accepted() {
+    // #631: servers relay the events of other servers, for example after
+    // catch-up. The signature of the sender's server identifies the event,
+    // whichever server delivers it.
+    let origin = Peer::start().await;
+    let other = Peer::start().await;
     let harness = Harness::new();
     let alice = harness.register("alice").await;
-    let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
+    let room = room_with_two_peers(&harness, &alice, &origin, &other).await;
 
-    // Signed by the peer, but claiming a sender on a different server:
-    // accepting it would let any peer forge any server's events.
-    let forged = peer.event(json!({
-        "type": "m.room.message",
-        "sender": "@mallory:elsewhere.org",
-        "room_id": room,
-        "content": { "msgtype": "m.text", "body": "forged" },
-        "origin_server_ts": now_millis(),
-        "depth": 11,
-        "prev_events": [head],
-        "auth_events": [],
-    }));
-    let (status, body) = harness.deliver(&peer, "t1", vec![forged]).await;
+    let head = harness.head_event(&room, &alice).await;
+    let message = message_event(&harness.store, &other, &room, &head, "relayed");
+    let (status, body) = harness.deliver(&origin, "relay", vec![message]).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let outcome = body["pdus"].as_object().unwrap().values().next().unwrap();
+    assert_eq!(only_result(&body), &json!({}), "{body}");
+
+    let (_, messages) = harness
+        .send(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=1"),
+            &alice,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(messages["chunk"][0]["content"]["body"], json!("relayed"));
+    assert_eq!(messages["chunk"][0]["sender"], json!(other.user()));
+    assert_eq!(
+        harness
+            .metrics
+            .relayed_pdu_count(PduOutcome::Accepted, true),
+        1
+    );
+    assert_eq!(
+        harness
+            .metrics
+            .relayed_pdu_count(PduOutcome::Accepted, false),
+        2
+    );
+}
+
+#[tokio::test]
+async fn a_relayed_pdu_without_its_senders_signature_is_refused() {
+    let origin = Peer::start().await;
+    let other = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = room_with_two_peers(&harness, &alice, &origin, &other).await;
+    let head = harness.head_event(&room, &alice).await;
+
+    // Signed by the origin only: the sender's server never signed it.
+    // Without this rule, any peer could forge the events of any server.
+    let mut unsigned = message_event(&harness.store, &origin, &room, &head, "forged");
+    unsigned["sender"] = json!(other.user());
+    let unsigned = origin.event(unsigned);
+    // Signed in the name of the sender's server, with a key it does not
+    // publish.
+    let impostor = Peer {
+        name: other.name.clone(),
+        pair: Ed25519KeyPair::from_der(&Ed25519KeyPair::generate(), "0".to_owned()).unwrap(),
+    };
+    let bad = message_event(&harness.store, &impostor, &room, &head, "bad signature");
+
+    for (txn, pdu, reason) in [
+        ("missing", unsigned, "missing_signature"),
+        ("bad", bad, "bad_signature"),
+    ] {
+        let (status, body) = harness.deliver(&origin, txn, vec![pdu]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let error = only_result(&body)["error"].as_str().unwrap_or_default();
+        assert!(error.contains(reason), "{body}");
+    }
+    let (_, messages) = harness
+        .send(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=10"),
+            &alice,
+            &json!({}),
+        )
+        .await;
     assert!(
-        outcome["error"].as_str().unwrap().contains("origin"),
-        "{body}"
+        messages["chunk"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| event["type"] != json!("m.room.message")),
+        "{messages}"
+    );
+    assert_eq!(
+        harness.metrics.relayed_pdu_count(PduOutcome::Refused, true),
+        2
+    );
+}
+
+#[tokio::test]
+async fn a_relayed_pdu_for_a_room_its_origin_is_not_in_is_judged_by_signature_and_auth() {
+    let origin = Peer::start().await;
+    let other = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    // Only the other server's user joins; the origin has no one here.
+    let (room, head) = harness.room_with_invite(&alice, &other.user()).await;
+    let join = join_event(&harness.store, &other, &room, &head);
+    let (_, body) = harness.deliver(&other, "join", vec![join]).await;
+    assert_eq!(only_result(&body), &json!({}), "{body}");
+
+    let head = harness.head_event(&room, &alice).await;
+    let message = message_event(&harness.store, &other, &room, &head, "via a stranger");
+    let (_, body) = harness.deliver(&origin, "relay", vec![message]).await;
+    assert_eq!(only_result(&body), &json!({}), "{body}");
+
+    // Correctly signed, but its sender is not a member: the room's
+    // authorization rules refuse it, as for any other event.
+    let head = harness.head_event(&room, &alice).await;
+    let mut stranger = message_event(&harness.store, &other, &room, &head, "not a member");
+    stranger["sender"] = json!(format!("@carol:{}", other.name));
+    let stranger = other.event(stranger);
+    let (_, body) = harness.deliver(&origin, "stranger", vec![stranger]).await;
+    let error = only_result(&body)["error"].as_str().unwrap_or_default();
+    assert!(!error.is_empty(), "{body}");
+    assert!(!error.contains("signature"), "{body}");
+
+    let (_, messages) = harness
+        .send(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=10"),
+            &alice,
+            &json!({}),
+        )
+        .await;
+    let bodies: Vec<&Value> = messages["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["type"] == json!("m.room.message"))
+        .map(|event| &event["content"]["body"])
+        .collect();
+    assert_eq!(bodies, [&json!("via a stranger")], "{messages}");
+    assert_eq!(
+        harness
+            .metrics
+            .relayed_pdu_count(PduOutcome::Accepted, true),
+        1
     );
 }
 

@@ -58,8 +58,8 @@ pub enum Origin {
 /// What became of one PDU a peer pushed in a transaction.
 ///
 /// Five outcomes are the receipt checks' own verdicts; `refused` is
-/// everything refused before them -- a bad signature, a foreign sender, an
-/// unknown room -- so the series add up to every PDU received.
+/// everything refused before them -- a bad signature, an unknown room --
+/// so the series add up to every PDU received.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PduOutcome {
     /// Appended to the timeline through the ordinary receipt checks,
@@ -315,8 +315,9 @@ pub struct Metrics {
     federation_queue: RwLock<Vec<(String, u64)>>,
     sync_subscribers: AtomicU64,
     sync_lag: Family,
-    /// Inbound PDUs by what became of them ([`PduOutcome`]).
-    pdu_outcomes: [AtomicU64; PduOutcome::ALL.len()],
+    /// Inbound PDUs by what became of them ([`PduOutcome`]): the
+    /// origin's own first, then those it relayed for other servers.
+    pdu_outcomes: [[AtomicU64; PduOutcome::ALL.len()]; 2],
     /// Predecessor recovery attempts by result ([`RecoveryResult`]).
     recovery_attempts: [AtomicU64; RecoveryResult::ALL.len()],
     recovery_latency: Family,
@@ -1573,9 +1574,11 @@ impl Metrics {
 }
 
 impl Metrics {
-    /// Record what became of one PDU a peer pushed.
-    pub fn record_pdu(&self, outcome: PduOutcome) {
-        self.pdu_outcomes[slot(&PduOutcome::ALL, outcome)].fetch_add(1, Ordering::Relaxed);
+    /// Record what became of one PDU a peer pushed. `relayed` is true
+    /// when the sender is on a server other than the origin.
+    pub fn record_pdu(&self, outcome: PduOutcome, relayed: bool) {
+        self.pdu_outcomes[usize::from(relayed)][slot(&PduOutcome::ALL, outcome)]
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record one predecessor recovery attempt against one peer, and how
@@ -1648,7 +1651,14 @@ impl Metrics {
     /// Read one counter, for tests that assert a metric actually moved.
     #[must_use]
     pub fn pdu_count(&self, outcome: PduOutcome) -> u64 {
-        self.pdu_outcomes[slot(&PduOutcome::ALL, outcome)].load(Ordering::Relaxed)
+        self.relayed_pdu_count(outcome, false) + self.relayed_pdu_count(outcome, true)
+    }
+
+    /// Read one counter for the origin's own PDUs or for relayed ones.
+    #[must_use]
+    pub fn relayed_pdu_count(&self, outcome: PduOutcome, relayed: bool) -> u64 {
+        self.pdu_outcomes[usize::from(relayed)][slot(&PduOutcome::ALL, outcome)]
+            .load(Ordering::Relaxed)
     }
 
     /// Read one counter, for tests that assert a metric actually moved.
@@ -1675,16 +1685,19 @@ impl Metrics {
     /// so a peer cannot mint series by sending us things.
     fn render_inbound(&self, out: &mut String) {
         out.push_str(
-            "# HELP spindle_federation_pdus_received_total PDUs peers pushed, by outcome.\n\
+            "# HELP spindle_federation_pdus_received_total PDUs peers pushed, by outcome \
+         and by whether the origin relayed them for another server.\n\
          # TYPE spindle_federation_pdus_received_total counter\n",
         );
-        for outcome in PduOutcome::ALL {
-            let _ = writeln!(
-                out,
-                "spindle_federation_pdus_received_total{{result=\"{}\"}} {}",
-                outcome.label(),
-                self.pdu_count(outcome)
-            );
+        for relayed in [false, true] {
+            for outcome in PduOutcome::ALL {
+                let _ = writeln!(
+                    out,
+                    "spindle_federation_pdus_received_total{{result=\"{}\",relayed=\"{relayed}\"}} {}",
+                    outcome.label(),
+                    self.relayed_pdu_count(outcome, relayed)
+                );
+            }
         }
         out.push_str(
             "# HELP spindle_federation_recovery_attempts_total Missing-dependency \
@@ -2723,13 +2736,15 @@ mod tests {
         let metrics = Metrics::new();
         let text = metrics.render();
         for outcome in PduOutcome::ALL {
-            assert!(
-                text.contains(&format!(
-                    "spindle_federation_pdus_received_total{{result=\"{}\"}} 0",
-                    outcome.label()
-                )),
-                "{text}"
-            );
+            for relayed in [false, true] {
+                assert!(
+                    text.contains(&format!(
+                        "spindle_federation_pdus_received_total{{result=\"{}\",relayed=\"{relayed}\"}} 0",
+                        outcome.label()
+                    )),
+                    "{text}"
+                );
+            }
         }
         for result in GapResult::ALL {
             assert!(
@@ -2741,9 +2756,9 @@ mod tests {
             );
         }
 
-        metrics.record_pdu(PduOutcome::GapAccepted);
-        metrics.record_pdu(PduOutcome::GapAccepted);
-        metrics.record_pdu(PduOutcome::RefusedMissingDeps);
+        metrics.record_pdu(PduOutcome::GapAccepted, false);
+        metrics.record_pdu(PduOutcome::GapAccepted, true);
+        metrics.record_pdu(PduOutcome::RefusedMissingDeps, false);
         metrics.record_recovery(RecoveryResult::RateLimited, Duration::from_millis(30));
         metrics.record_recovery(RecoveryResult::BudgetExceeded, Duration::from_secs(12));
         metrics.record_fetched(FetchKind::GapState, 7);
@@ -2752,6 +2767,7 @@ mod tests {
         metrics.observe_state_ids("ok", Duration::from_millis(400));
 
         assert_eq!(metrics.pdu_count(PduOutcome::GapAccepted), 2);
+        assert_eq!(metrics.relayed_pdu_count(PduOutcome::GapAccepted, true), 1);
         assert_eq!(metrics.pdu_count(PduOutcome::RefusedMissingDeps), 1);
         assert_eq!(metrics.pdu_count(PduOutcome::Accepted), 0);
         assert_eq!(metrics.recovery_count(RecoveryResult::RateLimited), 1);
@@ -2764,7 +2780,8 @@ mod tests {
 
         let text = metrics.render();
         for line in [
-            "spindle_federation_pdus_received_total{result=\"gap_accepted\"} 2",
+            "spindle_federation_pdus_received_total{result=\"gap_accepted\",relayed=\"false\"} 1",
+            "spindle_federation_pdus_received_total{result=\"gap_accepted\",relayed=\"true\"} 1",
             "spindle_federation_recovery_attempts_total{result=\"rate_limited\"} 1",
             "spindle_federation_recovery_events_fetched_total{kind=\"gap_state\"} 7",
             "spindle_federation_gap_acceptances_total{result=\"accepted\"} 1",
