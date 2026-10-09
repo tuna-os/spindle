@@ -4526,6 +4526,7 @@ async fn join_remote(
             .rooms
             .join_remote(room_id, &seed_state, &seed_rest, &join, &join_id)
             .map_err(room_error)?;
+        record_join_history(state, room_id, &join, &join_id, server);
         state.rooms.wake_sync_waiters();
         return Ok(Json(json!({ "room_id": room_id })));
     }
@@ -4537,6 +4538,19 @@ async fn join_remote(
             format!("no server admitted the join: {last_refusal}"),
         )
     }))
+}
+
+/// `send_join` brings state, not history. Record the history before the
+/// join as a federation gap, which the backfill loop fills in the
+/// background (#461). The join stands whether or not this works.
+fn record_join_history(state: &AppState, room_id: &str, join: &Value, join_id: &str, server: &str) {
+    match state.rooms.record_join_gap(room_id, join, join_id, server) {
+        Ok(true) => state.backfill.poke(room_id),
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(%error, %room_id, %server, "cannot record the history a join left out");
+        }
+    }
 }
 
 /// `POST /_matrix/client/v3/rooms/{room_id}/leave`

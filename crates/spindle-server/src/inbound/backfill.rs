@@ -568,7 +568,10 @@ async fn fill(
             "a state-DAG room's history cannot be folded from /state_ids".to_owned(),
         ));
     }
-    let frontier = peers.rooms.gap_unheld(room_id, &progress.frontier)?;
+    let through = join_anchor(&due.marker);
+    let frontier = peers
+        .rooms
+        .gap_unheld_through(room_id, &progress.frontier, through)?;
     if frontier.is_empty() {
         // Every branch already met held history: close the gap.
         return commit(
@@ -585,7 +588,10 @@ async fn fill(
         );
     }
     let room_left = u64::from(progress.next_seq).saturating_add(1);
-    if progress.filled >= settings.max_events
+    let max_events = due.marker["max_events"]
+        .as_u64()
+        .map_or(settings.max_events, |cap| cap.min(settings.max_events));
+    if progress.filled >= max_events
         || room_left < u64::try_from(settings.chunk).unwrap_or(u64::MAX)
     {
         return Err(Failure::Budget(format!(
@@ -612,9 +618,12 @@ async fn fill(
             )
         })
         .collect();
-    let floor = due.marker["li"]
-        .as_i64()
-        .map_or(Ok(0), |anchor| peers.rooms.gap_depth_floor(room_id, anchor))?;
+    // Below a join, the log holds only seeded state, not history, so no
+    // depth floor applies.
+    let floor = match (through, due.marker["li"].as_i64()) {
+        (None, Some(anchor)) => peers.rooms.gap_depth_floor(room_id, anchor)?,
+        _ => 0,
+    };
     let digest = digest_of(&frontier);
 
     let candidates = candidates(peers, backfill, room_id, &due.marker, anchor_event, digest);
@@ -634,7 +643,13 @@ async fn fill(
     let mut stuck: Option<(String, HashMap<String, Value>)> = None;
     for peer in candidates {
         let attempt = Box::pin(fetch_page(
-            peers, &peer, room_id, &version, &frontier, &bounds, settings,
+            peers,
+            &peer,
+            room_id,
+            &version,
+            &frontier,
+            Walk::new(&frontier, &bounds, through),
+            settings,
         ))
         .await;
         let (walk, offered) = match attempt {
@@ -717,7 +732,7 @@ async fn fill(
         .then(|| backfill.take_stuck(room_id, digest))
         .flatten()
     {
-        let mut walk = Walk::new(&frontier, &bounds);
+        let mut walk = Walk::new(&frontier, &bounds, through);
         let skipped = walk.bridge(peers.rooms, room_id, &offered, floor)?;
         if !skipped.is_empty() {
             walk.take(peers.rooms, room_id, &mut offered, settings.chunk)?;
@@ -822,6 +837,15 @@ fn note_failure(
     );
 }
 
+/// The join's position, when the marker is a remote join's gap
+/// ([`Rooms::record_join_gap`]): the walk passes through what the join
+/// seeded below it.
+fn join_anchor(marker: &Value) -> Option<i64> {
+    (marker["cause"].as_str() == Some(crate::rooms::JOIN_GAP_CAUSE))
+        .then(|| marker["li"].as_i64())
+        .flatten()
+}
+
 /// A stable digest of a frontier, for "asked this peer this before".
 fn digest_of(frontier: &[String]) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -914,15 +938,20 @@ struct Walk {
     seen: HashSet<String>,
     /// For each wanted event, the depth of the newest event naming it.
     bounds: HashMap<String, u64>,
+    /// For a remote join's gap, the join's position: the walk passes
+    /// through the seeded entries below it
+    /// ([`Rooms::gap_unheld_through`]).
+    through: Option<i64>,
 }
 
 impl Walk {
-    fn new(frontier: &[String], bounds: &HashMap<String, u64>) -> Self {
+    fn new(frontier: &[String], bounds: &HashMap<String, u64>, through: Option<i64>) -> Self {
         Self {
             wanted: frontier.iter().cloned().collect(),
             taken: Vec::new(),
             seen: HashSet::new(),
             bounds: bounds.clone(),
+            through,
         }
     }
 
@@ -967,7 +996,7 @@ impl Walk {
             }
             parents.sort();
             parents.dedup();
-            for parent in rooms.gap_unheld(room_id, &parents)? {
+            for parent in rooms.gap_unheld_through(room_id, &parents, self.through)? {
                 if !self.seen.contains(&parent) {
                     self.wanted.insert(parent);
                 }
@@ -1020,7 +1049,7 @@ impl Walk {
             .map(|(id, _)| id.clone())
             .collect();
         heads.sort();
-        let heads = rooms.gap_unheld(room_id, &heads)?;
+        let heads = rooms.gap_unheld_through(room_id, &heads, self.through)?;
         if heads.is_empty() {
             return Ok(Vec::new());
         }
@@ -1063,7 +1092,7 @@ async fn fetch_page(
     room_id: &str,
     version: &RoomVersionId,
     frontier: &[String],
-    bounds: &HashMap<String, u64>,
+    mut walk: Walk,
     settings: Settings,
 ) -> Result<(Walk, HashMap<String, Value>), Failure> {
     let from: Vec<String> = frontier.iter().take(MAX_FROM).cloned().collect();
@@ -1086,7 +1115,6 @@ async fn fetch_page(
         u64::try_from(pdus.len()).unwrap_or(u64::MAX),
     );
     let mut offered = by_id(version, pdus);
-    let mut walk = Walk::new(frontier, bounds);
     walk.take(peers.rooms, room_id, &mut offered, settings.chunk)?;
     if walk.taken.is_empty() {
         // A peer whose `/backfill` served nothing the walk asked for may

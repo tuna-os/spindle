@@ -152,6 +152,7 @@ mod synapse_positions;
 mod unread;
 
 pub use admin::AdminTimelineEntry;
+pub use federation::{JOIN_GAP_CAUSE, JOIN_HISTORY_EVENTS};
 pub use read::{ReadScope, RoomReader};
 pub use synapse_positions::SynapseGap;
 

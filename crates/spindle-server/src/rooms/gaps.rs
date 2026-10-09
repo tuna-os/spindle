@@ -721,12 +721,40 @@ impl Rooms {
     /// # Errors
     /// Returns [`RoomError`] if the room or the segment index cannot be read.
     pub fn gap_unheld(&self, room_id: &str, ids: &[String]) -> Result<Vec<String>, RoomError> {
+        self.gap_unheld_through(room_id, ids, None)
+    }
+
+    /// [`Self::gap_unheld`] for a walk that passes through the log entries
+    /// below `through`, except the create event.
+    ///
+    /// A remote join's gap is walked this way: the entries below the join
+    /// are the state and auth events `send_join` seeded, not the room's
+    /// history, so the history continues below them. The walk takes them
+    /// again to follow their predecessors, and [`Self::commit_gap_chunk`]
+    /// folds their state without placing them twice. The create event ends
+    /// the walk, because no state precedes it.
+    ///
+    /// # Errors
+    /// Returns [`RoomError`] if the room or the segment index cannot be read.
+    pub fn gap_unheld_through(
+        &self,
+        room_id: &str,
+        ids: &[String],
+        through: Option<i64>,
+    ) -> Result<Vec<String>, RoomError> {
+        let passes = |entry: &spindle_core::LogEntry| {
+            through.is_some_and(|anchor| entry.li.get() < anchor)
+                && entry
+                    .state_key
+                    .as_ref()
+                    .is_none_or(|key| key.event_type().as_str() != "m.room.create")
+        };
         let unlogged = self.with_room_read(room_id, |_, log| {
             Ok(ids
                 .iter()
                 .filter(|id| {
                     let id = EventId::new(id.as_str());
-                    log.get(&id).is_none()
+                    log.get(&id).is_none_or(passes)
                         && log.sidelined(&id).is_none()
                         && !log.historically_rejected(&id)
                 })
@@ -1139,7 +1167,28 @@ impl Rooms {
 
                 for (event_id, json) in chunk.events.iter().rev() {
                     let id = EventId::new(event_id.as_str());
-                    if log.get(&id).is_some() || rooms.gap_position(room_id, event_id)?.is_some() {
+                    if log.get(&id).is_some() {
+                        // A remote join seeded it, and a join gap's walk
+                        // passed through it. It keeps its place in the log,
+                        // but the events after it were sent on its state.
+                        if let (Some(kind), Some(state_key)) =
+                            (json["type"].as_str(), json["state_key"].as_str())
+                        {
+                            let before = state.clone();
+                            state = state.apply(StateKey::new(kind, state_key), event_id.as_str());
+                            for (address, node) in state.delta_nodes(Some(&before)) {
+                                writes.push((
+                                    spindle_core::keys::content_addressed(
+                                        spindle_core::keys::Keyspace::StateNode,
+                                        address.as_bytes(),
+                                    ),
+                                    node,
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+                    if rooms.gap_position(room_id, event_id)?.is_some() {
                         continue;
                     }
                     if let Some(held_room) = spindle_store::ReadView::get(
