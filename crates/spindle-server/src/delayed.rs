@@ -86,6 +86,107 @@ pub struct FinalisedDelay {
     /// or lost the power to send by the time their moment came.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The error code of that refusal, for the standard error response
+    /// MSC4140's `GET /delayed_events/{delay_id}` reports it as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub errcode: Option<String>,
+    /// Cancelled by its owner (or a delegate holding its id), rather than
+    /// sent or refused. Kept so the outcome can be looked up and a repeated
+    /// `cancel` answered as the success it is, and never reported on
+    /// `/sync`: MSC4309 reports what was sent or failed, and a cancel is
+    /// something the client did, not something that happened to it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
+    /// Unix milliseconds at which it finished. Zero on rows written before
+    /// the field existed.
+    #[serde(default)]
+    pub finalised_ts: u64,
+    /// The delay as it was asked for, and when its last window began --
+    /// what MSC4140 reports for a delay that has finished as for one that
+    /// has not.
+    #[serde(default)]
+    pub delay_ms: u64,
+    #[serde(default)]
+    pub delayed_since_ts: u64,
+    /// The content as it was scheduled.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub content: Value,
+}
+
+impl FinalisedDelay {
+    /// The record for `event`, finished now with `outcome`: the id of the
+    /// event it became, or the error that refused it.
+    #[must_use]
+    pub fn of(event: &DelayedEvent, outcome: Result<String, (String, String)>) -> Self {
+        let (event_id, error) = match outcome {
+            Ok(event_id) => (Some(event_id), None),
+            Err(error) => (None, Some(error)),
+        };
+        Self {
+            delay_id: event.delay_id.clone(),
+            room_id: event.room_id.clone(),
+            event_type: event.event_type.clone(),
+            state_key: event.state_key.clone(),
+            event_id,
+            errcode: error.as_ref().map(|(errcode, _)| errcode.clone()),
+            error: error.map(|(_, message)| message),
+            cancelled: false,
+            finalised_ts: Delayed::now_ms(),
+            delay_ms: event.delay_ms,
+            delayed_since_ts: event.fire_at_ms.saturating_sub(event.delay_ms),
+            content: event.content.clone(),
+        }
+    }
+
+    /// The record for `event`, cancelled now.
+    #[must_use]
+    pub fn cancelled(event: &DelayedEvent) -> Self {
+        Self {
+            event_id: None,
+            error: None,
+            errcode: None,
+            cancelled: true,
+            ..Self::of(event, Ok(String::new()))
+        }
+    }
+
+    /// What MSC4309 puts on `/sync` for this outcome: the shape this server
+    /// has always reported there, so a client reading it does not see the
+    /// fields MSC4140's lookup added grow under it.
+    #[must_use]
+    pub fn sync_view(&self) -> Value {
+        let mut view = serde_json::Map::new();
+        view.insert("delay_id".to_owned(), Value::from(self.delay_id.clone()));
+        view.insert("room_id".to_owned(), Value::from(self.room_id.clone()));
+        view.insert(
+            "event_type".to_owned(),
+            Value::from(self.event_type.clone()),
+        );
+        if let Some(state_key) = &self.state_key {
+            view.insert("state_key".to_owned(), Value::from(state_key.clone()));
+        }
+        if let Some(event_id) = &self.event_id {
+            view.insert("event_id".to_owned(), Value::from(event_id.clone()));
+        }
+        if let Some(error) = &self.error {
+            view.insert("error".to_owned(), Value::from(error.clone()));
+        }
+        Value::Object(view)
+    }
+
+    /// Whether this ending agrees with `action` asked of it afterwards.
+    ///
+    /// MSC4140: a `send` of a delay that was sent, or a `cancel` of one that
+    /// was cancelled -- by its owner or by an error -- succeeds again, so a
+    /// retried request is safe; anything else conflicts with what happened.
+    #[must_use]
+    pub fn agrees_with(&self, action: Action) -> bool {
+        match action {
+            Action::Send => self.event_id.is_some(),
+            Action::Cancel => self.event_id.is_none(),
+            Action::Restart => false,
+        }
+    }
 }
 
 /// What a caller asked to do with a pending delay.
@@ -125,11 +226,22 @@ pub enum DelayError {
     TooLong {
         limit_ms: u64,
     },
-    /// This sender already has as many delays pending in this room as the
-    /// server will hold for them.
+    /// This sender already has as many delays pending -- in this room, or
+    /// across the server -- as the server will hold for them.
+    ///
+    /// `retry_after_ms` is how long until the first of them is due, which
+    /// is when the same request can next succeed (MSC4140's `Retry-After`).
     TooMany {
         limit: usize,
+        per_room: bool,
+        retry_after_ms: u64,
     },
+    /// A delay of zero, which MSC4140 refuses: "later" has to be later.
+    NotPositive,
+    /// The delay has already finished, in a way that contradicts what was
+    /// asked of it (MSC4140's 409): restarting or sending one that was
+    /// cancelled, or restarting or cancelling one that was sent.
+    Conflict,
     Store(StoreError),
 }
 
@@ -140,9 +252,22 @@ impl std::fmt::Display for DelayError {
             Self::TooLong { limit_ms } => {
                 write!(formatter, "the maximum delay is {limit_ms}ms")
             }
-            Self::TooMany { limit } => write!(
+            Self::TooMany {
+                limit,
+                per_room: true,
+                ..
+            } => write!(
                 formatter,
                 "at most {limit} delayed events may be pending in one room"
+            ),
+            Self::TooMany { limit, .. } => write!(
+                formatter,
+                "at most {limit} delayed events may be pending for one user"
+            ),
+            Self::NotPositive => write!(formatter, "a delay must be greater than zero"),
+            Self::Conflict => write!(
+                formatter,
+                "the delayed event has already finished, and not in the way asked for"
             ),
             Self::Store(error) => write!(formatter, "{error}"),
         }
@@ -203,6 +328,18 @@ pub struct Delayed {
     /// that bounds the rows -- an entry exists only for a delay that has a
     /// row.
     restarts: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// The most delays one user may have pending across the server:
+    /// MSC4140's `max_scheduled`, advertised as a capability.
+    max_per_user: usize,
+    /// How many delays each sender has pending, per room and in all.
+    ///
+    /// Counted in memory rather than by reading the queue, because the
+    /// queue is keyed by deadline: answering "how many does this sender
+    /// have" from it meant reading every pending delay on the server for
+    /// every schedule, which the call-churn benchmark (#40) found growing
+    /// with everyone else's calls. Built from one scan the first time it is
+    /// needed and kept in step by every write and erase after that.
+    counts: std::sync::Mutex<Option<Counts>>,
     /// How many finalised delays are kept per user; see
     /// [`DEFAULT_MAX_FINALISED_PER_USER`].
     max_finalised: usize,
@@ -223,6 +360,57 @@ pub const DEFAULT_MAX_DELAY_MS: u64 = 24 * 60 * 60 * 1000;
 /// that is not done here, because a user's *other* devices have not synced
 /// yet and would lose the outcome. Keeping a bounded window serves both.
 pub const DEFAULT_MAX_FINALISED_PER_USER: usize = 100;
+
+/// The default count cap per user, across every room.
+///
+/// MSC4140 requires a per-user limit and advertises it as `max_scheduled`.
+/// Ten times the per-room cap, so that the per-room cap stays the one a
+/// client meets first in practice and this one only bounds the total.
+pub const DEFAULT_MAX_PER_USER: usize = 1_000;
+
+/// Pending delays per sender: per room, and in all.
+#[derive(Default)]
+struct Counts {
+    per_room: std::collections::HashMap<(String, String), usize>,
+    per_user: std::collections::HashMap<String, usize>,
+}
+
+impl Counts {
+    fn add(&mut self, sender: &str, room_id: &str) {
+        *self
+            .per_room
+            .entry((sender.to_owned(), room_id.to_owned()))
+            .or_default() += 1;
+        *self.per_user.entry(sender.to_owned()).or_default() += 1;
+    }
+
+    fn remove(&mut self, sender: &str, room_id: &str) {
+        let key = (sender.to_owned(), room_id.to_owned());
+        if let Some(count) = self.per_room.get_mut(&key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.per_room.remove(&key);
+            }
+        }
+        if let Some(count) = self.per_user.get_mut(sender) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.per_user.remove(sender);
+            }
+        }
+    }
+
+    fn in_room(&self, sender: &str, room_id: &str) -> usize {
+        self.per_room
+            .get(&(sender.to_owned(), room_id.to_owned()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn of_user(&self, sender: &str) -> usize {
+        self.per_user.get(sender).copied().unwrap_or(0)
+    }
+}
 
 /// The default count cap, per sender per room.
 ///
@@ -247,14 +435,71 @@ impl Delayed {
             store,
             max_delay_ms,
             max_per_room,
+            max_per_user: DEFAULT_MAX_PER_USER.max(max_per_room),
+            counts: std::sync::Mutex::new(None),
             max_finalised: DEFAULT_MAX_FINALISED_PER_USER,
             restarts: std::sync::Mutex::new(std::collections::HashMap::new()),
             generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
+    /// The same, with the per-user cap an operator configured.
+    #[must_use]
+    pub fn with_user_cap(mut self, max_per_user: usize) -> Self {
+        self.max_per_user = max_per_user;
+        self
+    }
+
+    /// The longest delay accepted, and the most one user may hold:
+    /// MSC4140's `max_delay_ms` and `max_scheduled`.
+    #[must_use]
+    pub fn limits(&self) -> (u64, usize) {
+        (self.max_delay_ms, self.max_per_user)
+    }
+
+    /// Run `f` over the pending counts, building them from the queue the
+    /// first time.
+    fn with_counts<R>(&self, f: impl FnOnce(&mut Counts) -> R) -> Result<R, DelayError> {
+        let mut guard = self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let counts = match &mut *guard {
+            Some(counts) => counts,
+            empty => {
+                let mut counts = Counts::default();
+                for (_, raw) in self
+                    .store
+                    .scan_prefix(&spindle_core::keys::delayed_event_prefix())?
+                {
+                    if let Ok(event) = serde_json::from_slice::<DelayedEvent>(&raw) {
+                        counts.add(&event.sender, &event.room_id);
+                    }
+                }
+                empty.insert(counts)
+            }
+        };
+        Ok(f(counts))
+    }
+
+    /// How long until the first of `sender`'s pending delays (in `room_id`,
+    /// when given) is due: when a refused schedule can next succeed.
+    ///
+    /// Reads the queue, but only on a refusal, which a client meets once and
+    /// then waits out.
+    fn next_due_for(&self, sender: &str, room_id: Option<&str>) -> u64 {
+        let now = Self::now_ms();
+        self.list(sender)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|event| room_id.is_none_or(|room_id| event.room_id == room_id))
+            .map(|event| event.fire_at_ms.saturating_sub(now))
+            .min()
+            .unwrap_or(0)
+    }
+
     /// Unix milliseconds now.
-    fn now_ms() -> u64 {
+    pub(crate) fn now_ms() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
@@ -277,6 +522,9 @@ impl Delayed {
         delay_ms: u64,
         sticky_ms: Option<u64>,
     ) -> Result<String, DelayError> {
+        if delay_ms == 0 {
+            return Err(DelayError::NotPositive);
+        }
         if delay_ms > self.max_delay_ms {
             return Err(DelayError::TooLong {
                 limit_ms: self.max_delay_ms,
@@ -286,9 +534,20 @@ impl Delayed {
         // cleanup. `restart` deliberately does not come through here: it
         // replaces a row rather than adding one, and a client sitting at the
         // cap must still be able to keep the delays it has alive.
-        if self.pending_in(room_id, sender)? >= self.max_per_room {
+        let (in_room, of_user) =
+            self.with_counts(|counts| (counts.in_room(sender, room_id), counts.of_user(sender)))?;
+        if in_room >= self.max_per_room {
             return Err(DelayError::TooMany {
                 limit: self.max_per_room,
+                per_room: true,
+                retry_after_ms: self.next_due_for(sender, Some(room_id)),
+            });
+        }
+        if of_user >= self.max_per_user {
+            return Err(DelayError::TooMany {
+                limit: self.max_per_user,
+                per_room: false,
+                retry_after_ms: self.next_due_for(sender, None),
             });
         }
         let delay_id = format!("{:032x}", rand::random::<u128>());
@@ -304,7 +563,22 @@ impl Delayed {
             sticky_ms,
         };
         self.write(&event)?;
+        self.with_counts(|counts| counts.add(sender, room_id))?;
         Ok(delay_id)
+    }
+
+    /// Put back a delay that was taken to be sent now and could not be.
+    ///
+    /// MSC4140: a `send` that fails answers with the send's own error and
+    /// leaves the delay scheduled, since whatever refused it may have
+    /// changed by its deadline, and the client may retry until then.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if the rows cannot be written.
+    pub fn reinstate(&self, event: &DelayedEvent) -> Result<(), DelayError> {
+        self.write(event)?;
+        self.with_counts(|counts| counts.add(&event.sender, &event.room_id))
     }
 
     /// Write both rows for one delay.
@@ -351,19 +625,28 @@ impl Delayed {
     /// [`DelayedEvent`] may be holding its *live* deadline (see
     /// [`Self::restarts`]), and deleting by that would leave the queue row
     /// behind to fire a second time.
-    fn erase(&self, delay_id: &str) -> Result<(), DelayError> {
-        if let Some(fire_at_ms) = self.queued_at(delay_id)? {
-            self.store
-                .delete(&spindle_core::keys::delayed_event(fire_at_ms, delay_id))?;
-        }
+    ///
+    /// Answers whether there was anything to remove. Two paths can reach
+    /// the same delay at once -- the fire loop taking it as due, and a
+    /// client cancelling or sending it -- and only the one that finds it
+    /// still queued may act on it, or a cancelled delay fires anyway and a
+    /// sent one is sent twice.
+    fn erase(&self, event: &DelayedEvent) -> Result<bool, DelayError> {
+        let delay_id = event.delay_id.as_str();
+        let Some(fire_at_ms) = self.queued_at(delay_id)? else {
+            return Ok(false);
+        };
+        self.store
+            .delete(&spindle_core::keys::delayed_event(fire_at_ms, delay_id))?;
         self.store
             .delete(&spindle_core::keys::delayed_event_by_id(delay_id))?;
+        self.with_counts(|counts| counts.remove(&event.sender, &event.room_id))?;
         if let Ok(mut restarts) = self.restarts.lock() {
             restarts.remove(delay_id);
         }
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+        Ok(true)
     }
 
     /// The live deadline for `delay_id`, if it has been restarted since it
@@ -436,18 +719,6 @@ impl Delayed {
         Ok(event)
     }
 
-    /// How many delays `sender` already has pending in `room_id`.
-    fn pending_in(&self, room_id: &str, sender: &str) -> Result<usize, DelayError> {
-        let rows = self
-            .store
-            .scan_prefix(&spindle_core::keys::delayed_event_prefix())?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|(_, raw)| serde_json::from_slice::<DelayedEvent>(&raw).ok())
-            .filter(|event| event.sender == sender && event.room_id == room_id)
-            .count())
-    }
-
     /// Every delay `sender` is waiting on.
     ///
     /// # Errors
@@ -486,8 +757,13 @@ impl Delayed {
         sender: &str,
         action: Action,
     ) -> Result<Option<DelayedEvent>, DelayError> {
-        let event = self.get(delay_id, sender)?;
-        self.apply(event, action)
+        match self
+            .get(delay_id, sender)
+            .and_then(|event| self.apply(event, action))
+        {
+            Err(DelayError::NotFound) => self.after_the_fact(delay_id, Some(sender), action),
+            other => other,
+        }
     }
 
     /// [`Self::act`] for whoever holds the delay ID, with no sender check:
@@ -506,9 +782,22 @@ impl Delayed {
         delay_id: &str,
         action: Action,
     ) -> Result<Option<DelayedEvent>, DelayError> {
-        let sender = self.sender_of(delay_id)?;
-        let event = self.get(delay_id, &sender)?;
-        self.apply(event, action)
+        match self
+            .sender_of(delay_id)
+            .and_then(|sender| self.get(delay_id, &sender))
+            .and_then(|event| self.apply(event, action))
+        {
+            Err(DelayError::NotFound) => self.after_the_fact(delay_id, None, action),
+            other => other,
+        }
+    }
+
+    /// One pending delay by id, whoever's it is. For the caller that
+    /// already holds the right to act on it and needs to know what it was.
+    #[must_use]
+    pub fn pending(&self, delay_id: &str) -> Option<DelayedEvent> {
+        let sender = self.sender_of(delay_id).ok()?;
+        self.get(delay_id, &sender).ok()
     }
 
     /// Who scheduled `delay_id`.
@@ -539,14 +828,11 @@ impl Delayed {
         action: Action,
     ) -> Result<Option<DelayedEvent>, DelayError> {
         match action {
-            Action::Cancel => {
-                self.erase(&event.delay_id)?;
-                Ok(None)
-            }
-            Action::Send => {
-                self.erase(&event.delay_id)?;
-                Ok(Some(event))
-            }
+            // Lost to the fire loop between the read and here: it is
+            // finished, and the caller asks how.
+            Action::Cancel | Action::Send if !self.erase(&event)? => Err(DelayError::NotFound),
+            Action::Cancel => Ok(None),
+            Action::Send => Ok(Some(event)),
             Action::Restart => {
                 // The *original* delay from now, not the time remaining. A
                 // heartbeat that shortened the window on every beat would
@@ -620,9 +906,15 @@ impl Delayed {
     ///
     /// # Errors
     ///
-    /// Returns a store error if the rows cannot be removed.
+    /// Returns [`DelayError::NotFound`] if another path took it first --
+    /// a client's `cancel` or `send` racing the tick -- and a store error if
+    /// the rows cannot be removed.
     pub fn take(&self, event: &DelayedEvent) -> Result<(), DelayError> {
-        self.erase(&event.delay_id)
+        if self.erase(event)? {
+            Ok(())
+        } else {
+            Err(DelayError::NotFound)
+        }
     }
 
     /// Record that a delay finished, for MSC4309's `/sync` report.
@@ -647,7 +939,71 @@ impl Delayed {
             &spindle_core::keys::finalised_delay(user_id, position, &record.delay_id),
             &encoded,
         )?;
+        self.store.put(
+            &spindle_core::keys::finalised_delay_by_id(&record.delay_id),
+            &spindle_core::keys::finalised_delay_by_id_value(user_id, position),
+        )?;
+        // MSC4140: the event a delay became carries the delay's id in its
+        // `unsigned`, for its sender, so a client can match the event it
+        // sees to the delay it scheduled.
+        if let Some(event_id) = &record.event_id {
+            self.store.put(
+                &spindle_core::keys::delay_echo(user_id, event_id),
+                record.delay_id.as_bytes(),
+            )?;
+        }
         self.prune_finalised(user_id)
+    }
+
+    /// How `delay_id` finished, and whose it was, if it has finished and the
+    /// record is still kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if the rows cannot be read.
+    pub fn outcome(&self, delay_id: &str) -> Result<Option<(String, FinalisedDelay)>, DelayError> {
+        let Some(raw) = self
+            .store
+            .get(&spindle_core::keys::finalised_delay_by_id(delay_id))?
+        else {
+            return Ok(None);
+        };
+        let Some((user_id, position)) = spindle_core::keys::finalised_delay_by_id_parts(&raw)
+        else {
+            return Ok(None);
+        };
+        let Some(record) = self.store.get(&spindle_core::keys::finalised_delay(
+            &user_id, position, delay_id,
+        ))?
+        else {
+            return Ok(None);
+        };
+        Ok(serde_json::from_slice(&record)
+            .ok()
+            .map(|record| (user_id, record)))
+    }
+
+    /// What `action` on a delay that is no longer pending comes to: success
+    /// when it agrees with how the delay ended, [`DelayError::Conflict`]
+    /// when it does not, and [`DelayError::NotFound`] when there is no
+    /// record of it -- or the record is someone else's, when `sender` names
+    /// who is asking.
+    fn after_the_fact(
+        &self,
+        delay_id: &str,
+        sender: Option<&str>,
+        action: Action,
+    ) -> Result<Option<DelayedEvent>, DelayError> {
+        match self.outcome(delay_id)? {
+            Some((owner, record)) if sender.is_none_or(|sender| sender == owner) => {
+                if record.agrees_with(action) {
+                    Ok(None)
+                } else {
+                    Err(DelayError::Conflict)
+                }
+            }
+            _ => Err(DelayError::NotFound),
+        }
     }
 
     /// Drop the oldest finalised rows past the cap.
@@ -662,8 +1018,12 @@ impl Delayed {
         let Some(excess) = rows.len().checked_sub(self.max_finalised) else {
             return Ok(());
         };
-        for (key, _) in rows.into_iter().take(excess) {
+        for (key, raw) in rows.into_iter().take(excess) {
             self.store.delete(&key)?;
+            if let Ok(record) = serde_json::from_slice::<FinalisedDelay>(&raw) {
+                self.store
+                    .delete(&spindle_core::keys::finalised_delay_by_id(&record.delay_id))?;
+            }
         }
         Ok(())
     }
@@ -696,7 +1056,9 @@ impl Delayed {
             if position > until || since.is_some_and(|since| position <= since) {
                 continue;
             }
-            if let Ok(record) = serde_json::from_slice::<FinalisedDelay>(&raw) {
+            if let Ok(record) = serde_json::from_slice::<FinalisedDelay>(&raw)
+                && !record.cancelled
+            {
                 out.push(record);
             }
         }
@@ -710,14 +1072,77 @@ impl Delayed {
     }
 }
 
+/// A refusal as MSC4140 reports it: the error code a client would have met
+/// sending the event itself, and the message.
+#[must_use]
+pub fn refusal(error: &crate::rooms::RoomError) -> (String, String) {
+    let errcode = match error {
+        crate::rooms::RoomError::Forbidden(_) => "M_FORBIDDEN",
+        crate::rooms::RoomError::UnknownRoom(_) => "M_NOT_FOUND",
+        _ => "M_UNKNOWN",
+    };
+    (errcode.to_owned(), error.to_string())
+}
+
+/// A graceful stop keeps the heartbeats.
+///
+/// `restart` moves a deadline in memory only (see [`Delayed::restarts`]),
+/// which is the right trade for a crash -- the delay fires early, never
+/// late -- but a planned restart is not a crash, and losing every bump on
+/// one would fire every live call's pending leave the moment the server
+/// came back, dropping everyone in every call at once. So the last holder
+/// of the scheduler, which is the server shutting down, settles each moved
+/// deadline into its row on the way out.
+impl Drop for Delayed {
+    fn drop(&mut self) {
+        let restarts = std::mem::take(
+            &mut *self
+                .restarts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let mut kept = 0_usize;
+        for (delay_id, deadline) in restarts {
+            let Ok(Some(queued_at)) = self.queued_at(&delay_id) else {
+                continue;
+            };
+            let Ok(Some(raw)) = self
+                .store
+                .get(&spindle_core::keys::delayed_event(queued_at, &delay_id))
+            else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_slice::<DelayedEvent>(&raw) else {
+                continue;
+            };
+            if self
+                .store
+                .delete(&spindle_core::keys::delayed_event(queued_at, &delay_id))
+                .is_ok()
+                && self
+                    .write(&DelayedEvent {
+                        fire_at_ms: deadline,
+                        ..event
+                    })
+                    .is_ok()
+            {
+                kept += 1;
+            }
+        }
+        if kept > 0 {
+            tracing::info!("kept {kept} restarted delayed-event deadlines across shutdown");
+        }
+    }
+}
+
 /// Send delays as they come due, for the life of the process.
 ///
 /// Polls rather than sleeping until the next deadline, because the deadline
 /// moves: a `restart` from any request handler can pull one earlier or push
 /// it later, and a task parked on a timer would have to be woken by every
-/// one of them. At one tick a second the cost is a single row read when
-/// nothing is due, and a heartbeat's whole point is that a second of
-/// imprecision does not matter.
+/// one of them. At ten ticks a second the cost is a single row read when
+/// nothing is due (#350), and a delay lands within a tenth of a second of
+/// its deadline.
 ///
 /// **Nothing here recovers a missed firing specially, because there is
 /// nothing to recover.** A row is due at a wall-clock time; a server that was
@@ -778,14 +1203,7 @@ pub async fn fire_loop(
             // MSC4309: whatever happened, the client that scheduled this is
             // very likely not here -- that is what a dead-man's switch means
             // -- so the outcome is recorded for its next sync to carry.
-            let record = FinalisedDelay {
-                delay_id: event.delay_id.clone(),
-                room_id: event.room_id.clone(),
-                event_type: event.event_type.clone(),
-                state_key: event.state_key.clone(),
-                event_id: sent.as_ref().ok().cloned(),
-                error: sent.as_ref().err().map(ToString::to_string),
-            };
+            let record = FinalisedDelay::of(&event, sent.as_ref().cloned().map_err(refusal));
             // A send takes the position of the event it produced; a refusal
             // takes the head, because nothing was appended and there is no
             // position of its own to take.
@@ -969,6 +1387,81 @@ mod restart_hot_path_tests {
             reopened.due(queued_at).unwrap().len(),
             1,
             "so it fires there, which is earlier than the client asked for"
+        );
+    }
+
+    /// A graceful stop is not a crash: the scheduler's last holder settles
+    /// every moved deadline into its row, so a planned restart does not
+    /// fire every live call's pending leave the moment the server is back.
+    #[test]
+    fn a_graceful_stop_keeps_the_restarted_deadline() {
+        let (_dir, store, delayed) = delayed();
+        let id = schedule(&delayed, 60_000);
+        let queued_at = delayed.get(&id, "@alice:example.org").unwrap().fire_at_ms;
+        a_moment();
+        delayed
+            .act(&id, "@alice:example.org", Action::Restart)
+            .unwrap();
+        let live = delayed.get(&id, "@alice:example.org").unwrap().fire_at_ms;
+        assert!(live > queued_at);
+
+        drop(delayed);
+        let reopened = Delayed::new(Arc::clone(&store));
+        assert_eq!(
+            reopened.get(&id, "@alice:example.org").unwrap().fire_at_ms,
+            live,
+            "the restart was lost on a clean stop"
+        );
+        assert!(
+            reopened.due(queued_at).unwrap().is_empty(),
+            "and nothing fires at the old deadline"
+        );
+    }
+
+    /// The per-room and per-user counts follow schedules, cancels and
+    /// firings, and are rebuilt from the queue by a fresh scheduler.
+    #[test]
+    fn the_caps_count_what_is_pending_and_nothing_else() {
+        let (_dir, store, delayed) = delayed();
+        let delayed = delayed.with_user_cap(3);
+        let first = schedule(&delayed, 60_000);
+        schedule(&delayed, 60_000);
+        schedule(&delayed, 60_000);
+        assert!(matches!(
+            delayed.schedule(
+                "!room:example.org",
+                "@alice:example.org",
+                "m.room.message",
+                None,
+                &serde_json::json!({}),
+                60_000,
+                None,
+            ),
+            Err(DelayError::TooMany {
+                per_room: false,
+                ..
+            })
+        ));
+        delayed
+            .act(&first, "@alice:example.org", Action::Cancel)
+            .unwrap();
+        schedule(&delayed, 60_000);
+
+        let reopened = Delayed::new(Arc::clone(&store)).with_user_cap(3);
+        assert!(
+            matches!(
+                reopened.schedule(
+                    "!other:example.org",
+                    "@alice:example.org",
+                    "m.room.message",
+                    None,
+                    &serde_json::json!({}),
+                    60_000,
+                    None,
+                ),
+                Err(DelayError::TooMany { .. })
+            ),
+            "the counts were not rebuilt from what is pending"
         );
     }
 

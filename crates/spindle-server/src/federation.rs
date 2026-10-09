@@ -2287,6 +2287,54 @@ impl Federation {
         Ok(())
     }
 
+    /// Send one federation request an application service asked for
+    /// (MSC4512's `fed_proxy`), signed as this server, and relay what came
+    /// back: the status and, when it is JSON, the body.
+    ///
+    /// The caller has already confined `uri` to the service's own prefix;
+    /// this only signs, sends and reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] when the request cannot be signed or the
+    /// destination cannot be reached -- not when it answers with an error,
+    /// which is relayed.
+    pub async fn remote_proxy(
+        &self,
+        destination: &str,
+        method: reqwest::Method,
+        uri: &str,
+        body: Option<&Value>,
+    ) -> Result<(u16, Option<Value>), FederationError> {
+        let authorization = self.sign_request(method.as_str(), uri, destination, body)?;
+        let mut request = self
+            .request(method, destination, uri)
+            .await?
+            .header("authorization", authorization)
+            .timeout(Duration::from_secs(30));
+        if let Some(body) = body {
+            request = request
+                .header("content-type", "application/json")
+                .body(body.to_string());
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| FederationError::Refused(format!("fed_proxy: {error}")))?;
+        let status = response.status().as_u16();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| FederationError::Refused(format!("fed_proxy body: {error}")))?;
+        Ok((status, serde_json::from_slice(&bytes).ok()))
+    }
+
+    /// This server's own name, which a proxied request may not be sent to.
+    #[must_use]
+    pub fn own_name(&self) -> &str {
+        &self.server_name
+    }
+
     /// Fetch a peer's media over authenticated federation (MSC3916),
     /// falling back to the legacy public endpoint for older peers.
     ///

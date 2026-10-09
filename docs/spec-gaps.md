@@ -71,13 +71,15 @@ and the diff is the work the release brought.
 
 ## Served beyond the spec at this pin
 
-133 routes the pinned spec does not define: MSC surfaces under
+141 routes the pinned spec does not define: MSC surfaces under
 `unstable/`, the admin and MAS-compatibility APIs, and stable spellings
 newer than the pin. Each MSC route must be accounted for in
 `contrib/msc/ledger.toml`; `scripts/msc-ledger.py --check` enforces that.
 
 - `/.well-known/openid-configuration`
 - `/_matrix/client/unstable/im.nheko.summary/rooms/{}/summary`
+- `/_matrix/client/unstable/io.element.msc4502/rooms/{}/is_joined`
+- `/_matrix/client/unstable/io.element.msc4512/appservice/fed_proxy`
 - `/_matrix/client/unstable/org.matrix.msc2965/auth_metadata`
 - `/_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device`
 - `/_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device/{}/events`
@@ -85,9 +87,15 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_matrix/client/unstable/org.matrix.msc4140/delayed_events`
 - `/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{}`
 - `/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{}/{}`
+- `/_matrix/client/unstable/org.matrix.msc4140/rooms/{}/delayed_event/{}/{}`
 - `/_matrix/client/unstable/org.matrix.msc4143/rtc/transports`
 - `/_matrix/client/unstable/org.matrix.simplified_msc3575/sync`
+- `/_matrix/client/v1/appservice/fed_proxy`
+- `/_matrix/client/v1/delayed_events/{}`
+- `/_matrix/client/v1/delayed_events/{}/{}`
 - `/_matrix/client/v1/rtc/transports`
+- `/_matrix/client/v3/rooms/{}/delayed_event/{}/{}`
+- `/_matrix/client/v3/rooms/{}/is_joined`
 - `/_matrix/client/v3/rooms/{}/state/{}`
 - `/_matrix/federation/v1/send_join/{}/{}`
 - `/_matrix/federation/v1/send_leave/{}/{}`
