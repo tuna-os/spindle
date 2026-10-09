@@ -7469,7 +7469,7 @@ fn sliding_room_entry(
     } else {
         state
             .rooms
-            .timeline_tail_public(room_id, timeline_limit.min(50))
+            .timeline_tail_for_preview(room_id, timeline_limit.min(50))
             .map_err(room_error)?
     };
     let events = state

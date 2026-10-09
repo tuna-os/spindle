@@ -403,6 +403,10 @@ impl Pass<'_> {
     /// Every notification `event` produces: one per `(reader, gateway,
     /// format)`, carrying every device of that reader on that gateway.
     fn notifications_for(&mut self, room_id: &str, event: &Value) -> Vec<(String, Pending)> {
+        // A dummy event merges forks (#626); it is nobody's news.
+        if crate::rooms::extremities::is_dummy_event(event) {
+            return Vec::new();
+        }
         let sender = event["sender"].as_str().unwrap_or_default().to_owned();
         let Some(facts) = self.facts_of(room_id) else {
             return Vec::new();

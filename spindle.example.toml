@@ -412,6 +412,24 @@ registrations = []
 # next delay is due. Must be > 0.
 # max_per_user = 1000
 
+[rooms]
+# Merging forks (#626). While a room has several forward extremities, every
+# event it receives re-resolves its state over all of them. A fork no event
+# cites again -- tips from an import, or ones only this server holds in a
+# room where no local user speaks -- never merges by itself. Like Synapse,
+# Spindle then sends an empty org.matrix.dummy_event from a local member
+# that names the tips, and it federates like any event. Clients hide it, and
+# it never counts as unread.
+#
+# dummy_events = true
+# Merge any room with more forward extremities than this (at least 2).
+# max_forward_extremities = 10
+# Merge a room that received an event while forked once its oldest
+# extremity is this many seconds old.
+# stale_forward_extremity_secs = 3600
+# The fewest seconds between two dummy events in one room.
+# dummy_event_interval_secs = 300
+
 [limits]
 # Ceilings on what one account may make this server hold. Each of these
 # stores grew without bound under an ordinary registered account before the

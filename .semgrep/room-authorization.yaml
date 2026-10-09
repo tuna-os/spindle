@@ -76,3 +76,13 @@ rules:
             let $SCOPE = read_scope(...)?;
             ...
           }
+      # A `RoomReader` (#258 follow-up): `rooms.reader` runs `read_scope`
+      # and hands back a reader bounded by it, or refuses. A room read after
+      # the handler holds one has already been through the gate -- the
+      # gap-backfill poke on `/messages` (#619) reads `has_open_gap` that way.
+      - pattern-not-inside: |
+          async fn $HANDLER(...) -> $RET {
+            ...
+            let $READER = $STATE.rooms.reader(...).map_err(...)?;
+            ...
+          }

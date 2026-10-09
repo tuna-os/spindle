@@ -15,7 +15,10 @@ jobs:
   rust:
     name: Rust quality gate
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 20 was marginal: main's own runs took 12-19 min, and the integration
+    # suite keeps growing. A timeout cancels the job instead of failing a
+    # test, so it reports nothing useful. Raise it rather than cut coverage.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # `rust-toolchain.toml` pins the version and rustup honours it over
@@ -24,7 +27,7 @@ jobs:
       # building on 1.89. It could not have built on 1.85: `rust-version`
       # in Cargo.toml is 1.89, and cargo refuses outright below it. Left
       # unset so there is one place the version is declared.
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: 1.90.0
           components: clippy,rustfmt

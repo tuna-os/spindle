@@ -43,6 +43,8 @@ pub struct Config {
     pub push: PushConfig,
     #[serde(default)]
     pub registration: RegistrationConfig,
+    #[serde(default)]
+    pub rooms: RoomsConfig,
     /// Absent means this server sends no notices and the admin endpoint
     /// says so.
     #[serde(default)]
@@ -318,6 +320,55 @@ const fn default_max_per_room() -> usize {
 
 const fn default_max_per_user() -> usize {
     crate::delayed::DEFAULT_MAX_PER_USER
+}
+
+/// `[rooms]`: keeping rooms' forward extremities merged (#626).
+///
+/// A fork that no event cites again makes every append to its room
+/// re-resolve the room's state. Synapse merges such forks by sending an
+/// `org.matrix.dummy_event` from a local member, and these settings decide
+/// when Spindle does the same (`rooms::extremities`).
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoomsConfig {
+    /// Send dummy events to merge forks at all.
+    #[serde(default = "default_true")]
+    pub dummy_events: bool,
+    /// Merge a room with more forward extremities than this. Synapse's
+    /// `dummy_events_threshold`, and the same default.
+    #[serde(default = "default_max_forward_extremities")]
+    pub max_forward_extremities: usize,
+    /// Merge a room that an append left forked once its oldest forward
+    /// extremity is this many seconds old. A young fork usually merges by
+    /// itself, and an old one in a busy room never will.
+    #[serde(default = "default_stale_forward_extremity_secs")]
+    pub stale_forward_extremity_secs: u64,
+    /// The fewest seconds between two dummy events in one room.
+    #[serde(default = "default_dummy_event_interval_secs")]
+    pub dummy_event_interval_secs: u64,
+}
+
+impl Default for RoomsConfig {
+    fn default() -> Self {
+        Self {
+            dummy_events: true,
+            max_forward_extremities: default_max_forward_extremities(),
+            stale_forward_extremity_secs: default_stale_forward_extremity_secs(),
+            dummy_event_interval_secs: default_dummy_event_interval_secs(),
+        }
+    }
+}
+
+const fn default_max_forward_extremities() -> usize {
+    10
+}
+
+const fn default_stale_forward_extremity_secs() -> u64 {
+    3_600
+}
+
+const fn default_dummy_event_interval_secs() -> u64 {
+    300
 }
 
 /// Caps on what one account may make this server keep (#268).
@@ -1271,6 +1322,18 @@ impl Config {
         Ok(())
     }
 
+    fn validate_rooms(&self) -> Result<(), ConfigError> {
+        // One extremity is a room with no fork; a threshold below two would
+        // send a dummy event into a room after every fork, however young.
+        if self.rooms.max_forward_extremities < 2 {
+            return Err(ConfigError::Invalid {
+                field: "rooms.max_forward_extremities",
+                message: "must be at least 2".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     fn validate_media(&self) -> Result<(), ConfigError> {
         if self.media.max_upload_bytes == 0 || self.media.max_upload_bytes == usize::MAX {
             return Err(ConfigError::Invalid {
@@ -1288,6 +1351,7 @@ impl Config {
         // dead-man's switch silently stops working. An operator who typed
         // it meant something else, so say so rather than starting.
         self.validate_delayed_events()?;
+        self.validate_rooms()?;
         self.validate_peers()?;
         // A ring budget of zero is not "unlimited" either: it refuses every
         // ring, and a call nobody can be summoned to is a feature silently

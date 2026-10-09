@@ -58,29 +58,36 @@ spindle set-password-hash <config> <localpart> < hash
 spindle set-password-hash <config> < hashes
 ```
 
-Stores Argon2 PHC hashes computed elsewhere (#611) — a Matrix
-Authentication Service's `user_passwords.hashed_password`, typically — so
-those users sign in to Spindle with the passwords they already have. The
-hashes come from stdin, never the command line, so they do not land in a
-process listing or shell history. With a localpart, stdin is that one
-account's hash; without, each line is `<localpart> <hash>` (`@user:server`
-works too; blank lines and `#` comments are skipped).
+Stores Argon2 hashes in PHC form that another system made (#611). This is
+usually the `user_passwords.hashed_password` of a Matrix Authentication
+Service. Those users then sign in to Spindle with the passwords they
+already have. The hashes come from stdin, never the command line, so they
+do not show in a process listing or shell history.
 
-Each hash is validated before it is written: `argon2id`, `argon2i` or
-`argon2d`, version 16 or 19, exactly the `m`/`t`/`p` parameters, with
-`m` at most 256 MiB and `t`, `p` at most 16. Anything else — bcrypt,
-pbkdf2, a keyed `keyid=`/`data=` hash — is refused, because a stored hash
-this server cannot verify is an account nobody can enter. A hash made with
-a pepper that is *not* recorded in the string (MAS's per-scheme `secret`)
-looks ordinary, is accepted, and never verifies: check your MAS
-`passwords.schemes` before importing. Accounts must already exist (the
-Synapse importer creates them); a refused line is named by line number
-and localpart, never with its hash, and the command exits non-zero while
-anything was refused. Offline like every command here; the running
-server's equivalent is `POST /_spindle/admin/v1/users/{user_id}/password_hash`
-with `{"password_hash": "...", "logout_devices": false}`, which also works
-while authentication is still delegated, so hashes can land before a
-cutover.
+With a localpart,
+stdin is the hash of that one account. Without one, each line is
+`<localpart> <hash>` (`@user:server` works too, and the command does not read
+blank lines and `#` comments).
+
+The command validates each hash before it writes it. It must be
+`argon2id`, `argon2i` or `argon2d`, version 16 or 19, with exactly the
+`m`/`t`/`p` parameters. `m` is 256 MiB at most, and `t` and `p` are 16 at
+most. The command refuses all other hashes (bcrypt, pbkdf2, a keyed
+`keyid=`/`data=` hash). If this server cannot verify a stored hash,
+nobody can enter that account.
+
+A hash made with a pepper that the string does *not* record (the
+per-scheme `secret` of MAS) looks ordinary. The command accepts it, but it
+never verifies. Check your MAS `passwords.schemes` before the import.
+
+The
+accounts must already exist (the Synapse importer makes them). The command
+names a refused line by line number and localpart, never with its hash.
+If it refused a line, it exits non-zero. Like each command here, it works
+offline. For a live server, use
+`POST /_spindle/admin/v1/users/{user_id}/password_hash` with
+`{"password_hash": "...", "logout_devices": false}`. This also works while
+authentication is still delegated, so hashes can land before a cutover.
 
 ## Issuing a password-reset link
 
@@ -88,19 +95,23 @@ cutover.
 spindle issue-reset-link <config> <localpart> [--ttl 24h]
 ```
 
-For a user who cannot sign in, on a server that sends no mail (or for
-anyone, really): prints a single-use link to the built-in provider's
-*choose a new password* page, on the configured issuer. Hand it over by a
-channel you trust; whoever opens it can set the account's password, and
-doing so signs every device out. `--ttl` takes `30m`, `24h`, `2d` or
-seconds; a day by default, a week at most. Only the newest link of an
-account works, so issuing another (or the user requesting a mailed one)
-retires this one. The token is stored only as a digest. Needs
-`auth.builtin_oidc`; offline like the other commands here, and the running
-server's equivalent is `POST /_spindle/admin/v1/users/{user_id}/reset_link`
-(optional body `{"ttl": "2h"}`), which audit-logs the issuance without the
-token. Users can also recover on their own with the recovery codes the
-account pages generate — see [delegated-auth.md](delegated-auth.md).
+This is for a user who cannot sign in, on a server that sends no mail
+(or for any user). It prints a link to the *choose a new password* page of
+the built-in provider, on the configured issuer. The link works one time.
+Give it by a channel you trust. The person who opens it can set the
+password of the account, and that signs each device out.
+
+`--ttl` takes `30m`, `24h`, `2d` or seconds: a day by default, a week at
+most. Only the newest link of an account works. A new link (or a mailed
+one that the user asks for) retires this one. The server keeps only a
+digest of the token.
+
+The command needs `auth.builtin_oidc` and works
+offline, like the other commands here. For a live server, use
+`POST /_spindle/admin/v1/users/{user_id}/reset_link` (optional body
+`{"ttl": "2h"}`). It records the link in the audit log without the token.
+Users can also recover on their own with the recovery codes of the
+account pages. See [delegated-auth.md](delegated-auth.md).
 
 ## Migration
 
