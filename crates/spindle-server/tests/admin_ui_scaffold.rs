@@ -46,8 +46,7 @@ impl Harness {
             "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n",
         )
         .expect("the configuration is valid");
-        let app = spindle_server::app(config, store)
-            .expect("a signing key is established");
+        let app = spindle_server::app(config, store).expect("a signing key is established");
         Self { _dir: dir, app }
     }
 

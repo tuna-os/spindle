@@ -21,15 +21,9 @@ use axum::routing::get;
 
 use crate::AppState;
 
-const INDEX_HTML: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/admin-ui/index.html"
-));
+const INDEX_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/admin-ui/index.html"));
 const APP_JS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/admin-ui/app.js"));
-const STYLES_CSS: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/admin-ui/styles.css"
-));
+const STYLES_CSS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/admin-ui/styles.css"));
 
 /// The console's three static routes, under the `/_spindle` namespace
 /// only: the Synapse alias exists for API compatibility, not for pages.
@@ -48,12 +42,18 @@ async fn index() -> Html<&'static str> {
 /// `GET /_spindle/admin/ui/app.js` — the console script.
 async fn script() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
         APP_JS,
     )
 }
 
 /// `GET /_spindle/admin/ui/styles.css` — the console stylesheet.
 async fn stylesheet() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], STYLES_CSS)
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        STYLES_CSS,
+    )
 }
