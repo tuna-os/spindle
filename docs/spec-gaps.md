@@ -71,13 +71,15 @@ and the diff is the work the release brought.
 
 ## Served beyond the spec at this pin
 
-141 routes the pinned spec does not define: MSC surfaces under
+150 routes the pinned spec does not define: MSC surfaces under
 `unstable/`, the admin and MAS-compatibility APIs, and stable spellings
 newer than the pin. Each MSC route must be accounted for in
 `contrib/msc/ledger.toml`; `scripts/msc-ledger.py --check` enforces that.
 
 - `/.well-known/openid-configuration`
 - `/_matrix/client/unstable/im.nheko.summary/rooms/{}/summary`
+- `/_matrix/client/unstable/io.element.msc4195/rtc/livekit/delegate_delayed_leave`
+- `/_matrix/client/unstable/io.element.msc4195/rtc/livekit/get_token`
 - `/_matrix/client/unstable/io.element.msc4502/rooms/{}/is_joined`
 - `/_matrix/client/unstable/io.element.msc4512/appservice/fed_proxy`
 - `/_matrix/client/unstable/org.matrix.msc2965/auth_metadata`
@@ -97,6 +99,10 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_matrix/client/v3/rooms/{}/delayed_event/{}/{}`
 - `/_matrix/client/v3/rooms/{}/is_joined`
 - `/_matrix/client/v3/rooms/{}/state/{}`
+- `/_matrix/client/v3/rtc/livekit/delegate_delayed_leave`
+- `/_matrix/client/v3/rtc/livekit/get_token`
+- `/_matrix/federation/unstable/io.element.msc4195/rtc/livekit/get_token`
+- `/_matrix/federation/v1/rtc/livekit/get_token`
 - `/_matrix/federation/v1/send_join/{}/{}`
 - `/_matrix/federation/v1/send_leave/{}/{}`
 - `/_spindle/admin/v1/audit`
@@ -119,6 +125,7 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_spindle/admin/v1/rooms/{}/state`
 - `/_spindle/admin/v1/rooms/{}/state_at`
 - `/_spindle/admin/v1/rooms/{}/timeline`
+- `/_spindle/admin/v1/rtc/sfu`
 - `/_spindle/admin/v1/scheduled_tasks`
 - `/_spindle/admin/v1/send_server_notice`
 - `/_spindle/admin/v1/server_version`
@@ -136,6 +143,7 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_spindle/admin/v1/users/{}/reset_password`
 - `/_spindle/admin/v1/whois/{}`
 - `/_spindle/rtc/livekit/sfu/get`
+- `/_spindle/rtc/livekit/sfu/webhook`
 - `/_synapse/admin/v1/audit`
 - `/_synapse/admin/v1/deactivate/{}`
 - `/_synapse/admin/v1/event_reports`
@@ -160,6 +168,7 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_synapse/admin/v1/rooms/{}/state`
 - `/_synapse/admin/v1/rooms/{}/state_at`
 - `/_synapse/admin/v1/rooms/{}/timeline`
+- `/_synapse/admin/v1/rtc/sfu`
 - `/_synapse/admin/v1/scheduled_tasks`
 - `/_synapse/admin/v1/send_server_notice`
 - `/_synapse/admin/v1/server_version`

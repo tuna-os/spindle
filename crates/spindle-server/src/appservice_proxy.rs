@@ -339,6 +339,26 @@ pub(crate) fn split(path: &str) -> Option<(Api, &str)> {
 /// The router's fallback: a path a service claims (MSC4512) is forwarded to
 /// it; anything else is the spec's `M_UNRECOGNIZED`.
 pub(crate) async fn proxy_or_unknown(State(state): State<AppState>, request: Request) -> Response {
+    match forward_claimed(&state, request).await {
+        Err(response) => response,
+        Ok(_) => unrecognized(),
+    }
+}
+
+/// A routed handler's first question, where the built-in service and a
+/// sidecar can both answer: when a service claimed the path (MSC4512) the
+/// request is forwarded to it and `Err(response)` returns; otherwise
+/// `Ok(request)` hands it back and the built-in serves.
+///
+/// The built-in MSC4195 endpoints need this because the router matches
+/// them before the fallback: without it, configuring `lk-jwt-service` as
+/// the homeserver's sidecar (option C) would silently stop reaching it
+/// the moment the built-in program is on, and the claim in the
+/// registration would be a lie.
+pub(crate) async fn forward_claimed(
+    state: &AppState,
+    request: Request,
+) -> Result<Request, Response> {
     let path = request.uri().path().to_owned();
     let Some((api, service)) = split(&path).and_then(|(api, rest)| {
         state
@@ -346,11 +366,11 @@ pub(crate) async fn proxy_or_unknown(State(state): State<AppState>, request: Req
             .proxy_for(rest)
             .map(|service| (api, std::sync::Arc::clone(service)))
     }) else {
-        return unrecognized();
+        return Ok(request);
     };
-    match forward(&state, api, &service, request).await {
+    Err(match forward(state, api, &service, request).await {
         Ok(response) | Err(response) => response,
-    }
+    })
 }
 
 fn unrecognized() -> Response {
