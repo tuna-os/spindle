@@ -129,7 +129,15 @@ async fn put_device(
     Authenticated(identity): Authenticated,
     Json(request): Json<PutRequest>,
 ) -> Result<Json<Value>, MatrixError> {
-    if request.device_id.is_empty() || request.device_id.contains(['/', '\0']) {
+    // A slash is allowed. matrix-rust-sdk names a dehydrated device after
+    // its Curve25519 key in unpadded standard base64, so about half of them
+    // contain a '/'. Refusing those failed Element Web's dehydration setup
+    // after recovery about half the time, and that failure aborted the
+    // step after it, which loads the key-backup key: the fresh device was
+    // verified but could not decrypt its history. The ID is length-framed
+    // in every store key, and the one route that names it in a path
+    // receives it percent-encoded, so a slash means nothing to this server.
+    if request.device_id.is_empty() || request.device_id.contains('\0') {
         return Err(MatrixError::bad_json("device_id must be a device ID"));
     }
     if !request.device_data.is_object()

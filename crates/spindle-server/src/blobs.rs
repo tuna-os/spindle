@@ -101,6 +101,23 @@ impl Blobs {
         }
     }
 
+    /// Remove the blob under `hash`. Removing an absent blob succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BlobError`] if the backend refuses.
+    pub async fn delete(&self, hash: &str) -> Result<(), BlobError> {
+        match self {
+            Self::Local { root } => match std::fs::remove_file(local_path(root, hash)) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    Err(BlobError::Io(error))
+                }
+                _ => Ok(()),
+            },
+            Self::S3(client) => client.delete(&s3_key(hash)).await.map_err(BlobError::S3),
+        }
+    }
+
     /// The bytes under `hash`, or `None`.
     ///
     /// # Errors

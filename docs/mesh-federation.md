@@ -43,7 +43,7 @@ Neutrino is stale; the fork has moved. Read from the code:
 | Event signatures | required on every inbound PDU (ruma `verify_event`) | produced on every event; verified against the origin's node id |
 | Key document | served, fetched from peers over `/_matrix/key/v2/server` | served in signed mode (`server_name` = 64-hex node id, key `ed25519:1`, the node id is the key) |
 | Request signing | every federation request signed and verified | not produced (`X-Matrix origin,destination` only) and not verified inbound |
-| Server names | hostname or literal; no `.well-known`/SRV | the node id; a hostname passes through to the wire unaltered |
+| Server names | hostname or literal; `.well-known` delegation, no SRV | the node id; a hostname passes through to the wire unaltered |
 | Transport | HTTPS, or `http` for a listed peer | `http://` to a proxy (the `neutrino-lb` egress) which carries CoAP over the iroh link |
 | Reaching a name | `[federation] peers` maps a name to a URL | the link takes the destination bytes as a node id; a hostname is unroutable |
 | Backoff to a dark peer | per-peer `max_backoff_ms`, rows kept until acked | full-jitter to about fifteen minutes, kicked on peer discovery |
@@ -400,8 +400,9 @@ Two things, in this order:
 ## What this page does not promise
 
 - The MSC3995 hub protocol, on either side.
-- Delegation. A peer whose name has `.well-known` or SRV delegation is
-  reached at the name; `peers` is the explicit override, not a resolver.
+- SRV delegation. A peer whose name has `.well-known` delegation is
+  reached where that names; one with only SRV records is reached at
+  `name:8448`. `peers` is the explicit override, not a resolver.
 - Merging the Neutrino patches upstream. `contrib/neutrino/` is a patch
   against the fork; the fork's owner carries it, and this page records
   what it does so it can be re-derived.

@@ -1,0 +1,25 @@
+{
+  "by_label_outcome": {
+    "post-A2:decrypted": 10,
+    "post-A:decrypted": 9,
+    "post-A:utd": 1,
+    "post-B:decrypted": 10,
+    "pre-A:decrypted": 15,
+    "pre-B:decrypted": 15
+  },
+  "device": "DEVD07C631E9ADB6A90",
+  "events": 60,
+  "failures": [
+    {
+      "event_id": "$XToocHHE0vOz5Lshg32NT52fVnb3yhTSs0Uq8PbJCaM",
+      "label": "post-A",
+      "outcome": "utd",
+      "sender": "@witness:witness.lab"
+    }
+  ],
+  "homeserver": "http://drill-b:8008/",
+  "how": "same device",
+  "pass": false,
+  "room": "!jJwQBRazJPYfrvvkys:reilly.asia",
+  "user": "@drill-b1:reilly.asia"
+}

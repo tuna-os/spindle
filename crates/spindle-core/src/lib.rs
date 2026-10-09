@@ -31,8 +31,9 @@ pub mod version;
 
 pub use log::{
     AppendError, ChainHash, DEFAULT_RESIDENT_WINDOW, EventId, EventInput, ForkWindow,
-    ForkWindowError, LinearIndex, LogEntry, NodeLoader, RestoreError, RestoredEntry, RestoredLog,
-    RoomLog, SetAside,
+    ForkWindowError, LinearIndex, LogEntry, LogRestore, MAX_AUTHORED_PREV_EVENTS, NodeLoader,
+    RestoreError, RestoredEntry, RestoredLog, RoomLog, RuntimeRestoredLog, Sideline,
+    SidelinedEntry, StateResolver, Strict,
 };
 pub use pdu::{Pdu, PduError};
 pub use state::{

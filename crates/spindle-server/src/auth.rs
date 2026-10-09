@@ -23,28 +23,62 @@ impl FromRequestParts<AppState> for Authenticated {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let token = bearer(parts).ok_or_else(MatrixError::missing_token)?;
-        let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
-        match accounts.identify(&token) {
-            Ok(Some(identity)) => {
-                refuse_if_locked_or_suspended(parts, &accounts, &identity)?;
-                Ok(Self(identity))
-            }
-            // Not a local session: an appservice's skeleton key, or —
-            // under MSC3861 delegation — a token only the provider can
-            // vouch for. The order is cheapest-check-first.
-            Ok(None) if state.appservices.by_token(&token).is_some() => {
-                appservice_identity(parts, state, &token).map(Self)
-            }
-            Ok(None) => match &state.delegated {
-                Some(delegated) => delegated
-                    .identify(state.store.as_ref(), &state.config.server.name, &token)
-                    .await
-                    .map(Self),
-                None => Err(MatrixError::unknown_token()),
-            },
-            Err(error) => Err(MatrixError::internal(&error.to_string())),
+        identify(parts, state, false).await.map(Self)
+    }
+}
+
+/// Account identity for `/whoami`, which can describe an admin session without
+/// a device. Device operations continue to require [`Authenticated`].
+pub struct AccountAuthenticated(pub Identity);
+
+impl FromRequestParts<AppState> for AccountAuthenticated {
+    type Rejection = MatrixError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        identify(parts, state, true).await.map(Self)
+    }
+}
+
+async fn identify(
+    parts: &mut Parts,
+    state: &AppState,
+    account_only: bool,
+) -> Result<Identity, MatrixError> {
+    let token = bearer(parts).ok_or_else(MatrixError::missing_token)?;
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    match accounts.identify(&token) {
+        Ok(Some(identity)) => {
+            refuse_if_locked_or_suspended(parts, &accounts, &identity)?;
+            Ok(identity)
         }
+        // Not a local session: an appservice's skeleton key, or —
+        // under MSC3861 delegation — a token only the provider can
+        // vouch for. The order is cheapest-check-first.
+        Ok(None) if state.appservices.by_token(&token).is_some() => {
+            appservice_identity(parts, state, &token)
+        }
+        Ok(None) => match &state.delegated {
+            Some(delegated) => {
+                let identity = if account_only {
+                    delegated
+                        .identify_account(state.store.as_ref(), &state.config.server.name, &token)
+                        .await?
+                } else {
+                    delegated
+                        .identify(state.store.as_ref(), &state.config.server.name, &token)
+                        .await?
+                };
+                if account_only {
+                    refuse_if_locked_or_suspended(parts, &accounts, &identity)?;
+                }
+                Ok(identity)
+            }
+            None => Err(MatrixError::unknown_token()),
+        },
+        Err(error) => Err(MatrixError::internal(&error.to_string())),
     }
 }
 
@@ -168,7 +202,7 @@ impl FromRequestParts<AppState> for MaybeAuthenticated {
 /// The `?access_token=` query parameter is the deprecated alternative and is
 /// deliberately not read: it lands in access logs, proxy logs and browser
 /// history, which is exactly what a bearer credential must not do.
-fn bearer(parts: &Parts) -> Option<String> {
+pub(crate) fn bearer(parts: &Parts) -> Option<String> {
     let value = parts.headers.get(AUTHORIZATION)?.to_str().ok()?;
     value
         .strip_prefix("Bearer ")

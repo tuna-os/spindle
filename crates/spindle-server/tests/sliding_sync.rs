@@ -414,6 +414,68 @@ async fn an_incremental_request_is_silent_about_unchanged_rooms() {
     );
 }
 
+/// Element X starts with a small window and grows it. A quiet room that
+/// enters the window has not changed, but the client has never been sent it:
+/// it must arrive in full, or the client's room list silently lacks it. This
+/// is how migrated reilly.asia accounts lost quiet rooms from Element X.
+#[tokio::test]
+async fn a_growing_window_sends_quiet_rooms_that_enter_it() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let quiet = harness.named_room(&alice, "quiet").await;
+    for name in ["a", "b"] {
+        let room = harness.named_room(&alice, name).await;
+        harness.say(&room, &alice, name, &format!("t{name}")).await;
+    }
+
+    // Rooms 0–1 of 3: the quiet room sorts last and is out of view.
+    let first = harness.sliding(&alice, None, &window()).await;
+    assert!(!first["rooms"].as_object().unwrap().contains_key(&quiet));
+    let pos = first["pos"].as_str().unwrap().to_owned();
+
+    // The client widens to 0–9 with nothing new on the server.
+    let mut wider = window();
+    wider["lists"]["main"]["ranges"] = json!([[0, 9]]);
+    let second = harness.sliding(&alice, Some(&pos), &wider).await;
+    let rooms = second["rooms"].as_object().unwrap();
+    assert!(
+        rooms.contains_key(&quiet),
+        "the quiet room entering the window is sent: {second}"
+    );
+    assert_eq!(rooms[&quiet]["initial"], json!(true), "in full: {second}");
+    assert_eq!(rooms.len(), 1, "rooms already sent stay silent: {second}");
+
+    // And once sent, it is silent again at the same window.
+    let pos = second["pos"].as_str().unwrap().to_owned();
+    let third = harness.sliding(&alice, Some(&pos), &wider).await;
+    assert!(
+        third["rooms"].as_object().unwrap().is_empty(),
+        "nothing new, nothing sent: {third}"
+    );
+}
+
+/// A `pos` minted before windows were recorded heals the client: every room
+/// in view is re-sent once.
+#[tokio::test]
+async fn a_pos_without_windows_resends_the_rooms_in_view() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.named_room(&alice, "only").await;
+
+    let first = harness.sliding(&alice, None, &window()).await;
+    let pos = first["pos"].as_str().unwrap();
+    let legacy = pos
+        .split_once('.')
+        .map_or(pos, |(stream, _)| stream)
+        .to_owned();
+
+    let second = harness.sliding(&alice, Some(&legacy), &window()).await;
+    assert!(
+        second["rooms"].as_object().unwrap().contains_key(&room),
+        "an old pos re-sends the window: {second}"
+    );
+}
+
 #[tokio::test]
 async fn a_subscription_reaches_a_room_outside_every_window() {
     let harness = Harness::new();

@@ -1,0 +1,103 @@
+{
+  "encrypted-v10": {
+    "encrypted": true,
+    "room_id": "!jJwQBRazJPYfrvvkys:reilly.asia",
+    "version": "10"
+  },
+  "fork-v10": {
+    "creator": "@drill-b1:reilly.asia",
+    "fork": {
+      "A_b2_power": 0,
+      "A_name": "fork: A side name",
+      "A_sees_B_topic_s": 12.7,
+      "A_topic": "fork: A side topic",
+      "B_b2_power": 0,
+      "B_name": "fork: A side name",
+      "B_sees_A_topic_s": 0.01,
+      "B_topic": "fork: A side topic",
+      "events": {
+        "A_name": "$czVbp4KzK2gyPYx3JcVmQI24qBmUiel1mqsrQAOYQiI",
+        "A_power": "$dtW0EXcs3jErLLycyf9n_wjY1yr40FRTJdcQ5IlZoKE",
+        "A_topic": "$c_Q4AICH67jEVSf6PS6UC28hdoCX1QIuhcTUTaGbcH4",
+        "B_power": "$cLboU6epLcboMbG0ulQgrJiJGNVyOrYurMtAN1GX9gE",
+        "B_topic": "$7TZ_6mHxtTnW0_-vrgT4HaLOyTVnAveH3RJ82warEfw"
+      },
+      "merge_A": "$tmewnIvPrYxiOWdBHvsLzTUbGkNE4Glebks9aH8OfkM",
+      "merge_B": "$WTF_Yul9-xHrCbtio657_95NCJvXQEzsIjTKNnYq9l8",
+      "room_id": "!XQcGaGIqHToDSLojtJ:reilly.asia",
+      "sides_agree": true
+    },
+    "members": [
+      "@drill-b1:reilly.asia",
+      "@witness:witness.lab",
+      "@wit2:witness.lab",
+      "@drill-b2:reilly.asia"
+    ],
+    "room_id": "!XQcGaGIqHToDSLojtJ:reilly.asia",
+    "version": "10"
+  },
+  "history-v10": {
+    "creator": "@drill-b1:reilly.asia",
+    "generated": 3000,
+    "members": [
+      "@drill-b1:reilly.asia",
+      "@witness:witness.lab",
+      "@wit2:witness.lab",
+      "@drill-b2:reilly.asia"
+    ],
+    "room_id": "!WpvjQmNLGeVSCrQGXP:reilly.asia",
+    "version": "10"
+  },
+  "v1": {
+    "creator": "@drill-b1:reilly.asia",
+    "members": [
+      "@drill-b1:reilly.asia",
+      "@witness:witness.lab",
+      "@drill-b2:reilly.asia"
+    ],
+    "room_id": "!GfNVdgJhOhlvfXUHSK:reilly.asia",
+    "version": "1"
+  },
+  "v10-general": {
+    "creator": "@drill-b1:reilly.asia",
+    "members": [
+      "@drill-b1:reilly.asia",
+      "@witness:witness.lab",
+      "@wit2:witness.lab",
+      "@drill-b2:reilly.asia"
+    ],
+    "room_id": "!UpTFCotHHetkcMTxeM:reilly.asia",
+    "version": "10"
+  },
+  "v12-witness-created": {
+    "creator": "@witness:witness.lab",
+    "members": [
+      "@witness:witness.lab",
+      "@drill-b1:reilly.asia",
+      "@drill-b2:reilly.asia",
+      "@wit2:witness.lab"
+    ],
+    "room_id": "!yQ1SqzDiKYxp7_hzwIb62xffSR822Ao6IWuCwgsOdLI",
+    "version": "12"
+  },
+  "v6": {
+    "creator": "@drill-b1:reilly.asia",
+    "members": [
+      "@drill-b1:reilly.asia",
+      "@witness:witness.lab",
+      "@drill-b2:reilly.asia"
+    ],
+    "room_id": "!eGAKNOtIYJgTECIGGK:reilly.asia",
+    "version": "6"
+  },
+  "v9": {
+    "creator": "@drill-b1:reilly.asia",
+    "members": [
+      "@drill-b1:reilly.asia",
+      "@witness:witness.lab",
+      "@drill-b2:reilly.asia"
+    ],
+    "room_id": "!gllblumXbTgEdNUayt:reilly.asia",
+    "version": "9"
+  }
+}

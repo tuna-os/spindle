@@ -25,6 +25,14 @@ use crate::accounts::Accounts;
 use crate::errors::MatrixError;
 use crate::routes::{MAX_TXN_ID_LEN, record_invite, room_error};
 
+mod backfill;
+mod gap;
+mod recovery;
+
+pub(crate) use backfill::run as run_backfill;
+pub use backfill::{GapBackfill, Settings as BackfillSettings, Sources as BackfillSources};
+pub use recovery::RecoveryGate;
+
 /// Say that a peer's event was refused, and name what it was refused over.
 ///
 /// Otherwise this is silent. The transaction still answers 200 -- one bad
@@ -57,19 +65,16 @@ pub(crate) fn report_refused_pdu(origin: &str, event_id: &str, pdu: &Value, reas
 /// membership event the origin relays on behalf of a user elsewhere (a join,
 /// knock or leave it brokered), that user's own server -- see
 /// [`relayed_membership_signer`].
-pub(crate) fn receive_one_pdu(
+pub(crate) fn receive_brokered_pdu(
     state: &AppState,
     signer: &str,
     keys: Option<&crate::federation::PeerKeys>,
     pdu: &Value,
-    delivery: Delivery,
 ) -> (String, Result<(), String>) {
     use ruma::CanonicalJsonValue;
 
-    // The same acceptance either way; only who fans the event out differs.
-    let receive = |room_id: &str, event_id: &str, json: &Value| match delivery {
-        Delivery::Transaction => state.rooms.receive_remote(room_id, event_id, json),
-        Delivery::Brokered => state.rooms.receive_brokered(room_id, event_id, json),
+    let receive = |room_id: &str, event_id: &str, json: &Value| {
+        state.rooms.receive_brokered(room_id, event_id, json)
     };
 
     let Ok(CanonicalJsonValue::Object(canonical)) = CanonicalJsonValue::try_from(pdu.clone())
@@ -112,7 +117,18 @@ pub(crate) fn receive_one_pdu(
         // Which of the peer's keys may answer for this event depends on
         // when the peer says it signed it: a key retired at `expired_ts`
         // verifies nothing claimed after that moment (#296).
-        let key_map = keys.map_for(pdu["origin_server_ts"].as_u64());
+        let enforce =
+            spindle_core::rules_of(&version).is_some_and(|rules| rules.enforce_key_validity);
+        let mut key_map = keys.map_for(pdu["origin_server_ts"].as_u64(), enforce);
+        // A restricted join can already carry our countersignature, which
+        // its own server's published keys cannot verify.
+        key_map
+            .entry(state.config.server.name.clone())
+            .or_default()
+            .insert(
+                state.key.key_id(),
+                ruma::serde::Base64::new(state.key.pair().public_key().to_vec()),
+            );
         match spindle_core::version::verify(&key_map, &canonical, &version) {
             Ok(ruma::signatures::Verified::All) => {}
             // The signature holds but the content hash does not: someone
@@ -136,7 +152,20 @@ pub(crate) fn receive_one_pdu(
                     Err(error) => (event_id, Err(error.to_string())),
                 };
             }
-            Err(error) => return (event_id, Err(format!("signature: {error}"))),
+            Err(error) => {
+                let error = error.to_string();
+                let reason = crate::federation::Federation::classify_signature_failure(
+                    Some(keys),
+                    Some(signer),
+                    pdu,
+                    &error,
+                );
+                state.metrics.record_signature_failure(reason);
+                return (
+                    event_id,
+                    Err(format!("signature: {}: {error}", reason.label())),
+                );
+            }
         }
     }
 
@@ -178,6 +207,15 @@ fn room_version_of(state: &AppState, pdu: &Value) -> ruma::RoomVersionId {
         return ruma::RoomVersionId::try_from(spindle_core::STATE_DAG_V12)
             .unwrap_or_else(|_| fallback());
     }
+    // `[id, hashes]` references are v1/v2's shape and nobody else's; the
+    // two name events alike, so v1 reads either.
+    if pdu["auth_events"]
+        .as_array()
+        .and_then(|edges| edges.first())
+        .is_some_and(Value::is_array)
+    {
+        return ruma::RoomVersionId::V1;
+    }
     fallback()
 }
 
@@ -209,9 +247,7 @@ async fn receive_pdus(
         }
         let (event_id, outcome) = match &relayed {
             Some(domain) => match relayed_keys.get(domain).and_then(Option::as_ref) {
-                Some(keys) => {
-                    receive_one_pdu(state, domain, Some(keys), pdu, Delivery::Transaction)
-                }
+                Some(keys) => recovery::receive(state, origin, domain, Some(keys), pdu).await,
                 None => (
                     "$unverifiable".to_owned(),
                     Err(format!(
@@ -219,7 +255,7 @@ async fn receive_pdus(
                     )),
                 ),
             },
-            None => receive_one_pdu(state, origin, key_map, pdu, Delivery::Transaction),
+            None => recovery::receive(state, origin, origin, key_map, pdu).await,
         };
         let result = match outcome {
             Ok(()) => json!({}),
@@ -256,20 +292,6 @@ fn relayed_membership_signer(origin: &str, pdu: &Value) -> Option<String> {
     (domain != origin).then(|| domain.to_owned())
 }
 
-/// How a PDU reached this server, which decides who fans it out.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Delivery {
-    /// In a `/send` transaction from a server in the room: the origin fans
-    /// its own events out, and forwarding it again would deliver everything
-    /// twice.
-    Transaction,
-    /// Handed back through a `send_join`/`send_knock`/`send_leave`
-    /// handshake by a server that is not in the room and cannot reach the
-    /// servers that are, so this one does it for them
-    /// (`Rooms::receive_brokered`).
-    Brokered,
-}
-
 /// Finish a membership template: stamp a timestamp if the resident server
 /// left it out, content-hash and sign it as ours, and name it by its
 /// reference hash — exactly what the resident's `send_join`/`send_leave`
@@ -300,18 +322,23 @@ pub(crate) fn sign_membership_template(
             ruma::CanonicalJsonValue::Integer(ruma::Int::try_from(now).unwrap_or_default()),
         );
     }
-    spindle_core::version::hash_and_sign(
+    // v1/v2: the joining server names its own event, `$opaque:ourname`,
+    // inside the bytes it signs; `Pdu::sign` mints it. A resident that put
+    // its own `event_id` in the template (Synapse builds one) named the
+    // event under *its* server, whose signature this event will never
+    // carry, so that name is dropped. From v3 the name is the hash and
+    // `Pdu::sign` computes it.
+    canonical.remove("event_id");
+    let pdu = spindle_core::Pdu::sign(
+        version.clone(),
+        canonical,
         &state.config.server.name,
         state.key.pair(),
-        &mut canonical,
-        version,
     )
-    .map_err(|error| format!("the template cannot be signed: {error}"))?;
-    let hash = spindle_core::version::reference_hash(&canonical, version)
-        .map_err(|error| format!("the signed event cannot be hashed: {error}"))?;
-    let event = serde_json::to_value(&canonical)
+    .map_err(|error| format!("the template cannot be signed: {error:?}"))?;
+    let event = serde_json::to_value(pdu.canonical())
         .map_err(|error| format!("the signed event cannot be serialized: {error}"))?;
-    Ok((format!("${hash}"), event))
+    Ok((pdu.event_id().as_str().to_owned(), event))
 }
 
 /// Add this server's signature to an event another server built.
@@ -423,10 +450,11 @@ pub(crate) fn join_candidates(
 /// is judged alone — hash and signature against the origin's published
 /// keys, then the same authorization predicate local events pass — and a
 /// refusal soft-fails into the per-PDU results without poisoning the
-/// batch. Of the EDUs, `m.typing` is applied — for the origin's own
-/// joined users only, so no server can put words in another's hands —
-/// and the rest are still accepted and dropped (receipts, presence and
-/// device lists arrive with later slices).
+/// batch. Of the EDUs, `m.typing` and `m.receipt` are applied — for the
+/// origin's own joined users only, so no server can put words in another's
+/// hands — keys, to-device messages and device lists go to
+/// `e2ee_federation`, and the rest (presence among them; see `receipts`)
+/// are accepted, counted and dropped.
 pub(crate) async fn send_transaction(
     state: AppState,
     headers: axum::http::HeaderMap,
@@ -485,7 +513,20 @@ pub(crate) async fn send_transaction(
         })?)
     };
 
-    let results = receive_pdus(&state, &origin, key_map.as_ref(), &pdus).await;
+    // Off the async workers: ingesting a backlog into a large room is
+    // seconds of synchronous work per PDU -- cold loads, state resolution
+    // -- and #614's liveness failures were four of these at once holding
+    // all four workers while `/health` waited to be polled.
+    let results = {
+        let state = state.clone();
+        let origin = origin.clone();
+        crate::blocking::offload_async(
+            std::sync::Arc::clone(&state.metrics),
+            crate::metrics::BlockingTask::FederationSend,
+            move || async move { receive_pdus(&state, &origin, key_map.as_ref(), &pdus).await },
+        )
+        .await?
+    };
 
     // EDUs after PDUs, so a join and the typing that follows it land in
     // order within one transaction. `m.typing` only, and only about the
@@ -498,29 +539,36 @@ pub(crate) async fn send_transaction(
         .iter()
         .take(100)
     {
-        if edu["edu_type"].as_str() != Some("m.typing") {
-            // Keys, to-device messages and device-list changes: the
-            // origin is the authority for all three, and each checks it.
-            crate::e2ee_federation::apply_edu(&state, &origin, edu).await;
-            continue;
-        }
-        let content = &edu["content"];
-        let (Some(room_id), Some(user_id), Some(typing)) = (
-            content["room_id"].as_str(),
-            content["user_id"].as_str(),
-            content["typing"].as_bool(),
-        ) else {
-            continue;
+        let edu_type = crate::metrics::EduType::of(edu["edu_type"].as_str());
+        let result = match edu_type {
+            crate::metrics::EduType::Typing => apply_typing(&state, &origin, &edu["content"]),
+            crate::metrics::EduType::Receipt => {
+                // A receipt for a cold room loads it: room work, so off
+                // the async workers like the PDUs above.
+                let state = state.clone();
+                let origin = origin.clone();
+                let content = edu["content"].clone();
+                crate::blocking::offload(
+                    std::sync::Arc::clone(&state.metrics),
+                    crate::metrics::BlockingTask::FederationSend,
+                    move || Ok(crate::receipts::apply_edu(&state, &origin, &content)),
+                )
+                .await
+                .unwrap_or(crate::metrics::EduResult::Ignored)
+            }
+            crate::metrics::EduType::DirectToDevice
+            | crate::metrics::EduType::DeviceListUpdate
+            | crate::metrics::EduType::SigningKeyUpdate => {
+                // Keys, to-device messages and device-list changes: the
+                // origin is the authority for all three, and each checks it.
+                crate::e2ee_federation::apply_edu(&state, &origin, edu).await;
+                crate::metrics::EduResult::Accepted
+            }
+            crate::metrics::EduType::Presence | crate::metrics::EduType::Other => {
+                crate::metrics::EduResult::Unsupported
+            }
         };
-        if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin.as_str()) {
-            continue;
-        }
-        if !state.rooms.is_joined(user_id, room_id).unwrap_or(false) {
-            continue;
-        }
-        state
-            .typing
-            .set(room_id, user_id, typing, crate::typing::DEFAULT_TIMEOUT);
+        state.metrics.record_edu_received(edu_type, result);
     }
 
     let response = json!({ "pdus": results });
@@ -532,6 +580,28 @@ pub(crate) async fn send_transaction(
     .map_err(|error| MatrixError::internal(&error.to_string()))?;
     state.rooms.wake_sync_waiters();
     Ok(Json(response))
+}
+
+/// Apply one inbound `m.typing` EDU: only about the origin's own joined
+/// users, so no server can put words in another's hands.
+fn apply_typing(state: &AppState, origin: &str, content: &Value) -> crate::metrics::EduResult {
+    let (Some(room_id), Some(user_id), Some(typing)) = (
+        content["room_id"].as_str(),
+        content["user_id"].as_str(),
+        content["typing"].as_bool(),
+    ) else {
+        return crate::metrics::EduResult::Malformed;
+    };
+    if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin) {
+        return crate::metrics::EduResult::Ignored;
+    }
+    if !state.rooms.is_joined(user_id, room_id).unwrap_or(false) {
+        return crate::metrics::EduResult::Ignored;
+    }
+    state
+        .typing
+        .set(room_id, user_id, typing, crate::typing::DEFAULT_TIMEOUT);
+    crate::metrics::EduResult::Accepted
 }
 
 /// `GET /_matrix/federation/v1/state/{roomId}?event_id=`
@@ -612,7 +682,7 @@ pub(crate) async fn event(
         ));
     };
     federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
-    let event = state.rooms.event(&room_id, &event_id).map_err(room_error)?;
+    let event = state.rooms.pdu(&room_id, &event_id).map_err(room_error)?;
     Ok(Json(json!({
         "origin": state.config.server.name,
         "origin_server_ts": std::time::SystemTime::now()
@@ -750,24 +820,7 @@ pub(crate) async fn make_join(
     // room. For a room of any other version that answer is simply false.
     let version = state.rooms.room_version(&room_id).map_err(room_error)?;
     let version = version.as_str();
-
-    // The `ver` list is the peer telling us what *they* can speak. If this
-    // room's version is not in it, no template we produce will parse on
-    // their side, so the refusal is correct — but it has to name the version
-    // they would have needed.
-    let offered = request.uri().query().is_some_and(|query| {
-        query
-            .split('&')
-            .filter_map(|pair| pair.strip_prefix("ver="))
-            .any(|ver| ver == version)
-    });
-    if !offered {
-        return Err(MatrixError::new(
-            StatusCode::BAD_REQUEST,
-            "M_INCOMPATIBLE_ROOM_VERSION",
-            format!("this room is version {version}"),
-        ));
-    }
+    require_offered_version(request.uri().query(), version)?;
     let event = state
         .rooms
         .make_join_template(&room_id, &user_id)
@@ -776,6 +829,23 @@ pub(crate) async fn make_join(
         "room_version": version,
         "event": event,
     })))
+}
+
+/// Refuse a `make_join`/`make_knock` whose `ver` list lacks the room's version.
+///
+/// The `ver` list is the peer telling us what *they* can speak. If this
+/// room's version is not in it, no template we produce will parse on their
+/// side, so the refusal is correct -- but it has to name the version they
+/// would have needed, which is what `room_version` in the body is for.
+fn require_offered_version(query: Option<&str>, version: &str) -> Result<(), MatrixError> {
+    let offered = query.is_some_and(|query| {
+        form_urlencoded::parse(query.as_bytes())
+            .any(|(key, value)| key == "ver" && value == version)
+    });
+    if offered {
+        return Ok(());
+    }
+    Err(MatrixError::incompatible_room_version(version))
 }
 
 /// `GET /_matrix/federation/v1/make_leave/{roomId}/{userId}`
@@ -836,6 +906,7 @@ pub(crate) async fn make_knock(
         ));
     }
     let version = state.rooms.room_version(&room_id).map_err(room_error)?;
+    require_offered_version(request.uri().query(), version.as_str())?;
     let event = state
         .rooms
         .make_knock_template(&room_id, &user_id)
@@ -888,8 +959,7 @@ pub(crate) async fn send_knock(
             "the origin's keys cannot be verified".to_owned(),
         )
     })?;
-    let (computed_id, outcome) =
-        receive_one_pdu(&state, &origin, Some(&key_map), &knock, Delivery::Brokered);
+    let (computed_id, outcome) = receive_brokered_pdu(&state, &origin, Some(&key_map), &knock);
     if computed_id != event_id {
         return Err(MatrixError::bad_json(format!(
             "the event hashes to {computed_id}, not {event_id}"
@@ -1069,11 +1139,11 @@ pub(crate) async fn invite(
         .map_err(|error| MatrixError::bad_json(format!("room_version: {error}")))?;
     // The path names the event the inviter computed; disagreement means the
     // two servers are not looking at the same event.
-    let hash = spindle_core::version::reference_hash(&canonical, &version)
-        .map_err(|error| MatrixError::bad_json(format!("the invite cannot be hashed: {error}")))?;
-    if format!("${hash}") != event_id {
+    let named = spindle_core::version::event_id(&canonical, &version)
+        .map_err(|error| MatrixError::bad_json(format!("the invite cannot be named: {error}")))?;
+    if named != event_id {
         return Err(MatrixError::bad_json(format!(
-            "the event hashes to ${hash}, not {event_id}"
+            "the event is {named}, not {event_id}"
         )));
     }
     if spindle_core::version::hash_and_sign(
@@ -1202,8 +1272,7 @@ pub(crate) async fn send_leave_common(
             "the origin's keys cannot be verified".to_owned(),
         )
     })?;
-    let (computed_id, outcome) =
-        receive_one_pdu(&state, &origin, Some(&key_map), &leave, Delivery::Brokered);
+    let (computed_id, outcome) = receive_brokered_pdu(&state, &origin, Some(&key_map), &leave);
     if computed_id != event_id {
         return Err(MatrixError::bad_json(format!(
             "the event hashes to {computed_id}, not {event_id}"
@@ -1284,8 +1353,7 @@ pub(crate) async fn send_join_common(
         // -- a nomination this server did not make is not one it endorses.
         _ => join,
     };
-    let (computed_id, outcome) =
-        receive_one_pdu(&state, &origin, Some(&key_map), &join, Delivery::Brokered);
+    let (computed_id, outcome) = receive_brokered_pdu(&state, &origin, Some(&key_map), &join);
     // The path names the event the peer computed; disagreement means one
     // side hashed a different event than the other signed.
     if computed_id != event_id {
