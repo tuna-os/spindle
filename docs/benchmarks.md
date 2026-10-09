@@ -1563,9 +1563,9 @@ Flat from ten to a thousand, an order of magnitude under Synapse, and
 Synapse doubles at a thousand. That is the hot path #36 designed for: a
 restart moves an in-memory deadline and writes nothing.
 
-**firing** -- how late a delay's event reaches a `/sync` long-poll against
-the deadline it was given, N deadlines spread over five seconds so every
-phase of each server's timer is sampled. The delays are call leaves:
+**firing** -- how late the event of a delay gets to a `/sync` long-poll,
+against its deadline. The N deadlines are spread over five seconds. Thus
+the bench samples each phase of the timer of each server. The delays are call leaves:
 state events in an N-member room.
 
 | delays (members) | Spindle p50 | p99 | Synapse p50 | p99 |
@@ -1574,69 +1574,83 @@ state events in an N-member room.
 | 100 | 61 ms | 112 ms | 61 ms | 89 ms |
 | 1,000 | 195 ms | 315 ms | did not finish: 382 of 1,000 had arrived two minutes after the last deadline | |
 
-### The first sitting lost, and why
+### The first run lost, and why
 
-The table above is the second run. The first had Spindle's firing at
-**504 ms p50, 1,085 ms p99 at a hundred** and 1,105 / 1,780 ms at a
-thousand, against Synapse's 59 / 82 ms -- the claim #35 made ("firing jitter
-under load should be materially better than a DAG server's") was false by
-an order of magnitude. The cause was not the design but a number: the fire
-loop shipped with a **one-second** tick, while this page's own
-`delayed_firing` table and the ring benchmark both describe it at 100 ms.
-The bench passes its own tick, so it measured the loop it was given and
-not the one deployed. A one-second tick puts p50 at half a second by
-construction. The tick was a second because an idle tick used to read every
-pending row; #350 made the idle tick one row, which made the second
-unnecessary, and nobody went back. It is now 100 ms, the push loop's tick.
+The table above is the second run. In the first run, Spindle fired at
+**504 ms p50, 1,085 ms p99 at a hundred**. At a thousand it was
+1,105 / 1,780 ms. Synapse was at 59 / 82 ms. #35
+said: "firing jitter under load should be materially better than a DAG
+server's". That claim was false by
+an order of magnitude.
 
-What the second run shows is the honest picture. At ten and a hundred,
-Synapse's per-delay timers land more tightly than a polling loop: its p99
-sits a few milliseconds over its p50, where Spindle's p99 is one tick over
--- a delay registered just after a tick waits for the next one. At a
-thousand the axis changes: Spindle is still landing them within a third
-of a second, and Synapse cannot keep up at all -- a thousand membership
-state events in a thousand-member room arriving inside five seconds is
-more than its event-persistence path drains in two minutes. That row is
-the one the linear model is built for; the first two rows are a loss on
-p99 that a deadline-driven wake-up (sleep until the earliest row rather
-than polling) would recover, and is the next step if a deployment cares
-about the tail of a ten-person call's departures.
+The cause was not the design but a number. The fire loop shipped with a
+**one-second** tick. The `delayed_firing` table on this page and the ring
+benchmark both give it as 100 ms. Those benches set their own tick. Thus
+they measured the loop that they got, not the deployed loop. With a
+one-second tick, p50 is half a second by construction.
 
-The third of #36's measurements, the reload at 10k pending, has no
-over-the-wire equivalent: it is a startup cost internal to each server.
-Spindle's figure stands in the section above; Synapse reloads its pending
-delays with one query at start-up and was not measured here.
+The tick was a second because
+an idle tick read each row in the queue. #350 made the idle tick read one row,
+so the long tick was no longer necessary, but nobody changed it. It is
+now 100 ms, the same as the tick of the push loop.
 
-The same steps on a GitHub runner (run 37853447544, at the commit before
-the tick changed, so Spindle's firing there is the one-second loop's)
-agree on the parts that did not move: Spindle's restart 0.38 ms p50 at
-every size against Synapse's 2.64 / 2.68 / 5.37 ms, and Synapse again not
-delivering the thousand-member case (620 of 1,000 missing at two minutes).
-Its Synapse firing figures were higher than the pod's (88 / 220 ms p50 at
-10 / 100) -- the runner is a different host, which is why the tables
-above come from one sitting on one host and this paragraph only confirms
-their shape.
+The second run shows the true picture. At ten and a hundred, the
+per-delay timers of Synapse are more accurate than a loop that polls. Its
+p99 is a few milliseconds over its p50. The p99 of Spindle is one tick
+over: a delay that arrives after a tick waits for the next one.
 
+At a
+thousand, the result is different. Spindle still fires them within a third
+of a second, and Synapse cannot keep up at all. In two minutes, the path that
+persists its events cannot drain a thousand state events of membership that arrive
+in a thousand-member room inside five seconds.
+
+The linear model is for that row. The first two rows are a loss on p99. A
+wake-up at the deadline (sleep until the earliest row, with no poll)
+would get it back. That is the next step if a deployment needs a better
+tail for the departures from a ten-person call.
+
+The third of #36's measurements, the reload with 10k delays in the
+queue, has no equivalent over the wire. It is a start-up cost inside each server. The
+section above gives the figure for Spindle. Synapse reloads its queued
+delays with one query at start-up; this page does not measure it.
+
+The same steps also ran on a GitHub runner (run 37853447544). That run
+used the commit before the tick change, so its Spindle firing is from the
+one-second loop. It agrees on the parts that did not move.
+
+The restart of
+Spindle was 0.38 ms p50 at each size, against 2.64 / 2.68 / 5.37 ms for
+Synapse. Synapse again did not deliver the thousand-member case (620 of
+1,000 missing at two minutes). Its Synapse firing figures were higher
+than on the pod (88 / 220 ms p50 at 10 / 100). The runner is a different
+host. Thus the tables above come from one run on one host, and this
+paragraph only confirms their shape.
+
+To do this again, run
 `scripts/delayed-events-benchmark.py --base <url> --label <name>` against
-`scripts/bench-servers.sh up` reproduces it; the temporary
-`delayed-events-vs-synapse` job on the M7 completion branch ran the same
-steps on a GitHub runner.
+`scripts/bench-servers.sh up`. The temporary `delayed-events-vs-synapse`
+job ran the same steps on a GitHub runner, from the branch that completed
+M7.
 
 ## M7: what a call costs at 5, 20 and 100 participants (#40)
 
-#40 named the hundred-party call as the place a single-writer room would
-bottleneck if anywhere, and asked for state churn and to-device throughput
-at 5, 20 and 100 participants. `cargo bench -p spindle-server --bench
-call_churn`, against a real listener over TCP with a `/sync` long-poll per
-participant, in Element Call's compatibility mode (membership as room
-state), with its timings: an 18-second delayed leave restarted every four
-seconds. Same 3-core pod; wall-clock, a measurement to record rather than a
-gate.
+#40 said that a hundred-party call is the place where a single-writer
+room could be a bottleneck. It asked for state churn and to-device
+throughput at 5, 20 and 100 participants.
 
-**Join burst and key burst** -- every participant at once schedules its
-leave and writes its membership; then every participant at once sends its
-media key to every other device in one `sendToDevice`, N(N-1) messages,
-with a timeline message sent into the middle of it:
+The bench is
+`cargo bench -p spindle-server --bench call_churn`. It runs against a real
+listener over TCP, with one `/sync` long-poll for each participant. It
+uses the compatibility mode of Element Call (membership as room state)
+and its timings: an 18-second delayed leave, restarted each four seconds.
+It ran on the same 3-core pod. The figures are wall-clock: a record, not
+a gate.
+
+**Join burst and key burst** -- all participants at once schedule their
+leave and write their membership. Then all participants at once send
+their media key to each other device in one `sendToDevice`: N(N-1)
+messages. A timeline message goes into the middle of that burst:
 
 | participants | membership write p50 | p99 | every membership seen | every key delivered | message, idle room | message, during key burst |
 |---|---|---|---|---|---|---|
@@ -1656,26 +1670,30 @@ every participant heartbeats:
 
 ### What it says
 
-A hundred people joining at the same instant are all in everyone's call
-within 180 ms, and every one of the 9,900 key messages is on its device
-within 282 ms: the executor does not bottleneck at a hundred. Churn at a
-hundred stays at 4.7 ms a write at the median; the p99 of 50 ms, and the
-heartbeat p99 of 43 ms beside it, is the fan-out -- every membership write
-wakes a hundred long-polls, each building a sync response, on three cores.
+A hundred people join at the same instant. Within 180 ms, each of them
+is in the call of each other person. Within 282 ms, each of the 9,900 key
+messages is on its device. The executor is not a bottleneck at a hundred.
 
-**The finding** is the last column. SPEC §16.1 gives to-device its own
-stream so a burst does not stall the room's events, and it does not stall
-them -- the message lands before the burst finishes -- but it is delayed:
-193 ms against 16 ms on the idle room at a hundred, twelve times. The two
-streams have separate tokens but share the sync responses that carry them,
-and a response full of a hundred keys is what the message waits behind. It
-is within what a call notices (a join is seen in under a fifth of a second
-either way) and it does not grow faster than the burst; capping the
-to-device messages carried per response, so a timeline event is never
-queued behind more than one response's worth, is where to start if it ever
-needs to.
+Churn at a hundred stays at 4.7 ms a write at the median. The p99 of
+50 ms, and the heartbeat p99 of 43 ms beside it, come from the fan-out.
+Each membership write wakes a hundred long-polls, and each makes a sync
+response, on three cores.
 
-The first run of this bench also found its own bug, not the server's: the
-sync loops of the last size were still long-polling when the process
-exited, and the server, half torn down, answered them with 500s. The bench
-now waits for every loop to finish before it moves on.
+**The result to note** is the last column. SPEC §16.1 gives to-device
+its own stream, so that a burst does not stop the events of the room. It
+does not stop them: the message arrives before the burst ends. But the
+message is late: 193 ms against 16 ms in the idle room at a hundred, which
+is twelve times. The two streams have separate tokens, but the same sync
+responses carry them. The message waits behind a response full of a
+hundred keys.
+
+This delay is less than a call shows: a user sees a join in under a fifth
+of a second in both cases. It also does not increase faster than the
+burst. If a fix becomes necessary, start with a limit on the to-device
+messages in each response. Then a timeline event never waits behind more
+than one response.
+
+The first run of this bench also found a bug in the bench, not in the
+server. The sync loops of the last size still made long-polls when the
+process stopped. The server was half shut down, and it answered them with
+500s. The bench now waits for each loop to stop before it continues.
