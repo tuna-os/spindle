@@ -75,6 +75,9 @@ jobs:
           path: site
 
   publish:
+    # A dispatch on a candidate branch measures it without replacing the
+    # public main results. Only main may deploy the benchmark site.
+    if: github.ref == 'refs/heads/main'
     needs: measure
     runs-on: ubuntu-24.04
     environment:
