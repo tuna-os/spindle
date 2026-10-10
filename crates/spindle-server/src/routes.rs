@@ -2627,7 +2627,8 @@ async fn put_device(
     accounts
         .put_device(&localpart, &device_id, display_name)
         .map_err(|error| internal(&error))?;
-    let seq = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let seq = stream_write.id();
     state
         .devices
         .mark_device_list_changed(&identity.user_id, seq)
@@ -2685,7 +2686,8 @@ async fn delete_device(
         .devices
         .remove_device_material(&identity.user_id, &device_id)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    let seq = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let seq = stream_write.id();
     state
         .devices
         .mark_device_list_changed(&identity.user_id, seq)
@@ -5149,7 +5151,8 @@ fn write_account_data(
     {
         return Err(limit_exceeded("account data entries", cap));
     }
-    let position = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let position = stream_write.id();
     state
         .account_data
         .put(user_id, room_id, event_type, content, position)
@@ -5312,7 +5315,8 @@ fn ruleset_of(state: &AppState, user_id: &str) -> Result<Value, MatrixError> {
 }
 
 fn save_ruleset(state: &AppState, user_id: &str, ruleset: &Value) -> Result<(), MatrixError> {
-    let position = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let position = stream_write.id();
     state
         .account_data
         .put(user_id, "", crate::push_rules::TYPE, ruleset, position)
@@ -5892,7 +5896,8 @@ async fn set_tag(
     // keeps there. Stored as given: the server has no opinion about tag
     // content for the same reason it has none about account data generally.
     tags["tags"][&tag] = content;
-    let position = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let position = stream_write.id();
     state
         .account_data
         .put(&user_id, &room_id, "m.tag", &tags, position)
@@ -5926,7 +5931,8 @@ async fn delete_tag(
             format!("{room_id} is not tagged {tag}"),
         ));
     }
-    let position = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let position = stream_write.id();
     state
         .account_data
         .put(&user_id, &room_id, "m.tag", &tags, position)
@@ -5973,7 +5979,8 @@ async fn upload_keys(
         // Identity keys changing is what "device list changed" means — other
         // users must re-query before encrypting to this user again. One-time
         // and fallback keys are consumables and do not move the watermark.
-        let seq = state.rooms.allocate_stream_id();
+        let stream_write = state.rooms.reserve_stream_id();
+        let seq = stream_write.id();
         state
             .devices
             .mark_device_list_changed(&identity.user_id, seq)
@@ -6264,7 +6271,8 @@ async fn upload_cross_signing(
     }
     // New cross-signing keys are a device-list change: peers must re-query
     // before they can trust (or distrust) the new signing tree.
-    let seq = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let seq = stream_write.id();
     state
         .devices
         .mark_device_list_changed(&identity.user_id, seq)
@@ -6315,7 +6323,8 @@ async fn upload_signatures(
     // names them in `device_lists.changed`, and until it does the identity
     // it just verified stays unverified in its own store.
     for user_id in &signed_users {
-        let seq = state.rooms.allocate_stream_id();
+        let stream_write = state.rooms.reserve_stream_id();
+        let seq = stream_write.id();
         state
             .devices
             .mark_device_list_changed(user_id, seq)
@@ -6787,7 +6796,8 @@ async fn send_to_device(
                 vec![target_device.clone()]
             };
             for device_id in devices {
-                let seq = state.rooms.allocate_stream_id();
+                let stream_write = state.rooms.reserve_stream_id();
+                let seq = stream_write.id();
                 let message = json!({
                     "type": event_type,
                     "sender": identity.user_id,
@@ -7234,15 +7244,18 @@ fn to_device_extension(
     let acknowledged = crate::tokens::Sync::resume(extension.since.as_deref())
         .map_err(|error| MatrixError::bad_json(error.to_string()))?
         .position();
-    let mut events = state
+    let (events, delivered_until) = state
         .devices
-        .take_pending(&identity.user_id, &identity.device_id, acknowledged)
+        .take_pending_until(
+            &identity.user_id,
+            &identity.device_id,
+            acknowledged,
+            position,
+            extension.limit,
+        )
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    if let Some(limit) = extension.limit {
-        events.truncate(limit.max(1));
-    }
     Ok(json!({
-        "next_batch": crate::tokens::Sync(position).to_string(),
+        "next_batch": crate::tokens::Sync(delivered_until).to_string(),
         "events": events,
     }))
 }
@@ -7718,8 +7731,15 @@ fn sync_device_sections(
 > {
     let to_device = state
         .devices
-        .take_pending(&identity.user_id, &identity.device_id, resume.position())
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        .take_pending_until(
+            &identity.user_id,
+            &identity.device_id,
+            resume.position(),
+            next_batch,
+            None,
+        )
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+        .0;
     let device_changes = match resume {
         crate::tokens::Resume::From(since) => {
             visible_device_changes(state, identity, since, next_batch)?
@@ -11481,7 +11501,8 @@ async fn delete_devices(
             .map_err(|error| MatrixError::internal(&error.to_string()))?;
     }
     if !request.devices.is_empty() {
-        let seq = state.rooms.allocate_stream_id();
+        let stream_write = state.rooms.reserve_stream_id();
+        let seq = stream_write.id();
         state
             .devices
             .mark_device_list_changed(&identity.user_id, seq)

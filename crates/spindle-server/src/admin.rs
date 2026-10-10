@@ -393,7 +393,8 @@ pub(crate) fn audit(
         "detail": detail,
         "ts_ms": now_ms(),
     });
-    let seq = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let seq = stream_write.id();
     Store::put(
         state.store.as_ref(),
         &keys::audit_entry(seq),
@@ -443,7 +444,8 @@ pub(crate) fn file_report(
     reason: Option<&str>,
     score: Option<i64>,
 ) -> Result<u64, MatrixError> {
-    let seq = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let seq = stream_write.id();
     let record = json!({
         "id": seq,
         "received_ts": now_ms(),

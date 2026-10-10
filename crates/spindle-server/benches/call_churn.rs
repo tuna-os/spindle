@@ -108,7 +108,7 @@ struct Participant {
     user_id: String,
     device_id: String,
     seen: Arc<Mutex<HashMap<String, Instant>>>,
-    keys: Arc<Mutex<Vec<Instant>>>,
+    keys: Arc<Mutex<HashMap<String, Instant>>>,
     delay_id: tokio::sync::Mutex<Option<String>>,
 }
 
@@ -138,7 +138,11 @@ impl Participant {
 
     /// Start the long-poll from now: an initial sync, then incremental ones
     /// until `stop`.
-    async fn sync_from_now(&self, client: &Client, stop: Arc<AtomicBool>) {
+    async fn sync_from_now(
+        &self,
+        client: &Client,
+        stop: Arc<AtomicBool>,
+    ) -> tokio::task::JoinHandle<()> {
         let first = client
             .call(
                 reqwest::Method::GET,
@@ -173,15 +177,17 @@ impl Participant {
                         }
                     }
                 }
-                let arrived = body["to_device"]["events"].as_array().map_or(0, |events| {
-                    events.iter().filter(|event| event["type"] == KEYS).count()
-                });
-                keys.lock()
-                    .unwrap()
-                    .extend(std::iter::repeat_n(now, arrived));
+                if let Some(events) = body["to_device"]["events"].as_array() {
+                    let mut received = keys.lock().unwrap();
+                    for event in events.iter().filter(|event| event["type"] == KEYS) {
+                        let sender = event["sender"].as_str().expect("a key has a sender");
+                        // Retransmissions are not another participant's key.
+                        received.entry(sender.to_owned()).or_insert(now);
+                    }
+                }
                 body["next_batch"].as_str().unwrap().clone_into(&mut since);
             }
-        });
+        })
     }
 
     async fn schedule_leave(&self, client: &Client, room: &str) {
@@ -330,8 +336,9 @@ async fn measure(client: &Client, size: usize) -> Row {
             .await;
     }
     let stop = Arc::new(AtomicBool::new(false));
+    let mut sync_tasks = Vec::new();
     for participant in &participants {
-        participant.sync_from_now(client, Arc::clone(&stop)).await;
+        sync_tasks.push(participant.sync_from_now(client, Arc::clone(&stop)).await);
     }
     let observer = Arc::clone(&participants[0]);
     let last = Arc::clone(&participants[size - 1]);
@@ -395,15 +402,22 @@ async fn measure(client: &Client, size: usize) -> Row {
     let heartbeats = Arc::new(Mutex::new(Vec::new()));
     let beating = Arc::new(AtomicBool::new(true));
     let mut heartbeat_tasks = Vec::new();
+    let heartbeat_participants = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for participant in &participants {
         let (client, participant) = (client.clone(), Arc::clone(participant));
         let (heartbeats, beating) = (Arc::clone(&heartbeats), Arc::clone(&beating));
+        let heartbeat_participants = Arc::clone(&heartbeat_participants);
         heartbeat_tasks.push(tokio::spawn(async move {
+            let mut first_heartbeat = true;
             // Spread across the interval, as independent clients would be.
             tokio::time::sleep(HEARTBEAT.mul_f64(rand::random::<f64>())).await;
             while beating.load(Ordering::Relaxed) {
                 if let Some(latency) = participant.act_on_delay(&client, "restart").await {
                     heartbeats.lock().unwrap().push(latency);
+                    if first_heartbeat {
+                        heartbeat_participants.fetch_add(1, Ordering::Relaxed);
+                        first_heartbeat = false;
+                    }
                 }
                 tokio::time::sleep(HEARTBEAT).await;
             }
@@ -467,7 +481,7 @@ async fn measure(client: &Client, size: usize) -> Row {
     .await;
     let keys_all = participants
         .iter()
-        .filter_map(|participant| participant.keys.lock().unwrap().last().copied())
+        .filter_map(|participant| participant.keys.lock().unwrap().values().copied().max())
         .max()
         .unwrap()
         .duration_since(started);
@@ -511,7 +525,7 @@ async fn measure(client: &Client, size: usize) -> Row {
     // Every participant has heartbeat at least once, however quick the
     // churn was, so the heartbeat column is a sample of the whole call.
     wait_until("a heartbeat from everyone", || {
-        heartbeats.lock().unwrap().len() >= size
+        heartbeat_participants.load(Ordering::Relaxed) >= size
     })
     .await;
     beating.store(false, Ordering::Relaxed);
@@ -519,10 +533,9 @@ async fn measure(client: &Client, size: usize) -> Row {
         task.await.expect("every heartbeat task succeeds");
     }
     stop.store(true, Ordering::Relaxed);
-    // Let every long-poll and heartbeat see the flag and finish, so none is
-    // still in flight against the server when the next size -- or the
-    // process's exit -- begins.
-    tokio::time::sleep(HEARTBEAT + Duration::from_secs(2)).await;
+    for task in sync_tasks {
+        task.await.expect("every sync task succeeds");
+    }
     let mut heartbeats = heartbeats.lock().unwrap().clone();
     heartbeats.sort_unstable();
     Row {

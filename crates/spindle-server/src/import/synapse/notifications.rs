@@ -343,7 +343,7 @@ mod tests {
         let store = std::sync::Arc::new(FjallStore::open(dir.path()).unwrap());
         let rooms = crate::rooms::Rooms::new(std::sync::Arc::clone(&store), "example");
         assert_eq!(rooms.stream_position(), 128);
-        assert_eq!(rooms.allocate_stream_id(), 129);
+        assert_eq!(rooms.reserve_stream_id().id(), 129);
     }
 
     #[test]

@@ -449,6 +449,28 @@ pub struct TimelineEvent {
     pub json: Value,
 }
 
+/// A reserved side-stream position. Keep this guard until persistence finishes.
+pub struct SideStreamWrite<'a> {
+    stream: &'a crate::stream::Stream,
+    id: u64,
+    wake: &'a tokio::sync::Notify,
+}
+
+impl SideStreamWrite<'_> {
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl Drop for SideStreamWrite<'_> {
+    fn drop(&mut self) {
+        // A failed write leaves a hole, not a permanently stalled watermark.
+        self.stream.abandon(self.id);
+        self.wake.notify_waiters();
+    }
+}
+
 impl Rooms {
     /// A `Rooms` with a registry of its own, for tests and tools that do
     /// not scrape it; the server uses [`Rooms::with_metrics`].
@@ -1368,7 +1390,8 @@ impl Rooms {
         event_id: &str,
         invite_state: &[Value],
     ) -> Result<(), RoomError> {
-        let stream_id = self.allocate_stream_id();
+        let stream_write = self.reserve_stream_id();
+        let stream_id = stream_write.id();
         spindle_store::Store::put(
             self.store.as_ref(),
             &spindle_core::keys::user_room(
@@ -2364,7 +2387,8 @@ impl Rooms {
             if let Some(object) = pdu.as_object_mut() {
                 object.remove("event_id");
             }
-            let seq = self.allocate_stream_id();
+            let stream_write = self.reserve_stream_id();
+            let seq = stream_write.id();
             spindle_store::Store::put(
                 self.store.as_ref(),
                 &spindle_core::keys::federation_outbox(destination, seq),
@@ -3658,20 +3682,19 @@ impl Rooms {
         self.appended.notify_waiters();
     }
 
-    /// Take the next global sequence number without writing a stream row.
+    /// Reserve a side-stream position until its writer finishes.
     ///
-    /// To-device messages draw from the same counter room events do, so a
-    /// sync token positions both at once — which is what lets `since`
-    /// acknowledge to-device deliveries with no second cursor. The stream
-    /// scan skips absent ids already, so a gap where a to-device message sat
-    /// costs nothing.
-    pub fn allocate_stream_id(&self) -> u64 {
-        // Allocated and committed together: these ids name positions on
-        // side streams (to-device, receipts) that are durable by the time
-        // the caller has one, so there is no window for them to be in.
-        let id = self.stream.allocate();
-        self.stream.commit(id);
-        id
+    /// Keep the returned guard alive through every store write. Dropping it
+    /// releases the position and wakes sync waiters, including on error or
+    /// panic. Publishing at allocation lets a sync acknowledge a message
+    /// before it exists, then delete it unseen when the write finally lands.
+    #[must_use]
+    pub fn reserve_stream_id(&self) -> SideStreamWrite<'_> {
+        SideStreamWrite {
+            stream: &self.stream,
+            id: self.stream.allocate(),
+            wake: &self.appended,
+        }
     }
 
     pub fn stream_position(&self) -> u64 {
@@ -3683,7 +3706,8 @@ impl Rooms {
     /// reader's own next sync answers now and carries the counts the
     /// receipt changed.
     pub fn mark_receipt(&self, room_id: &str, user_id: &str) {
-        let position = self.allocate_stream_id();
+        let stream_write = self.reserve_stream_id();
+        let position = stream_write.id();
         self.receipt_marks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5909,7 +5933,8 @@ impl Rooms {
             .filter(|domain| !live.iter().any(|known| known == *domain));
 
         for destination in live.iter().map(String::as_str).chain(departing) {
-            let seq = self.allocate_stream_id();
+            let stream_write = self.reserve_stream_id();
+            let seq = stream_write.id();
             spindle_store::Store::put(
                 self.store.as_ref(),
                 &spindle_core::keys::federation_outbox(destination, seq),

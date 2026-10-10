@@ -1527,12 +1527,15 @@ impl Rooms {
             // MSC4354: a seeded sticky event is owed to this server's
             // syncing clients like any other, at a position every token
             // issued before the join precedes.
-            if event.get(super::STICKY_KEY).is_some() {
+            let sticky_write = event
+                .get(super::STICKY_KEY)
+                .map(|_| self.reserve_stream_id());
+            if let Some(stream_write) = &sticky_write {
                 extra.extend(super::sticky_index_row(
                     room_id,
                     id,
                     event,
-                    self.allocate_stream_id(),
+                    stream_write.id(),
                 ));
             }
             room_store.journal_entry_with(&entry, &log, &extra)?;
