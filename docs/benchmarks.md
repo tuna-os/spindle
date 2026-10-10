@@ -48,6 +48,64 @@ Everything here is **algorithmic**, measured inside the library. None of it is a
 server throughput figure and none of it should be quoted as one. Server-to-
 server comparison starts at M1 and is defined in #42.
 
+### Interned state keys: before and after (#79, 2026-10-10)
+
+**Verdict: a trade, with a measured first-sight regression.** At 50,000 keys,
+replacing existing slots has an after/before normalized median of 0.46×;
+allocating new slots has a median of 1.83×. This does not establish a general
+speedup. First-sight updates at 1,000 and 50,000 keys regress in every observed
+normalized range. The ranges overlap for every other comparison, including the
+large-room replacement result, so three noisy rounds do not establish a stable
+win there. Lookup remains several times slower than the HashMap control.
+
+The baseline is `496a77a`; the interned implementation is `10d269b`. Each runs
+with a control in the same process: `imbl` for updates, `HashMap` for lookup.
+The numbers below are medians of three **HAMT/control mean-time ratios**, with
+the observed minimum and maximum in parentheses. Lower is faster. The last
+column divides those medians; it is not a ratio of unpaired wall times. The
+ranges are observations, not confidence intervals.
+
+| Workload | Keys | Before / control (range) | After / control (range) | After / before medians |
+|---|---:|---:|---:|---:|
+| First-sight updates | 100 | 1.68× (1.30–1.72) | 1.23× (1.16–1.98) | 0.73× |
+| First-sight updates | 1,000 | 0.80× (0.65–1.36) | 1.56× (1.46–1.99) | 1.96× |
+| First-sight updates | 10,000 | 1.34× (1.08–2.25) | 1.17× (0.95–1.82) | 0.87× |
+| First-sight updates | 50,000 | 0.64× (0.51–0.95) | 1.18× (1.18–1.72) | 1.83× |
+| Existing-key replacements | 100 | 1.95× (1.24–2.75) | 2.24× (1.38–2.90) | 1.15× |
+| Existing-key replacements | 1,000 | 0.88× (0.47–1.17) | 1.53× (0.87–1.65) | 1.74× |
+| Existing-key replacements | 10,000 | 1.89× (0.81–2.92) | 1.06× (0.82–1.26) | 0.56× |
+| Existing-key replacements | 50,000 | 2.01× (1.04–2.15) | 0.92× (0.71–1.05) | 0.46× |
+| One warm lookup | 1,000 | 7.75× (4.17–8.04) | 5.76× (5.46–9.94) | 0.74× |
+| One warm lookup | 50,000 | 5.86× (3.75–9.00) | 7.55× (3.89–7.78) | 1.29× |
+
+First-sight updates begin with an empty trie and a fresh table, so the timed
+loop includes allocating intern ids. Replacement updates seed the trie and
+table before timing, replace every existing slot once, and retain all snapshots.
+Both update groups time the release of that history too. Lookup repeats one
+warm key near the middle; it does not measure a distribution of room requests.
+
+The new representation stores one u64 per state key in a leaf. It still stores
+string event ids and must resolve keys through the shared table. New keys pay
+for table allocation and its mutex; existing keys still pay for table lookup.
+This evidence does not attribute the timing changes to any one of those costs,
+and does not measure memory use, write bytes, or server throughput.
+
+Three rounds alternate baseline/branch, branch/baseline, baseline/branch. Each
+uses Criterion with 10 samples, 0.5 seconds of warm-up and a requested 1 second
+of measurement; expensive groups extend the measurement to obtain 10 samples.
+The host has two logical Xeon Platinum 8259CL CPUs, Rust 1.90.0, concurrent
+builds and swap pressure. Starting load averages were 12–19. Controls run
+sequentially within each process: normalization cannot remove changes in host
+contention during a run. A quiet host is needed before claiming a stable win.
+
+[Collected estimates and normalized ratios](evidence/intern-state-keys-20261010.json)
+include all six runs and binary hashes. The
+[baseline benchmark patch](evidence/intern-state-keys-baseline.patch) adds the
+same 50,000-key and replacement workloads to `496a77a`. Apply it to that
+revision, build each arm with `cargo bench -p spindle-core --bench
+state_snapshot --no-run`, and run each binary in the recorded order with a
+separate `CRITERION_HOME`. The evidence records the exact filter and options.
+
 ### The other side of the trie's losses (#80)
 
 The micro-benchmark page has always shown the trie losing to `im` on retained

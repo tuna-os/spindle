@@ -37,7 +37,7 @@ COMPARISONS = [
         ["1", "4", "16", "64", "256"],
     ),
     (
-        "State updates: our HAMT vs the im crate",
+        "State updates: our HAMT vs imbl",
         "state_retained_updates/hamt/{}",
         "state_retained_updates/imbl/{}",
         ["100", "1000", "10000", "50000"],

@@ -484,7 +484,8 @@ mod tests {
         assert_eq!(actual.passes, expected.passes);
         for (id, state) in &expected.settled {
             let loaded = disk.read_settled(id).expect("read").expect("supplied");
-            assert_eq!(loaded.state.root(), state.state.root());
+            let expected_state = state.state.clone().with_table(loaded.state.table());
+            assert_eq!(loaded.state.root(), expected_state.root());
             assert_eq!(loaded.slots, state.slots);
             assert_eq!(loaded.reason, state.reason);
         }
