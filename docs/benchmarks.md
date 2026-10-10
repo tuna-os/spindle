@@ -1724,3 +1724,70 @@ The first run of this bench also found a bug in the bench, not in the
 server. The sync loops of the last size still made long-polls when the
 process stopped. The server was half shut down, and it answered them with
 500s. The bench now waits for each loop to stop before it continues.
+
+## v1 close-out: five servers, Synapse on Postgres, and the sync_delta losses
+
+Main at `0f2c143` holds the federated-timing bench from #644. A
+shared GitHub runner with 4 Xeon cores ran this comparison. The page
+shows a shared-runner result apart from the milestone runs. Three
+rounds ran, with reversed order on the even round. #645 commits the
+files as `ci-20261010.*`.
+
+This run measures Synapse 1.161.0 on Postgres for the first time.
+All milestone runs through m7 used SQLite.
+
+Versions: Continuwuity 26.9.0, Tuwunel 1.9.2, Dendrite 0.15.2. No
+server was absent.
+
+**Scoreboard, by the separation rule, median against median:**
+
+- **Synapse: Spindle takes 27 of 27 cells.** Joins run 60–64×
+  faster. Sends run 50–58× faster. `sliding_window` runs ~15×
+  faster. Incremental sync runs ~15× faster. Pagination runs 9–10×
+  faster. Deep context runs 8–8.5× faster. `state` runs ~6× faster.
+  The no-op poll runs 6.4–6.8× faster. Initial sync runs 2.3–2.4×
+  faster. Postgres closed no gap. The closest band is initial sync
+  at 2.21–2.56×.
+- **Tuwunel: Spindle takes 24 cells and drops 1.** Joins run
+  3.4–3.8× faster. Sends run 1.6–3.3× faster, with more lead in
+  big rooms. Pagination runs ~2× faster. Deep context runs
+  1.7–1.9× faster. `sliding_window` runs 1.3–1.5× faster. `state`
+  runs 1.3–1.4× faster. Incremental sync runs 1.1–1.7× faster. The
+  loss is `sync_delta` at 800 events: 0.90×, band 0.86–0.92×. The
+  rounds separate there, against us. The loss still fits the 1.2×
+  that parity line 2 allows, so the line holds. `sync_delta` at
+  200 and 3,200 events stays unresolved.
+- **Continuwuity: Spindle takes 24 cells and drops 1.** Joins run
+  5.2–5.8× faster. Sends run 2.1–6.5× faster. Deep context runs
+  4.4–4.8× faster. The sync poll runs 4.3–4.5× faster. Pagination
+  runs ~3.6× faster. `state` runs 1.6–1.8× faster. Initial sync
+  runs 1.5–1.7× faster. `sliding_window` runs 1.1–1.2× faster. The
+  loss is `sync_delta` at 3,200 events: 0.90×, band 0.85–1.00×.
+  The script calls it, but the band touches parity. Read it as the
+  weakest call in the run. `sync_delta` at 200 and 800 events
+  stays unresolved.
+- **Dendrite: Spindle takes 24 of 24 cells.** Dendrite skips the
+  `sync_delta` workload at all sizes. Its table thus holds three
+  fewer cells. No old run fills those cells.
+
+**The losses share a workload, not a rival.** `sync_delta` means one
+client posts and all clients then poll for the delta. It is the
+newest workload in the driver. It is also the sole workload where a
+rival in Rust beats us, each at one size.
+
+All aimed workloads but that one separate for us at all sizes.
+Pagination, deep context, and join do so against each rival. #79
+interns state keys. Small deltas over shared state form its target.
+Watch this workload when that work lands.
+
+**Parity verdict from `scripts/parity-gate.py`, also in the body of
+#645.** Line 1 holds on 27 cells. Line 2 holds on 21. Line 3 stays
+open. Three cells keep line 3 open. No client-server driver can
+build them.
+
+The 10,000-member federated join and the partition catch-up have a
+Spindle-side driver since #644. They still need a rival side.
+Concurrent send has a result against Synapse sole. The record keeps
+that gap open. #42 shuts on lines 1 and 2, with both losses above on
+file. A lone follow-up tracks the federated rival harness, where it
+can fail stark.
