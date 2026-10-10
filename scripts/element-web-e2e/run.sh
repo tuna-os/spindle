@@ -22,8 +22,8 @@
 # tmp/element-web so a second run downloads nothing.
 set -euo pipefail
 
-ELEMENT_TAG=v1.11.112
-ELEMENT_SHA256=0231387379f6e81d41718dd87d866d2e4168de0f4b1c9dbe0791e388e8e1dd2a
+ELEMENT_TAG=v1.12.30
+ELEMENT_SHA256=41ecae1e7af5d09baf2c1a7646cebad51ced6a44257d2096b9618bff3fee625d
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd "$here/../.." && pwd)
