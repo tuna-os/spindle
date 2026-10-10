@@ -1305,14 +1305,15 @@ impl Federation {
                     .record_key_fetch(KeySource::Direct, KeyFetchResult::Throttled);
                 return None;
             }
-            // Reserve an origin before the await, deduplicating concurrent
-            // misses and bounding both in-flight and failed-origin entries.
-            if negative.len() >= MAX_KEY_FETCH_ORIGINS {
+            // Refuse new origins at cache saturation without evicting a
+            // live throttle. The semaphore bounds concurrent cache misses.
+            if negative.len() >= MAX_KEY_FETCH_ORIGINS
+                || (fetched.len() >= MAX_KEY_FETCH_ORIGINS && !fetched.contains_key(origin))
+            {
                 self.metrics
                     .record_key_fetch(KeySource::Direct, KeyFetchResult::Throttled);
                 return None;
             }
-            negative.insert(origin.to_owned(), instant + NEGATIVE_CACHE);
         }
         match self.fetch_key_document(origin).await {
             Ok(document) => {
@@ -1341,10 +1342,13 @@ impl Federation {
                         KeyFetchResult::Error
                     },
                 );
-                self.negative
+                let mut negative = self
+                    .negative
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(origin.to_owned(), Instant::now() + NEGATIVE_CACHE);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if negative.len() < MAX_KEY_FETCH_ORIGINS {
+                    negative.insert(origin.to_owned(), Instant::now() + NEGATIVE_CACHE);
+                }
                 None
             }
         }
