@@ -23,6 +23,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: 1.90.0
+      - name: Prepare the last schema-2 checkout
+        run: git worktree add --detach old-version 496a77a029026a3acd087b4851c42e746bd9b9db
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: |
@@ -32,9 +34,9 @@ jobs:
         run: |
           cargo build --locked -p spindle-server
           cargo test --locked -p spindle-core --test state_res_equivalence --test fork_window_equivalence
+          cargo test --locked -p spindle-server --test side_stream_delivery
       - name: Build the last schema-2 version
         run: |
-          git worktree add --detach old-version 496a77a029026a3acd087b4851c42e746bd9b9db
           cargo build --locked --manifest-path old-version/Cargo.toml -p spindle-server
       - name: Rehearse upgrade and rollback
         run: >-
