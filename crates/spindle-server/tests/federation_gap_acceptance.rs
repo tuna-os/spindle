@@ -479,10 +479,7 @@ async fn a_gap_wider_than_the_recovery_budget_is_accepted_on_the_peers_state() {
             history.push(message.clone());
             parent = message;
         }
-        // Supply the full recovery window in one reply. Hundreds of
-        // sequential HTTP requests can hit the time budget before the
-        // event budget on a loaded runner, testing a different failure.
-        harness.peer.served.lock().unwrap().window = history[history.len() - 512..]
+        harness.peer.served.lock().unwrap().window = history[history.len() - 100..]
             .iter()
             .map(|event| event.1.clone())
             .collect();
