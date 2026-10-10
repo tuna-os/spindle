@@ -122,6 +122,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::mas::routes())
         .merge(crate::admin::routes())
         .merge(crate::admin_tasks::routes())
+        .merge(crate::admin_ui::routes())
         .merge(crate::admin_federation::routes())
         .merge(crate::admin_media::routes())
         .merge(crate::oidc::routes())

@@ -26,13 +26,16 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**289 routes implemented; 0 known gaps in scope.**
+**292 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
 
-### Admin & moderation — 86 implemented, 0 planned
+### Admin & moderation — 89 implemented, 0 planned
 
+- `GET /_spindle/admin/ui`
+- `GET /_spindle/admin/ui/app.js`
+- `GET /_spindle/admin/ui/styles.css`
 - `GET /_spindle/admin/v1/audit`
 - `GET /_spindle/admin/v1/event_reports`
 - `GET/DELETE /_spindle/admin/v1/event_reports/{report_id}`
