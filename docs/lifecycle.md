@@ -8,6 +8,11 @@ Every one of these opens the store directly, and fjall holds an exclusive
 lock, so **they run with the server stopped**. For a restore that is not just
 a limitation: it is the only way to be sure nothing is writing behind you.
 
+Sync positions have a durable checkpoint before classic sync, sliding sync,
+or dehydrated-device responses issue their tokens. The checkpoint survives
+mailbox drains and receipt-only activity. A restart must allocate future
+positions above tokens clients already hold, even when push is disabled.
+
 ## Backup
 
 ```
