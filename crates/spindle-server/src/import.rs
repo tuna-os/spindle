@@ -40,7 +40,12 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDequ
 #[cfg(feature = "synapse-import")]
 pub mod synapse;
 
-use spindle_core::{AppendError, EventId, EventInput, RoomLog, StateKey, StateSnapshot};
+use std::sync::Arc;
+
+use spindle_core::{
+    AppendError, EventId, EventInput, MemStateKeyTable, RoomLog, StateKey, StateKeyTable,
+    StateSnapshot,
+};
 
 /// Room state as Synapse holds it: `(type, state_key)` to event ID.
 pub type StateMap = BTreeMap<(String, String), String>;
@@ -947,7 +952,13 @@ fn replay_pass(
     marks: &HashSet<String>,
 ) -> Result<(ResolvedOutcome, HashSet<String>), ImportError> {
     let room_id = room.room_id.as_str();
-    let mut log = RoomLog::new();
+    // One table for the whole rehearsal: the log, the seeds, and the
+    // source-state snapshots all share numbering, so root comparisons
+    // between them mean something. Nothing here is persisted -- the
+    // persist path rebuilds against the store's table -- but mixed
+    // tables would still compare nonsense to nonsense.
+    let table = MemStateKeyTable::shared();
+    let mut log = RoomLog::new(table.clone());
     let mut head: Option<EventId> = None;
     let mut from_source = Vec::new();
     let mut settled: HashMap<String, Settled> = HashMap::new();
@@ -1013,7 +1024,7 @@ fn replay_pass(
         }
         let event_id = step.input.event_id.as_str();
         let apply_own = |state: StateSnapshot| match step.input.state_key.clone() {
-            Some(key) => state.apply(key, event_id.to_owned()),
+            Some(key) => state.apply(&key, event_id.to_owned()),
             None => state,
         };
 
@@ -1021,8 +1032,8 @@ fn replay_pass(
         let mut want = if step.seed {
             Want {
                 state: Some(match &room.state_after_root {
-                    Some(map) => snapshot_from(map),
-                    None => apply_own(StateSnapshot::new()),
+                    Some(map) => snapshot_from(map, &table),
+                    None => apply_own(StateSnapshot::new(table.clone())),
                 }),
                 reason: None,
                 slots: None,
@@ -1037,7 +1048,7 @@ fn replay_pass(
                 .iter()
                 .find_map(|parent| derived.get(parent.as_str()))
                 .or(previous.as_ref());
-            let (state, slots) = snapshot_over(base, &map);
+            let (state, slots) = snapshot_over(base, &map, &table);
             Want {
                 state: Some(state),
                 reason: Some(GAP_REASON),
@@ -1125,7 +1136,7 @@ fn replay_pass(
                         let mut changed = StateMap::new();
                         for (key, _, value) in first.diff(&state) {
                             if let Some(value) = value {
-                                changed.insert(key_pair(key), value.to_owned());
+                                changed.insert(key_pair(&key), value.to_owned());
                             }
                         }
                         forks.push(ForkCheck {
@@ -1161,7 +1172,7 @@ fn replay_pass(
                     .state_after(event_id)
                     .map_err(|why| no_state(event_id, why))?;
                 if !same_state(state, &map) {
-                    let (state, slots) = snapshot_over(Some(state), &map);
+                    let (state, slots) = snapshot_over(Some(state), &map, &table);
                     want = Want {
                         state: Some(state),
                         reason: Some(ELSEWHERE_REASON),
@@ -1205,10 +1216,10 @@ fn replay_pass(
                     .state
                     .clone()
                     .or_else(|| previous.clone())
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| StateSnapshot::new(head_state.table().clone()));
                 for (key, _, value) in base.diff(&head_state) {
                     if let Some(value) = value {
-                        slots.insert(key_pair(key), value.to_owned());
+                        slots.insert(key_pair(&key), value.to_owned());
                     }
                 }
                 want = Want {
@@ -1225,7 +1236,7 @@ fn replay_pass(
         // entry after extremity resolution, and persist it as a supplied seed.
         if position == last_position && step.head && !step.seed {
             let base = want.state.as_ref().or(previous.as_ref());
-            let (state, mut slots) = snapshot_over(base, &room.current_state);
+            let (state, mut slots) = snapshot_over(base, &room.current_state, &table);
             // Keep body references already supplied by historical comparison
             // or fork resolution, but only if the authoritative head retains them.
             if let Some(prior) = want.slots.take() {
@@ -1253,9 +1264,17 @@ fn replay_pass(
             && (want.reason.is_some_and(|reason| reason != RESOLVED_REASON)
                 || marks.contains(event_id));
         let entry = if step.seed {
-            seed_with(&mut log, want.state.clone().unwrap_or_default())?
+            seed_with(
+                &mut log,
+                want.state
+                    .clone()
+                    .unwrap_or_else(|| StateSnapshot::new(table.clone())),
+            )?
         } else if seeded {
-            let state = want.state.clone().unwrap_or_default();
+            let state = want
+                .state
+                .clone()
+                .unwrap_or_else(|| StateSnapshot::new(table.clone()));
             let reason = want.reason.unwrap_or(RESOLVED_REASON);
             from_source.push((event_id.to_owned(), reason.to_owned()));
             let supplied = Settled {
@@ -1293,7 +1312,7 @@ fn replay_pass(
         } else if step.head {
             // No resolver: Synapse's current state.
             from_source.push((event_id.to_owned(), HEAD_REASON.to_owned()));
-            seed_with(&mut log, snapshot_from(&room.current_state))?
+            seed_with(&mut log, snapshot_from(&room.current_state, &table))?
         } else {
             match log.append_remote(step.input.clone()) {
                 Ok(entry) => entry.event_id.clone(),
@@ -1302,7 +1321,7 @@ fn replay_pass(
                         .state_after(event_id)
                         .map_err(|why| no_state(event_id, why))?;
                     from_source.push((event_id.to_owned(), format!("{error:?}")));
-                    seed_with(&mut log, snapshot_from(&map))?
+                    seed_with(&mut log, snapshot_from(&map, &table))?
                 }
                 Err(error) => return Err(refused(event_id, error)),
             }
@@ -1377,7 +1396,7 @@ fn debug_fork(
     for (parent, state) in step.input.prev_events.iter().zip(parents) {
         match source.state_after(parent.as_str()) {
             Ok(map) => {
-                let theirs = snapshot_from(&map);
+                let theirs = snapshot_from(&map, &MemStateKeyTable::shared());
                 let diff = state.diff(&theirs);
                 eprintln!(
                     "debug   parent {}: {} slots differ from the source",
@@ -1401,7 +1420,7 @@ fn debug_fork(
             .prev_events
             .iter()
             .filter_map(|parent| source.state_after(parent.as_str()).ok())
-            .map(|map| snapshot_from(&map))
+            .map(|map| snapshot_from(&map, &MemStateKeyTable::shared()))
             .collect();
         let refs: Vec<&StateSnapshot> = maps.iter().collect();
         source.resolve(&refs)
@@ -1427,9 +1446,13 @@ fn debug_fork(
 /// Building each seed's state from nothing gave every gap in a room of
 /// tens of thousands of members a trie of its own, and the import held
 /// all of them.
-fn snapshot_over(base: Option<&StateSnapshot>, map: &StateMap) -> (StateSnapshot, StateMap) {
+fn snapshot_over(
+    base: Option<&StateSnapshot>,
+    map: &StateMap,
+    table: &Arc<dyn StateKeyTable>,
+) -> (StateSnapshot, StateMap) {
     let Some(base) = base else {
-        return (snapshot_from(map), map.clone());
+        return (snapshot_from(map, table), map.clone());
     };
     let mut changed = StateMap::new();
     let mut added = 0_usize;
@@ -1461,7 +1484,7 @@ fn snapshot_over(base: Option<&StateSnapshot>, map: &StateMap) -> (StateSnapshot
     }
     for ((kind, state_key), value) in &changed {
         state = state.apply(
-            StateKey::new(kind.clone(), state_key.clone()),
+            &StateKey::new(kind.clone(), state_key.clone()),
             value.clone(),
         );
     }
@@ -1482,18 +1505,25 @@ pub fn apply_slots(state: &StateSnapshot, slots: &[(StateKey, Option<String>)]) 
     let mut next = state.clone();
     for (key, value) in slots {
         next = match value {
-            Some(value) => next.apply(key.clone(), value.clone()),
+            Some(value) => next.apply(key, value.clone()),
             None => next.remove(key),
         };
     }
     next
 }
 
-pub(crate) fn snapshot_from(map: &StateMap) -> StateSnapshot {
-    let mut snapshot = StateSnapshot::new();
+/// `map` as a snapshot interned against `table`.
+///
+/// The table is the caller's, not a fresh one: roots are comparable only
+/// between snapshots that share numbering, and a seed this builds is
+/// persisted alongside the log it joins -- so it takes the log's table.
+/// A fresh table per call would give the same content different ids in
+/// every seed, and every one of those comparisons and rows would disagree.
+pub(crate) fn snapshot_from(map: &StateMap, table: &Arc<dyn StateKeyTable>) -> StateSnapshot {
+    let mut snapshot = StateSnapshot::new(table.clone());
     for ((event_type, state_key), event_id) in map {
         snapshot = snapshot.apply(
-            StateKey::new(event_type.clone(), state_key.clone()),
+            &StateKey::new(event_type.clone(), state_key.clone()),
             event_id.clone(),
         );
     }
@@ -1826,24 +1856,26 @@ pub fn compare(state: &StateSnapshot, current_state: &StateMap) -> Vec<Divergenc
 /// the full importer's room-version resolver; topology alone cannot resolve it.
 pub fn replay(room: &SourceRoom) -> Result<Outcome, ImportError> {
     let plan = plan(room)?;
-    let mut log = RoomLog::new();
+    // Transient like the rehearsal's: the outcome carries no snapshots,
+    // and persisting replays through the persist path instead.
+    let table = MemStateKeyTable::shared();
+    let mut log = RoomLog::new(table.clone());
     let mut head: Option<EventId> = None;
 
     for step in &plan.steps {
         let event_id = step.input.event_id.clone();
         let result = if step.seed {
             let state_after = match &room.state_after_root {
-                Some(map) => snapshot_from(map),
+                Some(map) => snapshot_from(map, &table),
                 // A create-rooted import folds forward from nothing, so the
                 // root's own state is just the root, and only when it is a
                 // state event.
-                None => step
-                    .input
-                    .state_key
-                    .clone()
-                    .map_or_else(StateSnapshot::new, |key| {
-                        StateSnapshot::new().apply(key, event_id.as_str().to_owned())
-                    }),
+                None => step.input.state_key.clone().map_or_else(
+                    || StateSnapshot::new(table.clone()),
+                    |key| {
+                        StateSnapshot::new(table.clone()).apply(&key, event_id.as_str().to_owned())
+                    },
+                ),
             };
             log.append_seeded(step.input.clone(), state_after, step.depth)
         } else {
@@ -1892,10 +1924,11 @@ mod seed_sharing_tests {
                 format!("$e{index}"),
             );
         }
-        let base = snapshot_from(&map);
+        let table = MemStateKeyTable::shared();
+        let base = snapshot_from(&map, &table);
         map.remove(&("m.room.member".to_owned(), "@u3000:example.org".to_owned()));
-        let (seed, changed) = snapshot_over(Some(&base), &map);
-        assert_eq!(seed.root(), snapshot_from(&map).root());
+        let (seed, changed) = snapshot_over(Some(&base), &map, &table);
+        assert_eq!(seed.root(), snapshot_from(&map, &table).root());
         assert!(
             changed.is_empty(),
             "removal needs no replacement event bodies"

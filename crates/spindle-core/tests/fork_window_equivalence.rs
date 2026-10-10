@@ -8,7 +8,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use proptest::prelude::*;
-use spindle_core::{EventId, EventInput, LogEntry, RoomLog};
+use spindle_core::{EventId, EventInput, LogEntry, MemStateKeyTable, RoomLog};
 
 /// Divergent ancestry by brute force: every ancestor of every tip, minus the
 /// ancestors common to all of them. O(room history), which is the cost the
@@ -61,7 +61,7 @@ fn exhaustive_window(room: &RoomLog, tips: &[EventId]) -> Option<(EventId, Vec<E
 
 /// A room whose forks are driven by the generated stale-parent choices.
 fn forked_room(choices: &[usize]) -> RoomLog {
-    let mut room = RoomLog::new();
+    let mut room = RoomLog::new(MemStateKeyTable::shared());
     room.append_local("$genesis", None).unwrap();
     for (number, choice) in choices.iter().enumerate() {
         let known = room.len();
@@ -100,7 +100,7 @@ proptest! {
 
 #[test]
 fn a_small_fork_in_a_large_room_does_not_scan_history() {
-    let mut room = RoomLog::new();
+    let mut room = RoomLog::new(MemStateKeyTable::shared());
     room.append_local("$genesis", None).unwrap();
     for number in 0..5_000 {
         room.append_local(format!("$live-{number}"), None).unwrap();

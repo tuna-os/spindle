@@ -3,7 +3,9 @@
 
 use std::{cell::RefCell, collections::BTreeMap};
 
-use spindle_core::RoomLog;
+use std::sync::Arc;
+
+use spindle_core::{MemStateKeyTable, RoomLog, StateKeyTable};
 use spindle_store::{Durability, ReadView, Record, RoomStore, Store, StoreError};
 
 /// An in-memory store that stops accepting commits after a set number, the way
@@ -16,6 +18,7 @@ struct FaultyStore {
     data: RefCell<BTreeMap<Vec<u8>, Vec<u8>>>,
     commits_before_failure: RefCell<usize>,
     writes_seen: RefCell<usize>,
+    table: Arc<dyn StateKeyTable>,
 }
 
 impl FaultyStore {
@@ -24,11 +27,16 @@ impl FaultyStore {
             data: RefCell::new(BTreeMap::new()),
             commits_before_failure: RefCell::new(commits_before_failure),
             writes_seen: RefCell::new(0),
+            table: MemStateKeyTable::shared(),
         }
     }
 }
 
 impl ReadView for FaultyStore {
+    fn key_table(&self) -> Arc<dyn StateKeyTable> {
+        self.table.clone()
+    }
+
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         Ok(self.data.borrow().get(key).cloned())
     }
@@ -127,7 +135,7 @@ const ROOM: &str = "!room:example.org";
 fn a_crash_loses_only_a_suffix_and_never_reorders_or_forks() {
     let store = FaultyStore::new(37);
     let room_store = RoomStore::new(&store, ROOM);
-    let mut log = RoomLog::new();
+    let mut log = RoomLog::new(store.key_table());
 
     let mut committed = 0_usize;
     for number in 0..100 {
@@ -169,7 +177,7 @@ fn a_crash_loses_only_a_suffix_and_never_reorders_or_forks() {
 fn a_failed_commit_lands_nothing_at_all() {
     let store = FaultyStore::new(1);
     let room_store = RoomStore::new(&store, ROOM);
-    let mut log = RoomLog::new();
+    let mut log = RoomLog::new(store.key_table());
 
     let first = log.append_local("$first", None).unwrap().clone();
     room_store
@@ -197,7 +205,7 @@ fn an_append_costs_a_fixed_number_of_writes() {
     // save was O(room) per append, which made a large room quadratic to fill.
     let store = FaultyStore::new(usize::MAX);
     let room_store = RoomStore::new(&store, ROOM);
-    let mut log = RoomLog::new();
+    let mut log = RoomLog::new(store.key_table());
 
     for number in 0..50 {
         let entry = log.append_local(format!("$event-{number}"), None).unwrap();
@@ -216,7 +224,7 @@ fn every_durability_mode_commits() {
     for mode in [Durability::Strict, Durability::Group, Durability::Relaxed] {
         let store = FaultyStore::new(usize::MAX);
         let room_store = RoomStore::new(&store, ROOM);
-        let mut log = RoomLog::new();
+        let mut log = RoomLog::new(store.key_table());
         let entry = log.append_local("$only", None).unwrap().clone();
         room_store.commit_entry(&entry, &log, mode).unwrap();
         assert_eq!(room_store.load().unwrap().unwrap().log.len(), 1, "{mode:?}");

@@ -44,8 +44,10 @@ use ruma::room_version_rules::{RoomVersionRules, StateResolutionVersion};
 use ruma::state_res::StateMap;
 use ruma::state_res::utils::event_id_set::EventIdSet;
 use serde_json::Value;
+use std::sync::Arc;
+
 use spindle_core::{
-    AppendError, EventId, RoomLog, Sideline, StateKey, StateResolver, StateSnapshot,
+    AppendError, EventId, RoomLog, Sideline, StateKey, StateKeyTable, StateResolver, StateSnapshot,
 };
 
 use crate::authorize::StoredEvent;
@@ -602,7 +604,7 @@ fn to_snapshot(
     for ((event_type, state_key), id) in resolved {
         let key = StateKey::new(event_type.to_string(), state_key.as_str());
         if state.get(&key) != Some(id.as_str()) {
-            state = state.apply(key.clone(), id.as_str());
+            state = state.apply(&key, id.as_str());
         }
         kept.insert(key);
     }
@@ -619,7 +621,11 @@ fn to_snapshot(
 }
 
 impl StateResolver for RoomResolver<'_> {
-    fn resolve(&mut self, states: &[StateSnapshot]) -> Result<StateSnapshot, AppendError> {
+    fn resolve(
+        &mut self,
+        states: &[StateSnapshot],
+        table: &Arc<dyn StateKeyTable>,
+    ) -> Result<StateSnapshot, AppendError> {
         let generation = {
             let mut graph = self
                 .graph
@@ -640,7 +646,11 @@ impl StateResolver for RoomResolver<'_> {
             return Ok(hit);
         }
         let Some(base) = states.first() else {
-            return Ok(StateSnapshot::new());
+            // The trait hands the empty case its table: with no states to
+            // inherit numbering from, the caller says which one the empty
+            // snapshot belongs to. The empty root is a constant either
+            // way; the table matters the moment anything is applied to it.
+            return Ok(StateSnapshot::new(table.clone()));
         };
         let mut unparsed = HashSet::new();
         let maps: Vec<StateMap<OwnedEventId>> = states

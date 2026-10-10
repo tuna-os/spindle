@@ -201,7 +201,7 @@ async fn serve(
     store: &Arc<FjallStore>,
     metrics: &Arc<Metrics>,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-    let config = spindle_server::Config::parse("[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n[federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n").unwrap();
+    let config = spindle_server::Config::parse("[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n[federation]\ngap_backfill = false\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n").unwrap();
     let app =
         spindle_server::app_with_metrics(config, Arc::clone(store), Arc::clone(metrics)).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -479,7 +479,10 @@ async fn a_gap_wider_than_the_recovery_budget_is_accepted_on_the_peers_state() {
             history.push(message.clone());
             parent = message;
         }
-        harness.peer.served.lock().unwrap().window = history[history.len() - 100..]
+        // Supply the full recovery window in one reply. Hundreds of
+        // sequential HTTP requests can hit the time budget before the
+        // event budget on a loaded runner, testing a different failure.
+        harness.peer.served.lock().unwrap().window = history[history.len() - 512..]
             .iter()
             .map(|event| event.1.clone())
             .collect();

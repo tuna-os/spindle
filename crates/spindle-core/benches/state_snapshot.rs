@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use spindle_core::{RoomLog, StateKey, StateRoot, StateSnapshot};
+use spindle_core::{MemStateKeyTable, RoomLog, StateKey, StateRoot, StateSnapshot};
 
 fn slots(count: usize) -> Vec<(StateKey, String)> {
     (0..count)
@@ -38,9 +38,9 @@ fn slots(count: usize) -> Vec<(StateKey, String)> {
 }
 
 fn seeded_trie(entries: &[(StateKey, String)]) -> StateSnapshot {
-    let mut state = StateSnapshot::new();
+    let mut state = StateSnapshot::new(MemStateKeyTable::shared());
     for (key, event_id) in entries {
-        state = state.apply(key.clone(), event_id.as_str());
+        state = state.apply(key, event_id.as_str());
     }
     state
 }
@@ -49,16 +49,18 @@ fn seeded_trie(entries: &[(StateKey, String)]) -> StateSnapshot {
 fn retained_updates(c: &mut Criterion) {
     let mut group = c.benchmark_group("state/retained_updates");
 
-    for size in [100_usize, 1_000, 10_000] {
-        // Sizes span two orders of magnitude so the shape, not one number, shows.
+    for size in [100_usize, 1_000, 10_000, 50_000] {
+        // Sizes span the curve to a large room so the shape, not one number,
+        // shows. The clone arm stays capped below: it is quadratic and does
+        // not finish at 10,000, which is the result, not a gap.
         let entries = slots(size);
 
         group.bench_with_input(BenchmarkId::new("hamt", size), &entries, |b, entries| {
             b.iter(|| {
                 let mut history = Vec::with_capacity(entries.len());
-                let mut state = StateSnapshot::new();
+                let mut state = StateSnapshot::new(MemStateKeyTable::shared());
                 for (key, event_id) in entries {
-                    state = state.apply(key.clone(), event_id.as_str());
+                    state = state.apply(key, event_id.as_str());
                     history.push(state.clone());
                 }
                 std::hint::black_box(history.len())
@@ -153,7 +155,7 @@ fn persist(c: &mut Criterion) {
         let update = (StateKey::new("m.room.topic", ""), "$topic".to_owned());
 
         let delta_bytes: usize = trie
-            .apply(update.0.clone(), update.1.as_str())
+            .apply(&update.0, update.1.as_str())
             .delta_nodes(Some(&trie))
             .iter()
             .map(|(_, node)| node.len())
@@ -164,7 +166,7 @@ fn persist(c: &mut Criterion) {
             &(&trie, &update),
             |b, (trie, (key, id))| {
                 b.iter(|| {
-                    let after = trie.apply(key.clone(), id.as_str());
+                    let after = trie.apply(key, id.as_str());
                     let nodes = after.delta_nodes(Some(trie));
                     std::hint::black_box(nodes.iter().map(|(_, node)| node.len()).sum::<usize>())
                 });
@@ -235,7 +237,7 @@ fn history_at(c: &mut Criterion) {
         // A log whose every entry is a state event, so the state at li is
         // the first li entries applied. Snapshots beyond the window are
         // written to a node store the way `RoomStore` writes them.
-        let mut log = RoomLog::new();
+        let mut log = RoomLog::new(MemStateKeyTable::shared());
         let mut nodes: HashMap<StateRoot, Vec<u8>> = HashMap::new();
         let mut previous: Option<StateSnapshot> = None;
         for (index, (key, _)) in entries.iter().enumerate() {
@@ -272,7 +274,8 @@ fn history_at(c: &mut Criterion) {
             b.iter(|| {
                 let mut load = |address: &StateRoot| nodes.get(address).cloned();
                 std::hint::black_box(
-                    StateSnapshot::rehydrate(*root, &mut load).map(|state| state.len()),
+                    StateSnapshot::rehydrate(*root, &mut load, log.table().clone())
+                        .map(|state| state.len()),
                 )
             });
         });
@@ -300,5 +303,50 @@ fn history_at(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, retained_updates, lookups, persist, history_at);
+/// Replacing existing slots after key allocation, retaining every snapshot.
+/// This complements first-sight updates: room state usually changes slots
+/// whose keys the store has already interned.
+fn retained_replacements(c: &mut Criterion) {
+    let mut group = c.benchmark_group("state/retained_replacements");
+    for size in [100_usize, 1_000, 10_000, 50_000] {
+        let entries = slots(size);
+        let seeded = seeded_trie(&entries);
+        let seeded_map: imbl::HashMap<String, String> = entries
+            .iter()
+            .map(|(key, id)| (key.state_key().to_owned(), id.clone()))
+            .collect();
+        group.bench_with_input(BenchmarkId::new("hamt", size), &entries, |b, entries| {
+            b.iter(|| {
+                let mut state = seeded.clone();
+                let mut history = Vec::with_capacity(entries.len());
+                for (key, _) in entries {
+                    state = state.apply(key, "$replacement");
+                    history.push(state.clone());
+                }
+                std::hint::black_box(history)
+            });
+        });
+        group.bench_with_input(BenchmarkId::new("imbl", size), &entries, |b, entries| {
+            b.iter(|| {
+                let mut state = seeded_map.clone();
+                let mut history = Vec::with_capacity(entries.len());
+                for (key, _) in entries {
+                    state.insert(key.state_key().to_owned(), "$replacement".to_owned());
+                    history.push(state.clone());
+                }
+                std::hint::black_box(history)
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    retained_updates,
+    retained_replacements,
+    lookups,
+    persist,
+    history_at
+);
 criterion_main!(benches);

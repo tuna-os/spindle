@@ -4,6 +4,8 @@ use std::{
     sync::{Arc, Weak},
 };
 
+use crate::state_table::StateKeyTable;
+
 /// How the content addresses in this module are derived.
 ///
 /// State roots and HAMT node addresses are BLAKE3 digests of state keys and
@@ -23,7 +25,12 @@ use std::{
 /// rather than misread. `the_domain_tags_carry_the_current_digest_version`
 /// holds the two together — the tags all end in `-v{VERSION}`, and that is
 /// asserted rather than trusted.
-pub const CONTENT_DIGEST_VERSION: u8 = 2;
+///
+/// Version 3 is the interned-keys derivation (#79): leaves hold interned
+/// `u64` ids rather than `(event_type, state_key)` strings, so the key
+/// digest hashes eight bytes instead of two framed strings. A version-2
+/// store is refused at open; `spindle migrate` carries it forward.
+pub const CONTENT_DIGEST_VERSION: u8 = 3;
 
 /// The domain tag separating each digest below from the others.
 ///
@@ -31,24 +38,16 @@ pub const CONTENT_DIGEST_VERSION: u8 = 2;
 /// definition: the digest uses it and [`DOMAIN_TAGS`] lists it, instead of a
 /// list that mirrors the literals and can drift from them.
 ///
-/// The state-key tag is eight bytes, not a sentence, and the lengths that
-/// follow it are `u32`, not `u64` (#77): BLAKE3 compresses in 64-byte
-/// blocks, and the version-1 stream for an ordinary member key ran to 69
-/// bytes -- a second block for five bytes of payload, at roughly twice the
-/// cost of one. At eight plus four plus four bytes of framing, a key with
-/// up to 48 bytes of type and state key fits in one block, which covers
-/// `m.room.member` for any user ID up to 35 bytes. The other three tags
-/// are hashed with 32-byte digests and are never near one block anyway;
-/// they moved to `-v2` with the version rather than for a saving.
-const STATE_KEY_TAG: &[u8] = b"spsk-v2\0";
-const EMPTY_STATE_TAG: &[u8] = b"spindle-empty-state-v2";
-const HAMT_LEAF_TAG: &[u8] = b"spindle-hamt-leaf-v2\0";
-const HAMT_BRANCH_TAG: &[u8] = b"spindle-hamt-branch-v2\0";
-
-/// The most bytes of event type plus state key that still digest in one
-/// BLAKE3 block under [`STATE_KEY_TAG`] and two `u32` lengths.
-#[cfg(test)]
-const ONE_BLOCK_KEY_BYTES: usize = 64 - STATE_KEY_TAG.len() - 2 * 4;
+/// The state-key tag is eight bytes, not a sentence, and the payload is
+/// one `u64` (#79): eight plus eight bytes digest in one BLAKE3 block
+/// with room to spare. Ordinary string keys already fit in one block;
+/// interning primarily shrinks nodes and replaces string comparisons. The other three tags are hashed with
+/// 32-byte digests and are never near one block anyway; they moved to
+/// `-v3` with the version rather than for a saving.
+const STATE_KEY_TAG: &[u8] = b"spsk-v3\0";
+const EMPTY_STATE_TAG: &[u8] = b"spindle-empty-state-v3";
+const HAMT_LEAF_TAG: &[u8] = b"spindle-hamt-leaf-v3\0";
+const HAMT_BRANCH_TAG: &[u8] = b"spindle-hamt-branch-v3\0";
 
 /// Every domain tag, for the test that binds them to
 /// [`CONTENT_DIGEST_VERSION`]. A new digest belongs here, or it is not covered.
@@ -101,14 +100,19 @@ impl StateKey {
     pub fn state_key(&self) -> &str {
         &self.state_key
     }
+}
 
-    fn digest(&self) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(STATE_KEY_TAG);
-        hash_bytes(&mut hasher, self.event_type.as_str().as_bytes());
-        hash_bytes(&mut hasher, self.state_key.as_bytes());
-        *hasher.finalize().as_bytes()
-    }
+/// A key's placement digest from its interned id: tag plus eight bytes,
+/// one BLAKE3 block with room to spare.
+///
+/// The id must come from the snapshot's own table. Two tables that saw
+/// the same pairs in a different order place the same state differently,
+/// which is why snapshots never cross tables.
+fn digest_id(id: u64) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(STATE_KEY_TAG);
+    hasher.update(&id.to_be_bytes());
+    *hasher.finalize().as_bytes()
 }
 
 /// The content address of a complete materialized room state.
@@ -133,16 +137,57 @@ impl StateRoot {
 /// This is a bitmap-indexed 32-way HAMT. Updating one slot path-copies only the
 /// nodes between the root and that slot. Nodes carry deterministic BLAKE3
 /// content addresses, so a storage backend can persist each node exactly once.
-#[derive(Clone, Debug, Default)]
+///
+/// Leaves hold interned key ids, not strings (#79): the trie orders, hashes
+/// and stores `u64`s, and resolves them to [`StateKey`]s only where the
+/// caller sees keys. The table lives beside the snapshot in an `Arc` so a
+/// clone shares it. Two snapshots built against different tables place the
+/// same state differently and must never be diffed or persisted together;
+/// in production every snapshot shares the store's table.
+#[derive(Clone, Debug)]
 pub struct StateSnapshot {
     root: Option<Arc<Node>>,
     len: usize,
+    table: Arc<dyn StateKeyTable>,
 }
 
 impl StateSnapshot {
+    /// An empty snapshot against `table`: production passes the store's
+    /// table, tests pass a shared [`crate::state_table::MemStateKeyTable`].
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(table: Arc<dyn StateKeyTable>) -> Self {
+        Self {
+            root: None,
+            len: 0,
+            table,
+        }
+    }
+
+    /// The same slots interned against `table`: the same state under the
+    /// destination's numbering, with every pair pending there for the
+    /// next persistence drain.
+    ///
+    /// The handoff a store boundary needs. A snapshot built against one
+    /// table carries ids meaningless to another; persisting its nodes
+    /// without re-interning writes rows the destination can never
+    /// resolve. Rebuilding slot by slot reuses the ids the destination
+    /// already has and allocates (hence persists) only what is new.
+    #[must_use]
+    pub fn with_table(self, table: &Arc<dyn StateKeyTable>) -> Self {
+        if std::sync::Arc::ptr_eq(&self.table, table) {
+            return self;
+        }
+        let mut rebased = Self::new(table.clone());
+        self.for_each(|key, event_id| {
+            rebased = rebased.apply(key, event_id);
+        });
+        rebased
+    }
+
+    /// The table this snapshot's ids belong to.
+    #[must_use]
+    pub fn table(&self) -> &Arc<dyn StateKeyTable> {
+        &self.table
     }
 
     #[must_use]
@@ -163,21 +208,34 @@ impl StateSnapshot {
         )
     }
 
+    /// Intern `key` without allocating when the table already holds it:
+    /// a key the table never saw is absent from every trie built against
+    /// it, so reads miss here rather than minting an id to miss with.
+    fn id_of(&self, key: &StateKey) -> Option<u64> {
+        self.table.id_of(key.event_type.as_str(), &key.state_key)
+    }
+
     #[must_use]
     pub fn get(&self, key: &StateKey) -> Option<&str> {
-        let digest = key.digest();
+        let id = self.id_of(key)?;
+        let digest = digest_id(id);
         self.root
             .as_deref()
-            .and_then(|node| node.get(key, &digest, 0))
+            .and_then(|node| node.get(id, &digest, 0))
     }
 
     /// Return a new snapshot with `key` pointing at `event_id`.
     #[must_use]
-    pub fn apply(&self, key: StateKey, event_id: impl Into<Box<str>>) -> Self {
-        let digest = key.digest();
+    pub fn apply(&self, key: &StateKey, event_id: impl Into<Box<str>>) -> Self {
+        let id = self.table.intern(key.event_type.as_str(), &key.state_key);
+        let digest = digest_id(id);
         let event_id = event_id.into();
-        let existed = self.get(&key).is_some();
-        let leaf = Arc::new(Node::leaf(digest, key, event_id));
+        let existed = self
+            .root
+            .as_deref()
+            .and_then(|node| node.get(id, &digest, 0))
+            .is_some();
+        let leaf = Arc::new(Node::leaf(digest, id, event_id));
         let root = Some(match &self.root {
             Some(root) => root.insert(leaf, 0),
             None => leaf,
@@ -186,6 +244,7 @@ impl StateSnapshot {
         Self {
             root,
             len: self.len + usize::from(!existed),
+            table: Arc::clone(&self.table),
         }
     }
 
@@ -196,14 +255,22 @@ impl StateSnapshot {
     /// trie places entries by digest, so an unsorted walk would return the
     /// same state in an order that shifts with the key set. Callers that
     /// render state to a client compare successive responses, and a set that
-    /// reorders itself looks like a set that changed.
+    /// reorders itself looks like a set that changed. The order is string
+    /// order on the resolved keys, not id order: first-seen assignment has
+    /// no relation to sort order.
     pub fn for_each(&self, mut visitor: impl FnMut(&StateKey, &str)) {
         let mut entries = Vec::with_capacity(self.len);
         if let Some(root) = &self.root {
             root.collect(&mut entries);
         }
-        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-        for (key, event_id) in entries {
+        let mut resolved = Vec::with_capacity(entries.len());
+        for (id, event_id) in entries {
+            if let Some(pair) = self.table.resolve(id) {
+                resolved.push((resolved_key(pair), event_id));
+            }
+        }
+        resolved.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        for (key, event_id) in &resolved {
             visitor(key, event_id);
         }
     }
@@ -223,12 +290,16 @@ impl StateSnapshot {
         let Some(root) = &self.root else {
             return self.clone();
         };
-        match root.remove(key, &key.digest(), 0) {
+        let Some(id) = self.id_of(key) else {
+            return self.clone();
+        };
+        match root.remove(id, &digest_id(id), 0) {
             Removal::Absent => self.clone(),
-            Removal::Emptied => Self::new(),
+            Removal::Emptied => Self::new(Arc::clone(&self.table)),
             Removal::Replaced(root) => Self {
                 root: Some(root),
                 len: self.len.saturating_sub(1),
+                table: Arc::clone(&self.table),
             },
         }
     }
@@ -243,19 +314,111 @@ impl StateSnapshot {
     /// paths that changed. Diffing two states of a large room that differ
     /// in a few slots costs those few paths, not a pass over every member --
     /// which is what a fork merge or a state comparison needs.
+    ///
+    /// The keys come back owned, not borrowed: leaves hold ids, and the
+    /// strings live in the table. Ids compare directly when both sides
+    /// share one table; across tables the slots resolve to strings first,
+    /// so a diff is always correct and only ever slow in a case the
+    /// production server never constructs.
     #[must_use]
     pub fn diff<'a>(
         &'a self,
         other: &'a Self,
-    ) -> Vec<(&'a StateKey, Option<&'a str>, Option<&'a str>)> {
-        let mut out = Vec::new();
-        diff_nodes(self.root.as_deref(), other.root.as_deref(), &mut out);
+    ) -> Vec<(StateKey, Option<&'a str>, Option<&'a str>)> {
+        if !Arc::ptr_eq(&self.table, &other.table) {
+            let mut out = Vec::new();
+            diff_resolved(self, other, &mut out);
+            out.sort_unstable_by(|(left, ..), (right, ..)| left.cmp(right));
+            return out;
+        }
+        let mut slots = Vec::new();
+        diff_nodes(self.root.as_deref(), other.root.as_deref(), &mut slots);
+        // Resolve only the slots that differ, not the whole state: a fork
+        // merge that touches three slots pays for three resolutions.
+        let mut out = Vec::with_capacity(slots.len());
+        for (id, ours, theirs) in slots {
+            if let Some(pair) = self.table.resolve(id) {
+                out.push((resolved_key(pair), ours, theirs));
+            }
+        }
         out.sort_unstable_by(|(left, ..), (right, ..)| left.cmp(right));
         out
     }
 }
 
-type SlotDiff<'a> = (&'a StateKey, Option<&'a str>, Option<&'a str>);
+/// A [`StateKey`] from a resolved table pair.
+fn resolved_key((event_type, state_key): (Box<str>, Box<str>)) -> StateKey {
+    StateKey {
+        event_type: EventType(event_type),
+        state_key,
+    }
+}
+
+/// A slot both sides resolve the same way: `(key, ours, theirs)`.
+type SlotDiff<'a> = (u64, Option<&'a str>, Option<&'a str>);
+
+/// The slow but always-correct diff for snapshots built against different
+/// tables: resolve every slot on both sides and compare strings. Only
+/// tests construct this case; production shares one table per store.
+fn diff_resolved<'a>(
+    left: &'a StateSnapshot,
+    right: &'a StateSnapshot,
+    out: &mut Vec<(StateKey, Option<&'a str>, Option<&'a str>)>,
+) {
+    let mut ours = Vec::new();
+    let mut theirs = Vec::new();
+    if let Some(root) = left.root.as_deref() {
+        root.collect(&mut ours);
+    }
+    if let Some(root) = right.root.as_deref() {
+        root.collect(&mut theirs);
+    }
+    let resolve_all = |entries: Vec<(u64, &'a str)>, table: &Arc<dyn StateKeyTable>| {
+        let mut resolved: Vec<(StateKey, &'a str)> = Vec::with_capacity(entries.len());
+        for (id, value) in entries {
+            if let Some(pair) = table.resolve(id) {
+                resolved.push((resolved_key(pair), value));
+            }
+        }
+        resolved.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        resolved
+    };
+    let ours = resolve_all(ours, &left.table);
+    let theirs = resolve_all(theirs, &right.table);
+    let (mut i, mut j) = (0, 0);
+    loop {
+        match (ours.get(i), theirs.get(j)) {
+            (None, None) => break,
+            (Some((key, value)), None) => {
+                out.push((key.clone(), Some(*value), None));
+                i += 1;
+            }
+            (None, Some((key, value))) => {
+                out.push((key.clone(), None, Some(*value)));
+                j += 1;
+            }
+            (Some((left_key, left_value)), Some((right_key, right_value))) => {
+                match left_key.cmp(right_key) {
+                    Ordering::Less => {
+                        out.push((left_key.clone(), Some(*left_value), None));
+                        i += 1;
+                    }
+                    Ordering::Greater => {
+                        out.push((right_key.clone(), None, Some(*right_value)));
+                        j += 1;
+                    }
+                    Ordering::Equal => {
+                        if left_value != right_value {
+                            out.push((left_key.clone(), Some(*left_value), Some(*right_value)));
+                        }
+                        i += 1;
+                        j += 1;
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Descend two tries in step, skipping subtrees with equal hashes.
 ///
@@ -264,6 +427,9 @@ type SlotDiff<'a> = (&'a StateKey, Option<&'a str>, Option<&'a str>);
 /// shapes differ at a level (a leaf on one side, a branch on the other), the
 /// two subtrees are small by construction -- a leaf sits where its slot has
 /// one digest -- and are compared entry by entry.
+/// Descend two tries built against one table, in step, skipping subtrees
+/// with equal hashes. Ids compare directly: within one table equal ids
+/// are equal keys, so no string leaves the table on this path.
 fn diff_nodes<'a>(left: Option<&'a Node>, right: Option<&'a Node>, out: &mut Vec<SlotDiff<'a>>) {
     match (left, right) {
         (None, None) => {}
@@ -313,27 +479,27 @@ fn diff_nodes<'a>(left: Option<&'a Node>, right: Option<&'a Node>, out: &mut Vec
             loop {
                 match (ours.get(i), theirs.get(j)) {
                     (None, None) => break,
-                    (Some((key, value)), None) => {
-                        out.push((*key, Some(*value), None));
+                    (Some((id, value)), None) => {
+                        out.push((*id, Some(*value), None));
                         i += 1;
                     }
-                    (None, Some((key, value))) => {
-                        out.push((*key, None, Some(*value)));
+                    (None, Some((id, value))) => {
+                        out.push((*id, None, Some(*value)));
                         j += 1;
                     }
-                    (Some((left_key, left_value)), Some((right_key, right_value))) => {
-                        match left_key.cmp(right_key) {
+                    (Some((left_id, left_value)), Some((right_id, right_value))) => {
+                        match left_id.cmp(right_id) {
                             Ordering::Less => {
-                                out.push((*left_key, Some(*left_value), None));
+                                out.push((*left_id, Some(*left_value), None));
                                 i += 1;
                             }
                             Ordering::Greater => {
-                                out.push((*right_key, None, Some(*right_value)));
+                                out.push((*right_id, None, Some(*right_value)));
                                 j += 1;
                             }
                             Ordering::Equal => {
                                 if left_value != right_value {
-                                    out.push((*left_key, Some(*left_value), Some(*right_value)));
+                                    out.push((*left_id, Some(*left_value), Some(*right_value)));
                                 }
                                 i += 1;
                                 j += 1;
@@ -360,7 +526,7 @@ enum Removal {
 enum Node {
     Leaf {
         digest: [u8; 32],
-        entries: Arc<[(StateKey, Box<str>)]>,
+        entries: Arc<[(u64, Box<str>)]>,
         hash: [u8; 32],
     },
     Branch {
@@ -371,11 +537,14 @@ enum Node {
 }
 
 impl Node {
-    fn leaf(digest: [u8; 32], key: StateKey, event_id: Box<str>) -> Self {
-        Self::leaf_from_entries(digest, vec![(key, event_id)])
+    /// A leaf holds `(interned key id, event id)` pairs, sorted by id. The
+    /// sort is by id, not by string: placement walks the digest, and within
+    /// one digest the order only has to be canonical, which id order is.
+    fn leaf(digest: [u8; 32], id: u64, event_id: Box<str>) -> Self {
+        Self::leaf_from_entries(digest, vec![(id, event_id)])
     }
 
-    fn leaf_from_entries(digest: [u8; 32], mut entries: Vec<(StateKey, Box<str>)>) -> Self {
+    fn leaf_from_entries(digest: [u8; 32], mut entries: Vec<(u64, Box<str>)>) -> Self {
         entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
         let hash = hash_leaf(&digest, &entries);
         Self::Leaf {
@@ -400,14 +569,14 @@ impl Node {
         }
     }
 
-    fn get<'a>(&'a self, key: &StateKey, digest: &[u8; 32], depth: usize) -> Option<&'a str> {
+    fn get<'a>(&'a self, id: u64, digest: &[u8; 32], depth: usize) -> Option<&'a str> {
         match self {
             Self::Leaf {
                 digest: leaf_digest,
                 entries,
                 ..
             } if leaf_digest == digest => entries
-                .binary_search_by(|(candidate, _)| candidate.cmp(key))
+                .binary_search_by(|(candidate, _)| candidate.cmp(&id))
                 .ok()
                 .and_then(|index| entries.get(index))
                 .map(|(_, value)| value.as_ref()),
@@ -421,7 +590,7 @@ impl Node {
                     return None;
                 }
                 let index = (bitmap & (bit - 1)).count_ones() as usize;
-                children.get(index)?.get(key, digest, depth + 1)
+                children.get(index)?.get(id, digest, depth + 1)
             }
         }
     }
@@ -441,14 +610,14 @@ impl Node {
                 },
             ) if current_digest == incoming_digest => {
                 let mut merged = entries.to_vec();
-                for (key, value) in incoming_entries.iter() {
-                    match merged.binary_search_by(|(candidate, _)| candidate.cmp(key)) {
+                for (id, value) in incoming_entries.iter() {
+                    match merged.binary_search_by(|(candidate, _)| candidate.cmp(id)) {
                         Ok(index) => {
                             if let Some(slot) = merged.get_mut(index) {
                                 slot.1.clone_from(value);
                             }
                         }
-                        Err(index) => merged.insert(index, (key.clone(), value.clone())),
+                        Err(index) => merged.insert(index, (*id, value.clone())),
                     }
                 }
                 Arc::new(Self::leaf_from_entries(*current_digest, merged))
@@ -488,7 +657,7 @@ impl Node {
     /// because that is the shape an insert-only trie holding the same keys
     /// has; a single child that is a branch stays wrapped, because that
     /// shape is what two digests sharing this slot produce on insert too.
-    fn remove(&self, key: &StateKey, digest: &[u8; 32], depth: usize) -> Removal {
+    fn remove(&self, id: u64, digest: &[u8; 32], depth: usize) -> Removal {
         match self {
             Self::Leaf {
                 digest: leaf_digest,
@@ -498,7 +667,7 @@ impl Node {
                 if leaf_digest != digest {
                     return Removal::Absent;
                 }
-                let Ok(index) = entries.binary_search_by(|(candidate, _)| candidate.cmp(key))
+                let Ok(index) = entries.binary_search_by(|(candidate, _)| candidate.cmp(&id))
                 else {
                     return Removal::Absent;
                 };
@@ -524,7 +693,7 @@ impl Node {
                 };
                 let mut next = children.to_vec();
                 let mut bits = *bitmap;
-                match child.remove(key, digest, depth + 1) {
+                match child.remove(id, digest, depth + 1) {
                     Removal::Absent => return Removal::Absent,
                     Removal::Replaced(child) => {
                         if let Some(slot) = next.get_mut(index) {
@@ -547,13 +716,13 @@ impl Node {
         }
     }
 
-    fn collect<'a>(&'a self, output: &mut Vec<(&'a StateKey, &'a str)>) {
+    fn collect<'a>(&'a self, output: &mut Vec<(u64, &'a str)>) {
         match self {
             Self::Leaf { entries, .. } => {
                 output.extend(
                     entries
                         .iter()
-                        .map(|(key, event_id)| (key, event_id.as_ref())),
+                        .map(|(id, event_id)| (*id, event_id.as_ref())),
                 );
             }
             Self::Branch { children, .. } => {
@@ -612,14 +781,16 @@ fn digest_slot(digest: &[u8; 32], depth: usize) -> u32 {
     u32::from(window & 0x1f)
 }
 
-fn hash_leaf(digest: &[u8; 32], entries: &[(StateKey, Box<str>)]) -> [u8; 32] {
+/// A leaf hashes its digest, its entry count, and one `u64` plus one
+/// framed string per entry. Eight bytes where two framed strings stood:
+/// fewer bytes per state change on the wire and in the store (#79).
+fn hash_leaf(digest: &[u8; 32], entries: &[(u64, Box<str>)]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(HAMT_LEAF_TAG);
     hasher.update(digest);
     hasher.update(&(entries.len() as u64).to_be_bytes());
-    for (key, event_id) in entries {
-        hash_bytes(&mut hasher, key.event_type().as_str().as_bytes());
-        hash_bytes(&mut hasher, key.state_key().as_bytes());
+    for (id, event_id) in entries {
+        hasher.update(&id.to_be_bytes());
         hash_bytes(&mut hasher, event_id.as_bytes());
     }
     *hasher.finalize().as_bytes()
@@ -655,6 +826,16 @@ fn hash_bytes(hasher: &mut blake3::Hasher, value: &[u8]) {
 /// fixed rather than derived from enum ordering.
 const TAG_LEAF: u8 = 0;
 const TAG_BRANCH: u8 = 1;
+
+/// The version-2 domain tags, kept for the migration read path only.
+/// Version 2 is what the store on disk holds until `spindle migrate` runs;
+/// nothing writes these and nothing serving reads them. They are repeated
+/// here rather than derived because their whole job is to be exactly what
+/// the old binary wrote -- a constant that updates itself is not a record
+/// of anything.
+const V2_HAMT_LEAF_TAG: &[u8] = b"spindle-hamt-leaf-v2\0";
+const V2_HAMT_BRANCH_TAG: &[u8] = b"spindle-hamt-branch-v2\0";
+const V2_EMPTY_STATE_TAG: &[u8] = b"spindle-empty-state-v2";
 
 /// The deepest an honest trie goes.
 ///
@@ -808,6 +989,12 @@ impl StateSnapshot {
 
     /// Rebuild a snapshot from stored nodes, verifying each one's address.
     ///
+    /// The nodes hold ids, so decoding needs no strings -- but the
+    /// snapshot must still know whose ids they are. Pass the table the
+    /// nodes were written against: the store's table in production, a
+    /// shared test table in tests. An empty root short-circuits before
+    /// the table is consulted.
+    ///
     /// # Errors
     ///
     /// Returns [`RehydrateError`] if a node is missing, malformed, or does not
@@ -815,14 +1002,16 @@ impl StateSnapshot {
     pub fn rehydrate(
         root: StateRoot,
         load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+        table: Arc<dyn StateKeyTable>,
     ) -> Result<Self, RehydrateError> {
-        if root == Self::new().root() {
-            return Ok(Self::new());
+        if root == Self::new(Arc::clone(&table)).root() {
+            return Ok(Self::new(table));
         }
-        let rebuilt = rebuild_verified(&root, load, 0, None)?;
+        let rebuilt = rebuild_verified(&root, load, 0, None, table.as_ref())?;
         Ok(Self {
             root: Some(rebuilt.node),
             len: rebuilt.len,
+            table,
         })
     }
 
@@ -833,14 +1022,16 @@ impl StateSnapshot {
         root: StateRoot,
         load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
         cache: &mut VerifiedNodeCache,
+        table: Arc<dyn StateKeyTable>,
     ) -> Result<Self, RehydrateError> {
-        if root == Self::new().root() {
-            return Ok(Self::new());
+        if root == Self::new(Arc::clone(&table)).root() {
+            return Ok(Self::new(table));
         }
-        let rebuilt = rebuild_verified(&root, load, 0, Some(cache))?;
+        let rebuilt = rebuild_verified(&root, load, 0, Some(cache), table.as_ref())?;
         Ok(Self {
             root: Some(rebuilt.node),
             len: rebuilt.len,
+            table,
         })
     }
 
@@ -853,17 +1044,21 @@ impl StateSnapshot {
         mut root: StateRoot,
         key: &StateKey,
         load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+        table: &Arc<dyn StateKeyTable>,
     ) -> Result<Option<String>, RehydrateError> {
-        if root == Self::new().root() {
+        if root == Self::new(Arc::clone(table)).root() {
             return Ok(None);
         }
-        let digest = key.digest();
+        let Some(id) = table.id_of(key.event_type.as_str(), &key.state_key) else {
+            return Ok(None);
+        };
+        let digest = digest_id(id);
         for depth in 0..=MAX_DEPTH {
             let bytes = load(&root).ok_or(RehydrateError::MissingNode)?;
             match bytes.first().copied() {
                 Some(TAG_LEAF) => {
-                    let leaf = rebuild(&root, &mut |_| Some(bytes.clone()), depth)?;
-                    return Ok(leaf.get(key, &digest, depth).map(str::to_owned));
+                    let leaf = rebuild(&root, &mut |_| Some(bytes.clone()), depth, table.as_ref())?;
+                    return Ok(leaf.get(id, &digest, depth).map(str::to_owned));
                 }
                 Some(TAG_BRANCH) => {
                     if depth == MAX_DEPTH {
@@ -904,6 +1099,154 @@ impl StateSnapshot {
         }
         Err(RehydrateError::Malformed)
     }
+}
+
+/// Rebuild the state at a version-2 root as a version-3 snapshot.
+///
+/// Version-2 leaves hold `(event_type, state_key)` strings placed by the
+/// string digest; version 3 holds interned ids placed by the id digest, so
+/// no node survives the move -- not even structurally, because the branch
+/// bitmaps above a leaf were built for the old placement. This decodes
+/// every slot and folds them into a fresh snapshot against `table`, which
+/// marks each pair for the persistence drain.
+///
+/// Every node is verified with the version-2 tags on the way down, which
+/// is also what tells a version-2 node from an already-migrated one: bytes
+/// the new derivation wrote do not hash to their address under the old
+/// tags. For `spindle migrate` only -- the serving paths never see
+/// version-2 bytes.
+///
+/// # Errors
+///
+/// Returns [`RehydrateError`] for missing, malformed, corrupt, or
+/// already-migrated nodes.
+pub fn rehydrate_v2(
+    root: StateRoot,
+    load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+    table: &Arc<dyn StateKeyTable>,
+) -> Result<StateSnapshot, RehydrateError> {
+    let (slots, _) = walk_v2(&root, load)?;
+    // Sorted, so the fresh numbering is a function of the content rather
+    // than of whatever order the old trie happened to store it in.
+    let mut slots = slots;
+    slots.sort();
+    let mut state = StateSnapshot::new(Arc::clone(table));
+    for (event_type, state_key, event_id) in slots {
+        state = state.apply(&StateKey::new(event_type, state_key), event_id);
+    }
+    Ok(state)
+}
+
+/// Every node address the version-2 trie at `root` occupies.
+///
+/// The migration deletes exactly these after the rewritten records land:
+/// no scan can find them afterwards, because content addressing spreads one
+/// room's old nodes across the whole keyspace. An empty root occupies
+/// nothing. For `spindle migrate` only.
+///
+/// # Errors
+///
+/// As [`rehydrate_v2`]: a node this cannot verify is corruption, not an
+/// already-migrated trie, and must stop the migration rather than be
+/// deleted from under records that still name it.
+pub fn v2_node_addresses(
+    root: StateRoot,
+    load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+) -> Result<Vec<StateRoot>, RehydrateError> {
+    Ok(walk_v2(&root, load)?.1)
+}
+
+/// One version-2 slot: the `(event_type, state_key)` strings and the event
+/// they name. A name for the triple nesting, as in [`AllocRecord`].
+type V2Slot = (String, String, String);
+
+fn walk_v2(
+    root: &StateRoot,
+    load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+) -> Result<(Vec<V2Slot>, Vec<StateRoot>), RehydrateError> {
+    if root.as_bytes() == blake3::hash(V2_EMPTY_STATE_TAG).as_bytes() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut slots = Vec::new();
+    let mut addresses = Vec::new();
+    collect_v2_slots(root, load, 0, &mut slots, &mut addresses)?;
+    Ok((slots, addresses))
+}
+
+fn collect_v2_slots(
+    address: &StateRoot,
+    load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+    depth: usize,
+    slots: &mut Vec<V2Slot>,
+    addresses: &mut Vec<StateRoot>,
+) -> Result<(), RehydrateError> {
+    if depth > MAX_DEPTH {
+        return Err(RehydrateError::Malformed);
+    }
+    addresses.push(*address);
+    let bytes = load(address).ok_or(RehydrateError::MissingNode)?;
+    let mut at = 0_usize;
+    let tag = *bytes.first().ok_or(RehydrateError::Malformed)?;
+    at += 1;
+    match tag {
+        TAG_LEAF => {
+            let digest = take_array::<32>(&bytes, &mut at)?;
+            let count = take_count(&bytes, &mut at, 3 * 4)?;
+            let mut entries = Vec::with_capacity(count);
+            for _ in 0..count {
+                let event_type = take_string(&bytes, &mut at)?;
+                let state_key = take_string(&bytes, &mut at)?;
+                let event_id = take_string(&bytes, &mut at)?;
+                entries.push((event_type, state_key, event_id));
+            }
+            if at != bytes.len() {
+                return Err(RehydrateError::Malformed);
+            }
+            // The old derivation over the old bytes: a version-3 node fails
+            // here, which is how the migration tells migrated from corrupt.
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(V2_HAMT_LEAF_TAG);
+            hasher.update(&digest);
+            hasher.update(&(entries.len() as u64).to_be_bytes());
+            for (event_type, state_key, event_id) in &entries {
+                hash_bytes(&mut hasher, event_type.as_bytes());
+                hash_bytes(&mut hasher, state_key.as_bytes());
+                hash_bytes(&mut hasher, event_id.as_bytes());
+            }
+            if hasher.finalize().as_bytes() != address.as_bytes() {
+                return Err(RehydrateError::HashMismatch);
+            }
+            slots.extend(entries);
+        }
+        TAG_BRANCH => {
+            let bitmap = u32::from_be_bytes(take_array::<4>(&bytes, &mut at)?);
+            let count = take_count(&bytes, &mut at, 32)?;
+            if count != bitmap.count_ones() as usize {
+                return Err(RehydrateError::Malformed);
+            }
+            let mut children = Vec::with_capacity(count);
+            for _ in 0..count {
+                children.push(StateRoot(take_array::<32>(&bytes, &mut at)?));
+            }
+            if at != bytes.len() {
+                return Err(RehydrateError::Malformed);
+            }
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(V2_HAMT_BRANCH_TAG);
+            hasher.update(&bitmap.to_be_bytes());
+            for child in &children {
+                hasher.update(child.as_bytes());
+            }
+            if hasher.finalize().as_bytes() != address.as_bytes() {
+                return Err(RehydrateError::HashMismatch);
+            }
+            for child in &children {
+                collect_v2_slots(child, load, depth + 1, slots, addresses)?;
+            }
+        }
+        _ => return Err(RehydrateError::Malformed),
+    }
+    Ok(())
 }
 
 /// Emit the nodes `new` has that `old` did not, descending only where they
@@ -969,9 +1312,8 @@ fn encode_node(node: &Node) -> Vec<u8> {
                     .unwrap_or(u32::MAX)
                     .to_be_bytes(),
             );
-            for (key, event_id) in entries.iter() {
-                put_field(&mut out, key.event_type().as_str().as_bytes());
-                put_field(&mut out, key.state_key().as_bytes());
+            for (id, event_id) in entries.iter() {
+                out.extend_from_slice(&id.to_be_bytes());
                 put_field(&mut out, event_id.as_bytes());
             }
         }
@@ -1002,8 +1344,9 @@ fn rebuild(
     address: &StateRoot,
     load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
     depth: usize,
+    table: &dyn StateKeyTable,
 ) -> Result<Arc<Node>, RehydrateError> {
-    Ok(rebuild_verified(address, load, depth, None)?.node)
+    Ok(rebuild_verified(address, load, depth, None, table)?.node)
 }
 
 fn rebuild_verified(
@@ -1011,6 +1354,7 @@ fn rebuild_verified(
     load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
     depth: usize,
     mut cache: Option<&mut VerifiedNodeCache>,
+    table: &dyn StateKeyTable,
 ) -> Result<RebuiltNode, RehydrateError> {
     if depth > MAX_DEPTH {
         return Err(RehydrateError::Malformed);
@@ -1027,16 +1371,15 @@ fn rebuild_verified(
     let (node, len) = match tag {
         TAG_LEAF => {
             let digest = take_array::<32>(&bytes, &mut at)?;
-            let count = take_count(&bytes, &mut at, 3 * 4)?;
+            let count = take_count(&bytes, &mut at, 8 + 4)?;
             let mut entries = Vec::with_capacity(count);
             for _ in 0..count {
-                let event_type = take_string(&bytes, &mut at)?;
-                let state_key = take_string(&bytes, &mut at)?;
+                let id = u64::from_be_bytes(take_array::<8>(&bytes, &mut at)?);
+                if !table.contains_id(id) {
+                    return Err(RehydrateError::Malformed);
+                }
                 let event_id = take_string(&bytes, &mut at)?;
-                entries.push((
-                    StateKey::new(event_type, state_key),
-                    event_id.into_boxed_str(),
-                ));
+                entries.push((id, event_id.into_boxed_str()));
             }
             (Node::leaf_from_entries(digest, entries), count)
         }
@@ -1047,7 +1390,8 @@ fn rebuild_verified(
             let mut len = 0_usize;
             for _ in 0..count {
                 let child = StateRoot(take_array::<32>(&bytes, &mut at)?);
-                let rebuilt = rebuild_verified(&child, load, depth + 1, cache.as_deref_mut())?;
+                let rebuilt =
+                    rebuild_verified(&child, load, depth + 1, cache.as_deref_mut(), table)?;
                 len = len
                     .checked_add(rebuilt.len)
                     .ok_or(RehydrateError::Malformed)?;
@@ -1151,20 +1495,13 @@ mod digest_version_tests {
         }
     }
 
-    /// An ordinary state key digests in one BLAKE3 block (#77). The bound
-    /// is arithmetic on the tag and the two length frames, checked here so
-    /// a longer tag or wider length cannot creep back in unnoticed; the
-    /// member key below is the shape the issue measured.
+    /// An interned id digests in one BLAKE3 block (#79). The bound is
+    /// arithmetic on the tag and the eight id bytes, checked here so a
+    /// wider payload cannot creep back in unnoticed.
     #[test]
-    fn an_ordinary_state_key_digests_in_one_block() {
-        let key = super::StateKey::new("m.room.member", "@u25000:example.org");
-        let stream = super::STATE_KEY_TAG.len()
-            + 4
-            + key.event_type().as_str().len()
-            + 4
-            + key.state_key().len();
+    fn an_interned_id_digests_in_one_block() {
+        let stream = super::STATE_KEY_TAG.len() + 8;
         assert!(stream <= 64, "{stream} bytes is more than one block");
-        assert_eq!(super::ONE_BLOCK_KEY_BYTES, 48);
     }
 
     /// The tags are distinct, so one digest cannot be mistaken for another.
@@ -1185,11 +1522,18 @@ mod digest_version_tests {
 mod cached_rehydrate_tests {
     use super::*;
 
-    fn state(count: usize) -> StateSnapshot {
-        let mut state = StateSnapshot::new();
+    fn table() -> std::sync::Arc<dyn crate::state_table::StateKeyTable> {
+        crate::state_table::MemStateKeyTable::shared()
+    }
+
+    fn state(
+        count: usize,
+        table: &std::sync::Arc<dyn crate::state_table::StateKeyTable>,
+    ) -> StateSnapshot {
+        let mut state = StateSnapshot::new(std::sync::Arc::clone(table));
         for index in 0..count {
             state = state.apply(
-                StateKey::new("m.room.member", format!("@u{index}:test")),
+                &StateKey::new("m.room.member", format!("@u{index}:test")),
                 format!("$e{index}"),
             );
         }
@@ -1202,19 +1546,22 @@ mod cached_rehydrate_tests {
 
     #[test]
     fn same_root_reuses_verified_arc_and_entry_count_without_storage_reads() {
-        let expected = state(512);
+        let table = table();
+        let expected = state(512, &table);
         let stored = nodes(&expected);
         let mut cache = VerifiedNodeCache::new(4 * 1024 * 1024);
         let first = StateSnapshot::rehydrate_cached(
             expected.root(),
             &mut |root| stored.get(root).cloned(),
             &mut cache,
+            Arc::clone(&table),
         )
         .expect("verified first read");
         let second = StateSnapshot::rehydrate_cached(
             expected.root(),
             &mut |_| panic!("same verified root must not reload"),
             &mut cache,
+            Arc::clone(&table),
         )
         .expect("cached root");
         assert_eq!(second.root(), expected.root());
@@ -1227,8 +1574,9 @@ mod cached_rehydrate_tests {
 
     #[test]
     fn changed_root_loads_only_changed_paths_and_shares_unchanged_subtrees() {
-        let before = state(512);
-        let after = before.apply(StateKey::new("m.room.member", "@u1:test"), "$updated");
+        let table = table();
+        let before = state(512, &table);
+        let after = before.apply(&StateKey::new("m.room.member", "@u1:test"), "$updated");
         let changed = after.delta_nodes(Some(&before));
         let mut stored = nodes(&before);
         stored.extend(changed.iter().cloned());
@@ -1237,6 +1585,7 @@ mod cached_rehydrate_tests {
             before.root(),
             &mut |root| stored.get(root).cloned(),
             &mut cache,
+            Arc::clone(&table),
         )
         .expect("before");
         let mut reads = 0;
@@ -1247,6 +1596,7 @@ mod cached_rehydrate_tests {
                 stored.get(root).cloned()
             },
             &mut cache,
+            Arc::clone(&table),
         )
         .expect("after");
         assert_eq!(reads, changed.len());
@@ -1276,7 +1626,8 @@ mod cached_rehydrate_tests {
 
     #[test]
     fn corrupt_nodes_never_enter_cache_and_a_fresh_read_still_detects_corruption() {
-        let expected = state(1);
+        let table = table();
+        let expected = state(1, &table);
         let stored = nodes(&expected);
         let mut bytes = stored.get(&expected.root()).expect("leaf bytes").clone();
         bytes[1] ^= 1;
@@ -1285,7 +1636,8 @@ mod cached_rehydrate_tests {
             StateSnapshot::rehydrate_cached(
                 expected.root(),
                 &mut |_| Some(bytes.clone()),
-                &mut cache
+                &mut cache,
+                Arc::clone(&table),
             ),
             Err(RehydrateError::HashMismatch)
         ));
@@ -1294,6 +1646,7 @@ mod cached_rehydrate_tests {
             expected.root(),
             &mut |root| stored.get(root).cloned(),
             &mut cache,
+            Arc::clone(&table),
         )
         .expect("valid read");
         let mut independent = VerifiedNodeCache::new(4096);
@@ -1301,7 +1654,8 @@ mod cached_rehydrate_tests {
             StateSnapshot::rehydrate_cached(
                 expected.root(),
                 &mut |_| Some(bytes.clone()),
-                &mut independent
+                &mut independent,
+                Arc::clone(&table),
             ),
             Err(RehydrateError::HashMismatch)
         ));
@@ -1309,10 +1663,16 @@ mod cached_rehydrate_tests {
 
     #[test]
     fn missing_and_malformed_nodes_keep_original_error_semantics() {
-        let expected = state(1);
+        let table = table();
+        let expected = state(1, &table);
         let mut cache = VerifiedNodeCache::new(4096);
         assert!(matches!(
-            StateSnapshot::rehydrate_cached(expected.root(), &mut |_| None, &mut cache),
+            StateSnapshot::rehydrate_cached(
+                expected.root(),
+                &mut |_| None,
+                &mut cache,
+                Arc::clone(&table)
+            ),
             Err(RehydrateError::MissingNode)
         ));
         let mut encoded = nodes(&expected)
@@ -1323,7 +1683,8 @@ mod cached_rehydrate_tests {
             StateSnapshot::rehydrate_cached(
                 expected.root(),
                 &mut |_| Some(encoded.clone()),
-                &mut cache
+                &mut cache,
+                Arc::clone(&table),
             ),
             Err(RehydrateError::Malformed)
         ));
@@ -1332,7 +1693,8 @@ mod cached_rehydrate_tests {
 
     #[test]
     fn missing_descendant_cannot_publish_a_successful_cached_parent() {
-        let expected = state(128);
+        let table = table();
+        let expected = state(128, &table);
         let stored = nodes(&expected);
         let missing = *stored
             .iter()
@@ -1350,7 +1712,8 @@ mod cached_rehydrate_tests {
                         stored.get(root).cloned()
                     }
                 },
-                &mut cache
+                &mut cache,
+                Arc::clone(&table),
             ),
             Err(RehydrateError::MissingNode)
         ));
@@ -1359,6 +1722,7 @@ mod cached_rehydrate_tests {
             expected.root(),
             &mut |root| stored.get(root).cloned(),
             &mut cache,
+            Arc::clone(&table),
         )
         .expect("complete source read");
         assert_eq!(recovered.root(), expected.root());
@@ -1367,13 +1731,15 @@ mod cached_rehydrate_tests {
 
     #[test]
     fn expired_nodes_are_reloaded_and_verified_without_cache_graph_ownership() {
-        let expected = state(1);
+        let table = table();
+        let expected = state(1, &table);
         let stored = nodes(&expected);
         let mut cache = VerifiedNodeCache::new(4096);
         let held = StateSnapshot::rehydrate_cached(
             expected.root(),
             &mut |root| stored.get(root).cloned(),
             &mut cache,
+            Arc::clone(&table),
         )
         .expect("first read");
         assert_eq!(Arc::strong_count(held.root.as_ref().expect("root")), 1);
@@ -1384,7 +1750,8 @@ mod cached_rehydrate_tests {
             StateSnapshot::rehydrate_cached(
                 expected.root(),
                 &mut |_| Some(corrupt.clone()),
-                &mut cache
+                &mut cache,
+                Arc::clone(&table),
             ),
             Err(RehydrateError::HashMismatch)
         ));
@@ -1392,8 +1759,24 @@ mod cached_rehydrate_tests {
     }
 
     #[test]
+    fn rehydration_refuses_nodes_with_missing_intern_rows() {
+        let table = table();
+        let expected = state(1, &table);
+        let stored = nodes(&expected);
+        assert!(matches!(
+            StateSnapshot::rehydrate(
+                expected.root(),
+                &mut |root| stored.get(root).cloned(),
+                crate::MemStateKeyTable::shared()
+            ),
+            Err(RehydrateError::Malformed)
+        ));
+    }
+
+    #[test]
     fn cached_nodes_cannot_bypass_recursion_depth_bound() {
-        let expected = state(1);
+        let table = table();
+        let expected = state(1, &table);
         let stored = nodes(&expected);
         let mut cache = VerifiedNodeCache::new(4096);
         rebuild_verified(
@@ -1401,6 +1784,7 @@ mod cached_rehydrate_tests {
             &mut |root| stored.get(root).cloned(),
             MAX_DEPTH,
             Some(&mut cache),
+            table.as_ref(),
         )
         .expect("leaf at depth limit");
         assert!(matches!(
@@ -1408,7 +1792,8 @@ mod cached_rehydrate_tests {
                 &expected.root(),
                 &mut |_| panic!("reject before loader"),
                 MAX_DEPTH + 1,
-                Some(&mut cache)
+                Some(&mut cache),
+                table.as_ref(),
             ),
             Err(RehydrateError::Malformed)
         ));
@@ -1421,6 +1806,7 @@ mod cached_rehydrate_tests {
             },
             0,
             Some(&mut cache),
+            table.as_ref(),
         )
         .expect("same address at distinct depth must verify separately");
         assert_eq!(reads, 1);
@@ -1430,26 +1816,32 @@ mod cached_rehydrate_tests {
     fn collision_leaf_preserves_all_entries_and_canonical_root() {
         // Collision buckets intentionally have several keys under one digest;
         // use the internal constructor to exercise that otherwise rare shape.
+        let table = table();
         let leaf = Arc::new(Node::leaf_from_entries(
             [7; 32],
             vec![
-                (StateKey::new("m.room.member", "@a:test"), "$a".into()),
-                (StateKey::new("m.room.member", "@b:test"), "$b".into()),
+                (table.intern("m.room.member", "@a:test"), "$a".into()),
+                (table.intern("m.room.member", "@b:test"), "$b".into()),
             ],
         ));
         let expected = StateSnapshot {
             root: Some(leaf),
             len: 2,
+            table: Arc::clone(&table),
         };
         let stored = nodes(&expected);
         let mut cache = VerifiedNodeCache::new(4096);
-        let plain =
-            StateSnapshot::rehydrate(expected.root(), &mut |root| stored.get(root).cloned())
-                .expect("plain collision");
+        let plain = StateSnapshot::rehydrate(
+            expected.root(),
+            &mut |root| stored.get(root).cloned(),
+            Arc::clone(&table),
+        )
+        .expect("plain collision");
         let cached = StateSnapshot::rehydrate_cached(
             expected.root(),
             &mut |root| stored.get(root).cloned(),
             &mut cache,
+            Arc::clone(&table),
         )
         .expect("cached collision");
         let mut plain_rows = Vec::new();
@@ -1463,7 +1855,8 @@ mod cached_rehydrate_tests {
 
     #[test]
     fn large_seeded_roots_reuse_subtrees_with_the_runtime_budget() {
-        let mut expected = state(51_200);
+        let table = table();
+        let mut expected = state(51_200, &table);
         let mut stored = nodes(&expected);
         let mut cache = VerifiedNodeCache::new(64 * 1024 * 1024);
         let full_walk_nodes = stored.len();
@@ -1472,7 +1865,7 @@ mod cached_rehydrate_tests {
         for index in 0..100 {
             let before = expected.clone();
             expected = expected.apply(
-                StateKey::new("m.room.member", "@u1:test"),
+                &StateKey::new("m.room.member", "@u1:test"),
                 format!("$version{index}"),
             );
             stored.extend(expected.delta_nodes(Some(&before)));
@@ -1483,6 +1876,7 @@ mod cached_rehydrate_tests {
                     stored.get(root).cloned()
                 },
                 &mut cache,
+                Arc::clone(&table),
             )
             .expect("large seeded read");
             assert_eq!(held.root(), expected.root());
@@ -1499,12 +1893,13 @@ mod cached_rehydrate_tests {
 
     #[test]
     fn cache_ownership_and_order_indexes_remain_bounded_after_eviction() {
-        let mut expected = state(128);
+        let table = table();
+        let mut expected = state(128, &table);
         let mut stored = nodes(&expected);
         let mut cache = VerifiedNodeCache::new(32 * 1024);
         for index in 0..200 {
             expected = expected.apply(
-                StateKey::new("m.room.member", "@u1:test"),
+                &StateKey::new("m.room.member", "@u1:test"),
                 format!("$version{index}"),
             );
             stored.extend(expected.delta_nodes(None));
@@ -1512,6 +1907,7 @@ mod cached_rehydrate_tests {
                 expected.root(),
                 &mut |root| stored.get(root).cloned(),
                 &mut cache,
+                Arc::clone(&table),
             )
             .expect("bounded read");
             assert_eq!(held.root(), expected.root());

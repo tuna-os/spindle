@@ -942,7 +942,7 @@ impl Rooms {
         state_before: &[String],
         create_id: &str,
     ) -> Result<StateSnapshot, RoomError> {
-        let mut state = StateSnapshot::new();
+        let mut state = StateSnapshot::new(log.table().clone());
         for state_id in state_before {
             let held = EventId::new(state_id.as_str());
             if log.historically_rejected(&held)
@@ -972,7 +972,7 @@ impl Rooms {
                     "the peer's state names two events for {kind}/{state_key}"
                 )));
             }
-            state = state.apply(key, state_id.as_str());
+            state = state.apply(&key, state_id.as_str());
         }
         if state
             .get(&StateKey::new("m.room.create", ""))
@@ -1175,7 +1175,7 @@ impl Rooms {
                             (json["type"].as_str(), json["state_key"].as_str())
                         {
                             let before = state.clone();
-                            state = state.apply(StateKey::new(kind, state_key), event_id.as_str());
+                            state = state.apply(&StateKey::new(kind, state_key), event_id.as_str());
                             for (address, node) in state.delta_nodes(Some(&before)) {
                                 writes.push((
                                     spindle_core::keys::content_addressed(
@@ -1221,7 +1221,7 @@ impl Rooms {
                         (json["type"].as_str(), json["state_key"].as_str())
                     {
                         let before = state.clone();
-                        state = state.apply(StateKey::new(kind, state_key), event_id.as_str());
+                        state = state.apply(&StateKey::new(kind, state_key), event_id.as_str());
                         for (address, node) in state.delta_nodes(Some(&before)) {
                             writes.push((
                                 spindle_core::keys::content_addressed(
@@ -1389,11 +1389,12 @@ impl Rooms {
                     .to_string()
                     .into_bytes(),
             ));
-            spindle_store::Store::commit(
+            spindle_store::Store::commit_state_deferred(
                 rooms.store.as_ref(),
                 &writes,
-                spindle_store::Durability::Group,
+                log.table(),
             )?;
+            spindle_store::Store::sync(rooms.store.as_ref(), spindle_store::Durability::Group)?;
             // What a batch cannot do is delete: the spent pending rows and a
             // finished marker were written as tombstones above, and go now.
             // A crash before this leaves only rows the next pass ignores.

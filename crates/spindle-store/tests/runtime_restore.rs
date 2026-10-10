@@ -6,11 +6,11 @@ use spindle_store::{Durability, FjallStore, RoomStore, Store, StoreError};
 fn runtime_deferred_old_root_cannot_pass_explicit_exhaustive_store_validation() {
     let dir = tempfile::tempdir().unwrap();
     let store = FjallStore::open(dir.path()).unwrap();
-    let mut log = RoomLog::new();
+    let mut log = RoomLog::new(store.key_table());
     let mut first = None;
     for i in 0..600 {
-        let state = StateSnapshot::new().apply(
-            StateKey::new("m.room.topic", ""),
+        let state = StateSnapshot::new(store.key_table()).apply(
+            &StateKey::new("m.room.topic", ""),
             format!("$source-outlier{i}"),
         );
         let entry = log
@@ -74,7 +74,7 @@ const ROOM: &str = "!stream:test";
 /// head, a sidelined event and an imported historical rejection.
 fn varied_room(store: &FjallStore) -> Log {
     let room = RoomStore::new(store, ROOM);
-    let mut log = Log::new();
+    let mut log = Log::new(store.key_table());
     let commit = |log: &Log, entry: &spindle_core::LogEntry| {
         room.commit_entry(entry, log, Durability::Relaxed).unwrap();
     };
@@ -113,8 +113,8 @@ fn varied_room(store: &FjallStore) -> Log {
     }
     // Backfilled history, with state supplied from outside.
     for i in 0..30 {
-        let supplied =
-            StateSnapshot::new().apply(StateKey::new("m.room.name", ""), format!("$name{i}"));
+        let supplied = StateSnapshot::new(store.key_table())
+            .apply(&StateKey::new("m.room.name", ""), format!("$name{i}"));
         let entry = log
             .prepend_remote(
                 EventInput::new(
@@ -489,7 +489,8 @@ const LARGE: &str = "!large:test";
 /// the record format: backfilled history with no chain, then sequenced
 /// history with one.
 fn large_room(store: &FjallStore, forward: i64, backfilled: i64) {
-    let state = StateSnapshot::new().apply(StateKey::new("m.room.create", ""), "$create");
+    let state =
+        StateSnapshot::new(store.key_table()).apply(&StateKey::new("m.room.create", ""), "$create");
     let mut batch: Vec<(Vec<u8>, Vec<u8>)> = state
         .delta_nodes(None)
         .into_iter()
@@ -501,6 +502,8 @@ fn large_room(store: &FjallStore, forward: i64, backfilled: i64) {
         })
         .collect();
     let root = *state.root().as_bytes();
+    // The rows the nodes reference: this writer bypasses `RoomStore`,
+    // so it owes the same batch coupling by hand.
     let row = |li: i64, chain: Option<[u8; 32]>| {
         (
             room_li(Keyspace::Log, LARGE, LinearIndex::from_raw(li)),
@@ -533,7 +536,8 @@ fn large_room(store: &FjallStore, forward: i64, backfilled: i64) {
         }
         .encode(),
     ));
-    store.commit(&batch, Durability::Relaxed).unwrap();
+    store.commit_state_deferred(&batch, state.table()).unwrap();
+    store.sync(Durability::Relaxed).unwrap();
 }
 
 fn edit_large(store: &FjallStore, li: i64, edit: impl FnOnce(&mut Vec<u8>)) {
@@ -570,6 +574,7 @@ fn the_pipelined_restore_is_the_sequential_one() {
         -500,
         [EventId::new("$e40000")],
         &mut load_node,
+        store.key_table(),
     )
     .unwrap()
     .log;

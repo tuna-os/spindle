@@ -598,7 +598,10 @@ impl Rooms {
             } else {
                 let log = RoomStore::new(self.store.as_ref(), room_id)
                     .load()?
-                    .map_or_else(RoomLog::new, |restored| restored.log);
+                    .map_or_else(
+                        || RoomLog::new(spindle_store::ReadView::key_table(self.store.as_ref())),
+                        |restored| restored.log,
+                    );
                 let room = Arc::new(RwLock::new(log));
                 open.insert(room_id.to_owned(), Arc::clone(&room));
                 room
@@ -629,19 +632,23 @@ impl Rooms {
             let refused = |error: spindle_core::AppendError| {
                 RoomError::Append(format!("{event_id}: {error:?}"))
             };
+            // Hoisted: `log.table()` inside an `append_seeded` argument
+            // would borrow the log shared while the call borrows it
+            // exclusively, and every seed below joins this log.
+            let table = log.table().clone();
             let seeded_state: Option<crate::import::StateMap>;
             let first_seed = step.seed && log.entries().next().is_none();
             let entry = if first_seed {
                 let state = state_after_root.map_or_else(
                     || {
-                        step.input
-                            .state_key
-                            .clone()
-                            .map_or_else(StateSnapshot::new, |key| {
-                                StateSnapshot::new().apply(key, event_id.to_owned())
-                            })
+                        step.input.state_key.clone().map_or_else(
+                            || StateSnapshot::new(table.clone()),
+                            |key| {
+                                StateSnapshot::new(table.clone()).apply(&key, event_id.to_owned())
+                            },
+                        )
                     },
-                    crate::import::snapshot_from,
+                    |map| crate::import::snapshot_from(map, &table),
                 );
                 seeded_state = state_after_root.cloned();
                 log.append_seeded(step.input.clone(), state, step.depth)
@@ -653,6 +660,8 @@ impl Rooms {
                 // The replay derived this event's state (the room version's
                 // resolver, the head over the forward extremities, or
                 // Synapse's state at a gap) and found the log's fold is not it.
+                // `append_seeded` rebases the spool's numbering onto the
+                // log's; the saved nodes name ids the room store resolves.
                 from_source.push((event_id.to_owned(), settled.reason.clone()));
                 let entry = log
                     .append_seeded(step.input.clone(), settled.state, step.depth)
@@ -687,7 +696,7 @@ impl Rooms {
                 let entry = log
                     .append_seeded(
                         step.input.clone(),
-                        crate::import::snapshot_from(&state),
+                        crate::import::snapshot_from(&state, &table),
                         step.depth,
                     )
                     .map_err(refused)?
@@ -1074,7 +1083,7 @@ impl Rooms {
         // would move `origin_server_ts` and, for v12, break the very
         // identity being established.
         let (create_id, create_json, room_id) = self.birth(creator, key, &create_content)?;
-        let mut log = RoomLog::new();
+        let mut log = RoomLog::new(spindle_store::ReadView::key_table(self.store.as_ref()));
         self.authorize(&log, &room_id, &create_id, &create_json, None)?;
         self.commit_event(
             &mut log,
@@ -1644,8 +1653,12 @@ impl Rooms {
             .ok()
             .flatten()
         };
-        let snapshot = spindle_core::StateSnapshot::rehydrate(root, &mut load)
-            .map_err(|error| RoomError::Build(format!("cannot rebuild state: {error:?}")))?;
+        let snapshot = spindle_core::StateSnapshot::rehydrate(
+            root,
+            &mut load,
+            spindle_store::ReadView::key_table(self.store.as_ref()),
+        )
+        .map_err(|error| RoomError::Build(format!("cannot rebuild state: {error:?}")))?;
         let mut ids = Vec::new();
         snapshot.for_each(|key, event_id| {
             if want(key) {
@@ -2973,8 +2986,12 @@ impl Rooms {
             .ok()
             .flatten()
         };
-        let snapshot = spindle_core::StateSnapshot::rehydrate(root, &mut load)
-            .map_err(|error| RoomError::Build(format!("cannot rebuild state: {error:?}")))?;
+        let snapshot = spindle_core::StateSnapshot::rehydrate(
+            root,
+            &mut load,
+            spindle_store::ReadView::key_table(self.store.as_ref()),
+        )
+        .map_err(|error| RoomError::Build(format!("cannot rebuild state: {error:?}")))?;
 
         let mut ids = Vec::with_capacity(snapshot.len());
         snapshot.for_each(|_, event_id| ids.push(event_id.to_owned()));
@@ -6068,7 +6085,7 @@ impl Rooms {
             let state = log
                 .sidelined_state(&entry.event_id)
                 .cloned()
-                .unwrap_or_default();
+                .unwrap_or_else(|| StateSnapshot::new(log.table().clone()));
             let mut load = |root: &StateRoot| self.load_node(root);
             let previous = prev
                 .first()
@@ -8363,6 +8380,7 @@ fn power_levels_content(
 #[cfg(test)]
 mod cold_registry_tests {
     use super::*;
+    use spindle_core::MemStateKeyTable;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -8377,7 +8395,9 @@ mod cold_registry_tests {
     fn blocked_cold_load_does_not_block_an_unrelated_warm_room() {
         let (_dir, rooms) = rooms();
         rooms
-            .room_or_load("!warm:test", || Ok(RoomLog::new()))
+            .room_or_load("!warm:test", || {
+                Ok(RoomLog::new(MemStateKeyTable::shared()))
+            })
             .unwrap();
         let (entered, inside) = mpsc::channel();
         let (release, held) = mpsc::channel();
@@ -8386,7 +8406,7 @@ mod cold_registry_tests {
             cold.room_or_load("!cold:test", || {
                 entered.send(()).unwrap();
                 held.recv().unwrap();
-                Ok(RoomLog::new())
+                Ok(RoomLog::new(MemStateKeyTable::shared()))
             })
             .unwrap()
         });
@@ -8420,7 +8440,7 @@ mod cold_registry_tests {
                 .room_or_load("!same:test", || {
                     entered.send(()).unwrap();
                     held.recv().unwrap();
-                    Ok(RoomLog::new())
+                    Ok(RoomLog::new(MemStateKeyTable::shared()))
                 })
                 .unwrap()
         });
@@ -8433,7 +8453,7 @@ mod cold_registry_tests {
             let room = second
                 .room_or_load("!same:test", || {
                     counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok(RoomLog::new())
+                    Ok(RoomLog::new(MemStateKeyTable::shared()))
                 })
                 .unwrap();
             done.send(()).unwrap();
@@ -8476,7 +8496,7 @@ mod cold_registry_tests {
             let second = Arc::clone(&rooms);
             let follower = std::thread::spawn(move || {
                 second.room_or_load("!flaky:test", || {
-                    let mut log = RoomLog::new();
+                    let mut log = RoomLog::new(MemStateKeyTable::shared());
                     log.append_local("$second", None).unwrap();
                     Ok(log)
                 })
@@ -8513,12 +8533,12 @@ mod cold_registry_tests {
                 .room_or_load("!same:test", || {
                     entered.send(()).unwrap();
                     held.recv().unwrap();
-                    Ok(RoomLog::new())
+                    Ok(RoomLog::new(MemStateKeyTable::shared()))
                 })
                 .unwrap()
         });
         inside.recv_timeout(Duration::from_secs(2)).unwrap();
-        let published = Arc::new(RwLock::new(RoomLog::new()));
+        let published = Arc::new(RwLock::new(RoomLog::new(MemStateKeyTable::shared())));
         rooms
             .open
             .write()

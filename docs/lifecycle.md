@@ -204,7 +204,7 @@ a bug report or a migration step has to say which one it means:
 |---|---|---|---|
 | **key schema** | `KEY_SCHEMA_VERSION` in `spindle-core` | 1 | the byte layout of keys: a keyspace discriminant reused or reordered, or a key's fields moved. *Adding* a keyspace is not a bump: every existing key keeps its bytes and its meaning. |
 | **record schema** | `RECORD_VERSION` in `spindle-store` | 1 | the encoding of the values under those keys (log entries and bodies), which carry their version as their first byte. |
-| **content digest** | `CONTENT_DIGEST_VERSION` in `spindle-core` | 2 | how content addresses are *derived*: a domain tag, a length width or a field order in the hashing. Keys and records are untouched by such a change, which is why it has its own number (#78): a store under the old derivation would open and misread every node address. |
+| **content digest** | `CONTENT_DIGEST_VERSION` in `spindle-core` | 3 | how content addresses are *derived*: a domain tag, a length width or a field order in the hashing. Keys and records are untouched by such a change, which is why it has its own number (#78): a store under the old derivation would open and misread every node address. |
 | **engine format** | the major version of `fjall` in `Cargo.toml` | 3 | the on-disk layout of the store itself: journal, segments, the engine's own `version` file. Spindle does not choose it and cannot rewrite it. |
 
 The first three are what the schema marker records and what `migrate` moves
@@ -221,8 +221,9 @@ The transitions so far, numbered so they can be referred to:
 |---|---|---|---|---|---|
 | 1 | engine format | fjall 2 | fjall 3 | #193 | it does not. fjall 3 refuses a v2 directory with `InvalidVersion(Some(V2))` and has no in-process upgrade. Restore from a backup taken under fjall 3, or start a fresh store. |
 | 2 | content digest | 1 | 2 | #330 | it does not, yet. The store is refused as `content_digest 1` (a store from before the marker existed counts as 1 if it holds any row), and no migration step re-derives the addresses. Start a fresh store. |
+| 3 | content digest | 2 | 3 | #79 | `spindle migrate` rewrites state tries with interned keys and persists their intern rows. Irreversible; restore the pre-migration backup to return to version 2. |
 
-Both were accepted deliberately, because no Spindle had data to lose. They
+The first two were accepted deliberately, because no Spindle had data to lose. They
 are kept on the books rather than forgotten because each is an example of
 what the machinery below does *not* do: transition 1 is the case it cannot
 help with, and `crates/spindle-store/tests/backend_compatibility.rs` holds
@@ -232,15 +233,14 @@ nobody has needed it. Key and record schemas have never moved.
 
 ### The current state of the table
 
-**No schema change has yet been given a data rewrite** (transition 2 above
-was refused rather than migrated), so the migration table is empty and
-`spindle migrate` reports "already at this binary's schema" on every store in
-existence.
+The first data rewrite is the version-2 to version-3 content-digest step (#79).
+It converts roots in the linear log, sidelined records and gap history, and
+writes the intern rows with their new nodes. Old nodes are deleted after all
+rooms have converted, because content addresses can be shared across rooms.
+A partial run keeps the old marker; rerunning preserves already converted roots
+and finishes the remaining work. Take a backup before this irreversible step.
 
-That is worth saying rather than implying otherwise. What exists today is the
-machinery and its guarantees, proven by `crates/spindle-store/tests/schema_migration.rs`
-against synthetic tables — chaining, the no-path refusal, dry runs writing
-nothing, and the marker never landing ahead of the data. Those are properties
-of the machinery rather than of any particular step, which is why they can be
-established before the first real step is written, under whatever pressure
-produced the schema change that needed it.
+The migration machinery is covered by `crates/spindle-store/tests/schema_migration.rs`;
+the actual rewrite and reopening are covered by `tests/state_migration.rs` in
+the same crate. The intern table is part of the backup: losing its rows loses
+the meaning of the ids in state nodes. Version 1 still has no migration path.

@@ -7,8 +7,14 @@
 //! any age.
 
 use spindle_core::{
-    AppendError, DEFAULT_RESIDENT_WINDOW, EventId, EventInput, RoomLog, StateKey, StateSnapshot,
+    AppendError, DEFAULT_RESIDENT_WINDOW, EventId, EventInput, MemStateKeyTable, RoomLog, StateKey,
+    StateKeyTable, StateSnapshot,
 };
+use std::sync::Arc;
+
+fn table() -> Arc<dyn StateKeyTable> {
+    MemStateKeyTable::shared()
+}
 
 /// A room whose resident count tracks its length has lost the bound, and that
 /// is the regression this whole mechanism exists to prevent.
@@ -16,7 +22,7 @@ use spindle_core::{
 fn resident_state_is_bounded_by_the_window_not_by_the_room() {
     let window = 64;
     let events = 5_000;
-    let mut log = RoomLog::with_resident_window(window);
+    let mut log = RoomLog::with_resident_window(window, table());
 
     for number in 0..events {
         log.append_local(
@@ -44,7 +50,7 @@ fn resident_state_is_bounded_by_the_window_not_by_the_room() {
 /// Eviction loses the materialization, never the address.
 #[test]
 fn an_evicted_entry_still_carries_its_state_root() {
-    let mut log = RoomLog::with_resident_window(8);
+    let mut log = RoomLog::with_resident_window(8, table());
     for number in 0..200 {
         log.append_local(format!("$event-{number}"), None).unwrap();
     }
@@ -71,7 +77,7 @@ fn an_evicted_entry_still_carries_its_state_root() {
 #[test]
 fn a_stale_forward_extremity_keeps_its_state_however_old_it_gets() {
     let window = 16;
-    let mut log = RoomLog::with_resident_window(window);
+    let mut log = RoomLog::with_resident_window(window, table());
 
     let root = log
         .append_local("$root", Some(StateKey::new("m.room.create", "")))
@@ -154,12 +160,13 @@ fn a_stale_forward_extremity_keeps_its_state_however_old_it_gets() {
 /// handed to the store.
 #[test]
 fn a_backfilled_entry_is_resident_until_the_next_append() {
-    let mut log = RoomLog::with_resident_window(4);
+    let mut log = RoomLog::with_resident_window(4, table());
     for number in 0..100 {
         log.append_local(format!("$event-{number}"), None).unwrap();
     }
 
-    let supplied = StateSnapshot::new().apply(StateKey::new("m.room.name", ""), "$name");
+    let supplied =
+        StateSnapshot::new(log.table().clone()).apply(&StateKey::new("m.room.name", ""), "$name");
     let backfilled = log
         .prepend_remote(EventInput::new("$older", vec![]), supplied, 40)
         .unwrap()
@@ -181,7 +188,7 @@ fn a_backfilled_entry_is_resident_until_the_next_append() {
 /// case changes.
 #[test]
 fn a_short_room_keeps_every_snapshot() {
-    let mut log = RoomLog::new();
+    let mut log = RoomLog::new(table());
     for number in 0..64 {
         log.append_local(format!("$event-{number}"), None).unwrap();
     }
@@ -196,7 +203,7 @@ fn a_short_room_keeps_every_snapshot() {
 #[test]
 fn every_predecessor_an_append_can_name_has_resident_state() {
     let window = 8;
-    let mut log = RoomLog::with_resident_window(window);
+    let mut log = RoomLog::with_resident_window(window, table());
     // A state event first: an empty state needs no store to rehydrate, so an
     // evicted entry with nothing in its state would be answerable anyway.
     log.append_local("$create", Some(StateKey::new("m.room.create", "")))
@@ -231,12 +238,16 @@ impl spindle_core::StateResolver for Union {
     fn resolve(
         &mut self,
         states: &[spindle_core::StateSnapshot],
+        table: &std::sync::Arc<dyn spindle_core::StateKeyTable>,
     ) -> Result<spindle_core::StateSnapshot, spindle_core::AppendError> {
-        let mut out = states.first().cloned().unwrap_or_default();
+        let mut out = match states.first() {
+            Some(first) => first.clone(),
+            None => spindle_core::StateSnapshot::new(std::sync::Arc::clone(table)),
+        };
         for other in states.iter().skip(1) {
             for (key, _, theirs) in out.clone().diff(other) {
                 if let Some(theirs) = theirs {
-                    out = out.apply(key.clone(), theirs);
+                    out = out.apply(&key, theirs);
                 }
             }
         }

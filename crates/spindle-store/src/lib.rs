@@ -28,7 +28,7 @@ pub mod migrate;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 // fjall 3 renamed the two levels: what was a `Keyspace` (the whole store) is
 // now a `Database`, and what was a `PartitionHandle` (one namespace inside
@@ -40,12 +40,18 @@ use fjall::{
     KeyspaceCreateOptions as PartitionCreateOptions, PersistMode, Readable,
 };
 use spindle_core::{
-    CONTENT_DIGEST_VERSION, EventId, LogRestore, RestoreError, RestoredEntry, RestoredLog, RoomLog,
-    RuntimeRestoredLog, StateRoot,
-    keys::{KEY_SCHEMA_VERSION, Keyspace, content_addressed, room_li, room_prefix, store_marker},
+    CONTENT_DIGEST_VERSION, EventId, LogRestore, MemStateKeyTable, RestoreError, RestoredEntry,
+    RestoredLog, RoomLog, RuntimeRestoredLog, StateKeyTable, StateRoot, StateSnapshot,
+    keys::{
+        KEY_SCHEMA_VERSION, Keyspace, content_addressed, room_li, room_prefix, state_key_intern,
+        state_key_intern_prefix, store_marker,
+    },
 };
 
-use crate::codec::{CodecError, EntryRecord, RECORD_VERSION, RoomRecord, SidelinedRecord};
+use crate::codec::{
+    CodecError, EntryRecord, RECORD_VERSION, RoomRecord, SidelinedRecord, decode_intern_pair,
+    encode_intern_pair,
+};
 
 /// How hard a commit tries to be on disk before it is acknowledged.
 ///
@@ -228,6 +234,16 @@ pub trait ReadView {
     /// deadline, and scanning to the end of the prefix meant reading every
     /// *pending* delay on a tick that had nothing to do (#348).
     ///
+    /// The table restored snapshots intern against.
+    ///
+    /// A state restored without the store's table replays the same rows
+    /// and -- on any restart that lands between the state and keyspace
+    /// migrations -- the same missing rows, only against a table that
+    /// forgets at drop. Every lookup after that misses, every node decodes
+    /// to empty, and the room's state is gone while its rows insist it is
+    /// there. The table is the store's, so the store hands it out.
+    fn key_table(&self) -> Arc<dyn StateKeyTable>;
+
     /// `end` is exclusive, and neither bound need be a stored key.
     ///
     /// # Errors
@@ -317,6 +333,56 @@ pub trait Store: ReadView {
     /// Returns a backend error if the flush fails.
     fn flush_to_segments(&self) -> Result<(), StoreError> {
         Ok(())
+    }
+
+    /// Reload persisted intern rows after an offline restore into a fresh store.
+    /// Existing ids must keep their meaning; writes must be stopped while
+    /// this runs. The restored rows have already been flushed.
+    ///
+    /// # Errors
+    ///
+    /// Refuses malformed, sparse or conflicting intern rows.
+    fn reload_key_table(&self) -> Result<(), StoreError> {
+        let table = self.key_table();
+        let mut expected = 1_u64;
+        for (key, value) in self.scan_prefix(&state_key_intern_prefix())? {
+            let id = key
+                .get(2..10)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u64::from_be_bytes)
+                .ok_or(CodecError::Truncated)?;
+            if key.len() != 10 || id != expected {
+                return Err(StoreError::Backend(
+                    "invalid restored intern id sequence".to_owned(),
+                ));
+            }
+            let (event_type, state_key) = decode_intern_pair(&value)?;
+            if table.intern(&event_type, &state_key) != id {
+                return Err(StoreError::ForeignStateTable);
+            }
+            expected += 1;
+        }
+        // Every row just loaded is already durable, so none is pending.
+        table.take_allocated();
+        Ok(())
+    }
+
+    /// Journal state nodes and newly allocated intern rows together.
+    ///
+    /// Concurrent backends must hold their drain lock until the batch has
+    /// reached the journal. Sync may follow outside that lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the batch fails.
+    fn commit_state_deferred(
+        &self,
+        writes: &[Record],
+        table: &Arc<dyn StateKeyTable>,
+    ) -> Result<(), StoreError> {
+        let mut batch = writes.to_vec();
+        batch.extend(encode_intern_rows(&table.take_allocated()));
+        self.commit_deferred(&batch)
     }
 
     /// Apply every write together, or none of them.
@@ -564,6 +630,34 @@ pub struct FjallStore {
     /// to ask, short of attempting a write, so the store remembers, and the
     /// server's readiness probe reads it (#21's disk-full drill).
     write_refused: AtomicBool,
+    /// The intern table every snapshot in this process shares (#79).
+    ///
+    /// Loaded whole from [`Keyspace::StateKeyIntern`] at open: a room's
+    /// distinct keys number in the thousands, and every hot path needs
+    /// allocation-free lookup, so the rows live here and fjall is only
+    /// touched for the rows a batch newly allocates.
+    state_table: Arc<MemStateKeyTable>,
+    /// Holds a drain through journal insertion so another room cannot
+    /// persist nodes before the batch carrying their intern rows.
+    intern_drain: Mutex<()>,
+}
+
+/// Newly allocated intern-table pairs as batch rows (#79).
+///
+/// Pure: the drain already happened in [`Store::commit_state_deferred`], and
+/// this only encodes. One row per pair, keyed by
+/// [`spindle_core::keys::state_key_intern`].
+#[must_use]
+pub fn encode_intern_rows(pairs: &[spindle_core::AllocRecord]) -> Vec<Record> {
+    pairs
+        .iter()
+        .map(|(id, (event_type, state_key))| {
+            (
+                state_key_intern(*id),
+                encode_intern_pair(event_type, state_key),
+            )
+        })
+        .collect()
 }
 
 impl FjallStore {
@@ -708,6 +802,7 @@ impl FjallStore {
             StoreError::from(error)
         })?;
         let partition = db.keyspace("spindle", PartitionCreateOptions::default)?;
+        let state_table = Arc::new(Self::load_intern_table(&partition)?);
         Ok(Self {
             reads: AtomicU64::new(0),
             scanned: AtomicU64::new(0),
@@ -718,7 +813,52 @@ impl FjallStore {
             write_refused: AtomicBool::new(false),
             db,
             partition,
+            state_table,
+            intern_drain: Mutex::new(()),
         })
+    }
+
+    /// Read every intern-table row into memory (#79).
+    ///
+    /// Rows scan in id order, and [`MemStateKeyTable::from_pairs`] refuses
+    /// a gap rather than opening onto repointed ids. An undecodable row
+    /// refuses the open for the same reason a bad node would: the table
+    /// is load-bearing for every state read, and a corrupt entry is a
+    /// corrupt trie.
+    fn load_intern_table(partition: &FjallPartition) -> Result<MemStateKeyTable, StoreError> {
+        let mut pairs = Vec::new();
+        for pair in partition.prefix(state_key_intern_prefix()) {
+            let (key, value) = pair.into_inner()?;
+            let id = key
+                .get(2..10)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u64::from_be_bytes)
+                .ok_or(CodecError::Truncated)?;
+            if id == 0 {
+                return Err(StoreError::Codec(CodecError::Malformed(0)));
+            }
+            pairs.push((id, decode_intern_pair(&value)?));
+        }
+        MemStateKeyTable::from_pairs(pairs).map_err(StoreError::Backend)
+    }
+
+    /// The intern table every snapshot built by this store shares.
+    ///
+    /// Hand this to [`StateSnapshot::new`](spindle_core::StateSnapshot::new)
+    /// wherever a snapshot is built: rooms, import, backfill, tests. A
+    /// snapshot built against any other table has different ids for the
+    /// same keys, and persisting it here would write nodes this table
+    /// cannot resolve.
+    #[must_use]
+    pub fn state_table(&self) -> Arc<dyn StateKeyTable> {
+        Arc::clone(&self.state_table) as Arc<dyn StateKeyTable>
+    }
+
+    /// An empty snapshot against this store's table: the one-line form of
+    /// `StateSnapshot::new(store.state_table())` at the 20-odd build sites.
+    #[must_use]
+    pub fn new_state(&self) -> StateSnapshot {
+        StateSnapshot::new(self.state_table())
     }
 
     /// Refuse a store this binary cannot read, and stamp one that has no mark.
@@ -874,6 +1014,10 @@ fn prefix_ceiling(prefix: &[u8]) -> Option<Vec<u8>> {
 }
 
 impl ReadView for FjallStore {
+    fn key_table(&self) -> Arc<dyn StateKeyTable> {
+        self.state_table.clone()
+    }
+
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         self.reads.fetch_add(1, Ordering::Relaxed);
         Ok(self.partition.get(key)?.map(|slice| slice.to_vec()))
@@ -961,9 +1105,12 @@ impl ReadView for FjallStore {
 /// snapshot spans the whole database and each read names the namespace it is
 /// reading -- where in fjall 2 the snapshot was taken *from* the partition
 /// and remembered it.
-pub struct FjallCheckpoint(fjall::Snapshot, FjallPartition);
+pub struct FjallCheckpoint(fjall::Snapshot, FjallPartition, Arc<dyn StateKeyTable>);
 
 impl ReadView for FjallCheckpoint {
+    fn key_table(&self) -> Arc<dyn StateKeyTable> {
+        self.2.clone()
+    }
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         Ok(self
             .0
@@ -1048,6 +1195,23 @@ impl Store for FjallStore {
         !self.write_refused.load(Ordering::Acquire)
     }
 
+    fn commit_state_deferred(
+        &self,
+        writes: &[Record],
+        table: &Arc<dyn StateKeyTable>,
+    ) -> Result<(), StoreError> {
+        if !Arc::ptr_eq(table, &self.key_table()) {
+            return Err(StoreError::ForeignStateTable);
+        }
+        let _guard = self
+            .intern_drain
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut batch = writes.to_vec();
+        batch.extend(encode_intern_rows(&table.take_allocated()));
+        self.commit_deferred(&batch)
+    }
+
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         self.latch(self.partition.insert(key, value).map_err(StoreError::from))?;
         self.written.fetch_add(1, Ordering::Relaxed);
@@ -1085,6 +1249,7 @@ impl Store for FjallStore {
         Some(Box::new(FjallCheckpoint(
             self.db.snapshot(),
             self.partition.clone(),
+            self.state_table.clone(),
         )))
     }
 
@@ -1482,6 +1647,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
         let state = log
             .state_after(entry.li)
             .ok_or(StoreError::StateNotResident { li: entry.li.get() })?;
+        self.check_state_table(state)?;
 
         let mut writes = vec![
             (
@@ -1500,11 +1666,11 @@ impl<'a, S: Store> RoomStore<'a, S> {
             ));
         }
         writes.extend_from_slice(extra);
-
-        match durability {
-            Some(durability) => self.store.commit(&writes, durability),
-            None => self.store.commit_deferred(&writes),
+        self.store.commit_state_deferred(&writes, state.table())?;
+        if let Some(durability) = durability {
+            self.store.sync(durability)?;
         }
+        Ok(())
     }
 
     /// Journal a soft-failed or rejected event: its record, the state
@@ -1534,6 +1700,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 Self::meta(log).encode(),
             ),
         ];
+        self.check_state_table(state)?;
         for (address, node) in state.delta_nodes(previous) {
             writes.push((
                 content_addressed(Keyspace::StateNode, address.as_bytes()),
@@ -1541,7 +1708,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
             ));
         }
         writes.extend_from_slice(extra);
-        self.store.commit_deferred(&writes)
+        self.store.commit_state_deferred(&writes, state.table())
     }
 
     /// Put the room's sidelined events back into a restored log, each with
@@ -1556,8 +1723,12 @@ impl<'a, S: Store> RoomStore<'a, S> {
         };
         for (_, value) in self.store.scan_prefix(&prefix)? {
             let entry = SidelinedRecord::decode(&value)?.to_entry()?;
-            let state = spindle_core::StateSnapshot::rehydrate(entry.state_root, &mut load_node)
-                .unwrap_or_default();
+            let state = spindle_core::StateSnapshot::rehydrate(
+                entry.state_root,
+                &mut load_node,
+                log.table().clone(),
+            )
+            .unwrap_or_else(|_| spindle_core::StateSnapshot::new(log.table().clone()));
             log.restore_sidelined(entry, state);
         }
         Ok(())
@@ -1573,8 +1744,12 @@ impl<'a, S: Store> RoomStore<'a, S> {
         };
         for (_, value) in self.store.scan_prefix(&prefix)? {
             let entry = SidelinedRecord::decode(&value)?.to_entry()?;
-            let state = spindle_core::StateSnapshot::rehydrate(entry.state_root, &mut load_node)
-                .map_err(|_| RestoreError::UnreadableSidelined(entry.event_id.clone()))?;
+            let state = spindle_core::StateSnapshot::rehydrate(
+                entry.state_root,
+                &mut load_node,
+                log.table().clone(),
+            )
+            .map_err(|_| RestoreError::UnreadableSidelined(entry.event_id.clone()))?;
             log.restore_sidelined(entry, state);
         }
         Ok(())
@@ -1657,12 +1832,33 @@ impl<'a, S: Store> RoomStore<'a, S> {
     /// # Errors
     ///
     /// Returns [`StoreError`] if any write fails.
+    /// Refuse a state built against another table than this store's.
+    ///
+    /// The check is identity, not compatibility: two tables can hold the
+    /// same pairs under different ids, and persisting the wrong numbering
+    /// overwrites the right one slot by slot without a single error to
+    /// show for it. The one exception needs no check: a `previous` state
+    /// used only for delta computation is never persisted, and a foreign
+    /// numbering there only writes more nodes, never wrong ones.
+    fn check_state_table(&self, state: &spindle_core::StateSnapshot) -> Result<(), StoreError> {
+        if Arc::ptr_eq(state.table(), &self.store.key_table()) {
+            Ok(())
+        } else {
+            Err(StoreError::ForeignStateTable)
+        }
+    }
+
+    /// Write every entry, its state trie and the intern rows the trie needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::StateNotResident`] for a room long enough to
+    /// have evicted state this is asked to rewrite wholesale, or
+    /// [`StoreError::ForeignStateTable`] for a log built against another
+    /// table than this store's, which no row count could persist correctly.
     pub fn save(&self, log: &RoomLog) -> Result<(), StoreError> {
         let mut previous: Option<&spindle_core::StateSnapshot> = None;
         for entry in log.entries() {
-            let key = room_li(Keyspace::Log, &self.room_id, entry.li);
-            self.store
-                .put(&key, &EntryRecord::from_entry(entry).encode())?;
             // Persist the state trie here too, so both write paths restore
             // identically. A seeding path that produced a differently
             // restorable room would be a trap for whoever hit it first.
@@ -1674,12 +1870,18 @@ impl<'a, S: Store> RoomStore<'a, S> {
             let state = log
                 .state_after(entry.li)
                 .ok_or(StoreError::StateNotResident { li: entry.li.get() })?;
+            // Before the first write, not after it: a refused log leaves
+            // no entry record behind for the next open to trip over.
+            self.check_state_table(state)?;
+            let key = room_li(Keyspace::Log, &self.room_id, entry.li);
+            let mut writes = vec![(key, EntryRecord::from_entry(entry).encode())];
             for (address, node) in state.delta_nodes(previous) {
-                self.store.put(
-                    &content_addressed(Keyspace::StateNode, address.as_bytes()),
-                    &node,
-                )?;
+                writes.push((
+                    content_addressed(Keyspace::StateNode, address.as_bytes()),
+                    node,
+                ));
             }
+            self.store.commit_state_deferred(&writes, state.table())?;
             previous = Some(state);
         }
         self.store.put(
@@ -1716,6 +1918,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
             meta.forward_extremities
                 .into_iter()
                 .map(|id| EventId::new(id.as_str())),
+            self.store.key_table(),
         )?;
         self.restore_historical_rejections(&mut restored.log)?;
         Ok(Some(restored))
@@ -1788,6 +1991,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 .into_iter()
                 .map(|id| EventId::new(id.as_str())),
             expected,
+            view.key_table(),
         );
         let mut profile = RestoreProfile::default();
         let prefix = room_prefix(Keyspace::Log, &self.room_id);
@@ -1893,6 +2097,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 .into_iter()
                 .map(|id| EventId::new(id.as_str())),
             &mut load_node,
+            self.store.key_table(),
         )?;
         self.restore_sidelined(&mut restored.log)?;
         self.restore_historical_rejections(&mut restored.log)?;
@@ -1924,6 +2129,15 @@ pub enum StoreError {
     /// [`RoomStore::commit_entry`] per append instead, which is the serving
     /// path and never needs more than the entry it is writing.
     StateNotResident { li: i64 },
+    /// The log was built against a different intern table than this store.
+    ///
+    /// Persisting it would write nodes whose ids name the log's numbering
+    /// into a keyspace numbered by the store's: same ids, different pairs,
+    /// and whichever row lands last wins while the other state silently
+    /// loses slots. Refusing is the whole fix -- build the log against
+    /// [`ReadView::key_table`] of the store it will be saved to, or rebase
+    /// it with [`StateSnapshot::with_table`] at the handoff.
+    ForeignStateTable,
 }
 
 impl From<fjall::Error> for StoreError {
@@ -1995,6 +2209,10 @@ impl std::fmt::Display for StoreError {
             Self::StateNotResident { li } => write!(
                 formatter,
                 "state for li {li} has been evicted; use commit_entry per append"
+            ),
+            Self::ForeignStateTable => write!(
+                formatter,
+                "log was built against another store's intern table; save it to its own store"
             ),
         }
     }

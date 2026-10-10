@@ -355,6 +355,12 @@ impl Rooms {
     /// check; [`RoomError::MissingBody`] for a state event the caller did
     /// not retain; [`RoomError::Append`] for a state-DAG room, whose state
     /// cannot be taken from `/state_ids`.
+    ///
+    /// # Panics
+    ///
+    /// When the peer state is missing after it was just pushed above.
+    /// That push is unconditional, so this cannot happen; the panic names
+    /// the broken invariant rather than inventing a state to resolve.
     #[allow(
         clippy::too_many_lines,
         reason = "the receipt checks and placement of one event, in order"
@@ -418,7 +424,7 @@ impl Rooms {
                 .and_then(|state| state.get(&StateKey::new("m.room.create", "")))
                 .ok_or_else(|| RoomError::Append("the room has no create event".to_owned()))?
                 .to_owned();
-            let mut state = StateSnapshot::new();
+            let mut state = StateSnapshot::new(log.table().clone());
             for state_id in state_before {
                 if state_id == event_id {
                     continue;
@@ -452,7 +458,7 @@ impl Rooms {
                         "the peer's state names two events for {kind}/{state_key}"
                     )));
                 }
-                state = state.apply(key, state_id.as_str());
+                state = state.apply(&key, state_id.as_str());
             }
             if state
                 .get(&StateKey::new("m.room.create", ""))
@@ -482,9 +488,12 @@ impl Rooms {
                     states.push(state.clone());
                 }
                 if states.len() == 1 {
-                    return Ok(states.pop().unwrap_or_default());
+                    // The peer state is always pushed above, so a single
+                    // state means every tip agreed with it -- and popping
+                    // here cannot fail.
+                    return Ok(states.pop().expect("the peer state is always pushed"));
                 }
-                resolver.resolve(&states)
+                resolver.resolve(&states, log.table())
             })?;
             if let Some((kind, reason)) =
                 rooms.receipt_checks(log, room_id, event_id, json, &state, &prev, Some(&current))?
@@ -1468,8 +1477,9 @@ impl Rooms {
             )));
         }
 
-        let mut log = RoomLog::new();
-        let mut snapshot = spindle_core::StateSnapshot::new();
+        let table = spindle_store::ReadView::key_table(self.store.as_ref());
+        let mut log = RoomLog::new(table.clone());
+        let mut snapshot = spindle_core::StateSnapshot::new(table);
         let room_store = RoomStore::new(self.store.as_ref(), room_id);
         let seed = |log: &mut RoomLog,
                     snapshot: &mut spindle_core::StateSnapshot,
@@ -1480,7 +1490,7 @@ impl Rooms {
                 StateKey::new(event["type"].as_str().unwrap_or_default(), state_key)
             });
             if let Some(key) = state_key.clone() {
-                *snapshot = snapshot.apply(key, id);
+                *snapshot = snapshot.apply(&key, id);
             }
             let prev: Vec<EventId> = super::edge_ids(&event["prev_events"])
                 .into_iter()

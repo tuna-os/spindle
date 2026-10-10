@@ -417,6 +417,19 @@ pub enum Keyspace {
     /// recovered, with the predecessors it named that this server lacks.
     /// What a later backfill reads to know where history is missing.
     FederationGap = 0x44,
+    /// `id` -> one interned `(event_type, state_key)` pair (#79).
+    ///
+    /// The state trie's leaves hold `u64` ids, not strings, and the ids
+    /// are only stable while the table that minted them lives. This row
+    /// is what makes them stable across restarts: id zero is never
+    /// assigned, and every other id holds its pair as two length-framed
+    /// strings. Loaded whole at open -- a room's distinct keys number in
+    /// the thousands, not the millions, and the next id to mint is one
+    /// past the highest row the scan finds. New pairs join the caller's
+    /// batch with the nodes that reference them, never outside it: a
+    /// row the batch does not hold is a row a crash can separate from
+    /// the node that needs it.
+    StateKeyIntern = 0x59,
     /// `(room_id, position)` -> one event of a filled federation gap: its
     /// ID and the root of the state after it. History backfilled into the
     /// *middle* of a room's timeline -- between the head this server held
@@ -675,6 +688,17 @@ pub fn from_order_preserving(bytes: [u8; 8]) -> i64 {
     )]
     let value = (u64::from_be_bytes(bytes) ^ (1_u64 << 63)) as i64;
     value
+}
+
+/// The two bytes every key in one keyspace shares: schema, then keyspace.
+///
+/// A whole-keyspace scan uses this, not [`room_prefix`] with an empty room:
+/// that bakes in a zero length no real room shares, and matches nothing.
+/// Room keys append a framed room id after these bytes; content-addressed
+/// and intern rows append their own suffixes directly.
+#[must_use]
+pub fn keyspace_prefix(keyspace: Keyspace) -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, keyspace as u8]
 }
 
 /// The prefix every key for one room in one keyspace shares.
@@ -1467,6 +1491,25 @@ pub fn content_addressed(keyspace: Keyspace, hash: &[u8; 32]) -> Vec<u8> {
     key.push(keyspace as u8);
     key.extend_from_slice(hash);
     key
+}
+
+/// One interned state-key row ([`Keyspace::StateKeyIntern`]): the id in
+/// big-endian, so rows scan in id order. Id zero is never assigned; the
+/// next id to mint is one past the highest row the open scan finds, so no
+/// counter row is stored.
+#[must_use]
+pub fn state_key_intern(id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(10);
+    key.push(KEY_SCHEMA_VERSION);
+    key.push(Keyspace::StateKeyIntern as u8);
+    key.extend_from_slice(&id.to_be_bytes());
+    key
+}
+
+/// The prefix every [`state_key_intern`] row shares.
+#[must_use]
+pub fn state_key_intern_prefix() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::StateKeyIntern as u8]
 }
 
 /// One finalised delayed event, ordered by when it finalised within a user.

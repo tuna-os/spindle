@@ -8,7 +8,7 @@ use spindle_core::{
 
 #[test]
 fn stale_remote_event_is_joined_by_the_next_local_event() {
-    let mut room = RoomLog::new();
+    let mut room = RoomLog::new(spindle_core::MemStateKeyTable::shared());
     room.append_local("$create", Some(StateKey::new("m.room.create", "")))
         .unwrap();
     room.append_local("$one", None).unwrap();
@@ -27,7 +27,7 @@ fn stale_remote_event_is_joined_by_the_next_local_event() {
 
 #[test]
 fn conflicting_state_fork_requires_the_matrix_resolver() {
-    let mut room = RoomLog::new();
+    let mut room = RoomLog::new(spindle_core::MemStateKeyTable::shared());
     room.append_local("$create", Some(StateKey::new("m.room.create", "")))
         .unwrap();
     room.append_local("$topic-a", Some(StateKey::new("m.room.topic", "")))
@@ -54,13 +54,20 @@ struct Recording {
 }
 
 impl StateResolver for Recording {
-    fn resolve(&mut self, states: &[StateSnapshot]) -> Result<StateSnapshot, AppendError> {
+    fn resolve(
+        &mut self,
+        states: &[StateSnapshot],
+        table: &std::sync::Arc<dyn spindle_core::StateKeyTable>,
+    ) -> Result<StateSnapshot, AppendError> {
         self.calls += 1;
-        let mut out = states.first().cloned().unwrap_or_default();
+        let mut out = match states.first() {
+            Some(first) => first.clone(),
+            None => StateSnapshot::new(std::sync::Arc::clone(table)),
+        };
         for other in states.iter().skip(1) {
             for (key, _, theirs) in out.clone().diff(other) {
                 if let Some(theirs) = theirs {
-                    out = out.apply(key.clone(), theirs);
+                    out = out.apply(&key, theirs);
                 }
             }
         }
@@ -99,7 +106,7 @@ fn append_resolved(
 #[test]
 fn a_disjoint_fork_is_the_resolvers_whether_or_not_the_slots_were_already_set() {
     for preset in [false, true] {
-        let mut room = RoomLog::new();
+        let mut room = RoomLog::new(spindle_core::MemStateKeyTable::shared());
         room.append_local("$create", Some(StateKey::new("m.room.create", "")))
             .unwrap();
         if preset {
@@ -136,7 +143,7 @@ fn a_disjoint_fork_is_the_resolvers_whether_or_not_the_slots_were_already_set() 
         append_resolved(&mut room, &mut resolver, EventInput::new("$merge", prev)).unwrap();
         assert!(resolver.calls >= 1, "preset={preset}");
         // Whatever the resolver said is the merge's state, exactly.
-        let expected = Recording::default().resolve(&tips).unwrap();
+        let expected = Recording::default().resolve(&tips, room.table()).unwrap();
         let state = room.state_after_event(&EventId::new("$merge")).unwrap();
         assert_eq!(state.root(), expected.root(), "preset={preset}");
         assert_eq!(
@@ -151,7 +158,7 @@ fn a_disjoint_fork_is_the_resolvers_whether_or_not_the_slots_were_already_set() 
 /// old fork merge provably shares with every room version's algorithm.
 #[test]
 fn parents_that_agree_cost_no_resolution() {
-    let mut room = RoomLog::new();
+    let mut room = RoomLog::new(spindle_core::MemStateKeyTable::shared());
     room.append_local("$create", Some(StateKey::new("m.room.create", "")))
         .unwrap();
     let base = room.forward_extremities().iter().next().unwrap().clone();
@@ -175,7 +182,7 @@ fn parents_that_agree_cost_no_resolution() {
 /// event was authorized against the resolution of both.
 #[test]
 fn the_state_before_a_merge_event_is_the_resolution_of_both_branches() {
-    let mut room = RoomLog::new();
+    let mut room = RoomLog::new(spindle_core::MemStateKeyTable::shared());
     room.append_local("$create", Some(StateKey::new("m.room.create", "")))
         .unwrap();
     let base = room.forward_extremities().iter().next().unwrap().clone();
@@ -237,7 +244,7 @@ fn the_state_before_a_merge_event_is_the_resolution_of_both_branches() {
 /// or not.
 #[test]
 fn a_same_slot_fork_still_needs_the_resolver_when_the_slot_was_already_set() {
-    let mut room = RoomLog::new();
+    let mut room = RoomLog::new(spindle_core::MemStateKeyTable::shared());
     room.append_local("$create", Some(StateKey::new("m.room.create", "")))
         .unwrap();
     room.append_local("$topic0", Some(StateKey::new("m.room.topic", "")))
@@ -263,7 +270,7 @@ fn a_same_slot_fork_still_needs_the_resolver_when_the_slot_was_already_set() {
 #[test]
 fn the_current_state_is_the_resolution_of_the_forward_extremities() {
     let topic = StateKey::new("m.room.topic", "");
-    let mut room = RoomLog::new();
+    let mut room = RoomLog::new(spindle_core::MemStateKeyTable::shared());
     room.append_local("$create", Some(StateKey::new("m.room.create", "")))
         .unwrap();
     let base = room.forward_extremities().iter().next().unwrap().clone();
@@ -303,7 +310,7 @@ fn the_current_state_is_the_resolution_of_the_forward_extremities() {
 #[test]
 fn a_rejected_event_changes_no_state_and_no_extremity() {
     let topic = StateKey::new("m.room.topic", "");
-    let mut room = RoomLog::new();
+    let mut room = RoomLog::new(spindle_core::MemStateKeyTable::shared());
     room.append_local("$create", Some(StateKey::new("m.room.create", "")))
         .unwrap();
     let head = room.forward_extremities().iter().next().unwrap().clone();
@@ -364,7 +371,7 @@ fn a_rejected_event_changes_no_state_and_no_extremity() {
 #[test]
 fn a_soft_failed_event_keeps_its_state_for_its_children() {
     let topic = StateKey::new("m.room.topic", "");
-    let mut room = RoomLog::new();
+    let mut room = RoomLog::new(spindle_core::MemStateKeyTable::shared());
     room.append_local("$create", Some(StateKey::new("m.room.create", "")))
         .unwrap();
     let head = room.forward_extremities().iter().next().unwrap().clone();
@@ -411,7 +418,7 @@ fn a_soft_failed_event_keeps_its_state_for_its_children() {
 
 #[test]
 fn fork_window_uses_ancestry_not_nearby_linear_indices() {
-    let mut room = RoomLog::new();
+    let mut room = RoomLog::new(spindle_core::MemStateKeyTable::shared());
     room.append_local("$root", None).unwrap();
     room.append_local("$a1", None).unwrap();
     room.append_remote(EventInput::new("$b1", vec![EventId::new("$root")]))
@@ -438,7 +445,7 @@ fn fork_window_uses_ancestry_not_nearby_linear_indices() {
 
 #[test]
 fn fork_window_excludes_all_common_history_after_a_prior_merge() {
-    let mut room = RoomLog::new();
+    let mut room = RoomLog::new(spindle_core::MemStateKeyTable::shared());
     room.append_local("$root", None).unwrap();
     room.append_local("$left", None).unwrap();
     room.append_remote(EventInput::new("$right", vec![EventId::new("$root")]))
@@ -460,7 +467,7 @@ fn fork_window_excludes_all_common_history_after_a_prior_merge() {
 
 #[test]
 fn fork_window_enforces_its_event_budget() {
-    let mut room = RoomLog::new();
+    let mut room = RoomLog::new(spindle_core::MemStateKeyTable::shared());
     room.append_local("$root", None).unwrap();
     room.append_local("$left", None).unwrap();
     room.append_remote(EventInput::new("$right", vec![EventId::new("$root")]))
@@ -480,12 +487,12 @@ proptest! {
     fn hamt_matches_a_btree_map(
         operations in prop::collection::vec(("[a-z]{1,12}", "[a-z]{0,12}", "\\$[a-z0-9]{1,16}"), 0..500)
     ) {
-        let mut state = StateSnapshot::new();
+        let mut state = StateSnapshot::new(spindle_core::MemStateKeyTable::shared());
         let mut model = BTreeMap::new();
 
         for (event_type, state_key, event_id) in operations {
             let key = StateKey::new(event_type, state_key);
-            state = state.apply(key.clone(), event_id.clone());
+            state = state.apply(&key, event_id.clone());
             model.insert(key, event_id);
         }
 
@@ -497,7 +504,7 @@ proptest! {
 
     #[test]
     fn every_linear_index_is_a_valid_topological_order(stale_parent_choices in prop::collection::vec(any::<usize>(), 0..200)) {
-        let mut room = RoomLog::new();
+        let mut room = RoomLog::new(spindle_core::MemStateKeyTable::shared());
         room.append_local("$genesis", None).unwrap();
 
         for (number, choice) in stale_parent_choices.into_iter().enumerate() {
@@ -522,7 +529,7 @@ proptest! {
 
 #[test]
 fn backfill_takes_descending_indices_below_live_history() {
-    let mut room = RoomLog::new();
+    let mut room = RoomLog::new(spindle_core::MemStateKeyTable::shared());
     room.append_local("$join", Some(StateKey::new("m.room.create", "")))
         .unwrap();
     room.append_local("$live", None).unwrap();
@@ -531,13 +538,17 @@ fn backfill_takes_descending_indices_below_live_history() {
     let older = room
         .prepend_remote(
             EventInput::new("$older", vec![EventId::new("$oldest")]),
-            StateSnapshot::new(),
+            StateSnapshot::new(room.table().clone()),
             41,
         )
         .unwrap()
         .li;
     let oldest = room
-        .prepend_remote(EventInput::new("$oldest", vec![]), StateSnapshot::new(), 40)
+        .prepend_remote(
+            EventInput::new("$oldest", vec![]),
+            StateSnapshot::new(room.table().clone()),
+            40,
+        )
         .unwrap()
         .li;
 
@@ -562,11 +573,11 @@ fn backfill_takes_descending_indices_below_live_history() {
 
 #[test]
 fn backfilled_history_sorts_before_the_join_point_it_precedes() {
-    let mut room = RoomLog::new();
+    let mut room = RoomLog::new(spindle_core::MemStateKeyTable::shared());
     room.append_local("$join", None).unwrap();
     room.prepend_remote(
         EventInput::new("$ancestor", vec![]),
-        StateSnapshot::new(),
+        StateSnapshot::new(room.table().clone()),
         7,
     )
     .unwrap();
@@ -581,12 +592,12 @@ fn backfilled_history_sorts_before_the_join_point_it_precedes() {
 
 #[test]
 fn backfill_requires_a_room_to_walk_backwards_from() {
-    let mut room = RoomLog::new();
+    let mut room = RoomLog::new(spindle_core::MemStateKeyTable::shared());
     assert_eq!(
         room.prepend_remote(
             EventInput::new("$ancestor", vec![]),
-            StateSnapshot::new(),
-            0
+            StateSnapshot::new(room.table().clone()),
+            0,
         )
         .err(),
         Some(AppendError::EmptyRoom)

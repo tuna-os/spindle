@@ -161,6 +161,7 @@ pub fn read_backup(source: &mut dyn Read, store: &dyn Store) -> Result<u64, Back
         });
     }
     store.flush()?;
+    store.reload_key_table()?;
     Ok(restored)
 }
 

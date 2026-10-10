@@ -17,7 +17,7 @@ use ruma::state_res::StateMap;
 use ruma::state_res::utils::event_id_set::EventIdSet;
 use ruma::{OwnedEventId, RoomVersionId};
 use serde_json::{Value, json};
-use spindle_core::{EventId, RoomLog, StateKey, StateResolver, StateSnapshot};
+use spindle_core::{EventId, MemStateKeyTable, RoomLog, StateKey, StateResolver, StateSnapshot};
 
 use super::{AuthGraph, ResolutionCache, RoomResolver};
 use crate::authorize::StoredEvent;
@@ -252,9 +252,9 @@ impl Room {
     }
 
     fn snapshot(&self) -> StateSnapshot {
-        let mut out = StateSnapshot::new();
+        let mut out = StateSnapshot::new(MemStateKeyTable::shared());
         for ((kind, key), id) in &self.state {
-            out = out.apply(StateKey::new(kind.as_str(), key.as_str()), id.as_str());
+            out = out.apply(&StateKey::new(kind.as_str(), key.as_str()), id.as_str());
         }
         out
     }
@@ -492,7 +492,7 @@ fn check(version: &RoomVersionId, seed: u64) {
     let expected = reference(&graph, &branches);
 
     let rules = graph.rules();
-    let log = RoomLog::new();
+    let log = RoomLog::new(MemStateKeyTable::shared());
     let bodies = graph.bodies.clone();
     let body = move |id: &str| bodies.get(id).cloned();
     let auth_graph = Mutex::new(AuthGraph::default());
@@ -508,14 +508,18 @@ fn check(version: &RoomVersionId, seed: u64) {
         return;
     }
     let mut resolver = RoomResolver::new(&rules, &graph.id, &log, &body, &auth_graph, &cache);
-    let actual = resolver.resolve(&distinct).expect("our resolver resolves");
+    let actual = resolver
+        .resolve(&distinct, distinct[0].table())
+        .expect("our resolver resolves");
     assert_eq!(
         ours(&actual),
         expected,
         "room v{version}, seed {seed}: the live resolver disagrees with the reference"
     );
     // A second ask is a cache hit, and the same answer.
-    let again = resolver.resolve(&distinct).expect("resolves again");
+    let again = resolver
+        .resolve(&distinct, distinct[0].table())
+        .expect("resolves again");
     assert_eq!(again.root(), actual.root());
     assert_eq!(resolver.stats.cache_hits, 1);
 }
@@ -624,9 +628,9 @@ fn the_auth_difference_walk_equals_full_chains() {
 /// the one inserting the remaining slots alone would build.
 #[test]
 fn a_slot_resolved_away_is_removed_canonically() {
-    let base = StateSnapshot::new()
-        .apply(StateKey::new("m.room.create", ""), "$c")
-        .apply(StateKey::new("m.room.topic", ""), "$t");
+    let base = StateSnapshot::new(MemStateKeyTable::shared())
+        .apply(&StateKey::new("m.room.create", ""), "$c")
+        .apply(&StateKey::new("m.room.topic", ""), "$t");
     let mut resolved = StateMap::new();
     resolved.insert(
         ("m.room.create".into(), String::new()),
@@ -636,8 +640,8 @@ fn a_slot_resolved_away_is_removed_canonically() {
     assert_eq!(out.len(), 1);
     assert_eq!(
         out.root(),
-        StateSnapshot::new()
-            .apply(StateKey::new("m.room.create", ""), "$c")
+        StateSnapshot::new(MemStateKeyTable::shared())
+            .apply(&StateKey::new("m.room.create", ""), "$c")
             .root()
     );
 }
@@ -663,10 +667,13 @@ fn auth_difference_includes_extremities_beyond_one_machine_word() {
 #[test]
 fn changing_imported_rejection_policy_cannot_reuse_a_cached_resolution() {
     let cache = ResolutionCache::default();
-    let states = [StateSnapshot::new()];
-    let mut log = RoomLog::new();
+    let states = [StateSnapshot::new(MemStateKeyTable::shared())];
+    let mut log = RoomLog::new(MemStateKeyTable::shared());
     let original = ResolutionCache::key(&states, log.resolution_policy_id());
-    cache.put(original.clone(), StateSnapshot::new());
+    cache.put(
+        original.clone(),
+        StateSnapshot::new(MemStateKeyTable::shared()),
+    );
     log.preserve_historical_rejection(EventId::new("$historical-ban"));
     let changed = ResolutionCache::key(&states, log.resolution_policy_id());
     assert_ne!(changed, original);
@@ -711,7 +718,7 @@ fn a_live_rejected_malformed_power_event_cannot_be_reconsidered() {
     let mut room = base.clone();
     room.absorb(&left);
     room.absorb(&right);
-    let mut log = RoomLog::new();
+    let mut log = RoomLog::new(MemStateKeyTable::shared());
     let previous_policy = log.resolution_policy_id();
     log.restore_sidelined(
         spindle_core::SidelinedEntry {
@@ -720,9 +727,9 @@ fn a_live_rejected_malformed_power_event_cannot_be_reconsidered() {
             depth: left.depth[&malformed],
             state_key: Some(StateKey::new("m.room.power_levels", "")),
             kind: spindle_core::Sideline::Rejected,
-            state_root: StateSnapshot::new().root(),
+            state_root: StateSnapshot::new(MemStateKeyTable::shared()).root(),
         },
-        StateSnapshot::new(),
+        StateSnapshot::new(MemStateKeyTable::shared()),
     );
     assert_ne!(log.resolution_policy_id(), previous_policy);
     let rules = room.rules();
@@ -730,9 +737,8 @@ fn a_live_rejected_malformed_power_event_cannot_be_reconsidered() {
     let graph = Mutex::new(AuthGraph::default());
     let cache = ResolutionCache::default();
     let mut resolver = RoomResolver::new(&rules, &room.id, &log, &body, &graph, &cache);
-    let actual = resolver
-        .resolve(&[left.snapshot(), right.snapshot()])
-        .unwrap();
+    let inputs = [left.snapshot(), right.snapshot()];
+    let actual = resolver.resolve(&inputs, inputs[0].table()).unwrap();
     assert_eq!(
         actual.get(&StateKey::new("m.room.power_levels", "")),
         Some(valid_power.as_str())
@@ -792,16 +798,22 @@ fn a_recovered_auth_body_cannot_reuse_a_resolution_from_before_its_arrival() {
     // A previous fork touched this unavailable auth ancestor.
     graph.lock().unwrap().ensure("$late", &|_| None);
     let cache = ResolutionCache::default();
-    let log = RoomLog::new();
+    let log = RoomLog::new(MemStateKeyTable::shared());
     let state = room.snapshot();
     let mut resolver = RoomResolver::new(&rules, &room.id, &log, &body, &graph, &cache);
-    let first = resolver.resolve(&[state.clone(), state.clone()]).unwrap();
-    resolver.resolve(&[state.clone(), state.clone()]).unwrap();
+    let first = resolver
+        .resolve(&[state.clone(), state.clone()], state.table())
+        .unwrap();
+    resolver
+        .resolve(&[state.clone(), state.clone()], state.table())
+        .unwrap();
     assert_eq!(resolver.stats.cache_hits, 1);
     bodies
         .borrow_mut()
         .insert("$late".to_owned(), json!({"auth_events": []}));
-    let recovered = resolver.resolve(&[state.clone(), state]).unwrap();
+    let recovered = resolver
+        .resolve(&[state.clone(), state.clone()], state.table())
+        .unwrap();
     assert_eq!(first.root(), recovered.root());
     assert_eq!(
         resolver.stats.resolutions, 2,
@@ -841,13 +853,13 @@ fn a_rejection_inside_resolution_is_counted() {
     room.absorb(&left);
     room.absorb(&right);
     let rules = room.rules();
-    let log = RoomLog::new();
+    let log = RoomLog::new(MemStateKeyTable::shared());
     let body = |id: &str| room.bodies.get(id).cloned();
     let graph = Mutex::new(AuthGraph::default());
     let cache = ResolutionCache::default();
     let mut resolver = RoomResolver::new(&rules, &room.id, &log, &body, &graph, &cache);
     let states = [left.snapshot(), right.snapshot()];
-    let answer = resolver.resolve(&states).unwrap();
+    let answer = resolver.resolve(&states, states[0].table()).unwrap();
     assert_eq!(
         answer.get(&StateKey::new("m.room.topic", "")),
         Some(bobs.as_str())
@@ -856,7 +868,7 @@ fn a_rejection_inside_resolution_is_counted() {
     assert!(resolver.stats.rejections >= 1, "{:?}", resolver.stats);
     // The same fork again is the cache's, and refuses nothing anew.
     let rejections = resolver.stats.rejections;
-    resolver.resolve(&states).unwrap();
+    resolver.resolve(&states, states[0].table()).unwrap();
     assert_eq!(resolver.stats.resolutions, 1);
     assert_eq!(resolver.stats.cache_hits, 1);
     assert_eq!(resolver.stats.rejections, rejections);
@@ -870,8 +882,8 @@ fn a_resolution_in_use_survives_a_full_cache() {
     let cache = ResolutionCache::default();
     let policy = [7_u8; 32];
     let state = |index: usize| {
-        StateSnapshot::new().apply(
-            StateKey::new("m.room.topic", ""),
+        StateSnapshot::new(MemStateKeyTable::shared()).apply(
+            &StateKey::new("m.room.topic", ""),
             format!("$t{index}").as_str(),
         )
     };
@@ -897,8 +909,10 @@ fn a_resolution_in_use_survives_a_full_cache() {
 /// change the question.
 #[test]
 fn the_cache_key_is_the_set_of_input_roots() {
-    let one = StateSnapshot::new().apply(StateKey::new("m.room.topic", ""), "$a");
-    let two = StateSnapshot::new().apply(StateKey::new("m.room.topic", ""), "$b");
+    let one = StateSnapshot::new(MemStateKeyTable::shared())
+        .apply(&StateKey::new("m.room.topic", ""), "$a");
+    let two = StateSnapshot::new(MemStateKeyTable::shared())
+        .apply(&StateKey::new("m.room.topic", ""), "$b");
     let policy = [1_u8; 32];
     assert_eq!(
         ResolutionCache::key(&[one.clone(), two.clone()], policy),
