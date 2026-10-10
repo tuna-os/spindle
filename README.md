@@ -157,10 +157,11 @@ skip it and they don't" was never true of them. What linear storage removes is
 the per-event *bookkeeping* the algorithm needs in order to exist — extremity
 sets, state-group delta stacks — not the algorithm.
 
-**The load-bearing claim is the equivalence theorem** (SPEC §9.3): that
-window-bounded state resolution produces exactly what full state resolution
-would. It is tested as one, differentially against `ruma-state-res`, for every
-fork the fast path claims to handle. A counterexample is a release blocker.
+**State resolution must agree with Matrix.** The old slot-wise fork merge
+had counterexamples and was retired (ADR 0005). Differing fork states use
+the room version's resolver. Scheduled checks preserve the counterexamples,
+compare with `ruma-state-res`, and test the fork-window search against an
+exhaustive walk. A disagreement on the live path is a release blocker.
 
 **Losses are published next to wins.** [docs/benchmarks.md](docs/benchmarks.md)
 carries the cells where Spindle lost, the investigations, and two claims that

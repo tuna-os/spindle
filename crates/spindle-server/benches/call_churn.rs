@@ -109,7 +109,7 @@ struct Participant {
     device_id: String,
     seen: Arc<Mutex<HashMap<String, Instant>>>,
     keys: Arc<Mutex<Vec<Instant>>>,
-    delay_id: Mutex<Option<String>>,
+    delay_id: tokio::sync::Mutex<Option<String>>,
 }
 
 impl Participant {
@@ -132,7 +132,7 @@ impl Participant {
             device_id: body["device_id"].as_str().unwrap().to_owned(),
             seen: Arc::default(),
             keys: Arc::default(),
-            delay_id: Mutex::new(None),
+            delay_id: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -185,6 +185,7 @@ impl Participant {
     }
 
     async fn schedule_leave(&self, client: &Client, room: &str) {
+        let mut delay_id = self.delay_id.lock().await;
         let body = client
             .call(
                 reqwest::Method::PUT,
@@ -196,7 +197,12 @@ impl Participant {
                 &json!({}),
             )
             .await;
-        *self.delay_id.lock().unwrap() = body["delay_id"].as_str().map(str::to_owned);
+        *delay_id = Some(
+            body["delay_id"]
+                .as_str()
+                .expect("scheduled delay has an id")
+                .to_owned(),
+        );
     }
 
     async fn write_membership(&self, client: &Client, room: &str, joined: bool) -> String {
@@ -234,7 +240,10 @@ impl Participant {
     }
 
     async fn act_on_delay(&self, client: &Client, action: &str) -> Option<Duration> {
-        let delay_id = self.delay_id.lock().unwrap().clone()?;
+        // Serialize heartbeats with cancellation and replacement. Otherwise a
+        // heartbeat can restart the id that the churn task just cancelled.
+        let mut guard = self.delay_id.lock().await;
+        let delay_id = guard.as_ref()?;
         let started = Instant::now();
         client
             .call(
@@ -244,6 +253,9 @@ impl Participant {
                 &json!({}),
             )
             .await;
+        if action != "restart" {
+            *guard = None;
+        }
         Some(started.elapsed())
     }
 }
@@ -382,10 +394,11 @@ async fn measure(client: &Client, size: usize) -> Row {
     // Heartbeats from here on, as Element Call sends them.
     let heartbeats = Arc::new(Mutex::new(Vec::new()));
     let beating = Arc::new(AtomicBool::new(true));
+    let mut heartbeat_tasks = Vec::new();
     for participant in &participants {
         let (client, participant) = (client.clone(), Arc::clone(participant));
         let (heartbeats, beating) = (Arc::clone(&heartbeats), Arc::clone(&beating));
-        tokio::spawn(async move {
+        heartbeat_tasks.push(tokio::spawn(async move {
             // Spread across the interval, as independent clients would be.
             tokio::time::sleep(HEARTBEAT.mul_f64(rand::random::<f64>())).await;
             while beating.load(Ordering::Relaxed) {
@@ -394,7 +407,7 @@ async fn measure(client: &Client, size: usize) -> Row {
                 }
                 tokio::time::sleep(HEARTBEAT).await;
             }
-        });
+        }));
     }
 
     // Key burst, with a timeline message sent at the same moment.
@@ -502,6 +515,9 @@ async fn measure(client: &Client, size: usize) -> Row {
     })
     .await;
     beating.store(false, Ordering::Relaxed);
+    for task in heartbeat_tasks {
+        task.await.expect("every heartbeat task succeeds");
+    }
     stop.store(true, Ordering::Relaxed);
     // Let every long-poll and heartbeat see the flag and finish, so none is
     // still in flight against the server when the next size -- or the

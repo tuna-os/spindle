@@ -226,6 +226,12 @@ jobs:
             case "$TAG" in
               v0.0.*)
                 echo "An addressable prerelease, per ROADMAP.md: no upgrade path, no support window, storage format unstable. It exists so that benchmarks, bug reports and security fixes can name a build." ;;
+              v0.1.*)
+                echo "First supported maturity line: use the latest v0.1.x patch. Explicit offline migrations and backup-based rollback may be required. This remains a prerelease."
+                echo
+                echo "Candidate evidence and limits: https://github.com/${GITHUB_REPOSITORY}/blob/${SHA}/docs/v0.1.0-readiness.md"
+                echo "Checks on this exact commit: https://github.com/${GITHUB_REPOSITORY}/commit/${SHA}/checks"
+                echo "Operator guide: https://github.com/${GITHUB_REPOSITORY}/blob/${SHA}/docs/operations.md" ;;
               v0.*)
                 echo "A prerelease: see ROADMAP.md for what this line promises and the evidence behind it." ;;
             esac
