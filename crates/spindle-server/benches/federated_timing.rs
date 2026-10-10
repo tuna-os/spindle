@@ -345,10 +345,10 @@ async fn partition_catchup() {
     // Each server is named by its proxy's address, so federation traffic
     // both ways crosses a proxy: partitioning both proxies partitions
     // the pair. The proxies bind first, so both names are exact.
-    let (partition_ba, proxy_ba) = Partition::start(SocketAddr::new(localhost, port_a)).await;
-    let (partition_ab, proxy_ab) = Partition::start(SocketAddr::new(localhost, port_b)).await;
-    let name_a = format!("127.0.0.1:{}", proxy_ba.port());
-    let name_b = format!("127.0.0.1:{}", proxy_ab.port());
+    let (gate_a, front_a) = Partition::start(SocketAddr::new(localhost, port_a)).await;
+    let (gate_b, front_b) = Partition::start(SocketAddr::new(localhost, port_b)).await;
+    let name_a = format!("127.0.0.1:{}", front_a.port());
+    let name_b = format!("127.0.0.1:{}", front_b.port());
 
     let dir_a = tempfile::TempDir::new().unwrap();
     let store_a = Arc::new(FjallStore::open(dir_a.path()).unwrap());
@@ -359,7 +359,7 @@ async fn partition_catchup() {
     let store_b = Arc::new(FjallStore::open(dir_b.path()).unwrap());
     let server_b = Server::start_on(store_b, name_b, port_b).await;
 
-    let partition = (&partition_ab, &partition_ba);
+    let partition = (&gate_b, &gate_a);
 
     let (alice, _) = server_a.register("alice").await;
     let (bob, _) = server_b.register("bob").await;
