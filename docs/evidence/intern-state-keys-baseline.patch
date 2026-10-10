@@ -3,16 +3,16 @@
 @@ -49,7 +49,7 @@
  fn retained_updates(c: &mut Criterion) {
      let mut group = c.benchmark_group("state/retained_updates");
- 
+
 -    for size in [100_usize, 1_000, 10_000] {
 +    for size in [100_usize, 1_000, 10_000, 50_000] {
          // Sizes span two orders of magnitude so the shape, not one number, shows.
          let entries = slots(size);
- 
+
 @@ -143,7 +143,7 @@
  fn persist(c: &mut Criterion) {
      let mut group = c.benchmark_group("state/persist");
- 
+
 -    for size in [100_usize, 1_000, 10_000] {
 +    for size in [100_usize, 1_000, 10_000, 50_000] {
          let entries = slots(size);
@@ -21,16 +21,16 @@
 @@ -229,7 +229,7 @@
  fn history_at(c: &mut Criterion) {
      let mut group = c.benchmark_group("state/history_at");
- 
+
 -    for size in [100_usize, 1_000, 10_000] {
 +    for size in [100_usize, 1_000, 10_000, 50_000] {
          let entries = slots(size);
- 
+
          // A log whose every entry is a state event, so the state at li is
 @@ -300,5 +300,43 @@
      group.finish();
  }
- 
+
 -criterion_group!(benches, retained_updates, lookups, persist, history_at);
 +/// Replacing existing slots after key allocation, retaining every snapshot.
 +/// This complements first-sight updates: room state usually changes slots

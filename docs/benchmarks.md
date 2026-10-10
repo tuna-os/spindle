@@ -51,8 +51,8 @@ server comparison starts at M1 and is defined in #42.
 ### Interned state keys: before and after (#79, 2026-10-10)
 
 **Verdict: a trade, with a measured first-sight regression.** At 50,000 keys,
-replacing existing slots has an after/before normalized median of 0.46×;
-allocating new slots has a median of 1.83×. This does not establish a general
+replacement of existing slots has an after/before normalized median of 0.46×.
+Allocation of new slots has a median of 1.83×. This does not establish a general
 speedup. First-sight updates at 1,000 and 50,000 keys regress in every observed
 normalized range. The ranges overlap for every other comparison, including the
 large-room replacement result, so three noisy rounds do not establish a stable
@@ -79,24 +79,24 @@ ranges are observations, not confidence intervals.
 | One warm lookup | 50,000 | 5.86× (3.75–9.00) | 7.55× (3.89–7.78) | 1.29× |
 
 First-sight updates begin with an empty trie and a fresh table, so the timed
-loop includes allocating intern ids. Replacement updates seed the trie and
+loop includes allocation of intern ids. Replacement updates seed the trie and
 table before timing, replace every existing slot once, and retain all snapshots.
-Both update groups time the release of that history too. Lookup repeats one
-warm key near the middle; it does not measure a distribution of room requests.
+Both update groups time the release of that history too. The lookup benchmark repeats a warm key near the middle; it does not measure a distribution of room requests.
 
-The new representation stores one u64 per state key in a leaf. It still stores
+Each leaf uses a u64 for its state key. It still stores
 string event ids and must resolve keys through the shared table. New keys pay
 for table allocation and its mutex; existing keys still pay for table lookup.
 This evidence does not attribute the timing changes to any one of those costs,
 and does not measure memory use, write bytes, or server throughput.
 
 Three rounds alternate baseline/branch, branch/baseline, baseline/branch. Each
-uses Criterion with 10 samples, 0.5 seconds of warm-up and a requested 1 second
-of measurement; expensive groups extend the measurement to obtain 10 samples.
-The host has two logical Xeon Platinum 8259CL CPUs, Rust 1.90.0, concurrent
-builds and swap pressure. Starting load averages were 12–19. Controls run
+uses Criterion with 10 samples, 0.5 seconds of warm-up and a target of 1 second
+for measurement. Expensive groups extend the measurement to get 10 samples.
+
+The host has two logical CPUs: `Xeon Platinum 8259CL`.
+It runs Rust 1.90.0, concurrent builds and has swap pressure. Initial load averages were 12–19. Controls run
 sequentially within each process: normalization cannot remove changes in host
-contention during a run. A quiet host is needed before claiming a stable win.
+contention during a run. Use a quiet host before you claim a stable win.
 
 [Collected estimates and normalized ratios](evidence/intern-state-keys-20261010.json)
 include all six runs and binary hashes. The
