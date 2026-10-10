@@ -97,9 +97,11 @@ def main():
         source, rollback, restored = [Instance(root / name) for name in
                                       ('source', 'rollback', 'restored')]
         with source.serve(old):
-            token = source.request('POST', '/_matrix/client/v3/register', {
+            registered = source.request('POST', '/_matrix/client/v3/register', {
                 'username': 'operator', 'password': 'release-fixture-password',
-                'auth': {'type': 'm.login.dummy', 'session': 'release-fixture'}})['access_token']
+                'auth': {'type': 'm.login.dummy', 'session': 'release-fixture'}})
+            token = registered['access_token']
+            user_id, device_id = registered['user_id'], registered['device_id']
             room = source.request('POST', '/_matrix/client/v3/createRoom', {
                 'room_version': '11', 'name': 'upgrade fixture'}, token)['room_id']
             state_path = '/_matrix/client/v3/rooms/' + urllib.parse.quote(room, safe='') + '/state/m.room.topic/'
@@ -114,6 +116,7 @@ def main():
 
         def verify(instance, binary):
             with instance.serve(binary):
+                instance.request('GET', '/_matrix/client/v3/sync', token=token)
                 assert instance.request('GET', state_path, token=token)['topic'] == 'survives migration'
                 assert instance.request('GET', media_path, token=token, raw=True) == payload
 
@@ -136,6 +139,23 @@ def main():
         shutil.copytree(rollback.data / 'media', restored.data / 'media', dirs_exist_ok=True)
         restored.command(candidate, 'verify-media')
         verify(restored, candidate)
+        # Drain a real mailbox, restart with push disabled, then resume from
+        # the acknowledged token. Consumed rows must not reset the counter.
+        with restored.serve(candidate):
+            restored.request('PUT', '/_matrix/client/v3/sendToDevice/m.room.encrypted/restart-proof',
+                             {'messages': {user_id: {device_id: {'ciphertext': 'fixture'}}}}, token)
+            delivered = restored.request('GET', '/_matrix/client/v3/sync', token=token)
+            assert len(delivered['to_device']['events']) == 1
+            acknowledged = restored.request('GET', '/_matrix/client/v3/sync?since=' +
+                                            urllib.parse.quote(delivered['next_batch'], safe=''), token=token)
+            assert not acknowledged['to_device']['events']
+            since = acknowledged['next_batch']
+        with restored.serve(candidate):
+            path = '/_matrix/client/v3/rooms/' + urllib.parse.quote(room, safe='') + '/send/m.room.message/after-restart'
+            sent = restored.request('PUT', path, {'msgtype': 'm.text', 'body': 'after restart'}, token)['event_id']
+            resumed = restored.request('GET', '/_matrix/client/v3/sync?since=' +
+                                       urllib.parse.quote(since, safe=''), token=token)
+            assert any(event['event_id'] == sent for event in resumed['rooms']['join'][room]['timeline']['events'])
         # Rollback starts from the original backup, never from migrated data.
         recovery = Instance(root / 'recovery')
         recovery.command(old, 'restore', backup)
@@ -146,7 +166,7 @@ def main():
               'migration': 'content_digest 2 -> 3', 'result': 'passed',
               'checks': ['old backup/restore', 'dry-run preserves old readability',
                          'real migration and idempotence', 'old binary refuses new schema',
-                         'new backup/restore', 'media and state survive', 'old backup rollback'],
+                         'new backup/restore', 'media and state survive', 'drained mailbox restart', 'old backup rollback'],
               'media_sha256': hashlib.sha256(payload).hexdigest()}
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2) + '\n')

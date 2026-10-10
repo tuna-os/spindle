@@ -290,6 +290,7 @@ pub struct Rooms {
     /// that event for that client forever, silently. Building and proving it
     /// first makes the lock change mechanical instead of frightening.
     stream: crate::stream::Stream,
+    issued_position: Mutex<u64>,
     /// Woken whenever an event lands, so a long-polling `/sync` does not have
     /// to spin. SPEC §10.3 wants per-room subscriber lists; this is the same
     /// shape at server granularity, which is enough while there is one lock.
@@ -519,6 +520,7 @@ impl Rooms {
             // they point at -- the same shape of bug as a room registry that
             // does not survive a restart, and worse, because it corrupts
             // rather than merely forgets.
+            issued_position: Mutex::new(read_stream_checkpoint(store_for_stream.as_ref())),
             stream: crate::stream::Stream::resuming_at(highest_stream_id(
                 store_for_stream.as_ref(),
                 stream_high,
@@ -3702,6 +3704,37 @@ impl Rooms {
         self.stream.position()
     }
 
+    /// Persist a position before issuing a token that acknowledges it.
+    /// Queue rows and ephemeral marks can disappear; they cannot be the only
+    /// evidence that a client already holds a position above the room log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the checkpoint cannot be made durable.
+    pub fn checkpoint_stream_position(&self, position: u64) -> Result<(), RoomError> {
+        if position > self.stream_position() {
+            return Err(RoomError::StateUnavailable(
+                "uncommitted stream position".to_owned(),
+            ));
+        }
+        let mut issued = self
+            .issued_position
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if position > *issued {
+            spindle_store::Store::commit(
+                self.store.as_ref(),
+                &[(
+                    spindle_core::keys::stream_checkpoint(),
+                    position.to_be_bytes().to_vec(),
+                )],
+                spindle_store::Durability::Strict,
+            )?;
+            *issued = position;
+        }
+        Ok(())
+    }
+
     /// Note that `user_id` sent a receipt in `room_id`: a position on the
     /// stream counter, and a wake for whoever is long-polling, so the
     /// reader's own next sync answers now and carries the counts the
@@ -3820,6 +3853,7 @@ impl Rooms {
         state_after: bool,
     ) -> Result<SyncResult, RoomError> {
         let position = self.stream_position();
+        self.checkpoint_stream_position(position)?;
         let joined = self.joined(user_id)?;
         let invited = self.invited_since(user_id, since, position)?;
         let knocked = self.knocked(user_id)?;
@@ -7508,6 +7542,14 @@ fn backfill_room_stream_index(store: &FjallStore, through: u64) -> usize {
     written
 }
 
+fn read_stream_checkpoint(store: &FjallStore) -> u64 {
+    spindle_store::ReadView::get(store, &spindle_core::keys::stream_checkpoint())
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_slice().try_into().map(u64::from_be_bytes).ok())
+        .unwrap_or(0)
+}
+
 /// The highest stream id already on disk, or 0 for a fresh store.
 ///
 /// `from_stream` is [`highest_stream_row`], passed in because the caller has
@@ -7609,7 +7651,23 @@ fn highest_stream_id(store: &FjallStore, from_stream: u64) -> u64 {
         .flatten()
         .and_then(|value| value.as_slice().try_into().map(u64::from_be_bytes).ok())
         .unwrap_or(0);
+    // An appservice can drain the last to-device row without any Matrix
+    // client syncing. Its durable acknowledgement is also a counter floor.
+    let from_appservices = spindle_store::ReadView::scan_prefix(
+        store,
+        &[
+            spindle_core::keys::KEY_SCHEMA_VERSION,
+            spindle_core::keys::Keyspace::AppserviceCursor as u8,
+        ],
+    )
+    .unwrap_or_default()
+    .iter()
+    .filter_map(|(_, value)| value.as_slice().try_into().map(u64::from_be_bytes).ok())
+    .max()
+    .unwrap_or(0);
     from_stream
+        .max(read_stream_checkpoint(store))
+        .max(from_appservices)
         .max(from_push_cursor)
         .max(from_to_device)
         .max(from_device_lists)

@@ -430,6 +430,8 @@ pub enum Keyspace {
     /// row the batch does not hold is a row a crash can separate from
     /// the node that needs it.
     StateKeyIntern = 0x59,
+    /// Highest global position issued to a client, retained after queue drains.
+    StreamCheckpoint = 0x5a,
     /// `(room_id, position)` -> one event of a filled federation gap: its
     /// ID and the root of the state after it. History backfilled into the
     /// *middle* of a room's timeline -- between the head this server held
@@ -522,6 +524,12 @@ pub fn profile(user_id: &str) -> Vec<u8> {
 #[must_use]
 pub fn push_cursor() -> Vec<u8> {
     vec![KEY_SCHEMA_VERSION, Keyspace::PushCursor as u8]
+}
+
+/// A durable floor for global sync positions across restarts.
+#[must_use]
+pub fn stream_checkpoint() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::StreamCheckpoint as u8]
 }
 
 /// The durable proof that a fresh offline import owns its notification boundary.

@@ -280,6 +280,10 @@ async fn events(
         None => None,
     };
     let position = state.rooms.stream_position();
+    crate::blocking::section(&state.metrics, crate::metrics::BlockingTask::Sync, || {
+        state.rooms.checkpoint_stream_position(position)
+    })
+    .map_err(|error| MatrixError::internal(&error.to_string()))?;
     let events = state
         .devices
         .take_pending_until(&identity.user_id, &device_id, acknowledged, position, None)

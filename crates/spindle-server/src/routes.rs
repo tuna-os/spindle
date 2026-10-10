@@ -6977,6 +6977,10 @@ fn sliding_answer(
     request: &crate::sliding::SlidingRequest,
     inputs: SlidingInputs<'_>,
 ) -> Result<Json<Value>, MatrixError> {
+    state
+        .rooms
+        .checkpoint_stream_position(inputs.position)
+        .map_err(room_error)?;
     let SlidingInputs {
         since,
         position,

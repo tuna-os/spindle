@@ -35,6 +35,7 @@ jobs:
           cargo build --locked -p spindle-server
           cargo test --locked -p spindle-core --test state_res_equivalence --test fork_window_equivalence
           cargo test --locked -p spindle-server --test side_stream_delivery
+          cargo test --locked -p spindle-server --test sync acknowledged_to_device_positions_survive_restart_without_push
       - name: Build the last schema-2 version
         run: |
           cargo build --locked --manifest-path old-version/Cargo.toml -p spindle-server

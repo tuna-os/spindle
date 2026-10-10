@@ -23,18 +23,31 @@ struct Harness {
     dir: TempDir,
     store: Arc<FjallStore>,
     app: axum::Router,
+    push_enabled: bool,
 }
 
 impl Harness {
     fn new() -> Self {
-        let dir = TempDir::new().unwrap();
-        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
-        let app = Self::build(&store);
-        Self { dir, store, app }
+        Self::with_push(true)
     }
 
-    fn build(store: &Arc<FjallStore>) -> axum::Router {
-        let config = spindle_server::Config::parse("[server]\nname = \"example.org\"\n").unwrap();
+    fn with_push(push_enabled: bool) -> Self {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let app = Self::build(&store, push_enabled);
+        Self {
+            dir,
+            store,
+            app,
+            push_enabled,
+        }
+    }
+
+    fn build(store: &Arc<FjallStore>, push_enabled: bool) -> axum::Router {
+        let config = spindle_server::Config::parse(&format!(
+            "[server]\nname = \"example.org\"\n[push]\nenabled = {push_enabled}\n"
+        ))
+        .unwrap();
         spindle_server::app(config, Arc::clone(store)).expect("a signing key is established")
     }
 
@@ -45,7 +58,7 @@ impl Harness {
     /// re-read from the stored rows whenever a server is built, so the claim
     /// survives -- see `restart.rs` for the fuller note.
     fn restart(&mut self) {
-        self.app = Self::build(&self.store);
+        self.app = Self::build(&self.store, self.push_enabled);
     }
 
     async fn call(&self, request: Request<Body>) -> (StatusCode, Value) {
@@ -682,5 +695,52 @@ async fn creating_a_room_wakes_an_existing_long_poll() {
     assert!(
         body["rooms"]["join"][&room_id].is_object(),
         "the created room was absent: {body}"
+    );
+}
+
+/// Once the receiver acknowledges its mailbox, pending rows no longer keep
+/// the global counter alive. Push is disabled so its cursor cannot mask this.
+#[tokio::test]
+async fn acknowledged_to_device_positions_survive_restart_without_push() {
+    let mut harness = Harness::with_push(false);
+    let token = harness.register("alice").await;
+    let room = harness.create_room(&token).await;
+    let (status, devices) = harness.get("/_matrix/client/v3/devices", &token).await;
+    assert_eq!(status, StatusCode::OK, "{devices}");
+    let device = devices["devices"][0]["device_id"].as_str().unwrap();
+    let (status, body) = harness
+        .put(
+            "/_matrix/client/v3/sendToDevice/m.room.encrypted/restart-proof",
+            &token,
+            &json!({"messages": {"@alice:example.org": {device: {"ciphertext": "fixture"}}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let delivered = harness.sync(&token, None).await;
+    assert_eq!(
+        delivered["to_device"]["events"].as_array().unwrap().len(),
+        1
+    );
+    let acknowledged = harness.sync(&token, delivered["next_batch"].as_str()).await;
+    assert!(
+        acknowledged["to_device"]["events"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let since = acknowledged["next_batch"].as_str().unwrap().to_owned();
+    harness.restart();
+    harness
+        .say(
+            &room,
+            &token,
+            "after mailbox drain and restart",
+            "after-restart",
+        )
+        .await;
+    let incremental = harness.sync(&token, Some(&since)).await;
+    assert_eq!(
+        bodies(&incremental["rooms"]["join"][&room]),
+        vec!["after mailbox drain and restart"]
     );
 }
