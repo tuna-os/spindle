@@ -197,10 +197,12 @@ impl StateKeyTable for MemStateKeyTable {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let first = inner.pending_from;
         inner.pending_from = inner.reverse.len();
-        inner.reverse[first..]
+        inner
+            .reverse
             .iter()
             .enumerate()
-            .map(|(offset, pair)| ((first + offset) as u64 + 1, pair.clone()))
+            .skip(first)
+            .map(|(offset, pair)| (offset as u64 + 1, pair.clone()))
             .collect()
     }
 }

@@ -376,7 +376,10 @@ fn migrate_room(
             old, table, &mut load, converted, written, &mut puts, old_nodes,
         )?;
         if root != old {
-            value[..32].copy_from_slice(&root);
+            value
+                .get_mut(..32)
+                .ok_or(crate::codec::CodecError::Truncated)?
+                .copy_from_slice(&root);
             puts.push((key, value));
         }
         count += commit_chunk(store, &mut puts)?;
