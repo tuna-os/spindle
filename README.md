@@ -8,13 +8,13 @@ never runs on the hot path.**
 · [spec coverage dashboard](https://tuna-os.github.io/spindle/dashboard.html)
 · [SPEC.md](SPEC.md)
 
-> **Status: an experiment under construction, not a deployment.** The
-> client-server surface is broad and tested, federation interoperates with real
-> Synapse, and nothing here has ever run in production. Releases are weekly
-> `v0.0.x` prereleases that name a build and promise nothing else: no
-> upgrade path, and the storage format has already broken once —
-> deliberately, with the [test that caught it](crates/spindle-store/tests/backend_compatibility.rs)
-> kept and inverted rather than deleted.
+> **Status: prerelease.** The client-server surface is broad and tested,
+> and federation interoperates with Synapse. The first supported maturity
+> line is `v0.1.x`, subject to the exact candidate checks and evidence in
+> [v0.1.0 readiness](docs/v0.1.0-readiness.md). Use the newest patch and the
+> [operator guide](docs/operations.md). Explicit migrations can need downtime;
+> rollback restores a pre-migration backup. Earlier `v0.0.x` tags identify
+> experimental builds and receive no backports.
 
 ---
 

@@ -120,10 +120,13 @@ def main():
         verify(rollback, old)
         # Migration is explicit, irreversible, and repeatable. Dry-run must not
         # prevent the previous binary from reading the same restored fixture.
-        rollback.command(candidate, 'migrate', '--dry-run')
+        planned = rollback.command(candidate, 'migrate', '--dry-run')
+        assert b'CANNOT be undone' in planned.stdout, 'the drill must cross a real schema boundary'
         verify(rollback, old)
-        rollback.command(candidate, 'migrate')
-        rollback.command(candidate, 'migrate')
+        migrated = rollback.command(candidate, 'migrate')
+        assert b'CANNOT be undone' in migrated.stdout
+        repeated = rollback.command(candidate, 'migrate')
+        assert b'already at this binary' in repeated.stdout
         rollback.command(candidate, 'verify-media')
         verify(rollback, candidate)
         rollback.command(old, 'backup', root / 'must-refuse.backup', succeeds=False)

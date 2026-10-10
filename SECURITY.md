@@ -14,7 +14,7 @@ homeserver produces that an installer or an image does not.
 1. Open **Security → Report a vulnerability** on this repository and
    describe the affected route or component, a minimal reproduction, the
    impact, and a suggested fix if you have one.
-2. Private reporting is enabled. If the button is unavailable to you,
+2. The repository accepts private reports. If the button is unavailable to you,
    open an ordinary issue titled `security contact request` with
    **no details in it**. A maintainer will open a private advisory and add
    you to it, and the conversation continues there.
@@ -64,12 +64,12 @@ be made sound. We ask for a coordinated window of up to **90 days** from
 acknowledgement before details are published, shorter once the fix has
 landed.
 
-The supported release line is **v0.1.x**, starting with v0.1.0. Operators
-must run the newest patch in that line. Security fixes are developed on
-`main` and included in the next v0.1.x release; advisories name the fixing
-commit and first release carrying it. Older v0.0.x builds receive no
-backports. The line remains a prerelease: explicit offline storage migrations
-may be required, with backup-based rollback documented in `docs/lifecycle.md`.
+The supported release line is **v0.1.x**; the first release is v0.1.0. Operators
+must run the newest patch in that line. Maintainers develop security fixes on
+`main` and include them in the next v0.1.x release. Advisories name the fix
+commit and first release with it. Older v0.0.x builds receive no
+backports. The line remains a prerelease: storage migrations
+can need downtime. Backup-based rollback is documented in `docs/lifecycle.md`.
 
 ## Scope
 

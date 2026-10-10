@@ -104,10 +104,10 @@ emergency either: every row above is storage growth at the rate one
 account can generate it, on a server whose registration is rate limited
 and can be closed.
 
-The v0.1 deployment envelope requires closed registration, bounded ingress,
-a process memory ceiling and monitored storage quotas. See
+For v0.1, close registration and bound ingress.
+Set a process memory ceiling and monitor storage quotas. See
 [operations.md](operations.md). These are operator-enforced bounds; Spindle
-does not supply general per-account storage quotas.
+does not supply general quotas for storage per account.
 
 ## How to read this against the code
 

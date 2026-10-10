@@ -40,7 +40,7 @@ experiment, and what is deliberately not being built yet.
 ## Release maturity
 
 Spindle has addressable `v0.0.x` prereleases. The next maturity boundary is
-`v0.1.0`, whose candidate evidence is collected in
+`v0.1.0`, with candidate evidence in
 [docs/v0.1.0-readiness.md](docs/v0.1.0-readiness.md).
 
 ### `v0.0.x` — an addressable prerelease
