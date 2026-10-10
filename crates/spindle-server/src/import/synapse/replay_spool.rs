@@ -250,10 +250,12 @@ mod tests {
             let id = format!("$update{event}");
             let key = format!("@member{event}:test");
             state = state.apply(&StateKey::new("m.room.member", key.clone()), id.clone());
-            roots.push(state.root());
             spool
                 .save(&id, &supplied(state.clone(), &key, &id))
                 .expect("save");
+            // Roots name table-local ids; compare after rebasing the source.
+            let table = ReadView::key_table(spool.store().expect("store"));
+            roots.push(state.clone().with_table(&table).root());
             // The original outcome held a snapshot per supplied event. This
             // source holds exactly one while saving, regardless of count.
             assert!(spool.saved.is_some());
@@ -592,7 +594,8 @@ mod tests {
                 .read_settled(&id)
                 .expect("load")
                 .expect("current record");
-            assert_eq!(actual.state.root(), expected.state.root());
+            let expected_state = expected.state.with_table(actual.state.table());
+            assert_eq!(actual.state.root(), expected_state.root());
             assert_eq!(actual.slots, expected.slots);
             assert_eq!(actual.reason, expected.reason);
         }
