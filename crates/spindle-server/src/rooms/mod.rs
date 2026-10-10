@@ -466,8 +466,9 @@ impl SideStreamWrite<'_> {
 impl Drop for SideStreamWrite<'_> {
     fn drop(&mut self) {
         // A failed write leaves a hole, not a permanently stalled watermark.
-        self.stream.abandon(self.id);
-        self.wake.notify_waiters();
+        if self.stream.finish(self.id) {
+            self.wake.notify_waiters();
+        }
     }
 }
 

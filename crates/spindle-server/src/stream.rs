@@ -79,19 +79,26 @@ impl Stream {
     /// Committing out of order is the case this exists for: an id above the
     /// watermark waits, and the watermark jumps when the gap below it fills.
     pub fn commit(&self, id: u64) {
+        self.finish(id);
+    }
+
+    /// Release a completed or abandoned position, reporting visible progress.
+    pub fn finish(&self, id: u64) -> bool {
         let mut state = self.lock();
         if id <= state.watermark {
             // Already published, or committed twice. Either way, nothing to
             // do -- and specifically not a panic: a retry that double-commits
             // must not take the server down.
-            return;
+            return false;
         }
+        let previous = state.watermark;
         state.ahead.insert(id);
         let mut watermark = state.watermark;
         while state.ahead.remove(&(watermark + 1)) {
             watermark += 1;
         }
         state.watermark = watermark;
+        watermark > previous
     }
 
     /// Release `id` without an event behind it.

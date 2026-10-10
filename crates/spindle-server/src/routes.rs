@@ -6774,6 +6774,10 @@ async fn send_to_device(
         &txn_id,
         &request.messages,
     );
+    // Hold publication through the batch, so its N recipients need one
+    // sync wake rather than N complete response assemblies. Each message
+    // still has its own id, including wildcard/explicit-device overlaps.
+    let mut batch_write = None;
     for (target_user, per_device) in &request.messages {
         if target_user.split_once(':').map(|(_, domain)| domain)
             != Some(state.config.server.name.as_str())
@@ -6796,6 +6800,7 @@ async fn send_to_device(
                 vec![target_device.clone()]
             };
             for device_id in devices {
+                batch_write.get_or_insert_with(|| state.rooms.reserve_stream_id());
                 let stream_write = state.rooms.reserve_stream_id();
                 let seq = stream_write.id();
                 let message = json!({
