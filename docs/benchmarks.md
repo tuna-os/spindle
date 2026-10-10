@@ -94,7 +94,7 @@ uses Criterion with 10 samples, 0.5 seconds of warm-up and a target of 1 second
 for measurement. Expensive groups extend the measurement to get 10 samples.
 
 The host has two logical CPUs: `Xeon Platinum 8259CL`.
-It runs Rust 1.90.0, concurrent builds and has swap pressure. Initial load averages were 12–19. Controls run
+It runs Rust 1.90.0, concurrent builds and has swap pressure. Initial load averages were 12–24. Controls run
 sequentially within each process: normalization cannot remove changes in host
 contention during a run. Use a quiet host before you claim a stable win.
 

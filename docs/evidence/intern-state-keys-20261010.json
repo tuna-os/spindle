@@ -11,9 +11,41 @@
     "filter": "^state/(lookup|retained_updates|retained_replacements)/(hamt|imbl|hashmap)/(100|1000|10000|50000)$",
     "host": {
       "architecture": "x86_64",
-      "conditions": "Shared development host; concurrent builds, swap pressure, starting load averages 12\u201319. Controls are sequential in each process, so normalization cannot remove changes in contention within an arm.",
+      "conditions": "Shared development host; concurrent builds, swap pressure, starting load averages 12\u201324. Controls are sequential in each process, so normalization cannot remove changes in contention within an arm.",
       "cpu": "Intel Xeon Platinum 8259CL @ 2.50GHz",
-      "logical_cpus": 2
+      "logical_cpus": 2,
+      "starting_load_averages": {
+        "1-baseline": [
+          18.759765625,
+          18.62841796875,
+          16.1875
+        ],
+        "1-branch": [
+          19.7763671875,
+          23.57421875,
+          20.244140625
+        ],
+        "2-baseline": [
+          18.92578125,
+          19.279296875,
+          19.18408203125
+        ],
+        "2-branch": [
+          16.767578125,
+          18.42578125,
+          18.92529296875
+        ],
+        "3-baseline": [
+          12.4111328125,
+          16.01025390625,
+          17.8857421875
+        ],
+        "3-branch": [
+          12.74365234375,
+          14.2216796875,
+          16.61572265625
+        ]
+      }
     },
     "measurement_seconds": 1,
     "normalization": "Criterion mean HAMT time / mean control time within each process. Report median and observed min/max across three rounds; ranges are not confidence intervals.",
