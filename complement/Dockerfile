@@ -8,7 +8,7 @@
 # Build from the repository root:
 #   docker build -f complement/Dockerfile -t complement-spindle:latest .
 
-FROM rust:1.98-bookworm AS build
+FROM rust:1.98-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS build
 WORKDIR /src
 
 # The dependency layer: manifests only, with placeholder sources, so the
@@ -54,7 +54,7 @@ COPY crates ./crates
 RUN find crates -name '*.rs' -exec touch {} + \
     && cargo build --release --locked --bin spindle
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates openssl curl util-linux \

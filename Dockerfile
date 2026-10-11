@@ -10,7 +10,7 @@
 # startup contract (TLS on 8448 from a mounted CA, a health check), which
 # an operator's image should not carry.
 
-FROM rust:1.98-bookworm AS build
+FROM rust:1.98-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS build
 # Extra cargo features, empty for the release image. The Synapse migration
 # rehearsal image passes FEATURES=synapse-import.
 ARG FEATURES=""
@@ -19,7 +19,7 @@ COPY . .
 RUN cargo build --release -p spindle-server --bin spindle --locked \
     ${FEATURES:+--features "$FEATURES"}
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
