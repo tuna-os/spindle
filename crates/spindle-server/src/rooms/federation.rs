@@ -392,6 +392,7 @@ impl Rooms {
                     Sideline::Rejected => format!("{event_id} was rejected"),
                 }));
             }
+            rooms.check_policy_in(log, room_id, json)?;
             let version = rooms.version_in_log(log, room_id)?;
             if spindle_core::is_state_dag(&version) {
                 return Err(RoomError::Append(
@@ -1684,7 +1685,7 @@ impl Rooms {
         json: &Value,
     ) -> Result<(), RoomError> {
         self.with_room(room_id, |rooms, log| {
-            rooms.ingest(log, room_id, event_id, json, true)
+            rooms.ingest_checked(log, room_id, event_id, json, true, true)
         })
     }
 
@@ -1709,6 +1710,7 @@ impl Rooms {
         json: &Value,
     ) -> Result<(), RoomError> {
         self.with_room(room_id, |rooms, log| {
+            rooms.check_policy_in(log, room_id, json)?;
             rooms.ingest(log, room_id, event_id, json, true)
         })
     }

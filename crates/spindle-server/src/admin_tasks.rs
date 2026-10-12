@@ -254,7 +254,12 @@ async fn delete_room_v2(
     let worker_actor = actor.duplicate();
     let worker_state = state.clone();
     tokio::task::spawn_blocking(move || {
-        let outcome = crate::admin::shutdown_room(&worker_state, &worker_actor, &room_id, &request);
+        let outcome = tokio::runtime::Handle::current().block_on(crate::admin::shutdown_room(
+            &worker_state,
+            &worker_actor,
+            &room_id,
+            &request,
+        ));
         let mut task = task;
         task.timestamp_ms = now_ms();
         match outcome {

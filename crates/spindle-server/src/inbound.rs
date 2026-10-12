@@ -60,7 +60,7 @@ pub(crate) fn report_refused_pdu(origin: &str, event_id: &str, pdu: &Value, reas
 ///
 /// `signer` is the server whose `keys` these are, and the sender has to live
 /// there: the server that asks to join, knock or leave.
-pub(crate) fn receive_brokered_pdu(
+pub(crate) async fn receive_brokered_pdu(
     state: &AppState,
     signer: &str,
     keys: Option<&crate::federation::PeerKeys>,
@@ -68,9 +68,23 @@ pub(crate) fn receive_brokered_pdu(
 ) -> (String, Result<(), String>) {
     use ruma::CanonicalJsonValue;
 
-    let receive = |room_id: &str, event_id: &str, json: &Value| {
-        state.rooms.receive_brokered(room_id, event_id, json)
-    };
+    async fn receive(
+        state: &AppState,
+        room_id: &str,
+        event_id: &str,
+        json: &Value,
+    ) -> Result<(), crate::rooms::RoomError> {
+        let mut json = json.clone();
+        if let Err(error) = state.rooms.authorize_policy(room_id, &mut json).await
+            && !matches!(
+                error,
+                crate::rooms::RoomError::Forbidden(_) | crate::rooms::RoomError::Policy(_)
+            )
+        {
+            return Err(error);
+        }
+        state.rooms.receive_brokered(room_id, event_id, &json)
+    }
 
     let Ok(CanonicalJsonValue::Object(canonical)) = CanonicalJsonValue::try_from(pdu.clone())
     else {
@@ -138,10 +152,13 @@ pub(crate) fn receive_brokered_pdu(
                 };
                 let json = serde_json::to_value(&redacted).unwrap_or(Value::Null);
                 return match receive(
+                    state,
                     pdu["room_id"].as_str().unwrap_or_default(),
                     &event_id,
                     &json,
-                ) {
+                )
+                .await
+                {
                     Ok(()) => (event_id, Ok(())),
                     Err(error) => (event_id, Err(error.to_string())),
                 };
@@ -166,7 +183,7 @@ pub(crate) fn receive_brokered_pdu(
     let Some(room_id) = pdu["room_id"].as_str() else {
         return (event_id, Err("no room_id".to_owned()));
     };
-    match receive(room_id, &event_id, pdu) {
+    match receive(state, room_id, &event_id, pdu).await {
         Ok(()) => (event_id, Ok(())),
         Err(error) => (event_id, Err(error.to_string())),
     }
@@ -359,7 +376,17 @@ pub(crate) fn merge_returned_signatures(join: &mut Value, returned: &Value) {
         // Never overwrite: our own entry is the one we can vouch for, and a
         // resident replacing it would be substituting a signature we did
         // not make for one we did.
-        ours.entry(server).or_insert(keys);
+        let Some(keys) = keys.as_object() else {
+            continue;
+        };
+        let signer = ours.entry(server).or_insert_with(|| json!({}));
+        if let Some(signer) = signer.as_object_mut() {
+            for (key, signature) in keys {
+                signer
+                    .entry(key.clone())
+                    .or_insert_with(|| signature.clone());
+            }
+        }
     }
 }
 
@@ -907,7 +934,8 @@ pub(crate) async fn send_knock(
             "the origin's keys cannot be verified".to_owned(),
         )
     })?;
-    let (computed_id, outcome) = receive_brokered_pdu(&state, &origin, Some(&key_map), &knock);
+    let (computed_id, outcome) =
+        receive_brokered_pdu(&state, &origin, Some(&key_map), &knock).await;
     if computed_id != event_id {
         return Err(MatrixError::bad_json(format!(
             "the event hashes to {computed_id}, not {event_id}"
@@ -1220,7 +1248,8 @@ pub(crate) async fn send_leave_common(
             "the origin's keys cannot be verified".to_owned(),
         )
     })?;
-    let (computed_id, outcome) = receive_brokered_pdu(&state, &origin, Some(&key_map), &leave);
+    let (computed_id, outcome) =
+        receive_brokered_pdu(&state, &origin, Some(&key_map), &leave).await;
     if computed_id != event_id {
         return Err(MatrixError::bad_json(format!(
             "the event hashes to {computed_id}, not {event_id}"
@@ -1301,7 +1330,7 @@ pub(crate) async fn send_join_common(
         // -- a nomination this server did not make is not one it endorses.
         _ => join,
     };
-    let (computed_id, outcome) = receive_brokered_pdu(&state, &origin, Some(&key_map), &join);
+    let (computed_id, outcome) = receive_brokered_pdu(&state, &origin, Some(&key_map), &join).await;
     // The path names the event the peer computed; disagreement means one
     // side hashed a different event than the other signed.
     if computed_id != event_id {
@@ -1313,6 +1342,8 @@ pub(crate) async fn send_join_common(
         return Err(MatrixError::forbidden(&reason));
     }
 
+    // Return the accepted body, including approval obtained by the broker.
+    let join = state.rooms.pdu(&room_id, &event_id).map_err(room_error)?;
     state.rooms.wake_sync_waiters();
     // MSC4354: a server that has just joined is owed every unexpired
     // sticky event of the room. Pushed through the outbox as the MSC

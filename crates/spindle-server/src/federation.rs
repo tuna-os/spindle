@@ -2479,6 +2479,69 @@ impl Federation {
         .await
     }
 
+    /// Ask a room's policy server for a signature, stable first, then MSC4284.
+    /// The whole operation, including discovery and reading the body, is bounded.
+    ///
+    /// # Errors
+    /// Returns a refusal for a denied event or any transport/protocol failure.
+    pub async fn policy_sign(
+        &self,
+        destination: &str,
+        event: &Value,
+    ) -> Result<Value, FederationError> {
+        let work = async {
+            for (index, uri) in [
+                "/_matrix/policy/v1/sign",
+                "/_matrix/policy/unstable/org.matrix.msc4284/sign",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let authorization = self.sign_request("POST", uri, destination, Some(event))?;
+                let response = self
+                    .request(reqwest::Method::POST, destination, uri)
+                    .await?
+                    .header("authorization", authorization)
+                    .header("content-type", "application/json")
+                    .body(event.to_string())
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        FederationError::Refused(format!("policy signing: {error}"))
+                    })?;
+                let status = response.status();
+                let bytes = read_bounded(response, 64 * 1024, "policy signature").await?;
+                if index == 0
+                    && (status == reqwest::StatusCode::NOT_FOUND
+                        || status == reqwest::StatusCode::METHOD_NOT_ALLOWED)
+                {
+                    continue;
+                }
+                let body: Value = serde_json::from_slice(&bytes).map_err(|error| {
+                    FederationError::Refused(format!("policy signature: {error}"))
+                })?;
+                if index == 0
+                    && (!status.is_success() && body["errcode"].as_str() == Some("M_UNRECOGNIZED"))
+                {
+                    continue;
+                }
+                if !status.is_success() {
+                    return Err(FederationError::Answered {
+                        status: status.as_u16(),
+                        body,
+                    });
+                }
+                return Ok(body);
+            }
+            Err(FederationError::Refused(
+                "policy signing endpoint unavailable".to_owned(),
+            ))
+        };
+        tokio::time::timeout(Duration::from_secs(30), work)
+            .await
+            .map_err(|_| FederationError::Refused("policy signing timed out".to_owned()))?
+    }
+
     /// The signed request carrying one transaction, built but not sent.
     ///
     /// Split from the send so the outbox drain can build every request of

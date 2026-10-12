@@ -433,12 +433,15 @@ impl Harness {
         self.state.rooms.forward_extremity_count(room).unwrap()
     }
 
-    fn merge(&self) -> spindle_server::rooms::extremities::MergePass {
-        self.state.rooms.merge_extremities(
-            self.state.key.pair(),
-            &MergePolicy::of(&self.state.config.rooms),
-            now_millis(),
-        )
+    async fn merge(&self) -> spindle_server::rooms::extremities::MergePass {
+        self.state
+            .rooms
+            .merge_extremities(
+                self.state.key.pair(),
+                &MergePolicy::of(&self.state.config.rooms),
+                now_millis(),
+            )
+            .await
     }
 
     /// `/sync`'s `unread_notifications.notification_count` for `room`.
@@ -535,7 +538,7 @@ async fn a_crowded_room_is_merged_by_a_dummy_event_that_federates() {
     }
     assert_eq!(harness.extremities(&room), 3);
 
-    let pass = harness.merge();
+    let pass = harness.merge().await;
     assert_eq!(pass.merged.len(), 1, "{pass:?}");
     assert_eq!(pass.buckets, [0, 1, 0, 0], "the census saw the fork");
     assert_eq!(harness.metrics.extremity_buckets(), [0, 1, 0, 0]);
@@ -574,7 +577,7 @@ async fn a_crowded_room_is_merged_by_a_dummy_event_that_federates() {
     assert_eq!(federated[0]["prev_events"], pdu["prev_events"]);
 
     // Merged: the next census finds one extremity and sends nothing.
-    let again = harness.merge();
+    let again = harness.merge().await;
     assert!(again.merged.is_empty());
     assert_eq!(again.buckets, [1, 0, 0, 0]);
 }
@@ -600,7 +603,7 @@ async fn a_stale_fork_is_merged_once_per_interval() {
     let theirs = harness.inject(&peer, "theirs", pdu).await;
     assert_eq!(harness.extremities(&room), 2);
 
-    let pass = harness.merge();
+    let pass = harness.merge().await;
     assert_eq!(pass.merged.len(), 1, "{pass:?}");
     assert_eq!(harness.extremities(&room), 1);
 
@@ -609,7 +612,7 @@ async fn a_stale_fork_is_merged_once_per_interval() {
     let pdu = harness.message(&peer, &room, &theirs, "again");
     harness.inject(&peer, "again", pdu).await;
     assert_eq!(harness.extremities(&room), 2);
-    let pass = harness.merge();
+    let pass = harness.merge().await;
     assert!(pass.merged.is_empty(), "{pass:?}");
     assert_eq!(harness.extremities(&room), 2);
     assert_eq!(harness.metrics.dummy_event_counts(), (1, 0));
@@ -637,7 +640,7 @@ async fn young_forks_and_a_disabled_merge_send_nothing() {
         assert_eq!(status, StatusCode::OK);
         let pdu = harness.message(&peer, &room, &fork_point, "theirs");
         harness.inject(&peer, "theirs", pdu).await;
-        let pass = harness.merge();
+        let pass = harness.merge().await;
         assert!(pass.merged.is_empty(), "{rooms:?}: {pass:?}");
         assert_eq!(pass.buckets, [0, 1, 0, 0], "{rooms:?}");
         assert_eq!(harness.extremities(&room), 2, "{rooms:?}");
@@ -666,7 +669,7 @@ async fn a_dummy_event_is_nobodys_unread_message() {
     let bob_badge = harness.badge(&room, &bob).await;
     assert_eq!(bob_badge, 3);
 
-    let pass = harness.merge();
+    let pass = harness.merge().await;
     assert_eq!(pass.merged.len(), 1, "{pass:?}");
 
     assert_eq!(harness.unread(&room, "@bob:example.org"), bob_unread);
@@ -738,7 +741,7 @@ async fn a_dummy_event_does_not_bump_a_quiet_room() {
 
     // Then the quiet room is merged, by an event newer than both.
     tokio::time::sleep(Duration::from_millis(5)).await;
-    let pass = harness.merge();
+    let pass = harness.merge().await;
     assert_eq!(pass.merged.len(), 1, "{pass:?}");
     let dummy = &pass.merged[0].1;
     let dummy_ts = harness.state.rooms.pdu(&quiet, dummy).unwrap()["origin_server_ts"]

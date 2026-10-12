@@ -1182,23 +1182,31 @@ pub async fn fire_loop(
                 continue;
             }
             let sent = match &event.state_key {
-                Some(state_key) => rooms.set_state_sticky(
-                    &event.room_id,
-                    &event.sender,
-                    key.pair(),
-                    &event.event_type,
-                    state_key,
-                    &event.content,
-                    event.sticky_ms,
-                ),
-                None => rooms.send_sticky(
-                    &event.room_id,
-                    &event.sender,
-                    key.pair(),
-                    &event.event_type,
-                    &event.content,
-                    event.sticky_ms,
-                ),
+                Some(state_key) => {
+                    rooms
+                        .set_state_sticky_checked(
+                            &event.room_id,
+                            &event.sender,
+                            key.pair(),
+                            &event.event_type,
+                            state_key,
+                            &event.content,
+                            event.sticky_ms,
+                        )
+                        .await
+                }
+                None => {
+                    rooms
+                        .send_sticky_checked(
+                            &event.room_id,
+                            &event.sender,
+                            key.pair(),
+                            &event.event_type,
+                            &event.content,
+                            event.sticky_ms,
+                        )
+                        .await
+                }
             };
             // MSC4309: whatever happened, the client that scheduled this is
             // very likely not here -- that is what a dead-man's switch means

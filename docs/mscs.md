@@ -59,6 +59,7 @@ what became of each proposal.
 | MSC | Title | Stable in | Flags | Evidence | Notes |
 |---|---|---|---|---|---|
 | [MSC4108](https://github.com/matrix-org/matrix-spec-proposals/pull/4108) | QR code login | — | `org.matrix.msc4108` | `rendezvous.rs` | Homeserver rendezvous mailbox with conditional reads and writes, expiry and capacity limits. OAuth device authorization and secure-channel negotiation belong to MAS and the clients; their integrated rehearsal is pending. |
+| [MSC4284](https://github.com/matrix-org/matrix-spec-proposals/pull/4284) | Policy servers | v1.18 | — | `policy_servers.rs`, `policy-servers.md` | Homeserver participation: stable m.room.policy and MSC4284 compatibility, outbound signing, room-key verification, and live-event soft failure. Spindle consumes an external service; it does not host a policy service or publish policy-service discovery. |
 
 ## Planned
 

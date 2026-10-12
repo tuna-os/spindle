@@ -594,7 +594,7 @@ async fn save_profile(
         .profiles
         .set(&user_id, field(displayname), field(avatar_url))
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    crate::routes::propagate_profile(&state, &user_id)?;
+    crate::routes::propagate_profile(&state, &user_id).await?;
     state.metrics.record_account_action(AccountAction::Profile);
     Ok(web::see_other(
         "/account/?action=org.matrix.profile&notice=profile_saved",
@@ -802,14 +802,17 @@ async fn deactivate(
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     let user_id = accounts.user_id(&localpart);
     for room_id in state.rooms.joined(&user_id).unwrap_or_default() {
-        let _ = state.rooms.set_membership(
-            &room_id,
-            &user_id,
-            &user_id,
-            "leave",
-            Some("account deactivated"),
-            state.key.pair(),
-        );
+        let _ = state
+            .rooms
+            .set_membership_checked(
+                &room_id,
+                &user_id,
+                &user_id,
+                "leave",
+                Some("account deactivated"),
+                state.key.pair(),
+            )
+            .await;
     }
     crate::mas::deactivate_user(&state, &localpart, form.erase.as_deref() == Some("yes"))?;
     accounts
