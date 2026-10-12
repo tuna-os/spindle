@@ -34,19 +34,21 @@ An existing valid `ed25519:policy_server` signature avoids a network request.
 Otherwise Spindle sends the complete wire PDU in a signed federation request:
 `POST /_matrix/policy/v1/sign`. Unsupported endpoints fall back to
 `/_matrix/policy/unstable/org.matrix.msc4284/sign`. The response is a signatures
-map. Spindle verifies the signature with the public key from room state.
-Verification uses the redaction rules for the room version. Spindle preserves
-origin signatures and verifies approvals for events it sends too.
+map.
+
+Spindle verifies the signature with the public key from room state.
+Verification uses the redaction rules for the room version. Spindle retains signatures from the origin and verifies approvals for events
+it sends too.
 
 Spindle rejects an event after a refusal, an invalid or absent signature, a
 transport failure, or a timeout of 30 seconds. Transport failures and invalid
 signatures return `M_FORBIDDEN`. HTTP refusals retain their status, known
-Matrix error codes, and `retry_after_ms`. Spindle rewrites remote authentication
-errors so a policy service cannot invalidate a homeserver login.
+error codes from Matrix, and `retry_after_ms`. Spindle converts authentication
+errors from the remote service. These errors cannot invalidate a homeserver login.
 
 A rejection leaves no successful record for the client transaction. A retry
 can succeed later. Spindle holds no room lock during the network request.
-Changes to room state cause Spindle to rebuild the event and request approval
+If the room state changes, Spindle rebuilds the event and requests approval
 again. After three tries, Spindle returns a retry error. Concurrent retries of
 the same client transaction share its result.
 
