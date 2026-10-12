@@ -19,7 +19,10 @@
 //! - a second run reports nothing to do.
 
 use spindle_core::keys::{Keyspace, content_addressed, room_li, room_prefix, store_marker};
-use spindle_core::{EventId, LinearIndex, RehydrateError, RoomLog, StateKey, rehydrate_v2};
+use spindle_core::{
+    EventId, LinearIndex, RehydrateError, RoomLog, StateKey, rehydrate_v2,
+    rehydrate_v2_with_addresses,
+};
 use spindle_store::codec::{EntryRecord, RoomRecord, SidelinedRecord};
 use spindle_store::migrate::{MIGRATIONS, run};
 use spindle_store::{FjallStore, ReadView, RoomStore, SchemaMarker, Store};
@@ -324,6 +327,50 @@ fn a_version_two_store_migrates_and_reads_back() {
     assert!(again.steps.is_empty(), "migration converges");
 }
 
+#[test]
+fn a_staged_root_revisited_from_sidelined_history_does_not_read_before_flush() {
+    let dir = TempDir::new().unwrap();
+    let store = FjallStore::open_unchecked(dir.path()).unwrap();
+    seed_v3_entry(&store);
+    let fixture = write_v2_fixture(&store);
+
+    // Add a second distinct old root after the first one. The later sidelined
+    // row then revisits the first root while both conversions are still below
+    // the batch commit threshold.
+    let (leaf, second_root) = v2_leaf(&[("m.room.history_visibility", "", "$h")]);
+    Store::put(
+        &store,
+        &content_addressed(Keyspace::StateNode, &second_root),
+        &leaf,
+    )
+    .unwrap();
+    let second_entry = EntryRecord {
+        li: 3,
+        event_id: "$c3".to_owned(),
+        prev_events: vec!["$c2".to_owned()],
+        depth: 3,
+        state_key: None,
+        state_root: second_root,
+        chain: None,
+    };
+    Store::put(
+        &store,
+        &room_li(Keyspace::Log, ROOM, LinearIndex::from_raw(3)),
+        &second_entry.encode(),
+    )
+    .unwrap();
+
+    let sideline_key = spindle_core::keys::sidelined(ROOM, "$s1");
+    let sideline_bytes = ReadView::get(&store, &sideline_key).unwrap().unwrap();
+    let mut sideline = SidelinedRecord::decode(&sideline_bytes).unwrap();
+    sideline.state_root = fixture.root;
+    Store::put(&store, &sideline_key, &sideline.encode()).unwrap();
+
+    let report = run(&store, MIGRATIONS, false).unwrap();
+    assert_eq!(report.steps.len(), 1);
+    assert_eq!(report.to, SchemaMarker::current());
+}
+
 /// The version-2 reader fails closed: version-3 bytes and corruption are
 /// both refused, never mistaken for convertible state.
 ///
@@ -353,12 +400,14 @@ fn the_version_two_reader_refuses_new_bytes_and_corruption() {
         &leaf,
     )
     .unwrap();
-    let state = rehydrate_v2(
+    let (state, old_addresses) = rehydrate_v2_with_addresses(
         spindle_core::StateRoot::from_bytes(address),
         &mut load,
         &table,
     )
     .unwrap();
+    assert_eq!(old_addresses.len(), 1);
+    assert_eq!(old_addresses[0].as_bytes(), &address);
     assert_eq!(
         state.get(&StateKey::new("m.room.topic", "")),
         Some("$t"),
@@ -453,4 +502,419 @@ fn migration_preserves_old_nodes_until_every_room_has_converted() {
             Some("$t")
         );
     }
+}
+
+/// A real v2 path-copy trie, built from the old placement and wire format.
+fn v2_tree(
+    entries: &[(String, String, String)],
+    depth: usize,
+    nodes: &mut std::collections::HashMap<spindle_core::StateRoot, Vec<u8>>,
+) -> spindle_core::StateRoot {
+    use spindle_core::StateRoot;
+    if entries.is_empty() {
+        return StateRoot::from_bytes(*blake3::hash(b"spindle-empty-state-v2").as_bytes());
+    }
+    let (bytes, address) = if entries.len() == 1 {
+        let (kind, key, event) = &entries[0];
+        v2_leaf(&[(kind, key, event)])
+    } else {
+        let mut groups = std::collections::BTreeMap::<u32, Vec<_>>::new();
+        for entry in entries {
+            groups
+                .entry(slot(&placement(&entry.0, &entry.1), depth))
+                .or_default()
+                .push(entry.clone());
+        }
+        let slots: Vec<_> = groups.keys().copied().collect();
+        let children: Vec<_> = groups
+            .values()
+            .map(|entries| *v2_tree(entries, depth + 1, nodes).as_bytes())
+            .collect();
+        v2_branch(&slots, &children)
+    };
+    let root = StateRoot::from_bytes(address);
+    nodes.insert(root, bytes);
+    root
+}
+
+#[test]
+fn incremental_history_matches_full_conversion_with_changed_path_reads() {
+    use spindle_core::{MemStateKeyTable, StateRoot, rehydrate_v2_incremental};
+    let table = MemStateKeyTable::shared();
+    let mut entries: Vec<_> = (0..2048)
+        .map(|i| {
+            (
+                "m.room.member".to_owned(),
+                format!("@member{i}:example.org"),
+                format!("$member{i}"),
+            )
+        })
+        .collect();
+    let mut nodes = std::collections::HashMap::new();
+    let mut previous_root = v2_tree(&entries, 0, &mut nodes);
+    let mut previous =
+        rehydrate_v2(previous_root, &mut |root| nodes.get(root).cloned(), &table).unwrap();
+    let mut incremental_reads = 0;
+    let mut full_reads = 0;
+    let mut v3_nodes = std::collections::HashMap::new();
+    for (address, bytes) in previous.delta_nodes(None) {
+        v3_nodes.insert(address, bytes);
+    }
+    let started = std::time::Instant::now();
+    for revision in 0..64 {
+        // Includes replacement, insertion, deletion and changes in trie shape.
+        match revision % 4 {
+            0 => entries[revision].2 = format!("$changed{revision}"),
+            1 => entries.push((
+                "m.room.member".to_owned(),
+                format!("@new{revision}:example.org"),
+                format!("$new{revision}"),
+            )),
+            2 => {
+                entries.remove(revision);
+            }
+            _ => entries[revision].2 = format!("$other{revision}"),
+        }
+        let root = v2_tree(&entries, 0, &mut nodes);
+        let (state, addresses) =
+            rehydrate_v2_incremental(root, previous_root, &previous, &mut |address| {
+                incremental_reads += 1;
+                nodes.get(address).cloned()
+            })
+            .unwrap();
+        let full = rehydrate_v2(
+            root,
+            &mut |address| {
+                full_reads += 1;
+                nodes.get(address).cloned()
+            },
+            &table,
+        )
+        .unwrap();
+        assert_eq!(state.root(), full.root(), "revision {revision}");
+        assert!(
+            addresses.len() < 32,
+            "only changed old paths need deletion tracking"
+        );
+        let delta = state.delta_nodes(Some(&previous));
+        assert!(delta.len() < 32, "only changed new paths are persisted");
+        for (address, bytes) in delta {
+            v3_nodes.insert(address, bytes);
+        }
+        let restored = spindle_core::StateSnapshot::rehydrate(
+            state.root(),
+            &mut |address| v3_nodes.get(address).cloned(),
+            table.clone(),
+        )
+        .unwrap();
+        assert_eq!(restored.root(), full.root());
+        previous_root = root;
+        previous = state;
+    }
+    eprintln!(
+        "2048-slot/64-revision history: full={full_reads} node reads, incremental={incremental_reads}, elapsed={:?}",
+        started.elapsed()
+    );
+    assert!(
+        incremental_reads * 100 < full_reads,
+        "reads must scale with changed paths"
+    );
+    // Root/leaf/branch/empty transitions and a nonadjacent history jump.
+    for subset in [&entries[..1], &entries[..2], &entries[..], &entries[..0]] {
+        let root = v2_tree(subset, 0, &mut nodes);
+        let (state, _) = rehydrate_v2_incremental(root, previous_root, &previous, &mut |address| {
+            nodes.get(address).cloned()
+        })
+        .unwrap();
+        let full = rehydrate_v2(root, &mut |address| nodes.get(address).cloned(), &table).unwrap();
+        assert_eq!(state.root(), full.root());
+        previous_root = root;
+        previous = state;
+    }
+    assert_eq!(
+        previous_root,
+        StateRoot::from_bytes(*blake3::hash(b"spindle-empty-state-v2").as_bytes())
+    );
+}
+
+#[test]
+fn incremental_conversion_rejects_corruption_and_missing_changed_nodes() {
+    use spindle_core::{MemStateKeyTable, rehydrate_v2_incremental};
+    let table = MemStateKeyTable::shared();
+    let entries = vec![("m.room.name".to_owned(), String::new(), "$name".to_owned())];
+    let mut nodes = std::collections::HashMap::new();
+    let previous_root = v2_tree(&entries, 0, &mut nodes);
+    let previous =
+        rehydrate_v2(previous_root, &mut |root| nodes.get(root).cloned(), &table).unwrap();
+    let changed = vec![("m.room.name".to_owned(), String::new(), "$next".to_owned())];
+    let root = v2_tree(&changed, 0, &mut nodes);
+    let mut corrupt = nodes[&root].clone();
+    *corrupt.last_mut().unwrap() ^= 1;
+    nodes.insert(root, corrupt);
+    assert!(matches!(
+        rehydrate_v2_incremental(root, previous_root, &previous, &mut |address| nodes
+            .get(address)
+            .cloned()),
+        Err(RehydrateError::HashMismatch)
+    ));
+    nodes.remove(&root);
+    assert!(matches!(
+        rehydrate_v2_incremental(root, previous_root, &previous, &mut |address| nodes
+            .get(address)
+            .cloned()),
+        Err(RehydrateError::MissingNode)
+    ));
+}
+
+#[test]
+fn migrated_history_verification_skips_shared_nodes_without_retaining_snapshots() {
+    use spindle_core::{MemStateKeyTable, MigrationStateVerifier, StateSnapshot};
+    let table = MemStateKeyTable::shared();
+    let mut state = StateSnapshot::new(table.clone());
+    for i in 0..2048 {
+        state = state.apply(
+            &StateKey::new("m.room.member", format!("@member{i}:example.org")),
+            format!("$member{i}"),
+        );
+    }
+    let mut nodes: std::collections::HashMap<_, _> = state.delta_nodes(None).into_iter().collect();
+    let mut verifier = MigrationStateVerifier::new(table.clone(), 100_000);
+    verifier
+        .verify(state.root(), &mut |root| nodes.get(root).cloned())
+        .unwrap();
+    let mut cached_reads = 0;
+    let mut full_reads = 0;
+    for i in 0..64 {
+        let next = state.apply(
+            &StateKey::new("m.room.member", format!("@member{i}:example.org")),
+            format!("$changed{i}"),
+        );
+        nodes.extend(next.delta_nodes(Some(&state)));
+        let root = next.root();
+        state = next;
+        verifier
+            .verify(root, &mut |address| {
+                cached_reads += 1;
+                nodes.get(address).cloned()
+            })
+            .unwrap();
+        StateSnapshot::rehydrate(
+            root,
+            &mut |address| {
+                full_reads += 1;
+                nodes.get(address).cloned()
+            },
+            table.clone(),
+        )
+        .unwrap();
+    }
+    eprintln!("v3 retry history: full={full_reads} node reads, verification memo={cached_reads}");
+    assert!(cached_reads * 100 < full_reads);
+    // Bounded eviction sacrifices performance, never validity.
+    let mut bounded = MigrationStateVerifier::new(table.clone(), 8);
+    bounded
+        .verify(state.root(), &mut |address| nodes.get(address).cloned())
+        .unwrap();
+    let changed = state.apply(&StateKey::new("m.room.name", ""), "$new");
+    nodes.extend(changed.delta_nodes(Some(&state)));
+    nodes.remove(&changed.root());
+    assert!(matches!(
+        verifier.verify(changed.root(), &mut |address| nodes.get(address).cloned()),
+        Err(RehydrateError::MissingNode)
+    ));
+    let mut fresh = MigrationStateVerifier::new(table, 100_000);
+    let mut corrupt = nodes[&state.root()].clone();
+    *corrupt.last_mut().unwrap() ^= 1;
+    nodes.insert(state.root(), corrupt);
+    assert!(
+        fresh
+            .verify(state.root(), &mut |address| nodes.get(address).cloned())
+            .is_err()
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One failure/reopen/retry scenario.
+fn incremental_migration_resumes_after_a_committed_chunk_and_keeps_all_history() {
+    use spindle_core::{StateRoot, StateSnapshot};
+    let dir = TempDir::new().unwrap();
+    let store = FjallStore::open_unchecked(dir.path()).unwrap();
+    seed_v3_entry(&store);
+    write_v2_fixture(&store);
+    let mut entries: Vec<_> = (0..2048)
+        .map(|i| {
+            (
+                "m.room.member".to_owned(),
+                format!("@member{i}:example.org"),
+                format!("$member{i}"),
+            )
+        })
+        .collect();
+    let mut nodes = std::collections::HashMap::new();
+    let first = v2_tree(&entries, 0, &mut nodes);
+    let mut history = vec![(first, entries.clone())];
+    for revision in 0..16 {
+        entries[revision].2 = format!("$changed{revision}");
+        let root = v2_tree(&entries, 0, &mut nodes);
+        history.push((root, entries.clone()));
+    }
+    for (address, bytes) in &nodes {
+        Store::put(
+            &store,
+            &content_addressed(Keyspace::StateNode, address.as_bytes()),
+            bytes,
+        )
+        .unwrap();
+    }
+    let template_key = room_li(Keyspace::Log, ROOM, LinearIndex::from_raw(2));
+    let template =
+        EntryRecord::decode(&ReadView::get(&store, &template_key).unwrap().unwrap()).unwrap();
+    for (index, (root, _)) in history.iter().enumerate() {
+        let mut record = template.clone();
+        record.li = i64::try_from(index).unwrap() + 2;
+        record.state_root = *root.as_bytes();
+        Store::put(
+            &store,
+            &room_li(Keyspace::Log, ROOM, LinearIndex::from_raw(record.li)),
+            &record.encode(),
+        )
+        .unwrap();
+    }
+    // The first conversion exceeds the 2,000-row commit chunk. Fail only
+    // afterwards, then reopen so retry uses persisted intern ids and v3 nodes.
+    let missing = history[1].0;
+    Store::delete(
+        &store,
+        &content_addressed(Keyspace::StateNode, missing.as_bytes()),
+    )
+    .unwrap();
+    assert!(run(&store, MIGRATIONS, false).is_err());
+    let committed =
+        EntryRecord::decode(&ReadView::get(&store, &template_key).unwrap().unwrap()).unwrap();
+    assert_ne!(
+        committed.state_root,
+        *first.as_bytes(),
+        "a chunk really committed"
+    );
+    Store::put(
+        &store,
+        &content_addressed(Keyspace::StateNode, missing.as_bytes()),
+        &nodes[&missing],
+    )
+    .unwrap();
+    drop(store);
+    let store = FjallStore::open_unchecked(dir.path()).unwrap();
+    run(&store, MIGRATIONS, false).unwrap();
+    drop(store);
+    let store = FjallStore::open(dir.path()).unwrap();
+    for (index, (_, expected)) in history.iter().enumerate() {
+        let key = room_li(
+            Keyspace::Log,
+            ROOM,
+            LinearIndex::from_raw(i64::try_from(index).unwrap() + 2),
+        );
+        let record = EntryRecord::decode(&ReadView::get(&store, &key).unwrap().unwrap()).unwrap();
+        let state = StateSnapshot::rehydrate(
+            StateRoot::from_bytes(record.state_root),
+            &mut |root| {
+                ReadView::get(
+                    &store,
+                    &content_addressed(Keyspace::StateNode, root.as_bytes()),
+                )
+                .unwrap()
+            },
+            store.key_table(),
+        )
+        .unwrap();
+        assert_eq!(state.len(), expected.len());
+        for (kind, key, event) in expected {
+            assert_eq!(
+                state.get(&StateKey::new(kind.as_str(), key.as_str())),
+                Some(event.as_str())
+            );
+        }
+    }
+    // Retry can only collect v2 nodes reachable from records still naming v2.
+    // The first committed record no longer references its old root; its
+    // unreachable old nodes are harmless orphans under the existing contract.
+    let mut retry_nodes = std::collections::HashSet::new();
+    for (root, _) in &history[1..] {
+        retry_nodes.extend(
+            spindle_core::v2_node_addresses(*root, &mut |address| nodes.get(address).cloned())
+                .unwrap(),
+        );
+    }
+    for address in retry_nodes {
+        assert!(
+            ReadView::get(
+                &store,
+                &content_addressed(Keyspace::StateNode, address.as_bytes())
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+    assert!(
+        ReadView::get(
+            &store,
+            &content_addressed(Keyspace::StateNode, first.as_bytes())
+        )
+        .unwrap()
+        .is_some()
+    );
+    assert!(run(&store, MIGRATIONS, false).unwrap().steps.is_empty());
+}
+
+#[test]
+fn migration_verifier_checks_descendants_intern_ids_and_depth_after_cache_hits() {
+    use spindle_core::{MemStateKeyTable, MigrationStateVerifier, StateRoot, StateSnapshot};
+    let table = MemStateKeyTable::shared();
+    let state = StateSnapshot::new(table.clone()).apply(&StateKey::new("m.room.name", ""), "$name");
+    let mut nodes: std::collections::HashMap<_, _> = state.delta_nodes(None).into_iter().collect();
+    let mut verifier = MigrationStateVerifier::new(table, 1000);
+    verifier
+        .verify(state.root(), &mut |address| nodes.get(address).cloned())
+        .unwrap();
+    // A separately scoped table must refuse the same leaf's unknown intern id.
+    let mut foreign = MigrationStateVerifier::new(MemStateKeyTable::shared(), 1000);
+    assert!(matches!(
+        foreign.verify(state.root(), &mut |address| nodes.get(address).cloned()),
+        Err(RehydrateError::Malformed)
+    ));
+    let branch = |child: StateRoot| {
+        let mut bytes = vec![1];
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.extend_from_slice(child.as_bytes());
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"spindle-hamt-branch-v3\0");
+        hash.update(&1_u32.to_be_bytes());
+        hash.update(child.as_bytes());
+        (StateRoot::from_bytes(*hash.finalize().as_bytes()), bytes)
+    };
+    let (root, bytes) = branch(state.root());
+    nodes.insert(root, bytes);
+    let mut independent = MigrationStateVerifier::new(state.table().clone(), 1000);
+    assert!(matches!(
+        independent.verify(root, &mut |address| {
+            if *address == state.root() {
+                None
+            } else {
+                nodes.get(address).cloned()
+            }
+        }),
+        Err(RehydrateError::MissingNode)
+    ));
+    // Hash-valid branch wrappers reach the already cached leaf at depth 53,
+    // beyond the decoder's 52-level limit. Cached depth zero cannot bypass it.
+    let mut root = state.root();
+    for _ in 0..53 {
+        let (next, bytes) = branch(root);
+        nodes.insert(next, bytes);
+        root = next;
+    }
+    assert!(matches!(
+        verifier.verify(root, &mut |address| nodes.get(address).cloned()),
+        Err(RehydrateError::Malformed)
+    ));
 }
