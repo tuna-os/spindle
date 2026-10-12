@@ -265,13 +265,14 @@ impl Rooms {
         content: &Value,
         sticky_ms: Option<u64>,
     ) -> Result<String, RoomError> {
+        let content = super::sanitized_member_content(event_type, content);
         self.append_policy_checked(
             room_id,
             sender,
             key,
             event_type,
             Some(state_key),
-            content,
+            &content,
             sticky_ms,
         )
         .await

@@ -960,3 +960,42 @@ async fn timeline_activity_during_signing_does_not_force_approval_retries() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(peer.requests.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn client_member_state_cannot_supply_a_restricted_join_nominee() {
+    let peer = Peer::start().await;
+    for active in [false, true] {
+        let h = Harness::new("");
+        let (room, alice, _) = h.shared_room(&peer).await;
+        if active {
+            h.enable(&peer, &room, &alice, false).await;
+        }
+        let (status, body) = h
+            .send(
+                "PUT",
+                &format!("/_matrix/client/v3/rooms/{room}/state/m.room.member/@alice:example.org"),
+                &alice,
+                &json!({
+                    "membership": "join",
+                    "displayname": "Alice",
+                    "join_authorised_via_users_server": "unused",
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let event = h
+            .state
+            .rooms
+            .state_event_full(&room, "m.room.member", "@alice:example.org")
+            .unwrap();
+        assert_eq!(event["content"]["displayname"], "Alice");
+        assert!(event["content"]["join_authorised_via_users_server"].is_null());
+        if active {
+            let policy = h.state.rooms.policy_server(&room).unwrap().unwrap();
+            assert!(policy.verifies(&event, &RoomVersionId::V11));
+            assert!(peer.requests.lock().unwrap().last().unwrap()["content"]
+                ["join_authorised_via_users_server"]
+                .is_null());
+        }
+    }
+}
