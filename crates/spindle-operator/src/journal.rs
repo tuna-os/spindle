@@ -315,6 +315,16 @@ impl Journal {
     }
 }
 
+impl Drop for Journal {
+    /// Release the directory lock explicitly. Closing the file is not
+    /// enough: a child forked by another thread holds a copy of the
+    /// descriptor until it calls `exec`, and the lock stays held until every
+    /// copy closes. An explicit unlock releases it for all copies.
+    fn drop(&mut self) {
+        let _ = self.lock.unlock();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
