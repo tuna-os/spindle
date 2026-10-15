@@ -39,7 +39,7 @@ import urllib.request
 import jsonschema
 import yaml
 
-SPEC_PIN = "0dfc6917367ee54dc1366a95196c074ee75d9c34"
+SPEC_PIN = "c6a54df511489a9e7f7880b4d55a36ae67405400"
 SPEC_URL = "https://github.com/matrix-org/matrix-spec"
 REPO = pathlib.Path(__file__).resolve().parent.parent
 ALLOWLIST = REPO / "scripts" / "openapi-allowlist.txt"

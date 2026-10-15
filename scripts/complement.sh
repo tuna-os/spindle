@@ -29,7 +29,7 @@
 set -euo pipefail
 
 # Bump deliberately, with the allowlist re-baselined in the same commit.
-COMPLEMENT_REV=6d2fdc286c2b44faaddd1037205869b2242a4005
+COMPLEMENT_REV=7bcf2103e571514c2c628b41099f97f1f83c0519
 PACKAGES=("./tests/csapi" "./tests")
 # COMPLEMENT_PACKAGES overrides the list (space separated), e.g.
 # "./tests/spindle" for this repository's own tests in complement/tests,
