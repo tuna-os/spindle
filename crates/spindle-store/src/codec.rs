@@ -446,6 +446,34 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// One interned state-key row value (#79): two length-framed strings,
+/// `(event_type, state_key)`. The id is the key, not the value.
+/// Trailing bytes refuse the row: a longer writer's fields are not a
+/// shorter reader's pair.
+#[must_use]
+pub fn encode_intern_pair(event_type: &str, state_key: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + event_type.len() + state_key.len());
+    put_str(&mut out, event_type);
+    put_str(&mut out, state_key);
+    out
+}
+
+/// The inverse of [`encode_intern_pair`].
+///
+/// # Errors
+///
+/// Returns [`CodecError`] when the row is truncated, holds invalid UTF-8,
+/// or carries trailing bytes.
+pub fn decode_intern_pair(bytes: &[u8]) -> Result<(Box<str>, Box<str>), CodecError> {
+    let mut cursor = Cursor { bytes, at: 0 };
+    let event_type: Box<str> = cursor.str()?.into();
+    let state_key: Box<str> = cursor.str()?.into();
+    if let Some(extra) = bytes.get(cursor.at) {
+        return Err(CodecError::Malformed(*extra));
+    }
+    Ok((event_type, state_key))
+}
+
 /// A record that could not be read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CodecError {

@@ -68,6 +68,10 @@ if abuse ever needs one, and it belongs in `[ratelimit]` beside `enabled`.
 | Pushers registered per user | 100 | `[limits] pushers_per_user` | 400 `M_LIMIT_EXCEEDED`; replacing a registration is free |
 | Pending delayed events per sender per room | 100 | `[delayed_events] max_per_room` | 400 `M_LIMIT_EXCEEDED` |
 | Longest delay | 24 h | `[delayed_events] max_delay_ms` | 400, naming the limit |
+| Rate-limit counter keys | 65,536; identifiers at most 512 bytes | `ratelimit::MAX_TRACKED_KEYS`, `MAX_KEY_BYTES` | new identifiers refused at saturation; expired counters reclaimed without resetting live budgets |
+| Peer-key fetches | 32 concurrent direct fetches; 8,192 entries in each direct-fetch cache | `federation::MAX_CONCURRENT_KEY_FETCHES`, `MAX_KEY_FETCH_ORIGINS` | excess direct fetches refused; failures retained for 60 s and successful refetches throttled for 10 s |
+| Incoming EDUs processed per transaction | 100 | `inbound::send` | additional EDUs ignored; entire transaction body limited to 1 MiB |
+| Pending delayed events per sender across rooms | 1,000 | `[delayed_events] max_per_user` | 400 `M_LIMIT_EXCEEDED` |
 | PDUs per federation transaction | 50 | fixed (the spec's own number) | 400 `M_BAD_JSON` |
 | Federation transaction id length | 255 bytes | fixed | 400 `M_BAD_JSON`; the id is a replay key, and an unbounded key is a storage sink |
 | Peer key-document validity | 7 days regardless of what the peer claims | `federation::MAX_KEY_VALIDITY` | refetch |
@@ -76,7 +80,7 @@ Every configurable cap refuses zero at startup. A zero would reject every
 write, and a config that quietly disables a feature is worse than one that
 will not load.
 
-## Not bounded
+## Account-driven storage growth
 
 Each of these grows with what an ordinary registered account chooses to
 do, and nothing stops it. Listed with the shape a cap would take, so the
@@ -91,14 +95,19 @@ next one is a small change and not a design discussion.
 | Room tags per room per user | `PUT /tags/{tag}` | per-user-per-room count |
 | Invites outstanding per sender | `POST /invite` | per-user count of pending invites |
 | Events per room, and rooms joined per user | `PUT /send`, `POST /join` | a per-account send rate (above), not a cap: a room's history is the product |
-| EDUs per federation transaction | `PUT /send/{txnId}` | a count beside the PDU cap; the spec allows 100 |
-| Peer key fetches on a cache miss | any signed request from an unknown key id | per-origin refetch rate; filed as #288 |
+
+
 
 The first four are the ones #268 named and #297 did not reach. None is
 an attack that needs anything beyond a registered account. None is an
 emergency either: every row above is storage growth at the rate one
 account can generate it, on a server whose registration is rate limited
 and can be closed.
+
+For v0.1, close registration and bound ingress.
+Set a process memory ceiling and monitor storage quotas. See
+[operations.md](operations.md). These are operator-enforced bounds; Spindle
+does not supply general quotas for storage per account.
 
 ## How to read this against the code
 

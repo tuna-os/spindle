@@ -25,6 +25,9 @@ pub struct MatrixError {
     /// `M_INCOMPATIBLE_ROOM_VERSION` names the version the asker would have
     /// needed (federation `make_join`/`make_knock`).
     pub room_version: Option<String>,
+    /// Further keys an error code defines beside `errcode` and `error`,
+    /// such as the limit MSC4140's delay-too-large names.
+    pub extra: Option<Box<serde_json::Map<String, serde_json::Value>>>,
 }
 
 impl MatrixError {
@@ -37,6 +40,7 @@ impl MatrixError {
             retry_after_ms: None,
             soft_logout: false,
             room_version: None,
+            extra: None,
         }
     }
 
@@ -51,6 +55,7 @@ impl MatrixError {
             retry_after_ms: None,
             soft_logout: true,
             room_version: None,
+            extra: None,
         }
     }
 
@@ -123,6 +128,7 @@ impl MatrixError {
             retry_after_ms: Some(retry_after_ms),
             soft_logout: false,
             room_version: None,
+            extra: None,
         }
     }
 
@@ -172,6 +178,22 @@ impl IntoResponse for MatrixError {
         if let Some(version) = self.room_version {
             body.insert("room_version".to_owned(), json!(version));
         }
-        (self.status, Json(serde_json::Value::Object(body))).into_response()
+        if let Some(extra) = self.extra {
+            for (key, value) in *extra {
+                body.entry(key).or_insert(value);
+            }
+        }
+        let mut response = (self.status, Json(serde_json::Value::Object(body))).into_response();
+        // The header beside the body field: HTTP clients and proxies read
+        // `Retry-After`, and MSC4140 names it for a refused schedule. Whole
+        // seconds, rounded up, so a client that honours it is never early.
+        if let Some(retry) = self.retry_after_ms
+            && let Ok(value) = axum::http::HeaderValue::from_str(&retry.div_ceil(1000).to_string())
+        {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, value);
+        }
+        response
     }
 }

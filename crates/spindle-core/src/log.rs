@@ -1,6 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    sync::Arc,
+};
 
 use crate::state::VerifiedNodeCache;
+use crate::state_table::StateKeyTable;
 use crate::{StateKey, StateRoot, StateSnapshot};
 
 /// Matrix caps `prev_events` at 20 references per event.
@@ -226,7 +230,16 @@ pub trait StateResolver {
     /// Returns [`AppendError`] when the states cannot be resolved -- an
     /// event a candidate needs cannot be read, or this resolver declines
     /// to resolve a conflict at all ([`Strict`]).
-    fn resolve(&mut self, states: &[StateSnapshot]) -> Result<StateSnapshot, AppendError>;
+    ///
+    /// `table` is the table an empty answer is built against. It is only
+    /// used when `states` is empty: any snapshot the resolver returns
+    /// otherwise is cloned or folded from its inputs and keeps their
+    /// table.
+    fn resolve(
+        &mut self,
+        states: &[StateSnapshot],
+        table: &Arc<dyn StateKeyTable>,
+    ) -> Result<StateSnapshot, AppendError>;
 }
 
 /// The resolver that resolves nothing: parents that disagree are refused
@@ -240,15 +253,19 @@ pub trait StateResolver {
 pub struct Strict;
 
 impl StateResolver for Strict {
-    fn resolve(&mut self, states: &[StateSnapshot]) -> Result<StateSnapshot, AppendError> {
+    fn resolve(
+        &mut self,
+        states: &[StateSnapshot],
+        table: &Arc<dyn StateKeyTable>,
+    ) -> Result<StateSnapshot, AppendError> {
         let Some((first, rest)) = states.split_first() else {
-            return Ok(StateSnapshot::new());
+            return Ok(StateSnapshot::new(Arc::clone(table)));
         };
         for other in rest {
             if let Some((key, _, _)) = first.diff(other).into_iter().next() {
                 let candidates = states
                     .iter()
-                    .filter_map(|state| state.get(key))
+                    .filter_map(|state| state.get(&key))
                     .map(EventId::new)
                     .collect::<BTreeSet<_>>()
                     .into_iter()
@@ -307,10 +324,17 @@ pub struct RoomLog {
     /// grows without limit even though the trie shares structure perfectly.
     resident: BTreeMap<i64, StateSnapshot>,
     resident_window: usize,
+    /// Whose ids the resident snapshots hold. Every snapshot a log hands
+    /// out shares this table, so diffs and persists across entries stay
+    /// within one id space. Cloned, never rebuilt, on every `Clone`.
+    table: Arc<dyn StateKeyTable>,
 }
 
-impl Default for RoomLog {
-    fn default() -> Self {
+impl RoomLog {
+    /// An empty log against `table`: production passes the store's table,
+    /// tests pass a shared [`crate::state_table::MemStateKeyTable`].
+    #[must_use]
+    pub fn new(table: Arc<dyn StateKeyTable>) -> Self {
         Self {
             entries: BTreeMap::new(),
             positions: HashMap::new(),
@@ -326,14 +350,14 @@ impl Default for RoomLog {
             head_chain: ChainHash::seed(),
             resident: BTreeMap::new(),
             resident_window: DEFAULT_RESIDENT_WINDOW,
+            table,
         }
     }
-}
 
-impl RoomLog {
+    /// The table this log's snapshots belong to.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn table(&self) -> &Arc<dyn StateKeyTable> {
+        &self.table
     }
 
     /// A log that keeps `window` recent snapshots resident instead of the
@@ -343,11 +367,10 @@ impl RoomLog {
     /// — below that, a fork the design says is cheap has to reach the store for
     /// state the design says should be in hand.
     #[must_use]
-    pub fn with_resident_window(window: usize) -> Self {
-        Self {
-            resident_window: window,
-            ..Self::default()
-        }
+    pub fn with_resident_window(window: usize, table: Arc<dyn StateKeyTable>) -> Self {
+        let mut log = Self::new(table);
+        log.resident_window = window;
+        log
     }
 
     /// Materialized state after the entry at `li`, if it is still resident.
@@ -414,14 +437,14 @@ impl RoomLog {
             .collect();
         if held.is_empty() {
             let Some(li) = li else {
-                return Ok(StateSnapshot::new());
+                return Ok(StateSnapshot::new(Arc::clone(&self.table)));
             };
             return match self
                 .entry_at_or_before(li.get().saturating_sub(1))
                 .filter(|previous| previous.li < li)
             {
                 Some(previous) => self.state_after_any(&previous.event_id, load),
-                None => Ok(StateSnapshot::new()),
+                None => Ok(StateSnapshot::new(Arc::clone(&self.table))),
             };
         }
         self.resolve_parents(&held, resolver, load)
@@ -456,9 +479,15 @@ impl RoomLog {
             }
         }
         match states.len() {
-            0 => Ok(StateSnapshot::new()),
-            1 => Ok(states.pop().unwrap_or_default()),
-            _ => resolver.resolve(&states),
+            0 => Ok(StateSnapshot::new(Arc::clone(&self.table))),
+            // `pop` cannot miss on a one-element vector; the empty shape
+            // below is unreachable, and an unreachable empty keeps the
+            // table the caller would otherwise lose.
+            1 => match states.pop() {
+                Some(state) => Ok(state),
+                None => Ok(StateSnapshot::new(Arc::clone(&self.table))),
+            },
+            _ => resolver.resolve(&states, &self.table),
         }
     }
 
@@ -479,19 +508,25 @@ impl RoomLog {
             if let Some(state) = self.resident.get(&entry.li.get()) {
                 return Ok(state.clone());
             }
-            return StateSnapshot::rehydrate(entry.state_root, &mut |root: &StateRoot| load(root))
-                .map_err(|_| AppendError::StateNotResident {
-                    li: entry.li,
-                    event_id: event_id.clone(),
-                });
+            return StateSnapshot::rehydrate(
+                entry.state_root,
+                &mut |root: &StateRoot| load(root),
+                Arc::clone(&self.table),
+            )
+            .map_err(|_| AppendError::StateNotResident {
+                li: entry.li,
+                event_id: event_id.clone(),
+            });
         }
         if let Some(sidelined) = self.sidelined.get(event_id) {
             if let Some(state) = self.sidelined_state.get(event_id) {
                 return Ok(state.clone());
             }
-            return StateSnapshot::rehydrate(sidelined.state_root, &mut |root: &StateRoot| {
-                load(root)
-            })
+            return StateSnapshot::rehydrate(
+                sidelined.state_root,
+                &mut |root: &StateRoot| load(root),
+                Arc::clone(&self.table),
+            )
             .map_err(|_| AppendError::StateNotResident {
                 li: LinearIndex(0),
                 event_id: event_id.clone(),
@@ -1089,7 +1124,7 @@ impl RoomLog {
     ) -> Result<&LogEntry, AppendError> {
         let mut state_after = state_before;
         let state_key = input.state_key;
-        if let Some(state_key) = state_key.clone() {
+        if let Some(state_key) = &state_key {
             state_after = state_after.apply(state_key, input.event_id.as_str());
         }
 
@@ -1148,9 +1183,7 @@ impl RoomLog {
     ) -> Result<&SidelinedEntry, AppendError> {
         let depth = self.check_parents(&input)?;
         let state_after = match (&input.state_key, kind) {
-            (Some(key), Sideline::SoftFailed) => {
-                state_before.apply(key.clone(), input.event_id.as_str())
-            }
+            (Some(key), Sideline::SoftFailed) => state_before.apply(key, input.event_id.as_str()),
             _ => state_before,
         };
         let entry = SidelinedEntry {
@@ -1169,6 +1202,10 @@ impl RoomLog {
 
     /// Put back a sidelined event read from storage, with its state.
     pub fn restore_sidelined(&mut self, entry: SidelinedEntry, state: StateSnapshot) {
+        // A log's states share its numbering: a foreign snapshot is rebased
+        // at the door, so everything this log persists resolves through one
+        // table. Same table is a no-op clone.
+        let state = state.with_table(&self.table);
         let previous = self.sidelined.get(&entry.event_id).map(|old| old.kind);
         if previous != Some(entry.kind)
             && (entry.kind == Sideline::Rejected || previous == Some(Sideline::Rejected))
@@ -1221,6 +1258,7 @@ impl RoomLog {
         if input.prev_events.len() > MAX_PREV_EVENTS {
             return Err(AppendError::TooManyPredecessors(input.prev_events.len()));
         }
+        let state_after = state_after.with_table(&self.table);
 
         let li = self.next_forward;
         self.next_forward = self
@@ -1280,6 +1318,7 @@ impl RoomLog {
         if self.entries.is_empty() {
             return Err(AppendError::EmptyRoom);
         }
+        let state_after = state_after.with_table(&self.table);
 
         let li = self.next_backward;
         self.next_backward = self
@@ -1426,13 +1465,12 @@ impl LogRestore {
         next_backward: i64,
         forward_extremities: impl IntoIterator<Item = EventId>,
         expected_entries: usize,
+        table: Arc<dyn StateKeyTable>,
     ) -> Self {
-        let mut log = RoomLog {
-            next_forward,
-            next_backward,
-            forward_extremities: forward_extremities.into_iter().collect(),
-            ..RoomLog::default()
-        };
+        let mut log = RoomLog::new(table);
+        log.next_forward = next_forward;
+        log.next_backward = next_backward;
+        log.forward_extremities = forward_extremities.into_iter().collect();
         let reserve = expected_entries.min(MAX_RESTORE_RESERVATION);
         log.positions.reserve(reserve);
         Self {
@@ -1568,9 +1606,15 @@ impl LogRestore {
             selected.insert(*li);
         }
         let mut verified_nodes = VerifiedNodeCache::new(64 * 1024 * 1024);
+        let table = log.table().clone();
         let mut hydrate = |root: StateRoot, li: i64, cache: &mut VerifiedNodeCache| {
-            StateSnapshot::rehydrate_cached(root, &mut |root: &StateRoot| load_node(root), cache)
-                .map_err(|_| RestoreError::UnreadableState(li))
+            StateSnapshot::rehydrate_cached(
+                root,
+                &mut |root: &StateRoot| load_node(root),
+                cache,
+                Arc::clone(&table),
+            )
+            .map_err(|_| RestoreError::UnreadableState(li))
         };
         if exhaustive {
             // Weak cache entries need live owners during an exhaustive
@@ -1625,6 +1669,7 @@ impl RoomLog {
         next_forward: i64,
         next_backward: i64,
         forward_extremities: impl IntoIterator<Item = EventId>,
+        table: Arc<dyn StateKeyTable>,
     ) -> Result<RestoredLog, RestoreError> {
         Self::rebuild(
             entries,
@@ -1632,6 +1677,7 @@ impl RoomLog {
             next_backward,
             forward_extremities,
             None,
+            table,
         )
     }
 
@@ -1653,6 +1699,7 @@ impl RoomLog {
         next_backward: i64,
         forward_extremities: impl IntoIterator<Item = EventId>,
         load_node: NodeLoader<'_>,
+        table: Arc<dyn StateKeyTable>,
     ) -> Result<RestoredLog, RestoreError> {
         Self::rebuild(
             entries,
@@ -1660,6 +1707,7 @@ impl RoomLog {
             next_backward,
             forward_extremities,
             Some(load_node),
+            table,
         )
     }
 
@@ -1676,6 +1724,7 @@ impl RoomLog {
         next_backward: i64,
         forward_extremities: impl IntoIterator<Item = EventId>,
         load_node: NodeLoader<'_>,
+        table: Arc<dyn StateKeyTable>,
     ) -> Result<RuntimeRestoredLog, RestoreError> {
         Self::restore_stored_roots(
             entries,
@@ -1684,6 +1733,7 @@ impl RoomLog {
             forward_extremities,
             load_node,
             false,
+            table,
         )
         .map(|log| RuntimeRestoredLog { log })
     }
@@ -1699,6 +1749,7 @@ impl RoomLog {
         next_backward: i64,
         forward_extremities: impl IntoIterator<Item = EventId>,
         load_node: NodeLoader<'_>,
+        table: Arc<dyn StateKeyTable>,
     ) -> Result<RestoredLog, RestoreError> {
         Self::restore_stored_roots(
             entries,
@@ -1707,6 +1758,7 @@ impl RoomLog {
             forward_extremities,
             load_node,
             true,
+            table,
         )
         .map(|log| RestoredLog {
             log,
@@ -1722,6 +1774,7 @@ impl RoomLog {
         forward_extremities: impl IntoIterator<Item = EventId>,
         load_node: NodeLoader<'_>,
         exhaustive: bool,
+        table: Arc<dyn StateKeyTable>,
     ) -> Result<Self, RestoreError> {
         let entries = entries.into_iter();
         let mut restore = LogRestore::new(
@@ -1729,6 +1782,7 @@ impl RoomLog {
             next_backward,
             forward_extremities,
             entries.size_hint().0,
+            table,
         );
         for restored in entries {
             restore.push(restored)?;
@@ -1742,11 +1796,13 @@ impl RoomLog {
         next_backward: i64,
         forward_extremities: impl IntoIterator<Item = EventId>,
         mut load_node: Option<NodeLoader<'_>>,
+        table: Arc<dyn StateKeyTable>,
     ) -> Result<RestoredLog, RestoreError> {
         let mut log = Self {
             entries: BTreeMap::new(),
             positions: HashMap::new(),
             forward_extremities: forward_extremities.into_iter().collect(),
+            table,
             sidelined: HashMap::new(),
             sidelined_state: HashMap::new(),
             historical_rejections: BTreeSet::new(),
@@ -1799,9 +1855,10 @@ impl RoomLog {
             // about ancestry it does not yet hold.
             // A conflict means the fold cannot be reproduced; fall through
             // to the stored trie rather than refusing to open the room.
-            let mut folded = restored_fold(&parents).unwrap_or_default();
+            let mut folded =
+                restored_fold(&parents).unwrap_or_else(|| StateSnapshot::new(log.table().clone()));
             if let Some(state_key) = restored.state_key.clone() {
-                folded = folded.apply(state_key, restored.event_id.as_str());
+                folded = folded.apply(&state_key, restored.event_id.as_str());
             }
 
             let state_after = if *folded.root().as_bytes() == restored.expected_state_root {
@@ -1812,7 +1869,13 @@ impl RoomLog {
                 // stored trie can supply it.
                 let stored = StateRoot::from_bytes(restored.expected_state_root);
                 if let Some(state) = load_node.as_mut().and_then(|load| {
-                    StateSnapshot::rehydrate_cached(stored, load, &mut verified_nodes).ok()
+                    StateSnapshot::rehydrate_cached(
+                        stored,
+                        load,
+                        &mut verified_nodes,
+                        log.table().clone(),
+                    )
+                    .ok()
                 }) {
                     state
                 } else {

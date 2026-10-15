@@ -41,6 +41,10 @@ const NEGATIVE_CACHE: Duration = Duration::from_secs(60);
 /// exist gets at most one fetch of the real server per interval.
 const REFETCH_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Bounds for attacker-selected direct-key origins and network work.
+const MAX_KEY_FETCH_ORIGINS: usize = 8_192;
+const MAX_CONCURRENT_KEY_FETCHES: usize = 32;
+
 /// How soon the notaries are asked about the same origin again, whatever
 /// they answered. Their answer for one origin carries its whole history,
 /// so asking again sooner learns nothing new.
@@ -99,6 +103,7 @@ pub struct Federation {
     allowed: Vec<Cidr>,
     /// Origins whose key fetch failed, and until when not to try again.
     negative: std::sync::Mutex<HashMap<String, Instant>>,
+    key_fetch_slots: tokio::sync::Semaphore,
     /// EDUs waiting for the next transaction to each destination.
     ///
     /// In memory and nowhere else, deliberately: an EDU is ephemeral by
@@ -132,6 +137,33 @@ pub struct Federation {
     notary_asked: std::sync::Mutex<HashMap<String, Instant>>,
     /// Notary queries in the current minute: `(minute began, count)`.
     notary_budget: std::sync::Mutex<(Instant, u32)>,
+    /// How delivery to each destination has gone since this process
+    /// started, as the outbox loop reports it: what the admin API's
+    /// `federation/destinations` shows (Synapse's `destinations` table).
+    delivery: std::sync::Mutex<HashMap<String, DeliveryHealth>>,
+    /// Destinations an administrator asked to retry now
+    /// (`reset_connection`); the outbox loop drops their backoff on its
+    /// next pass.
+    delivery_resets: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+/// How delivery to one destination stands, in the terms of Synapse's
+/// `destinations` table so the admin API can report it in that shape.
+///
+/// Process-local: a restart forgets a destination's failures and retries
+/// it at once, which is what the outbox loop does anyway.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeliveryHealth {
+    /// When the last failed attempt was made, in ms; 0 while healthy.
+    pub retry_last_ts: u64,
+    /// How long the outbox waits before the next attempt, in ms; 0 while
+    /// healthy.
+    pub retry_interval: u64,
+    /// When the current run of failures began; `None` while healthy.
+    pub failure_ts: Option<u64>,
+    /// The outbox sequence number of the newest PDU the destination
+    /// acknowledged, if it acknowledged any since this process started.
+    pub last_successful_stream_ordering: Option<u64>,
 }
 
 /// One trusted key server, and the keys its answers must carry if the
@@ -502,6 +534,7 @@ impl Federation {
             insecure_http,
             allowed,
             negative: std::sync::Mutex::new(HashMap::new()),
+            key_fetch_slots: tokio::sync::Semaphore::new(MAX_CONCURRENT_KEY_FETCHES),
             edu_queue: std::sync::Mutex::new(std::collections::HashMap::new()),
             receipt_queue: std::sync::Mutex::new(std::collections::HashMap::new()),
             enabled: true,
@@ -513,6 +546,8 @@ impl Federation {
             fetched: std::sync::Mutex::new(HashMap::new()),
             notary_asked: std::sync::Mutex::new(HashMap::new()),
             notary_budget: std::sync::Mutex::new((Instant::now(), 0)),
+            delivery: std::sync::Mutex::new(HashMap::new()),
+            delivery_resets: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -771,6 +806,83 @@ impl Federation {
             edus.extend(pending);
         }
         edus
+    }
+
+    /// How delivery to every destination attempted since this process
+    /// started stands.
+    #[must_use]
+    pub fn delivery_health(&self) -> HashMap<String, DeliveryHealth> {
+        self.delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Record that `destination` acknowledged a transaction. `last_seq` is
+    /// the outbox sequence of the newest PDU in it, `None` for EDUs only.
+    pub fn record_delivery_success(&self, destination: &str, last_seq: Option<u64>) {
+        let mut delivery = self
+            .delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let health = delivery.entry(destination.to_owned()).or_default();
+        health.retry_last_ts = 0;
+        health.retry_interval = 0;
+        health.failure_ts = None;
+        if let Some(seq) = last_seq {
+            health.last_successful_stream_ordering = Some(
+                health
+                    .last_successful_stream_ordering
+                    .map_or(seq, |previous| previous.max(seq)),
+            );
+        }
+    }
+
+    /// Record a failed attempt at `destination`, and how long the outbox
+    /// now waits before the next one.
+    pub fn record_delivery_failure(&self, destination: &str, retry_in: Duration) {
+        let now = now_millis();
+        let mut delivery = self
+            .delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let health = delivery.entry(destination.to_owned()).or_default();
+        health.failure_ts.get_or_insert(now);
+        health.retry_last_ts = now;
+        health.retry_interval = u64::try_from(retry_in.as_millis()).unwrap_or(u64::MAX);
+    }
+
+    /// Clear `destination`'s backoff so the outbox tries it on its next
+    /// pass: Synapse's admin `reset_connection`. Returns whether this
+    /// server had any record of the destination.
+    pub fn reset_delivery(&self, destination: &str) -> bool {
+        let known = {
+            let mut delivery = self
+                .delivery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            delivery.get_mut(destination).is_some_and(|health| {
+                health.retry_last_ts = 0;
+                health.retry_interval = 0;
+                health.failure_ts = None;
+                true
+            })
+        };
+        self.delivery_resets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(destination.to_owned());
+        known
+    }
+
+    /// The destinations whose backoff an administrator cleared since the
+    /// last call.
+    fn take_delivery_resets(&self) -> Vec<String> {
+        self.delivery_resets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+            .collect()
     }
 
     /// The destinations with EDUs waiting.
@@ -1168,6 +1280,14 @@ impl Federation {
     /// failed too recently to be asked again -- or, with `recent_success`,
     /// answered too recently.
     async fn direct_key_document(&self, origin: &str, recent_success: bool) -> Option<Value> {
+        if origin.len() > 255 || ruma::ServerName::parse(origin).is_err() {
+            return None;
+        }
+        let Ok(_slot) = self.key_fetch_slots.try_acquire() else {
+            self.metrics
+                .record_key_fetch(KeySource::Direct, KeyFetchResult::Throttled);
+            return None;
+        };
         let instant = Instant::now();
         {
             let mut negative = self
@@ -1185,15 +1305,31 @@ impl Federation {
                     .record_key_fetch(KeySource::Direct, KeyFetchResult::Throttled);
                 return None;
             }
+            // Refuse new origins at cache saturation without evicting a
+            // live throttle. The semaphore bounds concurrent cache misses.
+            if negative.len() >= MAX_KEY_FETCH_ORIGINS
+                || (fetched.len() >= MAX_KEY_FETCH_ORIGINS && !fetched.contains_key(origin))
+            {
+                self.metrics
+                    .record_key_fetch(KeySource::Direct, KeyFetchResult::Throttled);
+                return None;
+            }
         }
         match self.fetch_key_document(origin).await {
             Ok(document) => {
                 self.metrics
                     .record_key_fetch(KeySource::Direct, KeyFetchResult::Ok);
-                self.fetched
+                self.negative
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(origin.to_owned(), Instant::now());
+                    .remove(origin);
+                let mut fetched = self
+                    .fetched
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if fetched.len() < MAX_KEY_FETCH_ORIGINS {
+                    fetched.insert(origin.to_owned(), Instant::now());
+                }
                 Some(document)
             }
             Err((error, invalid)) => {
@@ -1206,10 +1342,13 @@ impl Federation {
                         KeyFetchResult::Error
                     },
                 );
-                self.negative
+                let mut negative = self
+                    .negative
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(origin.to_owned(), Instant::now() + NEGATIVE_CACHE);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if negative.len() < MAX_KEY_FETCH_ORIGINS {
+                    negative.insert(origin.to_owned(), Instant::now() + NEGATIVE_CACHE);
+                }
                 None
             }
         }
@@ -2200,6 +2339,54 @@ impl Federation {
         Ok(())
     }
 
+    /// Send one federation request an application service asked for
+    /// (MSC4512's `fed_proxy`), signed as this server, and relay what came
+    /// back: the status and, when it is JSON, the body.
+    ///
+    /// The caller has already confined `uri` to the service's own prefix;
+    /// this only signs, sends and reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] when the request cannot be signed or the
+    /// destination cannot be reached -- not when it answers with an error,
+    /// which is relayed.
+    pub async fn remote_proxy(
+        &self,
+        destination: &str,
+        method: reqwest::Method,
+        uri: &str,
+        body: Option<&Value>,
+    ) -> Result<(u16, Option<Value>), FederationError> {
+        let authorization = self.sign_request(method.as_str(), uri, destination, body)?;
+        let mut request = self
+            .request(method, destination, uri)
+            .await?
+            .header("authorization", authorization)
+            .timeout(Duration::from_secs(30));
+        if let Some(body) = body {
+            request = request
+                .header("content-type", "application/json")
+                .body(body.to_string());
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| FederationError::Refused(format!("fed_proxy: {error}")))?;
+        let status = response.status().as_u16();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| FederationError::Refused(format!("fed_proxy body: {error}")))?;
+        Ok((status, serde_json::from_slice(&bytes).ok()))
+    }
+
+    /// This server's own name, which a proxied request may not be sent to.
+    #[must_use]
+    pub fn own_name(&self) -> &str {
+        &self.server_name
+    }
+
     /// Fetch a peer's media over authenticated federation (MSC3916),
     /// falling back to the legacy public endpoint for older peers.
     ///
@@ -2463,6 +2650,9 @@ pub async fn drain_outbox(
             let (Some(store), Some(federation)) = (store.upgrade(), federation.upgrade()) else {
                 return;
             };
+            for destination in federation.take_delivery_resets() {
+                backoff.remove(&destination);
+            }
             // The registry is not something the store's close waits on,
             // so holding it across a send is as harmless as the request.
             (
@@ -2497,6 +2687,15 @@ pub async fn drain_outbox(
                         let _ = Store::delete(store.as_ref(), key);
                     }
                     backoff.remove(&destination);
+                    if let Some(federation) = federation.upgrade() {
+                        let last_seq = keys
+                            .iter()
+                            .filter_map(|key| key.get(key.len().saturating_sub(8)..))
+                            .filter_map(|bytes| bytes.try_into().ok())
+                            .map(u64::from_be_bytes)
+                            .max();
+                        federation.record_delivery_success(&destination, last_seq);
+                    }
                 }
                 Err(error) => {
                     tracing::debug!("outbox to {destination}: {error}");
@@ -2509,6 +2708,7 @@ pub async fn drain_outbox(
                         failures,
                         federation.peer_max_backoff(&destination),
                     );
+                    federation.record_delivery_failure(&destination, delay);
                     backoff.insert(destination, (failures, Instant::now() + delay));
                 }
             }
@@ -3198,5 +3398,58 @@ mod receipt_queue_tests {
             .map(|edu| edu["content"]["!r:x"]["m.read"].as_object().unwrap().len())
             .sum();
         assert_eq!(held, MAX_PENDING_RECEIPTS);
+    }
+}
+
+#[cfg(test)]
+mod key_fetch_capacity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn saturated_origin_cache_and_fetch_slots_refuse_before_network_io() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(FjallStore::open(directory.path()).unwrap());
+        let key = Arc::new(ServerKey::load_or_create(store.as_ref()).unwrap());
+        let federation = Federation::new(store, "example.org", key, false, &[]).unwrap();
+        assert!(
+            federation
+                .direct_key_document(&"x".repeat(256), false)
+                .await
+                .is_none()
+        );
+        assert!(federation.negative.lock().unwrap().is_empty());
+        let permits = federation
+            .key_fetch_slots
+            .acquire_many(u32::try_from(MAX_CONCURRENT_KEY_FETCHES).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            federation
+                .direct_key_document("invalid.invalid", false)
+                .await
+                .is_none()
+        );
+        assert!(federation.negative.lock().unwrap().is_empty());
+        drop(permits);
+        {
+            let mut negative = federation.negative.lock().unwrap();
+            for number in 0..MAX_KEY_FETCH_ORIGINS {
+                negative.insert(format!("{number}.invalid"), Instant::now() + NEGATIVE_CACHE);
+            }
+        }
+        assert!(
+            federation
+                .direct_key_document("new.invalid", false)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            federation.negative.lock().unwrap().len(),
+            MAX_KEY_FETCH_ORIGINS
+        );
+        assert_eq!(
+            federation.key_fetch_slots.available_permits(),
+            MAX_CONCURRENT_KEY_FETCHES
+        );
     }
 }

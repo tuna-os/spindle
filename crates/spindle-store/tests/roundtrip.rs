@@ -1,7 +1,9 @@
 //! Part of #6: what a reopen must reproduce, and what it must admit it cannot.
 
+use std::sync::Arc;
+
 use proptest::prelude::*;
-use spindle_core::{EventInput, RoomLog, StateKey, StateSnapshot};
+use spindle_core::{EventInput, MemStateKeyTable, RoomLog, StateKey, StateKeyTable, StateSnapshot};
 use spindle_store::{
     FjallStore, ReadView, RoomStore, Store, StoreError,
     codec::{CodecError, EntryRecord, RECORD_VERSION, RoomRecord},
@@ -10,8 +12,8 @@ use tempfile::TempDir;
 
 const ROOM: &str = "!room:example.org";
 
-fn live_room() -> RoomLog {
-    let mut room = RoomLog::new();
+fn live_room(table: &Arc<dyn StateKeyTable>) -> RoomLog {
+    let mut room = RoomLog::new(table.clone());
     room.append_local("$create", Some(StateKey::new("m.room.create", "")))
         .unwrap();
     room.append_local("$topic", Some(StateKey::new("m.room.topic", "")))
@@ -23,12 +25,11 @@ fn live_room() -> RoomLog {
 #[test]
 fn a_reopen_reproduces_head_extremities_counters_and_state() {
     let dir = TempDir::new().unwrap();
-    let original = live_room();
+    let store = FjallStore::open(dir.path()).unwrap();
+    let original = live_room(&store.key_table());
 
-    {
-        let store = FjallStore::open(dir.path()).unwrap();
-        RoomStore::new(&store, ROOM).save(&original).unwrap();
-    }
+    RoomStore::new(&store, ROOM).save(&original).unwrap();
+    drop(store);
 
     // A genuinely separate open, not a reused handle.
     let store = FjallStore::open(dir.path()).unwrap();
@@ -71,11 +72,15 @@ fn a_reopen_reproduces_head_extremities_counters_and_state() {
 #[test]
 fn history_scans_back_in_log_order_after_a_reopen() {
     let dir = TempDir::new().unwrap();
-    let mut room = live_room();
-    room.prepend_remote(EventInput::new("$older", vec![]), StateSnapshot::new(), 40)
-        .unwrap();
-
     let store = FjallStore::open(dir.path()).unwrap();
+    let mut room = live_room(&store.key_table());
+    room.prepend_remote(
+        EventInput::new("$older", vec![]),
+        StateSnapshot::new(store.key_table()),
+        40,
+    )
+    .unwrap();
+
     RoomStore::new(&store, ROOM).save(&room).unwrap();
     let restored = RoomStore::new(&store, ROOM).load().unwrap().unwrap();
 
@@ -91,15 +96,16 @@ fn history_scans_back_in_log_order_after_a_reopen() {
 #[test]
 fn backfilled_state_survives_a_reopen_now_that_the_trie_is_persisted() {
     let dir = TempDir::new().unwrap();
-    let mut room = live_room();
+    let store = FjallStore::open(dir.path()).unwrap();
+    let mut room = live_room(&store.key_table());
 
     // Backfilled state comes from /state_ids (SPEC 6.5), not from parents this
     // log holds, so a refold cannot reproduce it.
-    let supplied = StateSnapshot::new().apply(StateKey::new("m.room.name", ""), "$name");
+    let supplied =
+        StateSnapshot::new(store.key_table()).apply(&StateKey::new("m.room.name", ""), "$name");
     room.prepend_remote(EventInput::new("$older", vec![]), supplied, 40)
         .unwrap();
 
-    let store = FjallStore::open(dir.path()).unwrap();
     RoomStore::new(&store, ROOM).save(&room).unwrap();
     let restored = RoomStore::new(&store, ROOM).load().unwrap().unwrap();
 
@@ -131,7 +137,9 @@ fn backfilled_state_survives_a_reopen_now_that_the_trie_is_persisted() {
 fn a_corrupted_state_node_is_detected_rather_than_served() {
     let dir = TempDir::new().unwrap();
     let store = FjallStore::open(dir.path()).unwrap();
-    RoomStore::new(&store, ROOM).save(&live_room()).unwrap();
+    RoomStore::new(&store, ROOM)
+        .save(&live_room(&store.key_table()))
+        .unwrap();
 
     // Flip a byte in a stored trie node. Content addressing exists precisely so
     // this is caught; the alternative is serving state that silently is not
@@ -172,7 +180,11 @@ fn a_corrupted_state_node_is_detected_rather_than_served() {
     );
     assert_eq!(
         restored.log.entries().next_back().unwrap().state_root,
-        live_room().entries().next_back().unwrap().state_root,
+        live_room(&store.key_table())
+            .entries()
+            .next_back()
+            .unwrap()
+            .state_root,
     );
 }
 
@@ -182,7 +194,9 @@ fn an_unknown_room_is_distinguishable_from_an_empty_one() {
     let store = FjallStore::open(dir.path()).unwrap();
     assert!(RoomStore::new(&store, ROOM).load().unwrap().is_none());
 
-    RoomStore::new(&store, ROOM).save(&RoomLog::new()).unwrap();
+    RoomStore::new(&store, ROOM)
+        .save(&RoomLog::new(MemStateKeyTable::shared()))
+        .unwrap();
     let empty = RoomStore::new(&store, ROOM).load().unwrap();
     assert!(empty.is_some());
     assert_eq!(empty.unwrap().log.len(), 0);
@@ -230,7 +244,9 @@ fn a_record_from_another_schema_version_is_refused() {
 fn a_corrupt_stored_record_surfaces_as_a_store_error() {
     let dir = TempDir::new().unwrap();
     let store = FjallStore::open(dir.path()).unwrap();
-    RoomStore::new(&store, ROOM).save(&live_room()).unwrap();
+    RoomStore::new(&store, ROOM)
+        .save(&live_room(&store.key_table()))
+        .unwrap();
 
     // Overwrite one log record with rubbish, as a bad disk would.
     let prefix = spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::Log, ROOM);
@@ -275,7 +291,9 @@ proptest! {
 fn tampering_with_stored_history_breaks_the_chain_on_reopen() {
     let dir = TempDir::new().unwrap();
     let store = FjallStore::open(dir.path()).unwrap();
-    RoomStore::new(&store, ROOM).save(&live_room()).unwrap();
+    RoomStore::new(&store, ROOM)
+        .save(&live_room(&store.key_table()))
+        .unwrap();
 
     // A clean reopen attests to itself.
     let clean = RoomStore::new(&store, ROOM).load().unwrap().unwrap();
@@ -321,14 +339,15 @@ fn tampering_with_stored_history_breaks_the_chain_on_reopen() {
 #[test]
 fn an_unverified_entry_advertises_the_state_it_has_not_the_one_it_wanted() {
     let dir = TempDir::new().unwrap();
-    let mut room = live_room();
-    let supplied = StateSnapshot::new().apply(StateKey::new("m.room.name", ""), "$name");
+    let store = FjallStore::open(dir.path()).unwrap();
+    let mut room = live_room(&store.key_table());
+    let supplied =
+        StateSnapshot::new(store.key_table()).apply(&StateKey::new("m.room.name", ""), "$name");
     let recorded = room
         .prepend_remote(EventInput::new("$older", vec![]), supplied, 40)
         .unwrap()
         .state_root;
 
-    let store = FjallStore::open(dir.path()).unwrap();
     RoomStore::new(&store, ROOM).save(&room).unwrap();
     // `load_refolding` deliberately ignores the stored trie, so the backfilled
     // entry cannot come back.
@@ -362,4 +381,31 @@ fn an_unverified_entry_advertises_the_state_it_has_not_the_one_it_wanted() {
             );
         }
     }
+}
+
+/// A log built against another table is refused, not persisted.
+///
+/// Two tables number the same pairs differently, so the rows one log's
+/// states need collide with the rows the store already holds: whichever
+/// lands last wins and the other state silently loses slots. The store
+/// cannot re-number the log -- its entry roots name the numbering they
+/// were computed under -- so it refuses before writing anything.
+#[test]
+fn saving_a_log_built_against_another_table_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let store = FjallStore::open(dir.path()).unwrap();
+    let foreign = live_room(&MemStateKeyTable::shared());
+
+    let error = RoomStore::new(&store, ROOM)
+        .save(&foreign)
+        .expect_err("a foreign-numbered log must not persist");
+    assert!(
+        matches!(error, StoreError::ForeignStateTable),
+        "unexpected refusal: {error}"
+    );
+    // Nothing was written: the room is still unknown, not half-seeded.
+    assert!(
+        RoomStore::new(&store, ROOM).load().unwrap().is_none(),
+        "a refused save must leave no entry record behind"
+    );
 }

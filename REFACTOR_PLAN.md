@@ -21,6 +21,11 @@ Split `crates/spindle-server/src/routes.rs` (10.8k LOC, 308 handlers) into domai
    - Handlers: `post_report_event`, `get_report` (~200 LOC)
    - Dependencies: `MatrixError`, audit logging
    - Router builder: `report_and_hold_routes()`
+   - The extracted `moderation_routes` module uses the existing
+     `routes::{localpart_of, may_read_room, internal}` helpers with crate-only
+     visibility. They are not exported by `spindle-core` or `rooms`. Reusing
+     them preserves local-user normalization, room-read authorization and
+     internal-error redaction across the extraction.
 
 3. **Push** (`push/mod.rs`)
    - Handlers: All push-related (rules, settings, pushers) (~150 LOC estimated)

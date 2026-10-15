@@ -1,14 +1,20 @@
 use spindle_core::{
-    EventId, EventInput, RestoreError, RestoredEntry, RoomLog, StateKey, StateRoot, StateSnapshot,
+    EventId, EventInput, MemStateKeyTable, RestoreError, RestoredEntry, RoomLog, StateKey,
+    StateKeyTable, StateRoot, StateSnapshot,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+fn table() -> Arc<dyn StateKeyTable> {
+    MemStateKeyTable::shared()
+}
 
 fn seeded() -> (RoomLog, Vec<RestoredEntry>, HashMap<StateRoot, Vec<u8>>) {
-    let mut log = RoomLog::new();
-    let mut state = StateSnapshot::new();
+    let mut log = RoomLog::new(table());
+    let mut state = StateSnapshot::new(log.table().clone());
     for i in 0..128 {
         state = state.apply(
-            StateKey::new("m.room.member", format!("@u{i}:test")),
+            &StateKey::new("m.room.member", format!("@u{i}:test")),
             format!("$m{i}"),
         );
     }
@@ -16,7 +22,7 @@ fn seeded() -> (RoomLog, Vec<RestoredEntry>, HashMap<StateRoot, Vec<u8>>) {
     for i in 0..600 {
         let previous = state.clone();
         state = state.apply(
-            StateKey::new("m.room.topic", ""),
+            &StateKey::new("m.room.topic", ""),
             format!("$outlier-state{i}"),
         );
         nodes.extend(state.delta_nodes(Some(&previous)));
@@ -61,6 +67,7 @@ fn runtime_preserves_history_cursors_seed_roots_and_following_append() {
             reads.insert(*root);
             nodes.get(root).cloned()
         },
+        original.table().clone(),
     )
     .unwrap()
     .log;
@@ -132,6 +139,7 @@ fn historical_corruption_is_deferred_only_in_runtime_and_exhaustive_detects_it()
         original.next_backward(),
         original.forward_extremities().iter().cloned(),
         &mut |r| nodes.get(r).cloned(),
+        original.table().clone(),
     )
     .unwrap()
     .log;
@@ -146,7 +154,8 @@ fn historical_corruption_is_deferred_only_in_runtime_and_exhaustive_detects_it()
             original.next_forward(),
             original.next_backward(),
             original.forward_extremities().iter().cloned(),
-            &mut |r| nodes.get(r).cloned()
+            &mut |r| nodes.get(r).cloned(),
+            original.table().clone(),
         )
         .unwrap_err(),
         RestoreError::UnreadableState(1)
@@ -163,6 +172,7 @@ fn selected_roots_and_old_forward_extremities_are_verified_before_serving() {
         original.next_backward(),
         tips.clone(),
         &mut |r| nodes.get(r).cloned(),
+        original.table().clone(),
     )
     .unwrap()
     .log;
@@ -183,7 +193,8 @@ fn selected_roots_and_old_forward_extremities_are_verified_before_serving() {
                     original.next_forward(),
                     original.next_backward(),
                     tips.clone(),
-                    &mut |r| altered.get(r).cloned()
+                    &mut |r| altered.get(r).cloned(),
+                    original.table().clone(),
                 )
                 .unwrap_err(),
                 RestoreError::UnreadableState(i64::try_from(bad).unwrap() + 1)
@@ -194,7 +205,7 @@ fn selected_roots_and_old_forward_extremities_are_verified_before_serving() {
 
 #[test]
 fn full_chain_is_checked_even_for_nonresident_old_history() {
-    let mut original = RoomLog::new();
+    let mut original = RoomLog::new(table());
     original.append_local("$a", None).unwrap();
     original.append_local("$b", None).unwrap();
     let mut records: Vec<_> = original
@@ -216,7 +227,8 @@ fn full_chain_is_checked_even_for_nonresident_old_history() {
             original.next_forward(),
             original.next_backward(),
             original.forward_extremities().iter().cloned(),
-            &mut |_| None
+            &mut |_| None,
+            original.table().clone(),
         )
         .unwrap_err(),
         RestoreError::BrokenChain(1)
@@ -236,6 +248,7 @@ fn exhaustive_rolling_owners_keep_distributed_seed_node_reads_bounded() {
             reads += 1;
             nodes.get(r).cloned()
         },
+        original.table().clone(),
     )
     .unwrap();
     assert!(
@@ -250,11 +263,11 @@ fn exhaustive_rolling_owners_keep_distributed_seed_node_reads_bounded() {
 
 #[test]
 fn exhaustive_repeated_nonresident_root_is_loaded_once() {
-    let mut log = RoomLog::new();
-    let mut state = StateSnapshot::new();
+    let mut log = RoomLog::new(table());
+    let mut state = StateSnapshot::new(log.table().clone());
     for i in 0..1024 {
         state = state.apply(
-            StateKey::new("m.room.member", format!("@u{i}:test")),
+            &StateKey::new("m.room.member", format!("@u{i}:test")),
             format!("$m{i}"),
         );
     }
@@ -289,6 +302,7 @@ fn exhaustive_repeated_nonresident_root_is_loaded_once() {
             reads += 1;
             nodes.get(r).cloned()
         },
+        log.table().clone(),
     )
     .unwrap();
     assert_eq!(reads, nodes.len());
@@ -306,7 +320,8 @@ fn duplicate_ids_and_colliding_counters_fail_before_state_reads() {
             original.next_forward(),
             original.next_backward(),
             original.forward_extremities().iter().cloned(),
-            &mut |_| panic!("metadata failure must precede state I/O")
+            &mut |_| panic!("metadata failure must precede state I/O"),
+            original.table().clone(),
         ),
         Err(RestoreError::DuplicateEvent(_))
     ));
@@ -317,7 +332,8 @@ fn duplicate_ids_and_colliding_counters_fail_before_state_reads() {
             600,
             original.next_backward(),
             original.forward_extremities().iter().cloned(),
-            &mut |r| nodes.get(r).cloned()
+            &mut |r| nodes.get(r).cloned(),
+            original.table().clone(),
         ),
         Err(RestoreError::InvalidCounters { .. })
     ));

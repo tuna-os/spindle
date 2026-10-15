@@ -25,6 +25,14 @@ use super::{
     event_body_key, version_in,
 };
 
+/// The `cause` a remote join's gap marker carries ([`Rooms::record_join_gap`]).
+pub const JOIN_GAP_CAUSE: &str = "remote_join";
+
+/// The most history events backfilled after a remote join: a bounded first
+/// window, not the whole room. Far less than `gap_backfill_max_events`,
+/// because every join of a large room would otherwise fetch that much.
+pub const JOIN_HISTORY_EVENTS: u64 = 1_000;
+
 impl Rooms {
     /// Whether `domain` has a joined member in the room right now.
     ///
@@ -347,6 +355,12 @@ impl Rooms {
     /// check; [`RoomError::MissingBody`] for a state event the caller did
     /// not retain; [`RoomError::Append`] for a state-DAG room, whose state
     /// cannot be taken from `/state_ids`.
+    ///
+    /// # Panics
+    ///
+    /// When the peer state is missing after it was just pushed above.
+    /// That push is unconditional, so this cannot happen; the panic names
+    /// the broken invariant rather than inventing a state to resolve.
     #[allow(
         clippy::too_many_lines,
         reason = "the receipt checks and placement of one event, in order"
@@ -410,7 +424,7 @@ impl Rooms {
                 .and_then(|state| state.get(&StateKey::new("m.room.create", "")))
                 .ok_or_else(|| RoomError::Append("the room has no create event".to_owned()))?
                 .to_owned();
-            let mut state = StateSnapshot::new();
+            let mut state = StateSnapshot::new(log.table().clone());
             for state_id in state_before {
                 if state_id == event_id {
                     continue;
@@ -444,7 +458,7 @@ impl Rooms {
                         "the peer's state names two events for {kind}/{state_key}"
                     )));
                 }
-                state = state.apply(key, state_id.as_str());
+                state = state.apply(&key, state_id.as_str());
             }
             if state
                 .get(&StateKey::new("m.room.create", ""))
@@ -474,9 +488,12 @@ impl Rooms {
                     states.push(state.clone());
                 }
                 if states.len() == 1 {
-                    return Ok(states.pop().unwrap_or_default());
+                    // The peer state is always pushed above, so a single
+                    // state means every tip agreed with it -- and popping
+                    // here cannot fail.
+                    return Ok(states.pop().expect("the peer state is always pushed"));
                 }
-                resolver.resolve(&states)
+                resolver.resolve(&states, log.table())
             })?;
             if let Some((kind, reason)) =
                 rooms.receipt_checks(log, room_id, event_id, json, &state, &prev, Some(&current))?
@@ -579,6 +596,86 @@ impl Rooms {
                 .filter_map(|(_, value)| serde_json::from_slice(&value).ok())
                 .collect(),
         )
+    }
+
+    /// Record the history a remote join did not bring as a federation gap
+    /// (#461), so the background backfill fills it.
+    ///
+    /// `send_join` carries the room's state and auth chain, not its
+    /// timeline. The history before the join is filled the way an event
+    /// accepted across a gap is filled (SPEC §6.6): a marker anchored at the
+    /// join, and the backfill loop walks back from the join's
+    /// `prev_events`. Unlike that gap, the walk passes through the events
+    /// the join seeded ([`Self::gap_unheld_through`]): a predecessor that is
+    /// current state, such as the joiner's own invite, is not the end of
+    /// the history. The walk stops at the create event, or after
+    /// [`JOIN_HISTORY_EVENTS`] events.
+    ///
+    /// Nothing is recorded when the seeded events are all the history
+    /// there is: every `prev_event` is held, and the join is no deeper
+    /// than the number of seeded events. A new room of state events only
+    /// is like that, and asking a peer for its history would be a wasted
+    /// request. Returns whether a gap was recorded.
+    ///
+    /// # Errors
+    /// Returns [`RoomError`] if the room cannot be read, the join is not in
+    /// its log, or the marker cannot be written.
+    pub fn record_join_gap(
+        &self,
+        room_id: &str,
+        join: &Value,
+        join_id: &str,
+        state_from: &str,
+    ) -> Result<bool, RoomError> {
+        use spindle_store::Store as _;
+
+        let prev = super::edge_ids(&join["prev_events"]);
+        let (li, state_dag, all_held) = self.with_room_read(room_id, |rooms, log| {
+            let entry = log
+                .get(&EventId::new(join_id))
+                .ok_or_else(|| RoomError::UnknownState(format!("the join {join_id}")))?;
+            let version = rooms.version_in_log(log, room_id)?;
+            let all_held = prev
+                .iter()
+                .all(|id| log.get(&EventId::new(id.as_str())).is_some());
+            Ok((
+                entry.li.get(),
+                spindle_core::is_state_dag(&version),
+                all_held,
+            ))
+        })?;
+        // A state-DAG room's history cannot be folded from `/state_ids`,
+        // so the backfill loop could not fill the gap.
+        if state_dag {
+            return Ok(false);
+        }
+        // Every depth from 1 to the join's parents' depth has an event. If
+        // the join seeded fewer events than that, some history is missing.
+        let seeded = u64::try_from(li.saturating_sub(1)).unwrap_or(0);
+        let parents_depth = join["depth"].as_u64().unwrap_or(0).saturating_sub(1);
+        if all_held && parents_depth <= seeded {
+            return Ok(false);
+        }
+        let frontier = self.gap_unheld_through(room_id, &prev, Some(li))?;
+        if frontier.is_empty() {
+            return Ok(false);
+        }
+        let marker = serde_json::json!({
+            "event_id": join_id,
+            "missing_prev_events": frontier,
+            "state_from": state_from,
+            "li": li,
+            "cause": JOIN_GAP_CAUSE,
+            "max_events": JOIN_HISTORY_EVENTS,
+            "accepted_ts": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)),
+        });
+        self.store.put(
+            &spindle_core::keys::federation_gap(room_id, join_id),
+            marker.to_string().as_bytes(),
+        )?;
+        Ok(true)
     }
 
     /// A join-event template for a remote user, for `make_join`.
@@ -1380,8 +1477,9 @@ impl Rooms {
             )));
         }
 
-        let mut log = RoomLog::new();
-        let mut snapshot = spindle_core::StateSnapshot::new();
+        let table = spindle_store::ReadView::key_table(self.store.as_ref());
+        let mut log = RoomLog::new(table.clone());
+        let mut snapshot = spindle_core::StateSnapshot::new(table);
         let room_store = RoomStore::new(self.store.as_ref(), room_id);
         let seed = |log: &mut RoomLog,
                     snapshot: &mut spindle_core::StateSnapshot,
@@ -1392,7 +1490,7 @@ impl Rooms {
                 StateKey::new(event["type"].as_str().unwrap_or_default(), state_key)
             });
             if let Some(key) = state_key.clone() {
-                *snapshot = snapshot.apply(key, id);
+                *snapshot = snapshot.apply(&key, id);
             }
             let prev: Vec<EventId> = super::edge_ids(&event["prev_events"])
                 .into_iter()
@@ -1429,12 +1527,15 @@ impl Rooms {
             // MSC4354: a seeded sticky event is owed to this server's
             // syncing clients like any other, at a position every token
             // issued before the join precedes.
-            if event.get(super::STICKY_KEY).is_some() {
+            let sticky_write = event
+                .get(super::STICKY_KEY)
+                .map(|_| self.reserve_stream_id());
+            if let Some(stream_write) = &sticky_write {
                 extra.extend(super::sticky_index_row(
                     room_id,
                     id,
                     event,
-                    self.allocate_stream_id(),
+                    stream_write.id(),
                 ));
             }
             room_store.journal_entry_with(&entry, &log, &extra)?;

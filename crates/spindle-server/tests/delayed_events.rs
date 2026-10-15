@@ -309,13 +309,27 @@ async fn send_delivers_it_immediately_and_only_once() {
     );
     assert!(harness.pending(&alice).await.is_empty());
 
-    // And it is gone: a second `send` has nothing to act on.
-    let (status, _) = harness.act(&delay_id, &alice, "send").await;
-    assert_eq!(
-        status,
-        StatusCode::NOT_FOUND,
-        "the delay survived being sent, so it could be sent twice"
-    );
+    // And it is gone. MSC4140 as merged answers a repeated `send` of a
+    // delay that was sent with success, so a client can retry safely --
+    // but it must not send the event a second time.
+    let (status, body) = harness.act(&delay_id, &alice, "send").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sent = harness
+        .timeline_bodies(&room, &alice)
+        .await
+        .into_iter()
+        .filter(|body| body == "now")
+        .count();
+    assert_eq!(sent, 1, "the delay survived being sent, and was sent twice");
+    // And what conflicts with having been sent is "not found" on this
+    // unstable endpoint, as it always was here and still is on Synapse --
+    // the 409 MSC4140 settled on is the stable endpoint's
+    // (delayed_events_merged.rs), because a js-sdk built before it ends
+    // the call on one.
+    for action in ["cancel", "restart"] {
+        let (status, body) = harness.act(&delay_id, &alice, action).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{action}: {body}");
+    }
 }
 
 /// `cancel` drops it unsent.
@@ -503,7 +517,13 @@ async fn an_unbounded_delay_is_refused_with_its_limit() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["errcode"], "M_INVALID_PARAM", "{body}");
+    // MSC4140's code, spelled as its unstable prefix on the unstable
+    // parameter, with the limit beside it under the key Synapse uses.
+    assert_eq!(
+        body["errcode"], "ORG.MATRIX.MSC4140_DELAY_TOO_LARGE",
+        "{body}"
+    );
+    assert_eq!(body["org.matrix.msc4140.max_delay"], 86_400_000, "{body}");
     assert!(
         body["error"].as_str().unwrap().contains("86400000"),
         "the limit must be in the message so a client can retry under it: {body}"
@@ -544,8 +564,15 @@ async fn one_sender_cannot_hold_unbounded_delays_in_one_room() {
                 .unwrap(),
         )
         .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    // MSC4140: 429, with how long until one of the held delays is due --
+    // when the same request can next succeed.
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
     assert_eq!(body["errcode"], "M_LIMIT_EXCEEDED", "{body}");
+    let retry = body["retry_after_ms"].as_u64().unwrap();
+    assert!(
+        retry > 590_000 && retry <= 600_000,
+        "the wait is until the first held delay is due: {body}"
+    );
     assert_eq!(harness.pending(&alice).await.len(), 100, "the cap leaked");
 }
 
@@ -923,7 +950,7 @@ async fn the_count_cap_is_the_one_the_operator_set() {
         .await;
     assert_eq!(
         status,
-        StatusCode::BAD_REQUEST,
+        StatusCode::TOO_MANY_REQUESTS,
         "the third is past the operator's cap of 2, far below the default 100: {body}"
     );
     assert_eq!(
@@ -1205,10 +1232,20 @@ async fn a_delegate_restarts_and_sends_with_only_the_delay_id() {
             .contains(&"left".to_owned()),
         "the delegate's send did not send it, as alice"
     );
-    // Sent once: a second send finds nothing, which lk-jwt-service reads
-    // as "already sent".
-    let (status, _) = act_by_id(&harness, &delay_id, "send").await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    // Sent once. A second send succeeds without sending again (MSC4140's
+    // retry rule), and a restart after it is the 404 lk-jwt-service before
+    // 0.7 reads as "gone" -- it retries a 409 until its deadline.
+    let (status, body) = act_by_id(&harness, &delay_id, "send").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = act_by_id(&harness, &delay_id, "restart").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let sent = harness
+        .timeline_bodies(&room, &alice)
+        .await
+        .into_iter()
+        .filter(|body| body == "left")
+        .count();
+    assert_eq!(sent, 1);
 }
 
 #[tokio::test]

@@ -259,6 +259,34 @@ impl RoomAdmin<'_> {
         Ok((out, next))
     }
 
+    /// How many state entries the room's current state holds: the
+    /// `state_events` count Synapse's room listing reports, read from the
+    /// state trie without loading a single event body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::UnknownRoom`] for a room that does not exist.
+    pub fn state_entry_count(&self, room_id: &str) -> Result<usize, RoomError> {
+        self.rooms.with_room_read(room_id, |_, log| {
+            Ok(log
+                .current_state()
+                .map_or(0, spindle_core::StateSnapshot::len))
+        })
+    }
+
+    /// Lift an administrative block. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the store cannot be written.
+    pub fn clear_room_block(&self, room_id: &str) -> Result<(), RoomError> {
+        spindle_store::Store::delete(
+            self.rooms.store.as_ref(),
+            &spindle_core::keys::room_block(room_id),
+        )?;
+        Ok(())
+    }
+
     /// Record an administrative block. The row's presence is the block;
     /// the record says who and when for the audit trail.
     ///

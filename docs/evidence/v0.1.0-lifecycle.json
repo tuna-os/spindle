@@ -1,0 +1,17 @@
+{
+  "candidate": "bc983d33e5d3b427e54e988ba0873d83d2e1134a",
+  "old_commit": "496a77a029026a3acd087b4851c42e746bd9b9db",
+  "migration": "content_digest 2 -> 3",
+  "result": "passed",
+  "checks": [
+    "old backup/restore",
+    "dry-run preserves old readability",
+    "real migration and idempotence",
+    "old binary refuses new schema",
+    "new backup/restore",
+    "media and state survive",
+    "drained mailbox restart",
+    "old backup rollback"
+  ],
+  "media_sha256": "5f0393d3bd36f0e613cc24fb2ef4e4c7ceb0f5138b1b9360ddcab1b246d12cbd"
+}

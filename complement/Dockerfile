@@ -8,7 +8,7 @@
 # Build from the repository root:
 #   docker build -f complement/Dockerfile -t complement-spindle:latest .
 
-FROM rust:1.98-bookworm AS build
+FROM rust:1.99-bookworm AS build
 WORKDIR /src
 
 # Cargo features to build with, e.g. `hub-mode` for the hub-mode interop job

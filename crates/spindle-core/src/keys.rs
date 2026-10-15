@@ -417,6 +417,21 @@ pub enum Keyspace {
     /// recovered, with the predecessors it named that this server lacks.
     /// What a later backfill reads to know where history is missing.
     FederationGap = 0x44,
+    /// `id` -> one interned `(event_type, state_key)` pair (#79).
+    ///
+    /// The state trie's leaves hold `u64` ids, not strings, and the ids
+    /// are only stable while the table that minted them lives. This row
+    /// is what makes them stable across restarts: id zero is never
+    /// assigned, and every other id holds its pair as two length-framed
+    /// strings. Loaded whole at open -- a room's distinct keys number in
+    /// the thousands, not the millions, and the next id to mint is one
+    /// past the highest row the scan finds. New pairs join the caller's
+    /// batch with the nodes that reference them, never outside it: a
+    /// row the batch does not hold is a row a crash can separate from
+    /// the node that needs it.
+    StateKeyIntern = 0x59,
+    /// Highest global position issued to a client, retained after queue drains.
+    StreamCheckpoint = 0x5a,
     /// `(room_id, position)` -> one event of a filled federation gap: its
     /// ID and the root of the state after it. History backfilled into the
     /// *middle* of a room's timeline -- between the head this server held
@@ -465,6 +480,27 @@ pub enum Keyspace {
     /// `localpart` -> the account's one-time recovery codes, each as a
     /// salt and the BLAKE3 digest of salt and code; never the codes.
     RecoveryCodes = 0x54,
+    /// `task_id` -> one administrative background task (a room deletion
+    /// started through Synapse's v2 `DELETE /rooms/{roomId}`) and how it
+    /// ended, as `GET /scheduled_tasks` reports it. Numbered from 0x58 to
+    /// leave 0x55.. to the built-in provider's keyspaces.
+    AdminTask = 0x58,
+    /// `delay_id` -> the user and stream position of its
+    /// [`Self::FinalisedDelay`] row.
+    ///
+    /// MSC4140 as merged keeps a finished delay answerable by id: a `GET`
+    /// reports how it ended, and an action repeated after the fact succeeds
+    /// when it agrees with that ending and is refused with 409 when it does
+    /// not. The id is all the token-less management route has, so without
+    /// this a finished delay is a scan of every user's history away.
+    /// Written and pruned with the row it points at.
+    FinalisedDelayById = 0x55,
+    /// `(user_id, event_id)` -> the `delay_id` that event was sent from.
+    ///
+    /// MSC4140 puts the delay id in the `unsigned` of the event a delay
+    /// became, for its sender only -- the same shape as
+    /// [`Self::TransactionEcho`], and read at the same point.
+    DelayEcho = 0x56,
     /// `(room_id, epoch, li)` -> a hub's signed chain attestation for the
     /// entry it sequenced at `li` in that epoch (SPEC section 12.6, #22).
     /// Written only by a build with the `hub-mode` feature.
@@ -502,6 +538,12 @@ pub fn profile(user_id: &str) -> Vec<u8> {
 #[must_use]
 pub fn push_cursor() -> Vec<u8> {
     vec![KEY_SCHEMA_VERSION, Keyspace::PushCursor as u8]
+}
+
+/// A durable floor for global sync positions across restarts.
+#[must_use]
+pub fn stream_checkpoint() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::StreamCheckpoint as u8]
 }
 
 /// The durable proof that a fresh offline import owns its notification boundary.
@@ -573,6 +615,20 @@ pub fn event_report(seq: u64) -> Vec<u8> {
 #[must_use]
 pub fn event_reports_prefix() -> Vec<u8> {
     vec![KEY_SCHEMA_VERSION, Keyspace::EventReport as u8]
+}
+
+/// One administrative background task.
+#[must_use]
+pub fn admin_task(task_id: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::AdminTask as u8];
+    key.extend_from_slice(task_id.as_bytes());
+    key
+}
+
+/// Every administrative background task.
+#[must_use]
+pub fn admin_tasks_prefix() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::AdminTask as u8]
 }
 
 /// One dynamically registered OAuth 2.0 client.
@@ -654,6 +710,17 @@ pub fn from_order_preserving(bytes: [u8; 8]) -> i64 {
     )]
     let value = (u64::from_be_bytes(bytes) ^ (1_u64 << 63)) as i64;
     value
+}
+
+/// The two bytes every key in one keyspace shares: schema, then keyspace.
+///
+/// A whole-keyspace scan uses this, not [`room_prefix`] with an empty room:
+/// that bakes in a zero length no real room shares, and matches nothing.
+/// Room keys append a framed room id after these bytes; content-addressed
+/// and intern rows append their own suffixes directly.
+#[must_use]
+pub fn keyspace_prefix(keyspace: Keyspace) -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, keyspace as u8]
 }
 
 /// The prefix every key for one room in one keyspace shares.
@@ -1466,6 +1533,25 @@ pub fn content_addressed(keyspace: Keyspace, hash: &[u8; 32]) -> Vec<u8> {
     key
 }
 
+/// One interned state-key row ([`Keyspace::StateKeyIntern`]): the id in
+/// big-endian, so rows scan in id order. Id zero is never assigned; the
+/// next id to mint is one past the highest row the open scan finds, so no
+/// counter row is stored.
+#[must_use]
+pub fn state_key_intern(id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(10);
+    key.push(KEY_SCHEMA_VERSION);
+    key.push(Keyspace::StateKeyIntern as u8);
+    key.extend_from_slice(&id.to_be_bytes());
+    key
+}
+
+/// The prefix every [`state_key_intern`] row shares.
+#[must_use]
+pub fn state_key_intern_prefix() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::StateKeyIntern as u8]
+}
+
 /// One finalised delayed event, ordered by when it finalised within a user.
 ///
 /// The position is big-endian first so `/sync` reads the range after the
@@ -1499,6 +1585,44 @@ pub fn finalised_delay_position(user_id: &str, key: &[u8]) -> Option<u64> {
     let rest = key.strip_prefix(prefix.as_slice())?;
     let bytes: [u8; 8] = rest.get(..8)?.try_into().ok()?;
     Some(u64::from_be_bytes(bytes))
+}
+
+/// The by-id row for one finalised delay ([`Keyspace::FinalisedDelayById`]).
+#[must_use]
+pub fn finalised_delay_by_id(delay_id: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::FinalisedDelayById as u8];
+    key.extend_from_slice(delay_id.as_bytes());
+    key
+}
+
+/// The value of a [`finalised_delay_by_id`] row: the user, length-prefixed,
+/// then the position of their [`finalised_delay`] row.
+#[must_use]
+pub fn finalised_delay_by_id_value(user_id: &str, position: u64) -> Vec<u8> {
+    let (len, user) = framed(user_id.as_bytes());
+    let mut value = Vec::with_capacity(2 + user.len() + 8);
+    value.extend_from_slice(&len.to_be_bytes());
+    value.extend_from_slice(user);
+    value.extend_from_slice(&position.to_be_bytes());
+    value
+}
+
+/// Read a [`finalised_delay_by_id_value`] back: `(user_id, position)`.
+#[must_use]
+pub fn finalised_delay_by_id_parts(value: &[u8]) -> Option<(String, u64)> {
+    let len = usize::from(u16::from_be_bytes(value.get(..2)?.try_into().ok()?));
+    let user = String::from_utf8(value.get(2..2 + len)?.to_vec()).ok()?;
+    let position: [u8; 8] = value.get(2 + len..2 + len + 8)?.try_into().ok()?;
+    Some((user, u64::from_be_bytes(position)))
+}
+
+/// The echo row naming the delay one event was sent from
+/// ([`Keyspace::DelayEcho`]).
+#[must_use]
+pub fn delay_echo(user_id: &str, event_id: &str) -> Vec<u8> {
+    let mut key = user_prefix(Keyspace::DelayEcho, user_id);
+    key.extend_from_slice(event_id.as_bytes());
+    key
 }
 
 /// One user's presence row.

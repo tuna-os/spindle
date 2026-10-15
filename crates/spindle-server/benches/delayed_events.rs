@@ -160,8 +160,8 @@ fn firing_tick(criterion: &mut Criterion) {
                     || {
                         let tmp = tempfile::TempDir::new().expect("a temporary directory");
                         let delayed = delayed(&tmp);
-                        // Due immediately: scheduled with no delay at all.
-                        let _ids = a_call_of(&delayed, due_now, 0);
+                        // A positive delay is required; query the next millisecond.
+                        let _ids = a_call_of(&delayed, due_now, 1);
                         (tmp, delayed)
                     },
                     |(_tmp, delayed)| {

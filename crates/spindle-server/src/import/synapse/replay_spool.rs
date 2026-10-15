@@ -86,9 +86,20 @@ impl ReplaySpool {
     }
 
     pub(super) fn save(&mut self, event_id: &str, state: &Settled) -> Result<(), String> {
+        // The replay interns against its own table; the spool reads back
+        // against its store's. Rebase at the handoff, the way a room
+        // store does: nodes name the numbering they are persisted with,
+        // and that numbering is the spool's, not the caller's.
+        //
+        // Intern rows are deliberately not written: the spool directory is
+        // per-process and deleted on drop, so this store never reopens and
+        // its in-memory table -- populated by the rebase above -- is the
+        // only one that ever resolves these nodes.
+        let table = ReadView::key_table(self.store()?);
+        let rebased = state.state.clone().with_table(&table);
         let record = Record {
             event_id: event_id.to_owned(),
-            root: *state.state.root().as_bytes(),
+            root: *rebased.root().as_bytes(),
             slots: state
                 .slots
                 .iter()
@@ -96,8 +107,7 @@ impl ReplaySpool {
                 .collect(),
             reason: state.reason.clone(),
         };
-        let mut writes: Vec<_> = state
-            .state
+        let mut writes: Vec<_> = rebased
             .delta_nodes(self.saved.as_ref())
             .into_iter()
             .map(|(root, bytes)| (Self::node_key(root), bytes))
@@ -111,7 +121,7 @@ impl ReplaySpool {
         self.store()?
             .commit(&writes, Durability::Relaxed)
             .map_err(|error| error.to_string())?;
-        self.saved = Some(state.state.clone());
+        self.saved = Some(rebased);
         Ok(())
     }
 
@@ -137,15 +147,17 @@ impl ReplaySpool {
         } else {
             let store = self.store()?;
             let mut read_error = None;
-            let loaded = StateSnapshot::rehydrate(root, &mut |address| match store
-                .get(&Self::node_key(*address))
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    read_error = Some(error.to_string());
-                    None
-                }
-            })
+            let loaded = StateSnapshot::rehydrate(
+                root,
+                &mut |address| match store.get(&Self::node_key(*address)) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        read_error = Some(error.to_string());
+                        None
+                    }
+                },
+                ReadView::key_table(store),
+            )
             .map_err(|error| {
                 read_error.unwrap_or_else(|| format!("invalid replay state: {error:?}"))
             })?;
@@ -158,8 +170,8 @@ impl ReplaySpool {
                     let mut shared = previous.clone();
                     for (key, _, value) in previous.diff(&loaded) {
                         shared = match value {
-                            Some(value) => shared.apply(key.clone(), value.to_owned()),
-                            None => shared.remove(key),
+                            Some(value) => shared.apply(&key, value.to_owned()),
+                            None => shared.remove(&key),
                         };
                     }
                     if shared.root() != root {
@@ -206,6 +218,7 @@ mod tests {
     };
     use crate::rooms::Rooms;
     use serde_json::{Value, json};
+    use spindle_core::MemStateKeyTable;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -225,10 +238,10 @@ mod tests {
         let parent = tempfile::tempdir().expect("parent");
         let mut spool = ReplaySpool::new(parent.path()).expect("spool");
         spool.begin_pass().expect("pass");
-        let mut state = StateSnapshot::new();
+        let mut state = StateSnapshot::new(MemStateKeyTable::shared());
         for member in 0..1_000 {
             state = state.apply(
-                StateKey::new("m.room.member", format!("@member{member}:test")),
+                &StateKey::new("m.room.member", format!("@member{member}:test")),
                 format!("$old{member}"),
             );
         }
@@ -236,11 +249,13 @@ mod tests {
         for event in 0..100 {
             let id = format!("$update{event}");
             let key = format!("@member{event}:test");
-            state = state.apply(StateKey::new("m.room.member", key.clone()), id.clone());
-            roots.push(state.root());
+            state = state.apply(&StateKey::new("m.room.member", key.clone()), id.clone());
             spool
                 .save(&id, &supplied(state.clone(), &key, &id))
                 .expect("save");
+            // Roots name table-local ids; compare after rebasing the source.
+            let table = ReadView::key_table(spool.store().expect("store"));
+            roots.push(state.clone().with_table(&table).root());
             // The original outcome held a snapshot per supplied event. This
             // source holds exactly one while saving, regardless of count.
             assert!(spool.saved.is_some());
@@ -273,7 +288,8 @@ mod tests {
         let parent = tempfile::tempdir().expect("parent");
         let mut spool = ReplaySpool::new(parent.path()).expect("spool");
         spool.begin_pass().expect("first");
-        let state = StateSnapshot::new().apply(StateKey::new("m.room.member", "@a:test"), "$a");
+        let state = StateSnapshot::new(MemStateKeyTable::shared())
+            .apply(&StateKey::new("m.room.member", "@a:test"), "$a");
         spool
             .save("$a", &supplied(state.clone(), "@a:test", "$a"))
             .expect("save");
@@ -291,21 +307,35 @@ mod tests {
         let parent = tempfile::tempdir().expect("parent");
         let mut spool = ReplaySpool::new(parent.path()).expect("spool");
         spool.begin_pass().expect("pass");
-        let state = StateSnapshot::new().apply(StateKey::new("m.room.member", "@a:test"), "$a");
+        let state = StateSnapshot::new(MemStateKeyTable::shared())
+            .apply(&StateKey::new("m.room.member", "@a:test"), "$a");
         spool
             .save("$a", &supplied(state.clone(), "@a:test", "$a"))
             .expect("save");
-        spool
+        // The spool persists under its own numbering, which need not match
+        // the caller's, so the test does not assume which node keys those
+        // are: every node row is corruptible and then deletable, and both
+        // refuse the read instead of folding.
+        let nodes: Vec<Vec<u8>> = spool
             .store()
             .expect("store")
-            .put(&ReplaySpool::node_key(state.root()), b"bad node")
-            .expect("corrupt");
+            .scan_prefix(b"n")
+            .expect("scan")
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert!(!nodes.is_empty(), "a saved state persists its nodes");
+        for node in &nodes {
+            spool
+                .store()
+                .expect("store")
+                .put(node, b"bad node")
+                .expect("corrupt");
+        }
         assert!(spool.load("$a").is_err());
-        spool
-            .store()
-            .expect("store")
-            .delete(&ReplaySpool::node_key(state.root()))
-            .expect("delete");
+        for node in &nodes {
+            spool.store().expect("store").delete(node).expect("delete");
+        }
         assert!(spool.load("$a").is_err());
     }
 
@@ -315,7 +345,7 @@ mod tests {
         let mut spool = ReplaySpool::new(parent.path()).expect("spool");
         spool.begin_pass().expect("pass");
         let empty = Settled {
-            state: StateSnapshot::new(),
+            state: StateSnapshot::new(MemStateKeyTable::shared()),
             slots: StateMap::new(),
             reason: "empty".to_owned(),
         };
@@ -454,7 +484,8 @@ mod tests {
         assert_eq!(actual.passes, expected.passes);
         for (id, state) in &expected.settled {
             let loaded = disk.read_settled(id).expect("read").expect("supplied");
-            assert_eq!(loaded.state.root(), state.state.root());
+            let expected_state = state.state.clone().with_table(loaded.state.table());
+            assert_eq!(loaded.state.root(), expected_state.root());
             assert_eq!(loaded.slots, state.slots);
             assert_eq!(loaded.reason, state.reason);
         }
@@ -544,7 +575,8 @@ mod tests {
             resolve_first_parent: true,
         };
         disk.spool.begin_pass().expect("old pass");
-        let state = StateSnapshot::new().apply(StateKey::new("m.room.member", "@old:test"), "$old");
+        let state = StateSnapshot::new(MemStateKeyTable::shared())
+            .apply(&StateKey::new("m.room.member", "@old:test"), "$old");
         disk.spool
             .save("$old-pass-only", &supplied(state, "@old:test", "$old"))
             .expect("old record");
@@ -563,7 +595,8 @@ mod tests {
                 .read_settled(&id)
                 .expect("load")
                 .expect("current record");
-            assert_eq!(actual.state.root(), expected.state.root());
+            let expected_state = expected.state.with_table(actual.state.table());
+            assert_eq!(actual.state.root(), expected_state.root());
             assert_eq!(actual.slots, expected.slots);
             assert_eq!(actual.reason, expected.reason);
         }

@@ -593,6 +593,57 @@ impl Media {
         Ok(("image/png".to_owned(), bytes))
     }
 
+    /// Every media record, with its ID: what the admin API lists a user's
+    /// uploads from. Remote media cached here is included, under its
+    /// [`Self::remote_id`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the store cannot be scanned or a record
+    /// cannot be decoded.
+    pub fn records(&self) -> Result<Vec<(String, MediaRecord)>, MediaError> {
+        let mut out = Vec::new();
+        for (key, value) in ReadView::scan_prefix(self.store.as_ref(), &keys::media_all())? {
+            if let Some(id) = keys::media_id(&key) {
+                out.push((id, serde_json::from_slice(&value)?));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete `media_id`: its record, and its bytes and cached thumbnails
+    /// unless another record holds the same bytes. Returns whether there
+    /// was anything to delete.
+    ///
+    /// The record goes first, so from that moment the media is not served
+    /// even if removing the bytes then fails; the bytes left behind are an
+    /// orphan the media audit can find, never media that still answers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the store or the blob backend fails.
+    pub async fn delete(&self, media_id: &str) -> Result<bool, MediaError> {
+        let Some(record) = self.record(media_id)? else {
+            return Ok(false);
+        };
+        Store::delete(self.store.as_ref(), &keys::media(media_id))?;
+        let shared = self
+            .records()?
+            .iter()
+            .any(|(_, other)| other.hash == record.hash);
+        if !shared {
+            for (width, height) in THUMBNAIL_LADDER {
+                for method in ["crop", "scale"] {
+                    let cache_key = format!("{}-{width}x{height}-{method}", record.hash);
+                    let cache_hash = blake3::hash(cache_key.as_bytes()).to_hex().to_string();
+                    self.blobs.delete(&cache_hash).await?;
+                }
+            }
+            self.blobs.delete(&record.hash).await?;
+        }
+        Ok(true)
+    }
+
     /// The `mxc://` URI for one of this server's media IDs.
     #[must_use]
     pub fn mxc(&self, media_id: &str) -> String {
@@ -612,14 +663,16 @@ impl Media {
 /// gets less than it asked for unless it asked for more than the largest rung.
 /// A fixed ladder bounds the cache at a handful of files per upload.
 fn normalize_dimensions(width: u32, height: u32) -> (u32, u32) {
-    const LADDER: [(u32, u32); 5] = [(32, 32), (96, 96), (320, 240), (640, 480), (800, 600)];
-    for (rung_width, rung_height) in LADDER {
+    for (rung_width, rung_height) in THUMBNAIL_LADDER {
         if width <= rung_width && height <= rung_height {
             return (rung_width, rung_height);
         }
     }
     (800, 600)
 }
+
+/// The thumbnail sizes this server makes; every cached thumbnail is one.
+const THUMBNAIL_LADDER: [(u32, u32); 5] = [(32, 32), (96, 96), (320, 240), (640, 480), (800, 600)];
 
 /// An opaque, unguessable media ID.
 ///

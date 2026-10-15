@@ -10,6 +10,11 @@ pub mod account;
 pub mod account_data;
 pub mod accounts;
 pub mod admin;
+pub mod admin_federation;
+pub mod admin_media;
+pub mod admin_tasks;
+pub mod admin_ui;
+pub mod appservice_proxy;
 pub mod appservices;
 pub mod auth;
 pub mod authorize;
@@ -35,6 +40,7 @@ pub mod livekit;
 pub mod mas;
 pub mod media;
 pub mod metrics;
+pub mod moderation_routes;
 pub mod netguard;
 pub mod oidc;
 pub mod openid;
@@ -122,6 +128,10 @@ pub struct AppState {
     /// `[email]` names, or what a test supplied. Absent, nothing is mailed
     /// and the pages that would need it are not offered.
     pub mailer: Option<Arc<dyn email::Mailer>>,
+    /// The SFU sidecar supervisor: the local model's child process, watched
+    /// and restarted. Present in every state — the remote model and the
+    /// unconfigured server simply report through it rather than spawn.
+    pub sfu: Arc<livekit::SfuSupervisor>,
     /// MSC3995 hub mode's process state (#22): who answered the capability
     /// probe, how far each hubbed room's attestations have gone, counters.
     #[cfg(feature = "hub-mode")]
@@ -463,6 +473,8 @@ fn app_state_with(
     let push =
         Arc::new(push::Gateway::new(&config.push.allow_internal).map_err(AppError::PushConfig)?);
     let delayed_caps = config.delayed_events.clone();
+    let config_for_sfu = config.clone();
+    let store_for_sfu = Arc::clone(&store);
     let state = AppState {
         config: Arc::new(config),
         store,
@@ -484,11 +496,14 @@ fn app_state_with(
         delegated,
         oidc: oidc_provider,
         federation,
-        delayed: Arc::new(delayed::Delayed::with_limits(
-            Arc::clone(&store_for_delayed),
-            delayed_caps.max_delay_ms,
-            delayed_caps.max_per_room,
-        )),
+        delayed: Arc::new(
+            delayed::Delayed::with_limits(
+                Arc::clone(&store_for_delayed),
+                delayed_caps.max_delay_ms,
+                delayed_caps.max_per_room,
+            )
+            .with_user_cap(delayed_caps.max_per_user),
+        ),
         push,
         registration_nonces: Arc::new(shared_secret_registration::RegistrationNonces::new()),
         rendezvous: Arc::new(rendezvous::Rendezvous::new()),
@@ -496,6 +511,7 @@ fn app_state_with(
         backfill: Arc::new(inbound::GapBackfill::new()),
         metrics,
         mailer,
+        sfu: livekit::SfuSupervisor::new(config_for_sfu, store_for_sfu),
         #[cfg(feature = "hub-mode")]
         hub: Arc::new(hub::Hub::new()),
     };
@@ -531,14 +547,17 @@ fn spawn_delivery_loops(state: &AppState) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
     }
-    // A second is far below any heartbeat a client would set and far above
-    // the cost of the tick: when nothing is due it reads one row, because
-    // the rows are ordered by when they fire.
+    // A tenth of a second, the push loop's tick, so a call's departure and
+    // its ring land with the same delay. It was a second until #36's
+    // comparison against Synapse measured what that cost: a delay landed
+    // half a second late at the median, where Synapse's timer landed it in
+    // sixty milliseconds. The idle tick reads one row (#350), so ten of
+    // them a second cost microseconds.
     tokio::spawn(delayed::fire_loop(
         Arc::downgrade(&state.delayed),
         Arc::downgrade(&state.rooms),
         Arc::downgrade(&state.key),
-        std::time::Duration::from_secs(1),
+        std::time::Duration::from_millis(100),
     ));
     // Forks no event merges are merged with dummy events, and the census
     // behind `spindle_rooms_by_forward_extremities` is taken, once a minute

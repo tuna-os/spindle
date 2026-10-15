@@ -16,7 +16,7 @@
 use std::time::Instant;
 
 use spindle_core::RoomLog;
-use spindle_store::{Durability, FjallStore, RoomStore};
+use spindle_store::{Durability, FjallStore, ReadView, RoomStore};
 use tempfile::TempDir;
 
 const ROOM: &str = "!scale:example.org";
@@ -39,7 +39,7 @@ fn append_and_reopen(count: usize, durability: Durability) -> Measured {
     {
         let store = FjallStore::open(dir.path()).unwrap();
         let room_store = RoomStore::new(&store, ROOM);
-        let mut log = RoomLog::new();
+        let mut log = RoomLog::new(store.key_table());
         let mut window = Instant::now();
 
         for number in 0..count {
@@ -170,7 +170,7 @@ fn persisting_the_state_trie_pays_off_only_when_there_is_state() {
         {
             let store = FjallStore::open(dir.path()).unwrap();
             let room_store = RoomStore::new(&store, ROOM);
-            let mut log = RoomLog::new();
+            let mut log = RoomLog::new(store.key_table());
             for number in 0..events {
                 let slot = if state_every > 0 && number % state_every == 0 {
                     Some(spindle_core::StateKey::new(
@@ -223,7 +223,7 @@ fn reopening_a_state_heavy_room_does_not_materialize_every_snapshot() {
     {
         let store = FjallStore::open(dir.path()).unwrap();
         let room_store = RoomStore::new(&store, ROOM);
-        let mut log = RoomLog::new();
+        let mut log = RoomLog::new(store.key_table());
         for number in 0..events {
             let entry = log
                 .append_local(

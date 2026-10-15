@@ -51,7 +51,8 @@ impl Peer {
         let signing = Ed25519KeyPair::from_der(&document, "0".to_owned()).unwrap();
         let mut key_document = json!({
             "server_name": name,
-            "valid_until_ts": now_millis() + 60_000,
+            // These scenarios exercise fork merging, not key expiry.
+            "valid_until_ts": now_millis() + 86_400_000,
             "verify_keys": { "ed25519:0": { "key": unpadded(pair.public_key().as_ref()) } },
         });
         sign_value(&name, &signing, &mut key_document);

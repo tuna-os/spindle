@@ -257,7 +257,10 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, MatrixError> {
 }
 
 /// The verified addresses of one account, with when each was added.
-fn addresses_of(state: &AppState, localpart: &str) -> Result<Vec<(String, u64)>, MatrixError> {
+pub(crate) fn addresses_of(
+    state: &AppState,
+    localpart: &str,
+) -> Result<Vec<(String, u64)>, MatrixError> {
     let prefix = keys::user_email_prefix(localpart);
     let mut out = Vec::new();
     for (key, raw) in
