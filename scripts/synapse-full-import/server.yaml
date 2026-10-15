@@ -1,0 +1,82 @@
+# The full-corpus dark Spindle (#563). Same isolation as dark-spindle (#558):
+# [federation] enabled = false, no resolver, ClusterIP only, netwatch sidecar.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fi-dark-spindle
+  namespace: spindle-rehearsal
+  labels: {app: fi-dark-spindle, part-of: spindle-full-import}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: fi-dark-spindle}
+  template:
+    metadata:
+      labels: {app: fi-dark-spindle, part-of: spindle-full-import}
+    spec:
+      nodeSelector: {kubernetes.io/hostname: __NODE__}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: [127.0.0.1]
+        options: [{name: ndots, value: "1"}, {name: attempts, value: "1"}, {name: timeout, value: "1"}]
+      securityContext:
+        runAsUser: 10092
+        runAsGroup: 10092
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: spindle
+        image: __IMAGE__
+        command: [/usr/local/bin/spindle, /conf/spindle.toml]
+        ports:
+        - {name: client, containerPort: 8008}
+        readinessProbe:
+          httpGet: {path: /_matrix/client/versions, port: 8008}
+          periodSeconds: 5
+          failureThreshold: 120
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: [ALL]}
+        resources:
+          requests: {cpu: 100m, memory: 512Mi}
+          limits: {cpu: "1", memory: 4Gi}
+        volumeMounts:
+        - {name: conf, mountPath: /conf, readOnly: true}
+        - {name: data, mountPath: /data}
+      - name: netwatch
+        image: oci.element.io/synapse:v1.156.0
+        command: [python3, -u, /netwatch/netwatch.py]
+        env:
+        - {name: ALLOWED_DB, value: none}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: [ALL]}
+        resources:
+          requests: {cpu: 10m, memory: 32Mi}
+          limits: {memory: 128Mi}
+        volumeMounts:
+        - {name: netwatch, mountPath: /netwatch, readOnly: true}
+      volumes:
+      - name: conf
+        configMap: {name: fi-dark-spindle-config}
+      - name: data
+        persistentVolumeClaim: {claimName: fi-dark-spindle}
+      - name: netwatch
+        configMap:
+          name: dark-synapse-config
+          items: [{key: netwatch.py, path: netwatch.py}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fi-dark-spindle
+  namespace: spindle-rehearsal
+  labels: {app: fi-dark-spindle, part-of: spindle-full-import}
+spec:
+  type: ClusterIP
+  selector: {app: fi-dark-spindle}
+  ports:
+  - {name: client, port: 8008, targetPort: 8008}

@@ -1,0 +1,25 @@
+{
+  "at": "2026-10-03T22:12:28Z",
+  "well_known": {
+    "m.server": "matrix.reilly.asia:443"
+  },
+  "fetched_from": "https://matrix.reilly.asia:443",
+  "server_name": "reilly.asia",
+  "verify_keys": {
+    "ed25519:a_qMqD": "cQoPy/2xh5Uu/18g41391liTx6tJGyO6t2GaAZyYf6s"
+  },
+  "old_verify_keys": {},
+  "valid_until_ts": 1791151948983,
+  "self_signature_verifies": {
+    "ed25519:a_qMqD": true
+  },
+  "a_cached": [
+    {
+      "key_id": "ed25519:a_qMqD",
+      "from_server": "reilly.asia",
+      "ts_added_ms": 1791061812997,
+      "ts_valid_until_ms": 1791147324942,
+      "public_key": "cQoPy/2xh5Uu/18g41391liTx6tJGyO6t2GaAZyYf6s"
+    }
+  ]
+}

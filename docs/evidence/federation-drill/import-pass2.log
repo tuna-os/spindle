@@ -1,0 +1,19 @@
+secret/drill-passwords unchanged
+job.batch "drill-b-import" deleted from spindle-rehearsal namespace
+store emptied
+warning: couldn't attach to pod/drill-b-data-op, falling back to streaming logs: unable to upgrade connection: container op not found in pod drill-b-data-op_spindle-rehearsal
+store emptied
+pod "drill-b-data-op" deleted from spindle-rehearsal namespace
+configmap/drill-b-spindle-config unchanged
+job.batch/drill-b-import created
+job.batch/drill-b-import condition met
+room !UpTFCotHHetkcMTxeM:reilly.asia: room_events=28
+room !WpvjQmNLGeVSCrQGXP:reilly.asia: room_events=3277
+room !eGAKNOtIYJgTECIGGK:reilly.asia: room_events=26
+room !gllblumXbTgEdNUayt:reilly.asia: room_events=26
+room !jJwQBRazJPYfrvvkys:reilly.asia: room_events=44
+room !yQ1SqzDiKYxp7_hzwIb62xffSR822Ao6IWuCwgsOdLI: room_events=17
+user @drill-b1:reilly.asia: account_data=8 device_keys=1 cross_signing_keys=3 signatures=1 skipped_signatures=0 backup_versions=1 backup_sessions=3
+user @drill-b2:reilly.asia: account_data=0 device_keys=0 cross_signing_keys=0 signatures=0 skipped_signatures=0 backup_versions=0 backup_sessions=0
+rehearsal ready: rooms=6 users=2
+rehearsal only: no media, remote cached keys, receipts, pushers, or federation cutover

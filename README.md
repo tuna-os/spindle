@@ -8,13 +8,13 @@ never runs on the hot path.**
 · [spec coverage dashboard](https://tuna-os.github.io/spindle/dashboard.html)
 · [SPEC.md](SPEC.md)
 
-> **Status: an experiment under construction, not a deployment.** The
-> client-server surface is broad and tested, federation interoperates with real
-> Synapse, and nothing here has ever run in production. Releases are weekly
-> `v0.0.x` prereleases that name a build and promise nothing else: no
-> upgrade path, and the storage format has already broken once —
-> deliberately, with the [test that caught it](crates/spindle-store/tests/backend_compatibility.rs)
-> kept and inverted rather than deleted.
+> **Status: prerelease.** The client-server surface is broad and tested,
+> and federation interoperates with Synapse. The first supported maturity
+> line is `v0.1.x`, subject to the exact candidate checks and evidence in
+> [v0.1.0 readiness](docs/v0.1.0-readiness.md). Use the newest patch and the
+> [operator guide](docs/operations.md). Explicit migrations can need downtime;
+> rollback restores a pre-migration backup. Earlier `v0.0.x` tags identify
+> experimental builds and receive no backports.
 
 ---
 
@@ -50,13 +50,15 @@ curl -XPOST localhost:8008/_matrix/client/v3/register \
 ```
 
 Point Element, Element X, Cinny, Nheko or FluffyChat at `http://localhost:8008`
-and it works unmodified — Spindle serves ordinary room version 11 and 12 rooms,
-so there is no client capability to negotiate.
+and it works unmodified — Spindle serves ordinary rooms of room versions 1 to
+12, so there is no client capability to negotiate.
 
 [`spindle.example.toml`](spindle.example.toml) documents every setting, and a
 CI gate fails if a config field exists in the code and not in that file.
 
 **Other commands:** `promote-admin` (mints the first admin offline),
+`set-password-hash` (imports Argon2 hashes, e.g. from MAS),
+`issue-reset-link` (a password-reset link that needs no mail),
 `backup` / `restore` / `verify-media`, `migrate`. See
 [docs/lifecycle.md](docs/lifecycle.md).
 
@@ -115,13 +117,18 @@ impossible and the exception path is dead code.
 | **M6** Differentiators | Not started | Hub mode, MLS |
 | **M7** MatrixRTC | Server side served | **MSC4140 delayed events** — the dead-man's switch that stops calls accumulating ghost participants, which no other Rust homeserver has — plus MSC4354 sticky events, MSC4143 transport discovery, a built-in LiveKit JWT service or the OpenID round trip for an external one, ringing and decline. Element Call's own Playwright suite runs with Spindle in Synapse's seat: thirteen specs pass, among them a two-party call with video through LiveKit and MatrixRTC 2.0 sticky-event membership with a rejoin after an improper leave. Ringing, churn, a restart mid-call and the federated call are what remains of the gate |
 
-**225 routes** and a **310-test Complement ratchet** in CI, over a workspace of
+**292 routes** and a **310-test Complement ratchet** in CI, over a workspace of
 100+ test suites. The first two are gated — the [dashboard](docs/dashboard.md)
 is parsed from the router and CI fails on drift, and the ratchet is a file every
 entry of which must pass — so what they say matches `main` rather than matching
 when someone last edited this paragraph.
 
-### Throughput
+### Throughput (dated snapshot)
+
+The table below is a dated analysis snapshot, not the current benchmark
+result. See the [published benchmark results](https://tuna-os.github.io/spindle/)
+for the latest run and [the benchmark notes](docs/benchmarks.md) for the
+method and the limitations of comparing snapshots.
 
 Same host, same driver, same sitting; Synapse 1.159.0 on both back ends,
 because for a *write throughput* comparison the database is not a detail —
@@ -155,10 +162,11 @@ skip it and they don't" was never true of them. What linear storage removes is
 the per-event *bookkeeping* the algorithm needs in order to exist — extremity
 sets, state-group delta stacks — not the algorithm.
 
-**The load-bearing claim is the equivalence theorem** (SPEC §9.3): that
-window-bounded state resolution produces exactly what full state resolution
-would. It is tested as one, differentially against `ruma-state-res`, for every
-fork the fast path claims to handle. A counterexample is a release blocker.
+**State resolution must agree with Matrix.** The old slot-wise fork merge
+had counterexamples and was retired (ADR 0005). Differing fork states use
+the room version's resolver. Scheduled checks preserve the counterexamples,
+compare with `ruma-state-res`, and test the fork-window search against an
+exhaustive walk. A disagreement on the live path is a release blocker.
 
 **Losses are published next to wins.** [docs/benchmarks.md](docs/benchmarks.md)
 carries the cells where Spindle lost, the investigations, and two claims that
@@ -197,6 +205,7 @@ The risks that would invalidate the headline claim are enumerated in
 | [docs/delegated-auth.md](docs/delegated-auth.md) | MSC3861, both ways — built-in provider or a real MAS |
 | [docs/metrics.md](docs/metrics.md) | What is exported, including the number the architecture is falsified by |
 | [docs/lifecycle.md](docs/lifecycle.md) | Backup, restore, migrations |
+| [docs/synapse-kubernetes-cutover.md](docs/synapse-kubernetes-cutover.md) | Reversible ESS/Kubernetes quiesce and the production cutover gates |
 | [docs/rate-limits.md](docs/rate-limits.md) | Every rate and cap, and the growth nothing bounds yet |
 | [docs/matrix-rtc.md](docs/matrix-rtc.md) | Calls end to end: the SFU, the JWT service built in or beside, and what a token cannot promise |
 | [docs/mesh-federation.md](docs/mesh-federation.md) | Federating with a Bluetooth mesh: the venue system, the loopback evidence, and the Neutrino gateway patch |

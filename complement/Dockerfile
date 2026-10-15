@@ -8,7 +8,7 @@
 # Build from the repository root:
 #   docker build -f complement/Dockerfile -t complement-spindle:latest .
 
-FROM rust:1.98-bookworm AS build
+FROM rust:1.99-bookworm AS build
 WORKDIR /src
 
 # The dependency layer: manifests only, with placeholder sources, so the
@@ -21,6 +21,7 @@ WORKDIR /src
 # placeholder build simply will not cover it and the real build compiles
 # it from scratch. The failure mode is a slower build, not a wrong one.
 COPY Cargo.toml Cargo.lock ./
+COPY vendor ./vendor
 COPY crates/spindle-core/Cargo.toml crates/spindle-core/
 COPY crates/spindle-store/Cargo.toml crates/spindle-store/
 COPY crates/spindle-server/Cargo.toml crates/spindle-server/

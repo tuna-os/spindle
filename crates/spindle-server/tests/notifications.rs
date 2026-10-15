@@ -315,49 +315,128 @@ async fn a_notice_and_a_rule_the_client_disabled_do_not_notify() {
     assert_eq!(bodies(&page), vec!["from alice", "m.room.member"]);
 }
 
-#[tokio::test]
-async fn pages_walk_every_notification_once_across_rooms() {
-    let h = Harness::new();
+/// Three rooms bob talks in turn in, as alice's notifications: the event
+/// IDs in the order they were sent.
+async fn three_rooms(h: &Harness) -> (String, String, Vec<String>, Vec<String>) {
     let alice = h.register("alice").await;
     let bob = h.register("bob").await;
-    let one = h.create_room(&alice).await;
-    h.admit(&one, &alice, &bob, "@bob:example.org").await;
-    let two = h.create_room(&alice).await;
-    h.admit(&two, &alice, &bob, "@bob:example.org").await;
-    let mut said = Vec::new();
-    for n in 0..5 {
-        let room = if n % 2 == 0 { &one } else { &two };
-        said.push(h.say(room, &bob, &format!("message {n}")).await);
+    let mut rooms = Vec::new();
+    for _ in 0..3 {
+        let room = h.create_room(&alice).await;
+        h.admit(&room, &alice, &bob, "@bob:example.org").await;
+        rooms.push(room);
     }
+    // Back to back, so neighbours share a millisecond as often as not:
+    // the tie that made a timestamp order disagree with the send order.
+    let mut said = Vec::new();
+    for (n, room) in [0, 1, 2, 2, 0, 1, 1, 2, 0].into_iter().enumerate() {
+        said.push(h.say(&rooms[room], &bob, &format!("message {n}")).await);
+    }
+    (alice, bob, rooms, said)
+}
 
+/// Walk `/notifications` from `from` at `limit`, asserting nothing comes
+/// back twice; returns the event IDs and the number of pages.
+async fn walk(
+    h: &Harness,
+    token: &str,
+    limit: usize,
+    from: Option<String>,
+) -> (Vec<String>, usize) {
     let mut seen: Vec<String> = Vec::new();
-    let mut from: Option<String> = None;
+    let mut from = from;
     let mut pages = 0;
     loop {
         let query = match &from {
-            Some(token) => format!("?limit=2&from={token}"),
-            None => "?limit=2".to_owned(),
+            Some(token) => format!("?limit={limit}&from={token}"),
+            None => format!("?limit={limit}"),
         };
-        let (status, page) = h.notifications(&alice, &query).await;
+        let (status, page) = h.notifications(token, &query).await;
         assert_eq!(status, StatusCode::OK, "{page}");
         pages += 1;
-        assert!(pages <= 3, "more pages than notifications allow");
+        assert!(pages <= 20, "paging at {limit} does not end");
         for notification in page["notifications"].as_array().unwrap() {
             let id = notification["event"]["event_id"]
                 .as_str()
                 .unwrap()
                 .to_owned();
-            assert!(!seen.contains(&id), "{id} came back twice");
+            assert!(!seen.contains(&id), "{id} came back twice at limit {limit}");
             seen.push(id);
         }
         match page["next_token"].as_str() {
             Some(token) => from = Some(token.to_owned()),
-            None => break,
+            None => return (seen, pages),
         }
     }
-    assert_eq!(pages, 3);
+}
+
+/// #635: newest first is the order events reached the server, a total
+/// order, so every page size serves the same sequence with no skip and no
+/// repeat at any page boundary.
+#[tokio::test]
+async fn pages_walk_every_notification_once_across_rooms() {
+    let h = Harness::new();
+    let (alice, _, _, mut said) = three_rooms(&h).await;
     said.reverse();
-    assert_eq!(seen, said, "every notification, newest first, exactly once");
+    for limit in 1..=said.len() + 1 {
+        let (seen, pages) = walk(&h, &alice, limit, None).await;
+        assert_eq!(
+            seen, said,
+            "limit {limit}: every notification, newest first, once"
+        );
+        assert!(
+            pages <= said.len().div_ceil(limit) + 1,
+            "limit {limit}: {pages} pages"
+        );
+    }
+}
+
+/// A walk is cut to where its first page stood: a message sent mid-walk is
+/// not served out of order on a later page, and leads the next walk.
+#[tokio::test]
+async fn a_walk_is_a_snapshot() {
+    let h = Harness::new();
+    let (alice, bob, rooms, mut said) = three_rooms(&h).await;
+    said.reverse();
+    let (_, first) = h.notifications(&alice, "?limit=4").await;
+    let token = first["next_token"].as_str().unwrap().to_owned();
+    let late = h.say(&rooms[1], &bob, "late").await;
+    let (rest, _) = walk(&h, &alice, 4, Some(token)).await;
+    let ids = |page: &Value| -> Vec<String> {
+        page["notifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["event"]["event_id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let mut seen = ids(&first);
+    seen.extend(rest);
+    assert_eq!(seen, said);
+    let (_, fresh) = h.notifications(&alice, "?limit=1").await;
+    assert_eq!(ids(&fresh), vec![late]);
+}
+
+/// A `next_token` from before the snapshot was added (the bare per-room
+/// cursor) still parses, and resumes each room it names exactly.
+#[tokio::test]
+async fn a_token_without_a_snapshot_still_resumes() {
+    let h = Harness::new();
+    let (alice, _, _, mut said) = three_rooms(&h).await;
+    said.reverse();
+    let (_, first) = h.notifications(&alice, "?limit=3").await;
+    let token = first["next_token"].as_str().unwrap();
+    let (snapshot, old) = token.split_once(';').unwrap();
+    assert!(snapshot.starts_with('s'), "{token}");
+    let (rest, _) = walk(&h, &alice, 3, Some(old.to_owned())).await;
+    let mut seen: Vec<String> = first["notifications"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["event"]["event_id"].as_str().unwrap().to_owned())
+        .collect();
+    seen.extend(rest);
+    assert_eq!(seen, said);
 }
 
 #[tokio::test]

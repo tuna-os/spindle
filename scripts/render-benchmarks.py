@@ -37,10 +37,16 @@ COMPARISONS = [
         ["1", "4", "16", "64", "256"],
     ),
     (
-        "State updates: our HAMT vs the im crate",
+        "State updates: our HAMT vs imbl",
         "state_retained_updates/hamt/{}",
-        "state_retained_updates/im/{}",
-        ["100", "1000", "10000"],
+        "state_retained_updates/imbl/{}",
+        ["100", "1000", "10000", "50000"],
+    ),
+    (
+        "Replacing existing state slots: our HAMT vs imbl",
+        "state_retained_replacements/hamt/{}",
+        "state_retained_replacements/imbl/{}",
+        ["100", "1000", "10000", "50000"],
     ),
     (
         "State lookup: our HAMT vs HashMap",

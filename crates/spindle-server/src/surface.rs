@@ -52,40 +52,49 @@ pub const SPEC_VERSIONS: &[SpecVersion] = &[
 /// hands back events our machinery rightly refuses — which is how
 /// Complement's `TestJoinViaRoomIDAndServerName` found this.
 ///
-/// # Why not the older versions, when they appear to work
+/// # A version is listed only when it is served at that version
 ///
-/// They create. Driving `Rooms::create` at v6 through v12 with this list
-/// widened, every one creates, authorizes and accepts messages, and
-/// `ruma` reports `event_id_format = V3` for everything from v4 up — the
-/// same event IDs this server computes. On that evidence v4–v12 looks
-/// advertisable, and this list was briefly widened to say so.
+/// Creating a room at a version is not the same as *joining* one over
+/// federation at it, and only the second is what advertising promises. An
+/// earlier widening to v4–v10 was withdrawn because `send_join` refused a
+/// v7 join (`M_BAD_JSON`) while `/createRoom` quietly substituted v11 for
+/// every unlisted version, so knock and restricted-join tests passed on a
+/// room of the wrong version.
 ///
-/// **Complement says otherwise, and it is right.** With v7 actually
-/// served, `make_join` truthfully answers "7", the peer builds a
-/// v7-shaped join, and `send_join` rejects it:
+/// Versions 6 to 10 are listed because each is exercised at its own
+/// version: two-server joins and event exchange, redaction under the
+/// version's own algorithm, the v7 knock and v8/v9 restricted-join
+/// handshakes, and v1–v9 string power levels. The migration corpus tracked
+/// by #456 holds real v6, v9 and v10 rooms. The differences between them are
+/// ruma's per-version rules plus the three places this server makes a
+/// version-dependent choice of its own: the redaction target's location
+/// (top level before v11), the restricted-join nomination (v8+), and knock
+/// templates (v7+).
 ///
-/// ```text
-/// MustJoinRoom: send_join failed: {"errcode":"M_BAD_JSON", …}
-/// ```
-///
-/// Restricted joins fail the same way at v8–v10:
-/// `TestRestrictedRooms*/Join_should_succeed_when_joined_to_allowed_room`.
-///
-/// So `ruma`'s per-version rules are necessary and not sufficient. The
-/// federation join path carries v11-shaped assumptions that held only
-/// because every room was quietly v11 — which is exactly what made those
-/// thirty allowlisted tests pass on a substitution. Creating a room at a
-/// version is not the same as *joining* one over federation at it, and
-/// only the second is what advertising promises.
-///
-/// Advertising v4–v10 before that path is fixed would move the
-/// substitution's dishonesty rather than remove it: clients would be told
-/// the version is available and then fail to federate into it.
-///
-/// The work is real and tracked separately. This list moves when
-/// Complement's knock and restricted-join tests pass at the versions they
-/// ask for, and not before.
-pub const ROOM_VERSIONS: &[&str] = &["11", "12", spindle_core::STATE_DAG_V12];
+/// Versions 1 to 5 add their own differences, each handled where it lives:
+/// v1 and v2 name events `$opaque:server` and link them by
+/// `[id, {"sha256": hash}]` pairs (`spindle_core::version::event_id`,
+/// `edge`, `Rooms::link_edges`, `rooms::edge_ids`); v1 resolves state with
+/// the original algorithm (`state_res_v1`); v1 and v2 let a server redact
+/// its own events whatever its power (ruma, given the `redacts` target);
+/// v3 names events in standard rather than URL-safe base64; and v5 starts
+/// enforcing key validity (`PeerKeys::map_for`). The migration corpus holds
+/// a real v1 room.
+pub const ROOM_VERSIONS: &[&str] = &[
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+    "10",
+    "11",
+    "12",
+    spindle_core::STATE_DAG_V12,
+];
 
 /// The default room version.
 pub const DEFAULT_ROOM_VERSION: Option<&str> = Some("11");
@@ -138,6 +147,8 @@ pub const ROOM_VERSION_REQUIRES: &[&str] = &[
 
 /// Unstable features. Same rule: nothing here that is not built.
 pub const UNSTABLE_FEATURES: &[(&str, bool)] = &[
+    // MSC4108 rendezvous for linking a new device through MAS.
+    ("org.matrix.msc4108", true),
     // MSC3266's room summary. Advertised because the endpoint is served under
     // the unstable prefix as well as at `/v1/room_summary`, and a client that
     // checks this flag before probing the unstable path is doing the right
@@ -153,6 +164,10 @@ pub const UNSTABLE_FEATURES: &[(&str, bool)] = &[
     // expected to fall back to leaving a stale membership behind. So the
     // advertisement is not decoration: it changes what clients do.
     ("org.matrix.msc4140", true),
+    // MSC4140 is merged, and the stable endpoints it names are served
+    // beside the unstable ones: this is the MSC's own flag for "use them"
+    // until a spec version that contains it is advertised.
+    ("org.matrix.msc4140.stable", true),
     // MSC4143's MatrixRTC discovery. Advertised unconditionally, because
     // the flag answers "does this server serve /rtc/transports", not "does
     // it have a backend to name": the endpoint is served either way and
@@ -165,6 +180,9 @@ pub const UNSTABLE_FEATURES: &[(&str, bool)] = &[
     // on a send, the key on the event, and the section on `/sync`. What
     // MatrixRTC 2.0 makes `m.rtc.member`.
     ("org.matrix.msc4354", true),
+    // MSC4502's membership look-up, which lk-jwt-service asks as an
+    // application service before it mints a token for a room.
+    ("io.element.msc4502", true),
     // MSC3814's dehydrated devices. Element X checks this flag before it
     // offers to keep room keys across the last device being lost.
     ("org.matrix.msc3814", true),
@@ -172,6 +190,11 @@ pub const UNSTABLE_FEATURES: &[(&str, bool)] = &[
     // unstable and the plain names), and a disabled pusher receives
     // nothing. A client checks here before showing the toggle.
     ("org.matrix.msc3881", true),
+    // MSC4186's simplified sliding sync, under the flag name it kept from
+    // MSC3575. Not decoration: matrix-sdk's `DiscoverNative` -- what
+    // Element X builds its client with at login -- reads exactly this flag,
+    // and without it refuses the server as having no sliding sync at all.
+    ("org.matrix.simplified_msc3575", true),
 ];
 
 #[must_use]
@@ -195,31 +218,59 @@ pub fn required_routes() -> Vec<&'static str> {
 mod room_version_surface_tests {
     use super::{DEFAULT_ROOM_VERSION, ROOM_VERSIONS};
 
-    /// Every advertised version mints the event IDs this server computes.
+    /// Every advertised version names events the way its rules say, and
+    /// names a received event the way it named the event it signed.
     ///
     /// The advertised set is a claim, and this is the part of it that is
-    /// checkable without a running room: an event ID format other than `V3`
-    /// means IDs this implementation does not produce, so advertising such a
-    /// version would promise machinery that does not exist.
-    ///
-    /// It fails in both directions on purpose. Adding v3 or below fails here
-    /// rather than in a federation trace weeks later; and if a future room
-    /// version changes the format, adding it fails here too — which is the
-    /// moment to decide deliberately rather than discover it from a peer.
+    /// checkable without a running room. A version whose event ID format
+    /// this server did not implement would fail the round trip here rather
+    /// than in a federation trace weeks later.
     #[test]
-    fn every_advertised_version_uses_the_event_id_format_this_server_computes() {
+    fn every_advertised_version_names_its_events_by_its_own_rules() {
+        use ruma::room_version_rules::EventIdFormatVersion;
+        let document = ruma::signatures::Ed25519KeyPair::generate();
+        let key = ruma::signatures::Ed25519KeyPair::from_der(&document, "1".to_owned()).unwrap();
         for name in ROOM_VERSIONS {
             let version = ruma::RoomVersionId::try_from(*name)
                 .unwrap_or_else(|error| panic!("v{name} is not a room version: {error}"));
             let rules = spindle_core::rules_of(&version)
                 .unwrap_or_else(|| panic!("no rules for advertised v{name}"));
-            assert_eq!(
-                rules.event_id_format,
-                ruma::room_version_rules::EventIdFormatVersion::V3,
-                "v{name} is advertised but mints event IDs in {:?}, not the V3 \
-                 reference hashes this server computes",
-                rules.event_id_format,
-            );
+            if spindle_core::is_state_dag(&version) {
+                // MSC4242's event shape (no `auth_events`) has its own
+                // round-trip tests in `spindle_core::version`.
+                continue;
+            }
+            let edges = if rules.event_id_format == EventIdFormatVersion::V1 {
+                serde_json::json!([["$p:example.org", { "sha256": "abc" }]])
+            } else {
+                serde_json::json!(["$p"])
+            };
+            let ruma::CanonicalJsonValue::Object(event) =
+                ruma::CanonicalJsonValue::try_from(serde_json::json!({
+                    "type": "m.room.message",
+                    "sender": "@a:example.org",
+                    "room_id": "!r:example.org",
+                    "content": { "body": "hi" },
+                    "origin_server_ts": 1,
+                    "depth": 2,
+                    "prev_events": edges,
+                    "auth_events": edges,
+                }))
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            let signed = spindle_core::Pdu::sign(version.clone(), event, "example.org", &key)
+                .unwrap_or_else(|error| panic!("v{name} cannot sign: {error:?}"));
+            let id = signed.event_id().as_str();
+            match rules.event_id_format {
+                EventIdFormatVersion::V1 => assert!(id.ends_with(":example.org"), "v{name}: {id}"),
+                EventIdFormatVersion::V2 => assert!(!id.contains(':'), "v{name}: {id}"),
+                _ => assert!(!id.contains([':', '+', '/']), "v{name}: {id}"),
+            }
+            let received =
+                spindle_core::Pdu::from_remote(version, signed.canonical().clone()).unwrap();
+            assert_eq!(received.event_id(), signed.event_id(), "v{name}");
         }
     }
 

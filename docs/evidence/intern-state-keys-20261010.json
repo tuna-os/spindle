@@ -1,0 +1,1218 @@
+{
+  "metadata": {
+    "baseline": "496a77a029026a3acd087b4851c42e746bd9b9db",
+    "baseline_benchmark_patch": "intern-state-keys-baseline.patch",
+    "binary_sha256": {
+      "baseline": "97a3d4cca39e048b0a73544062a82b091bf9200892d47b89706b89dc4388f0d5",
+      "branch": "54af29e41653eb13a36e1df57f0b3c90202e715525c6bb7bded2ebc89be87cb2"
+    },
+    "branch": "10d269b4be3190ad849c12a125f466d43e88df2f",
+    "branch_benchmark_note": "Later commits change persistence draining, the corpus harness and tests; the selected benchmark hot paths match this source revision.",
+    "filter": "^state/(lookup|retained_updates|retained_replacements)/(hamt|imbl|hashmap)/(100|1000|10000|50000)$",
+    "host": {
+      "architecture": "x86_64",
+      "conditions": "Shared development host; concurrent builds, swap pressure, starting load averages 12\u201324. Controls are sequential in each process, so normalization cannot remove changes in contention within an arm.",
+      "cpu": "Intel Xeon Platinum 8259CL @ 2.50GHz",
+      "logical_cpus": 2,
+      "starting_load_averages": {
+        "1-baseline": [
+          18.759765625,
+          18.62841796875,
+          16.1875
+        ],
+        "1-branch": [
+          19.7763671875,
+          23.57421875,
+          20.244140625
+        ],
+        "2-baseline": [
+          18.92578125,
+          19.279296875,
+          19.18408203125
+        ],
+        "2-branch": [
+          16.767578125,
+          18.42578125,
+          18.92529296875
+        ],
+        "3-baseline": [
+          12.4111328125,
+          16.01025390625,
+          17.8857421875
+        ],
+        "3-branch": [
+          12.74365234375,
+          14.2216796875,
+          16.61572265625
+        ]
+      }
+    },
+    "measurement_seconds": 1,
+    "normalization": "Criterion mean HAMT time / mean control time within each process. Report median and observed min/max across three rounds; ranges are not confidence intervals.",
+    "order": [
+      "1-baseline",
+      "1-branch",
+      "2-branch",
+      "2-baseline",
+      "3-baseline",
+      "3-branch"
+    ],
+    "rounds": 3,
+    "sample_size": 10,
+    "started_utc": "2026-10-10T19:27:39Z",
+    "toolchain": "rustc 1.90.0 (1159e78c4 2025-09-14)",
+    "warm_up_seconds": 0.5
+  },
+  "normalized_comparison": [
+    {
+      "baseline": {
+        "max": 1.7167909835136816,
+        "median": 1.6813940367189795,
+        "min": 1.3016591233299808,
+        "ratios": [
+          1.7167909835136816,
+          1.3016591233299808,
+          1.6813940367189795
+        ]
+      },
+      "branch": {
+        "max": 1.9760948873585684,
+        "median": 1.2253145330286164,
+        "min": 1.164695846590091,
+        "ratios": [
+          1.164695846590091,
+          1.9760948873585684,
+          1.2253145330286164
+        ]
+      },
+      "control": "imbl",
+      "median_change": 0.7287491844681794,
+      "size": 100,
+      "workload": "retained_updates"
+    },
+    {
+      "baseline": {
+        "max": 1.3586375354238729,
+        "median": 0.7981701420453635,
+        "min": 0.6544547713081835,
+        "ratios": [
+          1.3586375354238729,
+          0.6544547713081835,
+          0.7981701420453635
+        ]
+      },
+      "branch": {
+        "max": 1.9925995681140447,
+        "median": 1.5638094134802063,
+        "min": 1.4637790540894602,
+        "ratios": [
+          1.4637790540894602,
+          1.5638094134802063,
+          1.9925995681140447
+        ]
+      },
+      "control": "imbl",
+      "median_change": 1.9592431877655079,
+      "size": 1000,
+      "workload": "retained_updates"
+    },
+    {
+      "baseline": {
+        "max": 2.254789633795355,
+        "median": 1.3392292413519915,
+        "min": 1.0771493585267853,
+        "ratios": [
+          1.0771493585267853,
+          2.254789633795355,
+          1.3392292413519915
+        ]
+      },
+      "branch": {
+        "max": 1.815808325482066,
+        "median": 1.1668481026365265,
+        "min": 0.952057970200003,
+        "ratios": [
+          1.815808325482066,
+          1.1668481026365265,
+          0.952057970200003
+        ]
+      },
+      "control": "imbl",
+      "median_change": 0.8712833222328381,
+      "size": 10000,
+      "workload": "retained_updates"
+    },
+    {
+      "baseline": {
+        "max": 0.9530305562073549,
+        "median": 0.6437242309346964,
+        "min": 0.5106494873371188,
+        "ratios": [
+          0.9530305562073549,
+          0.6437242309346964,
+          0.5106494873371188
+        ]
+      },
+      "branch": {
+        "max": 1.7195118080895895,
+        "median": 1.1779956447546034,
+        "min": 1.1772079905422665,
+        "ratios": [
+          1.1772079905422665,
+          1.1779956447546034,
+          1.7195118080895895
+        ]
+      },
+      "control": "imbl",
+      "median_change": 1.8299694001640074,
+      "size": 50000,
+      "workload": "retained_updates"
+    },
+    {
+      "baseline": {
+        "max": 2.753642114148664,
+        "median": 1.952732819218742,
+        "min": 1.2352496669175892,
+        "ratios": [
+          1.2352496669175892,
+          2.753642114148664,
+          1.952732819218742
+        ]
+      },
+      "branch": {
+        "max": 2.9049353910524442,
+        "median": 2.2359887534717364,
+        "min": 1.3756543496083222,
+        "ratios": [
+          1.3756543496083222,
+          2.2359887534717364,
+          2.9049353910524442
+        ]
+      },
+      "control": "imbl",
+      "median_change": 1.1450561651164959,
+      "size": 100,
+      "workload": "retained_replacements"
+    },
+    {
+      "baseline": {
+        "max": 1.1734157312072853,
+        "median": 0.8781780924209146,
+        "min": 0.47128008917146846,
+        "ratios": [
+          0.8781780924209146,
+          1.1734157312072853,
+          0.47128008917146846
+        ]
+      },
+      "branch": {
+        "max": 1.6549394975211298,
+        "median": 1.5250622049469331,
+        "min": 0.8679548514529758,
+        "ratios": [
+          1.6549394975211298,
+          0.8679548514529758,
+          1.5250622049469331
+        ]
+      },
+      "control": "imbl",
+      "median_change": 1.7366206446151746,
+      "size": 1000,
+      "workload": "retained_replacements"
+    },
+    {
+      "baseline": {
+        "max": 2.9174554397199417,
+        "median": 1.8941690570963556,
+        "min": 0.81216273169716,
+        "ratios": [
+          1.8941690570963556,
+          2.9174554397199417,
+          0.81216273169716
+        ]
+      },
+      "branch": {
+        "max": 1.2585742991981088,
+        "median": 1.0561307732844725,
+        "min": 0.8223592140450823,
+        "ratios": [
+          0.8223592140450823,
+          1.0561307732844725,
+          1.2585742991981088
+        ]
+      },
+      "control": "imbl",
+      "median_change": 0.5575694362273322,
+      "size": 10000,
+      "workload": "retained_replacements"
+    },
+    {
+      "baseline": {
+        "max": 2.1536550277996516,
+        "median": 2.007600027073579,
+        "min": 1.0415240074333818,
+        "ratios": [
+          2.007600027073579,
+          2.1536550277996516,
+          1.0415240074333818
+        ]
+      },
+      "branch": {
+        "max": 1.0461570865628915,
+        "median": 0.9247899230897807,
+        "min": 0.71047531397204,
+        "ratios": [
+          1.0461570865628915,
+          0.9247899230897807,
+          0.71047531397204
+        ]
+      },
+      "control": "imbl",
+      "median_change": 0.4606445061857368,
+      "size": 50000,
+      "workload": "retained_replacements"
+    },
+    {
+      "baseline": {
+        "max": 8.040767674436358,
+        "median": 7.747038686213588,
+        "min": 4.168338883217111,
+        "ratios": [
+          8.040767674436358,
+          7.747038686213588,
+          4.168338883217111
+        ]
+      },
+      "branch": {
+        "max": 9.941655412479948,
+        "median": 5.760827301478695,
+        "min": 5.464243063252342,
+        "ratios": [
+          5.760827301478695,
+          9.941655412479948,
+          5.464243063252342
+        ]
+      },
+      "control": "hashmap",
+      "median_change": 0.7436166946901274,
+      "size": 1000,
+      "workload": "lookup"
+    },
+    {
+      "baseline": {
+        "max": 8.998636377071394,
+        "median": 5.858487684923237,
+        "min": 3.7542998527713984,
+        "ratios": [
+          8.998636377071394,
+          3.7542998527713984,
+          5.858487684923237
+        ]
+      },
+      "branch": {
+        "max": 7.782044231757032,
+        "median": 7.553025596215238,
+        "min": 3.8881595067567702,
+        "ratios": [
+          3.8881595067567702,
+          7.553025596215238,
+          7.782044231757032
+        ]
+      },
+      "control": "hashmap",
+      "median_change": 1.289244938698579,
+      "size": 50000,
+      "workload": "lookup"
+    }
+  ],
+  "runs": {
+    "1-baseline": {
+      "benchmarks": {
+        "state_lookup/hamt/1000": {
+          "lower_ns": 1136.9357986241262,
+          "mean_ns": 1402.391060238573,
+          "median_ns": 1553.5416988218346,
+          "standard_error_ns": 129.4964647178084,
+          "upper_ns": 1641.3748458021887
+        },
+        "state_lookup/hamt/50000": {
+          "lower_ns": 1063.1247597787315,
+          "mean_ns": 1147.243528665148,
+          "median_ns": 1113.8098160362365,
+          "standard_error_ns": 47.58744214939662,
+          "upper_ns": 1247.9228373331214
+        },
+        "state_lookup/hashmap/1000": {
+          "lower_ns": 156.3539671730773,
+          "mean_ns": 174.41009577942788,
+          "median_ns": 165.78856479028047,
+          "standard_error_ns": 10.400397283648498,
+          "upper_ns": 196.7595979048902
+        },
+        "state_lookup/hashmap/50000": {
+          "lower_ns": 112.10282590089847,
+          "mean_ns": 127.49081978557714,
+          "median_ns": 115.975614963087,
+          "standard_error_ns": 9.552177645274622,
+          "upper_ns": 148.6526746895526
+        },
+        "state_retained_replacements/hamt/100": {
+          "lower_ns": 5024506.0905046305,
+          "mean_ns": 5985617.279272486,
+          "median_ns": 6133578.544973545,
+          "standard_error_ns": 484155.5551516455,
+          "upper_ns": 6921969.821733796
+        },
+        "state_retained_replacements/hamt/1000": {
+          "lower_ns": 98177397.17875001,
+          "mean_ns": 120399051.75,
+          "median_ns": 119459210.75,
+          "standard_error_ns": 12131780.431953406,
+          "upper_ns": 145477490.15
+        },
+        "state_retained_replacements/hamt/10000": {
+          "lower_ns": 2444113500.5,
+          "mean_ns": 2662439889.6,
+          "median_ns": 2529228724.5,
+          "standard_error_ns": 121999756.02189371,
+          "upper_ns": 2919750584.7
+        },
+        "state_retained_replacements/hamt/50000": {
+          "lower_ns": 12848855206.8,
+          "mean_ns": 14678093581.9,
+          "median_ns": 15196806502.5,
+          "standard_error_ns": 946691267.5029864,
+          "upper_ns": 16546652178.2
+        },
+        "state_retained_replacements/imbl/100": {
+          "lower_ns": 4306094.055900794,
+          "mean_ns": 4845674.068634922,
+          "median_ns": 4438716.05,
+          "standard_error_ns": 311421.27717372926,
+          "upper_ns": 5510219.080444445
+        },
+        "state_retained_replacements/imbl/1000": {
+          "lower_ns": 124716918.54124999,
+          "mean_ns": 137100951.15,
+          "median_ns": 135092271.75,
+          "standard_error_ns": 6525120.706833266,
+          "upper_ns": 150266777.58124998
+        },
+        "state_retained_replacements/imbl/10000": {
+          "lower_ns": 1298401567.29,
+          "mean_ns": 1405597815.9,
+          "median_ns": 1406611222.0,
+          "standard_error_ns": 53416695.33277675,
+          "upper_ns": 1506734565.3
+        },
+        "state_retained_replacements/imbl/50000": {
+          "lower_ns": 6012722216.2,
+          "mean_ns": 7311263889.2,
+          "median_ns": 6148390208.0,
+          "standard_error_ns": 718741450.262782,
+          "upper_ns": 8818364661.294998
+        },
+        "state_retained_updates/hamt/100": {
+          "lower_ns": 2805482.723571429,
+          "mean_ns": 3081062.029007937,
+          "median_ns": 3186520.938095238,
+          "standard_error_ns": 138126.52669012148,
+          "upper_ns": 3343974.3153968253
+        },
+        "state_retained_updates/hamt/1000": {
+          "lower_ns": 30704275.917499997,
+          "mean_ns": 34158062.96666666,
+          "median_ns": 33142154.833333336,
+          "standard_error_ns": 1768106.9283780667,
+          "upper_ns": 37607883.721666664
+        },
+        "state_retained_updates/hamt/10000": {
+          "lower_ns": 596223194.5699999,
+          "mean_ns": 664073743.0,
+          "median_ns": 691442892.0,
+          "standard_error_ns": 34184378.65856885,
+          "upper_ns": 729268478.2
+        },
+        "state_retained_updates/hamt/50000": {
+          "lower_ns": 7638947238.705001,
+          "mean_ns": 8796650755.9,
+          "median_ns": 9320037113.0,
+          "standard_error_ns": 565752905.9477109,
+          "upper_ns": 9844458948.385
+        },
+        "state_retained_updates/imbl/100": {
+          "lower_ns": 1500219.5787654324,
+          "mean_ns": 1794663.4497707232,
+          "median_ns": 1668346.8703703703,
+          "standard_error_ns": 158975.57621965025,
+          "upper_ns": 2121979.2091080244
+        },
+        "state_retained_updates/imbl/1000": {
+          "lower_ns": 23355241.355555557,
+          "mean_ns": 25141409.740317456,
+          "median_ns": 24734920.583333336,
+          "standard_error_ns": 1000689.4340471941,
+          "upper_ns": 27292542.284674596
+        },
+        "state_retained_updates/imbl/10000": {
+          "lower_ns": 563795333.5,
+          "mean_ns": 616510363.9,
+          "median_ns": 622114848.0,
+          "standard_error_ns": 27499536.35135604,
+          "upper_ns": 670933182.895
+        },
+        "state_retained_updates/imbl/50000": {
+          "lower_ns": 8732487101.58,
+          "mean_ns": 9230187530.3,
+          "median_ns": 9081116533.5,
+          "standard_error_ns": 258104267.0958797,
+          "upper_ns": 9738260522.3625
+        }
+      },
+      "commit": "496a77a",
+      "ref": "unknown",
+      "runner": "shared development host; alternating A/B",
+      "timestamp": "unknown"
+    },
+    "1-branch": {
+      "benchmarks": {
+        "state_lookup/hamt/1000": {
+          "lower_ns": 1631.5653952485113,
+          "mean_ns": 1861.4258248919327,
+          "median_ns": 1800.5314608903473,
+          "standard_error_ns": 123.30019376184906,
+          "upper_ns": 2114.26800579415
+        },
+        "state_lookup/hamt/50000": {
+          "lower_ns": 1030.8494192777175,
+          "mean_ns": 1098.4109035671695,
+          "median_ns": 1105.4444450869726,
+          "standard_error_ns": 34.853750569866534,
+          "upper_ns": 1166.9432160177867
+        },
+        "state_lookup/hashmap/1000": {
+          "lower_ns": 266.01640873940744,
+          "mean_ns": 323.1177967119653,
+          "median_ns": 313.87067033597475,
+          "standard_error_ns": 32.2006328406669,
+          "upper_ns": 391.99746874215634
+        },
+        "state_lookup/hashmap/50000": {
+          "lower_ns": 244.6768407933929,
+          "mean_ns": 282.5015027440031,
+          "median_ns": 284.0334297746631,
+          "standard_error_ns": 18.11215132026383,
+          "upper_ns": 315.87738833036553
+        },
+        "state_retained_replacements/hamt/100": {
+          "lower_ns": 2274138.078864501,
+          "mean_ns": 2988991.9201355823,
+          "median_ns": 3390691.482638889,
+          "standard_error_ns": 359373.67711020994,
+          "upper_ns": 3677890.4280555556
+        },
+        "state_retained_replacements/hamt/1000": {
+          "lower_ns": 23665474.33583333,
+          "mean_ns": 26615884.033333335,
+          "median_ns": 26821490.166666668,
+          "standard_error_ns": 1497533.9643286385,
+          "upper_ns": 29496841.233333327
+        },
+        "state_retained_replacements/hamt/10000": {
+          "lower_ns": 460391671.0,
+          "mean_ns": 570407256.9,
+          "median_ns": 578021813.0,
+          "standard_error_ns": 56601672.43888516,
+          "upper_ns": 681200784.8549998
+        },
+        "state_retained_replacements/hamt/50000": {
+          "lower_ns": 5209933507.7,
+          "mean_ns": 5910091073.6,
+          "median_ns": 5604568831.0,
+          "standard_error_ns": 395801878.1447049,
+          "upper_ns": 6748867906.019999
+        },
+        "state_retained_replacements/imbl/100": {
+          "lower_ns": 1737663.647353316,
+          "mean_ns": 2172778.300731293,
+          "median_ns": 2303670.523809524,
+          "standard_error_ns": 217303.38214675698,
+          "upper_ns": 2584750.6499158163
+        },
+        "state_retained_replacements/imbl/1000": {
+          "lower_ns": 10614130.373611111,
+          "mean_ns": 16082693.097361108,
+          "median_ns": 11169191.1,
+          "standard_error_ns": 3673284.255941044,
+          "upper_ns": 23688105.06
+        },
+        "state_retained_replacements/imbl/10000": {
+          "lower_ns": 563859188.5,
+          "mean_ns": 693622990.0,
+          "median_ns": 788227878.5,
+          "standard_error_ns": 63442357.3562828,
+          "upper_ns": 810610741.7825
+        },
+        "state_retained_replacements/imbl/50000": {
+          "lower_ns": 4656186673.8,
+          "mean_ns": 5649334263.0,
+          "median_ns": 5544108446.0,
+          "standard_error_ns": 505353895.08330977,
+          "upper_ns": 6632946015.1
+        },
+        "state_retained_updates/hamt/100": {
+          "lower_ns": 1655928.7075314154,
+          "mean_ns": 1806922.1967857145,
+          "median_ns": 1712250.25,
+          "standard_error_ns": 87075.8816221816,
+          "upper_ns": 1993612.632900794
+        },
+        "state_retained_updates/hamt/1000": {
+          "lower_ns": 36741574.96666666,
+          "mean_ns": 40846945.96666666,
+          "median_ns": 36916334.33333333,
+          "standard_error_ns": 2202298.1067477143,
+          "upper_ns": 45348195.48833333
+        },
+        "state_retained_updates/hamt/10000": {
+          "lower_ns": 541723014.9,
+          "mean_ns": 578031519.2,
+          "median_ns": 587776056.5,
+          "standard_error_ns": 17684745.6414814,
+          "upper_ns": 610822960.49
+        },
+        "state_retained_updates/hamt/50000": {
+          "lower_ns": 5900108885.1,
+          "mean_ns": 7117663962.0,
+          "median_ns": 7442931820.0,
+          "standard_error_ns": 591888877.352435,
+          "upper_ns": 8203886981.8
+        },
+        "state_retained_updates/imbl/100": {
+          "lower_ns": 1415055.6492307694,
+          "mean_ns": 1551411.2135592187,
+          "median_ns": 1618967.8021978023,
+          "standard_error_ns": 66140.71786987344,
+          "upper_ns": 1673511.80993895
+        },
+        "state_retained_updates/imbl/1000": {
+          "lower_ns": 20543978.686666667,
+          "mean_ns": 27905130.8,
+          "median_ns": 33187930.166666668,
+          "standard_error_ns": 3711957.627730315,
+          "upper_ns": 34956073.571666665
+        },
+        "state_retained_updates/imbl/10000": {
+          "lower_ns": 257611924.1,
+          "mean_ns": 318332894.0,
+          "median_ns": 298307770.5,
+          "standard_error_ns": 33058564.530822538,
+          "upper_ns": 386425450.96249986
+        },
+        "state_retained_updates/imbl/50000": {
+          "lower_ns": 5634869005.655001,
+          "mean_ns": 6046224642.7,
+          "median_ns": 5922303607.0,
+          "standard_error_ns": 221901114.67620102,
+          "upper_ns": 6498480077.3
+        }
+      },
+      "commit": "working-tree",
+      "ref": "unknown",
+      "runner": "shared development host; alternating A/B",
+      "timestamp": "unknown"
+    },
+    "2-baseline": {
+      "benchmarks": {
+        "state_lookup/hamt/1000": {
+          "lower_ns": 638.6263169094358,
+          "mean_ns": 722.2925213992523,
+          "median_ns": 760.5429525939423,
+          "standard_error_ns": 42.60437123909126,
+          "upper_ns": 803.9323775463482
+        },
+        "state_lookup/hamt/50000": {
+          "lower_ns": 341.2485513894727,
+          "mean_ns": 413.5711170427363,
+          "median_ns": 355.4869902337365,
+          "standard_error_ns": 51.123783279405465,
+          "upper_ns": 527.1006883733661
+        },
+        "state_lookup/hashmap/1000": {
+          "lower_ns": 83.25748559812868,
+          "mean_ns": 93.23466044962751,
+          "median_ns": 98.4428460242064,
+          "standard_error_ns": 4.611414511005475,
+          "upper_ns": 101.04920644133176
+        },
+        "state_lookup/hashmap/50000": {
+          "lower_ns": 102.42903534584974,
+          "mean_ns": 110.15931951664462,
+          "median_ns": 103.03896000963776,
+          "standard_error_ns": 4.055119991107432,
+          "upper_ns": 118.30793385153275
+        },
+        "state_retained_replacements/hamt/100": {
+          "lower_ns": 1372779.2869999998,
+          "mean_ns": 1798753.2860416665,
+          "median_ns": 1700960.8125,
+          "standard_error_ns": 219392.7481536074,
+          "upper_ns": 2228248.5196979167
+        },
+        "state_retained_replacements/hamt/1000": {
+          "lower_ns": 32693141.398160715,
+          "mean_ns": 38652011.507896826,
+          "median_ns": 35559669.77083333,
+          "standard_error_ns": 3300902.2704459163,
+          "upper_ns": 45526227.916033715
+        },
+        "state_retained_replacements/hamt/10000": {
+          "lower_ns": 902420880.1,
+          "mean_ns": 1031140711.5,
+          "median_ns": 1016865604.0,
+          "standard_error_ns": 70996459.4226804,
+          "upper_ns": 1179499233.6575
+        },
+        "state_retained_replacements/hamt/50000": {
+          "lower_ns": 5066809715.6,
+          "mean_ns": 6378875216.8,
+          "median_ns": 6573916148.5,
+          "standard_error_ns": 659186699.5168129,
+          "upper_ns": 7638410896.084999
+        },
+        "state_retained_replacements/imbl/100": {
+          "lower_ns": 545950.2045124717,
+          "mean_ns": 653226.9668594105,
+          "median_ns": 726666.753968254,
+          "standard_error_ns": 53872.54749737786,
+          "upper_ns": 755959.1292613378
+        },
+        "state_retained_replacements/imbl/1000": {
+          "lower_ns": 28613498.83102678,
+          "mean_ns": 32939742.0538492,
+          "median_ns": 35153512.7,
+          "standard_error_ns": 2118834.0383166433,
+          "upper_ns": 36903983.15218749
+        },
+        "state_retained_replacements/imbl/10000": {
+          "lower_ns": 311280902.1,
+          "mean_ns": 353438375.6,
+          "median_ns": 346633702.0,
+          "standard_error_ns": 21375640.688092243,
+          "upper_ns": 394747878.3575
+        },
+        "state_retained_replacements/imbl/50000": {
+          "lower_ns": 2723549864.9474998,
+          "mean_ns": 2961883465.3,
+          "median_ns": 2920123822.5,
+          "standard_error_ns": 122803152.57770507,
+          "upper_ns": 3201194116.3
+        },
+        "state_retained_updates/hamt/100": {
+          "lower_ns": 2547742.488732143,
+          "mean_ns": 2843106.112896825,
+          "median_ns": 2856443.586309524,
+          "standard_error_ns": 163107.51363366857,
+          "upper_ns": 3184002.70515873
+        },
+        "state_retained_updates/hamt/1000": {
+          "lower_ns": 40865821.8,
+          "mean_ns": 43704560.2,
+          "median_ns": 41404156.25,
+          "standard_error_ns": 1669276.5521645988,
+          "upper_ns": 47301106.05374999
+        },
+        "state_retained_updates/hamt/10000": {
+          "lower_ns": 590949544.1,
+          "mean_ns": 753385674.1,
+          "median_ns": 823026317.0,
+          "standard_error_ns": 82382122.93981032,
+          "upper_ns": 911744759.3
+        },
+        "state_retained_updates/hamt/50000": {
+          "lower_ns": 1625361632.2,
+          "mean_ns": 2073428145.2,
+          "median_ns": 1974375973.5,
+          "standard_error_ns": 238535506.98292005,
+          "upper_ns": 2555904482.6
+        },
+        "state_retained_updates/imbl/100": {
+          "lower_ns": 1974734.1218981482,
+          "mean_ns": 2184217.097962963,
+          "median_ns": 2200045.1296296297,
+          "standard_error_ns": 111770.555995119,
+          "upper_ns": 2412347.122148148
+        },
+        "state_retained_updates/imbl/1000": {
+          "lower_ns": 60448375.48000001,
+          "mean_ns": 66780107.833333336,
+          "median_ns": 66915142.16666667,
+          "standard_error_ns": 3438280.693624078,
+          "upper_ns": 73833415.83333334
+        },
+        "state_retained_updates/imbl/10000": {
+          "lower_ns": 294122976.9675,
+          "mean_ns": 334126812.9,
+          "median_ns": 355578137.0,
+          "standard_error_ns": 18932327.876408417,
+          "upper_ns": 367501121.15500003
+        },
+        "state_retained_updates/imbl/50000": {
+          "lower_ns": 2849951715.6825004,
+          "mean_ns": 3220988189.6,
+          "median_ns": 3123701334.5,
+          "standard_error_ns": 203241573.12309733,
+          "upper_ns": 3641376171.6875
+        }
+      },
+      "commit": "496a77a",
+      "ref": "unknown",
+      "runner": "shared development host; alternating A/B",
+      "timestamp": "unknown"
+    },
+    "2-branch": {
+      "benchmarks": {
+        "state_lookup/hamt/1000": {
+          "lower_ns": 1033.302453951613,
+          "mean_ns": 1184.621162353884,
+          "median_ns": 1120.9897912642198,
+          "standard_error_ns": 79.4258281550204,
+          "upper_ns": 1342.203089120477
+        },
+        "state_lookup/hamt/50000": {
+          "lower_ns": 742.469268615078,
+          "mean_ns": 859.2386366501463,
+          "median_ns": 870.5121208488875,
+          "standard_error_ns": 58.32212545707422,
+          "upper_ns": 971.8115951133356
+        },
+        "state_lookup/hashmap/1000": {
+          "lower_ns": 92.56664044461259,
+          "mean_ns": 119.15733479022083,
+          "median_ns": 123.91980026643202,
+          "standard_error_ns": 13.810039026144738,
+          "upper_ns": 146.51376429753378
+        },
+        "state_lookup/hashmap/50000": {
+          "lower_ns": 111.10911141948172,
+          "mean_ns": 113.76085327722232,
+          "median_ns": 113.02229799621705,
+          "standard_error_ns": 1.408907713971809,
+          "upper_ns": 116.60053050164237
+        },
+        "state_retained_replacements/hamt/100": {
+          "lower_ns": 4068717.1246230155,
+          "mean_ns": 5726060.210734127,
+          "median_ns": 4589320.378472222,
+          "standard_error_ns": 1145782.7616667168,
+          "upper_ns": 8285230.3694910705
+        },
+        "state_retained_replacements/hamt/1000": {
+          "lower_ns": 66255018.64875001,
+          "mean_ns": 71605449.95,
+          "median_ns": 68181476.75,
+          "standard_error_ns": 2975566.360321516,
+          "upper_ns": 77818105.78375
+        },
+        "state_retained_replacements/hamt/10000": {
+          "lower_ns": 684132777.4350001,
+          "mean_ns": 837769295.2,
+          "median_ns": 914515672.5,
+          "standard_error_ns": 76896630.24364045,
+          "upper_ns": 983548025.5
+        },
+        "state_retained_replacements/hamt/50000": {
+          "lower_ns": 5274991059.7,
+          "mean_ns": 5831780157.1,
+          "median_ns": 5771808321.0,
+          "standard_error_ns": 298104561.5312339,
+          "upper_ns": 6443968305.332499
+        },
+        "state_retained_replacements/imbl/100": {
+          "lower_ns": 1861823.110600907,
+          "mean_ns": 2560862.7064172337,
+          "median_ns": 2411301.4479591837,
+          "standard_error_ns": 369451.5401183227,
+          "upper_ns": 3295558.313785714
+        },
+        "state_retained_replacements/imbl/1000": {
+          "lower_ns": 47709944.07875001,
+          "mean_ns": 82499049.15,
+          "median_ns": 72266132.75,
+          "standard_error_ns": 19918327.693096373,
+          "upper_ns": 124448082.20499998
+        },
+        "state_retained_replacements/imbl/10000": {
+          "lower_ns": 692586876.3675001,
+          "mean_ns": 793243901.6,
+          "median_ns": 724889149.0,
+          "standard_error_ns": 57095905.82654345,
+          "upper_ns": 914563262.0
+        },
+        "state_retained_replacements/imbl/50000": {
+          "lower_ns": 5079167394.2,
+          "mean_ns": 6306059367.1,
+          "median_ns": 6199819111.0,
+          "standard_error_ns": 668553074.2641325,
+          "upper_ns": 7687665855.0
+        },
+        "state_retained_updates/hamt/100": {
+          "lower_ns": 2925664.617203571,
+          "mean_ns": 4042491.3483095234,
+          "median_ns": 2901186.66,
+          "standard_error_ns": 588111.7498671765,
+          "upper_ns": 5235960.686374997
+        },
+        "state_retained_updates/hamt/1000": {
+          "lower_ns": 40167371.741666675,
+          "mean_ns": 52561720.99999999,
+          "median_ns": 41760679.0,
+          "standard_error_ns": 7159649.292209215,
+          "upper_ns": 67889579.83333334
+        },
+        "state_retained_updates/hamt/10000": {
+          "lower_ns": 770263892.7,
+          "mean_ns": 940061597.1,
+          "median_ns": 990420505.0,
+          "standard_error_ns": 84047427.42579983,
+          "upper_ns": 1099057064.1
+        },
+        "state_retained_updates/hamt/50000": {
+          "lower_ns": 6186836531.1,
+          "mean_ns": 6844693986.2,
+          "median_ns": 7022959576.0,
+          "standard_error_ns": 325883833.30910224,
+          "upper_ns": 7457678948.2
+        },
+        "state_retained_updates/imbl/100": {
+          "lower_ns": 1911907.6619855438,
+          "mean_ns": 2045696.982553855,
+          "median_ns": 1987218.7762896824,
+          "standard_error_ns": 72309.87799043913,
+          "upper_ns": 2193536.090560161
+        },
+        "state_retained_updates/imbl/1000": {
+          "lower_ns": 30473171.87396826,
+          "mean_ns": 33611334.3140873,
+          "median_ns": 33526592.5625,
+          "standard_error_ns": 1619228.1453887792,
+          "upper_ns": 36776814.53492064
+        },
+        "state_retained_updates/imbl/10000": {
+          "lower_ns": 697823066.2,
+          "mean_ns": 805641792.6,
+          "median_ns": 810502315.5,
+          "standard_error_ns": 55104777.68778252,
+          "upper_ns": 913374056.6
+        },
+        "state_retained_updates/imbl/50000": {
+          "lower_ns": 5475921445.0,
+          "mean_ns": 5810457803.2,
+          "median_ns": 5726031471.0,
+          "standard_error_ns": 180742432.95907006,
+          "upper_ns": 6182233918.1
+        }
+      },
+      "commit": "working-tree",
+      "ref": "unknown",
+      "runner": "shared development host; alternating A/B",
+      "timestamp": "unknown"
+    },
+    "3-baseline": {
+      "benchmarks": {
+        "state_lookup/hamt/1000": {
+          "lower_ns": 636.221765871808,
+          "mean_ns": 886.1221142391369,
+          "median_ns": 864.3272941271966,
+          "standard_error_ns": 133.49314177378588,
+          "upper_ns": 1157.771521852333
+        },
+        "state_lookup/hamt/50000": {
+          "lower_ns": 1045.1761266787876,
+          "mean_ns": 1350.5992458374392,
+          "median_ns": 1378.6954330960014,
+          "standard_error_ns": 153.17723896092863,
+          "upper_ns": 1645.7159748363424
+        },
+        "state_lookup/hashmap/1000": {
+          "lower_ns": 170.90608799802192,
+          "mean_ns": 212.58399066518086,
+          "median_ns": 216.41600075601735,
+          "standard_error_ns": 21.282190207750126,
+          "upper_ns": 254.1755331582968
+        },
+        "state_lookup/hashmap/50000": {
+          "lower_ns": 185.33172263474003,
+          "mean_ns": 230.53718271239072,
+          "median_ns": 251.02167056109496,
+          "standard_error_ns": 22.25177360846572,
+          "upper_ns": 272.27847417032115
+        },
+        "state_retained_replacements/hamt/100": {
+          "lower_ns": 4910850.32327738,
+          "mean_ns": 5095004.24815873,
+          "median_ns": 5083164.275,
+          "standard_error_ns": 97786.7882894336,
+          "upper_ns": 5293456.089924206
+        },
+        "state_retained_replacements/hamt/1000": {
+          "lower_ns": 33229869.75,
+          "mean_ns": 46286035.25,
+          "median_ns": 40997269.75,
+          "standard_error_ns": 7109974.765789261,
+          "upper_ns": 60945386.70999999
+        },
+        "state_retained_replacements/hamt/10000": {
+          "lower_ns": 474266175.5600001,
+          "mean_ns": 670626787.6,
+          "median_ns": 591145289.0,
+          "standard_error_ns": 109017389.15343043,
+          "upper_ns": 899055324.1449997
+        },
+        "state_retained_replacements/hamt/50000": {
+          "lower_ns": 3958668902.2,
+          "mean_ns": 4520129582.6,
+          "median_ns": 4251030562.5,
+          "standard_error_ns": 299875972.27900356,
+          "upper_ns": 5129336731.15
+        },
+        "state_retained_replacements/imbl/100": {
+          "lower_ns": 2390016.087152778,
+          "mean_ns": 2609166.0866319444,
+          "median_ns": 2512203.28125,
+          "standard_error_ns": 114804.11136207728,
+          "upper_ns": 2840654.874292535
+        },
+        "state_retained_replacements/imbl/1000": {
+          "lower_ns": 86914927.9,
+          "mean_ns": 98213432.55,
+          "median_ns": 99440860.75,
+          "standard_error_ns": 5724248.991167996,
+          "upper_ns": 109294673.22375
+        },
+        "state_retained_replacements/imbl/10000": {
+          "lower_ns": 664670987.4,
+          "mean_ns": 825729575.4,
+          "median_ns": 774463379.0,
+          "standard_error_ns": 85402662.1933185,
+          "upper_ns": 997496143.4499997
+        },
+        "state_retained_replacements/imbl/50000": {
+          "lower_ns": 3379090455.1,
+          "mean_ns": 4339918763.6,
+          "median_ns": 4608842377.5,
+          "standard_error_ns": 503260582.61713266,
+          "upper_ns": 5343735716.212498
+        },
+        "state_retained_updates/hamt/100": {
+          "lower_ns": 1093027.5082894736,
+          "mean_ns": 1242141.8166854638,
+          "median_ns": 1337677.601754386,
+          "standard_error_ns": 74243.64963751691,
+          "upper_ns": 1382727.0260161343
+        },
+        "state_retained_updates/hamt/1000": {
+          "lower_ns": 13020496.519861111,
+          "mean_ns": 15982732.035099208,
+          "median_ns": 16691944.0625,
+          "standard_error_ns": 1549335.7011640824,
+          "upper_ns": 19101194.848968755
+        },
+        "state_retained_updates/hamt/10000": {
+          "lower_ns": 318900777.49750006,
+          "mean_ns": 392649354.5,
+          "median_ns": 384657971.0,
+          "standard_error_ns": 38401705.763370164,
+          "upper_ns": 467930072.885
+        },
+        "state_retained_updates/hamt/50000": {
+          "lower_ns": 2979562537.4375,
+          "mean_ns": 3585947789.7,
+          "median_ns": 3631570572.0,
+          "standard_error_ns": 304697231.3896392,
+          "upper_ns": 4169307115.3
+        },
+        "state_retained_updates/imbl/100": {
+          "lower_ns": 649234.4240422078,
+          "mean_ns": 738757.1203174605,
+          "median_ns": 765271.5156565655,
+          "standard_error_ns": 40540.34883964826,
+          "upper_ns": 803260.883109668
+        },
+        "state_retained_updates/imbl/1000": {
+          "lower_ns": 18020613.953494046,
+          "mean_ns": 20024216.88456349,
+          "median_ns": 19991874.270833336,
+          "standard_error_ns": 1123345.380296639,
+          "upper_ns": 22390732.81027778
+        },
+        "state_retained_updates/imbl/10000": {
+          "lower_ns": 272355157.2,
+          "mean_ns": 293190547.5,
+          "median_ns": 293677394.0,
+          "standard_error_ns": 10271384.872671815,
+          "upper_ns": 312586743.9
+        },
+        "state_retained_updates/imbl/50000": {
+          "lower_ns": 5892900103.8,
+          "mean_ns": 7022327210.0,
+          "median_ns": 7025238896.5,
+          "standard_error_ns": 540586746.567666,
+          "upper_ns": 8018240732.5325
+        }
+      },
+      "commit": "496a77a",
+      "ref": "unknown",
+      "runner": "shared development host; alternating A/B",
+      "timestamp": "unknown"
+    },
+    "3-branch": {
+      "benchmarks": {
+        "state_lookup/hamt/1000": {
+          "lower_ns": 1344.550638726258,
+          "mean_ns": 1809.4652420448401,
+          "median_ns": 1440.2523020257827,
+          "standard_error_ns": 246.16824387090352,
+          "upper_ns": 2304.421088617685
+        },
+        "state_lookup/hamt/50000": {
+          "lower_ns": 1444.3735249154697,
+          "mean_ns": 2005.9201386787493,
+          "median_ns": 1851.8814352959039,
+          "standard_error_ns": 324.80798843380285,
+          "upper_ns": 2708.56675972473
+        },
+        "state_lookup/hashmap/1000": {
+          "lower_ns": 240.86722154824474,
+          "mean_ns": 331.14655060161954,
+          "median_ns": 262.7553604161171,
+          "standard_error_ns": 52.60310154182018,
+          "upper_ns": 444.3101816030388
+        },
+        "state_lookup/hashmap/50000": {
+          "lower_ns": 220.91796100110008,
+          "mean_ns": 257.7626236680811,
+          "median_ns": 245.22981553512494,
+          "standard_error_ns": 19.707050200341303,
+          "upper_ns": 297.6191207920792
+        },
+        "state_retained_replacements/hamt/100": {
+          "lower_ns": 1189193.6415384617,
+          "mean_ns": 1542930.051697192,
+          "median_ns": 1239510.352991453,
+          "standard_error_ns": 210280.42242373148,
+          "upper_ns": 2003393.4315873017
+        },
+        "state_retained_replacements/hamt/1000": {
+          "lower_ns": 22128951.2575,
+          "mean_ns": 29972576.456230164,
+          "median_ns": 29207421.555555556,
+          "standard_error_ns": 4120837.1339347847,
+          "upper_ns": 38164384.861944444
+        },
+        "state_retained_replacements/hamt/10000": {
+          "lower_ns": 285958717.7,
+          "mean_ns": 319315399.2,
+          "median_ns": 317364257.5,
+          "standard_error_ns": 16724024.703932278,
+          "upper_ns": 351217491.6
+        },
+        "state_retained_replacements/hamt/50000": {
+          "lower_ns": 2367052812.1,
+          "mean_ns": 2680170155.3,
+          "median_ns": 2711596584.0,
+          "standard_error_ns": 161724755.2642165,
+          "upper_ns": 2999094087.0
+        },
+        "state_retained_replacements/imbl/100": {
+          "lower_ns": 488663.6101053113,
+          "mean_ns": 531140.9184691698,
+          "median_ns": 501700.45641025645,
+          "standard_error_ns": 24760.919464349256,
+          "upper_ns": 584649.7631478936
+        },
+        "state_retained_replacements/imbl/1000": {
+          "lower_ns": 14061429.366666665,
+          "mean_ns": 19653346.833333336,
+          "median_ns": 15219724.333333332,
+          "standard_error_ns": 3235097.0766336448,
+          "upper_ns": 26574940.555833325
+        },
+        "state_retained_replacements/imbl/10000": {
+          "lower_ns": 203766788.7,
+          "mean_ns": 253711997.3,
+          "median_ns": 259061913.0,
+          "standard_error_ns": 27418899.79201297,
+          "upper_ns": 310189461.7
+        },
+        "state_retained_replacements/imbl/50000": {
+          "lower_ns": 2778990425.3,
+          "mean_ns": 3772362111.1,
+          "median_ns": 3448848032.0,
+          "standard_error_ns": 536934696.1174395,
+          "upper_ns": 4870733388.41
+        },
+        "state_retained_updates/hamt/100": {
+          "lower_ns": 3042156.028968254,
+          "mean_ns": 3402940.618168934,
+          "median_ns": 3159348.5678571425,
+          "standard_error_ns": 202566.2517114665,
+          "upper_ns": 3828930.3221160714
+        },
+        "state_retained_updates/hamt/1000": {
+          "lower_ns": 67566723.69000001,
+          "mean_ns": 77525982.4,
+          "median_ns": 71177258.0,
+          "standard_error_ns": 5262692.962311037,
+          "upper_ns": 88083710.74249999
+        },
+        "state_retained_updates/hamt/10000": {
+          "lower_ns": 647074968.1550001,
+          "mean_ns": 802631941.1,
+          "median_ns": 745209565.5,
+          "standard_error_ns": 81814148.08437324,
+          "upper_ns": 967113427.3
+        },
+        "state_retained_updates/hamt/50000": {
+          "lower_ns": 4837891718.4525,
+          "mean_ns": 5607646174.5,
+          "median_ns": 5370676705.0,
+          "standard_error_ns": 395271442.19549185,
+          "upper_ns": 6385926710.62
+        },
+        "state_retained_updates/imbl/100": {
+          "lower_ns": 2209600.697215609,
+          "mean_ns": 2777197.630846561,
+          "median_ns": 2947135.4333333336,
+          "standard_error_ns": 292040.9886666998,
+          "upper_ns": 3349756.3292592587
+        },
+        "state_retained_updates/imbl/1000": {
+          "lower_ns": 33411229.13476191,
+          "mean_ns": 38906955.336428575,
+          "median_ns": 36806653.125,
+          "standard_error_ns": 3015754.2910108506,
+          "upper_ns": 45136441.19476191
+        },
+        "state_retained_updates/imbl/10000": {
+          "lower_ns": 611625712.3,
+          "mean_ns": 843049442.6,
+          "median_ns": 922192864.0,
+          "standard_error_ns": 116693388.99663097,
+          "upper_ns": 1066586017.1
+        },
+        "state_retained_updates/imbl/50000": {
+          "lower_ns": 2660664508.2,
+          "mean_ns": 3261185034.1,
+          "median_ns": 2936850726.5,
+          "standard_error_ns": 324944250.08152306,
+          "upper_ns": 3927222834.4474983
+        }
+      },
+      "commit": "working-tree",
+      "ref": "unknown",
+      "runner": "shared development host; alternating A/B",
+      "timestamp": "unknown"
+    }
+  }
+}

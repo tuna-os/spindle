@@ -1,0 +1,14 @@
+{
+  "by_label_outcome": {
+    "pre-A:decrypted": 15,
+    "pre-B:decrypted": 15
+  },
+  "device": "PCCJGKHJYN",
+  "events": 30,
+  "failures": [],
+  "homeserver": "http://drill-b:8008/",
+  "how": "same device",
+  "pass": true,
+  "room": "!jJwQBRazJPYfrvvkys:reilly.asia",
+  "user": "@drill-b1:reilly.asia"
+}

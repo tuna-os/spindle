@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Spindle admin console</title>
+  <link rel="stylesheet" href="/_spindle/admin/ui/styles.css">
+</head>
+<body>
+  <header class="console-header">
+    <h1>Spindle admin console</h1>
+    <p>Baked-in operator console. Every action below calls the admin API
+    with your access token; nothing here bypasses it.</p>
+  </header>
+
+  <div class="console-layout">
+    <nav class="console-nav" aria-label="Console sections">
+      <ul>
+        <li><a href="#onboarding">Onboarding</a></li>
+        <li><a href="#sfu" aria-current="page">Voice &amp; video (SFU)</a></li>
+      </ul>
+    </nav>
+
+    <main class="console-main">
+      <section id="onboarding" aria-labelledby="onboarding-heading">
+        <h2 id="onboarding-heading">Onboarding</h2>
+        <ol class="steps">
+          <li>Create your account on this server, then make it an admin
+            with <code>spindle promote-admin &lt;config&gt; &lt;localpart&gt;</code>.</li>
+          <li>Sign in with any Matrix client and copy the access token.</li>
+          <li>Paste the token below. It stays in this tab's session
+            storage and is sent as a <code>Bearer</code> token on every
+            admin API call.</li>
+        </ol>
+        <form class="token-form" id="token-form">
+          <label for="token-input">Admin access token</label>
+          <input id="token-input" name="token" type="password"
+            autocomplete="off" spellcheck="false"
+            placeholder="syt_... / sya_...">
+          <div class="row">
+            <button type="submit">Save token</button>
+            <button type="button" class="secondary" id="token-clear">Sign out</button>
+          </div>
+          <p class="hint" id="token-state" role="status"></p>
+        </form>
+      </section>
+
+      <section id="sfu" aria-labelledby="sfu-heading">
+        <h2 id="sfu-heading">Voice &amp; video (SFU)</h2>
+        <p class="hint">Reads and flips the runtime switch at
+          <code>GET / PUT /_spindle/admin/v1/rtc/sfu</code> with body
+          <code>{"enabled": true|false}</code>. Turning the switch off
+          stops the supervised sidecar and silences every minter path;
+          turning it on starts it again on the next tick.</p>
+
+        <div class="model-line">
+          <span>Deployment model:</span>
+          <span class="model-badge" id="sfu-model">unknown</span>
+          <button type="button" class="secondary" id="sfu-refresh">Refresh status</button>
+        </div>
+
+        <div class="switch-row">
+          <input type="checkbox" id="sfu-toggle" role="switch" aria-describedby="sfu-toggle-hint">
+          <label for="sfu-toggle">SFU enabled</label>
+          <span class="hint" id="sfu-toggle-hint"></span>
+        </div>
+
+        <div class="notice error" id="sfu-error" hidden></div>
+        <div class="notice" id="sfu-notice" hidden></div>
+
+        <table class="status-table" aria-label="SFU status">
+          <tbody id="sfu-status-body">
+            <tr><th scope="row">Status</th><td>Not loaded yet.</td></tr>
+          </tbody>
+        </table>
+      </section>
+    </main>
+  </div>
+
+  <script src="/_spindle/admin/ui/app.js" defer></script>
+</body>
+</html>

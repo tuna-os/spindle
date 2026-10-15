@@ -1,5 +1,10 @@
-//! The comparison SPEC §18.1 rests on: resolving a fork our way versus running
+//! The comparison SPEC §18.1 rested on: resolving a fork our way versus running
 //! Matrix state resolution v2 over the same fork.
+//!
+//! Since ADR 0005 "our way" *is* state resolution v2 whenever the tips' states
+//! differ -- the fork merge it used to be compared against does not equal it in
+//! general -- so the Spindle arm now times only what Spindle adds in front of
+//! the shared algorithm: splitting the conflict out of two materialized states.
 //!
 //! `ruma-state-res` is the implementation Conduit, Continuwuity and Tuwunel
 //! actually run, so this is the closest thing to a like-for-like measurement
@@ -26,7 +31,7 @@ use oracle::{ALICE, RoomBuilder, auth_chains, reference_resolve_with_chains};
 use ruma::state_res::StateMap;
 use ruma::{OwnedEventId, events::TimelineEventType};
 use serde_json::json;
-use spindle_core::{EventId, EventInput, RoomLog, StateKey};
+use spindle_core::{EventId, EventInput, MemStateKeyTable, RoomLog, StateKey};
 
 /// Build a fork with `per_side` divergent state writes on each branch.
 ///
@@ -84,7 +89,7 @@ fn spindle_log(
     base: &RoomBuilder,
     branches: &[Vec<(StateKey, String)>],
 ) -> (RoomLog, Vec<EventId>) {
-    let mut log = RoomLog::new();
+    let mut log = RoomLog::new(MemStateKeyTable::shared());
     let shared = base.state_map();
     let mut ordered: Vec<_> = shared.iter().collect();
     ordered.sort_by_key(|(_, id)| id.as_str().to_owned());
@@ -151,21 +156,25 @@ fn compare(criterion: &mut Criterion) {
         );
 
         group.bench_with_input(
-            BenchmarkId::new("spindle window merge", per_side),
+            BenchmarkId::new("spindle conflict split", per_side),
             &per_side,
             |bencher, _| {
                 bencher.iter_batched(
                     || spindle_log(&fork.base, &fork.writes),
-                    |(mut log, tips)| {
-                        let window = log
-                            .fork_window(&tips, 512)
-                            .expect("the fork is within the window");
-                        let merged = log
-                            .append_local("$merge", None)
-                            .expect("a disjoint fork merges")
-                            .li;
-                        // Touch both results so neither is optimized away.
-                        (window.visited, log.state_after(merged).map(|_| ()))
+                    |(log, tips)| {
+                        // What Spindle adds in front of the resolver since ADR
+                        // 0005: the tips' materialized states compared by
+                        // content address, proportional to what differs. The
+                        // resolution itself is the same algorithm as the
+                        // reference's, so it is not timed twice.
+                        let states: Vec<_> = tips
+                            .iter()
+                            .filter_map(|tip| log.state_after_event(tip))
+                            .collect();
+                        states
+                            .first()
+                            .zip(states.get(1))
+                            .map(|(left, right)| left.diff(right).len())
                     },
                     criterion::BatchSize::SmallInput,
                 );

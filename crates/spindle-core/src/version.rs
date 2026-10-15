@@ -15,7 +15,7 @@
 use ruma::{
     CanonicalJsonObject, CanonicalJsonValue, RoomVersionId,
     canonical_json::CanonicalJsonFieldError,
-    room_version_rules::RoomVersionRules,
+    room_version_rules::{EventIdFormatVersion, RoomVersionRules},
     signatures::{JsonError, KeyPair, PublicKeyMap, VerificationError, Verified},
 };
 use sha2::{Digest, Sha256};
@@ -45,6 +45,119 @@ pub fn rules_of(version: &RoomVersionId) -> Option<RoomVersionRules> {
         return RoomVersionId::V12.rules();
     }
     version.rules()
+}
+
+/// Whether `version` names an event by the reference hash of its redacted
+/// form (v3 and later), rather than by the `event_id` its origin chose and
+/// wrote into it (v1 and v2, `$opaque:origin`).
+///
+/// The two differ in more than spelling. A v1/v2 event *carries* its ID,
+/// and so does every reference to it: `prev_events` and `auth_events` are
+/// `[event_id, {"sha256": reference_hash}]` pairs, the hash pinning the
+/// referenced event's content the way a v3+ ID does by itself.
+#[must_use]
+pub fn names_events_by_hash(version: &RoomVersionId) -> bool {
+    rules_of(version).is_some_and(|rules| rules.event_id_format != EventIdFormatVersion::V1)
+}
+
+/// The event ID of `object` under `version`'s rules.
+///
+/// v3 and later: `$` and the reference hash, computed, never read from the
+/// event. v1 and v2: the `event_id` the event carries, which must be a
+/// `$opaque:server` ID. Its server must also have signed the event; that is
+/// ruma's to check at verification (`check_event_id_server`).
+///
+/// # Errors
+///
+/// Returns [`VersionError`] when the version is unknown, a v1/v2 event has
+/// no well-formed `event_id`, or the hash cannot be taken.
+pub fn event_id(
+    object: &CanonicalJsonObject,
+    version: &RoomVersionId,
+) -> Result<String, VersionError> {
+    if names_events_by_hash(version) {
+        return Ok(format!("${}", reference_hash(object, version)?));
+    }
+    let Some(CanonicalJsonValue::String(claimed)) = object.get("event_id") else {
+        return Err(VersionError::Json(format!(
+            "a room v{version} event carries its event_id"
+        )));
+    };
+    let well_formed = claimed
+        .strip_prefix('$')
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(opaque, server)| !opaque.is_empty() && !server.is_empty());
+    if !well_formed {
+        return Err(VersionError::Json(format!(
+            "a room v{version} event_id is $opaque:server, not {claimed}"
+        )));
+    }
+    Ok(claimed.clone())
+}
+
+/// Whether `a` and `b` are the same event, signatures aside.
+///
+/// The reference hash covers everything but signatures and `unsigned`, so
+/// equal hashes are the same event; from v3 that is also equal IDs, while a
+/// v1/v2 ID is chosen rather than computed and has to be compared as well.
+#[must_use]
+pub fn same_event(
+    a: &CanonicalJsonObject,
+    b: &CanonicalJsonObject,
+    version: &RoomVersionId,
+) -> bool {
+    matches!(
+        (reference_hash(a, version), reference_hash(b, version)),
+        (Ok(left), Ok(right)) if left == right
+    ) && matches!(
+        (event_id(a, version), event_id(b, version)),
+        (Ok(left), Ok(right)) if left == right
+    )
+}
+
+/// One reference to `parent` as `version` writes it in `prev_events` or
+/// `auth_events`: the bare ID from v3, or `[id, {"sha256": hash}]` before.
+///
+/// # Errors
+///
+/// Returns [`VersionError`] when the parent's reference hash cannot be taken.
+pub fn edge(
+    parent_id: &str,
+    parent: &CanonicalJsonObject,
+    version: &RoomVersionId,
+) -> Result<CanonicalJsonValue, VersionError> {
+    if names_events_by_hash(version) {
+        return Ok(CanonicalJsonValue::String(parent_id.to_owned()));
+    }
+    let mut hashes = CanonicalJsonObject::new();
+    hashes.insert(
+        "sha256".to_owned(),
+        CanonicalJsonValue::String(reference_hash(parent, version)?),
+    );
+    Ok(CanonicalJsonValue::Array(vec![
+        CanonicalJsonValue::String(parent_id.to_owned()),
+        CanonicalJsonValue::Object(hashes),
+    ]))
+}
+
+/// The event IDs a `prev_events` or `auth_events` value names, whichever
+/// shape it has: bare IDs (v3+) or `[id, hashes]` pairs (v1, v2).
+#[must_use]
+pub fn edge_ids(edges: Option<&CanonicalJsonValue>) -> Vec<String> {
+    let Some(CanonicalJsonValue::Array(edges)) = edges else {
+        return Vec::new();
+    };
+    edges
+        .iter()
+        .filter_map(|edge| match edge {
+            CanonicalJsonValue::String(id) => Some(id.clone()),
+            CanonicalJsonValue::Array(pair) => match pair.first() {
+                Some(CanonicalJsonValue::String(id)) => Some(id.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 /// Redact `object` under `version`'s rules.

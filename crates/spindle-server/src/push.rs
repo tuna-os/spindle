@@ -86,11 +86,18 @@ const TICK: Duration = Duration::from_millis(100);
 /// for long.
 const SEND_BATCH: usize = 64;
 
+/// MSC4075's ring under its unstable name, which is what clients send: the
+/// MSC now calls the event `m.rtc.invite`, and kept the earlier
+/// `rtc.notification` for the unstable identifier.
+pub const RING_UNSTABLE: &str = "org.matrix.msc4075.rtc.notification";
+
 /// Whether `event_type` is a `MatrixRTC` ring (MSC4075), under the stable
 /// or the unstable name.
 #[must_use]
 pub fn is_ring(event_type: &str) -> bool {
-    event_type == "m.rtc.notification" || event_type == "org.matrix.msc4075.rtc.notification"
+    event_type == "m.rtc.notification"
+        || event_type == "m.rtc.invite"
+        || event_type == RING_UNSTABLE
 }
 
 /// The client every push goes through, and the judgement on where it may
@@ -396,6 +403,10 @@ impl Pass<'_> {
     /// Every notification `event` produces: one per `(reader, gateway,
     /// format)`, carrying every device of that reader on that gateway.
     fn notifications_for(&mut self, room_id: &str, event: &Value) -> Vec<(String, Pending)> {
+        // A dummy event merges forks (#626); it is nobody's news.
+        if crate::rooms::extremities::is_dummy_event(event) {
+            return Vec::new();
+        }
         let sender = event["sender"].as_str().unwrap_or_default().to_owned();
         let Some(facts) = self.facts_of(room_id) else {
             return Vec::new();
@@ -554,7 +565,10 @@ impl Pass<'_> {
                 .get(user_id, "", crate::push_rules::TYPE)
                 .ok()
                 .flatten()
-                .unwrap_or_else(|| crate::push_rules::defaults(user_id));
+                .map_or_else(
+                    || crate::push_rules::defaults(user_id),
+                    |stored| crate::push_rules::with_defaults(stored, user_id),
+                );
             self.rulesets.insert(user_id.to_owned(), ruleset);
         }
         self.rulesets[user_id].clone()
