@@ -31,12 +31,16 @@ python3 scripts/readme-numbers.py --check       # the README's headline numbers 
 python3 scripts/actions-pinned.py               # every action is pinned to a commit
 ```
 
-The slower suites run on pushes to main and nightly, not on pull requests:
-the Complement ratchet (`scripts/complement.sh`, needs Docker), Element
-Web and Element Call end to end, the full-mesh peer-to-peer call, the
-Neutrino mesh seam, a real bridge through the appservice API, release-mode
-performance budgets, and weekly fuzzing and coverage. `.github/workflows/`
-is the list; each job's comment says why it runs where it runs.
+Pull requests also run the Complement protected subset
+(`scripts/complement.sh`, needs Docker) with the state-resolution interop
+rooms, Element Web end to end, synadm, the protocol fixtures and the
+release-mode performance budgets; a change that touches only prose
+(Markdown, `docs/`) skips them. Pushes to main run the whole Complement
+suite, the bridges, the full-mesh peer-to-peer call and, in rotation, one
+of Element Call end to end, the Neutrino mesh seam and matrix-rust-sdk's
+suite; every night runs all of them, and fuzzing and coverage run weekly.
+`.github/workflows/` is the list; each job's comment says why it runs
+where it runs.
 
 ## What a change is expected to carry
 

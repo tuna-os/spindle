@@ -1,9 +1,14 @@
 name: Release readiness
 
+# Prose-only changes cannot move the lifecycle, so they do not start this
+# (no job here is a required check, so a run that never starts blocks
+# nothing); the nightly run covers every day regardless.
 on:
   pull_request:
+    paths-ignore: ['**.md', '**.mdx', 'docs/**', .ste-budget]
   push:
     branches: [main]
+    paths-ignore: ['**.md', '**.mdx', 'docs/**', .ste-budget]
   schedule:
     - cron: '37 4 * * *'
   workflow_dispatch:
