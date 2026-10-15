@@ -43,8 +43,9 @@ it sends too.
 Spindle rejects an event after a refusal, an invalid or absent signature, a
 transport failure, or a timeout of 30 seconds. Transport failures and invalid
 signatures return `M_FORBIDDEN`. HTTP refusals retain their status, known
-error codes from Matrix, and `retry_after_ms`. Spindle converts authentication
-errors from the remote service. These errors cannot invalidate a homeserver login.
+error codes from Matrix, and `retry_after_ms`. Spindle converts the
+authentication errors that the remote service sends. These errors cannot
+invalidate a homeserver login.
 
 A rejection leaves no successful record for the client transaction. A retry
 can succeed later. Spindle holds no room lock during the network request.
