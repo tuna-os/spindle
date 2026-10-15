@@ -1,0 +1,59 @@
+# Build-and-run pod for the rig client (mig-rig). It compiles the Rust
+# client in-cluster (the cargo cache and target dir live on the PVC, so a
+# rebuild after the first is incremental) and runs `seed` / `verify` against
+# the dark Synapse or any other homeserver URL.
+#
+# The toolbox is NOT the dark Synapse: it has normal DNS and egress so cargo
+# can fetch crates. It never holds the production signing key; it sees only
+# the rig credentials Secret and the dark Synapse's registration secret.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mig-rig-work
+  labels: {part-of: spindle-mig-rig}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests: {storage: 20Gi}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mig-rig-toolbox
+  labels: {app: mig-rig-toolbox, part-of: spindle-mig-rig}
+spec:
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  restartPolicy: Always
+  containers:
+  - name: toolbox
+    image: rust:1.94-bookworm
+    command: [sleep, infinity]
+    env:
+    - {name: CARGO_HOME, value: /work/cargo}
+    - {name: CARGO_TARGET_DIR, value: /work/target}
+    - {name: CARGO_INCREMENTAL, value: "0"}
+    - {name: CARGO_BUILD_JOBS, value: "2"}
+    - {name: CARGO_PROFILE_RELEASE_DEBUG, value: "0"}
+    - {name: RIG_HOMESERVER, value: "http://dark-synapse.spindle-rehearsal.svc.cluster.local:8008"}
+    resources:
+      # The only untainted node also runs production ESS: keep the build
+      # bounded so it cannot starve it.
+      requests: {cpu: 250m, memory: 1Gi}
+      limits: {cpu: "2", memory: 6Gi}
+    volumeMounts:
+    - {name: work, mountPath: /work}
+    - {name: rig-credentials, mountPath: /secrets/rig, readOnly: true}
+    - {name: dark-registration, mountPath: /secrets/dark, readOnly: true}
+  volumes:
+  - name: work
+    persistentVolumeClaim: {claimName: mig-rig-work}
+  - name: rig-credentials
+    secret: {secretName: spindle-mig-rig, optional: true}
+  - name: dark-registration
+    secret:
+      secretName: dark-synapse-secrets
+      optional: true
+      items:
+      - {key: registration_shared_secret, path: registration_shared_secret}
