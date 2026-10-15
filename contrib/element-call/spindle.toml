@@ -7,6 +7,9 @@
 # msc4143 (the transport below) and msc4354 (sticky events) are all served
 # and need no switch; registration is open by default; the rate limiter is
 # off because the suite registers and sends as fast as a browser can.
+# msc4502 (membership look-up) and msc4512 (request proxying) are not
+# served: the homeserver's delegation probe answers 404, so the client
+# delegates its delayed leave to the transport instead.
 [server]
 name = "synapse.m.localhost"
 bind = "0.0.0.0:8008"
@@ -20,6 +23,11 @@ filter = "info"
 
 [ratelimit]
 enabled = false
+
+[appservices]
+# lk-jwt-service runs as an appservice from 0.7.0 on, with the tokens in
+# upstream's backend/app-service.yaml (mounted by docker-compose-spindle.yml).
+registrations = ["/cfg/app-service.yaml"]
 
 [registration]
 shared_secret = "test_shared_secret_for_local_dev_only"

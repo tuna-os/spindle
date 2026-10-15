@@ -22,15 +22,20 @@
 //! statement is "this cannot be undone except from a backup", made *before*
 //! the write rather than in a release note afterwards.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::codec::{EntryRecord, SidelinedRecord};
 use crate::{Durability, FjallStore, ReadView, Record, SchemaMarker, Store, StoreError};
 use spindle_core::keys::{
     Keyspace, content_addressed, keyspace_prefix, room_from_prefixed, room_prefix, store_marker,
 };
-use spindle_core::{StateKeyTable, StateRoot, StateSnapshot, rehydrate_v2, v2_node_addresses};
+use spindle_core::{
+    MigrationStateVerifier, StateKeyTable, StateRoot, StateSnapshot, rehydrate_v2_incremental,
+    rehydrate_v2_with_addresses,
+};
 
 /// Whether a store that took this step can be handed back to the binary it
 /// came from.
@@ -283,27 +288,22 @@ fn migrate_intern_state_keys(store: &FjallStore) -> Result<u64, StoreError> {
         .filter_map(|(key, _)| room_from_prefixed(&key).map(str::to_owned))
         .collect();
     let mut rewritten = 0_u64;
-    let mut old_nodes = Vec::new();
-    for room_id in &rooms {
-        // Per room, not per store: the converted-root memo and the
-        // written-node set are bounded by the largest room, not by the
-        // largest store. Old node deletion waits until every room has
-        // converted, because content addresses can be shared across rooms.
-        let mut converted: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
-        let mut written: HashSet<[u8; 32]> = HashSet::new();
-        rewritten += migrate_room(
-            store,
-            room_id,
-            &table,
-            &mut converted,
-            &mut written,
-            &mut old_nodes,
-        )?;
+    let mut old_nodes = HashSet::new();
+    for (index, room_id) in rooms.iter().enumerate() {
+        eprintln!(
+            "migrate: state keys room {}/{}: {room_id}",
+            index + 1,
+            rooms.len()
+        );
+        // Keep room-local root and verified-node caches bounded by the
+        // largest room. Old node deletion waits until every room converts,
+        // because content addresses can be shared across rooms.
+        let mut migration = RoomMigration::new(Arc::clone(&table));
+        rewritten += migrate_room(store, room_id, &table, &mut migration, &mut old_nodes)?;
     }
     // Every record now names version-3 nodes. Version-2 tags use a
     // separate address domain, so these cannot be new nodes.
-    old_nodes.sort_unstable();
-    old_nodes.dedup();
+    eprintln!("migrate: deleting {} obsolete v2 nodes", old_nodes.len());
     for address in old_nodes {
         Store::delete(store, &content_addressed(Keyspace::StateNode, &address))?;
         rewritten += 1;
@@ -311,15 +311,61 @@ fn migrate_intern_state_keys(store: &FjallStore) -> Result<u64, StoreError> {
     Ok(rewritten)
 }
 
+struct RoomMigration {
+    converted: HashMap<[u8; 32], [u8; 32]>,
+    written: HashSet<[u8; 32]>,
+    verified: MigrationStateVerifier,
+    previous_v2: Option<(StateRoot, StateSnapshot)>,
+}
+
+impl RoomMigration {
+    fn new(table: Arc<dyn StateKeyTable>) -> Self {
+        Self {
+            converted: HashMap::new(),
+            written: HashSet::new(),
+            verified: MigrationStateVerifier::new(table, 1_000_000),
+            previous_v2: None,
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)] // Three record keyspaces share one bounded commit buffer.
 fn migrate_room(
     store: &FjallStore,
     room_id: &str,
     table: &Arc<dyn StateKeyTable>,
-    converted: &mut HashMap<[u8; 32], [u8; 32]>,
-    written: &mut HashSet<[u8; 32]>,
-    old_nodes: &mut Vec<[u8; 32]>,
+    migration: &mut RoomMigration,
+    old_nodes: &mut HashSet<[u8; 32]>,
 ) -> Result<u64, StoreError> {
+    let mut total = 0_u64;
+    for space in [
+        Keyspace::Log,
+        Keyspace::Sidelined,
+        Keyspace::FederationGapEvent,
+    ] {
+        ReadView::visit_prefix(store, &room_prefix(space, room_id), &mut |_, _| {
+            total += 1;
+            Ok(())
+        })?;
+    }
+    let started = Instant::now();
+    let mut reported = Instant::now();
+    let mut processed = 0_u64;
+    let reads = Cell::new(0_u64);
+    let mut progress = || {
+        processed += 1;
+        if reported.elapsed() >= Duration::from_secs(15) || processed == total {
+            eprintln!(
+                "migrate: room {room_id}: {processed}/{total} records checked ({}%), {} trie node reads, {:.1}s elapsed",
+                processed.saturating_mul(100) / total.max(1),
+                reads.get(),
+                started.elapsed().as_secs_f64(),
+            );
+            reported = Instant::now();
+        }
+    };
     let mut load = |address: &StateRoot| {
+        reads.set(reads.get() + 1);
         ReadView::get(
             store,
             &content_addressed(Keyspace::StateNode, address.as_bytes()),
@@ -329,61 +375,74 @@ fn migrate_room(
     };
     let mut puts: Vec<Record> = Vec::new();
     let mut count = 0_u64;
-    for (key, value) in ReadView::scan_prefix(store, &room_prefix(Keyspace::Log, room_id))? {
-        let mut record = EntryRecord::decode(&value)?;
-        let root = convert_root(
-            record.state_root,
-            table,
-            &mut load,
-            converted,
-            written,
-            &mut puts,
-            old_nodes,
-        )?;
-        if root != record.state_root {
-            record.state_root = root;
-            puts.push((key, record.encode()));
-        }
-        count += commit_chunk(store, &mut puts)?;
-    }
-    for (key, value) in ReadView::scan_prefix(store, &room_prefix(Keyspace::Sidelined, room_id))? {
-        let mut record = SidelinedRecord::decode(&value)?;
-        let root = convert_root(
-            record.state_root,
-            table,
-            &mut load,
-            converted,
-            written,
-            &mut puts,
-            old_nodes,
-        )?;
-        if root != record.state_root {
-            record.state_root = root;
-            puts.push((key, record.encode()));
-        }
-        count += commit_chunk(store, &mut puts)?;
-    }
+    ReadView::visit_prefix(
+        store,
+        &room_prefix(Keyspace::Log, room_id),
+        &mut |key, value| {
+            let mut record = EntryRecord::decode(value)?;
+            let root = convert_root(
+                record.state_root,
+                table,
+                &mut load,
+                migration,
+                &mut puts,
+                old_nodes,
+            )?;
+            if root != record.state_root {
+                record.state_root = root;
+                puts.push((key.to_vec(), record.encode()));
+            }
+            count += commit_chunk(store, &mut puts)?;
+            progress();
+            Ok(())
+        },
+    )?;
+    ReadView::visit_prefix(
+        store,
+        &room_prefix(Keyspace::Sidelined, room_id),
+        &mut |key, value| {
+            let mut record = SidelinedRecord::decode(value)?;
+            let root = convert_root(
+                record.state_root,
+                table,
+                &mut load,
+                migration,
+                &mut puts,
+                old_nodes,
+            )?;
+            if root != record.state_root {
+                record.state_root = root;
+                puts.push((key.to_vec(), record.encode()));
+            }
+            count += commit_chunk(store, &mut puts)?;
+            progress();
+            Ok(())
+        },
+    )?;
     // Gap history keeps roots outside the linear log: 32 address bytes
     // followed by the event id. These must move before old nodes go away.
-    for (key, mut value) in
-        ReadView::scan_prefix(store, &room_prefix(Keyspace::FederationGapEvent, room_id))?
-    {
-        let old: [u8; 32] = value
-            .get(..32)
-            .and_then(|bytes| bytes.try_into().ok())
-            .ok_or(crate::codec::CodecError::Truncated)?;
-        let root = convert_root(
-            old, table, &mut load, converted, written, &mut puts, old_nodes,
-        )?;
-        if root != old {
-            value
-                .get_mut(..32)
-                .ok_or(crate::codec::CodecError::Truncated)?
-                .copy_from_slice(&root);
-            puts.push((key, value));
-        }
-        count += commit_chunk(store, &mut puts)?;
-    }
+    ReadView::visit_prefix(
+        store,
+        &room_prefix(Keyspace::FederationGapEvent, room_id),
+        &mut |key, value| {
+            let mut value = value.to_vec();
+            let old: [u8; 32] = value
+                .get(..32)
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or(crate::codec::CodecError::Truncated)?;
+            let root = convert_root(old, table, &mut load, migration, &mut puts, old_nodes)?;
+            if root != old {
+                value
+                    .get_mut(..32)
+                    .ok_or(crate::codec::CodecError::Truncated)?
+                    .copy_from_slice(&root);
+                puts.push((key.to_vec(), value));
+            }
+            count += commit_chunk(store, &mut puts)?;
+            progress();
+            Ok(())
+        },
+    )?;
     // The tail below the chunk size: staged all along, committed here.
     if !puts.is_empty() {
         Store::commit_state_deferred(store, puts.as_slice(), &store.key_table())?;
@@ -419,37 +478,49 @@ fn convert_root(
     old: [u8; 32],
     table: &Arc<dyn StateKeyTable>,
     load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
-    converted: &mut HashMap<[u8; 32], [u8; 32]>,
-    written: &mut HashSet<[u8; 32]>,
+    migration: &mut RoomMigration,
     puts: &mut Vec<Record>,
-    old_nodes: &mut Vec<[u8; 32]>,
+    old_nodes: &mut HashSet<[u8; 32]>,
 ) -> Result<[u8; 32], StoreError> {
-    if let Some(root) = converted.get(&old) {
-        return Ok(*root);
-    }
-    if StateSnapshot::rehydrate(StateRoot::from_bytes(old), load, Arc::clone(table)).is_ok() {
-        converted.insert(old, old);
-        return Ok(old);
-    }
     let corrupt = |error: spindle_core::RehydrateError| {
         StoreError::Backend(format!("version-2 state trie is unreadable: {error:?}"))
     };
-    let state = rehydrate_v2(StateRoot::from_bytes(old), load, table).map_err(corrupt)?;
-    for (address, node) in state.delta_nodes(None) {
-        if written.insert(*address.as_bytes()) {
+    if let Some(root) = migration.converted.get(&old).copied() {
+        if migration
+            .previous_v2
+            .as_ref()
+            .map(|(old, _)| *old.as_bytes())
+            != Some(old)
+        {
+            // A mapped root may still be staged. Keep only a baseline that
+            // actually matches this record, without reading staged nodes.
+            migration.previous_v2 = None;
+        }
+        return Ok(root);
+    }
+    let old_root = StateRoot::from_bytes(old);
+    if migration.verified.verify(old_root, load).is_ok() {
+        migration.converted.insert(old, old);
+        migration.previous_v2 = None;
+        return Ok(old);
+    }
+    let (state, old_addresses) = if let Some((previous_root, previous)) = &migration.previous_v2 {
+        rehydrate_v2_incremental(old_root, *previous_root, previous, load).map_err(corrupt)?
+    } else {
+        rehydrate_v2_with_addresses(old_root, load, table).map_err(corrupt)?
+    };
+    let previous = migration.previous_v2.as_ref().map(|(_, state)| state);
+    for (address, node) in state.delta_nodes(previous) {
+        if migration.written.insert(*address.as_bytes()) {
             puts.push((
                 content_addressed(Keyspace::StateNode, address.as_bytes()),
                 node,
             ));
         }
     }
-    old_nodes.extend(
-        v2_node_addresses(StateRoot::from_bytes(old), load)
-            .map_err(corrupt)?
-            .into_iter()
-            .map(|root| *root.as_bytes()),
-    );
+    old_nodes.extend(old_addresses.into_iter().map(|root| *root.as_bytes()));
     let root = *state.root().as_bytes();
-    converted.insert(old, root);
+    migration.previous_v2 = Some((old_root, state));
+    migration.converted.insert(old, root);
     Ok(root)
 }

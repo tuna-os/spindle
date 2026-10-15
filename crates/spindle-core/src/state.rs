@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Weak},
 };
 
@@ -870,7 +870,7 @@ pub enum RehydrateError {
 /// depth so a verified subtree cannot bypass the decoder's recursion bound.
 /// Weak references share nodes already retained by the caller's snapshots;
 /// the cache owns only a bounded index, never additional subtree graphs.
-pub(crate) struct VerifiedNodeCache {
+pub struct VerifiedNodeCache {
     nodes: HashMap<(StateRoot, usize), CachedNode>,
     order: BTreeMap<u64, (StateRoot, usize)>,
     clock: u64,
@@ -892,7 +892,9 @@ struct CachedNode {
 }
 
 impl VerifiedNodeCache {
-    pub(crate) fn new(budget: usize) -> Self {
+    /// Create a cache whose index is bounded by `budget` bytes.
+    #[must_use]
+    pub fn new(budget: usize) -> Self {
         Self {
             nodes: HashMap::new(),
             order: BTreeMap::new(),
@@ -965,6 +967,111 @@ impl VerifiedNodeCache {
     }
 }
 
+/// Bounded verification memo for an offline migration's immutable v3 nodes.
+///
+/// Unlike snapshot rehydration, verification needs no retained subtree graphs.
+/// Entries certify a whole subtree at a specific depth, against this table.
+/// Do not reuse this cache after node deletion, mutation or a store change.
+pub struct MigrationStateVerifier {
+    table: Arc<dyn StateKeyTable>,
+    verified: HashSet<(StateRoot, usize)>,
+    max_nodes: usize,
+}
+
+impl MigrationStateVerifier {
+    #[must_use]
+    pub fn new(table: Arc<dyn StateKeyTable>, max_nodes: usize) -> Self {
+        Self {
+            table,
+            verified: HashSet::new(),
+            max_nodes,
+        }
+    }
+
+    /// Verify every previously unseen subtree without constructing a snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RehydrateError`] for missing, malformed or incorrectly
+    /// addressed nodes, or leaves naming unknown intern ids.
+    pub fn verify(
+        &mut self,
+        root: StateRoot,
+        load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+    ) -> Result<(), RehydrateError> {
+        if root.as_bytes() == blake3::hash(EMPTY_STATE_TAG).as_bytes() {
+            return Ok(());
+        }
+        self.verify_node(root, load, 0)
+    }
+
+    fn verify_node(
+        &mut self,
+        address: StateRoot,
+        load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+        depth: usize,
+    ) -> Result<(), RehydrateError> {
+        if depth > MAX_DEPTH {
+            return Err(RehydrateError::Malformed);
+        }
+        if self.verified.contains(&(address, depth)) {
+            return Ok(());
+        }
+        let bytes = load(&address).ok_or(RehydrateError::MissingNode)?;
+        let mut at = 1;
+        match bytes.first().copied().ok_or(RehydrateError::Malformed)? {
+            TAG_LEAF => {
+                let digest = take_array::<32>(&bytes, &mut at)?;
+                let count = take_count(&bytes, &mut at, 8 + 4)?;
+                let mut entries = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let id = u64::from_be_bytes(take_array::<8>(&bytes, &mut at)?);
+                    if !self.table.contains_id(id) {
+                        return Err(RehydrateError::Malformed);
+                    }
+                    entries.push((id, take_string(&bytes, &mut at)?.into_boxed_str()));
+                }
+                if Node::leaf_from_entries(digest, entries).hash() != *address.as_bytes() {
+                    return Err(RehydrateError::HashMismatch);
+                }
+            }
+            TAG_BRANCH => {
+                let bitmap = u32::from_be_bytes(take_array::<4>(&bytes, &mut at)?);
+                let count = take_count(&bytes, &mut at, 32)?;
+                if count != bitmap.count_ones() as usize {
+                    return Err(RehydrateError::Malformed);
+                }
+                let mut children = Vec::with_capacity(count);
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(HAMT_BRANCH_TAG);
+                hasher.update(&bitmap.to_be_bytes());
+                for _ in 0..count {
+                    let child = StateRoot(take_array::<32>(&bytes, &mut at)?);
+                    hasher.update(child.as_bytes());
+                    children.push(child);
+                }
+                if hasher.finalize().as_bytes() != address.as_bytes() {
+                    return Err(RehydrateError::HashMismatch);
+                }
+                for child in children {
+                    self.verify_node(child, load, depth + 1)?;
+                }
+            }
+            _ => return Err(RehydrateError::Malformed),
+        }
+        if at != bytes.len() {
+            return Err(RehydrateError::Malformed);
+        }
+        if self.max_nodes != 0 {
+            if self.verified.len() >= self.max_nodes {
+                self.verified.clear();
+            }
+            self.verified.insert((address, depth));
+        }
+        Ok(())
+    }
+}
+
 impl StateSnapshot {
     /// Every node reachable from this snapshot that `previous` does not already
     /// contain, encoded and addressed by hash.
@@ -1018,7 +1125,15 @@ impl StateSnapshot {
     /// Rehydrate with nodes already verified during this immutable log read.
     /// Shared subtrees retain their Arcs and cached entry counts, so a new root
     /// costs its changed paths rather than a walk of every membership slot.
-    pub(crate) fn rehydrate_cached(
+    /// Rebuild a snapshot while reusing verified subtrees retained by earlier
+    /// snapshots. Keep the most recent returned snapshot alive while rebuilding
+    /// adjacent roots so their shared nodes remain available through weak refs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RehydrateError`] if a node is missing, malformed, or does not
+    /// hash to its stored address.
+    pub fn rehydrate_cached(
         root: StateRoot,
         load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
         cache: &mut VerifiedNodeCache,
@@ -1125,7 +1240,26 @@ pub fn rehydrate_v2(
     load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
     table: &Arc<dyn StateKeyTable>,
 ) -> Result<StateSnapshot, RehydrateError> {
-    let (slots, _) = walk_v2(&root, load)?;
+    let (state, _) = rehydrate_v2_with_addresses(root, load, table)?;
+    Ok(state)
+}
+
+/// Rebuild a version-2 snapshot and return every old node address reached
+/// during the same verified walk.
+///
+/// Migrations need both the rebuilt state and the old addresses to delete.
+/// Returning them together avoids traversing a large historical trie twice.
+///
+/// # Errors
+///
+/// Returns [`RehydrateError`] if any node is missing, malformed, or does not
+/// match its version-2 content address.
+pub fn rehydrate_v2_with_addresses(
+    root: StateRoot,
+    load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+    table: &Arc<dyn StateKeyTable>,
+) -> Result<(StateSnapshot, Vec<StateRoot>), RehydrateError> {
+    let (slots, addresses) = walk_v2(&root, load)?;
     // Sorted, so the fresh numbering is a function of the content rather
     // than of whatever order the old trie happened to store it in.
     let mut slots = slots;
@@ -1134,7 +1268,7 @@ pub fn rehydrate_v2(
     for (event_type, state_key, event_id) in slots {
         state = state.apply(&StateKey::new(event_type, state_key), event_id);
     }
-    Ok(state)
+    Ok((state, addresses))
 }
 
 /// Every node address the version-2 trie at `root` occupies.
@@ -1173,6 +1307,11 @@ fn walk_v2(
     Ok((slots, addresses))
 }
 
+enum V2Node {
+    Leaf(Vec<V2Slot>),
+    Branch(u32, Vec<StateRoot>),
+}
+
 fn collect_v2_slots(
     address: &StateRoot,
     load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
@@ -1180,10 +1319,146 @@ fn collect_v2_slots(
     slots: &mut Vec<V2Slot>,
     addresses: &mut Vec<StateRoot>,
 ) -> Result<(), RehydrateError> {
+    let node = read_v2_node(address, load, depth)?;
+    addresses.push(*address);
+    collect_v2_node(node, load, depth, slots, addresses)
+}
+
+fn collect_v2_node(
+    node: V2Node,
+    load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+    depth: usize,
+    slots: &mut Vec<V2Slot>,
+    addresses: &mut Vec<StateRoot>,
+) -> Result<(), RehydrateError> {
+    match node {
+        V2Node::Leaf(entries) => slots.extend(entries),
+        V2Node::Branch(_, children) => {
+            for child in children {
+                collect_v2_slots(&child, load, depth + 1, slots, addresses)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Convert the changes between two version-2 roots into an existing snapshot.
+///
+/// `previous` must be the conversion of the fully verified `previous_root`,
+/// using the same table. The loader must keep previously verified nodes
+/// immutable throughout the migration. Equal subtree addresses then need no
+/// reads. Newly reached addresses are returned for eventual old-node deletion;
+/// the caller must also retain addresses from the initial full conversion.
+///
+/// # Errors
+///
+/// Returns [`RehydrateError`] for missing, malformed or incorrectly addressed
+/// nodes on changed paths. An invalid baseline violates the caller contract.
+pub fn rehydrate_v2_incremental(
+    root: StateRoot,
+    previous_root: StateRoot,
+    previous: &StateSnapshot,
+    load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+) -> Result<(StateSnapshot, Vec<StateRoot>), RehydrateError> {
+    let empty = StateRoot(*blake3::hash(V2_EMPTY_STATE_TAG).as_bytes());
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+    let mut addresses = Vec::new();
+    diff_v2(
+        (previous_root != empty).then_some(previous_root),
+        (root != empty).then_some(root),
+        load,
+        0,
+        &mut removed,
+        &mut added,
+        &mut addresses,
+    )?;
+    let mut state = previous.clone();
+    for (event_type, state_key, _) in removed {
+        state = state.remove(&StateKey::new(event_type, state_key));
+    }
+    // Keep first-seen intern ids identical to the full sorted conversion.
+    added.sort();
+    for (event_type, state_key, event_id) in added {
+        state = state.apply(&StateKey::new(event_type, state_key), event_id);
+    }
+    Ok((state, addresses))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn diff_v2(
+    old: Option<StateRoot>,
+    new: Option<StateRoot>,
+    load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+    depth: usize,
+    removed: &mut Vec<V2Slot>,
+    added: &mut Vec<V2Slot>,
+    addresses: &mut Vec<StateRoot>,
+) -> Result<(), RehydrateError> {
     if depth > MAX_DEPTH {
         return Err(RehydrateError::Malformed);
     }
-    addresses.push(*address);
+    if old == new {
+        return Ok(());
+    }
+    let old_node = old
+        .map(|address| read_v2_node(&address, load, depth))
+        .transpose()?;
+    let new_node = new
+        .map(|address| read_v2_node(&address, load, depth))
+        .transpose()?;
+    if let Some(address) = new {
+        addresses.push(address);
+    }
+    match (old_node, new_node) {
+        (
+            Some(V2Node::Branch(old_bitmap, old_children)),
+            Some(V2Node::Branch(new_bitmap, new_children)),
+        ) => {
+            for slot in 0..32 {
+                let child = |bitmap: u32, children: &[StateRoot]| {
+                    let bit = 1_u32 << slot;
+                    if bitmap & bit == 0 {
+                        None
+                    } else {
+                        children
+                            .get((bitmap & (bit - 1)).count_ones() as usize)
+                            .copied()
+                    }
+                };
+                diff_v2(
+                    child(old_bitmap, &old_children),
+                    child(new_bitmap, &new_children),
+                    load,
+                    depth + 1,
+                    removed,
+                    added,
+                    addresses,
+                )?;
+            }
+        }
+        (old_node, new_node) => {
+            // A leaf/branch transition changes the local shape. Compare that
+            // subtree in full; unrelated branches still stopped at equal hashes.
+            if let Some(node) = old_node {
+                collect_v2_node(node, load, depth, removed, &mut Vec::new())?;
+            }
+            if let Some(node) = new_node {
+                collect_v2_node(node, load, depth, added, addresses)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_v2_node(
+    address: &StateRoot,
+    load: &mut impl FnMut(&StateRoot) -> Option<Vec<u8>>,
+    depth: usize,
+) -> Result<V2Node, RehydrateError> {
+    if depth > MAX_DEPTH {
+        return Err(RehydrateError::Malformed);
+    }
     let bytes = load(address).ok_or(RehydrateError::MissingNode)?;
     let mut at = 0_usize;
     let tag = *bytes.first().ok_or(RehydrateError::Malformed)?;
@@ -1216,7 +1491,7 @@ fn collect_v2_slots(
             if hasher.finalize().as_bytes() != address.as_bytes() {
                 return Err(RehydrateError::HashMismatch);
             }
-            slots.extend(entries);
+            Ok(V2Node::Leaf(entries))
         }
         TAG_BRANCH => {
             let bitmap = u32::from_be_bytes(take_array::<4>(&bytes, &mut at)?);
@@ -1240,13 +1515,10 @@ fn collect_v2_slots(
             if hasher.finalize().as_bytes() != address.as_bytes() {
                 return Err(RehydrateError::HashMismatch);
             }
-            for child in &children {
-                collect_v2_slots(child, load, depth + 1, slots, addresses)?;
-            }
+            Ok(V2Node::Branch(bitmap, children))
         }
-        _ => return Err(RehydrateError::Malformed),
+        _ => Err(RehydrateError::Malformed),
     }
-    Ok(())
 }
 
 /// Emit the nodes `new` has that `old` did not, descending only where they

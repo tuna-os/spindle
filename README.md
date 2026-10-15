@@ -205,6 +205,7 @@ The risks that would invalidate the headline claim are enumerated in
 | [docs/delegated-auth.md](docs/delegated-auth.md) | MSC3861, both ways — built-in provider or a real MAS |
 | [docs/metrics.md](docs/metrics.md) | What is exported, including the number the architecture is falsified by |
 | [docs/lifecycle.md](docs/lifecycle.md) | Backup, restore, migrations |
+| [docs/migration-workspace.md](docs/migration-workspace.md) | Synapse cutover gates, evidence, authority, and recovery |
 | [docs/synapse-kubernetes-cutover.md](docs/synapse-kubernetes-cutover.md) | Reversible ESS/Kubernetes quiesce and the production cutover gates |
 | [docs/ess-kubernetes-driver.md](docs/ess-kubernetes-driver.md) | Discover, fence, switch, and recover an ESS deployment without two writers |
 | [docs/rate-limits.md](docs/rate-limits.md) | Every rate and cap, and the growth nothing bounds yet |

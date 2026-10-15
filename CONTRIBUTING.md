@@ -33,12 +33,15 @@ python3 scripts/actions-pinned.py               # every action is pinned to a co
 
 Pull requests also run the Complement protected subset
 (`scripts/complement.sh`, needs Docker) with the state-resolution interop
-rooms, Element Web end to end, synadm, the protocol fixtures and the
-release-mode performance budgets; a change that touches only prose
-(Markdown, `docs/`) skips them. Pushes to main run the whole Complement
-suite, the bridges, the full-mesh peer-to-peer call and, in rotation, one
-of Element Call end to end, the Neutrino mesh seam and matrix-rust-sdk's
-suite; every night runs all of them, and fuzzing and coverage run weekly.
+rooms. They run Element Web end to end, synadm, the protocol fixtures and
+the release-mode performance budgets too. A change to prose only
+(Markdown, `docs/`) skips them.
+
+Pushes to main run the whole Complement suite, the bridges and the
+full-mesh peer-to-peer call. Each push to main also runs one suite in
+rotation: Element Call end to end, the Neutrino mesh seam or
+matrix-rust-sdk's suite. All of them run every night. Fuzz tests and
+coverage run weekly.
 `.github/workflows/` is the list; each job's comment says why it runs
 where it runs.
 

@@ -141,6 +141,12 @@ jobs:
       - name: Check the Synapse fixture builder
         run: python3 scripts/synapse-fixture-test.py
 
+      # Migration authority is a fail-closed state machine. Keep its evidence
+      # freshness, room-version, E2EE, federation and rollback boundaries
+      # executable without needing a live deployment.
+      - name: Check the migration workspace safety gates
+        run: python3 scripts/migration-workspace-test.py
+
       # The #42 parity gate decides which benchmark cells count as a loss
       # against which competitor; its judgement runs against synthetic
       # sittings and the committed milestone one.
