@@ -29,6 +29,12 @@ ignore = [
     # It is never in a shipped binary. Revisit when imbl releases a version bumping
     # imbl-sized-chunks to >=0.2.0.
     { id = "RUSTSEC-2026-0292", reason = "imbl-sized-chunks: dev-only, via imbl, benchmarks only; upstream imbl 7.0.1 pins 0.1.3" },
+    # `unsafe-libyaml` comes in through `serde_yaml`. Spindle uses it only to
+    # read appservice registration files (appservices.rs), which the operator
+    # supplies. It never parses YAML from a client or a remote server. The
+    # advisory is "unmaintained", not a vulnerability, and no maintained
+    # release of the crate exists. Revisit when serde_yaml is replaced.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml: unmaintained, via serde_yaml, operator-supplied appservice registrations only" },
 ]
 
 [licenses]

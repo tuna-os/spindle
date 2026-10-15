@@ -751,6 +751,10 @@ impl Metrics {
     /// The warm-up loaded one more room.
     pub fn warmup_loaded(&self) {
         self.warmup_loaded.fetch_add(1, Ordering::Relaxed);
+        // `fetch_update` is deprecated (renamed `try_update`) from Rust 1.99,
+        // which the container images build with; the pinned toolchain
+        // (rust-toolchain.toml, 1.90) has no `try_update` yet.
+        #[allow(deprecated)]
         let _ = self
             .warmup_pending
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -760,6 +764,7 @@ impl Metrics {
 
     /// The warm-up gave up on one room; it is no longer pending.
     pub fn warmup_failed(&self) {
+        #[allow(deprecated)] // `fetch_update`: see `warmup_loaded`.
         let _ = self
             .warmup_pending
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -782,6 +787,7 @@ pub struct BlockingGuard<'a> {
 
 impl Drop for BlockingGuard<'_> {
     fn drop(&mut self) {
+        #[allow(deprecated)] // `fetch_update`: see `Metrics::warmup_loaded`.
         let _ = self
             .gauge
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -1562,6 +1568,7 @@ impl Metrics {
     pub fn sync_waiter_finished(&self) {
         // Saturating: an unbalanced decrement would wrap to u64::MAX and
         // report every client on earth as connected to this server.
+        #[allow(deprecated)] // `fetch_update`: see `Metrics::warmup_loaded`.
         let _ =
             self.sync_subscribers
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
