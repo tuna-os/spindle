@@ -49,3 +49,24 @@ async fn room_messages_bounded(
         .map_err(room_error)?;
     Ok(Json(json!({ "chunk": events, "end": next })))
 }
+
+/// The same handler holding a `RoomReader`: `rooms.reader` runs
+/// `read_scope` and refuses a stranger, so a later read of the room (here
+/// the gap check that pokes the backfill loop) is already authorised.
+async fn room_messages_reader(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<MessagesQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    let reader = state
+        .rooms
+        .reader(&identity.user_id, &room_id)
+        .map_err(room_error)?;
+    if state.rooms.has_open_gap(&room_id).unwrap_or(false) {
+        state.backfill.poke(&room_id);
+    }
+    let limit = query.limit.unwrap_or(10).clamp(1, 100);
+    let (events, next) = reader.page(Page::default(), limit).map_err(room_error)?;
+    Ok(Json(json!({ "chunk": events, "end": next })))
+}

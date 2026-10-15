@@ -2,7 +2,7 @@
 
 use proptest::prelude::*;
 use spindle_core::{
-    EventInput, LinearIndex, RoomLog, StateSnapshot,
+    EventInput, LinearIndex, MemStateKeyTable, RoomLog, StateSnapshot,
     keys::{
         Keyspace, from_order_preserving, li_from_key, order_preserving, relation, relation_prefix,
         room_from_user_room, room_li, room_prefix, user_prefix, user_room,
@@ -50,13 +50,21 @@ fn a_naive_big_endian_encoding_would_sort_backfill_last() {
 
 #[test]
 fn a_rooms_keys_scan_in_log_order_across_the_sign_boundary() {
-    let mut room = RoomLog::new();
+    let mut room = RoomLog::new(MemStateKeyTable::shared());
     room.append_local("$join", None).unwrap();
     room.append_local("$live", None).unwrap();
-    room.prepend_remote(EventInput::new("$older", vec![]), StateSnapshot::new(), 40)
-        .unwrap();
-    room.prepend_remote(EventInput::new("$oldest", vec![]), StateSnapshot::new(), 39)
-        .unwrap();
+    room.prepend_remote(
+        EventInput::new("$older", vec![]),
+        StateSnapshot::new(room.table().clone()),
+        40,
+    )
+    .unwrap();
+    room.prepend_remote(
+        EventInput::new("$oldest", vec![]),
+        StateSnapshot::new(room.table().clone()),
+        39,
+    )
+    .unwrap();
 
     // Encode every entry, then sort by key alone — as a range scan would.
     let mut encoded: Vec<(Vec<u8>, String)> = room

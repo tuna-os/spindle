@@ -27,13 +27,17 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   protocol-fixtures:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: 1.90.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -59,7 +63,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: 1.90.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -76,7 +80,7 @@ jobs:
         run: scripts/element-web-e2e/run.sh
       - name: Keep the screenshots and logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: element-web-e2e
           path: tmp/element-web-e2e/
@@ -290,10 +294,81 @@ jobs:
 
       - name: Keep the ledger
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: complement-results
           path: tmp/complement-results.jsonl
+          if-no-files-found: ignore
+
+  # Contested forks against a real Synapse (#563, ADR 0005): Complement's
+  # fake server forks a room six ways -- power levels, a ban against the
+  # banned member's write, a join against a join-rule change -- sends the
+  # branches to Spindle (hs1) and Synapse (hs2) in opposite orders, and the
+  # two must end on the same state. Run homogeneously first, Spindle on both
+  # ends, so a failure says which pairing broke. Per pull request, unlike the
+  # full interop run: it is five rooms, not the suite, and agreeing with
+  # Synapse on a fork is a property every change to ingest has to keep.
+  state-resolution-interop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 'stable'
+          cache: false
+
+      - name: Cache the Complement checkout and Go build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            tmp/complement-src
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: complement-${{ runner.os }}-${{ hashFiles('scripts/complement.sh') }}
+          restore-keys: complement-${{ runner.os }}-
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build the Complement image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: complement/Dockerfile
+          tags: complement-spindle:latest
+          load: true
+          cache-from: type=gha,scope=complement-image
+
+      - name: Spindle beside Spindle
+        env:
+          GOPROXY: https://proxy.golang.org|direct
+          COMPLEMENT_IMAGE: complement-spindle:latest
+          COMPLEMENT_PACKAGES: ./tests/spindle
+          COMPLEMENT_RUN: TestContestedForkResolvesLikeThePeer
+        run: scripts/complement.sh tmp/state-res-homogeneous.jsonl
+
+      - name: Spindle beside Synapse
+        env:
+          GOPROXY: https://proxy.golang.org|direct
+          COMPLEMENT_IMAGE: complement-spindle:latest
+          COMPLEMENT_INTEROP_IMAGE: ghcr.io/element-hq/synapse/complement-synapse:latest
+          COMPLEMENT_INTEROP_HS: hs2
+          COMPLEMENT_PACKAGES: ./tests/spindle
+          COMPLEMENT_RUN: TestContestedForkResolvesLikeThePeer
+        run: scripts/complement.sh tmp/state-res-interop.jsonl
+
+      - name: Require every room version to agree
+        run: |
+          python3 scripts/complement-require.py TestContestedForkResolvesLikeThePeer \
+            tmp/state-res-homogeneous.jsonl tmp/state-res-interop.jsonl
+
+      - name: Keep the ledgers
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: state-resolution-interop
+          path: tmp/state-res-*.jsonl
           if-no-files-found: ignore
 
   # Heterogeneous federation against a real Synapse (docs/conformance-testing.md
@@ -353,7 +428,7 @@ jobs:
           cache-from: type=gha,scope=complement-image
 
       - name: Fetch the homogeneous baseline
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: complement-results
           path: tmp/baseline
@@ -377,7 +452,7 @@ jobs:
 
       - name: Keep the ledger and the report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: compliance-interop
           path: |
@@ -429,7 +504,7 @@ jobs:
           cache-from: type=gha,scope=complement-image
 
       - name: Fetch the homogeneous baseline
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: complement-results
           path: tmp/baseline
@@ -453,7 +528,7 @@ jobs:
 
       - name: Keep the ledger and the report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: compliance-interop-inverse
           path: |
@@ -474,7 +549,7 @@ jobs:
   element-call-e2e:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -492,7 +567,7 @@ jobs:
           rev=$(sed -n 's/^ELEMENT_CALL_REV=//p' contrib/element-call/run.sh)
           git clone --quiet https://github.com/element-hq/element-call.git tmp/element-call
           git -C tmp/element-call checkout --quiet "$rev"
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: tmp/element-call/.node-version
       - name: Run the suite against Spindle
@@ -503,7 +578,7 @@ jobs:
         run: contrib/element-call/run.sh tmp/element-call-results/results.json
       - name: Keep the report and the server logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: element-call-e2e
           path: |
@@ -525,7 +600,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: 1.90.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -539,7 +614,7 @@ jobs:
         run: contrib/synadm/run.sh
       - name: Keep the logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: synadm-interop
           path: tmp/synadm/
@@ -563,7 +638,7 @@ jobs:
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: 1.90.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -571,7 +646,7 @@ jobs:
           workspaces: |
             . -> target
             tmp/neutrino-iroh -> target
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
       - name: Check out the fork at the pin and apply the patches
@@ -617,7 +692,7 @@ jobs:
         run: contrib/element-call-full-mesh/run.sh
       - name: Keep the screenshots and logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mesh-seam
           path: |
@@ -635,7 +710,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: 1.90.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -647,7 +722,7 @@ jobs:
         run: contrib/hookshot/run.sh
       - name: Keep the logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: hookshot-bridge
           path: tmp/hookshot/
@@ -663,7 +738,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: 1.90.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -689,7 +764,7 @@ jobs:
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: 1.90.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -708,7 +783,7 @@ jobs:
         run: cargo build --release -p spindle-server --bin spindle
       # The SDK's floor is above this repository's pin; a second toolchain
       # for its build alone, named to the rig rather than changing the pin.
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: 1.93.0
       - name: Run the suite against Spindle
@@ -719,7 +794,7 @@ jobs:
         run: contrib/rust-sdk/run.sh tmp/rust-sdk/results.log
       - name: Keep the log
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rust-sdk-suite
           path: tmp/rust-sdk/
@@ -731,11 +806,11 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: 1.90.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
       - name: Build the server
@@ -751,7 +826,7 @@ jobs:
         run: contrib/element-call-full-mesh/run.sh
       - name: Keep the screenshots and logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: full-mesh-e2e
           path: tmp/element-call-full-mesh/

@@ -1,0 +1,81 @@
+# Full-corpus dark Spindle (#563): storage, config and a shell pod.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fi-dark-spindle
+  namespace: spindle-rehearsal
+  labels: {app: fi-dark-spindle, part-of: spindle-full-import}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 30Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fi-dark-spindle-config
+  namespace: spindle-rehearsal
+  labels: {app: fi-dark-spindle, part-of: spindle-full-import}
+data:
+  spindle.toml: |
+    [server]
+    name = "reilly.asia"
+    bind = "0.0.0.0:8008"
+    public_base_url = "http://fi-dark-spindle.spindle-rehearsal.svc.cluster.local:8008"
+
+    [storage]
+    path = "/data/store"
+
+    [federation]
+    enabled = false
+
+    [push]
+    enabled = false
+
+    [previews]
+    enabled = false
+
+    [ratelimit]
+    enabled = false
+
+    [logging]
+    filter = "info"
+---
+# A shell on the store volume: receives the read-only media copy and lets
+# an operator inspect the store and the report. No network use of its own.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fi-shell
+  namespace: spindle-rehearsal
+  labels: {app: fi-shell, part-of: spindle-full-import}
+spec:
+  nodeSelector: {kubernetes.io/hostname: __NODE__}
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  dnsPolicy: None
+  dnsConfig:
+    nameservers: [127.0.0.1]
+  securityContext:
+    runAsUser: 10092
+    runAsGroup: 10092
+    fsGroup: 10092
+    runAsNonRoot: true
+    seccompProfile: {type: RuntimeDefault}
+  containers:
+  - name: shell
+    image: rust:1.94-bookworm
+    command: [sleep, infinity]
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities: {drop: [ALL]}
+    resources:
+      requests: {cpu: 10m, memory: 32Mi}
+      limits: {cpu: 500m, memory: 512Mi}
+    volumeMounts:
+    - {name: data, mountPath: /data}
+  volumes:
+  - name: data
+    persistentVolumeClaim: {claimName: fi-dark-spindle}

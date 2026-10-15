@@ -27,8 +27,8 @@ pub mod codec;
 pub mod migrate;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 // fjall 3 renamed the two levels: what was a `Keyspace` (the whole store) is
 // now a `Database`, and what was a `PartitionHandle` (one namespace inside
@@ -40,11 +40,18 @@ use fjall::{
     KeyspaceCreateOptions as PartitionCreateOptions, PersistMode, Readable,
 };
 use spindle_core::{
-    CONTENT_DIGEST_VERSION, EventId, RestoreError, RestoredEntry, RestoredLog, RoomLog, StateRoot,
-    keys::{KEY_SCHEMA_VERSION, Keyspace, content_addressed, room_li, room_prefix, store_marker},
+    CONTENT_DIGEST_VERSION, EventId, LogRestore, MemStateKeyTable, RestoreError, RestoredEntry,
+    RestoredLog, RoomLog, RuntimeRestoredLog, StateKeyTable, StateRoot, StateSnapshot,
+    keys::{
+        KEY_SCHEMA_VERSION, Keyspace, content_addressed, room_li, room_prefix, state_key_intern,
+        state_key_intern_prefix, store_marker,
+    },
 };
 
-use crate::codec::{CodecError, EntryRecord, RECORD_VERSION, RoomRecord};
+use crate::codec::{
+    CodecError, EntryRecord, RECORD_VERSION, RoomRecord, SidelinedRecord, decode_intern_pair,
+    encode_intern_pair,
+};
 
 /// How hard a commit tries to be on disk before it is acknowledged.
 ///
@@ -152,6 +159,10 @@ mod durability_tests {
 /// One key and its value, as read back from a scan.
 pub type Record = (Vec<u8>, Vec<u8>);
 
+/// What [`ReadView::visit_prefix`] calls with each key and value; an error
+/// stops the scan and is returned from it.
+pub type RowVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> Result<(), StoreError> + 'a;
+
 /// The ordered key-value operations the log needs.
 ///
 /// Narrow on purpose: every hot operation is a point lookup or a sorted range
@@ -169,6 +180,28 @@ pub trait ReadView {
     ///
     /// Returns a backend error if the scan fails.
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<Record>, StoreError>;
+
+    /// Visit every entry whose key starts with `prefix`, in key order,
+    /// without collecting them.
+    ///
+    /// [`Self::scan_prefix`] copies the whole range into memory before the
+    /// caller sees its first row. For a room restore that is the room's
+    /// entire log, held twice -- once as rows, once decoded -- at the
+    /// moment memory is scarcest. A visitor sees each row while the backend
+    /// still owns it and stops the scan by returning an error.
+    ///
+    /// The default collects through [`Self::scan_prefix`], so a backend
+    /// gets the semantics for free and the memory saving by overriding it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the scan fails, or the visitor's error.
+    fn visit_prefix(&self, prefix: &[u8], visit: &mut RowVisitor<'_>) -> Result<(), StoreError> {
+        for (key, value) in self.scan_prefix(prefix)? {
+            visit(&key, &value)?;
+        }
+        Ok(())
+    }
 
     /// Entries whose key starts with `prefix` *and* sorts at or after
     /// `start`, in key order.
@@ -201,6 +234,16 @@ pub trait ReadView {
     /// deadline, and scanning to the end of the prefix meant reading every
     /// *pending* delay on a tick that had nothing to do (#348).
     ///
+    /// The table restored snapshots intern against.
+    ///
+    /// A state restored without the store's table replays the same rows
+    /// and -- on any restart that lands between the state and keyspace
+    /// migrations -- the same missing rows, only against a table that
+    /// forgets at drop. Every lookup after that misses, every node decodes
+    /// to empty, and the room's state is gone while its rows insist it is
+    /// there. The table is the store's, so the store hands it out.
+    fn key_table(&self) -> Arc<dyn StateKeyTable>;
+
     /// `end` is exclusive, and neither bound need be a stored key.
     ///
     /// # Errors
@@ -212,6 +255,26 @@ pub trait ReadView {
         start: &[u8],
         end: &[u8],
     ) -> Result<Vec<Record>, StoreError>;
+
+    /// The last entry whose key starts with `prefix` and sorts *before*
+    /// `end`, or `None` when there is none.
+    ///
+    /// The nearest-at-or-below lookup: "which stored position is the last
+    /// one at or before this point". Reading the whole range with
+    /// [`Self::scan_until`] and keeping its last row costs every row below
+    /// the point, which for a position near the end of a large room is the
+    /// room. The default does exactly that, for a backend with no reverse
+    /// iteration; the Fjall store walks one step back from `end`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the read fails.
+    fn last_before(&self, prefix: &[u8], end: &[u8]) -> Result<Option<Record>, StoreError> {
+        if end <= prefix {
+            return Ok(None);
+        }
+        Ok(self.scan_until(prefix, prefix, end)?.pop())
+    }
 }
 
 pub trait Store: ReadView {
@@ -272,6 +335,56 @@ pub trait Store: ReadView {
         Ok(())
     }
 
+    /// Reload persisted intern rows after an offline restore into a fresh store.
+    /// Existing ids must keep their meaning; writes must be stopped while
+    /// this runs. The restored rows have already been flushed.
+    ///
+    /// # Errors
+    ///
+    /// Refuses malformed, sparse or conflicting intern rows.
+    fn reload_key_table(&self) -> Result<(), StoreError> {
+        let table = self.key_table();
+        let mut expected = 1_u64;
+        for (key, value) in self.scan_prefix(&state_key_intern_prefix())? {
+            let id = key
+                .get(2..10)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u64::from_be_bytes)
+                .ok_or(CodecError::Truncated)?;
+            if key.len() != 10 || id != expected {
+                return Err(StoreError::Backend(
+                    "invalid restored intern id sequence".to_owned(),
+                ));
+            }
+            let (event_type, state_key) = decode_intern_pair(&value)?;
+            if table.intern(&event_type, &state_key) != id {
+                return Err(StoreError::ForeignStateTable);
+            }
+            expected += 1;
+        }
+        // Every row just loaded is already durable, so none is pending.
+        table.take_allocated();
+        Ok(())
+    }
+
+    /// Journal state nodes and newly allocated intern rows together.
+    ///
+    /// Concurrent backends must hold their drain lock until the batch has
+    /// reached the journal. Sync may follow outside that lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the batch fails.
+    fn commit_state_deferred(
+        &self,
+        writes: &[Record],
+        table: &Arc<dyn StateKeyTable>,
+    ) -> Result<(), StoreError> {
+        let mut batch = writes.to_vec();
+        batch.extend(encode_intern_rows(&table.take_allocated()));
+        self.commit_deferred(&batch)
+    }
+
     /// Apply every write together, or none of them.
     ///
     /// Atomicity is the point: an appended event, its room metadata and its
@@ -313,6 +426,20 @@ pub trait Store: ReadView {
     ///
     /// Returns a backend error if the sync fails.
     fn sync(&self, durability: Durability) -> Result<(), StoreError>;
+
+    /// Whether this store can still accept a write.
+    ///
+    /// False from the first write or sync the backend refused, because the
+    /// backend then refuses every later one: the way back is to free the
+    /// space (or replace the disk) and reopen the directory, which for a
+    /// server is a restart. One-way on purpose. A probe that flapped back
+    /// to ready would route clients to a server whose next write fails.
+    ///
+    /// Read paths consult this before a write they can do without -- a
+    /// lazily initialized marker, a cache fill -- so a degraded store
+    /// takes writes out of rotation without taking reads down with them.
+    #[must_use]
+    fn accepts_writes(&self) -> bool;
 
     /// # Errors
     ///
@@ -495,6 +622,42 @@ pub struct FjallStore {
     journalled: AtomicU64,
     /// Shared by every writer, which is what lets their fsyncs become one.
     group: GroupCommit,
+    /// Set by the first write or sync the engine refuses, and never cleared.
+    ///
+    /// fjall poisons its database on a failed journal write or sync -- a
+    /// full disk is the ordinary way to get one -- and refuses every write
+    /// after it until the directory is reopened. Its public API has no way
+    /// to ask, short of attempting a write, so the store remembers, and the
+    /// server's readiness probe reads it (#21's disk-full drill).
+    write_refused: AtomicBool,
+    /// The intern table every snapshot in this process shares (#79).
+    ///
+    /// Loaded whole from [`Keyspace::StateKeyIntern`] at open: a room's
+    /// distinct keys number in the thousands, and every hot path needs
+    /// allocation-free lookup, so the rows live here and fjall is only
+    /// touched for the rows a batch newly allocates.
+    state_table: Arc<MemStateKeyTable>,
+    /// Holds a drain through journal insertion so another room cannot
+    /// persist nodes before the batch carrying their intern rows.
+    intern_drain: Mutex<()>,
+}
+
+/// Newly allocated intern-table pairs as batch rows (#79).
+///
+/// Pure: the drain already happened in [`Store::commit_state_deferred`], and
+/// this only encodes. One row per pair, keyed by
+/// [`spindle_core::keys::state_key_intern`].
+#[must_use]
+pub fn encode_intern_rows(pairs: &[spindle_core::AllocRecord]) -> Vec<Record> {
+    pairs
+        .iter()
+        .map(|(id, (event_type, state_key))| {
+            (
+                state_key_intern(*id),
+                encode_intern_pair(event_type, state_key),
+            )
+        })
+        .collect()
 }
 
 impl FjallStore {
@@ -548,6 +711,15 @@ impl FjallStore {
     #[must_use]
     pub fn written(&self) -> u64 {
         self.written.load(Ordering::Relaxed)
+    }
+
+    /// Pass `result` through, and latch [`Store::accepts_writes`] off if it
+    /// is an error.
+    fn latch<T>(&self, result: Result<T, StoreError>) -> Result<T, StoreError> {
+        if result.is_err() {
+            self.write_refused.store(true, Ordering::Release);
+        }
+        result
     }
 
     /// Rows written outside any batch since this store was opened.
@@ -630,6 +802,7 @@ impl FjallStore {
             StoreError::from(error)
         })?;
         let partition = db.keyspace("spindle", PartitionCreateOptions::default)?;
+        let state_table = Arc::new(Self::load_intern_table(&partition)?);
         Ok(Self {
             reads: AtomicU64::new(0),
             scanned: AtomicU64::new(0),
@@ -637,9 +810,55 @@ impl FjallStore {
             unbatched: AtomicU64::new(0),
             journalled: AtomicU64::new(0),
             group: GroupCommit::default(),
+            write_refused: AtomicBool::new(false),
             db,
             partition,
+            state_table,
+            intern_drain: Mutex::new(()),
         })
+    }
+
+    /// Read every intern-table row into memory (#79).
+    ///
+    /// Rows scan in id order, and [`MemStateKeyTable::from_pairs`] refuses
+    /// a gap rather than opening onto repointed ids. An undecodable row
+    /// refuses the open for the same reason a bad node would: the table
+    /// is load-bearing for every state read, and a corrupt entry is a
+    /// corrupt trie.
+    fn load_intern_table(partition: &FjallPartition) -> Result<MemStateKeyTable, StoreError> {
+        let mut pairs = Vec::new();
+        for pair in partition.prefix(state_key_intern_prefix()) {
+            let (key, value) = pair.into_inner()?;
+            let id = key
+                .get(2..10)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u64::from_be_bytes)
+                .ok_or(CodecError::Truncated)?;
+            if id == 0 {
+                return Err(StoreError::Codec(CodecError::Malformed(0)));
+            }
+            pairs.push((id, decode_intern_pair(&value)?));
+        }
+        MemStateKeyTable::from_pairs(pairs).map_err(StoreError::Backend)
+    }
+
+    /// The intern table every snapshot built by this store shares.
+    ///
+    /// Hand this to [`StateSnapshot::new`](spindle_core::StateSnapshot::new)
+    /// wherever a snapshot is built: rooms, import, backfill, tests. A
+    /// snapshot built against any other table has different ids for the
+    /// same keys, and persisting it here would write nodes this table
+    /// cannot resolve.
+    #[must_use]
+    pub fn state_table(&self) -> Arc<dyn StateKeyTable> {
+        Arc::clone(&self.state_table) as Arc<dyn StateKeyTable>
+    }
+
+    /// An empty snapshot against this store's table: the one-line form of
+    /// `StateSnapshot::new(store.state_table())` at the 20-odd build sites.
+    #[must_use]
+    pub fn new_state(&self) -> StateSnapshot {
+        StateSnapshot::new(self.state_table())
     }
 
     /// Refuse a store this binary cannot read, and stamp one that has no mark.
@@ -783,7 +1002,22 @@ const MARKER_VERSION: u8 = 2;
 /// The three-byte marker, still readable. See [`SchemaMarker::decode`].
 const MARKER_V1: u8 = 1;
 
+fn prefix_ceiling(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut ceiling = prefix.to_vec();
+    while let Some(last) = ceiling.pop() {
+        if last != u8::MAX {
+            ceiling.push(last + 1);
+            return Some(ceiling);
+        }
+    }
+    None
+}
+
 impl ReadView for FjallStore {
+    fn key_table(&self) -> Arc<dyn StateKeyTable> {
+        self.state_table.clone()
+    }
+
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         self.reads.fetch_add(1, Ordering::Relaxed);
         Ok(self.partition.get(key)?.map(|slice| slice.to_vec()))
@@ -797,6 +1031,17 @@ impl ReadView for FjallStore {
         }
         self.scanned.fetch_add(out.len() as u64, Ordering::Relaxed);
         Ok(out)
+    }
+
+    fn visit_prefix(&self, prefix: &[u8], visit: &mut RowVisitor<'_>) -> Result<(), StoreError> {
+        let mut visited = 0_u64;
+        let result = self.partition.prefix(prefix).try_for_each(|pair| {
+            let (key, value) = pair.into_inner()?;
+            visited += 1;
+            visit(&key, &value)
+        });
+        self.scanned.fetch_add(visited, Ordering::Relaxed);
+        result
     }
 
     fn scan_from(&self, prefix: &[u8], start: &[u8]) -> Result<Vec<Record>, StoreError> {
@@ -835,6 +1080,22 @@ impl ReadView for FjallStore {
         self.scanned.fetch_add(out.len() as u64, Ordering::Relaxed);
         Ok(out)
     }
+
+    fn last_before(&self, prefix: &[u8], end: &[u8]) -> Result<Option<Record>, StoreError> {
+        if end <= prefix {
+            return Ok(None);
+        }
+        let end = prefix_ceiling(prefix)
+            .map_or_else(|| end.to_vec(), |ceiling| ceiling.min(end.to_vec()));
+        let Some(pair) = self.partition.range(prefix.to_vec()..end).next_back() else {
+            return Ok(None);
+        };
+        let (key, value) = pair.into_inner()?;
+        self.scanned.fetch_add(1, Ordering::Relaxed);
+        Ok(key
+            .starts_with(prefix)
+            .then(|| (key.to_vec(), value.to_vec())))
+    }
 }
 
 /// A Fjall read snapshot: every read sees the partition as of the sequence
@@ -844,9 +1105,12 @@ impl ReadView for FjallStore {
 /// snapshot spans the whole database and each read names the namespace it is
 /// reading -- where in fjall 2 the snapshot was taken *from* the partition
 /// and remembered it.
-pub struct FjallCheckpoint(fjall::Snapshot, FjallPartition);
+pub struct FjallCheckpoint(fjall::Snapshot, FjallPartition, Arc<dyn StateKeyTable>);
 
 impl ReadView for FjallCheckpoint {
+    fn key_table(&self) -> Arc<dyn StateKeyTable> {
+        self.2.clone()
+    }
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         Ok(self
             .0
@@ -864,6 +1128,15 @@ impl ReadView for FjallCheckpoint {
             out.push((key.to_vec(), value.to_vec()));
         }
         Ok(out)
+    }
+
+    fn visit_prefix(&self, prefix: &[u8], visit: &mut RowVisitor<'_>) -> Result<(), StoreError> {
+        self.0.prefix(&self.1, prefix).try_for_each(|pair| {
+            let (key, value) = pair
+                .into_inner()
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+            visit(&key, &value)
+        })
     }
 
     fn scan_from(&self, prefix: &[u8], start: &[u8]) -> Result<Vec<Record>, StoreError> {
@@ -898,11 +1171,49 @@ impl ReadView for FjallCheckpoint {
         }
         Ok(out)
     }
+
+    fn last_before(&self, prefix: &[u8], end: &[u8]) -> Result<Option<Record>, StoreError> {
+        if end <= prefix {
+            return Ok(None);
+        }
+        let end = prefix_ceiling(prefix)
+            .map_or_else(|| end.to_vec(), |ceiling| ceiling.min(end.to_vec()));
+        let Some(pair) = self.0.range(&self.1, prefix.to_vec()..end).next_back() else {
+            return Ok(None);
+        };
+        let (key, value) = pair
+            .into_inner()
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        Ok(key
+            .starts_with(prefix)
+            .then(|| (key.to_vec(), value.to_vec())))
+    }
 }
 
 impl Store for FjallStore {
+    fn accepts_writes(&self) -> bool {
+        !self.write_refused.load(Ordering::Acquire)
+    }
+
+    fn commit_state_deferred(
+        &self,
+        writes: &[Record],
+        table: &Arc<dyn StateKeyTable>,
+    ) -> Result<(), StoreError> {
+        if !Arc::ptr_eq(table, &self.key_table()) {
+            return Err(StoreError::ForeignStateTable);
+        }
+        let _guard = self
+            .intern_drain
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut batch = writes.to_vec();
+        batch.extend(encode_intern_rows(&table.take_allocated()));
+        self.commit_deferred(&batch)
+    }
+
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
-        self.partition.insert(key, value)?;
+        self.latch(self.partition.insert(key, value).map_err(StoreError::from))?;
         self.written.fetch_add(1, Ordering::Relaxed);
         self.unbatched.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -913,12 +1224,16 @@ impl Store for FjallStore {
         // returns. The non-waiting variant queues the rotation, which for a
         // fixture generator means writing the directory before the segment
         // it is supposed to contain.
-        self.partition.rotate_memtable_and_wait()?;
+        self.latch(
+            self.partition
+                .rotate_memtable_and_wait()
+                .map_err(StoreError::from),
+        )?;
         Ok(())
     }
 
     fn delete(&self, key: &[u8]) -> Result<(), StoreError> {
-        self.partition.remove(key)?;
+        self.latch(self.partition.remove(key).map_err(StoreError::from))?;
         self.written.fetch_add(1, Ordering::Relaxed);
         self.unbatched.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -934,6 +1249,7 @@ impl Store for FjallStore {
         Some(Box::new(FjallCheckpoint(
             self.db.snapshot(),
             self.partition.clone(),
+            self.state_table.clone(),
         )))
     }
 
@@ -949,7 +1265,12 @@ impl Store for FjallStore {
         }
         // Always `Buffer`: the bytes reach the journal and nothing is synced.
         // Which sync they get -- if any -- is `sync`'s decision.
-        batch.durability(Some(PersistMode::Buffer)).commit()?;
+        self.latch(
+            batch
+                .durability(Some(PersistMode::Buffer))
+                .commit()
+                .map_err(StoreError::from),
+        )?;
         // Rows, not batches: a batch of a hundred is a hundred rows to
         // merge and compact, and counting it as one would let a path claim
         // it writes less by bundling the same work.
@@ -973,19 +1294,20 @@ impl Store for FjallStore {
             Durability::Relaxed => Ok(()),
             // Not coalesced: `strict` exists for deployments that want the
             // barrier they asked for, not the cheapest correct one.
-            Durability::Strict => {
-                self.db.persist(mode)?;
-                Ok(())
-            }
+            Durability::Strict => self.latch(self.db.persist(mode).map_err(StoreError::from)),
             // Take the next sync going -- ours to lead if nobody else is
-            // already running one.
-            Durability::Group => self.group.sync(&self.db, mode),
+            // already running one. The group hands the leader's failure to
+            // every follower, so each of them latches too.
+            Durability::Group => self.latch(self.group.sync(&self.db, mode)),
         }
     }
 
     fn flush(&self) -> Result<(), StoreError> {
-        self.db.persist(PersistMode::SyncAll)?;
-        Ok(())
+        self.latch(
+            self.db
+                .persist(PersistMode::SyncAll)
+                .map_err(StoreError::from),
+        )
     }
 }
 
@@ -1140,6 +1462,93 @@ mod group_commit_tests {
     }
 }
 
+/// Rows above which a restore reads and checks on two threads.
+const PIPELINE_ROWS: usize = 16_384;
+
+/// Rows handed from the reading thread to the checking one at a time.
+const PIPELINE_BATCH: usize = 4_096;
+
+/// Stream `prefix` into `restore` on two threads: this one reads and
+/// decodes rows, a scoped worker checks and accepts them, in order.
+///
+/// Reading a row (the store's iteration, the decode, the allocations) and
+/// accepting it (the chain hash, the event index) cost about the same, and
+/// on a large room each is most of a second, so overlapping them is most of
+/// the remaining win. Nothing about the checks changes: every row still
+/// passes through [`LogRestore::push`], one at a time, in ascending order,
+/// on one thread. Bounded: at most a few batches are in flight.
+///
+/// The error reported is the one a single-threaded restore would report.
+/// A row is only decoded after every row before it was, and every decoded
+/// row is handed over before the scan's own error is: so a check failing
+/// on an earlier row wins over a decode failing on a later one.
+fn pipelined(
+    view: &dyn ReadView,
+    prefix: &[u8],
+    restore: LogRestore,
+    profile: &mut RestoreProfile,
+) -> Result<LogRestore, StoreError> {
+    std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::sync_channel::<Vec<RestoredEntry>>(4);
+        let worker = std::thread::Builder::new()
+            .name("spindle-restore".to_owned())
+            .spawn_scoped(scope, move || {
+                let mut restore = restore;
+                for batch in receive {
+                    for entry in batch {
+                        restore.push(entry)?;
+                    }
+                }
+                Ok::<_, RestoreError>(restore)
+            })
+            .map_err(|error| StoreError::Backend(format!("cannot start a restore: {error}")))?;
+        let mut batch = Vec::with_capacity(PIPELINE_BATCH);
+        let scanned = view.visit_prefix(prefix, &mut |_, value| {
+            profile.row_bytes += value.len() as u64;
+            batch.push(EntryRecord::decode_restored(value)?);
+            if batch.len() == PIPELINE_BATCH {
+                let full = std::mem::replace(&mut batch, Vec::with_capacity(PIPELINE_BATCH));
+                // The worker has stopped on an error of its own, which is
+                // reported below; there is no point reading further.
+                send.send(full)
+                    .map_err(|_| StoreError::Backend("restore stopped".to_owned()))?;
+            }
+            Ok(())
+        });
+        if !batch.is_empty() {
+            let _ = send.send(batch);
+        }
+        drop(send);
+        let checked = match worker.join() {
+            Ok(checked) => checked,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        let restore = checked?;
+        scanned?;
+        Ok(restore)
+    })
+}
+
+/// Where one room restore spent its time ([`RoomStore::load_runtime_profiled`]).
+///
+/// Reported by the server for slow cold loads, so a slow one says which
+/// part was slow instead of only that it was.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RestoreProfile {
+    /// Log rows read.
+    pub rows: usize,
+    /// Their encoded size, in bytes.
+    pub row_bytes: u64,
+    /// Reading, decoding and checking every row: order, uniqueness, chain.
+    pub records: std::time::Duration,
+    /// Hydrating and verifying the resident window's and every tip's state.
+    pub roots: std::time::Duration,
+    /// Restoring soft-failed and rejected events with their states.
+    pub sidelined: std::time::Duration,
+    /// Restoring imported historical rejection markers.
+    pub rejections: std::time::Duration,
+}
+
 /// Persist a room's log, and read it back.
 pub struct RoomStore<'a, S: Store> {
     store: &'a S,
@@ -1238,6 +1647,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
         let state = log
             .state_after(entry.li)
             .ok_or(StoreError::StateNotResident { li: entry.li.get() })?;
+        self.check_state_table(state)?;
 
         let mut writes = vec![
             (
@@ -1256,11 +1666,150 @@ impl<'a, S: Store> RoomStore<'a, S> {
             ));
         }
         writes.extend_from_slice(extra);
-
-        match durability {
-            Some(durability) => self.store.commit(&writes, durability),
-            None => self.store.commit_deferred(&writes),
+        self.store.commit_state_deferred(&writes, state.table())?;
+        if let Some(durability) = durability {
+            self.store.sync(durability)?;
         }
+        Ok(())
+    }
+
+    /// Journal a soft-failed or rejected event: its record, the state
+    /// nodes its state adds over `previous` (a parent's state, which is
+    /// already stored), the room's metadata and the caller's records, in
+    /// one batch. Like [`Self::journal_entry_with`], the sync is the
+    /// caller's.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the batch cannot be journalled.
+    pub fn journal_sidelined(
+        &self,
+        entry: &spindle_core::SidelinedEntry,
+        state: &spindle_core::StateSnapshot,
+        previous: Option<&spindle_core::StateSnapshot>,
+        log: &RoomLog,
+        extra: &[Record],
+    ) -> Result<(), StoreError> {
+        let mut writes = vec![
+            (
+                spindle_core::keys::sidelined(&self.room_id, entry.event_id.as_str()),
+                SidelinedRecord::from_entry(entry).encode(),
+            ),
+            (
+                room_prefix(Keyspace::RoomMeta, &self.room_id),
+                Self::meta(log).encode(),
+            ),
+        ];
+        self.check_state_table(state)?;
+        for (address, node) in state.delta_nodes(previous) {
+            writes.push((
+                content_addressed(Keyspace::StateNode, address.as_bytes()),
+                node,
+            ));
+        }
+        writes.extend_from_slice(extra);
+        self.store.commit_state_deferred(&writes, state.table())
+    }
+
+    /// Put the room's sidelined events back into a restored log, each with
+    /// its state rehydrated from the stored trie.
+    fn restore_sidelined(&self, log: &mut RoomLog) -> Result<(), StoreError> {
+        let prefix = room_prefix(Keyspace::Sidelined, &self.room_id);
+        let mut load_node = |address: &StateRoot| {
+            self.store
+                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
+                .ok()
+                .flatten()
+        };
+        for (_, value) in self.store.scan_prefix(&prefix)? {
+            let entry = SidelinedRecord::decode(&value)?.to_entry()?;
+            let state = spindle_core::StateSnapshot::rehydrate(
+                entry.state_root,
+                &mut load_node,
+                log.table().clone(),
+            )
+            .unwrap_or_else(|_| spindle_core::StateSnapshot::new(log.table().clone()));
+            log.restore_sidelined(entry, state);
+        }
+        Ok(())
+    }
+
+    fn restore_sidelined_checked(&self, log: &mut RoomLog) -> Result<(), StoreError> {
+        let prefix = room_prefix(Keyspace::Sidelined, &self.room_id);
+        let mut load_node = |address: &StateRoot| {
+            self.store
+                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
+                .ok()
+                .flatten()
+        };
+        for (_, value) in self.store.scan_prefix(&prefix)? {
+            let entry = SidelinedRecord::decode(&value)?.to_entry()?;
+            let state = spindle_core::StateSnapshot::rehydrate(
+                entry.state_root,
+                &mut load_node,
+                log.table().clone(),
+            )
+            .map_err(|_| RestoreError::UnreadableSidelined(entry.event_id.clone()))?;
+            log.restore_sidelined(entry, state);
+        }
+        Ok(())
+    }
+
+    /// Commit imported historical rejection decisions and their PDU records.
+    ///
+    /// The markers never become timeline entries. In-memory decisions are
+    /// published only after the atomic durable write succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error, or refuses an ID already in the accepted log.
+    pub fn commit_historical_rejections(
+        &self,
+        log: &mut RoomLog,
+        ids: &[EventId],
+        extra: &[Record],
+        durability: Durability,
+    ) -> Result<(), StoreError> {
+        let mut writes = extra.to_vec();
+        for id in ids {
+            if log.get(id).is_some() {
+                return Err(StoreError::Backend(
+                    "historical rejection is already in the accepted log".into(),
+                ));
+            }
+            writes.push((
+                spindle_core::keys::historical_rejection(&self.room_id, id.as_str()),
+                vec![1],
+            ));
+        }
+        self.store.commit(&writes, durability)?;
+        for id in ids {
+            log.preserve_historical_rejection(id.clone());
+        }
+        Ok(())
+    }
+
+    /// Restore imported rejection markers without treating them as timeline entries.
+    fn restore_historical_rejections(&self, log: &mut RoomLog) -> Result<(), StoreError> {
+        let prefix = room_prefix(Keyspace::HistoricalRejection, &self.room_id);
+        for (key, value) in self.store.scan_prefix(&prefix)? {
+            if value != [1] {
+                return Err(CodecError::Malformed(value.first().copied().unwrap_or(0)).into());
+            }
+            let id = key.get(prefix.len()..).ok_or(CodecError::Truncated)?;
+            let id = std::str::from_utf8(id).map_err(|_| CodecError::NotUtf8)?;
+            if id.is_empty() {
+                return Err(CodecError::Truncated.into());
+            }
+            let id = EventId::new(id);
+            if log.get(&id).is_some() {
+                return Err(StoreError::Backend(
+                    "historical rejection overlaps accepted log".into(),
+                ));
+            }
+            log.preserve_historical_rejection(id);
+        }
+        Ok(())
     }
 
     fn meta(log: &RoomLog) -> RoomRecord {
@@ -1283,12 +1832,33 @@ impl<'a, S: Store> RoomStore<'a, S> {
     /// # Errors
     ///
     /// Returns [`StoreError`] if any write fails.
+    /// Refuse a state built against another table than this store's.
+    ///
+    /// The check is identity, not compatibility: two tables can hold the
+    /// same pairs under different ids, and persisting the wrong numbering
+    /// overwrites the right one slot by slot without a single error to
+    /// show for it. The one exception needs no check: a `previous` state
+    /// used only for delta computation is never persisted, and a foreign
+    /// numbering there only writes more nodes, never wrong ones.
+    fn check_state_table(&self, state: &spindle_core::StateSnapshot) -> Result<(), StoreError> {
+        if Arc::ptr_eq(state.table(), &self.store.key_table()) {
+            Ok(())
+        } else {
+            Err(StoreError::ForeignStateTable)
+        }
+    }
+
+    /// Write every entry, its state trie and the intern rows the trie needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::StateNotResident`] for a room long enough to
+    /// have evicted state this is asked to rewrite wholesale, or
+    /// [`StoreError::ForeignStateTable`] for a log built against another
+    /// table than this store's, which no row count could persist correctly.
     pub fn save(&self, log: &RoomLog) -> Result<(), StoreError> {
         let mut previous: Option<&spindle_core::StateSnapshot> = None;
         for entry in log.entries() {
-            let key = room_li(Keyspace::Log, &self.room_id, entry.li);
-            self.store
-                .put(&key, &EntryRecord::from_entry(entry).encode())?;
             // Persist the state trie here too, so both write paths restore
             // identically. A seeding path that produced a differently
             // restorable room would be a trap for whoever hit it first.
@@ -1300,18 +1870,30 @@ impl<'a, S: Store> RoomStore<'a, S> {
             let state = log
                 .state_after(entry.li)
                 .ok_or(StoreError::StateNotResident { li: entry.li.get() })?;
+            // Before the first write, not after it: a refused log leaves
+            // no entry record behind for the next open to trip over.
+            self.check_state_table(state)?;
+            let key = room_li(Keyspace::Log, &self.room_id, entry.li);
+            let mut writes = vec![(key, EntryRecord::from_entry(entry).encode())];
             for (address, node) in state.delta_nodes(previous) {
-                self.store.put(
-                    &content_addressed(Keyspace::StateNode, address.as_bytes()),
-                    &node,
-                )?;
+                writes.push((
+                    content_addressed(Keyspace::StateNode, address.as_bytes()),
+                    node,
+                ));
             }
+            self.store.commit_state_deferred(&writes, state.table())?;
             previous = Some(state);
         }
         self.store.put(
             &room_prefix(Keyspace::RoomMeta, &self.room_id),
             &Self::meta(log).encode(),
         )?;
+        for id in log.historical_rejections() {
+            self.store.put(
+                &spindle_core::keys::historical_rejection(&self.room_id, id.as_str()),
+                &[1],
+            )?;
+        }
         self.store.flush()
     }
 
@@ -1329,14 +1911,17 @@ impl<'a, S: Store> RoomStore<'a, S> {
         let Some((meta, entries)) = self.read_records()? else {
             return Ok(None);
         };
-        Ok(Some(RoomLog::restore(
+        let mut restored = RoomLog::restore(
             entries,
             meta.next_forward,
             meta.next_backward,
             meta.forward_extremities
                 .into_iter()
                 .map(|id| EventId::new(id.as_str())),
-        )?))
+            self.store.key_table(),
+        )?;
+        self.restore_historical_rejections(&mut restored.log)?;
+        Ok(Some(restored))
     }
 
     fn read_records(&self) -> Result<Option<(RoomRecord, Vec<RestoredEntry>)>, StoreError> {
@@ -1376,6 +1961,113 @@ impl<'a, S: Store> RoomStore<'a, S> {
         Ok(Some((meta, entries)))
     }
 
+    /// Read the room's metadata and stream its log into a [`LogRestore`],
+    /// through one frozen view (see [`Self::read_records`] for why one).
+    ///
+    /// Each row is decoded as the scan reaches it and handed straight to
+    /// the restore, which checks its order, its uniqueness and its chain
+    /// link before the next row is read. Nothing holds the room's rows as
+    /// rows: the only copy of the log this builds is the log.
+    fn stream_records(&self) -> Result<Option<(LogRestore, RestoreProfile)>, StoreError> {
+        let started = std::time::Instant::now();
+        let snapshot = self.store.snapshot();
+        let view: &dyn ReadView = snapshot.as_deref().unwrap_or(self.store);
+        let Some(raw_meta) = view.get(&room_prefix(Keyspace::RoomMeta, &self.room_id))? else {
+            return Ok(None);
+        };
+        let meta = RoomRecord::decode(&raw_meta)?;
+        // The occupied positions are contiguous, so the counters bound the
+        // row count. Only a reservation hint: `LogRestore` caps it.
+        let expected = usize::try_from(
+            meta.next_forward
+                .saturating_sub(meta.next_backward)
+                .saturating_sub(1),
+        )
+        .unwrap_or(0);
+        let mut restore = LogRestore::new(
+            meta.next_forward,
+            meta.next_backward,
+            meta.forward_extremities
+                .into_iter()
+                .map(|id| EventId::new(id.as_str())),
+            expected,
+            view.key_table(),
+        );
+        let mut profile = RestoreProfile::default();
+        let prefix = room_prefix(Keyspace::Log, &self.room_id);
+        let restore = if expected >= PIPELINE_ROWS {
+            pipelined(view, &prefix, restore, &mut profile)?
+        } else {
+            view.visit_prefix(&prefix, &mut |_, value| {
+                profile.row_bytes += value.len() as u64;
+                restore.push(EntryRecord::decode_restored(value)?)?;
+                Ok(())
+            })?;
+            restore
+        };
+        profile.rows = restore.len();
+        profile.records = started.elapsed();
+        Ok(Some((restore, profile)))
+    }
+
+    /// Runtime restoration checks all ordered metadata/chain and selected
+    /// roots only. Older roots are checked on demand, not declared verified.
+    ///
+    /// # Errors
+    /// Returns an error for unreadable records, chain, tips or selected roots.
+    pub fn load_runtime(&self) -> Result<Option<RuntimeRestoredLog>, StoreError> {
+        Ok(self.load_runtime_profiled()?.map(|(restored, _)| restored))
+    }
+
+    /// [`Self::load_runtime`], reporting where the time went.
+    ///
+    /// # Errors
+    /// As [`Self::load_runtime`].
+    pub fn load_runtime_profiled(
+        &self,
+    ) -> Result<Option<(RuntimeRestoredLog, RestoreProfile)>, StoreError> {
+        let Some((restore, mut profile)) = self.stream_records()? else {
+            return Ok(None);
+        };
+        let mut load_node = |address: &StateRoot| {
+            self.store
+                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
+                .ok()
+                .flatten()
+        };
+        let started = std::time::Instant::now();
+        let mut restored = restore.finish_runtime(&mut load_node)?;
+        profile.roots = started.elapsed();
+        let started = std::time::Instant::now();
+        self.restore_sidelined_checked(&mut restored.log)?;
+        profile.sidelined = started.elapsed();
+        let started = std::time::Instant::now();
+        self.restore_historical_rejections(&mut restored.log)?;
+        profile.rejections = started.elapsed();
+        Ok(Some((restored, profile)))
+    }
+
+    /// Validate every persisted root and chain, including historical roots
+    /// that runtime restoration deliberately leaves unmaterialized.
+    ///
+    /// # Errors
+    /// Returns an error for unreadable records, chain, tips or any state root.
+    pub fn load_exhaustive(&self) -> Result<Option<RestoredLog>, StoreError> {
+        let Some((restore, _)) = self.stream_records()? else {
+            return Ok(None);
+        };
+        let mut load_node = |address: &StateRoot| {
+            self.store
+                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
+                .ok()
+                .flatten()
+        };
+        let mut restored = restore.finish_exhaustive(&mut load_node)?;
+        self.restore_sidelined_checked(&mut restored.log)?;
+        self.restore_historical_rejections(&mut restored.log)?;
+        Ok(Some(restored))
+    }
+
     /// Rebuild the log from storage.
     ///
     /// Returns `Ok(None)` when the room has no metadata, which is how an unknown
@@ -1397,7 +2089,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 .flatten()
         };
 
-        let restored = RoomLog::restore_with_state(
+        let mut restored = RoomLog::restore_with_state(
             entries,
             meta.next_forward,
             meta.next_backward,
@@ -1405,7 +2097,10 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 .into_iter()
                 .map(|id| EventId::new(id.as_str())),
             &mut load_node,
+            self.store.key_table(),
         )?;
+        self.restore_sidelined(&mut restored.log)?;
+        self.restore_historical_rejections(&mut restored.log)?;
         Ok(Some(restored))
     }
 }
@@ -1434,6 +2129,15 @@ pub enum StoreError {
     /// [`RoomStore::commit_entry`] per append instead, which is the serving
     /// path and never needs more than the entry it is writing.
     StateNotResident { li: i64 },
+    /// The log was built against a different intern table than this store.
+    ///
+    /// Persisting it would write nodes whose ids name the log's numbering
+    /// into a keyspace numbered by the store's: same ids, different pairs,
+    /// and whichever row lands last wins while the other state silently
+    /// loses slots. Refusing is the whole fix -- build the log against
+    /// [`ReadView::key_table`] of the store it will be saved to, or rebase
+    /// it with [`StateSnapshot::with_table`] at the handoff.
+    ForeignStateTable,
 }
 
 impl From<fjall::Error> for StoreError {
@@ -1505,6 +2209,10 @@ impl std::fmt::Display for StoreError {
             Self::StateNotResident { li } => write!(
                 formatter,
                 "state for li {li} has been evicted; use commit_entry per append"
+            ),
+            Self::ForeignStateTable => write!(
+                formatter,
+                "log was built against another store's intern table; save it to its own store"
             ),
         }
     }

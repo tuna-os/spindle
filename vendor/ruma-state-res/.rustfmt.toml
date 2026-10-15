@@ -1,0 +1,5 @@
+# Stable subset of Ruma's formatting settings; keep the vendored diff small.
+newline_style = "Unix"
+style_edition = "2024"
+use_field_init_shorthand = true
+use_small_heuristics = "Max"

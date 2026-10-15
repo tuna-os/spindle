@@ -16,7 +16,14 @@ use std::collections::HashMap;
 use std::process::Command;
 
 use proptest::prelude::*;
-use spindle_core::{RehydrateError, StateKey, StateRoot, StateSnapshot};
+use spindle_core::{
+    MemStateKeyTable, RehydrateError, StateKey, StateKeyTable, StateRoot, StateSnapshot,
+};
+use std::sync::Arc;
+
+fn table() -> Arc<dyn StateKeyTable> {
+    MemStateKeyTable::shared()
+}
 
 /// The environment variable that turns this test binary into the child.
 const CASE: &str = "SPINDLE_HOSTILE_TRIE";
@@ -51,16 +58,23 @@ fn branch_to(child: &StateRoot) -> Vec<u8> {
 
 /// A real snapshot with enough entries to have branches under its root, and
 /// every node it is made of.
-fn honest_trie(entries: usize) -> (StateSnapshot, HashMap<StateRoot, Vec<u8>>) {
-    let mut snapshot = StateSnapshot::new();
+fn honest_trie(
+    entries: usize,
+) -> (
+    StateSnapshot,
+    HashMap<StateRoot, Vec<u8>>,
+    Arc<dyn StateKeyTable>,
+) {
+    let table = table();
+    let mut snapshot = StateSnapshot::new(table.clone());
     for index in 0..entries {
         snapshot = snapshot.apply(
-            StateKey::new("m.room.member", format!("@user{index}:example.org")),
+            &StateKey::new("m.room.member", format!("@user{index}:example.org")),
             format!("$event{index}"),
         );
     }
     let nodes = snapshot.delta_nodes(None).into_iter().collect();
-    (snapshot, nodes)
+    (snapshot, nodes, table)
 }
 
 fn load_from(
@@ -96,7 +110,8 @@ fn rehydrates_one_hostile_trie() {
         "cycle" => branch_to(&address),
         other => panic!("no such case: {other}"),
     };
-    let outcome = StateSnapshot::rehydrate(address, &mut |_: &StateRoot| Some(node.clone()));
+    let outcome =
+        StateSnapshot::rehydrate(address, &mut |_: &StateRoot| Some(node.clone()), table());
     assert_eq!(outcome.map(|_| ()), Err(RehydrateError::Malformed));
 }
 
@@ -135,7 +150,7 @@ fn a_trie_that_never_bottoms_out_is_refused_not_followed() {
 /// corrupted to an ancestor's address.
 #[test]
 fn a_child_pointer_aimed_at_an_ancestor_is_refused() {
-    let (snapshot, mut nodes) = honest_trie(200);
+    let (snapshot, mut nodes, table) = honest_trie(200);
     let root = snapshot.root();
     let root_bytes = nodes.get(&root).expect("the root is stored").clone();
     assert_eq!(
@@ -149,7 +164,7 @@ fn a_child_pointer_aimed_at_an_ancestor_is_refused() {
     corrupt[9..41].copy_from_slice(root.as_bytes());
     nodes.insert(root, corrupt);
 
-    let outcome = StateSnapshot::rehydrate(root, &mut load_from(&nodes));
+    let outcome = StateSnapshot::rehydrate(root, &mut load_from(&nodes), table);
     assert_eq!(outcome.map(|_| ()), Err(RehydrateError::Malformed));
 }
 
@@ -158,9 +173,9 @@ fn a_child_pointer_aimed_at_an_ancestor_is_refused() {
 /// pass every test above.
 #[test]
 fn an_honest_trie_still_rehydrates() {
-    let (snapshot, nodes) = honest_trie(2_000);
-    let rebuilt =
-        StateSnapshot::rehydrate(snapshot.root(), &mut load_from(&nodes)).expect("a real trie");
+    let (snapshot, nodes, table) = honest_trie(2_000);
+    let rebuilt = StateSnapshot::rehydrate(snapshot.root(), &mut load_from(&nodes), table)
+        .expect("a real trie");
     assert_eq!(rebuilt.root(), snapshot.root());
     assert_eq!(rebuilt.len(), 2_000);
     snapshot.for_each(|key, event_id| assert_eq!(rebuilt.get(key), Some(event_id)));
@@ -177,6 +192,7 @@ proptest! {
         let outcome = StateSnapshot::rehydrate(
             StateRoot::from_bytes([1; 32]),
             &mut |_: &StateRoot| Some(bytes.clone()),
+            table(),
         );
         prop_assert!(outcome.is_err());
     }
@@ -184,12 +200,12 @@ proptest! {
     /// A real root node that lost its tail, at every possible cut.
     #[test]
     fn truncated_nodes_rehydrate_or_refuse(entries in 1_usize..64) {
-        let (snapshot, mut nodes) = honest_trie(entries);
+        let (snapshot, mut nodes, table) = honest_trie(entries);
         let root = snapshot.root();
         let whole = nodes.get(&root).expect("the root is stored").clone();
         for cut in 0..whole.len() {
             nodes.insert(root, whole[..cut].to_vec());
-            let outcome = StateSnapshot::rehydrate(root, &mut load_from(&nodes));
+            let outcome = StateSnapshot::rehydrate(root, &mut load_from(&nodes), table.clone());
             prop_assert!(outcome.is_err(), "a root cut to {cut} bytes rehydrated");
         }
     }
@@ -198,14 +214,15 @@ proptest! {
     /// overwritten with an arbitrary `u32`.
     #[test]
     fn lying_lengths_rehydrate_or_refuse(entries in 1_usize..64, claimed: u32) {
-        let (snapshot, mut nodes) = honest_trie(entries);
+        let (snapshot, mut nodes, table) = honest_trie(entries);
         let root = snapshot.root();
         let whole = nodes.get(&root).expect("the root is stored").clone();
         for at in 0..whole.len().saturating_sub(4) {
             let mut corrupt = whole.clone();
             corrupt[at..at + 4].copy_from_slice(&claimed.to_be_bytes());
             nodes.insert(root, corrupt);
-            let outcome = StateSnapshot::rehydrate(root, &mut load_from(&nodes));
+            let outcome =
+                StateSnapshot::rehydrate(root, &mut load_from(&nodes), table.clone());
             // A window that happens to hold what was already there is the
             // honest node; anything else must be refused.
             if whole[at..at + 4] != claimed.to_be_bytes() {

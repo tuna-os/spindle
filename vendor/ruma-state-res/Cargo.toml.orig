@@ -1,0 +1,46 @@
+[package]
+name = "ruma-state-res"
+categories = ["api-bindings", "web-programming"]
+keywords = ["matrix", "chat", "ruma"]
+description = "An abstraction for Matrix state resolution."
+homepage = "https://ruma.dev/"
+repository = "https://github.com/ruma/ruma"
+readme = "README.md"
+license = "MIT"
+version = "0.18.0"
+edition = "2024"
+rust-version = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+# Private feature used for benchmarks.
+__criterion = ["dep:criterion"]
+
+[dependencies]
+js_int = { workspace = true }
+ruma-common = { workspace = true }
+ruma-events = { workspace = true }
+ruma-signatures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# dev-dependencies can't be optional, so this is a regular dependency
+criterion = { workspace = true, optional = true }
+
+[dev-dependencies]
+assert_matches2 = { workspace = true }
+insta = { workspace = true }
+similar = { workspace = true }
+test-log = { version = "0.2", default-features = false, features = ["trace"] }
+
+[[bench]]
+name = "state_res_bench"
+harness = false
+required-features = ["__criterion"]
+
+[lints]
+workspace = true

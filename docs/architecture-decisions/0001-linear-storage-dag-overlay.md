@@ -23,11 +23,14 @@ Storage order and federation ancestry are separate:
 - A class-D stale event may temporarily create several forward extremities.
 - The next local event references every current extremity (up to Matrix's limit
   of 20), collapsing the DAG back to one head.
-- If the parent states are identical or differ only on disjoint state slots,
-  their materialized snapshots merge without full state resolution.
-- Competing values for one state slot must use the room-version-specific Matrix
-  state resolver. The M0 core returns `NeedsStateResolution` until the
-  `ruma-state-res` adapter lands.
+- If the parent states are identical, their materialized snapshot is the
+  merge, without state resolution.
+- Parent states that differ in any slot use the room-version-specific Matrix
+  state resolver. *Amended by ADR 0005:* this said "competing values for one
+  slot", and let a fork on disjoint slots merge without the resolver. That is
+  not what state resolution decides, so it is gone; the core asks a
+  `StateResolver` for any difference, and the server supplies the room
+  version's algorithm.
 
 The bounded fork window must be defined by ancestry from an actual common
 ancestor, not merely by nearby linear indices. Linear position is not proof of

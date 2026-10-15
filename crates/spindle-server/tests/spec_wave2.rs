@@ -617,9 +617,18 @@ fn an_events_auth_chain_reaches_the_create_event() {
         .collect();
     kinds.sort_unstable();
     assert!(kinds.contains(&"m.room.create"), "{kinds:?}");
-    let ids: std::collections::BTreeSet<&str> = chain
+    let rules = rooms.room_version(&room).unwrap().rules().unwrap();
+    let ids: std::collections::BTreeSet<String> = chain
         .iter()
-        .filter_map(|event| event["event_id"].as_str())
+        .map(|event| {
+            assert!(event.get("event_id").is_none(), "serve the signed PDU");
+            let ruma::CanonicalJsonValue::Object(canonical) =
+                ruma::CanonicalJsonValue::try_from(event.clone()).unwrap()
+            else {
+                unreachable!()
+            };
+            ruma::signatures::reference_hash(&canonical, &rules).unwrap()
+        })
         .collect();
     assert_eq!(ids.len(), chain.len(), "each event once");
 }

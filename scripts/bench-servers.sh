@@ -108,6 +108,10 @@ rc_presence:
   per_user: {per_second: 1000, burst_count: 1000}
 rc_media_create: {per_second: 1000, burst_count: 1000}
 rc_delayed_event_mgmt: {per_second: 1000, burst_count: 1000}
+# MSC4140 delayed events, off unless a maximum delay is set: the day
+# Spindle's default allows, so the delayed-events comparison (#36,
+# scripts/delayed-events-benchmark.py) measures both with the feature on.
+max_event_delay_duration: 24h
 rc_reports: {per_second: 1000, burst_count: 1000}
 rc_admin_redaction: {per_second: 1000, burst_count: 1000}
 rc_joins_per_room: {per_second: 1000, burst_count: 1000}

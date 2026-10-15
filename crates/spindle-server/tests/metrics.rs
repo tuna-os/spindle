@@ -268,6 +268,85 @@ async fn serving_a_request_times_it_under_its_matched_route() {
     assert!(requests >= 1, "{requests}");
 }
 
+/// #625: a sync allowed to long-poll is timed under its own series, so its
+/// intended wait is not the route's latency; one that could not wait (an
+/// initial sync, or `timeout=0`) stays under the plain template.
+#[tokio::test]
+async fn a_long_polling_sync_is_timed_apart_from_one_that_could_not_wait() {
+    let server = Instance::start().await;
+    let token = server.register("erin").await;
+    let route = "/_matrix/client/v3/sync";
+    let suffix = spindle_server::metrics::LONG_POLL_SUFFIX;
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("{route}?timeout=5000"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let since = body["next_batch"].as_str().unwrap().to_owned();
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("{route}?since={since}&timeout=0"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("{route}?since={since}&timeout=50"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let sliding = "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync";
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            sliding,
+            Some(&token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let pos = body["pos"].as_str().unwrap().to_owned();
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("{sliding}?pos={pos}&timeout=50"),
+            Some(&token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let text = server.metrics.render();
+    let count = |route: &str| {
+        scrape(
+            &text,
+            &format!("spindle_http_request_duration_seconds_count{{route=\"{route}\"}}"),
+        )
+    };
+    assert_eq!(count(route), Some(2), "initial and timeout=0: {text}");
+    assert_eq!(count(&format!("{route}{suffix}")), Some(1), "{text}");
+    assert_eq!(count(sliding), Some(1), "{text}");
+    assert_eq!(count(&format!("{sliding}{suffix}")), Some(1), "{text}");
+    assert!(
+        text.contains(&format!(
+            "spindle_http_request_duration_seconds_bucket{{route=\"{route}\",le=\"120\"}} 2"
+        )),
+        "the wide buckets: {text}"
+    );
+}
+
 #[tokio::test]
 async fn committing_an_event_times_the_append() {
     let server = Instance::start().await;

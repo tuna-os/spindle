@@ -4,13 +4,22 @@
 //! cleanly — allocation cost is buried in wall clock and varies by allocator.
 //! Node count is exact, and it is the property the design actually rests on.
 
-use spindle_core::{StateKey, StateSnapshot};
+use spindle_core::{MemStateKeyTable, StateKey, StateKeyTable, StateSnapshot};
+use std::sync::Arc;
+
+fn table() -> Arc<dyn StateKeyTable> {
+    MemStateKeyTable::shared()
+}
 
 fn seeded(count: usize) -> StateSnapshot {
-    let mut state = StateSnapshot::new();
+    seeded_on(count, &table())
+}
+
+fn seeded_on(count: usize, table: &Arc<dyn StateKeyTable>) -> StateSnapshot {
+    let mut state = StateSnapshot::new(table.clone());
     for number in 0..count {
         state = state.apply(
-            StateKey::new("m.room.member", format!("@user{number}:example.org")),
+            &StateKey::new("m.room.member", format!("@user{number}:example.org")),
             format!("$event-{number}"),
         );
     }
@@ -26,7 +35,7 @@ fn one_update_creates_a_path_not_a_copy() {
 
     for size in [100_usize, 1_000, 10_000] {
         let before = seeded(size);
-        let after = before.apply(StateKey::new("m.room.topic", ""), "$topic");
+        let after = before.apply(&StateKey::new("m.room.topic", ""), "$topic");
 
         let created = after.delta_nodes(Some(&before)).len();
         counts.push((size, created));
@@ -60,7 +69,7 @@ fn an_unchanged_state_creates_nothing() {
 fn rewriting_a_slot_to_the_same_value_still_shares_the_rest() {
     let before = seeded(1_000);
     let after = before.apply(
-        StateKey::new("m.room.member", "@user0:example.org"),
+        &StateKey::new("m.room.member", "@user0:example.org"),
         "$event-0",
     );
 
@@ -76,16 +85,16 @@ fn rewriting_a_slot_to_the_same_value_still_shares_the_rest() {
 /// the trie's branches before the digest's own arrangement shows through.
 #[test]
 fn for_each_visits_in_key_order_however_the_trie_arranged_them() {
-    let mut snapshot = StateSnapshot::new();
+    let mut snapshot = StateSnapshot::new(table());
     for index in 0..256 {
         snapshot = snapshot.apply(
-            StateKey::new("m.room.member", format!("@user{index:03}:example.org")),
+            &StateKey::new("m.room.member", format!("@user{index:03}:example.org")),
             format!("$event{index}"),
         );
     }
     // Mixed types too: the order is over the whole key, not the state key alone.
     for kind in ["m.room.create", "m.room.topic", "m.room.avatar"] {
-        snapshot = snapshot.apply(StateKey::new(kind, ""), format!("${kind}"));
+        snapshot = snapshot.apply(&StateKey::new(kind, ""), format!("${kind}"));
     }
 
     let mut seen = Vec::new();
@@ -113,12 +122,12 @@ fn for_each_visits_in_key_order_however_the_trie_arranged_them() {
 /// attempt at the same optimisation has to answer, and answering it by
 /// inspection is how a format break ships unnoticed.
 ///
-/// **These values moved once, deliberately, with #77.** The state-key digest
-/// went from a 21-byte tag with `u64` length frames to an 8-byte tag with
-/// `u32` frames so an ordinary key hashes in one BLAKE3 block, and every
-/// tag moved to `-v2` with `CONTENT_DIGEST_VERSION`; every root below is
-/// the version-2 value, and a store written under version 1 is refused by
-/// its marker rather than read against these.
+/// **These values moved twice, deliberately: with #77, and now with #79.**
+/// The state-key digest went from two framed strings to one interned `u64`
+/// id, so a key hashes eight bytes under an 8-byte tag, and every tag
+/// moved to `-v3` with `CONTENT_DIGEST_VERSION`; every root below is the
+/// version-3 value, and a store written under an older version is refused
+/// by its marker rather than read against these.
 #[test]
 fn state_roots_are_the_bytes_they_have_always_been() {
     let hex = |bytes: &[u8; 32]| -> String {
@@ -129,28 +138,28 @@ fn state_roots_are_the_bytes_they_have_always_been() {
         })
     };
 
-    let mut state = StateSnapshot::new();
+    let mut state = StateSnapshot::new(table());
     for (kind, key, event_id, expected) in [
         (
             "m.room.create",
             "",
             "$create",
-            "890ce2d330f26e2d5355e92eefbdbf53c590223491f215cd9ef67123d6406614",
+            "dd393a4ff8a9355ff418ff7058379ded659ba5dcb19634733c9e389c2fbcec4f",
         ),
         (
             "m.room.member",
             "@alice:example.org",
             "$alice",
-            "3933ce89ec2e725217bc8053d0030afc146da7119e5cfe4653eb6bce23a921c3",
+            "2e71a7b3c47c2201719ff7d81004088cd0badf0fe9f660e6ad57931e98d98d6f",
         ),
         (
             "m.room.power_levels",
             "",
             "$power",
-            "fc96425d980d56028c5c91685f264dee6dd5ce98b525d4b1d281c8c8ba345c54",
+            "42d893dcd74128d072310c6b42e4b4cbb4e05ac09eb8b5091236a1c4810c580d",
         ),
     ] {
-        state = state.apply(StateKey::new(kind, key), event_id);
+        state = state.apply(&StateKey::new(kind, key), event_id);
         assert_eq!(hex(state.root().as_bytes()), expected, "after {kind}");
     }
 
@@ -159,10 +168,10 @@ fn state_roots_are_the_bytes_they_have_always_been() {
     // same digest here, or one unusually long key would silently address
     // different nodes from every other key in the same room.
     let long = format!("@{}:example.org", "x".repeat(2000));
-    let spilled = StateSnapshot::new().apply(StateKey::new("m.room.member", long), "$long");
+    let spilled = StateSnapshot::new(table()).apply(&StateKey::new("m.room.member", long), "$long");
     assert_eq!(
         hex(spilled.root().as_bytes()),
-        "9e8431f2c89141429bdb3a3118a8f36279fa266b6f9a8d03cdb7a00b95a4d1a8",
+        "602587b198d453b389575f8ed2d7a293ff7605953e81aa1ee6a4e3d2e8f0cdf9",
         "a state key that overflows the hashing buffer changed its digest"
     );
 }
@@ -192,7 +201,7 @@ fn one_update_writes_a_path_of_bytes_not_a_state() {
 
     for size in [100_usize, 1_000, 10_000] {
         let before = seeded(size);
-        let after = before.apply(StateKey::new("m.room.topic", ""), "$topic");
+        let after = before.apply(&StateKey::new("m.room.topic", ""), "$topic");
 
         let delta: usize = after
             .delta_nodes(Some(&before))

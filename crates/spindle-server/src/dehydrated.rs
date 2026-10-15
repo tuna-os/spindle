@@ -87,7 +87,8 @@ fn discard(state: &AppState, user_id: &str, device_id: &str) -> Result<(), Matri
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
     Store::delete(state.store.as_ref(), &record_key(user_id))
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    let seq = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let seq = stream_write.id();
     state
         .devices
         .mark_device_list_changed(user_id, seq)
@@ -129,7 +130,15 @@ async fn put_device(
     Authenticated(identity): Authenticated,
     Json(request): Json<PutRequest>,
 ) -> Result<Json<Value>, MatrixError> {
-    if request.device_id.is_empty() || request.device_id.contains(['/', '\0']) {
+    // A slash is allowed. matrix-rust-sdk names a dehydrated device after
+    // its Curve25519 key in unpadded standard base64, so about half of them
+    // contain a '/'. Refusing those failed Element Web's dehydration setup
+    // after recovery about half the time, and that failure aborted the
+    // step after it, which loads the key-backup key: the fresh device was
+    // verified but could not decrypt its history. The ID is length-framed
+    // in every store key, and the one route that names it in a path
+    // receives it percent-encoded, so a slash means nothing to this server.
+    if request.device_id.is_empty() || request.device_id.contains('\0') {
         return Err(MatrixError::bad_json("device_id must be a device ID"));
     }
     if !request.device_data.is_object()
@@ -211,7 +220,8 @@ async fn put_device(
     // client and every peer sharing a room, exactly as a session's upload
     // is: a peer that does not re-query will not encrypt to it, and the
     // whole point is that it be encrypted to.
-    let seq = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let seq = stream_write.id();
     state
         .devices
         .mark_device_list_changed(user_id, seq)
@@ -270,10 +280,15 @@ async fn events(
         None => None,
     };
     let position = state.rooms.stream_position();
+    crate::blocking::section(&state.metrics, crate::metrics::BlockingTask::Sync, || {
+        state.rooms.checkpoint_stream_position(position)
+    })
+    .map_err(|error| MatrixError::internal(&error.to_string()))?;
     let events = state
         .devices
-        .take_pending(&identity.user_id, &device_id, acknowledged)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        .take_pending_until(&identity.user_id, &device_id, acknowledged, position, None)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+        .0;
     Ok(Json(json!({
         "events": events,
         "next_batch": crate::tokens::Sync(position).to_string(),
