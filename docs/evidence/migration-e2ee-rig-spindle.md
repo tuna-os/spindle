@@ -4,7 +4,7 @@ This page continues
 [`migration-e2ee-rig-baseline.md`](migration-e2ee-rig-baseline.md). The
 same manifest, recovery keys and pass criteria are used here, but the target
 is a Spindle that holds an import of `synapse_dark`. The gate is the one in
-[#240](https://github.com/tuna-os/spindle/issues/240): a fresh device that
+[#240](https://github.com/tuna-os/spindle/issues/240). A fresh device that
 has only its recovery key and the server-side key backup must decrypt every
 historical encrypted event.
 
@@ -16,9 +16,11 @@ historical encrypted event.
 | b | PASS 89/89 | FAIL: same 4 | **PASS 89/89** | PASS 81/81 | not run | **PASS 81/81** |
 | c | PASS 59/59 | FAIL: 2 not redacted | **PASS 59/59** | PASS 56/56 | not run | **PASS 56/56** |
 
-Element counts are lower than `verify` counts because Element folds edits
-into their originals, so edits are not checked separately, and because
-plaintext and state events are not counted. After the fixes, 9 Element Web
+Element counts are lower than `verify` counts for two reasons. Element folds
+edits into their originals, so the checker does not check edits separately.
+The checker also does not count plaintext and state events.
+
+After the fixes, 9 Element Web
 logins on the dark Spindle had their dehydration request logged: a ×4, b ×2
 and c ×3. 4 of those logins created a dehydrated device whose ID contains a
 `/`, which is the case the dehydration fix below covers. Each of the 9
@@ -39,24 +41,25 @@ ignores quoted events.
    `org.matrix.msc4222.use_state_after=true` on every `/sync` and reads only
    `org.matrix.msc4222.state_after`, or else `state`. Spindle answered with
    the stable `state_after` field. Element therefore showed every room as an
-   unnamed room version 1 with "encryption not supported", and the composer
-   of an encrypted room offered to send unencrypted. This affected every
+   unnamed room version 1 with "encryption not supported". The composer of
+   an encrypted room offered to send unencrypted. This affected every
    Element Web user, not only migrated ones. Fixed in
    [#559](https://github.com/tuna-os/spindle/pull/559).
-3. **Element Web lost its backup key on about half of fresh logins.**
+3. **Element Web lost its backup key on about half of fresh logins**.
    matrix-rust-sdk names a dehydrated device after its Curve25519 key in
-   unpadded base64, and about 49% of those names contain a `/`. Spindle
-   refused them with `400 M_BAD_JSON`. Element sets up dehydration after
-   recovery, before it loads the backup key from secret storage, so the
-   failure skipped the backup restore. The device showed **"Device
+   unpadded base64. About 49% of those names contain a `/`. Spindle refused
+   them with `400 M_BAD_JSON`. Element sets up dehydration after recovery and
+   before it loads the backup key from secret storage. Thus the failure
+   skipped the backup restore. The device showed **"Device
    verified"** and then "Unable to decrypt" on every historical message.
    This matches the Element-only failure of 2026-09-20 exactly: identical
    ciphertext and backup, and only Element fails. The dark Synapse does not
    offer MSC3814, which is why Element always passed there. Fixed in
    [#561](https://github.com/tuna-os/spindle/pull/561).
-4. **No way to stop the dark copy federating.** It holds the production
-   server name and signing key. `[federation] enabled = false` was added in
-   [#560](https://github.com/tuna-os/spindle/pull/560).
+4. **No way to stop federation from the dark copy**. It holds the
+   production server name and `signing.key`.
+   [#560](https://github.com/tuna-os/spindle/pull/560) added
+   `[federation] enabled = false`.
 
 Fault 2 hid fault 3. With no room state, Element did not treat the rooms as
 encrypted rooms, and it decrypted every event: 81/81 with the v1 banner.
@@ -89,8 +92,8 @@ service/dark-spindle           ClusterIP 8008 only; no Ingress
 netwatch                       "outbound": 0 (outbound endpoints seen: 0)
 ```
 
-The server pod was replaced at each of the four re-imports. The netwatch logs of three
-of those pods were checked, including the pod that served the final
+Each of the four re-imports replaced the server pod. We checked the netwatch
+logs of three of those pods, including the pod that served the final
 `verify` and Element runs above. All three show 0 outbound endpoints. The only non-loopback peer was the
 toolbox's inbound client connection. `kubectl port-forward` traffic shows up
 as loopback. The import Job has no resolver, and its one configured peer is

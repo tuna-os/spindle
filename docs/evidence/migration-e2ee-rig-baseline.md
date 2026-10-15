@@ -40,22 +40,24 @@ resolv.conf                  nameserver 127.0.0.1
 exposure                     service/dark-synapse ClusterIP 8008 only; no Ingress/NodePort/LB
 ```
 
-The dark Synapse ran twice: once from 17:44 to 18:03 UTC, and again on a
-fresh copy from 18:04 to past 18:14 UTC. The second run covers the seed and
-all verify runs. Over the ~30 minutes of the two runs combined, the
-`netwatch` sidecar sampled the pod's socket table once per second. It saw
-only one remote endpoint, the database (`10.104.171.212:5432`), plus inbound
-client connections, and **0 outbound endpoints**. Each heartbeat reported
-`"outbound": 0`.
+There were two runs of the dark Synapse. The first run was from 17:44 to
+18:03 UTC. The second run used a fresh copy and went from 18:04 to past
+18:14 UTC. The second run covers the seed and all verify runs.
 
-In the second run's Synapse log, `matrixfederationclient` (DEBUG) logged no
-requests and no key fetches, and no pusher started ("Not starting pushers
-because they are disabled in the config"). There were 152 lines of the form
+Over the ~30 minutes of the two runs combined, the `netwatch` sidecar sampled the pod's
+socket table once per second. It saw only one remote endpoint, the database
+(`10.104.171.212:5432`), and inbound connections from clients. It saw
+**0 outbound endpoints**. Each heartbeat reported `"outbound": 0`.
+
+In the Synapse log of the second run, `matrixfederationclient` (DEBUG)
+logged no requests and no key fetches. No pusher started; the log says
+`Not starting pushers because they are disabled in the config`. There were
+152 lines of the form
 `_maybe_retry_device_resync: 403: Federation denied with <server>`, for 6
-distinct remote servers. These come from real remote users in the copied
-database whose device lists Synapse retries. The whitelist refuses each one
-inside the process, before name resolution, and netwatch confirms that no
-socket was opened.
+distinct remote servers. These lines come from real remote users in the
+copied database. Synapse retries the device lists of these users. The
+whitelist refuses each one inside the process, before name resolution, and
+netwatch confirms that the process opened no socket.
 
 The sampler checks once per second, so a sub-second connection could pass
 between samples. Layers 1, 3 and 4 in the README do not depend on the
@@ -71,15 +73,15 @@ sampler.
 | `v10` (a,b,c) | 10 | yes | 14 | 3 |
 
 There are 102 events in total, 88 of them encrypted, in 15 distinct Megolm
-sessions. They break down as 79 messages, 5 edits, 5 replies, 4 redacted
-targets, 4 redaction events and 5 state events (3 topics, 1 power-level
-change and 1 topic in v10). In the group room, a's session rotates from
+sessions. The events are 79 messages, 5 edits, 5 replies, 4 redacted targets
+and 4 redaction events. There are also 5 state events: 3 topics, 1
+power-level change and 1 topic in v10. In the group room, a's session rotates from
 `pfWm…` to `Epvd…` when c leaves, and then to `LZv5…` after c rejoins.
 
-All 3 users have cross-signing (master, self-signing and user-signing keys),
+All 3 users have the `master`, `self_signing` and `user_signing` keys,
 secret storage, backup version `1` and a recovery key. Backup counts are
-a=15, b=15 and c=11 sessions. At seed time, each seeding device read
-everything it should: a 89/89, b 89/89, c 59/59.
+a=15, b=15 and c=11 sessions. At seed time, the device that seeded each user
+read everything it should: a 89/89, b 89/89, c 59/59.
 
 ## Baseline verify: fresh device and recovery key against the dark Synapse
 
@@ -100,13 +102,13 @@ device out again.
 
 ## What was found on the way
 
-The first seed attempt could not read 2 of 89 events. A client that sends
-before it has fetched its room-mates' device lists shares its Megolm session
-with nobody, and the members only receive that session from a later index.
-The seed now waits until every member's devices are known before anyone
-sends. This was a seeding race, not a server fault. A homeserver that is
-slow to deliver `device_lists` changes could produce the same symptom in
-real use.
+The first seed run could not read 2 of 89 events. A client that sends
+before it has fetched the device lists of its room-mates shares its Megolm
+session with nobody. The members then receive that session only from a later
+index. The seed now waits until every member's devices are known before
+anyone sends. This was a race in the seed, not a server fault. A homeserver
+that is slow to deliver `device_lists` changes could produce the same symptom
+in real use.
 
 ## Next
 
