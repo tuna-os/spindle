@@ -123,7 +123,12 @@ is parsed from the router and CI fails on drift, and the ratchet is a file every
 entry of which must pass — so what they say matches `main` rather than matching
 when someone last edited this paragraph.
 
-### Throughput
+### Throughput (dated snapshot)
+
+The table below is a dated analysis snapshot, not the current benchmark
+result. See the [published benchmark results](https://tuna-os.github.io/spindle/)
+for the latest run and [the benchmark notes](docs/benchmarks.md) for the
+method and the limitations of comparing snapshots.
 
 Same host, same driver, same sitting; Synapse 1.159.0 on both back ends,
 because for a *write throughput* comparison the database is not a detail —
