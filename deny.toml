@@ -29,6 +29,20 @@ ignore = [
     # It is never in a shipped binary. Revisit when imbl releases a version bumping
     # imbl-sized-chunks to >=0.2.0.
     { id = "RUSTSEC-2026-0292", reason = "imbl-sized-chunks: dev-only, via imbl, benchmarks only; upstream imbl 7.0.1 pins 0.1.3" },
+    # rustls 0.23.45 has multiple CVEs fixed in 0.23.46+. Waiting for rustls 0.23.46
+    # release; these will be removed once cargo update pulls in the fixed version.
+    # See: https://github.com/rustls/rustls/pull/3299, https://github.com/rustls/rustls/pull/3300,
+    # https://github.com/rustls/rustls/pull/3297, https://github.com/rustls/rustls/pull/3355
+    { id = "RUSTSEC-2026-0346", reason = "rustls: waiting for 0.23.46 release" },
+    { id = "RUSTSEC-2026-0347", reason = "rustls: waiting for 0.23.46 release" },
+    { id = "RUSTSEC-2026-0348", reason = "rustls: waiting for 0.23.46 release" },
+    { id = "RUSTSEC-2026-0349", reason = "rustls: waiting for 0.23.46 release" },
+    # unsafe-libyaml 0.2.11 is unmaintained but is a transitive dependency through
+    # serde_yaml. serde_yaml is also deprecated. The crate is used for configuration
+    # parsing only and is not a cryptographic or network-facing component. A safe
+    # alternative like saphyr or noyalib would require replacing serde_yaml entirely.
+    # Revisit once a Rust-native YAML parser is preferred.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml: via deprecated serde_yaml; config parsing only; safe alternative requires full serde_yaml replacement" },
 ]
 
 [licenses]
