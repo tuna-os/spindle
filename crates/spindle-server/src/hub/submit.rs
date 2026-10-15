@@ -415,25 +415,8 @@ pub(crate) async fn try_send(
     let mut attempt = 0;
     loop {
         attempt += 1;
-        let (event_id, mut json) = state
-            .rooms
-            .build_for_hub(
-                room_id,
-                sender,
-                state.key.pair(),
-                event_type,
-                state_key,
-                content,
-            )
-            .map_err(room_error)?;
-        // The room's policy server approves the event before anyone sees
-        // it, as on the ordinary send path; its signature does not change
-        // the event ID.
-        state
-            .rooms
-            .authorize_policy(room_id, &mut json)
-            .await
-            .map_err(room_error)?;
+        let (event_id, json) =
+            build_approved(state, room_id, sender, event_type, state_key, content).await?;
         // `unsigned` is this server's annotation (`replaces_state`), not
         // part of the event; the hub gets the event.
         let mut wire = json.clone();
@@ -485,6 +468,37 @@ pub(crate) async fn try_send(
             }
         }
     }
+}
+
+/// Build an event on this server's head for the room's hub, and have the
+/// room's policy server approve it first, as the ordinary send path does
+/// before anyone sees an event. The approval's signature does not change
+/// the event ID.
+async fn build_approved(
+    state: &AppState,
+    room_id: &str,
+    sender: &str,
+    event_type: &str,
+    state_key: Option<&str>,
+    content: &Value,
+) -> Result<(String, Value), MatrixError> {
+    let (event_id, mut json) = state
+        .rooms
+        .build_for_hub(
+            room_id,
+            sender,
+            state.key.pair(),
+            event_type,
+            state_key,
+            content,
+        )
+        .map_err(room_error)?;
+    state
+        .rooms
+        .authorize_policy(room_id, &mut json)
+        .await
+        .map_err(room_error)?;
+    Ok((event_id, json))
 }
 
 /// The hub could not place the event: unreachable, too slow, stale too
@@ -600,22 +614,8 @@ pub(crate) async fn try_handoff(
             object.insert(PREV_HUB_KEY.to_owned(), json!(current.event_id));
             object.insert(PREV_FINAL_KEY.to_owned(), stated.clone());
         }
-        let (event_id, mut json) = state
-            .rooms
-            .build_for_hub(
-                room_id,
-                sender,
-                state.key.pair(),
-                HUB_EVENT_TYPE,
-                Some(""),
-                &opening,
-            )
-            .map_err(room_error)?;
-        state
-            .rooms
-            .authorize_policy(room_id, &mut json)
-            .await
-            .map_err(room_error)?;
+        let (event_id, json) =
+            build_approved(state, room_id, sender, HUB_EVENT_TYPE, Some(""), &opening).await?;
         if ours {
             attest::send_attestations(state, room_id).await;
             let guard = |last: Option<&ChainEntry>| names_final(&stated, last);
