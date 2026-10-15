@@ -83,5 +83,8 @@ pub use self::{
     },
     event_format::check_pdu_format,
     events::Event,
-    state_res::{StateMap, resolve, resolve_with_candidate_policy, reverse_topological_power_sort},
+    state_res::{
+        StateMap, resolve, resolve_with_candidate_policy, reverse_topological_power_sort,
+        take_auth_rejections,
+    },
 };

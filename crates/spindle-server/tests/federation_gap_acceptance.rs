@@ -201,7 +201,7 @@ async fn serve(
     store: &Arc<FjallStore>,
     metrics: &Arc<Metrics>,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-    let config = spindle_server::Config::parse("[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n[federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n").unwrap();
+    let config = spindle_server::Config::parse("[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n[federation]\ngap_backfill = false\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n").unwrap();
     let app =
         spindle_server::app_with_metrics(config, Arc::clone(store), Arc::clone(metrics)).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

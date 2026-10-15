@@ -158,16 +158,19 @@ impl Rooms {
         let Some(id) = event["event_id"].as_str().map(str::to_owned) else {
             return Err(RoomError::Build("client event has no event_id".to_owned()));
         };
-        let root = self.with_room_read(room_id, |_, log| {
-            Ok(log
-                .get(&EventId::new(id.as_str()))
-                .map(|entry| entry.state_root))
+        let (root, table) = self.with_room_read(room_id, |_, log| {
+            Ok((
+                log.get(&EventId::new(id.as_str()))
+                    .map(|entry| entry.state_root),
+                log.table().clone(),
+            ))
         })?;
         let membership_id = match root {
             Some(root) => StateSnapshot::get_persisted(
                 root,
                 &StateKey::new("m.room.member", user_id),
                 &mut |root| self.load_node(root),
+                &table,
             )
             .map_err(|error| {
                 RoomError::Build(format!("cannot read membership at event: {error:?}"))

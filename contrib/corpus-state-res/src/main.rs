@@ -37,6 +37,7 @@ use spindle_core::{
     EventId, EventInput, RoomLog, Sideline, SidelinedEntry, StateKey, StateSnapshot,
 };
 use spindle_server::rooms::{RoomError, Rooms};
+use spindle_store::ReadView;
 
 struct Merge {
     event_id: String,
@@ -257,11 +258,17 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
     let groups: Vec<i64> = closure.iter().map(|(group, _)| *group).collect();
     let prev_of: HashMap<i64, Option<i64>> = closure.iter().copied().collect();
 
+    let dir = tempfile::Builder::new()
+        .prefix("corpus-state-res")
+        .tempdir()?;
+    let store = Arc::new(spindle_store::FjallStore::open(dir.path())?);
+    let table = store.key_table();
+
     // Materialize the needed groups' states by walking deltas in group
     // order, sharing structure: a delta group is its parent plus its rows,
     // and a full snapshot is rebuilt against the last group built.
     let mut snaps: HashMap<i64, StateSnapshot> = HashMap::new();
-    let mut last: StateSnapshot = StateSnapshot::new();
+    let mut last: StateSnapshot = StateSnapshot::new(Arc::clone(&table));
     {
         let mut rows = db
             .query_raw(
@@ -292,10 +299,13 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
             }
             let snapshot = match prev_of.get(group).copied().flatten() {
                 Some(prev) => {
-                    let mut snapshot = snaps.get(&prev).cloned().unwrap_or_default();
+                    let mut snapshot = snaps
+                        .get(&prev)
+                        .cloned()
+                        .unwrap_or_else(|| StateSnapshot::new(Arc::clone(&table)));
                     for (key, id) in &delta {
                         if snapshot.get(key) != Some(id.as_str()) {
-                            snapshot = snapshot.apply(key.clone(), id.as_str());
+                            snapshot = snapshot.apply(key, id.as_str());
                         }
                     }
                     if let Some(left) = children.get_mut(&prev) {
@@ -321,7 +331,7 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
                     }
                     for (key, id) in &delta {
                         if snapshot.get(key) != Some(id.as_str()) {
-                            snapshot = snapshot.apply(key.clone(), id.as_str());
+                            snapshot = snapshot.apply(key, id.as_str());
                         }
                     }
                     snapshot
@@ -336,10 +346,6 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
 
     // Bodies: every state event of the room (outliers included: auth chains
     // reach them), and the merges and their parents.
-    let dir = tempfile::Builder::new()
-        .prefix("corpus-state-res")
-        .tempdir()?;
-    let store = Arc::new(spindle_store::FjallStore::open(dir.path())?);
     let rooms = Rooms::new(Arc::clone(&store), "replay.invalid");
     let mut wanted_ids: Vec<String> = Vec::new();
     for merge in &merges {
@@ -402,7 +408,7 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
             })
         });
 
-        let mut log = RoomLog::new();
+        let mut log = RoomLog::new(Arc::clone(&table));
         for id in &rejected {
             if std::env::var_os("CORPUS_REEVALUATE_REJECTED").is_none() {
                 log.preserve_historical_rejection(EventId::new(id.as_str()));
@@ -414,9 +420,9 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
                     depth: 0,
                     state_key: None,
                     kind: Sideline::Rejected,
-                    state_root: StateSnapshot::new().root(),
+                    state_root: StateSnapshot::new(Arc::clone(&table)).root(),
                 },
-                StateSnapshot::new(),
+                StateSnapshot::new(Arc::clone(&table)),
             );
         }
         for (parent, snapshot) in merge.prevs.iter().zip(&parents) {
@@ -480,7 +486,7 @@ fn replay_room(db: &mut Client, room_id: &str) -> Result<Tally, Box<dyn std::err
         let differences: Vec<_> = ours
             .diff(expected)
             .into_iter()
-            .filter(|(key, _, _)| Some(*key) != ignore.as_ref())
+            .filter(|(key, _, _)| Some(key) != ignore.as_ref())
             .collect();
         if conflicted {
             tally.conflicted += 1;

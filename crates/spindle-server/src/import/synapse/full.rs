@@ -1244,7 +1244,8 @@ impl Run<'_, '_> {
             if self.options.dry_run {
                 continue;
             }
-            let seq = self.target.rooms.allocate_stream_id();
+            let stream_write = self.target.rooms.reserve_stream_id();
+            let seq = stream_write.id();
             self.target
                 .devices
                 .queue_to_device(&user_id, &device_id, seq, &message)

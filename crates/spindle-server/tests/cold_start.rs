@@ -90,8 +90,10 @@ struct Restarted {
 
 impl Restarted {
     fn over(store: &Arc<FjallStore>) -> Self {
+        // These tests measure request-driven residency. Background push
+        // delivery can consume seeded events and load rooms first.
         let config = spindle_server::Config::parse(&format!(
-            "[server]\nname = \"{SERVER}\"\n[ratelimit]\nenabled = false\n"
+            "[server]\nname = \"{SERVER}\"\n[ratelimit]\nenabled = false\n[push]\nenabled = false\n"
         ))
         .unwrap();
         let metrics = Arc::new(Metrics::new());

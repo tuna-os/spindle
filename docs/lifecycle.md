@@ -8,6 +8,11 @@ Every one of these opens the store directly, and fjall holds an exclusive
 lock, so **they run with the server stopped**. For a restore that is not just
 a limitation: it is the only way to be sure nothing is writing behind you.
 
+Sync positions have a durable checkpoint before classic sync, sliding sync,
+or dehydrated-device responses issue their tokens. The checkpoint survives
+mailbox drains and receipt-only activity. A restart must allocate future
+positions above tokens clients already hold, even when push is disabled.
+
 ## Backup
 
 ```
@@ -58,29 +63,36 @@ spindle set-password-hash <config> <localpart> < hash
 spindle set-password-hash <config> < hashes
 ```
 
-Stores Argon2 PHC hashes computed elsewhere (#611) — a Matrix
-Authentication Service's `user_passwords.hashed_password`, typically — so
-those users sign in to Spindle with the passwords they already have. The
-hashes come from stdin, never the command line, so they do not land in a
-process listing or shell history. With a localpart, stdin is that one
-account's hash; without, each line is `<localpart> <hash>` (`@user:server`
-works too; blank lines and `#` comments are skipped).
+Stores Argon2 hashes in PHC form that another system made (#611). This is
+usually the `user_passwords.hashed_password` of a Matrix Authentication
+Service. Those users then sign in to Spindle with the passwords they
+already have. The hashes come from stdin, never the command line, so they
+do not show in a process listing or shell history.
 
-Each hash is validated before it is written: `argon2id`, `argon2i` or
-`argon2d`, version 16 or 19, exactly the `m`/`t`/`p` parameters, with
-`m` at most 256 MiB and `t`, `p` at most 16. Anything else — bcrypt,
-pbkdf2, a keyed `keyid=`/`data=` hash — is refused, because a stored hash
-this server cannot verify is an account nobody can enter. A hash made with
-a pepper that is *not* recorded in the string (MAS's per-scheme `secret`)
-looks ordinary, is accepted, and never verifies: check your MAS
-`passwords.schemes` before importing. Accounts must already exist (the
-Synapse importer creates them); a refused line is named by line number
-and localpart, never with its hash, and the command exits non-zero while
-anything was refused. Offline like every command here; the running
-server's equivalent is `POST /_spindle/admin/v1/users/{user_id}/password_hash`
-with `{"password_hash": "...", "logout_devices": false}`, which also works
-while authentication is still delegated, so hashes can land before a
-cutover.
+With a localpart,
+stdin is the hash of that one account. Without one, each line is
+`<localpart> <hash>` (`@user:server` works too, and the command does not read
+blank lines and `#` comments).
+
+The command validates each hash before it writes it. It must be
+`argon2id`, `argon2i` or `argon2d`, version 16 or 19, with exactly the
+`m`/`t`/`p` parameters. `m` is 256 MiB at most, and `t` and `p` are 16 at
+most. The command refuses all other hashes (bcrypt, pbkdf2, a keyed
+`keyid=`/`data=` hash). If this server cannot verify a stored hash,
+nobody can enter that account.
+
+A hash made with a pepper that the string does *not* record (the
+per-scheme `secret` of MAS) looks ordinary. The command accepts it, but it
+never verifies. Check your MAS `passwords.schemes` before the import.
+
+The
+accounts must already exist (the Synapse importer makes them). The command
+names a refused line by line number and localpart, never with its hash.
+If it refused a line, it exits non-zero. Like each command here, it works
+offline. For a live server, use
+`POST /_spindle/admin/v1/users/{user_id}/password_hash` with
+`{"password_hash": "...", "logout_devices": false}`. This also works while
+authentication is still delegated, so hashes can land before a cutover.
 
 ## Issuing a password-reset link
 
@@ -88,19 +100,49 @@ cutover.
 spindle issue-reset-link <config> <localpart> [--ttl 24h]
 ```
 
-For a user who cannot sign in, on a server that sends no mail (or for
-anyone, really): prints a single-use link to the built-in provider's
-*choose a new password* page, on the configured issuer. Hand it over by a
-channel you trust; whoever opens it can set the account's password, and
-doing so signs every device out. `--ttl` takes `30m`, `24h`, `2d` or
-seconds; a day by default, a week at most. Only the newest link of an
-account works, so issuing another (or the user requesting a mailed one)
-retires this one. The token is stored only as a digest. Needs
-`auth.builtin_oidc`; offline like the other commands here, and the running
-server's equivalent is `POST /_spindle/admin/v1/users/{user_id}/reset_link`
-(optional body `{"ttl": "2h"}`), which audit-logs the issuance without the
-token. Users can also recover on their own with the recovery codes the
-account pages generate — see [delegated-auth.md](delegated-auth.md).
+This is for a user who cannot sign in, on a server that sends no mail
+(or for any user). It prints a link to the *choose a new password* page of
+the built-in provider, on the configured issuer. The link works one time.
+Give it by a channel you trust. The person who opens it can set the
+password of the account, and that signs each device out.
+
+`--ttl` takes `30m`, `24h`, `2d` or seconds: a day by default, a week at
+most. Only the newest link of an account works. A new link (or a mailed
+one that the user asks for) retires this one. The server keeps only a
+digest of the token.
+
+The command needs `auth.builtin_oidc` and works
+offline, like the other commands here. For a live server, use
+`POST /_spindle/admin/v1/users/{user_id}/reset_link` (optional body
+`{"ttl": "2h"}`). It records the link in the audit log without the token.
+Users can also recover on their own with the recovery codes of the
+account pages. See [delegated-auth.md](delegated-auth.md).
+
+## A full disk
+
+When the disk fills, the store refuses the write that does not fit. The
+client gets a 500 for that request. From then on the store refuses every
+write until the process restarts, because fjall locks its database after a
+failed journal write. Nothing the server acknowledged is lost.
+
+What the probes say:
+
+- `/ready` answers 503 from the first refused write. A load balancer then
+  sends no clients to a server that cannot write.
+- `/health` stays at 200. The process is good and the disk is not. A restart
+  onto the same full disk only adds a crash loop.
+- Reads continue. `/sync` and `/messages` serve the history up to the last
+  acknowledged event.
+
+To recover, make space on the disk, then restart the server. Make a
+real amount of space, not a few megabytes: at start, the store must flush
+what it recovered before it accepts a write. In the drill, a 64 MiB disk
+with 2 MiB free did not recover, and with 16 MiB free it did.
+
+`just drill-disk-full` runs the drill. It mounts a 64 MiB tmpfs with sudo,
+then fills it under the store and under a server. CI runs it on each pull
+request. The two tests are `crates/spindle-store/tests/disk_full.rs` and
+`crates/spindle-server/tests/disk_full.rs`.
 
 ## Migration
 
@@ -167,7 +209,7 @@ a bug report or a migration step has to say which one it means:
 |---|---|---|---|
 | **key schema** | `KEY_SCHEMA_VERSION` in `spindle-core` | 1 | the byte layout of keys: a keyspace discriminant reused or reordered, or a key's fields moved. *Adding* a keyspace is not a bump: every existing key keeps its bytes and its meaning. |
 | **record schema** | `RECORD_VERSION` in `spindle-store` | 1 | the encoding of the values under those keys (log entries and bodies), which carry their version as their first byte. |
-| **content digest** | `CONTENT_DIGEST_VERSION` in `spindle-core` | 2 | how content addresses are *derived*: a domain tag, a length width or a field order in the hashing. Keys and records are untouched by such a change, which is why it has its own number (#78): a store under the old derivation would open and misread every node address. |
+| **content digest** | `CONTENT_DIGEST_VERSION` in `spindle-core` | 3 | how content addresses are *derived*: a domain tag, a length width or a field order in the hashing. Keys and records are untouched by such a change, which is why it has its own number (#78): a store under the old derivation would open and misread every node address. |
 | **engine format** | the major version of `fjall` in `Cargo.toml` | 3 | the on-disk layout of the store itself: journal, segments, the engine's own `version` file. Spindle does not choose it and cannot rewrite it. |
 
 The first three are what the schema marker records and what `migrate` moves
@@ -184,8 +226,9 @@ The transitions so far, numbered so they can be referred to:
 |---|---|---|---|---|---|
 | 1 | engine format | fjall 2 | fjall 3 | #193 | it does not. fjall 3 refuses a v2 directory with `InvalidVersion(Some(V2))` and has no in-process upgrade. Restore from a backup taken under fjall 3, or start a fresh store. |
 | 2 | content digest | 1 | 2 | #330 | it does not, yet. The store is refused as `content_digest 1` (a store from before the marker existed counts as 1 if it holds any row), and no migration step re-derives the addresses. Start a fresh store. |
+| 3 | content digest | 2 | 3 | #79 | `spindle migrate` rewrites state tries with interned keys and persists their intern rows. Irreversible; restore the pre-migration backup to return to version 2. |
 
-Both were accepted deliberately, because no Spindle had data to lose. They
+The first two were accepted deliberately, because no Spindle had data to lose. They
 are kept on the books rather than forgotten because each is an example of
 what the machinery below does *not* do: transition 1 is the case it cannot
 help with, and `crates/spindle-store/tests/backend_compatibility.rs` holds
@@ -195,15 +238,14 @@ nobody has needed it. Key and record schemas have never moved.
 
 ### The current state of the table
 
-**No schema change has yet been given a data rewrite** (transition 2 above
-was refused rather than migrated), so the migration table is empty and
-`spindle migrate` reports "already at this binary's schema" on every store in
-existence.
+The first data rewrite is the version-2 to version-3 content-digest step (#79).
+It converts roots in the linear log, sidelined records and gap history, and
+writes the intern rows with their new nodes. Old nodes are deleted after all
+rooms have converted, because content addresses can be shared across rooms.
+A partial run keeps the old marker; rerunning preserves already converted roots
+and finishes the remaining work. Take a backup before this irreversible step.
 
-That is worth saying rather than implying otherwise. What exists today is the
-machinery and its guarantees, proven by `crates/spindle-store/tests/schema_migration.rs`
-against synthetic tables — chaining, the no-path refusal, dry runs writing
-nothing, and the marker never landing ahead of the data. Those are properties
-of the machinery rather than of any particular step, which is why they can be
-established before the first real step is written, under whatever pressure
-produced the schema change that needed it.
+The migration machinery is covered by `crates/spindle-store/tests/schema_migration.rs`;
+the actual rewrite and reopening are covered by `tests/state_migration.rs` in
+the same crate. The intern table is part of the backup: losing its rows loses
+the meaning of the ids in state nodes. Version 1 still has no migration path.

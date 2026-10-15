@@ -27,7 +27,7 @@ use spindle_core::{
     AppendError, EventId, EventInput, LogEntry, Pdu, RoomLog, Sideline, StateKey, StateResolver,
     StateRoot, StateSnapshot, is_state_dag,
 };
-use spindle_store::{Durability, FjallStore, RoomStore, StoreError};
+use spindle_store::{Durability, FjallStore, RoomStore, Store, StoreError};
 
 /// Native rooms are v11 (SPEC §11.6).
 pub const ROOM_VERSION: &str = "11";
@@ -144,6 +144,7 @@ type Destinations = ([u8; 32], Arc<Vec<String>>);
 
 mod admin;
 mod erasure;
+pub mod extremities;
 mod federation;
 mod gaps;
 mod read;
@@ -151,6 +152,7 @@ mod synapse_positions;
 mod unread;
 
 pub use admin::AdminTimelineEntry;
+pub use federation::{JOIN_GAP_CAUSE, JOIN_HISTORY_EVENTS};
 pub use read::{ReadScope, RoomReader};
 pub use synapse_positions::SynapseGap;
 
@@ -269,6 +271,9 @@ pub struct Rooms {
     /// Resolutions already computed, keyed by the roots of the states they
     /// resolved (`state_res::ResolutionCache`).
     resolutions: crate::state_res::ResolutionCache,
+    /// Extremity merging's bookkeeping (`extremities`): rooms an append left
+    /// forked since the last pass, and when each room was last merged.
+    extremities: extremities::Tracker,
     /// The server-global order `/sync` needs (SPEC §10.2). The linear index
     /// orders events within one room; nothing orders them across rooms, so
     /// this is the one counter that exists purely because a per-room order is
@@ -285,6 +290,7 @@ pub struct Rooms {
     /// that event for that client forever, silently. Building and proving it
     /// first makes the lock change mechanical instead of frightening.
     stream: crate::stream::Stream,
+    issued_position: Mutex<u64>,
     /// Woken whenever an event lands, so a long-polling `/sync` does not have
     /// to spin. SPEC §10.3 wants per-room subscriber lists; this is the same
     /// shape at server granularity, which is enough while there is one lock.
@@ -444,6 +450,29 @@ pub struct TimelineEvent {
     pub json: Value,
 }
 
+/// A reserved side-stream position. Keep this guard until persistence finishes.
+pub struct SideStreamWrite<'a> {
+    stream: &'a crate::stream::Stream,
+    id: u64,
+    wake: &'a tokio::sync::Notify,
+}
+
+impl SideStreamWrite<'_> {
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl Drop for SideStreamWrite<'_> {
+    fn drop(&mut self) {
+        // A failed write leaves a hole, not a permanently stalled watermark.
+        if self.stream.finish(self.id) {
+            self.wake.notify_waiters();
+        }
+    }
+}
+
 impl Rooms {
     /// A `Rooms` with a registry of its own, for tests and tools that do
     /// not scrape it; the server uses [`Rooms::with_metrics`].
@@ -485,11 +514,13 @@ impl Rooms {
             state_heads: Mutex::new(HashMap::new()),
             auth_graphs: Mutex::new(HashMap::new()),
             resolutions: crate::state_res::ResolutionCache::default(),
+            extremities: extremities::Tracker::default(),
             // Resumed, not reset. A counter that restarted at zero would
             // re-issue stream ids already on disk, overwriting the entries
             // they point at -- the same shape of bug as a room registry that
             // does not survive a restart, and worse, because it corrupts
             // rather than merely forgets.
+            issued_position: Mutex::new(read_stream_checkpoint(store_for_stream.as_ref())),
             stream: crate::stream::Stream::resuming_at(highest_stream_id(
                 store_for_stream.as_ref(),
                 stream_high,
@@ -592,7 +623,10 @@ impl Rooms {
             } else {
                 let log = RoomStore::new(self.store.as_ref(), room_id)
                     .load()?
-                    .map_or_else(RoomLog::new, |restored| restored.log);
+                    .map_or_else(
+                        || RoomLog::new(spindle_store::ReadView::key_table(self.store.as_ref())),
+                        |restored| restored.log,
+                    );
                 let room = Arc::new(RwLock::new(log));
                 open.insert(room_id.to_owned(), Arc::clone(&room));
                 room
@@ -623,19 +657,23 @@ impl Rooms {
             let refused = |error: spindle_core::AppendError| {
                 RoomError::Append(format!("{event_id}: {error:?}"))
             };
+            // Hoisted: `log.table()` inside an `append_seeded` argument
+            // would borrow the log shared while the call borrows it
+            // exclusively, and every seed below joins this log.
+            let table = log.table().clone();
             let seeded_state: Option<crate::import::StateMap>;
             let first_seed = step.seed && log.entries().next().is_none();
             let entry = if first_seed {
                 let state = state_after_root.map_or_else(
                     || {
-                        step.input
-                            .state_key
-                            .clone()
-                            .map_or_else(StateSnapshot::new, |key| {
-                                StateSnapshot::new().apply(key, event_id.to_owned())
-                            })
+                        step.input.state_key.clone().map_or_else(
+                            || StateSnapshot::new(table.clone()),
+                            |key| {
+                                StateSnapshot::new(table.clone()).apply(&key, event_id.to_owned())
+                            },
+                        )
                     },
-                    crate::import::snapshot_from,
+                    |map| crate::import::snapshot_from(map, &table),
                 );
                 seeded_state = state_after_root.cloned();
                 log.append_seeded(step.input.clone(), state, step.depth)
@@ -647,6 +685,8 @@ impl Rooms {
                 // The replay derived this event's state (the room version's
                 // resolver, the head over the forward extremities, or
                 // Synapse's state at a gap) and found the log's fold is not it.
+                // `append_seeded` rebases the spool's numbering onto the
+                // log's; the saved nodes name ids the room store resolves.
                 from_source.push((event_id.to_owned(), settled.reason.clone()));
                 let entry = log
                     .append_seeded(step.input.clone(), settled.state, step.depth)
@@ -681,7 +721,7 @@ impl Rooms {
                 let entry = log
                     .append_seeded(
                         step.input.clone(),
-                        crate::import::snapshot_from(&state),
+                        crate::import::snapshot_from(&state, &table),
                         step.depth,
                     )
                     .map_err(refused)?
@@ -1068,7 +1108,7 @@ impl Rooms {
         // would move `origin_server_ts` and, for v12, break the very
         // identity being established.
         let (create_id, create_json, room_id) = self.birth(creator, key, &create_content)?;
-        let mut log = RoomLog::new();
+        let mut log = RoomLog::new(spindle_store::ReadView::key_table(self.store.as_ref()));
         self.authorize(&log, &room_id, &create_id, &create_json, None)?;
         self.commit_event(
             &mut log,
@@ -1353,7 +1393,8 @@ impl Rooms {
         event_id: &str,
         invite_state: &[Value],
     ) -> Result<(), RoomError> {
-        let stream_id = self.allocate_stream_id();
+        let stream_write = self.reserve_stream_id();
+        let stream_id = stream_write.id();
         spindle_store::Store::put(
             self.store.as_ref(),
             &spindle_core::keys::user_room(
@@ -1638,8 +1679,12 @@ impl Rooms {
             .ok()
             .flatten()
         };
-        let snapshot = spindle_core::StateSnapshot::rehydrate(root, &mut load)
-            .map_err(|error| RoomError::Build(format!("cannot rebuild state: {error:?}")))?;
+        let snapshot = spindle_core::StateSnapshot::rehydrate(
+            root,
+            &mut load,
+            spindle_store::ReadView::key_table(self.store.as_ref()),
+        )
+        .map_err(|error| RoomError::Build(format!("cannot rebuild state: {error:?}")))?;
         let mut ids = Vec::new();
         snapshot.for_each(|key, event_id| {
             if want(key) {
@@ -2345,7 +2390,8 @@ impl Rooms {
             if let Some(object) = pdu.as_object_mut() {
                 object.remove("event_id");
             }
-            let seq = self.allocate_stream_id();
+            let stream_write = self.reserve_stream_id();
+            let seq = stream_write.id();
             spindle_store::Store::put(
                 self.store.as_ref(),
                 &spindle_core::keys::federation_outbox(destination, seq),
@@ -2967,8 +3013,12 @@ impl Rooms {
             .ok()
             .flatten()
         };
-        let snapshot = spindle_core::StateSnapshot::rehydrate(root, &mut load)
-            .map_err(|error| RoomError::Build(format!("cannot rebuild state: {error:?}")))?;
+        let snapshot = spindle_core::StateSnapshot::rehydrate(
+            root,
+            &mut load,
+            spindle_store::ReadView::key_table(self.store.as_ref()),
+        )
+        .map_err(|error| RoomError::Build(format!("cannot rebuild state: {error:?}")))?;
 
         let mut ids = Vec::with_capacity(snapshot.len());
         snapshot.for_each(|_, event_id| ids.push(event_id.to_owned()));
@@ -3635,24 +3685,54 @@ impl Rooms {
         self.appended.notify_waiters();
     }
 
-    /// Take the next global sequence number without writing a stream row.
+    /// Reserve a side-stream position until its writer finishes.
     ///
-    /// To-device messages draw from the same counter room events do, so a
-    /// sync token positions both at once — which is what lets `since`
-    /// acknowledge to-device deliveries with no second cursor. The stream
-    /// scan skips absent ids already, so a gap where a to-device message sat
-    /// costs nothing.
-    pub fn allocate_stream_id(&self) -> u64 {
-        // Allocated and committed together: these ids name positions on
-        // side streams (to-device, receipts) that are durable by the time
-        // the caller has one, so there is no window for them to be in.
-        let id = self.stream.allocate();
-        self.stream.commit(id);
-        id
+    /// Keep the returned guard alive through every store write. Dropping it
+    /// releases the position and wakes sync waiters, including on error or
+    /// panic. Publishing at allocation lets a sync acknowledge a message
+    /// before it exists, then delete it unseen when the write finally lands.
+    #[must_use]
+    pub fn reserve_stream_id(&self) -> SideStreamWrite<'_> {
+        SideStreamWrite {
+            stream: &self.stream,
+            id: self.stream.allocate(),
+            wake: &self.appended,
+        }
     }
 
     pub fn stream_position(&self) -> u64 {
         self.stream.position()
+    }
+
+    /// Persist a position before issuing a token that acknowledges it.
+    /// Queue rows and ephemeral marks can disappear; they cannot be the only
+    /// evidence that a client already holds a position above the room log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the checkpoint cannot be made durable.
+    pub fn checkpoint_stream_position(&self, position: u64) -> Result<(), RoomError> {
+        if position > self.stream_position() {
+            return Err(RoomError::StateUnavailable(
+                "uncommitted stream position".to_owned(),
+            ));
+        }
+        let mut issued = self
+            .issued_position
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if position > *issued {
+            spindle_store::Store::commit(
+                self.store.as_ref(),
+                &[(
+                    spindle_core::keys::stream_checkpoint(),
+                    position.to_be_bytes().to_vec(),
+                )],
+                spindle_store::Durability::Strict,
+            )?;
+            *issued = position;
+        }
+        Ok(())
     }
 
     /// Note that `user_id` sent a receipt in `room_id`: a position on the
@@ -3660,7 +3740,8 @@ impl Rooms {
     /// reader's own next sync answers now and carries the counts the
     /// receipt changed.
     pub fn mark_receipt(&self, room_id: &str, user_id: &str) {
-        let position = self.allocate_stream_id();
+        let stream_write = self.reserve_stream_id();
+        let position = stream_write.id();
         self.receipt_marks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3772,6 +3853,7 @@ impl Rooms {
         state_after: bool,
     ) -> Result<SyncResult, RoomError> {
         let position = self.stream_position();
+        self.checkpoint_stream_position(position)?;
         let joined = self.joined(user_id)?;
         let invited = self.invited_since(user_id, since, position)?;
         let knocked = self.knocked(user_id)?;
@@ -4340,6 +4422,28 @@ impl Rooms {
         Ok(out)
     }
 
+    /// Every `(li, stream id)` pair this room has in the reverse stream
+    /// index, in stream order: where each of its events sits in the
+    /// server-wide order. `/notifications` orders across rooms by it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the index cannot be read.
+    pub fn stream_rows(&self, room_id: &str) -> Result<Vec<(i64, u64)>, RoomError> {
+        let rows = spindle_store::ReadView::scan_prefix(
+            self.store.as_ref(),
+            &spindle_core::keys::room_stream_prefix(room_id),
+        )?;
+        Ok(rows
+            .iter()
+            .filter_map(|(key, raw)| {
+                let stream_id = spindle_core::keys::room_stream_from_key(key)?;
+                let li = i64::from_be_bytes(<[u8; 8]>::try_from(raw.as_slice()).ok()?);
+                Some((li, stream_id))
+            })
+            .collect())
+    }
+
     /// Where the room stood when the server handed out sync token
     /// `position`: the room's own index of its newest event at or before
     /// that stream position, or `None` if nothing of the room's had entered
@@ -4621,29 +4725,33 @@ impl Rooms {
         // a backlog holds it for as long as that takes -- is read from the
         // store too: the store holds every entry the log does, and the sort
         // key is not worth queueing behind an ingest for.
+        //
+        // An `org.matrix.dummy_event` (#626) is not activity: it merges
+        // forks, and a quiet room that receives one must keep its place in
+        // the room list, as Synapse's bump stamps leave it out. So the newest
+        // entry that is not one dates the room, looked for at most
+        // `ACTIVITY_LOOKBACK` entries back from the head.
         let in_memory = self
             .resident(room_id)
             .and_then(|room| match room.try_read() {
-                Ok(log) => Some(Self::head_in_memory(&log)),
+                Ok(log) => Some(Self::tail_in_memory(&log)),
                 Err(std::sync::TryLockError::Poisoned(log)) => {
-                    Some(Self::head_in_memory(&log.into_inner()))
+                    Some(Self::tail_in_memory(&log.into_inner()))
                 }
                 Err(std::sync::TryLockError::WouldBlock) => None,
             });
-        let head = match in_memory {
-            Some(head) => head,
-            None => self.head_in_store(room_id)?,
-        };
-        let activity = match head {
-            None => 0,
-            Some((event_id, rejected)) => {
-                if rejected {
-                    return Err(RoomError::MissingBody(event_id));
-                }
-                self.read_event(room_id, &EventId::new(event_id.as_str()))?["origin_server_ts"]
-                    .as_i64()
-                    .unwrap_or(0)
-            }
+        let activity = if let Some(tail) = in_memory {
+            let mut tail = tail.into_iter();
+            self.activity_of(room_id, || Ok(tail.next()))?
+        } else {
+            let mut end: Option<Vec<u8>> = None;
+            self.activity_of(room_id, || {
+                let Some((head, key)) = self.head_in_store(room_id, end.as_deref())? else {
+                    return Ok(None);
+                };
+                end = Some(key);
+                Ok(Some(head))
+            })?
         };
         // Filled only if still empty: an append that landed while this was
         // reading has already stored a fresher key, and must not be
@@ -4656,30 +4764,81 @@ impl Rooms {
             .or_insert(activity))
     }
 
-    /// The head entry of a resident log: its event id, and whether that
-    /// event is historically rejected (and so has no body to show).
-    fn head_in_memory(log: &RoomLog) -> Option<(String, bool)> {
-        log.entries().next_back().map(|entry| {
-            (
-                entry.event_id.as_str().to_owned(),
-                log.historically_rejected(&entry.event_id),
-            )
-        })
+    /// The timestamp of the newest entry `next` yields, newest first, that
+    /// is not an `org.matrix.dummy_event`. Looks at most
+    /// [`ACTIVITY_LOOKBACK`] entries back; a tail of nothing but dummy
+    /// events is dated by the oldest of them looked at, and an empty room
+    /// is dated zero.
+    fn activity_of(
+        &self,
+        room_id: &str,
+        mut next: impl FnMut() -> Result<Option<TailEntry>, RoomError>,
+    ) -> Result<i64, RoomError> {
+        let mut oldest_dummy = None;
+        for _ in 0..ACTIVITY_LOOKBACK {
+            let Some(entry) = next()? else {
+                break;
+            };
+            if entry.rejected {
+                return Err(RoomError::MissingBody(entry.event_id));
+            }
+            let body = self.read_event(room_id, &EventId::new(entry.event_id.as_str()))?;
+            let ts = body["origin_server_ts"].as_i64().unwrap_or(0);
+            if entry.state || !extremities::is_dummy_event(&body) {
+                return Ok(ts);
+            }
+            oldest_dummy = Some(ts);
+        }
+        Ok(oldest_dummy.unwrap_or(0))
     }
 
-    /// [`Self::head_in_memory`] for a room that is not resident, read from
-    /// the store without restoring the room.
+    /// The newest [`ACTIVITY_LOOKBACK`] entries of a resident log, newest
+    /// first, ending early at a state event (which cannot be a dummy event).
+    fn tail_in_memory(log: &RoomLog) -> Vec<TailEntry> {
+        let mut tail = Vec::new();
+        for entry in log.entries().rev().take(ACTIVITY_LOOKBACK) {
+            let state = entry.state_key.is_some();
+            tail.push(TailEntry {
+                event_id: entry.event_id.as_str().to_owned(),
+                rejected: log.historically_rejected(&entry.event_id),
+                state,
+            });
+            if state {
+                break;
+            }
+        }
+        tail
+    }
+
+    /// The newest entry of a room's stored log below `end` (the head when
+    /// `None`), read without restoring the room, with its row key so the
+    /// caller can step further back.
     ///
     /// The log keyspace is ordered by linear index -- the encoding is
     /// order-preserving across the sign boundary, which is what lets a
     /// restore scan it straight into a log -- so the room's last row is the
     /// entry a restored log would hold at its head.
-    fn head_in_store(&self, room_id: &str) -> Result<Option<(String, bool)>, RoomError> {
+    fn head_in_store(
+        &self,
+        room_id: &str,
+        end: Option<&[u8]>,
+    ) -> Result<Option<(TailEntry, Vec<u8>)>, RoomError> {
         let store = self.store.as_ref();
         let prefix = spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::Log, room_id);
-        let mut end = prefix.clone();
-        end.extend_from_slice(&[0xff; 9]);
-        let Some((_, value)) = spindle_store::ReadView::last_before(store, &prefix, &end)? else {
+        let stepping_back = end.is_some();
+        let end = end.map_or_else(
+            || {
+                let mut end = prefix.clone();
+                end.extend_from_slice(&[0xff; 9]);
+                end
+            },
+            <[u8]>::to_vec,
+        );
+        let Some((key, value)) = spindle_store::ReadView::last_before(store, &prefix, &end)? else {
+            if stepping_back {
+                // Stepped back past the first row: nothing older.
+                return Ok(None);
+            }
             // No entries: an empty room, or no room at all -- which a load
             // would have told apart by the room's metadata, so this does too.
             let meta =
@@ -4696,7 +4855,14 @@ impl Rooms {
             &spindle_core::keys::historical_rejection(room_id, &record.event_id),
         )?
         .is_some();
-        Ok(Some((record.event_id, rejected)))
+        Ok(Some((
+            TailEntry {
+                event_id: record.event_id,
+                rejected,
+                state: record.state_key.is_some(),
+            },
+            key,
+        )))
     }
 
     /// Which of `rooms` had at least one event in the stream range
@@ -4739,6 +4905,48 @@ impl Rooms {
         limit: usize,
     ) -> Result<(Vec<Value>, bool, Option<i64>), RoomError> {
         self.timeline_tail(room_id, limit)
+    }
+
+    /// [`Self::timeline_tail_public`] without `org.matrix.dummy_event`s
+    /// (#626): the newest `limit` events a room list may preview. A dummy
+    /// event merges forks and says nothing, so a client asking for one event
+    /// to show under the room's name must get the message before it.
+    ///
+    /// Looks [`TIMELINE_DUMMY_SLACK`] events past `limit` to find them; dummy
+    /// events are at most one per room per merge interval, so a longer run
+    /// is a room with nothing else to show. The window begins at its oldest
+    /// kept event, so paging back from it reaches every event left out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room or an event cannot be read.
+    pub fn timeline_tail_for_preview(
+        &self,
+        room_id: &str,
+        limit: usize,
+    ) -> Result<(Vec<Value>, bool, Option<i64>), RoomError> {
+        let (events, more) = self.messages(room_id, None, limit + TIMELINE_DUMMY_SLACK)?;
+        let oldest = events.last().map(|event| event.li);
+        let mut kept = Vec::with_capacity(limit);
+        let mut cut = false;
+        // Newest first.
+        for event in events {
+            if extremities::is_dummy_event(&event.json) {
+                continue;
+            }
+            if kept.len() == limit {
+                cut = true;
+                break;
+            }
+            kept.push(event);
+        }
+        let first = kept.last().map(|event| event.li).or(oldest);
+        let mut out: Vec<Value> = kept
+            .into_iter()
+            .map(|event| stamp(event.json, &event.event_id))
+            .collect();
+        out.reverse();
+        Ok((out, more.is_some() || cut, first))
     }
 
     fn membership_rooms(&self, user_id: &str, wanted: &[u8]) -> Result<Vec<String>, RoomError> {
@@ -5172,7 +5380,57 @@ impl Rooms {
         if self.store.journalled() != before {
             spindle_store::Store::sync(self.store.as_ref(), Durability::Group)?;
         }
+        // A write the store refused leaves this room's log ahead of it: the
+        // entry is appended in memory before its batch is committed, and a
+        // full disk refuses the batch. Kept, the entry is a head whose body
+        // was never stored, and every read that reaches it -- `/messages`
+        // first -- answers `M_NOT_FOUND` for a room that is fine (#21's
+        // disk-full drill). The store is the record, so the room goes back
+        // to it: dropped here, reloaded on the next ask.
+        //
+        // Only when the store has stopped taking writes. A refusal for any
+        // other reason (a forbidden event, a contested key) is decided
+        // before anything is appended, and evicting a healthy room under
+        // concurrent writers would be a race of its own making.
+        if done.is_err() && !self.store.accepts_writes() {
+            self.evict(room_id, &room);
+        }
         done
+    }
+
+    /// Forget everything held in memory for `room_id`, so the next ask
+    /// loads it from the store.
+    ///
+    /// `room` is the log the caller held: if the registry has already
+    /// moved on to a newer load, that one came from the store and stays.
+    /// The caches keyed by room alone go with it, because they were kept
+    /// warm by the same appends. The ones keyed by a state root prove
+    /// themselves current on every hit and need nothing.
+    fn evict(&self, room_id: &str, room: &Arc<RwLock<RoomLog>>) {
+        {
+            let mut open = self
+                .open
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if open
+                .get(room_id)
+                .is_some_and(|held| Arc::ptr_eq(held, room))
+            {
+                open.remove(room_id);
+            }
+        }
+        self.unread_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(room_id);
+        self.last_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(room_id);
+        self.state_heads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(room_id);
     }
 
     /// Build, sign, append and persist one event.
@@ -5429,10 +5687,14 @@ impl Rooms {
         let started = std::time::Instant::now();
         let result = work(log, &mut resolver, &mut load);
         let stats = resolver.stats;
+        self.metrics
+            .record_state_res(stats.resolutions, stats.cache_hits, stats.rejections);
         if stats.resolutions > 0 {
             tracing::info!(
                 room = room_id,
                 elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                rejected = stats.rejections,
+                forward_extremities = log.forward_extremities().len(),
                 auth_graph = graph
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5504,6 +5766,11 @@ impl Rooms {
         previous_tips: &BTreeSet<EventId>,
     ) -> Result<(), RoomError> {
         if log.forward_extremities().len() > 1 {
+            // Every append to a forked room re-resolves its current state
+            // over every extremity. A fork no peer's event merges -- tips this
+            // server holds that no remote event cites -- costs that on every
+            // append for good, so it is noted for the merge pass (#626).
+            self.extremities.note_forked(room_id);
             match self.resolve_in(log, room_id, |log, resolver, load| {
                 log.resolve_current(resolver, load)
             }) {
@@ -5701,7 +5968,8 @@ impl Rooms {
             .filter(|domain| !live.iter().any(|known| known == *domain));
 
         for destination in live.iter().map(String::as_str).chain(departing) {
-            let seq = self.allocate_stream_id();
+            let stream_write = self.reserve_stream_id();
+            let seq = stream_write.id();
             spindle_store::Store::put(
                 self.store.as_ref(),
                 &spindle_core::keys::federation_outbox(destination, seq),
@@ -5877,7 +6145,7 @@ impl Rooms {
             let state = log
                 .sidelined_state(&entry.event_id)
                 .cloned()
-                .unwrap_or_default();
+                .unwrap_or_else(|| StateSnapshot::new(log.table().clone()));
             let mut load = |root: &StateRoot| self.load_node(root);
             let previous = prev
                 .first()
@@ -6133,7 +6401,8 @@ impl Rooms {
         // Keep the unread index current while it is warm. Only if cached:
         // a cold room's index is built from the log on first use, so there
         // is nothing to maintain until someone asks.
-        if input.state_key.is_none() {
+        // A dummy event is not something to read (#626): it never counts.
+        if input.state_key.is_none() && input.event_type != extremities::DUMMY_EVENT_TYPE {
             let mut cache = self
                 .unread_index
                 .lock()
@@ -6165,13 +6434,16 @@ impl Rooms {
         // sort key, so the sliding-sync room list never re-reads a body
         // for it. Unconditional: an absent entry is filled lazily, a
         // present one must not go stale.
-        self.last_activity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                room_id.to_owned(),
-                input.json["origin_server_ts"].as_i64().unwrap_or(0),
-            );
+        // A dummy event (#626) is not activity, and leaves the key alone.
+        if input.event_type != extremities::DUMMY_EVENT_TYPE {
+            self.last_activity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    room_id.to_owned(),
+                    input.json["origin_server_ts"].as_i64().unwrap_or(0),
+                );
+        }
 
         // The signed JSON is stored beside the log entry, in the entry's own
         // batch. The log holds ordering and state; the event body is what a
@@ -6490,26 +6762,59 @@ impl Rooms {
     /// the rest of the body. The unread index reads this for every event it
     /// indexes and nothing else, and the event's content is most of its
     /// size.
-    fn read_sender(&self, room_id: &str, event_id: &EventId) -> Result<String, RoomError> {
+    ///
+    /// `None` for an `org.matrix.dummy_event`, which the unread index leaves
+    /// out (#626).
+    fn read_sender(&self, room_id: &str, event_id: &EventId) -> Result<Option<String>, RoomError> {
         #[derive(serde::Deserialize)]
         struct Sender<'a> {
             #[serde(borrow, default)]
             sender: Option<std::borrow::Cow<'a, str>>,
+            #[serde(borrow, default, rename = "type")]
+            kind: Option<std::borrow::Cow<'a, str>>,
         }
         let raw = spindle_store::ReadView::get(
             self.store.as_ref(),
             &event_body_key(room_id, event_id.as_str()),
         )?
         .ok_or_else(|| RoomError::MissingBody(event_id.as_str().to_owned()))?;
-        if let Ok(Sender { sender }) = serde_json::from_slice::<Sender<'_>>(&raw) {
-            return Ok(sender.map(std::borrow::Cow::into_owned).unwrap_or_default());
+        if let Ok(Sender { sender, kind }) = serde_json::from_slice::<Sender<'_>>(&raw) {
+            if kind.as_deref() == Some(extremities::DUMMY_EVENT_TYPE) {
+                return Ok(None);
+            }
+            return Ok(Some(
+                sender.map(std::borrow::Cow::into_owned).unwrap_or_default(),
+            ));
         }
         // Whatever the narrow read refuses -- a sender that is not a
         // string, a repeated key -- is answered the way the whole-body
         // read answers it, errors included.
         let event: Value = serde_json::from_slice(&raw)?;
-        Ok(event["sender"].as_str().unwrap_or("").to_owned())
+        if extremities::is_dummy_event(&event) {
+            return Ok(None);
+        }
+        Ok(Some(event["sender"].as_str().unwrap_or("").to_owned()))
     }
+}
+
+/// How far back from a room's head [`Rooms::last_activity`] looks past
+/// `org.matrix.dummy_event`s for the event that dates the room. Merges are
+/// at most one per room per `[rooms] dummy_event_interval_secs`, and any
+/// other event ends the walk, so a longer run means a room nobody else has
+/// spoken in for that many intervals.
+const ACTIVITY_LOOKBACK: usize = 16;
+
+/// How many events past its limit [`Rooms::timeline_tail_for_preview`]
+/// reads to find what the dummy events it leaves out displaced.
+const TIMELINE_DUMMY_SLACK: usize = 4;
+
+/// One entry near a room's head, as [`Rooms::last_activity`] reads it.
+struct TailEntry {
+    event_id: String,
+    /// Historically rejected: there is no body to date it by.
+    rejected: bool,
+    /// A state event, which is never a dummy event.
+    state: bool,
 }
 
 /// One cold load in flight ([`Rooms::room_or_load`]): its outcome once it
@@ -7237,6 +7542,14 @@ fn backfill_room_stream_index(store: &FjallStore, through: u64) -> usize {
     written
 }
 
+fn read_stream_checkpoint(store: &FjallStore) -> u64 {
+    spindle_store::ReadView::get(store, &spindle_core::keys::stream_checkpoint())
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_slice().try_into().map(u64::from_be_bytes).ok())
+        .unwrap_or(0)
+}
+
 /// The highest stream id already on disk, or 0 for a fresh store.
 ///
 /// `from_stream` is [`highest_stream_row`], passed in because the caller has
@@ -7338,7 +7651,23 @@ fn highest_stream_id(store: &FjallStore, from_stream: u64) -> u64 {
         .flatten()
         .and_then(|value| value.as_slice().try_into().map(u64::from_be_bytes).ok())
         .unwrap_or(0);
+    // An appservice can drain the last to-device row without any Matrix
+    // client syncing. Its durable acknowledgement is also a counter floor.
+    let from_appservices = spindle_store::ReadView::scan_prefix(
+        store,
+        &[
+            spindle_core::keys::KEY_SCHEMA_VERSION,
+            spindle_core::keys::Keyspace::AppserviceCursor as u8,
+        ],
+    )
+    .unwrap_or_default()
+    .iter()
+    .filter_map(|(_, value)| value.as_slice().try_into().map(u64::from_be_bytes).ok())
+    .max()
+    .unwrap_or(0);
     from_stream
+        .max(read_stream_checkpoint(store))
+        .max(from_appservices)
         .max(from_push_cursor)
         .max(from_to_device)
         .max(from_device_lists)
@@ -8135,6 +8464,7 @@ fn power_levels_content(
 #[cfg(test)]
 mod cold_registry_tests {
     use super::*;
+    use spindle_core::MemStateKeyTable;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -8149,7 +8479,9 @@ mod cold_registry_tests {
     fn blocked_cold_load_does_not_block_an_unrelated_warm_room() {
         let (_dir, rooms) = rooms();
         rooms
-            .room_or_load("!warm:test", || Ok(RoomLog::new()))
+            .room_or_load("!warm:test", || {
+                Ok(RoomLog::new(MemStateKeyTable::shared()))
+            })
             .unwrap();
         let (entered, inside) = mpsc::channel();
         let (release, held) = mpsc::channel();
@@ -8158,7 +8490,7 @@ mod cold_registry_tests {
             cold.room_or_load("!cold:test", || {
                 entered.send(()).unwrap();
                 held.recv().unwrap();
-                Ok(RoomLog::new())
+                Ok(RoomLog::new(MemStateKeyTable::shared()))
             })
             .unwrap()
         });
@@ -8192,7 +8524,7 @@ mod cold_registry_tests {
                 .room_or_load("!same:test", || {
                     entered.send(()).unwrap();
                     held.recv().unwrap();
-                    Ok(RoomLog::new())
+                    Ok(RoomLog::new(MemStateKeyTable::shared()))
                 })
                 .unwrap()
         });
@@ -8205,7 +8537,7 @@ mod cold_registry_tests {
             let room = second
                 .room_or_load("!same:test", || {
                     counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok(RoomLog::new())
+                    Ok(RoomLog::new(MemStateKeyTable::shared()))
                 })
                 .unwrap();
             done.send(()).unwrap();
@@ -8248,7 +8580,7 @@ mod cold_registry_tests {
             let second = Arc::clone(&rooms);
             let follower = std::thread::spawn(move || {
                 second.room_or_load("!flaky:test", || {
-                    let mut log = RoomLog::new();
+                    let mut log = RoomLog::new(MemStateKeyTable::shared());
                     log.append_local("$second", None).unwrap();
                     Ok(log)
                 })
@@ -8285,12 +8617,12 @@ mod cold_registry_tests {
                 .room_or_load("!same:test", || {
                     entered.send(()).unwrap();
                     held.recv().unwrap();
-                    Ok(RoomLog::new())
+                    Ok(RoomLog::new(MemStateKeyTable::shared()))
                 })
                 .unwrap()
         });
         inside.recv_timeout(Duration::from_secs(2)).unwrap();
-        let published = Arc::new(RwLock::new(RoomLog::new()));
+        let published = Arc::new(RwLock::new(RoomLog::new(MemStateKeyTable::shared())));
         rooms
             .open
             .write()

@@ -31,8 +31,14 @@ use ruma::state_res::StateMap;
 use ruma::{OwnedEventId, events::TimelineEventType};
 use serde_json::json;
 use spindle_core::{
-    AppendError, EventId, EventInput, RoomLog, StateKey, StateResolver, StateSnapshot,
+    AppendError, EventId, EventInput, MemStateKeyTable, RoomLog, StateKey, StateKeyTable,
+    StateResolver, StateSnapshot,
 };
+use std::sync::Arc;
+
+fn table() -> Arc<dyn StateKeyTable> {
+    MemStateKeyTable::shared()
+}
 
 fn normalize(state: &StateMap<OwnedEventId>) -> BTreeMap<(String, String), String> {
     state
@@ -213,7 +219,11 @@ struct Oracle<'a> {
 }
 
 impl StateResolver for Oracle<'_> {
-    fn resolve(&mut self, states: &[StateSnapshot]) -> Result<StateSnapshot, AppendError> {
+    fn resolve(
+        &mut self,
+        states: &[StateSnapshot],
+        table: &Arc<dyn StateKeyTable>,
+    ) -> Result<StateSnapshot, AppendError> {
         self.calls += 1;
         let maps: Vec<StateMap<OwnedEventId>> = states
             .iter()
@@ -232,9 +242,14 @@ impl StateResolver for Oracle<'_> {
             panic!("the fixture forks two ways");
         };
         let resolved = reference_resolve(self.graph, left, right);
-        let mut out = StateSnapshot::new();
+        // The answer must intern exactly like its inputs: roots only match
+        // when both sides mint the same ids for the same pairs.
+        let answer_table = states
+            .first()
+            .map_or_else(|| Arc::clone(table), |state| state.table().clone());
+        let mut out = StateSnapshot::new(answer_table);
         for ((event_type, key), id) in resolved {
-            out = out.apply(StateKey::new(event_type.to_string(), key), id.as_str());
+            out = out.apply(&StateKey::new(event_type.to_string(), key), id.as_str());
         }
         Ok(out)
     }
@@ -286,7 +301,7 @@ fn the_log_takes_the_resolvers_answer_and_nothing_else() {
     let mut graph = left.fork("-g");
     graph.absorb(&right);
 
-    let mut log = RoomLog::new();
+    let mut log = RoomLog::new(table());
     let mut shared: Vec<(String, (String, String))> = base
         .state_map()
         .into_iter()
@@ -337,7 +352,7 @@ fn the_log_takes_the_resolvers_answer_and_nothing_else() {
 /// itself: the strict form refuses and names the slot, whatever the slot.
 #[test]
 fn a_fork_whose_states_differ_is_never_merged_without_a_resolver() {
-    let mut log = RoomLog::new();
+    let mut log = RoomLog::new(table());
     let root = log
         .append_local("$root", Some(StateKey::new("m.room.create", "")))
         .unwrap()

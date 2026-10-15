@@ -27,8 +27,9 @@
 //!   more than its highest auth event's). Available bodies are read once
 //!   per graph build; unavailable bodies are rechecked before cache reuse.
 //! - **A cache of resolutions** keyed by input state roots, room identity,
-//!   rejection policy and auth graph generation. A recovered auth body
-//!   changes the question even when all input state roots stay identical.
+//!   rejection policy and auth graph generation, least recently used out
+//!   first. A recovered auth body changes the question even when all input
+//!   state roots stay identical.
 //!
 //! Every "is this event allowed" question inside resolution is ruma's
 //! `check_state_dependent_auth_rules`, exactly as on the send path
@@ -43,8 +44,10 @@ use ruma::room_version_rules::{RoomVersionRules, StateResolutionVersion};
 use ruma::state_res::StateMap;
 use ruma::state_res::utils::event_id_set::EventIdSet;
 use serde_json::Value;
+use std::sync::Arc;
+
 use spindle_core::{
-    AppendError, EventId, RoomLog, Sideline, StateKey, StateResolver, StateSnapshot,
+    AppendError, EventId, RoomLog, Sideline, StateKey, StateKeyTable, StateResolver, StateSnapshot,
 };
 
 use crate::authorize::StoredEvent;
@@ -309,21 +312,33 @@ impl AuthGraph {
 /// Resolutions already computed, keyed by the sorted roots of the states
 /// they resolved.
 ///
-/// A root names a whole state by content, and every input a resolution
-/// reads -- the events, their auth chains, the room version through the
-/// create event -- is fixed by those states. So two calls with the same
-/// roots and imported rejection policy are the same call. The policy identity
-/// is part of the cache key because rejection metadata is not in signed PDUs.
+/// A root is the content address of a whole state (`StateSnapshot::root`),
+/// a BLAKE3 hash over every `(type, state_key) -> event ID` slot. Every input
+/// a resolution reads is fixed by those states: the events they name, whose
+/// IDs are reference hashes from room version 3 on and, before that, name
+/// the one body this store kept; the auth chains those bodies cite; and the
+/// room version, through the create event. Three inputs are not in signed
+/// PDUs, so they are in the key too: the room, the rejection policy, and the
+/// auth graph's generation, which changes when a missing auth body arrives.
+/// Two calls with the same key are therefore the same call.
+///
+/// Least recently used entries go first. The cache is shared by every room,
+/// and a room whose current state sits on a fork that does not merge asks
+/// the same question on every message it receives (#626). The old
+/// first-in-first-out order evicted such an entry after 512 newer misses
+/// anywhere on the server, however often it was hit.
 #[derive(Debug, Default)]
 pub struct ResolutionCache {
     entries: Mutex<CacheEntries>,
 }
 
-/// The cached resolutions, and their keys oldest first for eviction.
-type CacheEntries = (
-    HashMap<Vec<[u8; 32]>, StateSnapshot>,
-    VecDeque<Vec<[u8; 32]>>,
-);
+/// The cached resolutions with the tick each was last used at, and the
+/// clock that issues ticks.
+#[derive(Debug, Default)]
+struct CacheEntries {
+    map: HashMap<Vec<[u8; 32]>, (StateSnapshot, u64)>,
+    clock: u64,
+}
 
 /// Resolutions kept. Each is a state root and a snapshot sharing nearly all
 /// of its structure with its inputs, so this bounds bookkeeping, not memory
@@ -343,11 +358,16 @@ impl ResolutionCache {
     }
 
     fn get(&self, key: &[[u8; 32]]) -> Option<StateSnapshot> {
-        let entries = self
+        let mut entries = self
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        entries.0.get(key).cloned()
+        entries.clock = entries.clock.wrapping_add(1);
+        let now = entries.clock;
+        entries.map.get_mut(key).map(|(state, used)| {
+            *used = now;
+            state.clone()
+        })
     }
 
     fn put(&self, key: Vec<[u8; 32]>, state: StateSnapshot) {
@@ -355,14 +375,38 @@ impl ResolutionCache {
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if entries.0.insert(key.clone(), state).is_none() {
-            entries.1.push_back(key);
+        entries.clock = entries.clock.wrapping_add(1);
+        let now = entries.clock;
+        entries.map.insert(key, (state, now));
+        // One scan per insertion, and an insertion follows a resolution,
+        // which costs far more than 512 comparisons.
+        while entries.map.len() > RESOLUTION_CACHE_CAPACITY {
+            let Some(oldest) = entries
+                .map
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            entries.map.remove(&oldest);
         }
-        while entries.1.len() > RESOLUTION_CACHE_CAPACITY {
-            if let Some(oldest) = entries.1.pop_front() {
-                entries.0.remove(&oldest);
-            }
-        }
+    }
+
+    /// How many resolutions are held.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map
+            .len()
+    }
+
+    /// Whether nothing is held.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -371,6 +415,9 @@ impl ResolutionCache {
 pub struct ResolutionStats {
     pub resolutions: u64,
     pub cache_hits: u64,
+    /// Candidates the iterative auth checks refused. Expected, not a fault:
+    /// weighing such events is what resolution is for.
+    pub rejections: u64,
 }
 
 /// The room version's resolver over one room's log and bodies.
@@ -557,7 +604,7 @@ fn to_snapshot(
     for ((event_type, state_key), id) in resolved {
         let key = StateKey::new(event_type.to_string(), state_key.as_str());
         if state.get(&key) != Some(id.as_str()) {
-            state = state.apply(key.clone(), id.as_str());
+            state = state.apply(&key, id.as_str());
         }
         kept.insert(key);
     }
@@ -574,7 +621,11 @@ fn to_snapshot(
 }
 
 impl StateResolver for RoomResolver<'_> {
-    fn resolve(&mut self, states: &[StateSnapshot]) -> Result<StateSnapshot, AppendError> {
+    fn resolve(
+        &mut self,
+        states: &[StateSnapshot],
+        table: &Arc<dyn StateKeyTable>,
+    ) -> Result<StateSnapshot, AppendError> {
         let generation = {
             let mut graph = self
                 .graph
@@ -595,7 +646,11 @@ impl StateResolver for RoomResolver<'_> {
             return Ok(hit);
         }
         let Some(base) = states.first() else {
-            return Ok(StateSnapshot::new());
+            // The trait hands the empty case its table: with no states to
+            // inherit numbering from, the caller says which one the empty
+            // snapshot belongs to. The empty root is a constant either
+            // way; the table matters the moment anything is applied to it.
+            return Ok(StateSnapshot::new(table.clone()));
         };
         let mut unparsed = HashSet::new();
         let maps: Vec<StateMap<OwnedEventId>> = states
@@ -609,9 +664,12 @@ impl StateResolver for RoomResolver<'_> {
                 "state names event IDs that do not parse; those slots keep their value"
             );
         }
-        let resolved = self
-            .resolve_maps(&maps)
-            .map_err(AppendError::ResolutionFailed)?;
+        // Whatever an earlier resolution on this thread left uncounted is
+        // not this one's.
+        let _ = ruma::state_res::take_auth_rejections();
+        let resolved = self.resolve_maps(&maps);
+        self.stats.rejections += ruma::state_res::take_auth_rejections();
+        let resolved = resolved.map_err(AppendError::ResolutionFailed)?;
         let state = to_snapshot(base, &resolved, unparsed);
         self.stats.resolutions += 1;
         self.cache.put(key, state.clone());

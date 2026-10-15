@@ -485,7 +485,8 @@ pub(crate) fn remove_device(
 /// Mark the user's device list changed and wake `/sync`, so peers stop
 /// (or start) encrypting to the right set of devices.
 pub(crate) fn device_list_changed(state: &AppState, user_id: &str) {
-    let seq = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let seq = stream_write.id();
     if let Err(error) = state.devices.mark_device_list_changed(user_id, seq) {
         tracing::warn!(user_id, %error, "device-list change mark failed");
     }

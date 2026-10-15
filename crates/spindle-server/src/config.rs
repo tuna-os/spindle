@@ -43,6 +43,8 @@ pub struct Config {
     pub push: PushConfig,
     #[serde(default)]
     pub registration: RegistrationConfig,
+    #[serde(default)]
+    pub rooms: RoomsConfig,
     /// Absent means this server sends no notices and the admin endpoint
     /// says so.
     #[serde(default)]
@@ -291,6 +293,11 @@ pub struct DelayedEventsConfig {
     /// in: a legitimate Matrix RTC client sits at one.
     #[serde(default = "default_max_per_room")]
     pub max_per_room: usize,
+    /// The most delays one user may have pending across every room:
+    /// MSC4140's `max_scheduled`, which the server must enforce and
+    /// advertises in `/capabilities`.
+    #[serde(default = "default_max_per_user")]
+    pub max_per_user: usize,
 }
 
 impl Default for DelayedEventsConfig {
@@ -298,6 +305,7 @@ impl Default for DelayedEventsConfig {
         Self {
             max_delay_ms: default_max_delay_ms(),
             max_per_room: default_max_per_room(),
+            max_per_user: default_max_per_user(),
         }
     }
 }
@@ -308,6 +316,59 @@ const fn default_max_delay_ms() -> u64 {
 
 const fn default_max_per_room() -> usize {
     crate::delayed::DEFAULT_MAX_PER_ROOM
+}
+
+const fn default_max_per_user() -> usize {
+    crate::delayed::DEFAULT_MAX_PER_USER
+}
+
+/// `[rooms]`: keeping rooms' forward extremities merged (#626).
+///
+/// A fork that no event cites again makes every append to its room
+/// re-resolve the room's state. Synapse merges such forks by sending an
+/// `org.matrix.dummy_event` from a local member, and these settings decide
+/// when Spindle does the same (`rooms::extremities`).
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoomsConfig {
+    /// Send dummy events to merge forks at all.
+    #[serde(default = "default_true")]
+    pub dummy_events: bool,
+    /// Merge a room with more forward extremities than this. Synapse's
+    /// `dummy_events_threshold`, and the same default.
+    #[serde(default = "default_max_forward_extremities")]
+    pub max_forward_extremities: usize,
+    /// Merge a room that an append left forked once its oldest forward
+    /// extremity is this many seconds old. A young fork usually merges by
+    /// itself, and an old one in a busy room never will.
+    #[serde(default = "default_stale_forward_extremity_secs")]
+    pub stale_forward_extremity_secs: u64,
+    /// The fewest seconds between two dummy events in one room.
+    #[serde(default = "default_dummy_event_interval_secs")]
+    pub dummy_event_interval_secs: u64,
+}
+
+impl Default for RoomsConfig {
+    fn default() -> Self {
+        Self {
+            dummy_events: true,
+            max_forward_extremities: default_max_forward_extremities(),
+            stale_forward_extremity_secs: default_stale_forward_extremity_secs(),
+            dummy_event_interval_secs: default_dummy_event_interval_secs(),
+        }
+    }
+}
+
+const fn default_max_forward_extremities() -> usize {
+    10
+}
+
+const fn default_stale_forward_extremity_secs() -> u64 {
+    3_600
+}
+
+const fn default_dummy_event_interval_secs() -> u64 {
+    300
 }
 
 /// Caps on what one account may make this server keep (#268).
@@ -486,11 +547,33 @@ pub struct LivekitConfig {
     /// The SFU's own address, `wss://livekit.example.org`, as handed to
     /// clients in the token response. The one place the SFU's URL goes:
     /// `livekit_service_url` in the transport list is *this server*.
+    ///
+    /// Both models serve the same address: the supervised sidecar listens
+    /// where the operator put it (usually loopback, behind the same
+    /// reverse proxy), and a remote SFU lives wherever it is hosted.
     pub url: String,
     /// `LiveKit`'s API key, the `iss` of every token minted.
     pub key: String,
     /// `LiveKit`'s API secret, the HMAC key every token is signed with.
     pub secret: String,
+    /// The supervised-sidecar model: the operator-supplied path to the
+    /// `livekit-server` binary this server starts, watches and restarts.
+    ///
+    /// Absent, the SFU is separately hosted (the remote model) and this
+    /// server never starts a process: it only mints tokens for the address
+    /// in [`Self::url`]. Present, this server supervises that binary as a
+    /// child and mints for it identically. The switch and the minter do
+    /// not care which model is on; only supervision does.
+    #[serde(default)]
+    pub binary: Option<String>,
+    /// Where the generated sidecar configuration is written.
+    ///
+    /// Absent, `<storage.path>/livekit.yaml`. This is ever the only file
+    /// the server writes for the SFU, and it is a generated one: operator
+    /// files — the server config, the binary — are never rewritten. Point
+    /// it elsewhere only to put the generated file under your own eye.
+    #[serde(default)]
+    pub sidecar_config_path: Option<String>,
     /// How long a minted token admits its holder, in seconds.
     ///
     /// A token cannot be revoked once minted -- it is stateless, and the
@@ -502,6 +585,21 @@ pub struct LivekitConfig {
     /// needs it, knowing what the hour buys.
     #[serde(default = "default_livekit_ttl")]
     pub token_ttl_seconds: u64,
+}
+
+impl LivekitConfig {
+    /// Which SFU model this configuration asks for: the supervised local
+    /// sidecar when [`Self::binary`] names one, the remote separately-hosted
+    /// SFU otherwise. The minter and the on/off switch behave identically
+    /// for both; only supervision consults this.
+    #[must_use]
+    pub fn model(&self) -> &'static str {
+        if self.binary.is_some() {
+            "local"
+        } else {
+            "remote"
+        }
+    }
 }
 
 fn default_livekit_ttl() -> u64 {
@@ -1155,6 +1253,33 @@ impl Config {
         Self::parse(&text)
     }
 
+    /// The MSC4140 caps: each must be positive, for the reason given where
+    /// they are checked.
+    fn validate_delayed_events(&self) -> Result<(), ConfigError> {
+        if self.delayed_events.max_delay_ms == 0 {
+            return Err(ConfigError::Invalid {
+                field: "delayed_events.max_delay_ms",
+                message: "must be greater than zero; a zero cap refuses every delayed event"
+                    .to_owned(),
+            });
+        }
+        if self.delayed_events.max_per_room == 0 {
+            return Err(ConfigError::Invalid {
+                field: "delayed_events.max_per_room",
+                message: "must be greater than zero; a zero cap refuses every delayed event"
+                    .to_owned(),
+            });
+        }
+        if self.delayed_events.max_per_user == 0 {
+            return Err(ConfigError::Invalid {
+                field: "delayed_events.max_per_user",
+                message: "must be greater than zero; a zero cap refuses every delayed event"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// `[federation]`: no listener on a server told not to federate, each
     /// peer URL is a scheme, host and port, and a patience cap is never
     /// shorter than the base it caps.
@@ -1234,6 +1359,18 @@ impl Config {
         Ok(())
     }
 
+    fn validate_rooms(&self) -> Result<(), ConfigError> {
+        // One extremity is a room with no fork; a threshold below two would
+        // send a dummy event into a room after every fork, however young.
+        if self.rooms.max_forward_extremities < 2 {
+            return Err(ConfigError::Invalid {
+                field: "rooms.max_forward_extremities",
+                message: "must be at least 2".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     fn validate_media(&self) -> Result<(), ConfigError> {
         if self.media.max_upload_bytes == 0 || self.media.max_upload_bytes == usize::MAX {
             return Err(ConfigError::Invalid {
@@ -1250,20 +1387,8 @@ impl Config {
         // mean "unlimited", it means every schedule is refused and the
         // dead-man's switch silently stops working. An operator who typed
         // it meant something else, so say so rather than starting.
-        if self.delayed_events.max_delay_ms == 0 {
-            return Err(ConfigError::Invalid {
-                field: "delayed_events.max_delay_ms",
-                message: "must be greater than zero; a zero cap refuses every delayed event"
-                    .to_owned(),
-            });
-        }
-        if self.delayed_events.max_per_room == 0 {
-            return Err(ConfigError::Invalid {
-                field: "delayed_events.max_per_room",
-                message: "must be greater than zero; a zero cap refuses every delayed event"
-                    .to_owned(),
-            });
-        }
+        self.validate_delayed_events()?;
+        self.validate_rooms()?;
         self.validate_peers()?;
         // A ring budget of zero is not "unlimited" either: it refuses every
         // ring, and a call nobody can be summoned to is a feature silently
@@ -1431,6 +1556,27 @@ impl Config {
                     field: "rtc.livekit.token_ttl_seconds",
                     message: "must be > 0: a zero would mint tokens already expired \
                               rather than mean \"unlimited\""
+                        .to_owned(),
+                });
+            }
+            if livekit.binary.as_deref().is_some_and(str::is_empty) {
+                return Err(ConfigError::Invalid {
+                    field: "rtc.livekit.binary",
+                    message: "names the livekit-server binary to supervise, and an \
+                              empty path supervises nothing — leave it unset for \
+                              the remote model"
+                        .to_owned(),
+                });
+            }
+            if livekit
+                .sidecar_config_path
+                .as_deref()
+                .is_some_and(str::is_empty)
+            {
+                return Err(ConfigError::Invalid {
+                    field: "rtc.livekit.sidecar_config_path",
+                    message: "must be a path when set — leave it unset for \
+                              <storage.path>/livekit.yaml"
                         .to_owned(),
                 });
             }

@@ -41,7 +41,7 @@ outward as a federation profile:
    one event copies ~3 nodes. State at an arbitrary historical point is a single
    pointer lookup.
 3. **State resolution is an exception path.** It runs only when a legacy DAG
-   peer actually forks and the branches' states differ, it is the room
+   peer forks and the branches' states differ, it is the room
    version's own algorithm when it does (§9, ADR 0005), and in a non-federated
    room it never runs at all.
 4. **Wire format is unchanged.** Native Spindle rooms are ordinary **room
@@ -460,6 +460,13 @@ cooling down from a 429 or a 403 for that room. Chunks are paced
 (`gap_backfill_interval_ms`), a failed gap backs off, and a gap that outgrows
 `gap_backfill_max_events` is left truncated rather than fetched without end.
 
+A remote join leaves a gap of the same kind. The `send_join` response has the
+room's state and auth chain, but not its history (§11.5). The join is the
+anchor, and its `prev_events` are the first frontier. The events that the join
+put into the log are state, not history. Thus the walk goes through them and
+does not stop, and it folds their state into the chunk's state. The walk stops
+at the create event, or after 1,000 events.
+
 ---
 
 ## 7. Authorization
@@ -744,7 +751,7 @@ a server restart degrades to a re-initial-sync rather than a wrong answer.
 `t{li}`. That is the whole implementation.
 
 This is worth stating plainly because it is the endpoint that most visibly
-misbehaves on DAG servers: back-paginating a large room requires topological
+misbehaves on DAG servers: back-paginating a large room needs topological
 ordering over a graph that may need backfilling mid-scan. Here, ordering was
 decided at write time, and a gap in history is a contiguous `li` range that is
 either present or not.
@@ -843,7 +850,8 @@ capped separately, per room and per origin over a window
 2. Verifies signatures in batches during the stream.
 3. Sets `li = 1` at the join point, `next_backward = 0`, and starts serving
    immediately.
-4. Backfills asynchronously into negative `li` per §6.5.
+4. Records the history before the join as a gap at the join, and fills it
+   in the background per §6.6.
 
 Faster room joins (MSC3706 partial state / MSC3902) are designed for on the
 receive side, and not yet built: the room would be usable with partial state,
@@ -933,7 +941,7 @@ exactly as it already does for any event requiring remote authorization.
 
 A hub emits ordinary room-version-11 PDUs. A legacy homeserver in the room
 consumes them as a normal DAG and is unaware of the hub. An LM-only participant
-consumes the same PDUs as a linked list and never implements state resolution.
+consumes the same PDUs as a linked list and never does state resolution.
 This is MSC3995's dual-representation property, and it is what allows a room to
 contain both kinds of peer simultaneously — at the cost of readmitting the
 class-D fork path, which is why `m.room.hub` rooms with legacy members are class
@@ -1064,7 +1072,7 @@ operator toil.
 - **Horizontal scale-out** is a v2 concern (§21). The design admits it — rooms
   are independent and the shard key is the room — but v1 targets vertical scale
   on a single node, which is where the interesting comparison lies anyway: the
-  point is to make one node do what currently requires a worker fleet.
+  point is to make one node do what now needs a worker fleet.
 
 Implementation language is **Rust**, on the `ruma` crate family for spec types:
 `ruma-events`, `ruma-client-api`, `ruma-federation-api`, `ruma-common`,

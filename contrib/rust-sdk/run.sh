@@ -19,13 +19,13 @@
 #                  recorded as failed (default 180)
 #   RUST_SDK_TOOLCHAIN
 #                  a rustup toolchain for the suite's build, when the
-#                  SDK's floor is above this repository's pin (0.18 wants
-#                  1.93); `cargo +<toolchain>` outranks rust-toolchain.toml
+#                  SDK's floor is above this repository's pin (0.19 wants
+#                  1.96); `cargo +<toolchain>` outranks rust-toolchain.toml
 #
 # Needs a Rust toolchain, git, curl. Port 8228 on loopback.
 set -euo pipefail
 
-RUST_SDK_REV=1c44fb66214667c6d00acaf72ab592493653708b  # matrix-sdk-0.18.0
+RUST_SDK_REV=b18166c68bb958a21f0bca8b2d8320cb53583362  # matrix-sdk-0.19.1
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 RESULTS="${1:-tmp/rust-sdk/results.log}"

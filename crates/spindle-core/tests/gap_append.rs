@@ -4,8 +4,14 @@
 use std::collections::HashMap;
 
 use spindle_core::{
-    AppendError, EventId, EventInput, RestoredEntry, RoomLog, StateKey, StateRoot, StateSnapshot,
+    AppendError, EventId, EventInput, MemStateKeyTable, RestoredEntry, RoomLog, StateKey,
+    StateKeyTable, StateRoot, StateSnapshot,
 };
+use std::sync::Arc;
+
+fn table() -> Arc<dyn StateKeyTable> {
+    MemStateKeyTable::shared()
+}
 
 fn member(user: &str) -> StateKey {
     StateKey::new("m.room.member", user)
@@ -27,18 +33,19 @@ fn records(log: &RoomLog) -> Vec<RestoredEntry> {
 
 #[test]
 fn a_gap_event_is_an_extra_extremity_on_the_state_it_was_given() {
-    let mut log = RoomLog::new();
+    let mut log = RoomLog::new(table());
     log.append_local("$create", Some(StateKey::new("m.room.create", "")))
         .unwrap();
     log.append_local("$alice", Some(member("@alice:here")))
         .unwrap();
     let head = EventId::new("$alice");
 
-    // The remote state names a member this log has never seen.
-    let mut remote = StateSnapshot::new();
-    remote = remote.apply(StateKey::new("m.room.create", ""), "$create");
-    remote = remote.apply(member("@alice:here"), "$alice");
-    remote = remote.apply(member("@carol:there"), "$carol");
+    // The remote state names a member this log has never seen. It shares
+    // the log's table: roots only match when both sides intern alike.
+    let mut remote = StateSnapshot::new(log.table().clone());
+    remote = remote.apply(&StateKey::new("m.room.create", ""), "$create");
+    remote = remote.apply(&member("@alice:here"), "$alice");
+    remote = remote.apply(&member("@carol:there"), "$carol");
 
     let entry = log
         .append_across_gap(
@@ -93,6 +100,7 @@ fn a_gap_event_is_an_extra_extremity_on_the_state_it_was_given() {
         log.next_backward(),
         log.forward_extremities().iter().cloned(),
         &mut |root| stored.get(root).cloned(),
+        log.table().clone(),
     )
     .unwrap();
     assert!(restored.unverified.is_empty(), "{:?}", restored.unverified);
@@ -113,7 +121,7 @@ fn a_gap_event_is_an_extra_extremity_on_the_state_it_was_given() {
 
 #[test]
 fn a_held_parent_stops_being_an_extremity_and_raises_the_depth() {
-    let mut log = RoomLog::new();
+    let mut log = RoomLog::new(table());
     log.append_local("$create", Some(StateKey::new("m.room.create", "")))
         .unwrap();
     log.append_local("$a", None).unwrap();
@@ -138,23 +146,27 @@ fn a_held_parent_stops_being_an_extremity_and_raises_the_depth() {
 
 #[test]
 fn a_gap_needs_history_and_parents() {
-    let mut empty = RoomLog::new();
+    let mut empty = RoomLog::new(table());
     assert_eq!(
         empty
             .append_across_gap(
                 EventInput::new("$x", vec![EventId::new("$y")]),
-                StateSnapshot::new(),
+                StateSnapshot::new(empty.table().clone()),
                 1,
             )
             .unwrap_err(),
         AppendError::EmptyRoom
     );
-    let mut log = RoomLog::new();
+    let mut log = RoomLog::new(table());
     log.append_local("$create", Some(StateKey::new("m.room.create", "")))
         .unwrap();
     assert_eq!(
-        log.append_across_gap(EventInput::new("$x", Vec::new()), StateSnapshot::new(), 1)
-            .unwrap_err(),
+        log.append_across_gap(
+            EventInput::new("$x", Vec::new()),
+            StateSnapshot::new(log.table().clone()),
+            1
+        )
+        .unwrap_err(),
         AppendError::MissingPredecessor
     );
 }

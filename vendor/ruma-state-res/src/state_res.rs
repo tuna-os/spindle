@@ -37,6 +37,19 @@ use crate::{
 /// [state resolution]: https://spec.matrix.org/v1.19/rooms/v2/#state-resolution
 pub type StateMap<T> = HashMap<(StateEventType, String), T>;
 
+thread_local! {
+    /// Candidates the iterative auth checks refused on this thread since the last
+    /// [`take_auth_rejections`]. Spindle patch: per thread because a resolution runs
+    /// synchronously on the thread that asked, so the caller can attribute it.
+    static AUTH_REJECTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many events failed the authentication check during iterative auth checks on
+/// this thread since the previous call, resetting the count. Spindle patch.
+pub fn take_auth_rejections() -> u64 {
+    AUTH_REJECTIONS.with(std::cell::Cell::take)
+}
+
 /// Apply the [state resolution] algorithm introduced in room version 2 to resolve the state of a
 /// room.
 ///
@@ -740,8 +753,11 @@ fn iterative_auth_checks_with_candidate_policy<E: Event + Clone>(
                 state.insert(event.event_type().with_state_key(state_key), event_id.clone());
             }
             Err(error) => {
-                // Don't add this event to the state.
-                warn!(event_id = ?event.event_id(), "event failed the authentication check: {error}");
+                // Don't add this event to the state. Expected: resolution exists to
+                // weigh events that may fail at the partially resolved state, so this
+                // is counted (`take_auth_rejections`) and logged at DEBUG, not WARN.
+                AUTH_REJECTIONS.with(|count| count.set(count.get().saturating_add(1)));
+                debug!(event_id = ?event.event_id(), "event failed the authentication check: {error}");
             }
         }
 

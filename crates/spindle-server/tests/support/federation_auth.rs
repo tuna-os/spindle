@@ -17,7 +17,7 @@ pub fn with_auth_events(store: &Arc<FjallStore>, mut pdu: Value) -> Value {
     let previous = rooms.pdu(room, parent).unwrap();
     if let Some(key) = previous["state_key"].as_str() {
         state = state.apply(
-            StateKey::new(previous["type"].as_str().unwrap(), key),
+            &StateKey::new(previous["type"].as_str().unwrap(), key),
             parent,
         );
     }

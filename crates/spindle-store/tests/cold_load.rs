@@ -49,10 +49,12 @@ struct Shape {
 /// or years of appends leave it, without paying for a million appends.
 fn build(store: &FjallStore, shape: &Shape) {
     // The state: a few slots, all set before the first backfilled event.
-    let mut state = StateSnapshot::new();
+    // Numbered by the store under test, like every persisted state: the
+    // restore resolves these nodes through the store's table.
+    let mut state = StateSnapshot::new(store.key_table());
     for slot in 0..shape.state_slots {
         state = state.apply(
-            StateKey::new(format!("m.room.slot{slot}"), ""),
+            &StateKey::new(format!("m.room.slot{slot}"), ""),
             event_id(-1_000_000_000 - i64::try_from(slot).unwrap()),
         );
     }
@@ -66,9 +68,12 @@ fn build(store: &FjallStore, shape: &Shape) {
             )
         })
         .collect();
+    // The rows the nodes reference, beside the nodes: this hand-rolled
+    // writer bypasses `RoomStore`, so it owes the same batch coupling.
     let root = *state.root().as_bytes();
     let flush = |batch: &mut Vec<(Vec<u8>, Vec<u8>)>| {
-        store.commit(batch, Durability::Relaxed).unwrap();
+        store.commit_state_deferred(batch, state.table()).unwrap();
+        store.sync(Durability::Relaxed).unwrap();
         batch.clear();
     };
 
@@ -314,6 +319,7 @@ fn phases(store: &FjallStore, shape: &Shape) {
             -shape.backfilled,
             [EventId::new(event_id(shape.forward))],
             &mut load_node,
+            store.key_table(),
         )
         .unwrap()
         .log

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use spindle_core::RoomLog;
+use spindle_core::{RoomLog, StateKey};
 use spindle_store::backup::{BackupError, read_backup, write_backup};
 use spindle_store::{Durability, FjallStore, ReadView, RoomStore, SchemaMarker, Store};
 use tempfile::TempDir;
@@ -19,9 +19,14 @@ const ROOM: &str = "!backup:example.org";
 
 fn seed(store: &FjallStore, events: usize) {
     let room_store = RoomStore::new(store, ROOM);
-    let mut log = RoomLog::new();
+    let mut log = RoomLog::new(store.key_table());
     for number in 0..events {
-        let entry = log.append_local(format!("$event-{number}"), None).unwrap();
+        let entry = log
+            .append_local(
+                format!("$event-{number}"),
+                Some(StateKey::new("m.room.topic", "")),
+            )
+            .unwrap();
         let entry = entry.clone();
         room_store
             .commit_entry(&entry, &log, Durability::Strict)
@@ -59,11 +64,19 @@ fn a_restored_store_holds_what_the_backup_held() {
     );
     assert_eq!(restored, expected.len() as u64);
 
+    let key = StateKey::new("m.room.topic", "");
+    assert!(target.key_table().id_of("m.room.topic", "").is_some());
+
     // And the room reads back through the ordinary path, not just as bytes.
     let rebuilt = RoomStore::new(&target, ROOM)
         .load()
         .unwrap()
         .expect("the room is there after a restore");
+    assert_eq!(
+        rebuilt.log.current_state().unwrap().get(&key),
+        Some("$event-11")
+    );
+    assert!(rebuilt.unverified.is_empty());
     assert!(
         rebuilt.broken_chain.is_empty(),
         "the restored room's chain does not verify: {:?}",
