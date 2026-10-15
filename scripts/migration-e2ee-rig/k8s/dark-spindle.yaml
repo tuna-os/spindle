@@ -1,0 +1,199 @@
+# Dark (isolated) Spindle for the E2EE migration rig.
+#
+# It holds an import of synapse_dark with the production server_name and
+# signing key, so it must never reach anything. Same layers as
+# dark-synapse.yaml, since the CNI does not enforce NetworkPolicy:
+#
+#   1. [federation] enabled = false: every outbound federation request is
+#      refused in-process before name resolution; /_matrix/federation and
+#      /_matrix/key are not served; no outbox drain
+#   2. [push] enabled = false, [previews] enabled = false, no appservices,
+#      no delegated auth, no S3, no TURN/LiveKit
+#   3. no usable DNS (nameserver 127.0.0.1); the import Job reaches the
+#      database through a hostAliases entry
+#   4. ClusterIP Service on the client port only; no Ingress/NodePort/LB
+#   5. the netwatch sidecar logs any socket whose remote end is not
+#      loopback, the database or an inbound client connection
+#
+# The binary is built in the mig-rig-toolbox pod into /work/bin/spindle on
+# the shared PVC. __PG_IP__ is the rehearsal-pg ClusterIP.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dark-spindle-config
+  labels: {app: dark-spindle, part-of: spindle-mig-rig}
+data:
+  spindle.toml: |
+    [server]
+    name = "reilly.asia"
+    bind = "0.0.0.0:8008"
+    public_base_url = "http://dark-spindle.spindle-rehearsal.svc.cluster.local:8008"
+
+    [storage]
+    path = "/work/dark-spindle/store"
+
+    [federation]
+    enabled = false
+
+    [push]
+    enabled = false
+
+    [previews]
+    enabled = false
+
+    [ratelimit]
+    enabled = false
+
+    [logging]
+    filter = "info,spindle_server=debug"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dark-spindle-import
+  labels: {app: dark-spindle-import, part-of: spindle-mig-rig}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {app: dark-spindle-import, part-of: spindle-mig-rig}
+    spec:
+      restartPolicy: Never
+      nodeName: ip-10-20-1-11
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["127.0.0.1"]
+        searches: []
+        options: [{name: ndots, value: "1"}, {name: attempts, value: "1"}, {name: timeout, value: "1"}]
+      hostAliases:
+      - ip: "__PG_IP__"
+        hostnames: [rehearsal-pg]
+      securityContext:
+        runAsUser: 10092
+        runAsGroup: 10092
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: import
+        image: rust:1.94-bookworm
+        command:
+        - /work/bin/spindle
+        - import-synapse-rehearsal
+        - /conf/spindle.toml
+        - host=rehearsal-pg port=5432 user=postgres dbname=synapse_dark
+        - "__ROOMS__"
+        - "@spindle-mig-a:reilly.asia,@spindle-mig-b:reilly.asia,@spindle-mig-c:reilly.asia"
+        env:
+        - name: SPINDLE_SYNAPSE_PASSWORD
+          valueFrom: {secretKeyRef: {name: rehearsal-pg, key: POSTGRES_PASSWORD}}
+        - {name: SPINDLE_REHEARSAL_PASSWORD_DIR, value: /secrets/passwords}
+        - {name: SPINDLE_SYNAPSE_SIGNING_KEY_FILE, value: /secrets/signing/signing.key}
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+          limits: {cpu: "1", memory: 2Gi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: [ALL]}
+        volumeMounts:
+        - {name: conf, mountPath: /conf, readOnly: true}
+        - {name: work, mountPath: /work}
+        - {name: passwords, mountPath: /secrets/passwords, readOnly: true}
+        - {name: signing, mountPath: /secrets/signing, readOnly: true}
+      volumes:
+      - name: conf
+        configMap: {name: dark-spindle-config}
+      - name: work
+        persistentVolumeClaim: {claimName: mig-rig-work}
+      - name: passwords
+        secret:
+          secretName: spindle-mig-rig
+          items:
+          - {key: password-a, path: spindle-mig-a}
+          - {key: password-b, path: spindle-mig-b}
+          - {key: password-c, path: spindle-mig-c}
+      - name: signing
+        secret:
+          secretName: dark-synapse-secrets
+          items:
+          - {key: signing.key, path: signing.key}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dark-spindle
+  labels: {app: dark-spindle, part-of: spindle-mig-rig}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: dark-spindle}
+  template:
+    metadata:
+      labels: {app: dark-spindle, part-of: spindle-mig-rig}
+    spec:
+      nodeName: ip-10-20-1-11
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["127.0.0.1"]
+        searches: []
+        options: [{name: ndots, value: "1"}, {name: attempts, value: "1"}, {name: timeout, value: "1"}]
+      securityContext:
+        runAsUser: 10092
+        runAsGroup: 10092
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: spindle
+        image: rust:1.94-bookworm
+        command: [/work/bin/spindle, /conf/spindle.toml]
+        ports:
+        - {name: client, containerPort: 8008}
+        readinessProbe:
+          httpGet: {path: /_matrix/client/versions, port: 8008}
+          periodSeconds: 5
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+          limits: {cpu: "1", memory: 2Gi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: [ALL]}
+        volumeMounts:
+        - {name: conf, mountPath: /conf, readOnly: true}
+        - {name: work, mountPath: /work}
+      - name: netwatch
+        image: oci.element.io/synapse:v1.156.0
+        command: [python3, -u, /netwatch/netwatch.py]
+        env:
+        - {name: ALLOWED_DB, value: "none"}
+        resources:
+          requests: {cpu: 10m, memory: 32Mi}
+          limits: {memory: 128Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: [ALL]}
+        volumeMounts:
+        - {name: netwatch, mountPath: /netwatch, readOnly: true}
+      volumes:
+      - name: conf
+        configMap: {name: dark-spindle-config}
+      - name: netwatch
+        configMap:
+          name: dark-synapse-config
+          items: [{key: netwatch.py, path: netwatch.py}]
+      - name: work
+        persistentVolumeClaim: {claimName: mig-rig-work}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dark-spindle
+  labels: {app: dark-spindle, part-of: spindle-mig-rig}
+spec:
+  type: ClusterIP
+  selector: {app: dark-spindle}
+  ports:
+  - {name: client, port: 8008, targetPort: 8008}

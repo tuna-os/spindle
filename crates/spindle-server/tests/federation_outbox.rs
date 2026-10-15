@@ -33,6 +33,9 @@ struct Stub {
 }
 
 impl Stub {
+    // `fetch_update` is deprecated from Rust 1.99 (renamed `try_update`,
+    // absent from the pinned 1.90 toolchain).
+    #[allow(deprecated)]
     async fn start() -> Stub {
         let deliveries: Arc<Mutex<Vec<Delivery>>> = Arc::default();
         let refuse = Arc::new(AtomicUsize::new(0));
