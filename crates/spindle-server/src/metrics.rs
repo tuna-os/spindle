@@ -748,8 +748,8 @@ impl Metrics {
         self.warmup_loaded.fetch_add(1, Ordering::Relaxed);
         let _ = self
             .warmup_pending
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current.saturating_sub(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.saturating_sub(1)
             });
     }
 
@@ -757,8 +757,8 @@ impl Metrics {
     pub fn warmup_failed(&self) {
         let _ = self
             .warmup_pending
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current.saturating_sub(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.saturating_sub(1)
             });
     }
 
@@ -779,8 +779,8 @@ impl Drop for BlockingGuard<'_> {
     fn drop(&mut self) {
         let _ = self
             .gauge
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current.saturating_sub(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.saturating_sub(1)
             });
     }
 }

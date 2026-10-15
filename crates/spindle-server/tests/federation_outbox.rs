@@ -56,7 +56,7 @@ impl Stub {
                         let refused_log = Arc::clone(&refused_log);
                         async move {
                             if gate
-                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                                     (left > 0).then(|| left - 1)
                                 })
                                 .is_ok()
