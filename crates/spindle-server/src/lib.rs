@@ -44,6 +44,7 @@ pub mod moderation_routes;
 pub mod netguard;
 pub mod oidc;
 pub mod openid;
+pub mod policy;
 pub mod presence;
 pub mod presence_routes;
 pub mod previews;
@@ -121,6 +122,7 @@ pub struct AppState {
     /// One dependency recovery per room at a time, and the peers resting
     /// after a 429 (`inbound::recovery`).
     pub recovery: Arc<inbound::RecoveryGate>,
+    pub transactions: Arc<policy::TransactionLocks>,
     /// The background fill of recorded federation gaps, which a client
     /// paging into one wakes (`inbound::backfill`).
     pub backfill: Arc<inbound::GapBackfill>,
@@ -461,6 +463,7 @@ fn app_state_with(
         .map_err(|error| AppError::PreviewConfig(error.to_string()))?,
     );
     let federation = federation_client(&config, &store, &key, &metrics)?;
+    rooms.set_policy_federation(&federation);
     let delegated = config
         .auth
         .delegated
@@ -476,6 +479,7 @@ fn app_state_with(
     let config_for_sfu = config.clone();
     let store_for_sfu = Arc::clone(&store);
     let state = AppState {
+        transactions: Arc::new(policy::TransactionLocks::default()),
         config: Arc::new(config),
         store,
         limiter,

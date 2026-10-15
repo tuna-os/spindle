@@ -15,7 +15,7 @@
 //! (v2 and v2.1).
 //!
 //! The same scenarios against Synapse are in `complement/tests/` (the
-//! `state-resolution-interop` CI job).
+//! state-resolution steps of the `complement-suite` CI job).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;

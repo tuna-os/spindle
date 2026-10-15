@@ -558,7 +558,7 @@ async fn judge(
     if let Some(provided) = origin_keys {
         keys.insert(origin.to_owned(), provided.clone());
     }
-    let event = match verify(&Peers::of(state), room_id, &version, pdu, None, &mut keys).await {
+    let mut event = match verify(&Peers::of(state), room_id, &version, pdu, None, &mut keys).await {
         Ok(event) => event,
         Err(error) => {
             let id = CanonicalJsonValue::try_from(pdu.clone())
@@ -575,7 +575,18 @@ async fn judge(
             return (id, PduOutcome::Refused, Err(error));
         }
     };
-    let error = match state.rooms.receive_remote(room_id, &event.id, &event.body) {
+    if let Err(error) = state.rooms.authorize_policy(room_id, &mut event.body).await {
+        if !matches!(error, RoomError::Forbidden(_) | RoomError::Policy(_)) {
+            return (event.id, PduOutcome::Refused, Err(error.to_string()));
+        }
+        // Ordinary auth is still checked before the event is soft-failed.
+        tracing::debug!(
+            room_id,
+            event_id = event.id,
+            "policy approval failed: {error}"
+        );
+    }
+    let error = match state.rooms.receive_live(room_id, &event.id, &event.body) {
         Ok(()) => return (event.id, PduOutcome::Accepted, Ok(())),
         Err(error) => error,
     };
@@ -654,7 +665,7 @@ async fn resolve(
 ) -> (PduOutcome, Result<(), String>) {
     // A recovery that held the turn before this one may have placed exactly
     // what this event needs -- usually the event before it.
-    let error = match state.rooms.receive_remote(room_id, &event.id, &event.body) {
+    let error = match state.rooms.receive_live(room_id, &event.id, &event.body) {
         Ok(()) => return (PduOutcome::Accepted, Ok(())),
         Err(error) => error,
     };
@@ -683,7 +694,7 @@ async fn resolve(
                 state
                     .metrics
                     .record_recovery(RecoveryResult::Recovered, elapsed);
-                return match state.rooms.receive_remote(room_id, &event.id, &event.body) {
+                return match state.rooms.receive_live(room_id, &event.id, &event.body) {
                     Ok(()) => (PduOutcome::Accepted, Ok(())),
                     Err(error) => (classify(&error), Err(error.to_string())),
                 };

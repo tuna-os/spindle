@@ -179,7 +179,7 @@ impl Rooms {
     /// rather than waited for, and if an append marked it forked, it stays
     /// marked for the next pass.
     #[must_use]
-    pub fn merge_extremities(
+    pub async fn merge_extremities(
         &self,
         key: &Ed25519KeyPair,
         policy: &MergePolicy,
@@ -235,7 +235,7 @@ impl Rooms {
             if !self.extremities.claim(&room_id, now, policy.interval) {
                 continue;
             }
-            match self.send_dummy_event(&room_id, key) {
+            match self.send_dummy_event(&room_id, key).await {
                 Ok(Some((sender, event_id))) => {
                     self.metrics.record_dummy_event(true);
                     tracing::info!(
@@ -284,7 +284,7 @@ impl Rooms {
     /// Members are tried by power level, highest first, and a member the
     /// rules refuse makes way for the next. Returns the sender and the
     /// event, or `None` when no local member could send.
-    fn send_dummy_event(
+    async fn send_dummy_event(
         &self,
         room_id: &str,
         key: &Ed25519KeyPair,
@@ -307,7 +307,10 @@ impl Rooms {
             .collect();
         local.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(right.1)));
         for (_, sender) in local.into_iter().take(SENDERS_TRIED) {
-            match self.send(room_id, sender, key, DUMMY_EVENT_TYPE, &json!({})) {
+            match self
+                .send_checked(room_id, sender, key, DUMMY_EVENT_TYPE, &json!({}))
+                .await
+            {
                 Ok(event_id) => return Ok(Some((sender.clone(), event_id))),
                 Err(RoomError::Forbidden(why)) => {
                     tracing::debug!(
@@ -351,7 +354,11 @@ pub async fn merge_loop(
             let (Some(rooms), Some(key)) = (rooms.upgrade(), key.upgrade()) else {
                 return false;
             };
-            let _ = rooms.merge_extremities(key.pair(), &policy, now_ms());
+            let _ = tokio::runtime::Handle::current().block_on(rooms.merge_extremities(
+                key.pair(),
+                &policy,
+                now_ms(),
+            ));
             true
         })
         .await;

@@ -149,6 +149,7 @@ mod federation;
 mod gaps;
 #[cfg(feature = "hub-mode")]
 mod hub;
+mod policy;
 mod read;
 mod synapse_positions;
 mod unread;
@@ -166,6 +167,7 @@ pub use gaps::{GapChunk, GapChunkOutcome, GapProgress};
 pub use hub::{ChainEntry, HUB_EVENT_TYPE, Sequenced};
 
 pub struct Rooms {
+    policy_federation: Mutex<Option<std::sync::Weak<crate::federation::Federation>>>,
     store: Arc<FjallStore>,
     server_name: String,
     /// Where appends, lock acquisitions and sync waits are counted; the
@@ -502,6 +504,7 @@ impl Rooms {
         // report that nothing had happened -- not slower, wrong.
         backfill_room_stream_index(store_for_stream.as_ref(), stream_high);
         Self {
+            policy_federation: Mutex::new(None),
             store,
             server_name: server_name.into(),
             metrics,
@@ -5894,6 +5897,7 @@ impl Rooms {
         json: &Value,
     ) -> Result<String, RoomError> {
         let event_id = event_id.to_owned();
+        self.check_policy_in(log, room_id, json)?;
         let json = json.clone();
         let prev: Vec<EventId> = edge_ids(&json["prev_events"])
             .into_iter()
@@ -6088,7 +6092,6 @@ impl Rooms {
     ///
     /// Parents or auth events this server does not hold are refused without
     /// keeping anything: that is a gap to fill, not a verdict.
-    #[allow(clippy::too_many_lines, reason = "the receipt checks, in order")]
     fn ingest(
         &self,
         log: &mut RoomLog,
@@ -6096,6 +6099,23 @@ impl Rooms {
         event_id: &str,
         json: &Value,
         fan_out: bool,
+    ) -> Result<(), RoomError> {
+        self.ingest_checked(log, room_id, event_id, json, fan_out, false)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        reason = "the receipt checks, in order"
+    )]
+    fn ingest_checked(
+        &self,
+        log: &mut RoomLog,
+        room_id: &str,
+        event_id: &str,
+        json: &Value,
+        fan_out: bool,
+        live_policy: bool,
     ) -> Result<(), RoomError> {
         // Redelivery is not an error: transactions retry, and the event
         // is already exactly where it would go. A redelivered event that
@@ -6132,6 +6152,15 @@ impl Rooms {
         let (state_before, resolved) = self.state_for_parents(log, room_id, &prev)?;
         let verdict =
             self.receipt_checks(log, room_id, event_id, json, &state_before, &prev, None)?;
+        let verdict = if verdict.is_none() && live_policy {
+            match self.check_policy_in(log, room_id, json) {
+                Ok(()) => None,
+                Err(RoomError::Forbidden(reason)) => Some((Sideline::SoftFailed, reason)),
+                Err(error) => return Err(error),
+            }
+        } else {
+            verdict
+        };
 
         let input = EventInput::new(event_id, prev.clone());
         let input = match &state_key {
@@ -7399,6 +7428,8 @@ pub enum RoomError {
     StateUnavailable(String),
     UnknownState(String),
     Forbidden(String),
+    /// An actionable refusal from an external room policy service.
+    Policy(Box<crate::errors::MatrixError>),
     Storage(StoreError),
     Codec(String),
 }
@@ -7440,6 +7471,7 @@ impl std::fmt::Display for RoomError {
             }
             Self::UnknownState(what) => write!(formatter, "no {what} in this room"),
             Self::Forbidden(rule) => write!(formatter, "{rule}"),
+            Self::Policy(error) => write!(formatter, "policy server: {}", error.error),
             Self::Storage(error) => write!(formatter, "storage: {error}"),
             Self::Codec(message) => write!(formatter, "unreadable: {message}"),
         }

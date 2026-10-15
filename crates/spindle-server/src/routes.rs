@@ -3142,7 +3142,7 @@ async fn create_room(
         if !client_set_one {
             state
                 .rooms
-                .set_state(
+                .set_state_checked(
                     &room_id,
                     &identity.user_id,
                     state.key.pair(),
@@ -3150,6 +3150,7 @@ async fn create_room(
                     "",
                     &json!({ "alias": alias }),
                 )
+                .await
                 .map_err(room_error)?;
         }
     }
@@ -3354,7 +3355,7 @@ async fn put_profile_field(
         .map_err(|error| MatrixError::internal(&error.to_string()))?
         .map_err(field_refusal)?;
     if key == "displayname" || key == "avatar_url" {
-        propagate_profile(&state, &user_id)?;
+        propagate_profile(&state, &user_id).await?;
     }
     Ok(Json(json!({})))
 }
@@ -3372,7 +3373,7 @@ async fn delete_profile_field(
         .map_err(|error| MatrixError::internal(&error.to_string()))?
         .map_err(field_refusal)?;
     if key == "displayname" || key == "avatar_url" {
-        propagate_profile(&state, &user_id)?;
+        propagate_profile(&state, &user_id).await?;
     }
     Ok(Json(json!({})))
 }
@@ -3381,7 +3382,7 @@ async fn delete_profile_field(
 /// event — the propagation the spec asks for, and the step that carries a
 /// renamed user across federation, because member events fan out and
 /// profile rows do not.
-pub(crate) fn propagate_profile(state: &AppState, user_id: &str) -> Result<(), MatrixError> {
+pub(crate) async fn propagate_profile(state: &AppState, user_id: &str) -> Result<(), MatrixError> {
     let profile = state
         .profiles
         .get(user_id)
@@ -3400,7 +3401,7 @@ pub(crate) fn propagate_profile(state: &AppState, user_id: &str) -> Result<(), M
         }
         state
             .rooms
-            .set_state(
+            .set_state_checked(
                 &room_id,
                 user_id,
                 state.key.pair(),
@@ -3408,6 +3409,7 @@ pub(crate) fn propagate_profile(state: &AppState, user_id: &str) -> Result<(), M
                 user_id,
                 &content,
             )
+            .await
             .map_err(room_error)?;
     }
     state.rooms.wake_sync_waiters();
@@ -3428,7 +3430,7 @@ async fn put_profile_displayname(
         .profiles
         .set(&user_id, Some(request.displayname), None)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    propagate_profile(&state, &user_id)?;
+    propagate_profile(&state, &user_id).await?;
     Ok(Json(json!({})))
 }
 
@@ -3446,7 +3448,7 @@ async fn put_profile_avatar(
         .profiles
         .set(&user_id, None, Some(request.avatar_url))
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    propagate_profile(&state, &user_id)?;
+    propagate_profile(&state, &user_id).await?;
     Ok(Json(json!({})))
 }
 
@@ -3523,7 +3525,7 @@ async fn invite_user(
         }
         state
             .rooms
-            .set_membership_with(
+            .set_membership_with_checked(
                 room_id,
                 sender,
                 target,
@@ -3532,13 +3534,15 @@ async fn invite_user(
                 &extra,
                 state.key.pair(),
             )
+            .await
             .map_err(room_error)?;
         return Ok(());
     }
 
     let (event_id, event) = state
         .rooms
-        .build_invite_event(room_id, sender, target, reason, is_direct, state.key.pair())
+        .build_invite_event_checked(room_id, sender, target, reason, is_direct, state.key.pair())
+        .await
         .map_err(room_error)?;
     // The stripped state the invited user renders the invite from — plus
     // the invite itself, which is not yet state anywhere and is exactly the
@@ -3577,7 +3581,7 @@ async fn invite_user(
     // reference hash proves it, because signatures are outside the hash.
     // (A v1/v2 ID is not the hash, so the hash is compared to the hash of
     // what was sent, and the ID to the ID.)
-    let cosigned = response["event"].clone();
+    let mut cosigned = response["event"].clone();
     let object = |value: &Value| match ruma::CanonicalJsonValue::try_from(value.clone()) {
         Ok(ruma::CanonicalJsonValue::Object(object)) => Some(object),
         _ => None,
@@ -3596,6 +3600,8 @@ async fn invite_user(
             format!("{domain} returned a different event than it was asked to sign"),
         ));
     }
+    // The peer may return only its own signature; keep our approved proof.
+    merge_returned_signatures(&mut cosigned, &event);
     state
         .rooms
         .commit_cosigned(room_id, &event_id, &cosigned)
@@ -3617,7 +3623,7 @@ async fn kick_from_room(
     axum::extract::Path(room_id): axum::extract::Path<String>,
     Json(request): Json<TargetedMembershipRequest>,
 ) -> Result<Json<Value>, MatrixError> {
-    targeted_membership(&state, &identity.user_id, &room_id, &request, "leave")
+    targeted_membership(&state, &identity.user_id, &room_id, &request, "leave").await
 }
 
 /// `POST /_matrix/client/v3/rooms/{room_id}/ban`
@@ -3632,7 +3638,7 @@ async fn ban_from_room(
     axum::extract::Path(room_id): axum::extract::Path<String>,
     Json(request): Json<TargetedMembershipRequest>,
 ) -> Result<Json<Value>, MatrixError> {
-    targeted_membership(&state, &identity.user_id, &room_id, &request, "ban")
+    targeted_membership(&state, &identity.user_id, &room_id, &request, "ban").await
 }
 
 /// `POST /_matrix/client/v3/rooms/{room_id}/unban`
@@ -3646,10 +3652,10 @@ async fn unban_from_room(
     axum::extract::Path(room_id): axum::extract::Path<String>,
     Json(request): Json<TargetedMembershipRequest>,
 ) -> Result<Json<Value>, MatrixError> {
-    targeted_membership(&state, &identity.user_id, &room_id, &request, "leave")
+    targeted_membership(&state, &identity.user_id, &room_id, &request, "leave").await
 }
 
-fn targeted_membership(
+async fn targeted_membership(
     state: &AppState,
     sender: &str,
     room_id: &str,
@@ -3658,7 +3664,7 @@ fn targeted_membership(
 ) -> Result<Json<Value>, MatrixError> {
     state
         .rooms
-        .set_membership(
+        .set_membership_checked(
             room_id,
             sender,
             &request.user_id,
@@ -3666,6 +3672,7 @@ fn targeted_membership(
             request.reason.as_deref(),
             state.key.pair(),
         )
+        .await
         .map_err(room_error)?;
     // The spec's response is an empty object, not the event ID. A client that
     // wanted the event reads it from the timeline.
@@ -3720,15 +3727,19 @@ async fn knock_room(
     let request: SelfMembershipRequest = optional_body(&body)?;
     let mut servers = server_name_params(query.as_deref());
     let room_id = resolve_room_target(&state, &room_id_or_alias, &mut servers).await?;
-    match state.rooms.set_membership_with(
-        &room_id,
-        &identity.user_id,
-        &identity.user_id,
-        "knock",
-        request.reason.as_deref(),
-        &member_profile(&state, &identity.user_id),
-        state.key.pair(),
-    ) {
+    match state
+        .rooms
+        .set_membership_with_checked(
+            &room_id,
+            &identity.user_id,
+            &identity.user_id,
+            "knock",
+            request.reason.as_deref(),
+            &member_profile(&state, &identity.user_id),
+            state.key.pair(),
+        )
+        .await
+    {
         Ok(_) => {
             state.rooms.wake_sync_waiters();
             Ok(Json(json!({ "room_id": room_id })))
@@ -4154,14 +4165,17 @@ async fn delete_alias(
         .state_event_full(&room_id, "m.room.canonical_alias", "")
         && let Some(without) = without_alias(&event["content"], &room_alias)
     {
-        let _ = state.rooms.set_state(
-            &room_id,
-            &identity.user_id,
-            state.key.pair(),
-            "m.room.canonical_alias",
-            "",
-            &without,
-        );
+        let _ = state
+            .rooms
+            .set_state_checked(
+                &room_id,
+                &identity.user_id,
+                state.key.pair(),
+                "m.room.canonical_alias",
+                "",
+                &without,
+            )
+            .await;
     }
     Ok(Json(json!({})))
 }
@@ -4282,15 +4296,19 @@ async fn join(
     if !resident && !invited && !blocked {
         return join_remote(state, user_id, room_id, servers).await;
     }
-    match state.rooms.set_membership_with(
-        room_id,
-        user_id,
-        user_id,
-        "join",
-        None,
-        &member_profile(state, user_id),
-        state.key.pair(),
-    ) {
+    match state
+        .rooms
+        .set_membership_with_checked(
+            room_id,
+            user_id,
+            user_id,
+            "join",
+            None,
+            &member_profile(state, user_id),
+            state.key.pair(),
+        )
+        .await
+    {
         Ok(_) => Ok(Json(json!({ "room_id": room_id }))),
         // A room this server has never held may still be joinable: through
         // the servers the client named, or the one in the room ID itself.
@@ -4407,7 +4425,7 @@ async fn join_remote(
         // below only takes fresh rooms, while the resident has already
         // made the decision, so a held room records through the local
         // path instead.
-        if let Some(answer) = record_held_join(state, user_id, room_id) {
+        if let Some(answer) = record_held_join(state, user_id, room_id).await {
             return answer;
         }
 
@@ -4461,7 +4479,7 @@ fn record_join_history(state: &AppState, room_id: &str, join: &Value, join_id: &
 /// local answer wherever the resident admits, while a refusal already
 /// returned to the caller above. `None` means the room is not held here
 /// and the caller should seed it fresh from the resident's answer.
-fn record_held_join(
+async fn record_held_join(
     state: &AppState,
     user_id: &str,
     room_id: &str,
@@ -4470,15 +4488,19 @@ fn record_held_join(
         return None;
     }
     Some(
-        match state.rooms.set_membership_with(
-            room_id,
-            user_id,
-            user_id,
-            "join",
-            None,
-            &member_profile(state, user_id),
-            state.key.pair(),
-        ) {
+        match state
+            .rooms
+            .set_membership_with_checked(
+                room_id,
+                user_id,
+                user_id,
+                "join",
+                None,
+                &member_profile(state, user_id),
+                state.key.pair(),
+            )
+            .await
+        {
             Ok(_) => {
                 state.rooms.wake_sync_waiters();
                 Ok(Json(json!({ "room_id": room_id })))
@@ -4496,14 +4518,18 @@ async fn leave_room(
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, MatrixError> {
     let request: SelfMembershipRequest = optional_body(&body)?;
-    match state.rooms.set_membership(
-        &room_id,
-        &identity.user_id,
-        &identity.user_id,
-        "leave",
-        request.reason.as_deref(),
-        state.key.pair(),
-    ) {
+    match state
+        .rooms
+        .set_membership_checked(
+            &room_id,
+            &identity.user_id,
+            &identity.user_id,
+            "leave",
+            request.reason.as_deref(),
+            state.key.pair(),
+        )
+        .await
+    {
         Ok(_) => Ok(Json(json!({}))),
         // A room this server holds no log for can still be left in the one
         // way that matters here: rejecting the pending invite that named it.
@@ -8399,18 +8425,20 @@ async fn redact_event(
     axum::extract::Path((room_id, event_id, txn_id)): axum::extract::Path<(String, String, String)>,
     Json(request): Json<RedactRequest>,
 ) -> Result<Json<Value>, MatrixError> {
-    with_transaction(&state, &identity, &txn_id, || {
+    with_transaction(&state, &identity, &txn_id, || async {
         state
             .rooms
-            .redact(
+            .redact_checked(
                 &room_id,
                 &identity.user_id,
                 state.key.pair(),
                 &event_id,
                 request.reason.as_deref(),
             )
+            .await
             .map_err(room_error)
     })
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -8795,7 +8823,7 @@ async fn delayed_event_action(
             request.action
         ))
     })?;
-    act_on_delay(&state, &delay_id, Some(&identity.user_id), action, false)
+    act_on_delay(&state, &delay_id, Some(&identity.user_id), action, false).await
 }
 
 /// Apply `action` to a delay -- the caller's when `owner` names them, the
@@ -8809,7 +8837,7 @@ async fn delayed_event_action(
 /// 2026 treats a 409 on `restart` or `cancel` as unrecoverable and ends the
 /// call, and lk-jwt-service before 0.7 retries a 409 until its deadline
 /// where a 404 tells it the delay is gone. Synapse answers 404 there too.
-fn act_on_delay(
+async fn act_on_delay(
     state: &AppState,
     delay_id: &str,
     owner: Option<&str>,
@@ -8831,7 +8859,7 @@ fn act_on_delay(
         other => delay_error(other),
     })?;
     if let Some(event) = acted {
-        send_delayed_now(state, &event)?;
+        send_delayed_now(state, &event).await?;
     } else if action == crate::delayed::Action::Cancel {
         // A cancel is kept as an outcome like any other, so a lookup can
         // report it and a repeated cancel is the success it should be. Not
@@ -8870,28 +8898,38 @@ fn record_cancel(state: &AppState, event: &crate::delayed::DelayedEvent) {
 /// A send that is refused leaves the delay scheduled and answers with the
 /// refusal, as MSC4140 asks: whatever refused it may have changed by its
 /// deadline, and the client may retry until then.
-fn send_delayed_now(
+async fn send_delayed_now(
     state: &AppState,
     event: &crate::delayed::DelayedEvent,
 ) -> Result<(), MatrixError> {
     let sent = match &event.state_key {
-        Some(state_key) => state.rooms.set_state_sticky(
-            &event.room_id,
-            &event.sender,
-            state.key.pair(),
-            &event.event_type,
-            state_key,
-            &event.content,
-            event.sticky_ms,
-        ),
-        None => state.rooms.send_sticky(
-            &event.room_id,
-            &event.sender,
-            state.key.pair(),
-            &event.event_type,
-            &event.content,
-            event.sticky_ms,
-        ),
+        Some(state_key) => {
+            state
+                .rooms
+                .set_state_sticky_checked(
+                    &event.room_id,
+                    &event.sender,
+                    state.key.pair(),
+                    &event.event_type,
+                    state_key,
+                    &event.content,
+                    event.sticky_ms,
+                )
+                .await
+        }
+        None => {
+            state
+                .rooms
+                .send_sticky_checked(
+                    &event.room_id,
+                    &event.sender,
+                    state.key.pair(),
+                    &event.event_type,
+                    &event.content,
+                    event.sticky_ms,
+                )
+                .await
+        }
     };
     let event_id = match sent {
         Ok(event_id) => event_id,
@@ -8953,6 +8991,7 @@ async fn delayed_event_action_by_id(
         action,
         false,
     )
+    .await
 }
 
 /// `POST /_matrix/client/v1/delayed_events/{delay_id}/{action}`
@@ -8970,7 +9009,7 @@ async fn delayed_event_action_stable(
             format!("no delayed-event action {action:?}"),
         )
     })?;
-    act_on_delay(&state, &delay_id, Some(&identity.user_id), action, true)
+    act_on_delay(&state, &delay_id, Some(&identity.user_id), action, true).await
 }
 
 /// The body of MSC4140's scheduling endpoint.
@@ -9486,7 +9525,7 @@ async fn set_room_state(
     }
     let event_id = state
         .rooms
-        .set_state_sticky(
+        .set_state_sticky_checked(
             &room_id,
             &identity.user_id,
             state.key.pair(),
@@ -9495,6 +9534,7 @@ async fn set_room_state(
             &content,
             query.sticky,
         )
+        .await
         .map_err(room_error)?;
     #[cfg(feature = "hub-mode")]
     crate::hub::after_local_send(&state, &room_id);
@@ -9657,6 +9697,7 @@ pub(crate) fn room_error(error: crate::rooms::RoomError) -> MatrixError {
         // is the same explanation a federating peer would give. A generic
         // "forbidden" would make a client's bug report useless.
         crate::rooms::RoomError::Forbidden(rule) => MatrixError::forbidden(rule),
+        crate::rooms::RoomError::Policy(error) => *error,
         crate::rooms::RoomError::UnsupportedVersion(version) => MatrixError::new(
             StatusCode::BAD_REQUEST,
             "M_UNSUPPORTED_ROOM_VERSION",
@@ -9700,19 +9741,20 @@ pub(crate) fn room_error(error: crate::rooms::RoomError) -> MatrixError {
 /// failure would replay the *error* forever, and recording nothing means the
 /// retry gets a fresh chance, which is what a client expects of a 429 or an
 /// auth refusal that a later state change resolves.
-fn with_transaction(
+async fn with_transaction<F: std::future::Future<Output = Result<String, MatrixError>>>(
     state: &AppState,
     identity: &crate::accounts::Identity,
     txn_id: &str,
-    mint: impl FnOnce() -> Result<String, MatrixError>,
+    mint: impl FnOnce() -> F,
 ) -> Result<Json<Value>, MatrixError> {
     let key = spindle_core::keys::transaction(&identity.user_id, &identity.device_id, txn_id);
+    let _turn = state.transactions.enter(&key).await;
     if let Ok(Some(stored)) = spindle_store::ReadView::get(state.store.as_ref(), &key)
         && let Ok(event_id) = String::from_utf8(stored)
     {
         return Ok(Json(json!({ "event_id": event_id })));
     }
-    let event_id = mint()?;
+    let event_id = mint().await?;
     record_transaction(state, identity, txn_id, &event_id)
 }
 
@@ -9910,10 +9952,10 @@ async fn send_event(
     {
         return Ok(response);
     }
-    let response = with_transaction(&state, &identity, &txn_id, || {
+    let response = with_transaction(&state, &identity, &txn_id, || async {
         state
             .rooms
-            .send_sticky(
+            .send_sticky_checked(
                 &room_id,
                 &identity.user_id,
                 state.key.pair(),
@@ -9921,8 +9963,10 @@ async fn send_event(
                 &content,
                 query.sticky,
             )
+            .await
             .map_err(room_error)
-    })?;
+    })
+    .await?;
     #[cfg(feature = "hub-mode")]
     crate::hub::after_local_send(&state, &room_id);
     Ok(response)
@@ -11340,14 +11384,17 @@ async fn deactivate_account(
 
     let rooms = state.rooms.joined(&identity.user_id).unwrap_or_default();
     for room_id in rooms {
-        let _ = state.rooms.set_membership(
-            &room_id,
-            &identity.user_id,
-            &identity.user_id,
-            "leave",
-            Some("account deactivated"),
-            state.key.pair(),
-        );
+        let _ = state
+            .rooms
+            .set_membership_checked(
+                &room_id,
+                &identity.user_id,
+                &identity.user_id,
+                "leave",
+                Some("account deactivated"),
+                state.key.pair(),
+            )
+            .await;
     }
 
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
@@ -11638,14 +11685,18 @@ async fn upgrade_room(
         // ruleset the old room should not have had either, and failing the
         // whole upgrade over it would strand the user in a room they have
         // already been told is being replaced.
-        if let Err(error) = state.rooms.set_state(
-            &replacement,
-            &identity.user_id,
-            state.key.pair(),
-            "m.room.power_levels",
-            "",
-            &levels,
-        ) {
+        if let Err(error) = state
+            .rooms
+            .set_state_checked(
+                &replacement,
+                &identity.user_id,
+                state.key.pair(),
+                "m.room.power_levels",
+                "",
+                &levels,
+            )
+            .await
+        {
             tracing::warn!(
                 %room_id, %replacement,
                 "the upgraded room kept default power levels: {error}"
@@ -11656,7 +11707,7 @@ async fn upgrade_room(
     // Last, and the reason for the whole ordering above.
     state
         .rooms
-        .set_state(
+        .set_state_checked(
             &room_id,
             &identity.user_id,
             state.key.pair(),
@@ -11667,6 +11718,7 @@ async fn upgrade_room(
                 "replacement_room": replacement.clone(),
             }),
         )
+        .await
         .map_err(room_error)?;
 
     Ok(Json(json!({ "replacement_room": replacement })))

@@ -1872,7 +1872,7 @@ pub(crate) fn validate_delete(state: &AppState, request: &DeleteRoom) -> Result<
     clippy::too_many_lines,
     reason = "one sequence, in the order Synapse performs it"
 )]
-pub(crate) fn shutdown_room(
+pub(crate) async fn shutdown_room(
     state: &AppState,
     actor: &AdminActor,
     room_id: &str,
@@ -1940,7 +1940,7 @@ pub(crate) fn shutdown_room(
                 .unwrap_or("Content Violation Notification");
             state
                 .rooms
-                .set_state(
+                .set_state_checked(
                     &new_room,
                     creator,
                     state.key.pair(),
@@ -1948,17 +1948,19 @@ pub(crate) fn shutdown_room(
                     "",
                     &json!({ "name": name }),
                 )
+                .await
                 .map_err(crate::routes::room_error)?;
             if let Some(message) = &request.message {
                 state
                     .rooms
-                    .send(
+                    .send_checked(
                         &new_room,
                         creator,
                         state.key.pair(),
                         "m.room.message",
                         &json!({ "msgtype": "m.text", "body": message }),
                     )
+                    .await
                     .map_err(crate::routes::room_error)?;
             }
             for alias in &local_aliases {
@@ -1979,23 +1981,23 @@ pub(crate) fn shutdown_room(
         {
             // Best-effort: an invite the new room refuses must not stop
             // the eviction from the old one.
-            let _ = state.rooms.set_membership(
-                new_room,
-                creator,
-                user,
-                "invite",
-                None,
-                state.key.pair(),
-            );
+            let _ = state
+                .rooms
+                .set_membership_checked(new_room, creator, user, "invite", None, state.key.pair())
+                .await;
         }
-        match state.rooms.set_membership(
-            room_id,
-            user,
-            user,
-            "leave",
-            request.message.as_deref(),
-            state.key.pair(),
-        ) {
+        match state
+            .rooms
+            .set_membership_checked(
+                room_id,
+                user,
+                user,
+                "leave",
+                request.message.as_deref(),
+                state.key.pair(),
+            )
+            .await
+        {
             Ok(_) => kicked.push(user.clone()),
             Err(_) => failed.push(user.clone()),
         }
@@ -2039,7 +2041,9 @@ async fn delete_room(
     Path(room_id): Path<String>,
     Json(request): Json<DeleteRoom>,
 ) -> Result<Json<Value>, MatrixError> {
-    shutdown_room(&state, &actor, &room_id, &request).map(Json)
+    shutdown_room(&state, &actor, &room_id, &request)
+        .await
+        .map(Json)
 }
 
 /// `GET /rooms/{roomId}/block` — `{block, user_id}` when blocked, and
@@ -2174,7 +2178,7 @@ async fn make_room_admin(
     content["users"][&target] = json!(granted);
     let event_id = state
         .rooms
-        .set_state(
+        .set_state_checked(
             &room_id,
             &author,
             state.key.pair(),
@@ -2182,6 +2186,7 @@ async fn make_room_admin(
             "",
             &content,
         )
+        .await
         .map_err(crate::routes::room_error)?;
 
     audit(
@@ -2528,7 +2533,8 @@ async fn send_server_notice(
             content: &request.content,
             event_type,
         },
-    )?;
+    )
+    .await?;
     audit(
         &state,
         &actor.identity().user_id,

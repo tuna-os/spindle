@@ -31,7 +31,7 @@ pub struct Notice<'a> {
 ///
 /// 400 when `[server_notices]` is not configured, 404 for a recipient this
 /// server does not hold, and the room layer's refusals otherwise.
-pub fn send(state: &AppState, notice: &Notice<'_>) -> Result<String, MatrixError> {
+pub async fn send(state: &AppState, notice: &Notice<'_>) -> Result<String, MatrixError> {
     let Some(config) = &state.config.server_notices else {
         return Err(MatrixError::new(
             axum::http::StatusCode::BAD_REQUEST,
@@ -75,16 +75,17 @@ pub fn send(state: &AppState, notice: &Notice<'_>) -> Result<String, MatrixError
             .map_err(|error| MatrixError::internal(&error.to_string()))?;
     }
 
-    let room_id = notices_room(state, &sender, notice.user_id, &config.room_name)?;
+    let room_id = notices_room(state, &sender, notice.user_id, &config.room_name).await?;
     let event_id = state
         .rooms
-        .send(
+        .send_checked(
             &room_id,
             &sender,
             state.key.pair(),
             notice.event_type,
             notice.content,
         )
+        .await
         .map_err(room_error)?;
     Ok(event_id)
 }
@@ -93,7 +94,7 @@ pub fn send(state: &AppState, notice: &Notice<'_>) -> Result<String, MatrixError
 /// still stands, with the user asked back in when they left; otherwise a
 /// fresh private room with them invited, tagged `m.server_notice` for
 /// them.
-fn notices_room(
+async fn notices_room(
     state: &AppState,
     sender: &str,
     user_id: &str,
@@ -115,7 +116,8 @@ fn notices_room(
         if !matches!(membership.as_deref(), Some("join" | "invite")) {
             state
                 .rooms
-                .set_membership(&room_id, sender, user_id, "invite", None, state.key.pair())
+                .set_membership_checked(&room_id, sender, user_id, "invite", None, state.key.pair())
+                .await
                 .map_err(room_error)?;
         }
         return Ok(room_id);
@@ -145,7 +147,8 @@ fn notices_room(
     // federation here.
     state
         .rooms
-        .set_membership(&room_id, sender, user_id, "invite", None, state.key.pair())
+        .set_membership_checked(&room_id, sender, user_id, "invite", None, state.key.pair())
+        .await
         .map_err(room_error)?;
     Store::put(
         state.store.as_ref(),

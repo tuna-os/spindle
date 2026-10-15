@@ -414,3 +414,11 @@ title = "Delegating parts of the C-S and S-S API to application services"
 status = "served"
 evidence = ["crates/spindle-server/tests/appservice_proxy.rs"]
 notes = "A registration's `io.element.msc4512.proxy_prefix` / `proxy_url` claims a prefix under both APIs; requests there are authenticated and forwarded with the hs_token and X-Matrix-User-Identifier / X-Matrix-Origin, and `fed_proxy` sends the federation twin under the service's own prefix. How lk-jwt-service runs as the homeserver's sidecar and serves MSC4195's homeserver endpoints."
+
+[[msc]]
+number = 4284
+title = "Policy servers"
+status = "partial"
+stable = "1.18"
+evidence = ["crates/spindle-server/tests/policy_servers.rs", "docs/policy-servers.md"]
+notes = "Homeserver participation: stable m.room.policy and MSC4284 compatibility, outbound signing, room-key verification, and live-event soft failure. Spindle consumes an external service; it does not host a policy service or publish policy-service discovery."

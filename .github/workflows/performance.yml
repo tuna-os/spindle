@@ -1,9 +1,13 @@
 name: Performance
 
+# Prose-only changes cannot move a budget, so they do not start this (no
+# job here is a required check, so a run that never starts blocks nothing).
 on:
   pull_request:
+    paths-ignore: ['**.md', '**.mdx', 'docs/**', .ste-budget]
   push:
     branches: [main]
+    paths-ignore: ['**.md', '**.mdx', 'docs/**', .ste-budget]
 
 permissions:
   contents: read

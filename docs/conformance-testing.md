@@ -109,7 +109,7 @@ conformance test may not pin down.
   on a throwaway store, and drives two browsers through Playwright: register,
   log in, create a room, invite, accept, a message each way, leave. Every step
   is named; a failure leaves a screenshot per browser under that name in
-  `tmp/element-web-e2e/`, and the `element-web-e2e` job in `compliance.yml`
+  `tmp/element-web-e2e/`, and the `debug-rigs` job in `compliance.yml`
   uploads them. Locally: `npm ci` and `npx playwright install chromium` in
   `scripts/element-web-e2e/`, then the script. Its first run found something
   Complement had not: `/sync` carried no timeline `prev_batch`, so Element
