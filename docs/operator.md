@@ -43,7 +43,7 @@ own origin, and nothing else.
 
 The pages work with a keyboard and a screen reader. They have a skip link,
 landmarks, table captions and headers, visible focus, and a live region for
-results. They meet WCAG AA contrast in light and dark mode, and they work on a
+results. In light and dark mode, their contrast meets the WCAG AA level, and they work on a
 narrow screen. They have no animation. Status always has a text label, not
 only a color.
 
@@ -87,13 +87,14 @@ page. The page lists that part under `unavailable` and shows the rest.
 
 ## State
 
-The operator keeps one file, `journal.jsonl`, in its data directory. A lock
-on `journal.lock` stops a second operator process from using the same
-directory. If an append fails, the operator removes the partial line. If it
-cannot remove the line, it refuses all later writes. Each
+The operator keeps one file, `journal.jsonl`, in its data directory. Each
 change is one JSON line. The engine syncs the line to disk before it changes
 its memory or answers the request. At startup the engine reads the file again
 and gets the same state back.
+
+A lock on `journal.lock` stops a second operator process from using the same
+directory. If an append fails, the operator removes the partial line. If it
+cannot remove the line, it refuses all later writes.
 
 The journal is also the audit trail. No code path edits or removes a line.
 `GET /_spindle/operator/v1/audit` reads it, with session hashes and stored
@@ -170,13 +171,13 @@ the program and writes one JSON document to its stdin:
 The program writes `{"ok": <result>}` or `{"error": "<text>"}` to stdout. The
 operator accepts an `ok` only if the program exits with success. A reply must
 be smaller than 4 MiB. The operator logs at most 64 KiB of stderr, with
-secrets removed. Each call runs in its own process group, and a timeout stops
-the whole group. The operator removes secrets from every driver error and
-finding before it stores or returns them. The operator gives the program a
-clean environment. It adds only `PATH` and the
-secrets from `[drivers.<name>.secrets]`. Thus secret values never go into the
-request, the journal or the logs. The operator stops a call at
-`timeout_secs`.
+secrets removed. Each call runs in its own process group. The operator stops a
+call at `timeout_secs`, and the timeout stops the whole group.
+
+The operator removes secrets from every driver error and every assessment
+result before it stores or returns them. The operator gives the program a clean environment.
+It adds only `PATH` and the secrets from `[drivers.<name>.secrets]`. Thus
+secret values never go into the request, the journal or the logs.
 
 ## Sessions and roles
 
@@ -223,8 +224,8 @@ future `spindlectl` use the same routes.
 
 - Every `POST` needs an `Idempotency-Key` header. A retry with the same key
   and body gets the first successful reply again, with
-  `Idempotent-Replayed: true`. The operator does not store a refusal, so a
-  retry after a refusal is checked again. The same key with a different body
+  `Idempotent-Replayed: true`. The operator does not store a refusal, so it
+  checks a retry after a refusal again. The same key with a different body
   gets `422 idempotency_key_reused`. If the client disconnects before the
   reply, the operator releases the key.
 - Each resource has an `ETag`. A change to a resource that exists needs
