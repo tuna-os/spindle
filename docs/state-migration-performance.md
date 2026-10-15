@@ -1,33 +1,41 @@
 # State-key migration performance
 
 Schema 2 to 3 changes state-key placement and node hashes. Historical room
-snapshots use path copying, so nearby v2 roots normally share nearly all their
-nodes. Rebuilding every root in full makes conversion cost proportional to
-history length multiplied by room-state size.
+snapshots use path copies, so two near v2 roots usually share almost all of
+their nodes. A full rebuild of each root makes the conversion cost equal to
+the history length multiplied by the size of the room state.
 
-The offline migration now verifies the first v2 root in full and compares
-successive v2 tries by address. Equal subtrees stop the traversal. Changed slots
-are applied to the previous converted snapshot, and only its changed v3 nodes
-are staged. Leaf/branch transitions, additions, removals and empty state fall
-back to walking the affected subtree. A repeated root is memoized; a
-nonadjacent repeat discards the incremental baseline because its converted
-nodes may still be staged rather than readable from disk.
+The offline migration now verifies the first v2 root in full. Then it compares
+each next v2 trie with the trie before it, by address. Equal subtrees stop the
+traversal. The migration applies the changed slots to the previous converted
+snapshot, and it stages only the changed v3 nodes. For leaf/branch
+transitions, additions, removals and empty state, the migration walks the full
+affected subtree.
 
-On a partial retry, already converted roots are checked with a bounded memo of
-fully verified v3 subtree addresses and depths. This avoids retaining historical
-snapshot graphs or rechecking their shared descendants. The memo is scoped to
-one room, one store and one intern table; it is valid only while those nodes
-remain immutable. It stores at most 1,000,000 entries. Eviction discards the memo
-and costs extra verification work without changing the result. Serving paths
-continue to use their existing snapshot decoder and weak node cache.
+The migration keeps a memo of each repeated root. A nonadjacent repeat
+discards the incremental baseline. The migration possibly staged the converted
+nodes of that root, and these nodes are possibly not yet on disk.
 
-Old-node addresses are collected during the same conversion walks. Their union
-includes the initial complete root and every subsequently reached changed
-subtree. Deletion still waits until all rooms have converted. Chunk commits
-still include newly allocated intern rows, new nodes and rewritten records;
-the schema marker advances only after success. The pre-migration backup remains
-the rollback method. A retry may leave unreachable old nodes from records
-committed by an earlier interrupted attempt, as the existing migration permits.
+On a partial retry, the migration checks the converted roots with a bounded
+memo. The memo keeps the addresses and depths of v3 subtrees that it verified
+in full. Thus the migration does not keep historical snapshot graphs, and it
+does not check their shared descendants again. Each memo is for one room, one
+store and one intern table. It is valid only while those nodes do not change.
+
+The memo keeps a maximum of 1,000,000 entries. An eviction discards the memo.
+This causes more verification work, but the result does not change. The server
+paths continue to use their snapshot decoder and weak node cache.
+
+The conversion walks also collect the old node addresses. This set includes
+the first full root and each changed subtree that the migration reaches after
+it. Deletion still waits until the migration converts all rooms. Each chunk
+commit still includes the new intern rows, the new nodes and the rewritten
+records. The schema marker moves forward only after success. The backup from
+before the migration stays the rollback method.
+
+A retry can leave old nodes that no root reaches. These nodes come from
+records that an interrupted run committed. The migration before this change
+also lets this occur.
 
 ## Regression measurement
 
@@ -37,25 +45,30 @@ Run:
 cargo test -p spindle-store --test state_migration --locked -- --nocapture
 ```
 
-The deterministic fixture has 2,048 membership slots and 64 revisions, including
-replacements, additions and removals. Every incremental root is compared with a
-full conversion against the same table, and every persisted node delta is
-rehydrated. The measured loader calls are:
+The deterministic fixture has 2,048 membership slots and 64 revisions, with
+replacements, additions and removals. The test compares each incremental root
+with a full conversion against the same table. It also rehydrates each node
+delta that the migration keeps. The measured loader calls are:
 
 | Work | Full traversal | Incremental / memoized |
 | --- | ---: | ---: |
 | V2 conversion across 64 revisions | 176,885 | 488 |
 | V3 validation across 64 revisions | 176,448 | 253 |
 
-These are node-read counts for this fixture, not production latency or a
-completion-time estimate. Each regression requires more than a 100-fold read
-reduction. Additional checks cover root/leaf/branch/empty transitions, missing
-and corrupt changed nodes, memo eviction, shared nodes across rooms, staged
-repeated roots, and reopening after a committed chunk followed by failure.
+These numbers are node reads for this fixture. They are not a production
+latency or an estimate of the completion time. Each regression test must show
+a decrease in reads of more than 100 times. Other checks cover these items:
 
-The migration prints the room ordinal, then checked records over the counted
-room total every 15 seconds and at the room's final record. Node-loader calls
-and elapsed time accompany the count. The final record count precedes the tail
-commit; the deletion phase and final successful schema result remain separate.
-Rooms can differ greatly in size, so room ordinals are not an overall percentage
-or an ETA.
+- root/leaf/branch/empty transitions
+- missing and corrupt changed nodes
+- memo eviction
+- shared nodes across rooms
+- staged repeated roots
+- a new open after a committed chunk and a failure
+
+The migration prints the room ordinal. Then it prints the checked records over
+the counted room total every 15 seconds and at the last record of the room.
+The node-loader calls and the elapsed time follow the count. The count for the
+last record comes before the tail commit. The deletion phase and the last
+schema result are separate from it. Rooms can be much different in size, so
+the room ordinals do not give a total percentage or an ETA.
