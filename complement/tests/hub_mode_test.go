@@ -81,21 +81,28 @@ func TestHubModeRoomStaysOrdinary(t *testing.T) {
 	})
 	sent = append(sent, final)
 
+	// The checks are subtests, so scripts/complement-require.py can see
+	// each of them pass rather than only the test around them.
+	//
 	// Every event reaches both servers: neither refused the other's.
-	for _, eventID := range sent {
-		alice.MustSyncUntil(t, client.SyncReq{}, client.SyncTimelineHasEventID(roomID, eventID))
-		bob.MustSyncUntil(t, client.SyncReq{}, client.SyncTimelineHasEventID(roomID, eventID))
-	}
+	t.Run("EveryEventReachesBothServers", func(t *testing.T) {
+		for _, eventID := range sent {
+			alice.MustSyncUntil(t, client.SyncReq{}, client.SyncTimelineHasEventID(roomID, eventID))
+			bob.MustSyncUntil(t, client.SyncReq{}, client.SyncTimelineHasEventID(roomID, eventID))
+		}
+	})
 
 	// The same state on both, the hub's own event included.
-	left, right := roomState(t, alice, roomID), roomState(t, bob, roomID)
-	if !equal(left, right) {
-		t.Fatalf("hs1 and hs2 disagree on the hub room's state:\n%s", diff(left, right))
-	}
-	if left["m.room.hub|"] != hubEvent {
-		t.Fatalf("m.room.hub is %q on both, not %q", left["m.room.hub|"], hubEvent)
-	}
-	if left["m.room.topic|"] == "" {
-		t.Fatalf("hs2's state event is not in the room's state:\n%s", diff(left, right))
-	}
+	t.Run("BothServersHoldTheSameState", func(t *testing.T) {
+		left, right := roomState(t, alice, roomID), roomState(t, bob, roomID)
+		if !equal(left, right) {
+			t.Fatalf("hs1 and hs2 disagree on the hub room's state:\n%s", diff(left, right))
+		}
+		if left["m.room.hub|"] != hubEvent {
+			t.Fatalf("m.room.hub is %q on both, not %q", left["m.room.hub|"], hubEvent)
+		}
+		if left["m.room.topic|"] == "" {
+			t.Fatalf("hs2's state event is not in the room's state:\n%s", diff(left, right))
+		}
+	})
 }
