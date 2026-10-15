@@ -56,7 +56,7 @@ async function register(page, name) {
   await page.locator('#mx_RegistrationForm_username').fill(name);
   await page.locator('#mx_RegistrationForm_password').fill(PASSWORD);
   await page.locator('#mx_RegistrationForm_passwordConfirm').fill(PASSWORD);
-  await page.locator('input[type=submit]').click();
+  await page.getByRole('button', { name: 'Register', exact: true }).click();
   await page.waitForURL(/#\/home/, { timeout: SLOW });
 }
 
@@ -65,7 +65,34 @@ async function login(page, name) {
   await page.getByRole('textbox', { name: /username/i }).fill(name);
   await page.getByRole('textbox', { name: /password/i }).fill(PASSWORD);
   await page.getByRole('button', { name: /sign in/i }).click();
+  // A second device of an account with cross-signing keys is asked to
+  // verify itself before it reaches the home page. There is no other
+  // device here to verify against, so it skips, the way a user can.
+  const verify = page.getByRole('heading', { name: /confirm your digital identity/i });
+  await Promise.race([
+    page.waitForURL(/#\/home/, { timeout: SLOW }),
+    verify.waitFor({ timeout: SLOW }),
+  ]);
+  if (await verify.isVisible()) {
+    await page.getByRole('button', { name: 'Skip verification for now' }).click();
+    await page.getByRole('button', { name: "I'll verify later" }).click();
+  }
   await page.waitForURL(/#\/home/, { timeout: SLOW });
+}
+
+// A fresh client stacks tooltips over the room list one after another:
+// "verify this device" for a device that skipped verification, then
+// "enable desktop notifications". Each is turned down until none is left.
+async function dismissTooltips(page) {
+  const later = page.getByRole('button', { name: /^(later|dismiss)$/i }).first();
+  for (let i = 0; i < 5; i++) {
+    try {
+      await later.waitFor({ timeout: 3_000 });
+    } catch {
+      return;
+    }
+    await later.click();
+  }
 }
 
 function composer(page) {
@@ -102,8 +129,11 @@ async function send(page, text) {
   });
 
   await step('create-room', async () => {
-    await alice.getByRole('button', { name: 'Add room' }).click();
-    await alice.getByRole('menuitem', { name: /new room/i }).click();
+    // A new account is greeted by a "back up your chats" tooltip that sits
+    // over the room list header.
+    const dismiss = alice.getByRole('button', { name: 'Dismiss', exact: true });
+    if (await dismiss.isVisible().catch(() => false)) await dismiss.click();
+    await alice.getByRole('button', { name: 'New room', exact: true }).click();
     const dialog = alice.getByRole('dialog');
     await dialog.getByRole('textbox', { name: /^name$/i }).fill(ROOM);
     // A private room defaults to encrypted; the point here is the plain
@@ -131,13 +161,23 @@ async function send(page, text) {
     const dialog = alice.getByRole('dialog');
     const bobId = `@bob:${SERVER}`;
     await dialog.getByRole('textbox').first().fill(bobId);
-    await dialog.getByRole('button', { name: bobId }).first().click();
+    await dialog.getByText(bobId, { exact: true }).first().click();
     await dialog.getByRole('button', { name: 'Invite', exact: true }).click();
+    // Inviting someone alice has no chat with yet asks her to confirm.
+    const confirm = alice.locator('.mx_UnknownIdentityUsersWarningDialog');
+    await confirm.getByRole('button', { name: 'Invite', exact: true }).click({ timeout: SLOW });
     await alice.getByRole('dialog').waitFor({ state: 'hidden', timeout: SLOW });
   });
 
   await step('accept-invite', async () => {
-    await bob.getByRole('treeitem', { name: ROOM }).first().click({ timeout: SLOW });
+    await dismissTooltips(bob);
+    // The invite waits in an "Invites" section of the room list, which
+    // starts collapsed.
+    const room = bob.getByText(ROOM, { exact: true }).first();
+    if (!(await room.isVisible().catch(() => false))) {
+      await bob.getByRole('button', { name: /^toggle invites section/i }).click({ timeout: SLOW });
+    }
+    await room.click({ timeout: SLOW });
     await bob.waitForURL(/#\/room\//, { timeout: SLOW });
     await bob.getByRole('button', { name: /^accept$/i }).click({ timeout: SLOW });
     await composer(bob).waitFor({ timeout: SLOW });

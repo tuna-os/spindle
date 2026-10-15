@@ -92,3 +92,7 @@ harness = false
 [[bench]]
 name = "call_churn"
 harness = false
+
+[[bench]]
+name = "federated_timing"
+harness = false

@@ -39,10 +39,9 @@ experiment, and what is deliberately not being built yet.
 
 ## Release maturity
 
-Spindle has **no tagged release**. That is the correct standing for the current
-stage and the README says so plainly. What has been missing is a stated
-condition under which it changes — so this section is that condition, and the
-absence of a release is a decision with an exit rather than a default.
+Spindle has addressable `v0.0.x` prereleases. The next maturity boundary is
+`v0.1.0`, with candidate evidence in
+[docs/v0.1.0-readiness.md](docs/v0.1.0-readiness.md).
 
 ### `v0.0.x` — an addressable prerelease
 
@@ -67,7 +66,7 @@ commit, and the candidate's evidence links belong in the release notes.
 |---|---|
 | Authorization surface | [#268](https://github.com/tuna-os/spindle/issues/268)'s systematic audit closed — the route table walked by a stranger for every room-scoped route, not "however much someone happened to look" |
 | Vulnerability intake | Private vulnerability reporting enabled on this repository and a `SECURITY.md` naming the server-software classes: authorization bypass, federation forgery, cross-account disclosure, unauthenticated resource exhaustion ([#307](https://github.com/tuna-os/spindle/issues/307)) |
-| The load-bearing claim | The SPEC §9.3 equivalence theorem's differential oracle against `ruma-state-res` passing on a schedule, not only on demand. A counterexample is a release blocker |
+| The load-bearing claim | Scheduled differential checks against `ruma-state-res`, including the retired merge counterexamples and resolver delegation (ADR 0005), plus the exhaustive fork-window oracle. A disagreement on the live path is a release blocker |
 | Federation under adversity | [#16](https://github.com/tuna-os/spindle/issues/16)'s fork-proof rig green, and [#225](https://github.com/tuna-os/spindle/issues/225) — a federated fork wedging a room permanently — fixed with a regression test |
 | Lifecycle round trip | `backup` → `restore` → `verify-media` demonstrated across a version boundary, with at least one real migration in the migration table rather than synthetic fixtures |
 | Performance parity | [#42](https://github.com/tuna-os/spindle/issues/42)'s protocol-workload comparison against Tuwunel and Synapse published under the counting discipline the benchmark host requires |

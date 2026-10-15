@@ -27,6 +27,7 @@ pub mod keys;
 mod log;
 mod pdu;
 mod state;
+pub mod state_table;
 pub mod version;
 
 pub use log::{
@@ -38,5 +39,7 @@ pub use log::{
 pub use pdu::{Pdu, PduError};
 pub use state::{
     CONTENT_DIGEST_VERSION, EventType, RehydrateError, StateKey, StateRoot, StateSnapshot,
+    rehydrate_v2, v2_node_addresses,
 };
+pub use state_table::{AllocRecord, MemStateKeyTable, StateKeyTable};
 pub use version::{STATE_DAG_V12, VersionError, is_state_dag, rules_of};

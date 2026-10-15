@@ -41,6 +41,10 @@ const NEGATIVE_CACHE: Duration = Duration::from_secs(60);
 /// exist gets at most one fetch of the real server per interval.
 const REFETCH_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Bounds for attacker-selected direct-key origins and network work.
+const MAX_KEY_FETCH_ORIGINS: usize = 8_192;
+const MAX_CONCURRENT_KEY_FETCHES: usize = 32;
+
 /// How soon the notaries are asked about the same origin again, whatever
 /// they answered. Their answer for one origin carries its whole history,
 /// so asking again sooner learns nothing new.
@@ -99,6 +103,7 @@ pub struct Federation {
     allowed: Vec<Cidr>,
     /// Origins whose key fetch failed, and until when not to try again.
     negative: std::sync::Mutex<HashMap<String, Instant>>,
+    key_fetch_slots: tokio::sync::Semaphore,
     /// EDUs waiting for the next transaction to each destination.
     ///
     /// In memory and nowhere else, deliberately: an EDU is ephemeral by
@@ -529,6 +534,7 @@ impl Federation {
             insecure_http,
             allowed,
             negative: std::sync::Mutex::new(HashMap::new()),
+            key_fetch_slots: tokio::sync::Semaphore::new(MAX_CONCURRENT_KEY_FETCHES),
             edu_queue: std::sync::Mutex::new(std::collections::HashMap::new()),
             receipt_queue: std::sync::Mutex::new(std::collections::HashMap::new()),
             enabled: true,
@@ -1274,6 +1280,14 @@ impl Federation {
     /// failed too recently to be asked again -- or, with `recent_success`,
     /// answered too recently.
     async fn direct_key_document(&self, origin: &str, recent_success: bool) -> Option<Value> {
+        if origin.len() > 255 || ruma::ServerName::parse(origin).is_err() {
+            return None;
+        }
+        let Ok(_slot) = self.key_fetch_slots.try_acquire() else {
+            self.metrics
+                .record_key_fetch(KeySource::Direct, KeyFetchResult::Throttled);
+            return None;
+        };
         let instant = Instant::now();
         {
             let mut negative = self
@@ -1291,15 +1305,31 @@ impl Federation {
                     .record_key_fetch(KeySource::Direct, KeyFetchResult::Throttled);
                 return None;
             }
+            // Refuse new origins at cache saturation without evicting a
+            // live throttle. The semaphore bounds concurrent cache misses.
+            if negative.len() >= MAX_KEY_FETCH_ORIGINS
+                || (fetched.len() >= MAX_KEY_FETCH_ORIGINS && !fetched.contains_key(origin))
+            {
+                self.metrics
+                    .record_key_fetch(KeySource::Direct, KeyFetchResult::Throttled);
+                return None;
+            }
         }
         match self.fetch_key_document(origin).await {
             Ok(document) => {
                 self.metrics
                     .record_key_fetch(KeySource::Direct, KeyFetchResult::Ok);
-                self.fetched
+                self.negative
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(origin.to_owned(), Instant::now());
+                    .remove(origin);
+                let mut fetched = self
+                    .fetched
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if fetched.len() < MAX_KEY_FETCH_ORIGINS {
+                    fetched.insert(origin.to_owned(), Instant::now());
+                }
                 Some(document)
             }
             Err((error, invalid)) => {
@@ -1312,10 +1342,13 @@ impl Federation {
                         KeyFetchResult::Error
                     },
                 );
-                self.negative
+                let mut negative = self
+                    .negative
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(origin.to_owned(), Instant::now() + NEGATIVE_CACHE);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if negative.len() < MAX_KEY_FETCH_ORIGINS {
+                    negative.insert(origin.to_owned(), Instant::now() + NEGATIVE_CACHE);
+                }
                 None
             }
         }
@@ -3346,5 +3379,58 @@ mod receipt_queue_tests {
             .map(|edu| edu["content"]["!r:x"]["m.read"].as_object().unwrap().len())
             .sum();
         assert_eq!(held, MAX_PENDING_RECEIPTS);
+    }
+}
+
+#[cfg(test)]
+mod key_fetch_capacity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn saturated_origin_cache_and_fetch_slots_refuse_before_network_io() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(FjallStore::open(directory.path()).unwrap());
+        let key = Arc::new(ServerKey::load_or_create(store.as_ref()).unwrap());
+        let federation = Federation::new(store, "example.org", key, false, &[]).unwrap();
+        assert!(
+            federation
+                .direct_key_document(&"x".repeat(256), false)
+                .await
+                .is_none()
+        );
+        assert!(federation.negative.lock().unwrap().is_empty());
+        let permits = federation
+            .key_fetch_slots
+            .acquire_many(u32::try_from(MAX_CONCURRENT_KEY_FETCHES).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            federation
+                .direct_key_document("invalid.invalid", false)
+                .await
+                .is_none()
+        );
+        assert!(federation.negative.lock().unwrap().is_empty());
+        drop(permits);
+        {
+            let mut negative = federation.negative.lock().unwrap();
+            for number in 0..MAX_KEY_FETCH_ORIGINS {
+                negative.insert(format!("{number}.invalid"), Instant::now() + NEGATIVE_CACHE);
+            }
+        }
+        assert!(
+            federation
+                .direct_key_document("new.invalid", false)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            federation.negative.lock().unwrap().len(),
+            MAX_KEY_FETCH_ORIGINS
+        );
+        assert_eq!(
+            federation.key_fetch_slots.available_permits(),
+            MAX_CONCURRENT_KEY_FETCHES
+        );
     }
 }

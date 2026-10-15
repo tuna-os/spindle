@@ -3,7 +3,12 @@
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
-use spindle_core::{StateKey, StateSnapshot};
+use spindle_core::{MemStateKeyTable, StateKey, StateKeyTable, StateSnapshot};
+use std::sync::Arc;
+
+fn table() -> Arc<dyn StateKeyTable> {
+    MemStateKeyTable::shared()
+}
 
 fn key(slot: u16) -> StateKey {
     StateKey::new("m.room.member", format!("@user{slot}:example.org"))
@@ -16,18 +21,19 @@ proptest! {
         removed in prop::collection::vec(any::<u16>(), 0..30),
     ) {
         let mut map = BTreeMap::new();
-        let mut state = StateSnapshot::new();
+        let table = table();
+        let mut state = StateSnapshot::new(table.clone());
         for (slot, value) in writes {
             let value = format!("$e{value}");
-            state = state.apply(key(slot), value.clone());
+            state = state.apply(&key(slot), value.clone());
             map.insert(slot, value);
         }
         for slot in removed.into_iter().chain(map.keys().copied().take(10).collect::<Vec<_>>()) {
             state = state.remove(&key(slot));
             map.remove(&slot);
-            let mut rebuilt = StateSnapshot::new();
+            let mut rebuilt = StateSnapshot::new(table.clone());
             for (slot, value) in &map {
-                rebuilt = rebuilt.apply(key(*slot), value.clone());
+                rebuilt = rebuilt.apply(&key(*slot), value.clone());
             }
             prop_assert_eq!(state.root(), rebuilt.root());
             prop_assert_eq!(state.len(), map.len());
@@ -37,9 +43,10 @@ proptest! {
 
 #[test]
 fn deleting_from_a_large_room_persists_only_the_changed_path() {
-    let mut state = StateSnapshot::new();
+    let table = table();
+    let mut state = StateSnapshot::new(table.clone());
     for slot in 0..20_000 {
-        state = state.apply(key(slot), format!("$e{slot}"));
+        state = state.apply(&key(slot), format!("$e{slot}"));
     }
     let removed = state.remove(&key(9000));
     assert_eq!(removed.len(), 19_999);
@@ -54,5 +61,5 @@ fn deleting_from_a_large_room_persists_only_the_changed_path() {
         "one trie path, never a fresh room trie"
     );
     assert_eq!(removed.remove(&key(9000)).root(), removed.root());
-    assert_eq!(removed.apply(key(9000), "$e9000").root(), state.root());
+    assert_eq!(removed.apply(&key(9000), "$e9000").root(), state.root());
 }

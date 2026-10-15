@@ -724,7 +724,8 @@ async fn end_session(
     if exists {
         let user_id = accounts.user_id(&session.localpart);
         crate::mas::remove_device(&state, &accounts, &session.localpart, &form.device_id)?;
-        let seq = state.rooms.allocate_stream_id();
+        let stream_write = state.rooms.reserve_stream_id();
+        let seq = stream_write.id();
         state
             .devices
             .mark_device_list_changed(&user_id, seq)

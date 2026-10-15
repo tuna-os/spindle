@@ -20,6 +20,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Bound attacker-controlled counter cardinality and identifier allocation.
+const MAX_TRACKED_KEYS: usize = 65_536;
+const MAX_KEY_BYTES: usize = 512;
+
 /// A fixed-window counter.
 ///
 /// Deliberately not a token bucket. The window's coarseness is the point: an
@@ -28,6 +32,7 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug)]
 struct Window {
     started: Instant,
+    expires: Instant,
     count: u32,
 }
 
@@ -114,6 +119,9 @@ impl RateLimiter {
         if !self.enabled {
             return Ok(());
         }
+        if key.len() > MAX_KEY_BYTES {
+            return Err(RetryAfter(limit.window));
+        }
         let mut windows = self.windows.lock().unwrap_or_else(|poisoned| {
             // A panic inside the critical section leaves counters, not
             // invariants, so the recovered state is usable. Refusing traffic
@@ -122,14 +130,24 @@ impl RateLimiter {
             poisoned.into_inner()
         });
 
+        // Preserve existing budgets at saturation: evicting a live counter
+        // would let an attacker reset it by flooding distinct identifiers.
+        if windows.len() >= MAX_TRACKED_KEYS && !windows.contains_key(key) {
+            windows.retain(|_, window| window.expires > now);
+            if windows.len() >= MAX_TRACKED_KEYS {
+                return Err(RetryAfter(limit.window));
+            }
+        }
         let entry = windows.entry(key.to_owned()).or_insert(Window {
             started: now,
+            expires: now + limit.window,
             count: 0,
         });
 
         if now.duration_since(entry.started) >= limit.window {
             *entry = Window {
                 started: now,
+                expires: now + limit.window,
                 count: 0,
             };
         }
@@ -232,3 +250,28 @@ pub const RESET_REQUEST_PER_SOURCE: Limit = Limit::new(5, Duration::from_secs(15
 /// belongs to anyone — a limit that applied only to known addresses would
 /// be the enumeration oracle the uniform page exists to deny.
 pub const RESET_REQUEST_PER_ADDRESS: Limit = Limit::new(3, Duration::from_secs(60 * 60));
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    #[test]
+    fn identifier_flood_cannot_allocate_or_reset_live_budgets() {
+        let limiter = RateLimiter::new();
+        let now = Instant::now();
+        let limit = Limit::new(1, Duration::from_secs(60));
+        for number in 0..MAX_TRACKED_KEYS {
+            assert!(limiter.check_at(&number.to_string(), limit, now).is_ok());
+        }
+        assert!(limiter.check_at("new", limit, now).is_err());
+        assert!(limiter.check_at("0", limit, now).is_err());
+        assert_eq!(limiter.tracked(), MAX_TRACKED_KEYS);
+        assert!(limiter.check_at("new", limit, now + limit.window).is_ok());
+        assert!(
+            limiter
+                .check_at(&"x".repeat(MAX_KEY_BYTES + 1), limit, now)
+                .is_err()
+        );
+        assert_eq!(limiter.tracked(), 1);
+    }
+}

@@ -18,7 +18,7 @@ const ROOM: &str = "!schema:example.org";
 
 fn seed(store: &FjallStore) {
     let room_store = RoomStore::new(store, ROOM);
-    let mut log = RoomLog::new();
+    let mut log = RoomLog::new(store.key_table());
     for number in 0..5 {
         let entry = log.append_local(format!("$event-{number}"), None).unwrap();
         let entry = entry.clone();

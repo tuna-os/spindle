@@ -1,0 +1,74 @@
+--- a/crates/spindle-core/benches/state_snapshot.rs
++++ b/crates/spindle-core/benches/state_snapshot.rs
+@@ -49,7 +49,7 @@
+ fn retained_updates(c: &mut Criterion) {
+     let mut group = c.benchmark_group("state/retained_updates");
+
+-    for size in [100_usize, 1_000, 10_000] {
++    for size in [100_usize, 1_000, 10_000, 50_000] {
+         // Sizes span two orders of magnitude so the shape, not one number, shows.
+         let entries = slots(size);
+
+@@ -143,7 +143,7 @@
+ fn persist(c: &mut Criterion) {
+     let mut group = c.benchmark_group("state/persist");
+
+-    for size in [100_usize, 1_000, 10_000] {
++    for size in [100_usize, 1_000, 10_000, 50_000] {
+         let entries = slots(size);
+         let trie = seeded_trie(&entries);
+         let map: imbl::HashMap<String, String> = entries
+@@ -229,7 +229,7 @@
+ fn history_at(c: &mut Criterion) {
+     let mut group = c.benchmark_group("state/history_at");
+
+-    for size in [100_usize, 1_000, 10_000] {
++    for size in [100_usize, 1_000, 10_000, 50_000] {
+         let entries = slots(size);
+
+         // A log whose every entry is a state event, so the state at li is
+@@ -300,5 +300,43 @@
+     group.finish();
+ }
+
+-criterion_group!(benches, retained_updates, lookups, persist, history_at);
++/// Replacing existing slots after key allocation, retaining every snapshot.
++/// This complements first-sight updates: room state usually changes slots
++/// whose keys the store has already interned.
++fn retained_replacements(c: &mut Criterion) {
++    let mut group = c.benchmark_group("state/retained_replacements");
++    for size in [100_usize, 1_000, 10_000, 50_000] {
++        let entries = slots(size);
++        let seeded = seeded_trie(&entries);
++        let seeded_map: imbl::HashMap<String, String> = entries
++            .iter()
++            .map(|(key, id)| (key.state_key().to_owned(), id.clone()))
++            .collect();
++        group.bench_with_input(BenchmarkId::new("hamt", size), &entries, |b, entries| {
++            b.iter(|| {
++                let mut state = seeded.clone();
++                let mut history = Vec::with_capacity(entries.len());
++                for (key, _) in entries {
++                    state = state.apply(key.clone(), "$replacement");
++                    history.push(state.clone());
++                }
++                std::hint::black_box(history)
++            });
++        });
++        group.bench_with_input(BenchmarkId::new("imbl", size), &entries, |b, entries| {
++            b.iter(|| {
++                let mut state = seeded_map.clone();
++                let mut history = Vec::with_capacity(entries.len());
++                for (key, _) in entries {
++                    state.insert(key.state_key().to_owned(), "$replacement".to_owned());
++                    history.push(state.clone());
++                }
++                std::hint::black_box(history)
++            });
++        });
++    }
++    group.finish();
++}
++
++criterion_group!(benches, retained_updates, retained_replacements, lookups, persist, history_at);
+ criterion_main!(benches);

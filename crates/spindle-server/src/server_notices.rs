@@ -162,7 +162,8 @@ fn notices_room(
         tags["tags"] = json!({});
     }
     tags["tags"]["m.server_notice"] = json!({});
-    let position = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let position = stream_write.id();
     state
         .account_data
         .put(user_id, &room_id, "m.tag", &tags, position)

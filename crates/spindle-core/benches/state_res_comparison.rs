@@ -31,7 +31,7 @@ use oracle::{ALICE, RoomBuilder, auth_chains, reference_resolve_with_chains};
 use ruma::state_res::StateMap;
 use ruma::{OwnedEventId, events::TimelineEventType};
 use serde_json::json;
-use spindle_core::{EventId, EventInput, RoomLog, StateKey};
+use spindle_core::{EventId, EventInput, MemStateKeyTable, RoomLog, StateKey};
 
 /// Build a fork with `per_side` divergent state writes on each branch.
 ///
@@ -89,7 +89,7 @@ fn spindle_log(
     base: &RoomBuilder,
     branches: &[Vec<(StateKey, String)>],
 ) -> (RoomLog, Vec<EventId>) {
-    let mut log = RoomLog::new();
+    let mut log = RoomLog::new(MemStateKeyTable::shared());
     let shared = base.state_map();
     let mut ordered: Vec<_> = shared.iter().collect();
     ordered.sort_by_key(|(_, id)| id.as_str().to_owned());

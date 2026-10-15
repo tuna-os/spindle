@@ -82,6 +82,15 @@ async fn main() -> ExitCode {
         return promote_admin(&config_path, &localpart);
     }
 
+    // `spindle sfu on|off|status <config>` — the SFU program's runtime
+    // switch and its status. The switch lives in the store, not the config
+    // file: flipping it never rewrites an operator file, and it survives
+    // restarts. `status` names the model (local supervised sidecar or
+    // remote SFU) beside the switch, so "which backend" is one command.
+    if std::env::args().nth(1).as_deref() == Some("sfu") {
+        return sfu_command().await;
+    }
+
     if let Some(code) = credential_command() {
         return code;
     }
@@ -953,6 +962,94 @@ async fn close_store(mut store: Arc<FjallStore>) {
 /// account minted with a password nobody chose would be a credential
 /// nobody can present, and a typo'd localpart silently created would be
 /// an admin nobody meant to exist.
+/// `spindle sfu on|off|status <config>`.
+const SFU_USAGE: &str = "usage: spindle sfu on|off|status <config>";
+
+async fn sfu_command() -> ExitCode {
+    let (Some(action), Some(config_path)) = (std::env::args().nth(2), std::env::args().nth(3))
+    else {
+        eprintln!("{SFU_USAGE}");
+        return ExitCode::FAILURE;
+    };
+    if !matches!(action.as_str(), "on" | "off" | "status") {
+        eprintln!("{SFU_USAGE}");
+        return ExitCode::FAILURE;
+    }
+    let config = match Config::load(&config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("spindle: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let store = match FjallStore::open(&config.storage.path) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!(
+                "spindle: cannot open storage at {}: {error}",
+                config.storage.path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let store = Arc::new(store);
+    match action.as_str() {
+        "on" => {
+            if config.rtc.livekit.is_none() {
+                eprintln!(
+                    "spindle: the LiveKit SFU program is not configured — set [rtc.livekit] first"
+                );
+                return ExitCode::FAILURE;
+            }
+            if let Err(error) = spindle_server::livekit::set_switch(&store, true) {
+                eprintln!("spindle: {error}");
+                return ExitCode::FAILURE;
+            }
+            // Regenerate the sidecar config from the operator's settings so
+            // the next start boots what the config says, not what it said.
+            // Without a supervisor: this command is short-lived, and a
+            // child would die with it.
+            let _ = spindle_server::livekit::SfuSupervisor::generate_config_for(&config);
+            println!("sfu on");
+            ExitCode::SUCCESS
+        }
+        "off" => {
+            if let Err(error) = spindle_server::livekit::set_switch(&store, false) {
+                eprintln!("spindle: {error}");
+                return ExitCode::FAILURE;
+            }
+            println!("sfu off");
+            ExitCode::SUCCESS
+        }
+        _ => {
+            let sfu =
+                spindle_server::livekit::SfuSupervisor::new(config.clone(), Arc::clone(&store));
+            let status = spindle_server::livekit::status_json(&config, &store, &sfu);
+            println!("{status:#}");
+            let binary = config
+                .rtc
+                .livekit
+                .as_ref()
+                .and_then(|livekit| livekit.binary.clone());
+            if let Some(binary) = binary {
+                match spindle_server::livekit::sidecar_version(&binary).await {
+                    Some(version) => {
+                        println!("sidecar: {version}");
+                        if !version.contains(spindle_server::livekit::LIVEKIT_SERVER_PIN) {
+                            println!(
+                                "note: running sidecar differs from pin {}",
+                                spindle_server::livekit::LIVEKIT_SERVER_PIN
+                            );
+                        }
+                    }
+                    None => println!("sidecar: not queryable at {binary}"),
+                }
+            }
+            ExitCode::SUCCESS
+        }
+    }
+}
+
 fn promote_admin(config_path: &str, localpart: &str) -> ExitCode {
     let config = match Config::load(config_path) {
         Ok(config) => config,

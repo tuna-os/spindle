@@ -7,7 +7,12 @@
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
-use spindle_core::{StateKey, StateSnapshot};
+use spindle_core::{MemStateKeyTable, StateKey, StateKeyTable, StateSnapshot};
+use std::sync::Arc;
+
+fn table() -> Arc<dyn StateKeyTable> {
+    MemStateKeyTable::shared()
+}
 
 fn key(slot: u16) -> StateKey {
     if slot.is_multiple_of(7) {
@@ -20,7 +25,7 @@ fn key(slot: u16) -> StateKey {
 fn build(base: &StateSnapshot, writes: &[(u16, u16)]) -> StateSnapshot {
     let mut state = base.clone();
     for (slot, value) in writes {
-        state = state.apply(key(*slot), format!("$e{value}"));
+        state = state.apply(&key(*slot), format!("$e{value}"));
     }
     state
 }
@@ -54,16 +59,10 @@ fn naive(
 }
 
 fn owned(
-    diff: Vec<(&StateKey, Option<&str>, Option<&str>)>,
+    diff: Vec<(StateKey, Option<&str>, Option<&str>)>,
 ) -> Vec<(StateKey, Option<String>, Option<String>)> {
     diff.into_iter()
-        .map(|(key, ours, theirs)| {
-            (
-                key.clone(),
-                ours.map(str::to_owned),
-                theirs.map(str::to_owned),
-            )
-        })
+        .map(|(key, ours, theirs)| (key, ours.map(str::to_owned), theirs.map(str::to_owned)))
         .collect()
 }
 
@@ -74,7 +73,8 @@ proptest! {
         left in prop::collection::vec((0_u16..2_500, 50_u16..100), 0..40),
         right in prop::collection::vec((0_u16..2_500, 50_u16..100), 0..40),
     ) {
-        let base = build(&StateSnapshot::new(), &base);
+        let table = table();
+        let base = build(&StateSnapshot::new(table.clone()), &base);
         let left = build(&base, &left);
         let right = build(&base, &right);
         prop_assert_eq!(owned(left.diff(&right)), naive(&left, &right));
@@ -85,22 +85,39 @@ proptest! {
 
 #[test]
 fn unrelated_states_diff_in_full() {
-    let left = build(&StateSnapshot::new(), &[(1, 1), (2, 2), (3, 3)]);
-    let right = build(&StateSnapshot::new(), &[(2, 2), (3, 4), (5, 5)]);
+    let table = table();
+    let left = build(
+        &StateSnapshot::new(table.clone()),
+        &[(1, 1), (2, 2), (3, 3)],
+    );
+    let right = build(
+        &StateSnapshot::new(table.clone()),
+        &[(2, 2), (3, 4), (5, 5)],
+    );
     assert_eq!(owned(left.diff(&right)), naive(&left, &right));
     assert_eq!(left.diff(&right).len(), 3);
-    assert!(StateSnapshot::new().diff(&StateSnapshot::new()).is_empty());
-    assert_eq!(StateSnapshot::new().diff(&left).len(), 3);
+    assert!(
+        StateSnapshot::new(table.clone())
+            .diff(&StateSnapshot::new(MemStateKeyTable::shared()))
+            .is_empty()
+    );
+    assert_eq!(
+        StateSnapshot::new(MemStateKeyTable::shared())
+            .diff(&left)
+            .len(),
+        3
+    );
 }
 
 #[test]
 fn a_large_shared_state_diffs_only_the_changed_slots() {
+    let table = table();
     let base = build(
-        &StateSnapshot::new(),
+        &StateSnapshot::new(table.clone()),
         &(0..20_000).map(|slot| (slot, 0)).collect::<Vec<_>>(),
     );
-    let left = base.apply(key(17), "$left");
-    let right = base.apply(key(17), "$right").apply(key(30_000), "$new");
+    let left = base.apply(&key(17), "$left");
+    let right = base.apply(&key(17), "$right").apply(&key(30_000), "$new");
     let diff = owned(left.diff(&right));
     assert_eq!(
         diff,

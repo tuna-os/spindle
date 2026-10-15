@@ -106,7 +106,8 @@ pub const MOUNTED: &[&str] = &[
 pub fn router(state: AppState) -> Router {
     let routes = Router::new()
         .merge(account_routes())
-        .merge(report_and_hold_routes())
+        .merge(crate::moderation_routes::routes())
+        .merge(profile_and_admin_routes())
         .merge(push_routes())
         .merge(appservice_routes())
         .merge(crate::dehydrated::routes())
@@ -122,6 +123,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::mas::routes())
         .merge(crate::admin::routes())
         .merge(crate::admin_tasks::routes())
+        .merge(crate::admin_ui::routes())
         .merge(crate::admin_federation::routes())
         .merge(crate::admin_media::routes())
         .merge(crate::oidc::routes())
@@ -321,76 +323,6 @@ fn profile_routes() -> Router<AppState> {
         )
 }
 
-/// `POST /_matrix/client/v3/rooms/{room_id}/report/{event_id}`
-///
-/// A user tells the server's operators that an event is a problem. The
-/// report is filed where the admin API's `/event_reports` reads it, by
-/// an id an operator can quote, and a line goes into the audit log too,
-/// which is the feed an operator already reads -- a report stored
-/// somewhere nobody looks is not a moderation feature, it is the
-/// appearance of one.
-///
-/// **404 covers both "no such event" and "you cannot see it", deliberately
-/// and per the spec.** Distinguishing them would turn this endpoint into an
-/// oracle for whether a given event ID exists in a room the caller is not
-/// in, which is exactly the thing a reporting endpoint must not become.
-async fn report_event(
-    State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
-    axum::extract::Path((room_id, event_id)): axum::extract::Path<(String, String)>,
-    Json(request): Json<ReportRequest>,
-) -> Result<Json<Value>, MatrixError> {
-    // The spec's range, and it is signed: a "score" here runs from -100
-    // (worst) to 0, so a positive number is a caller who has misread the
-    // API rather than one paying a compliment.
-    if let Some(score) = request.score
-        && !(-100..=0).contains(&score)
-    {
-        return Err(MatrixError::bad_json(format!(
-            "score must be between -100 and 0, not {score}"
-        )));
-    }
-    let not_found = || MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such event");
-    if may_read_room(&state, &identity.user_id, &room_id).is_err() {
-        return Err(not_found());
-    }
-    let event = state
-        .rooms
-        .event(&room_id, &event_id)
-        .map_err(|_| not_found())?;
-
-    let report_id = crate::admin::file_event_report(
-        &state,
-        &identity.user_id,
-        &room_id,
-        &event_id,
-        event["sender"].as_str(),
-        request.reason.as_deref(),
-        request.score,
-    )?;
-    crate::admin::audit(
-        &state,
-        &identity.user_id,
-        "report",
-        &event_id,
-        &json!({
-            "room_id": room_id,
-            "reason": request.reason,
-            "score": request.score,
-            "report_id": report_id,
-        }),
-    )?;
-    Ok(Json(json!({})))
-}
-
-#[derive(Debug, Deserialize)]
-struct ReportRequest {
-    #[serde(default)]
-    reason: Option<String>,
-    #[serde(default)]
-    score: Option<i64>,
-}
-
 /// The surface only an appservice speaks.
 fn appservice_routes() -> Router<AppState> {
     Router::new().route(
@@ -413,16 +345,9 @@ fn device_routes() -> Router<AppState> {
 
 /// Reports, generic profile fields, `whois`, and the v1.18 holds: the
 /// first wave filled in from `docs/spec-gaps.md`.
-fn report_and_hold_routes() -> Router<AppState> {
+/// Profile fields, whois, and the v1.18 holds.
+fn profile_and_admin_routes() -> Router<AppState> {
     Router::new()
-        .route(
-            "/_matrix/client/v3/rooms/{room_id}/report",
-            post(report_room),
-        )
-        .route(
-            "/_matrix/client/v3/users/{user_id}/report",
-            post(report_user),
-        )
         .route(
             "/_matrix/client/v3/profile/{user_id}/{key}",
             get(get_profile_field)
@@ -717,10 +642,6 @@ fn timeline_routes() -> Router<AppState> {
         .route(
             "/_matrix/client/v3/rooms/{room_id}/upgrade",
             post(upgrade_room),
-        )
-        .route(
-            "/_matrix/client/v3/rooms/{room_id}/report/{event_id}",
-            post(report_event),
         )
         .route(
             "/_matrix/client/v3/rooms/{room_id}/redact/{event_id}/{txn_id}",
@@ -1488,7 +1409,7 @@ async fn well_known_client(
     // before it has a token to ask with. Omitted entirely when nothing is
     // configured -- an empty array here would be a positive claim to have
     // no backend, where absence is "this server does not answer that".
-    let foci = rtc_transports(&state.config);
+    let foci = rtc_transports(&state);
     if !foci.is_empty() {
         body["org.matrix.msc4143.rtc_foci"] = Value::Array(foci);
     }
@@ -1556,10 +1477,22 @@ async fn health() -> StatusCode {
 /// takes minutes to load, and holding a single-replica deployment out of
 /// rotation for that long is an outage bought to avoid a slow first
 /// request. A room not yet warm is loaded by the request that needs it,
-/// off the async workers. A readiness probe that lies is worse than none
-/// -- this one claims only what is true.
-async fn ready() -> StatusCode {
-    StatusCode::OK
+/// off the async workers.
+///
+/// What it does wait on is the store: once the engine refuses a write (a
+/// full disk, a failing one) it refuses every write after it, and a server
+/// that answers `/sync` but fails every `/send` with a 500 is not one to
+/// route clients to. A readiness probe that lies is worse than none.
+///
+/// Liveness stays up on purpose. The process is fine and its disk is not;
+/// restarting it onto the same full disk only adds a crash loop to the page.
+/// The remedy is in `docs/lifecycle.md`, under "A full disk".
+async fn ready(State(state): State<AppState>) -> StatusCode {
+    if spindle_store::Store::accepts_writes(state.store.as_ref()) {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 /// The identifier half of a login request.
@@ -2190,100 +2123,6 @@ async fn well_known_support(State(state): State<AppState>) -> Result<Json<Value>
     Ok(Json(Value::Object(body)))
 }
 
-#[derive(Debug, Deserialize)]
-struct ReasonOnly {
-    reason: Option<String>,
-}
-
-/// `POST /_matrix/client/v3/rooms/{roomId}/report` (spec v1.13)
-///
-/// A report about a room rather than an event in it. The room must be one
-/// this server holds; a report about nothing is a 404, the same answer an
-/// event report gives.
-async fn report_room(
-    State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
-    axum::extract::Path(room_id): axum::extract::Path<String>,
-    Json(request): Json<ReasonOnly>,
-) -> Result<Json<Value>, MatrixError> {
-    // Deliberately open to strangers. A report is how somebody *outside*
-    // a room tells the admins about it (spec v1.13 says a reporter need
-    // not be joined), so the caller's own view of the room is not the
-    // gate here. What is checked is that the room exists at all: a
-    // member already knows that, and a stranger learns nothing more from
-    // the 404 than they would from a join attempt.
-    if may_read_room(&state, &identity.user_id, &room_id).is_err() {
-        // A stranger: still allowed to report, but only a room that exists.
-        if state.rooms.summary(&room_id).is_err() {
-            return Err(MatrixError::new(
-                StatusCode::NOT_FOUND,
-                "M_NOT_FOUND",
-                "no such room",
-            ));
-        }
-    }
-    let report_id = crate::admin::file_report(
-        &state,
-        &identity.user_id,
-        Some(&room_id),
-        None,
-        None,
-        request.reason.as_deref(),
-        None,
-    )?;
-    crate::admin::audit(
-        &state,
-        &identity.user_id,
-        "report",
-        &room_id,
-        &json!({ "room_id": room_id, "reason": request.reason, "report_id": report_id }),
-    )?;
-    Ok(Json(json!({})))
-}
-
-/// `POST /_matrix/client/v3/users/{userId}/report` (spec v1.14)
-///
-/// A report about a user. Only a local user can be reported here: a
-/// report about somebody else's user belongs to their server, and this
-/// one has nothing to act on. An unknown local user is a 404.
-async fn report_user(
-    State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
-    axum::extract::Path(user_id): axum::extract::Path<String>,
-    Json(request): Json<ReasonOnly>,
-) -> Result<Json<Value>, MatrixError> {
-    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
-    let local = user_id.ends_with(&format!(":{}", state.config.server.name))
-        && accounts
-            .account(&localpart_of(&user_id))
-            .map_err(|error| internal(&error))?
-            .is_some();
-    if !local {
-        return Err(MatrixError::new(
-            StatusCode::NOT_FOUND,
-            "M_NOT_FOUND",
-            "no such user here",
-        ));
-    }
-    let report_id = crate::admin::file_report(
-        &state,
-        &identity.user_id,
-        None,
-        None,
-        Some(&user_id),
-        request.reason.as_deref(),
-        None,
-    )?;
-    crate::admin::audit(
-        &state,
-        &identity.user_id,
-        "report",
-        &user_id,
-        &json!({ "user_id": user_id, "reason": request.reason, "report_id": report_id }),
-    )?;
-    Ok(Json(json!({})))
-}
-
 /// `GET /_matrix/client/v3/admin/whois/{userId}`
 ///
 /// The user's devices. The spec's shape carries the sessions and
@@ -2614,7 +2453,8 @@ async fn put_device(
     accounts
         .put_device(&localpart, &device_id, display_name)
         .map_err(|error| internal(&error))?;
-    let seq = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let seq = stream_write.id();
     state
         .devices
         .mark_device_list_changed(&identity.user_id, seq)
@@ -2672,7 +2512,8 @@ async fn delete_device(
         .devices
         .remove_device_material(&identity.user_id, &device_id)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    let seq = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let seq = stream_write.id();
     state
         .devices
         .mark_device_list_changed(&identity.user_id, seq)
@@ -2689,7 +2530,7 @@ async fn delete_device(
 }
 
 /// `@alice:example.org` and `alice` both mean the same localpart.
-fn localpart_of(user: &str) -> String {
+pub(crate) fn localpart_of(user: &str) -> String {
     // Folded to lowercase for the same reason registration folds: the
     // grammar is lowercase, and "Alice" logging in means the alice who
     // registered.
@@ -2699,7 +2540,7 @@ fn localpart_of(user: &str) -> String {
         .to_lowercase()
 }
 
-fn internal(error: &AccountError) -> MatrixError {
+pub(crate) fn internal(error: &AccountError) -> MatrixError {
     MatrixError::internal(&error.to_string())
 }
 
@@ -4388,6 +4229,49 @@ async fn join(
     room_id: &str,
     servers: &[String],
 ) -> Result<Json<Value>, MatrixError> {
+    // #342: a server with no joined member in a room is not a resident of
+    // it, even when it still holds a copy because everyone local left. The
+    // copy's state is one no resident will defend (peers fan out only to
+    // servers with a joined or invited member), so answering the join from
+    // it authorizes against stale rules. A known-but-unresident room goes
+    // remote like an unknown one; an unknown room reads back no members
+    // and takes the same path. A pending invite is the exception: it is a
+    // live grant from a resident, so the local path that honors it stays.
+    // A locally blocked room is answered locally too: the block is this
+    // server's own administrative state, which no resident across
+    // federation knows or enforces, so asking one could let a blocked
+    // user back in wherever the resident admits.
+    let resident = state
+        .rooms
+        .joined_member_ids(room_id)
+        .map(|ids| {
+            ids.iter().any(|id| {
+                id.split_once(':').map(|(_, domain)| domain)
+                    == Some(state.config.server.name.as_str())
+            })
+        })
+        .unwrap_or(false);
+    // Either record counts: the pending index feeds `/sync`, while the
+    // room's own member event is what authorization reads, and the two
+    // can disagree mid-flight.
+    let invited = state
+        .rooms
+        .pending_invite(user_id, room_id)
+        .map(|invite| invite.is_some())
+        .unwrap_or(false)
+        || state
+            .rooms
+            .state_event_full(room_id, "m.room.member", user_id)
+            .map(|event| event["content"]["membership"] == "invite")
+            .unwrap_or(false);
+    let blocked = state
+        .rooms
+        .room_block(room_id)
+        .map(|record| record.is_some())
+        .unwrap_or(false);
+    if !resident && !invited && !blocked {
+        return join_remote(state, user_id, room_id, servers).await;
+    }
     match state.rooms.set_membership_with(
         room_id,
         user_id,
@@ -4508,6 +4392,15 @@ async fn join_remote(
         let mut join = join;
         merge_returned_signatures(&mut join, &response["event"]);
 
+        // #342: the room may already be held here with a stale copy, which
+        // is exactly how an unresident join reaches this path. The seeder
+        // below only takes fresh rooms, while the resident has already
+        // made the decision, so a held room records through the local
+        // path instead.
+        if let Some(answer) = record_held_join(state, user_id, room_id) {
+            return answer;
+        }
+
         let arrays =
             |key: &str| -> Vec<Value> { response[key].as_array().cloned().unwrap_or_default() };
         // A stock room answers with `state` and `auth_chain`; a state-DAG
@@ -4526,6 +4419,7 @@ async fn join_remote(
             .rooms
             .join_remote(room_id, &seed_state, &seed_rest, &join, &join_id)
             .map_err(room_error)?;
+        record_join_history(state, room_id, &join, &join_id, server);
         state.rooms.wake_sync_waiters();
         return Ok(Json(json!({ "room_id": room_id })));
     }
@@ -4537,6 +4431,51 @@ async fn join_remote(
             format!("no server admitted the join: {last_refusal}"),
         )
     }))
+}
+
+/// `send_join` brings state, not history. Record the history before the
+/// join as a federation gap, which the backfill loop fills in the
+/// background (#461). The join stands whether or not this works.
+fn record_join_history(state: &AppState, room_id: &str, join: &Value, join_id: &str, server: &str) {
+    match state.rooms.record_join_gap(room_id, join, join_id, server) {
+        Ok(true) => state.backfill.poke(room_id),
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(%error, %room_id, %server, "cannot record the history a join left out");
+        }
+    }
+}
+
+/// #342: record a resident-accepted remote join through the local path
+/// when this server already holds the room. The outcomes equal today's
+/// local answer wherever the resident admits, while a refusal already
+/// returned to the caller above. `None` means the room is not held here
+/// and the caller should seed it fresh from the resident's answer.
+fn record_held_join(
+    state: &AppState,
+    user_id: &str,
+    room_id: &str,
+) -> Option<Result<Json<Value>, MatrixError>> {
+    if state.rooms.joined_member_ids(room_id).is_err() {
+        return None;
+    }
+    Some(
+        match state.rooms.set_membership_with(
+            room_id,
+            user_id,
+            user_id,
+            "join",
+            None,
+            &member_profile(state, user_id),
+            state.key.pair(),
+        ) {
+            Ok(_) => {
+                state.rooms.wake_sync_waiters();
+                Ok(Json(json!({ "room_id": room_id })))
+            }
+            Err(error) => Err(room_error(error)),
+        },
+    )
 }
 
 /// `POST /_matrix/client/v3/rooms/{room_id}/leave`
@@ -5038,7 +4977,8 @@ fn write_account_data(
     {
         return Err(limit_exceeded("account data entries", cap));
     }
-    let position = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let position = stream_write.id();
     state
         .account_data
         .put(user_id, room_id, event_type, content, position)
@@ -5201,7 +5141,8 @@ fn ruleset_of(state: &AppState, user_id: &str) -> Result<Value, MatrixError> {
 }
 
 fn save_ruleset(state: &AppState, user_id: &str, ruleset: &Value) -> Result<(), MatrixError> {
-    let position = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let position = stream_write.id();
     state
         .account_data
         .put(user_id, "", crate::push_rules::TYPE, ruleset, position)
@@ -5781,7 +5722,8 @@ async fn set_tag(
     // keeps there. Stored as given: the server has no opinion about tag
     // content for the same reason it has none about account data generally.
     tags["tags"][&tag] = content;
-    let position = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let position = stream_write.id();
     state
         .account_data
         .put(&user_id, &room_id, "m.tag", &tags, position)
@@ -5815,7 +5757,8 @@ async fn delete_tag(
             format!("{room_id} is not tagged {tag}"),
         ));
     }
-    let position = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let position = stream_write.id();
     state
         .account_data
         .put(&user_id, &room_id, "m.tag", &tags, position)
@@ -5862,7 +5805,8 @@ async fn upload_keys(
         // Identity keys changing is what "device list changed" means — other
         // users must re-query before encrypting to this user again. One-time
         // and fallback keys are consumables and do not move the watermark.
-        let seq = state.rooms.allocate_stream_id();
+        let stream_write = state.rooms.reserve_stream_id();
+        let seq = stream_write.id();
         state
             .devices
             .mark_device_list_changed(&identity.user_id, seq)
@@ -6153,7 +6097,8 @@ async fn upload_cross_signing(
     }
     // New cross-signing keys are a device-list change: peers must re-query
     // before they can trust (or distrust) the new signing tree.
-    let seq = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let seq = stream_write.id();
     state
         .devices
         .mark_device_list_changed(&identity.user_id, seq)
@@ -6204,7 +6149,8 @@ async fn upload_signatures(
     // names them in `device_lists.changed`, and until it does the identity
     // it just verified stays unverified in its own store.
     for user_id in &signed_users {
-        let seq = state.rooms.allocate_stream_id();
+        let stream_write = state.rooms.reserve_stream_id();
+        let seq = stream_write.id();
         state
             .devices
             .mark_device_list_changed(user_id, seq)
@@ -6654,6 +6600,10 @@ async fn send_to_device(
         &txn_id,
         &request.messages,
     );
+    // Hold publication through the batch, so its N recipients need one
+    // sync wake rather than N complete response assemblies. Each message
+    // still has its own id, including wildcard/explicit-device overlaps.
+    let mut batch_write = None;
     for (target_user, per_device) in &request.messages {
         if target_user.split_once(':').map(|(_, domain)| domain)
             != Some(state.config.server.name.as_str())
@@ -6676,7 +6626,9 @@ async fn send_to_device(
                 vec![target_device.clone()]
             };
             for device_id in devices {
-                let seq = state.rooms.allocate_stream_id();
+                batch_write.get_or_insert_with(|| state.rooms.reserve_stream_id());
+                let stream_write = state.rooms.reserve_stream_id();
+                let seq = stream_write.id();
                 let message = json!({
                     "type": event_type,
                     "sender": identity.user_id,
@@ -6851,6 +6803,10 @@ fn sliding_answer(
     request: &crate::sliding::SlidingRequest,
     inputs: SlidingInputs<'_>,
 ) -> Result<Json<Value>, MatrixError> {
+    state
+        .rooms
+        .checkpoint_stream_position(inputs.position)
+        .map_err(room_error)?;
     let SlidingInputs {
         since,
         position,
@@ -7123,15 +7079,18 @@ fn to_device_extension(
     let acknowledged = crate::tokens::Sync::resume(extension.since.as_deref())
         .map_err(|error| MatrixError::bad_json(error.to_string()))?
         .position();
-    let mut events = state
+    let (events, delivered_until) = state
         .devices
-        .take_pending(&identity.user_id, &identity.device_id, acknowledged)
+        .take_pending_until(
+            &identity.user_id,
+            &identity.device_id,
+            acknowledged,
+            position,
+            extension.limit,
+        )
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    if let Some(limit) = extension.limit {
-        events.truncate(limit.max(1));
-    }
     Ok(json!({
-        "next_batch": crate::tokens::Sync(position).to_string(),
+        "next_batch": crate::tokens::Sync(delivered_until).to_string(),
         "events": events,
     }))
 }
@@ -7607,8 +7566,15 @@ fn sync_device_sections(
 > {
     let to_device = state
         .devices
-        .take_pending(&identity.user_id, &identity.device_id, resume.position())
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        .take_pending_until(
+            &identity.user_id,
+            &identity.device_id,
+            resume.position(),
+            next_batch,
+            None,
+        )
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+        .0;
     let device_changes = match resume {
         crate::tokens::Resume::From(since) => {
             visible_device_changes(state, identity, since, next_batch)?
@@ -9208,11 +9174,22 @@ async fn voip_turn_server(
 /// built-in `LiveKit` service (#38), listed first when `[rtc.livekit]` is
 /// set: it is this server's own, and a deployment that configured it did
 /// so to use it.
-fn rtc_transports(config: &crate::Config) -> Vec<Value> {
-    crate::livekit::service_url(config)
-        .map(|url| json!({ "type": "livekit", "livekit_service_url": url }))
+fn rtc_transports(state: &AppState) -> Vec<Value> {
+    // The built-in service advertises only while the program is on. Off —
+    // by switch or by absence — reads exactly like unconfigured: the
+    // operator's `foci` alone, or the empty list, and well-known omitting
+    // the key when that list is empty.
+    let builtin = if crate::livekit::effective_enabled(&state.config, &state.store) {
+        crate::livekit::service_url(&state.config)
+            .map(|url| json!({ "type": "livekit", "livekit_service_url": url }))
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    builtin
         .into_iter()
-        .chain(config.rtc.foci.iter().map(|focus| {
+        .chain(state.config.rtc.foci.iter().map(|focus| {
             json!({
                 "type": focus.kind,
                 "livekit_service_url": focus.livekit_service_url,
@@ -9241,7 +9218,7 @@ async fn rtc_transports_endpoint(
     State(state): State<AppState>,
     Authenticated(_identity): Authenticated,
 ) -> Json<Value> {
-    Json(json!({ "rtc_transports": rtc_transports(&state.config) }))
+    Json(json!({ "rtc_transports": rtc_transports(&state) }))
 }
 
 /// The TURN REST password: base64 of HMAC-SHA1 over the username.
@@ -10795,7 +10772,9 @@ impl RoomRuleContext {
 /// notify about, newest first, with whether each is read. The same walk
 /// as `/search` -- there is no notification table; the rules are put to
 /// every event the walk passes, which is what the rules are for -- and the
-/// same per-room `next_token`. A reader's own events never notify,
+/// same per-room cursor in `next_token`. "Newest" is the server-wide
+/// stream order, not `origin_server_ts`: see [`page_by_stream`] for why.
+/// A reader's own events never notify,
 /// whatever the rules say: the spec's one rule the ruleset does not
 /// spell out. `only=highlight` keeps the hits whose actions carry the
 /// highlight tweak.
@@ -10817,10 +10796,13 @@ async fn notifications(
             )));
         }
     };
-    let mut cursor = match query.from.as_deref() {
-        Some(token) => parse_search_cursor(token)?,
-        None => BTreeMap::new(),
+    let (snapshot, mut cursor) = match query.from.as_deref() {
+        Some(token) => parse_notifications_cursor(token)?,
+        None => (None, BTreeMap::new()),
     };
+    // A token from before the snapshot existed resumes against the stream
+    // as it stands now; the token handed back carries that position.
+    let snapshot = snapshot.unwrap_or_else(|| state.rooms.stream_position());
     let ruleset = ruleset_of(&state, &identity.user_id)?;
     let profile = state
         .profiles
@@ -10829,7 +10811,7 @@ async fn notifications(
     let display_name = profile.displayname.as_deref();
 
     let mut rooms: BTreeMap<String, RoomRuleContext> = BTreeMap::new();
-    let mut hits: Vec<SearchHit> = Vec::new();
+    let mut hits: Vec<(u64, SearchHit)> = Vec::new();
     let mut more = false;
     for room_id in state.rooms.joined(&identity.user_id).map_err(room_error)? {
         let Ok(scope) = state.rooms.read_scope(&identity.user_id, &room_id) else {
@@ -10843,19 +10825,31 @@ async fn notifications(
                     !highlights_only || crate::push_rules::is_highlight(&actions)
                 })
         };
+        let order = RoomStreamOrder::new(state.rooms.stream_rows(&room_id).map_err(room_error)?);
+        let from = match (cursor.get(&room_id).copied(), order.bound(snapshot)) {
+            (Some(resume), Some(bound)) => Some(resume.min(bound)),
+            (resume, bound) => resume.or(bound),
+        };
         let (found, next) = state
             .rooms
             .reader_with(&identity.user_id, &room_id, scope.clone())
-            .search(cursor.get(&room_id).copied(), limit, &notifies)
+            .search(from, limit, &notifies)
             .map_err(room_error)?;
         more |= next.is_some();
-        hits.extend(found.into_iter().map(|event| SearchHit {
-            room_id: room_id.clone(),
-            event,
+        hits.extend(found.into_iter().map(|event| {
+            let key = order.key(event.li);
+            (
+                key,
+                SearchHit {
+                    room_id: room_id.clone(),
+                    event,
+                },
+            )
         }));
         rooms.insert(room_id, room);
     }
-    more |= page_newest_first(&mut hits, limit, &mut cursor);
+    more |= page_by_stream(&mut hits, limit, &mut cursor);
+    let hits: Vec<SearchHit> = hits.into_iter().map(|(_, hit)| hit).collect();
 
     let notifications = render_notifications(
         &state,
@@ -10868,9 +10862,111 @@ async fn notifications(
     let mut body = serde_json::Map::new();
     body.insert("notifications".to_owned(), Value::Array(notifications));
     if more {
-        body.insert("next_token".to_owned(), json!(search_cursor(&cursor)));
+        body.insert(
+            "next_token".to_owned(),
+            json!(notifications_cursor(snapshot, &cursor)),
+        );
     }
     Ok(Json(Value::Object(body)))
+}
+
+/// `/notifications`' `next_token`: `s<stream position>;` and then the
+/// `/search` cursor. The position is where the first page stood; every
+/// later page is cut to it, so an event or a room arriving mid-walk waits
+/// for the next walk instead of landing out of order on a later page.
+///
+/// A token from before the position was added is the bare `/search`
+/// cursor. It still parses, with no position, and resumes each room where
+/// it says (no repeats, no skips within a room it names).
+fn parse_notifications_cursor(
+    token: &str,
+) -> Result<(Option<u64>, BTreeMap<String, i64>), MatrixError> {
+    // A cursor pair starts with a position (a digit or `-`), so a leading
+    // `s` is unambiguous.
+    let Some(rest) = token.strip_prefix('s') else {
+        return Ok((None, parse_search_cursor(token)?));
+    };
+    let (position, rooms) = rest.split_once(';').unwrap_or((rest, ""));
+    let position = position
+        .parse::<u64>()
+        .map_err(|_| MatrixError::bad_json("from is not a notifications token"))?;
+    Ok((Some(position), parse_search_cursor(rooms)?))
+}
+
+fn notifications_cursor(snapshot: u64, cursor: &BTreeMap<String, i64>) -> String {
+    format!("s{snapshot};{}", search_cursor(cursor))
+}
+
+/// One room's events placed in the server-wide stream order.
+///
+/// Each event's key is the highest stream id at or below its position in
+/// the room. An indexed event gets its own id (ids rise with position, as
+/// both are assigned under the room's append lock); an event with no index
+/// row inherits the one below it. Taking the running maximum makes the key
+/// never fall as the position rises, which is what [`page_by_stream`]
+/// needs, whatever the index holds.
+struct RoomStreamOrder {
+    /// `(li, key)`, ascending in both.
+    rows: Vec<(i64, u64)>,
+}
+
+impl RoomStreamOrder {
+    fn new(mut rows: Vec<(i64, u64)>) -> Self {
+        rows.sort_unstable();
+        let mut high = 0;
+        for row in &mut rows {
+            high = high.max(row.1);
+            row.1 = high;
+        }
+        Self { rows }
+    }
+
+    fn key(&self, li: i64) -> u64 {
+        match self.rows.partition_point(|(at, _)| *at <= li) {
+            0 => 0,
+            n => self.rows[n - 1].1,
+        }
+    }
+
+    /// The exclusive `from` that keeps a walk to the events at or before
+    /// stream position `snapshot`, or `None` when that is all of them.
+    fn bound(&self, snapshot: u64) -> Option<i64> {
+        let first_after = self.rows.partition_point(|(_, key)| *key <= snapshot);
+        self.rows.get(first_after).map(|(li, _)| *li)
+    }
+}
+
+/// Cut a `/notifications` walk to one page and advance the per-room cursor,
+/// as [`page_newest_first`] does for `/search`, but newest first by stream
+/// key (see [`RoomStreamOrder`]), then room, then position: a total order.
+///
+/// Not `origin_server_ts`. Each room is walked by position and resumed
+/// below the oldest position taken from it, so the merge across rooms is
+/// exact only if the sort key never rises as the position falls. A
+/// timestamp breaks that: a federated event can carry any `ts`, and the
+/// local clock can step back. Then a page takes
+/// an older position first, the cursor drops below a newer one, and that
+/// event is never served (#635). The stream key cannot do this.
+fn page_by_stream(
+    hits: &mut Vec<(u64, SearchHit)>,
+    limit: usize,
+    cursor: &mut BTreeMap<String, i64>,
+) -> bool {
+    hits.sort_by(|(a_key, a), (b_key, b)| {
+        b_key
+            .cmp(a_key)
+            .then_with(|| a.room_id.cmp(&b.room_id))
+            .then_with(|| b.event.li.cmp(&a.event.li))
+    });
+    let more = hits.len() > limit;
+    hits.truncate(limit);
+    for (_, hit) in hits.iter() {
+        cursor
+            .entry(hit.room_id.clone())
+            .and_modify(|from| *from = (*from).min(hit.event.li))
+            .or_insert(hit.event.li);
+    }
+    more
 }
 
 /// One `/notifications` entry per hit: the rule's actions, the event with
@@ -11240,7 +11336,8 @@ async fn delete_devices(
             .map_err(|error| MatrixError::internal(&error.to_string()))?;
     }
     if !request.devices.is_empty() {
-        let seq = state.rooms.allocate_stream_id();
+        let stream_write = state.rooms.reserve_stream_id();
+        let seq = stream_write.id();
         state
             .devices
             .mark_device_list_changed(&identity.user_id, seq)
@@ -11334,7 +11431,11 @@ fn hierarchy_visible(
 /// caller may not see. The alternative is a 404-versus-403 oracle that tells
 /// a stranger which room IDs exist, which is the smaller half of the same
 /// question they were asking.
-fn may_read_room(state: &AppState, user_id: &str, room_id: &str) -> Result<(), MatrixError> {
+pub(crate) fn may_read_room(
+    state: &AppState,
+    user_id: &str,
+    room_id: &str,
+) -> Result<(), MatrixError> {
     state.rooms.may_read(user_id, room_id).map_err(room_error)
 }
 
@@ -11398,8 +11499,12 @@ async fn upgrade_room(
             ),
         ));
     }
-    may_read_room(&state, &identity.user_id, &room_id)?;
-    let old_state = state.rooms.state(&room_id).map_err(room_error)?;
+    let old_state = state
+        .rooms
+        .reader(&identity.user_id, &room_id)
+        .map_err(room_error)?
+        .state()
+        .map_err(room_error)?;
 
     // Whether this user may end the room, asked of the old room before
     // anything is built. The tombstone is a real state event and faces the
@@ -11497,7 +11602,7 @@ async fn upgrade_room(
 /// with no explicit order still has to paginate stably -- the same argument
 /// the room directory makes.
 fn space_children(state: &AppState, room_id: &str, suggested_only: bool) -> Vec<Value> {
-    let Ok(events) = state.rooms.state(room_id) else {
+    let Ok(events) = state.rooms.state_unscoped(room_id) else {
         return Vec::new();
     };
     let mut children: Vec<Value> = events
@@ -11841,4 +11946,199 @@ async fn federation_hierarchy(
         "children": children,
         "inaccessible_children": inaccessible,
     })))
+}
+
+#[cfg(test)]
+mod notifications_order_tests {
+    use std::collections::BTreeMap;
+
+    use serde_json::json;
+
+    use super::{
+        RoomStreamOrder, SearchHit, notifications_cursor, page_by_stream,
+        parse_notifications_cursor,
+    };
+
+    /// One stored event: its room, position, stream id and timestamp.
+    #[derive(Clone)]
+    struct Stored {
+        room: &'static str,
+        li: i64,
+        stream: u64,
+        ts: i64,
+    }
+
+    /// Events in arrival order across three rooms, every one stamped the
+    /// same millisecond (the tie the CI flake hit), and one late federated
+    /// event in `!c` whose `ts` is older than everything else (the case a
+    /// timestamp order skips).
+    fn history() -> Vec<Stored> {
+        let rooms = [
+            "!c:x", "!a:x", "!b:x", "!a:x", "!c:x", "!b:x", "!b:x", "!a:x", "!c:x",
+        ];
+        let mut next_li: BTreeMap<&str, i64> = BTreeMap::new();
+        rooms
+            .iter()
+            .enumerate()
+            .map(|(n, room)| {
+                let li = next_li.entry(room).or_insert(10);
+                *li += 1;
+                Stored {
+                    room,
+                    li: *li,
+                    stream: n as u64 + 1,
+                    ts: if n == 8 { 5 } else { 1_000 },
+                }
+            })
+            .collect()
+    }
+
+    /// The room walk the store does: the newest `limit` positions below
+    /// `from`, and whether more remain.
+    fn walk(
+        history: &[Stored],
+        room: &str,
+        from: Option<i64>,
+        limit: usize,
+    ) -> (Vec<Stored>, bool) {
+        let mut below: Vec<Stored> = history
+            .iter()
+            .filter(|event| event.room == room && from.is_none_or(|from| event.li < from))
+            .cloned()
+            .collect();
+        below.sort_by_key(|event| std::cmp::Reverse(event.li));
+        let more = below.len() > limit;
+        below.truncate(limit);
+        (below, more)
+    }
+
+    fn hit(event: &Stored) -> SearchHit {
+        SearchHit {
+            room_id: event.room.to_owned(),
+            event: crate::rooms::TimelineEvent {
+                event_id: format!("${}", event.stream),
+                li: event.li,
+                json: json!({ "origin_server_ts": event.ts }),
+            },
+        }
+    }
+
+    /// Page through `history` at `limit` the way the handler does, a token
+    /// round trip between pages, and return the stream ids served. `after`
+    /// arrives once the first page is out.
+    fn page_through(history: &[Stored], after: &[Stored], limit: usize) -> Vec<u64> {
+        let mut store = history.to_vec();
+        let mut token: Option<String> = None;
+        let mut served = Vec::new();
+        for _ in 0..=store.len() + after.len() {
+            let (snapshot, mut cursor) = match &token {
+                Some(token) => parse_notifications_cursor(token).unwrap(),
+                None => (None, BTreeMap::new()),
+            };
+            let snapshot =
+                snapshot.unwrap_or_else(|| store.iter().map(|e| e.stream).max().unwrap_or(0));
+            let mut hits = Vec::new();
+            let mut more = false;
+            for room in ["!a:x", "!b:x", "!c:x", "!d:x"] {
+                let order = RoomStreamOrder::new(
+                    store
+                        .iter()
+                        .filter(|e| e.room == room)
+                        .map(|e| (e.li, e.stream))
+                        .collect(),
+                );
+                let from = match (cursor.get(room).copied(), order.bound(snapshot)) {
+                    (Some(resume), Some(bound)) => Some(resume.min(bound)),
+                    (resume, bound) => resume.or(bound),
+                };
+                let (found, next) = walk(&store, room, from, limit);
+                more |= next;
+                hits.extend(found.iter().map(|e| (order.key(e.li), hit(e))));
+            }
+            more |= page_by_stream(&mut hits, limit, &mut cursor);
+            served.extend(hits.iter().map(|(key, _)| *key));
+            if token.is_none() {
+                store.extend_from_slice(after);
+            }
+            if !more {
+                return served;
+            }
+            token = Some(notifications_cursor(snapshot, &cursor));
+        }
+        panic!("paging at {limit} did not end");
+    }
+
+    #[test]
+    fn every_page_size_serves_the_stream_newest_first_exactly_once() {
+        let history = history();
+        let expected: Vec<u64> = (1..=history.len() as u64).rev().collect();
+        for limit in 1..=history.len() + 1 {
+            assert_eq!(
+                page_through(&history, &[], limit),
+                expected,
+                "limit {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn what_arrives_mid_walk_waits_for_the_next_walk() {
+        let history = history();
+        let next = history.len() as u64 + 1;
+        // A newer event in a room already walked, and one in a room the
+        // first page never saw.
+        let after = [
+            Stored {
+                room: "!a:x",
+                li: 100,
+                stream: next,
+                ts: 2_000,
+            },
+            Stored {
+                room: "!d:x",
+                li: 1,
+                stream: next + 1,
+                ts: 2_000,
+            },
+        ];
+        let expected: Vec<u64> = (1..=history.len() as u64).rev().collect();
+        for limit in 1..=history.len() {
+            assert_eq!(
+                page_through(&history, &after, limit),
+                expected,
+                "limit {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_event_with_no_index_row_takes_the_key_below_it() {
+        let order = RoomStreamOrder::new(vec![(5, 40), (2, 10), (8, 30)]);
+        assert_eq!(order.key(1), 0);
+        assert_eq!(order.key(2), 10);
+        assert_eq!(order.key(4), 10);
+        assert_eq!(order.key(5), 40);
+        // A row out of step with its position cannot make the key fall.
+        assert_eq!(order.key(8), 40);
+        assert_eq!(order.bound(10), Some(5));
+        assert_eq!(order.bound(40), None);
+        assert_eq!(order.bound(0), Some(2));
+    }
+
+    #[test]
+    fn a_token_from_before_the_snapshot_still_parses() {
+        let (snapshot, rooms) = parse_notifications_cursor("12:!a:x;7:!b:x").unwrap();
+        assert_eq!(snapshot, None);
+        assert_eq!(rooms.get("!a:x"), Some(&12));
+        assert_eq!(rooms.get("!b:x"), Some(&7));
+        let (snapshot, rooms) = parse_notifications_cursor("s99;12:!a:x").unwrap();
+        assert_eq!(snapshot, Some(99));
+        assert_eq!(rooms.get("!a:x"), Some(&12));
+        assert_eq!(
+            parse_notifications_cursor(&notifications_cursor(5, &BTreeMap::new())).unwrap(),
+            (Some(5), BTreeMap::new())
+        );
+        assert!(parse_notifications_cursor("sx;1:!a:x").is_err());
+        assert!(parse_notifications_cursor("garbage").is_err());
+    }
 }

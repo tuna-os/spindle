@@ -98,15 +98,15 @@ pub fn compare(
         |event| !event.preserved_rejection(),
     ) {
         Ok(map) => {
-            let mut snapshot = StateSnapshot::new();
+            let mut snapshot = StateSnapshot::new(live.table().clone());
             for ((kind, key), id) in map {
-                snapshot = snapshot.apply(StateKey::new(kind.to_string(), key), id.as_str());
+                snapshot = snapshot.apply(&StateKey::new(kind.to_string(), key), id.as_str());
             }
             let differs = |other: &StateSnapshot| {
                 snapshot
                     .diff(other)
                     .into_iter()
-                    .filter(|(key, _, _)| Some(*key) != ignore)
+                    .filter(|(key, _, _)| Some(key) != ignore)
                     .count()
             };
             json!({"differs_from_synapse": differs(expected), "differs_from_live": differs(live)})

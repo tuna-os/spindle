@@ -156,6 +156,42 @@ The two options compose. With both configured, the built-in service is
 listed first and the operator's `foci` follow in the order written;
 clients read the list as a priority order.
 
+## The SFU program: switch, models, sidecar
+
+The built-in service above is one half of an SFU *program* with an
+operator switch. `spindle sfu on|off|status <config>` flips and reads it;
+`GET/PUT /_spindle/admin/v1/rtc/sfu` does the same behind admin auth. The
+switch is stored server-side and survives restarts; it never rewrites the
+config file. When off, everything reads as unconfigured: `sfu/get`
+answers 404 `M_UNRECOGNIZED`, the transport is unadvertised on both
+discovery surfaces, and no sidecar runs — off costs zero.
+
+Two models serve the media, and the switch plus the minter behave
+identically for both:
+
+- **Remote** (default): the SFU is separately hosted at `[rtc.livekit]
+  url`. This server only mints.
+- **Local**: `[rtc.livekit] binary` names the operator-supplied
+  `livekit-server` binary (pinned at v1.13.5, Element Server Suite
+  parity), and this server supervises it as a child — generating its
+  config (keys from `[rtc.livekit]`, rooms self-creating, webhooks
+  pointing at this server), watching it, restarting it. Upgrades are
+  decoupled from spindle releases: replace the binary and restart, or
+  flip the switch off and on. The only file supervision writes is the
+  generated sidecar config (`<storage.path>/livekit.yaml` unless
+  `sidecar_config_path` says otherwise).
+
+The minter gaps the "What is not here" section used to list are closed:
+MSC4195's homeserver token endpoint (`POST
+.../rtc/livekit/get_token`, stable and unstable) mints for local users
+over their access token; the federation twin mints for a remote
+participant whose server vouches for them by X-Matrix signature; the
+delegation probe (`POST .../delegate_delayed_leave`, anything but 404
+meaning "held") records the hold; and the SFU webhook (`POST
+/_spindle/rtc/livekit/sfu/webhook`) releases held leaves when
+participants drop off the media — fed by the supervised sidecar's
+generated webhook config, or by the operator's hand on the remote model.
+
 ## Option C: lk-jwt-service as the homeserver's sidecar
 
 From 0.7, `lk-jwt-service` is built to sit behind the homeserver as an
@@ -270,18 +306,15 @@ page, docs/p2p-calls.md, with the rig that proves it against this server.
 
 ## What is not here
 
-- **Remote users on the built-in service.** MSC4195's current draft adds
-  a federation endpoint for a remote participant's token; the built-in
-  service does not serve it. A federated caller needs `lk-jwt-service`,
-  external (option B) or as the sidecar (option C), which does.
-- **MSC4195's homeserver token endpoint on the built-in service**
-  (`/_matrix/client/unstable/io.element.msc4195/rtc/livekit/get_token`).
-  Option C serves it, by forwarding it to `lk-jwt-service`; the built-in
-  service still answers only `/sfu/get`.
-- **Delegated leave on the built-in service.** Holding a participant's
-  leave for them needs to see them drop off the SFU, which only
-  `lk-jwt-service` does (from LiveKit's webhooks). With the built-in
-  service, Element Call keeps its own eighteen-second leave and restarts
-  it every four seconds.
-- **The SFU and the relay themselves.** Their own documentation covers
-  them; this server never speaks to either.
+- **Remote users without the program on.** The federation twin mints
+  for a remote participant while the SFU program is on. While it is
+  off, a federated caller needs `lk-jwt-service`, external (option B)
+  or as the sidecar (option C), which mints on its own.
+- **Delegated leave without SFU events.** The probe records the hold.
+  The release learns the drop from the SFU webhook. The supervised
+  sidecar points its webhooks here on generation. A remote deployment
+  must point its SFU at `/_spindle/rtc/livekit/sfu/webhook` by hand.
+  Without that pointer, crashed participants keep an hour-long leave.
+- **The SFU and the relay themselves.** Their docs cover them. This
+  server mints for one and supervises the local deployment of the
+  other. It never carries media.

@@ -143,6 +143,10 @@ pub fn routes() -> Router<AppState> {
                 &format!("{prefix}/send_server_notice"),
                 post(send_server_notice),
             )
+            .route(
+                &format!("{prefix}/rtc/sfu"),
+                get(sfu_status).put(sfu_switch),
+            )
     };
     group("/_spindle/admin/v1")
         .merge(group("/_synapse/admin/v1"))
@@ -389,7 +393,8 @@ pub(crate) fn audit(
         "detail": detail,
         "ts_ms": now_ms(),
     });
-    let seq = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let seq = stream_write.id();
     Store::put(
         state.store.as_ref(),
         &keys::audit_entry(seq),
@@ -439,7 +444,8 @@ pub(crate) fn file_report(
     reason: Option<&str>,
     score: Option<i64>,
 ) -> Result<u64, MatrixError> {
-    let seq = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let seq = stream_write.id();
     let record = json!({
         "id": seq,
         "received_ts": now_ms(),
@@ -1113,6 +1119,62 @@ async fn put_user_admin(
         &json!({ "admin": request.admin }),
     )?;
     Ok(Json(json!({})))
+}
+
+/// `GET /rtc/sfu` — the SFU program's status: the switch, the model, the
+/// minter's address, the supervised child's health. Same document `spindle
+/// sfu status` prints, from the same function, so the two never disagree.
+async fn sfu_status(
+    State(state): State<AppState>,
+    _actor: AdminActor,
+) -> Result<Json<Value>, MatrixError> {
+    Ok(Json(crate::livekit::status_json(
+        &state.config,
+        &state.store,
+        &state.sfu,
+    )))
+}
+
+#[derive(Deserialize)]
+struct SfuSwitch {
+    enabled: bool,
+}
+
+/// `PUT /rtc/sfu` — `{enabled}`. The runtime switch: stored server-side,
+/// surviving restarts, never rewriting the operator's config file. Turning
+/// off stops the supervised child and silences every minter path to
+/// `M_UNRECOGNIZED`; turning on starts the child again on the next tick.
+async fn sfu_switch(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Json(request): Json<SfuSwitch>,
+) -> Result<Json<Value>, MatrixError> {
+    if request.enabled && state.config.rtc.livekit.is_none() {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_UNKNOWN",
+            "the LiveKit SFU program is not configured — set [rtc.livekit] first",
+        ));
+    }
+    crate::livekit::set_switch(&state.store, request.enabled)
+        .map_err(|error| MatrixError::internal(&error))?;
+    if request.enabled {
+        state.sfu.tick();
+    } else {
+        state.sfu.stop();
+    }
+    audit(
+        &state,
+        &actor.identity().user_id,
+        "sfu_switch",
+        "rtc/sfu",
+        &json!({ "enabled": request.enabled }),
+    )?;
+    Ok(Json(crate::livekit::status_json(
+        &state.config,
+        &state.store,
+        &state.sfu,
+    )))
 }
 
 #[derive(Deserialize)]

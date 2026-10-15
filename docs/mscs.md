@@ -17,7 +17,7 @@ what became of each proposal.
 | [MSC2246](https://github.com/matrix-org/matrix-spec-proposals/pull/2246) | Asynchronous media uploads | v1.7 | — | `spec_wave2.rs` | POST /media/v1/create mints the mxc:// URI; PUT /media/v3/upload/{server}/{id} fills it once; a reader in between gets 504 M_NOT_YET_UPLOADED. Reservations lapse after 24 hours, twenty live per user. |
 | [MSC2409](https://github.com/matrix-org/matrix-spec-proposals/pull/2409) | Appservices receive to-device messages and ephemeral events | v1.13 | — | `appservice_transactions.rs` |  |
 | [MSC2659](https://github.com/matrix-org/matrix-spec-proposals/pull/2659) | Appservice ping | v1.7 | — | `appservice_ping.rs` |  |
-| [MSC2666](https://github.com/matrix-org/matrix-spec-proposals/pull/2666) | Mutual rooms | — | — | `spec_wave2.rs` | GET /_matrix/client/v1/mutual_rooms, one page: the rooms both users are joined to. |
+| [MSC2666](https://github.com/matrix-org/matrix-spec-proposals/pull/2666) | Mutual rooms | v1.19 | — | `spec_wave2.rs` | GET /_matrix/client/v1/mutual_rooms, one page: the rooms both users are joined to. |
 | [MSC2675](https://github.com/matrix-org/matrix-spec-proposals/pull/2675) | Serverside aggregations of relations | v1.3 | — | `aggregation.rs` |  |
 | [MSC2965](https://github.com/matrix-org/matrix-spec-proposals/pull/2965) | OAuth 2.0 server metadata discovery | v1.15 | — | `delegated_auth.rs` | Served at /v1/auth_metadata and the unstable path js-sdk asks first. |
 | [MSC2967](https://github.com/matrix-org/matrix-spec-proposals/pull/2967) | OAuth 2.0 API scopes | v1.15 | — | `delegated_auth.rs` | The v1.15 scope spelling and the draft one older clients still send. |
@@ -64,7 +64,7 @@ what became of each proposal.
 
 | MSC | Title | Stable in | Flags | Evidence | Notes |
 |---|---|---|---|---|---|
-| [MSC3706](https://github.com/matrix-org/matrix-spec-proposals/pull/3706) | Faster joins: partial state on send_join | — | — | `SPEC.md` | SPEC.md says partial-state joins are accepted on the receive side; nothing in the code or the tests handles members_omitted, so this ledger does not repeat the claim. Not started. |
+| [MSC3706](https://github.com/matrix-org/matrix-spec-proposals/pull/3706) | Faster joins: partial state on send_join | v1.6 | — | `SPEC.md` | Merged upstream; spec v1.6 added omit_members, members_omitted and servers_in_room to send_join v2. The fields are optional, so Spindle conforms without them: as joiner it does not send omit_members, and as resident it ignores omit_members and returns the full state. Partial-state joins on the receive side are not started, and nothing in the code or the tests handles members_omitted. |
 | [MSC4038](https://github.com/matrix-org/matrix-spec-proposals/pull/4038) | Key backup for MLS | — | — | `SPEC.md`, `mls.md` |  |
 | [MSC4244](https://github.com/matrix-org/matrix-spec-proposals/pull/4244) | RFC 9420 MLS for Matrix | — | — | `SPEC.md`, `ROADMAP.md`, `mls.md` | Milestone M6, behind a feature flag, deliberately last. The linear index is commit order for free. No-go until a stable MSC, a maintained client and hub mode (#22): docs/mls.md. |
 | [MSC4256](https://github.com/matrix-org/matrix-spec-proposals/pull/4256) | RFC 9420 MLS mode Matrix | — | — | `SPEC.md`, `ROADMAP.md`, `mls.md` |  |

@@ -378,6 +378,21 @@ registrations = []
 # lk-jwt-service issues an hour; set 3600 here to match it if a client
 # needs that, knowing what it buys.
 # token_ttl_seconds = 900
+#
+# The supervised-sidecar model: the operator-supplied path to the
+# livekit-server binary (pinned at v1.13.5, Element Server Suite parity).
+# Unset, the SFU is separately hosted (the remote model) and this server
+# only mints tokens for `url` above. Set, this server starts that binary
+# as a child, (re)generates its config, watches it and restarts it; the
+# switch (`spindle sfu on|off`, or the admin API's rtc/sfu) and the token
+# minter behave identically for both. Upgrades are yours: replace the
+# binary and restart, or flip the switch off and on.
+# binary = "/usr/local/bin/livekit-server"
+#
+# Where the generated sidecar config is written. The only file supervision
+# writes; your files are never rewritten. Defaults to livekit.yaml under
+# [storage] path.
+# sidecar_config_path = "/etc/spindle/livekit.yaml"
 
 [metrics]
 # Prometheus scrape surface, off unless this is set. Its own listener, on

@@ -1,10 +1,12 @@
 //! Imported rejection decisions survive every room recovery path.
-use spindle_core::{EventId, RoomLog, StateKey, keys};
-use spindle_store::{Durability, FjallStore, RoomStore, Store};
+use std::sync::Arc;
+
+use spindle_core::{EventId, RoomLog, StateKey, StateKeyTable, keys};
+use spindle_store::{Durability, FjallStore, ReadView, RoomStore, Store};
 
 const ROOM: &str = "!room:example.org";
-fn room() -> RoomLog {
-    let mut log = RoomLog::new();
+fn room(table: &Arc<dyn StateKeyTable>) -> RoomLog {
+    let mut log = RoomLog::new(table.clone());
     log.append_local("$create", Some(StateKey::new("m.room.create", "")))
         .unwrap();
     log
@@ -16,7 +18,7 @@ fn imported_rejections_survive_reopen_and_refolding_without_entering_the_timelin
     let id = EventId::new("$historical-ban");
     {
         let store = FjallStore::open(dir.path()).unwrap();
-        let mut log = room();
+        let mut log = room(&store.key_table());
         let rooms = RoomStore::new(&store, ROOM);
         rooms.save(&log).unwrap();
         rooms
@@ -51,7 +53,7 @@ fn imported_rejections_survive_reopen_and_refolding_without_entering_the_timelin
 fn an_accepted_id_cannot_be_relabelled_as_a_historical_rejection() {
     let dir = tempfile::tempdir().unwrap();
     let store = FjallStore::open(dir.path()).unwrap();
-    let mut log = room();
+    let mut log = room(&store.key_table());
     RoomStore::new(&store, ROOM).save(&log).unwrap();
     let accepted = EventId::new("$create");
     assert!(
@@ -71,7 +73,9 @@ fn an_accepted_id_cannot_be_relabelled_as_a_historical_rejection() {
 fn a_corrupt_marker_refuses_recovery_instead_of_dropping_the_rejection() {
     let dir = tempfile::tempdir().unwrap();
     let store = FjallStore::open(dir.path()).unwrap();
-    RoomStore::new(&store, ROOM).save(&room()).unwrap();
+    RoomStore::new(&store, ROOM)
+        .save(&room(&store.key_table()))
+        .unwrap();
     store
         .put(&keys::historical_rejection(ROOM, "$old"), &[0])
         .unwrap();

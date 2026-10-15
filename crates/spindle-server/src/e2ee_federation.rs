@@ -228,6 +228,7 @@ fn deliver_to_device(state: &AppState, origin: &str, content: &Value) {
         return;
     };
     let mut delivered = false;
+    let mut batch_write = None;
     for (target_user, per_device) in messages {
         if !is_local(state, target_user) {
             continue;
@@ -246,7 +247,9 @@ fn deliver_to_device(state: &AppState, origin: &str, content: &Value) {
                 vec![target_device.clone()]
             };
             for device_id in devices {
-                let seq = state.rooms.allocate_stream_id();
+                batch_write.get_or_insert_with(|| state.rooms.reserve_stream_id());
+                let stream_write = state.rooms.reserve_stream_id();
+                let seq = stream_write.id();
                 let message = json!({ "type": event_type, "sender": sender, "content": body });
                 if let Err(error) =
                     state
@@ -332,7 +335,8 @@ fn apply_signing_key_update(state: &AppState, origin: &str, content: &Value) {
 /// Record that a remote user's device list moved, so local clients that
 /// share a room with them hear it under `device_lists.changed`.
 fn note_remote_change(state: &AppState, user_id: &str) {
-    let seq = state.rooms.allocate_stream_id();
+    let stream_write = state.rooms.reserve_stream_id();
+    let seq = stream_write.id();
     if let Err(error) = state.devices.mark_device_list_changed(user_id, seq) {
         tracing::warn!(%error, user_id, "cannot record a device-list change");
     }

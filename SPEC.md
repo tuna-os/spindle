@@ -460,6 +460,13 @@ cooling down from a 429 or a 403 for that room. Chunks are paced
 (`gap_backfill_interval_ms`), a failed gap backs off, and a gap that outgrows
 `gap_backfill_max_events` is left truncated rather than fetched without end.
 
+A remote join leaves a gap of the same kind. The `send_join` response has the
+room's state and auth chain, but not its history (§11.5). The join is the
+anchor, and its `prev_events` are the first frontier. The events that the join
+put into the log are state, not history. Thus the walk goes through them and
+does not stop, and it folds their state into the chunk's state. The walk stops
+at the create event, or after 1,000 events.
+
 ---
 
 ## 7. Authorization
@@ -843,7 +850,8 @@ capped separately, per room and per origin over a window
 2. Verifies signatures in batches during the stream.
 3. Sets `li = 1` at the join point, `next_backward = 0`, and starts serving
    immediately.
-4. Backfills asynchronously into negative `li` per §6.5.
+4. Records the history before the join as a gap at the join, and fills it
+   in the background per §6.6.
 
 Faster room joins (MSC3706 partial state / MSC3902) are designed for on the
 receive side, and not yet built: the room would be usable with partial state,

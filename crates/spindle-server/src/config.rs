@@ -547,11 +547,33 @@ pub struct LivekitConfig {
     /// The SFU's own address, `wss://livekit.example.org`, as handed to
     /// clients in the token response. The one place the SFU's URL goes:
     /// `livekit_service_url` in the transport list is *this server*.
+    ///
+    /// Both models serve the same address: the supervised sidecar listens
+    /// where the operator put it (usually loopback, behind the same
+    /// reverse proxy), and a remote SFU lives wherever it is hosted.
     pub url: String,
     /// `LiveKit`'s API key, the `iss` of every token minted.
     pub key: String,
     /// `LiveKit`'s API secret, the HMAC key every token is signed with.
     pub secret: String,
+    /// The supervised-sidecar model: the operator-supplied path to the
+    /// `livekit-server` binary this server starts, watches and restarts.
+    ///
+    /// Absent, the SFU is separately hosted (the remote model) and this
+    /// server never starts a process: it only mints tokens for the address
+    /// in [`Self::url`]. Present, this server supervises that binary as a
+    /// child and mints for it identically. The switch and the minter do
+    /// not care which model is on; only supervision does.
+    #[serde(default)]
+    pub binary: Option<String>,
+    /// Where the generated sidecar configuration is written.
+    ///
+    /// Absent, `<storage.path>/livekit.yaml`. This is ever the only file
+    /// the server writes for the SFU, and it is a generated one: operator
+    /// files — the server config, the binary — are never rewritten. Point
+    /// it elsewhere only to put the generated file under your own eye.
+    #[serde(default)]
+    pub sidecar_config_path: Option<String>,
     /// How long a minted token admits its holder, in seconds.
     ///
     /// A token cannot be revoked once minted -- it is stateless, and the
@@ -563,6 +585,21 @@ pub struct LivekitConfig {
     /// needs it, knowing what the hour buys.
     #[serde(default = "default_livekit_ttl")]
     pub token_ttl_seconds: u64,
+}
+
+impl LivekitConfig {
+    /// Which SFU model this configuration asks for: the supervised local
+    /// sidecar when [`Self::binary`] names one, the remote separately-hosted
+    /// SFU otherwise. The minter and the on/off switch behave identically
+    /// for both; only supervision consults this.
+    #[must_use]
+    pub fn model(&self) -> &'static str {
+        if self.binary.is_some() {
+            "local"
+        } else {
+            "remote"
+        }
+    }
 }
 
 fn default_livekit_ttl() -> u64 {
@@ -1519,6 +1556,27 @@ impl Config {
                     field: "rtc.livekit.token_ttl_seconds",
                     message: "must be > 0: a zero would mint tokens already expired \
                               rather than mean \"unlimited\""
+                        .to_owned(),
+                });
+            }
+            if livekit.binary.as_deref().is_some_and(str::is_empty) {
+                return Err(ConfigError::Invalid {
+                    field: "rtc.livekit.binary",
+                    message: "names the livekit-server binary to supervise, and an \
+                              empty path supervises nothing — leave it unset for \
+                              the remote model"
+                        .to_owned(),
+                });
+            }
+            if livekit
+                .sidecar_config_path
+                .as_deref()
+                .is_some_and(str::is_empty)
+            {
+                return Err(ConfigError::Invalid {
+                    field: "rtc.livekit.sidecar_config_path",
+                    message: "must be a path when set — leave it unset for \
+                              <storage.path>/livekit.yaml"
                         .to_owned(),
                 });
             }

@@ -1,10 +1,10 @@
 //! SPEC §5.3 / §13.3: the log chain is what makes a server's ordering
 //! auditable rather than merely trusted.
 
-use spindle_core::{ChainHash, EventInput, RoomLog, StateSnapshot};
+use spindle_core::{ChainHash, EventInput, MemStateKeyTable, RoomLog, StateSnapshot};
 
 fn room_with(events: &[&str]) -> RoomLog {
-    let mut room = RoomLog::new();
+    let mut room = RoomLog::new(MemStateKeyTable::shared());
     for event in events {
         room.append_local(*event, None).unwrap();
     }
@@ -72,8 +72,12 @@ fn backfilled_history_carries_no_attestation_and_does_not_disturb_the_chain() {
     let mut room = room_with(&["$a", "$b"]);
     let before = room.head_chain();
 
-    room.prepend_remote(EventInput::new("$older", vec![]), StateSnapshot::new(), 40)
-        .unwrap();
+    room.prepend_remote(
+        EventInput::new("$older", vec![]),
+        StateSnapshot::new(room.table().clone()),
+        40,
+    )
+    .unwrap();
 
     // We did not sequence it, so we do not attest to it...
     let backfilled = room.entries().find(|entry| entry.li.get() == 0).unwrap();

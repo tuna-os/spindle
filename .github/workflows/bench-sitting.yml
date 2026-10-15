@@ -39,7 +39,7 @@ jobs:
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: 1.90.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -93,7 +93,7 @@ jobs:
           scripts/bench-sitting.sh --group "$group" --rounds "${{ inputs.rounds || '3' }}" --max-load 4
       - name: Keep the results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: bench-sitting
           path: |
@@ -102,6 +102,17 @@ jobs:
           if-no-files-found: ignore
       - name: Render the page with the new sitting, as a check
         run: python3 scripts/render-comparisons.py docs/benchmarks/data /tmp/comparisons.html
+      # #42's three parity lines, on this sitting. A failed line does not
+      # stop the sitting being filed -- a loss is a result, and the record
+      # keeps losses -- so the gate's verdict travels in the pull request
+      # body for the reviewer, and the step is marked failed afterwards.
+      - name: Judge the sitting against the parity lines
+        id: parity
+        run: |
+          set +e
+          python3 scripts/parity-gate.py docs/benchmarks/data "$GROUP" --markdown tmp/parity.md
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+          cat tmp/parity.md >> "$GITHUB_STEP_SUMMARY" || true
       - name: Open the pull request that files the sitting
         env:
           GH_TOKEN: ${{ github.token }}
@@ -119,6 +130,11 @@ jobs:
           # (run 34045231782 ran the whole Postgres sitting and lost it here
           # to a branch the SQLite run had left behind).
           git push --force -u origin "$branch"
+          {
+            echo "The weekly competitive sitting on a GitHub-hosted runner, filed as its own \`ci-\` group. Read \`docs/benchmarks/data/$GROUP.sitting.json\` for the host and the versions before merging; the page keeps shared-runner sittings apart from milestone ones."
+            echo
+            cat tmp/parity.md 2>/dev/null || echo "The parity gate did not produce a report; see the run log."
+          } > tmp/pr-body.md
           # Opening the pull request needs "Allow GitHub Actions to create
           # and approve pull requests" under Settings > Actions > General,
           # which is off by default and was off for the first sitting that
@@ -126,7 +142,12 @@ jobs:
           # pushed by now, so a refusal here is a notice, not a failed run:
           # somebody opens the pull request from the branch by hand.
           if ! gh pr create --title "Benchmark sitting $GROUP (shared runner)" \
-            --body "The weekly competitive sitting on a GitHub-hosted runner, filed as its own \`ci-\` group. Read \`docs/benchmarks/data/$GROUP.sitting.json\` for the host and the versions before merging; the page keeps shared-runner sittings apart from milestone ones." \
+            --body-file tmp/pr-body.md \
             --base main --head "$branch"; then
             echo "::warning title=Sitting pushed, pull request not opened::The results are on branch $branch. Open the pull request by hand at https://github.com/${{ github.repository }}/compare/main...$branch, or allow GitHub Actions to create pull requests under Settings > Actions > General so the next sitting files its own."
           fi
+      - name: The parity gate's verdict
+        if: steps.parity.outputs.status != '0'
+        run: |
+          echo "::error title=Parity gate failed::A line #42 draws failed on this sitting; the report is in the pull request body and the step summary."
+          exit 1

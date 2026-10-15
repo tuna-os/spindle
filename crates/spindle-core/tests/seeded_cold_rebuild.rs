@@ -1,17 +1,24 @@
 //! Cold reopen must reuse immutable historical subtrees without changing any
 //! stored root, timeline cursor, extremity, or following ordinary append.
 use spindle_core::{
-    EventId, EventInput, RestoredEntry, RoomLog, StateKey, StateRoot, StateSnapshot,
+    EventId, EventInput, MemStateKeyTable, RestoredEntry, RoomLog, StateKey, StateKeyTable,
+    StateRoot, StateSnapshot,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
+
+fn table() -> Arc<dyn StateKeyTable> {
+    MemStateKeyTable::shared()
+}
 
 #[test]
 fn many_seeded_historical_roots_reopen_equivalently_with_changed_path_reads() {
-    let mut expected = RoomLog::new();
-    let mut state = StateSnapshot::new();
+    let table = table();
+    let mut expected = RoomLog::new(table.clone());
+    let mut state = StateSnapshot::new(table.clone());
     for index in 0..512 {
         state = state.apply(
-            StateKey::new("m.room.member", format!("@u{index}:test")),
+            &StateKey::new("m.room.member", format!("@u{index}:test")),
             format!("$member{index}"),
         );
     }
@@ -20,7 +27,7 @@ fn many_seeded_historical_roots_reopen_equivalently_with_changed_path_reads() {
     let mut previous: Option<EventId> = None;
     for index in 0..100 {
         let before = state.clone();
-        state = state.apply(updated_key.clone(), format!("$current-only{index}"));
+        state = state.apply(&updated_key, format!("$current-only{index}"));
         stored.extend(state.delta_nodes(Some(&before)));
         let id = EventId::new(format!("$timeline{index}"));
         expected
@@ -54,6 +61,7 @@ fn many_seeded_historical_roots_reopen_equivalently_with_changed_path_reads() {
             reads += 1;
             stored.get(root).cloned()
         },
+        table.clone(),
     )
     .unwrap();
     assert!(restored.unverified.is_empty());
@@ -98,9 +106,10 @@ fn many_seeded_historical_roots_reopen_equivalently_with_changed_path_reads() {
 
 #[test]
 fn each_independent_cold_rebuild_rechecks_missing_and_corrupt_nodes() {
-    let mut log = RoomLog::new();
-    let state = StateSnapshot::new().apply(
-        StateKey::new("m.room.member", "@a:test"),
+    let table = table();
+    let mut log = RoomLog::new(table.clone());
+    let state = StateSnapshot::new(table.clone()).apply(
+        &StateKey::new("m.room.member", "@a:test"),
         "$accepted-outlier",
     );
     log.append_seeded(EventInput::new("$seed", Vec::new()), state.clone(), 1)
@@ -122,6 +131,7 @@ fn each_independent_cold_rebuild_rechecks_missing_and_corrupt_nodes() {
         log.next_backward(),
         log.forward_extremities().iter().cloned(),
         &mut |root| stored.get(root).cloned(),
+        table.clone(),
     )
     .unwrap();
     assert!(verified.unverified.is_empty());
@@ -131,6 +141,7 @@ fn each_independent_cold_rebuild_rechecks_missing_and_corrupt_nodes() {
         log.next_backward(),
         log.forward_extremities().iter().cloned(),
         &mut |_| None,
+        table.clone(),
     )
     .unwrap();
     assert_eq!(missing.unverified, vec![entry.li]);
@@ -145,6 +156,7 @@ fn each_independent_cold_rebuild_rechecks_missing_and_corrupt_nodes() {
                 bytes
             })
         },
+        table.clone(),
     )
     .unwrap();
     assert_eq!(corrupt.unverified, vec![entry.li]);
@@ -164,16 +176,17 @@ fn production_shaped_varied_roots_cold_rebuild() {
     const SLOTS: usize = 51_395;
     const ROOTS: usize = 8_957;
     let started = Instant::now();
-    let mut state = StateSnapshot::new();
+    let table = table();
+    let mut state = StateSnapshot::new(table.clone());
     for slot in 0..SLOTS {
         state = state.apply(
-            StateKey::new("m.room.member", format!("@member{slot}:synthetic.test")),
+            &StateKey::new("m.room.member", format!("@member{slot}:synthetic.test")),
             format!("$original-member-{slot}-synthetic"),
         );
     }
     let initial_nodes = state.delta_nodes(None).len();
     let mut stored: HashMap<StateRoot, Vec<u8>> = state.delta_nodes(None).into_iter().collect();
-    let mut log = RoomLog::new();
+    let mut log = RoomLog::new(table.clone());
     let mut previous: Option<EventId> = None;
     let mut baseline = Vec::new();
     let mut random = 17_u64;
@@ -185,7 +198,7 @@ fn production_shaped_varied_roots_cold_rebuild() {
                 .wrapping_add(1);
             let slot = random % u64::try_from(SLOTS).unwrap();
             state = state.apply(
-                StateKey::new("m.room.member", format!("@member{slot}:synthetic.test")),
+                &StateKey::new("m.room.member", format!("@member{slot}:synthetic.test")),
                 format!("$changed-{root}-{change}-synthetic"),
             );
         }
@@ -206,10 +219,14 @@ fn production_shaped_varied_roots_cold_rebuild() {
     let baseline_started = Instant::now();
     let mut baseline_reads = 0;
     for root in &baseline {
-        let restored = StateSnapshot::rehydrate(*root, &mut |address| {
-            baseline_reads += 1;
-            stored.get(address).cloned()
-        })
+        let restored = StateSnapshot::rehydrate(
+            *root,
+            &mut |address| {
+                baseline_reads += 1;
+                stored.get(address).cloned()
+            },
+            table.clone(),
+        )
         .unwrap();
         assert_eq!(restored.root(), *root);
         assert_eq!(restored.len(), SLOTS);
@@ -235,6 +252,7 @@ fn production_shaped_varied_roots_cold_rebuild() {
             cached_reads += 1;
             stored.get(root).cloned()
         },
+        table.clone(),
     )
     .unwrap();
     let cached_seconds = cached_started.elapsed().as_secs_f64();
