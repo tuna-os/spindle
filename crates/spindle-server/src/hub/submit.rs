@@ -322,7 +322,9 @@ async fn verify_submission(
 }
 
 /// [`try_send`] behind the client transaction: a retried transaction is
-/// left to the ordinary path, which answers it from what it recorded.
+/// left to the ordinary path, which answers it from what it recorded. The
+/// transaction's turn is held across the send, as the ordinary path holds
+/// it, so two concurrent retries cannot both send.
 ///
 /// # Errors
 ///
@@ -337,6 +339,7 @@ pub(crate) async fn send_with_transaction(
     content: &Value,
 ) -> Result<Option<Json<Value>>, MatrixError> {
     let key = spindle_core::keys::transaction(&identity.user_id, &identity.device_id, txn_id);
+    let _turn = state.transactions.enter(&key).await;
     if let Ok(Some(_)) = spindle_store::ReadView::get(state.store.as_ref(), &key) {
         return Ok(None);
     }
@@ -412,7 +415,7 @@ pub(crate) async fn try_send(
     let mut attempt = 0;
     loop {
         attempt += 1;
-        let (event_id, json) = state
+        let (event_id, mut json) = state
             .rooms
             .build_for_hub(
                 room_id,
@@ -422,6 +425,14 @@ pub(crate) async fn try_send(
                 state_key,
                 content,
             )
+            .map_err(room_error)?;
+        // The room's policy server approves the event before anyone sees
+        // it, as on the ordinary send path; its signature does not change
+        // the event ID.
+        state
+            .rooms
+            .authorize_policy(room_id, &mut json)
+            .await
             .map_err(room_error)?;
         // `unsigned` is this server's annotation (`replaces_state`), not
         // part of the event; the hub gets the event.
@@ -589,7 +600,7 @@ pub(crate) async fn try_handoff(
             object.insert(PREV_HUB_KEY.to_owned(), json!(current.event_id));
             object.insert(PREV_FINAL_KEY.to_owned(), stated.clone());
         }
-        let (event_id, json) = state
+        let (event_id, mut json) = state
             .rooms
             .build_for_hub(
                 room_id,
@@ -599,6 +610,11 @@ pub(crate) async fn try_handoff(
                 Some(""),
                 &opening,
             )
+            .map_err(room_error)?;
+        state
+            .rooms
+            .authorize_policy(room_id, &mut json)
+            .await
             .map_err(room_error)?;
         if ours {
             attest::send_attestations(state, room_id).await;
