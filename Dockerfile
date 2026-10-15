@@ -10,7 +10,7 @@
 # startup contract (TLS on 8448 from a mounted CA, a health check), which
 # an operator's image should not carry.
 
-FROM rust:1.98-bookworm AS build
+FROM rust:1.99-bookworm AS build
 # Extra cargo features, empty for the release image. The Synapse migration
 # rehearsal image passes FEATURES=synapse-import.
 ARG FEATURES=""
