@@ -412,6 +412,10 @@ def advance(
 ) -> None:
     if target not in PHASES:
         raise Blocked(f"unknown phase {target!r}")
+    if state["authority"] == "RECOVERY_REQUIRED":
+        raise Blocked(
+            "recovery is required; finish the reconciliation plan before advancing"
+        )
     current_index = PHASES.index(state["phase"])
     if current_index + 1 >= len(PHASES) or PHASES[current_index + 1] != target:
         raise Blocked(
@@ -481,7 +485,8 @@ def update_import(state: dict[str, Any], document: dict[str, Any], actor: str) -
         )
     for field in ("rooms", "events", "bytes", "exclusions"):
         if (
-            not isinstance(document[field], int)
+            isinstance(document[field], bool)
+            or not isinstance(document[field], int)
             or document[field] < state["import"][field]
         ):
             raise Blocked(f"import {field} must be a monotonic non-negative integer")

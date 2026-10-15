@@ -213,6 +213,9 @@ class MigrationWorkspaceTests(unittest.TestCase):
         pane = workspace.view(state)["Recovery"]
         self.assertEqual(pane["boundary"], "post-write recovery")
         self.assertFalse(pane["ordinary_rollback_available"])
+        with self.assertRaisesRegex(workspace.Blocked, "recovery is required"):
+            workspace.advance(state, "OBSERVE", "operator", None)
+        self.assertEqual(state["authority"], "RECOVERY_REQUIRED")
 
     def test_prewrite_compensation_restores_synapse_authority(self):
         state = self.state()
