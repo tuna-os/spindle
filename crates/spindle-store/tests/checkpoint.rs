@@ -24,7 +24,7 @@ fn a_checkpoint_does_not_see_writes_that_land_after_it() {
     let store = FjallStore::open(dir.path()).unwrap();
     let room_store = RoomStore::new(&store, ROOM);
 
-    let mut log = RoomLog::new();
+    let mut log = RoomLog::new(store.key_table());
     for number in 0..10 {
         let entry = log.append_local(format!("$event-{number}"), None).unwrap();
         let entry = entry.clone();
@@ -67,7 +67,7 @@ fn a_room_read_during_concurrent_appends_is_never_torn() {
     // Seed, so the reader has something to find immediately.
     {
         let room_store = RoomStore::new(store.as_ref(), ROOM);
-        let mut log = RoomLog::new();
+        let mut log = RoomLog::new(store.key_table());
         let entry = log.append_local("$seed", None).unwrap().clone();
         room_store
             .commit_entry(&entry, &log, Durability::Relaxed)
@@ -158,4 +158,79 @@ fn a_room_read_during_concurrent_appends_is_never_torn() {
         appended > 0,
         "the writer never committed, so nothing was read concurrently"
     );
+}
+
+/// Every checkpoint taken under concurrent room writes must contain the
+/// intern rows needed to interpret every state root it can see.
+#[test]
+fn concurrent_rooms_publish_intern_rows_before_referencing_nodes() {
+    use spindle_core::keys::{Keyspace, content_addressed, keyspace_prefix};
+    use spindle_core::{MemStateKeyTable, StateKey, StateSnapshot};
+    use spindle_store::codec::{EntryRecord, decode_intern_pair};
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+    let start = Arc::new(std::sync::Barrier::new(5));
+    let mut writers = Vec::new();
+    for room in 0..4 {
+        let store = Arc::clone(&store);
+        let start = Arc::clone(&start);
+        writers.push(thread::spawn(move || {
+            let mut log = RoomLog::new(store.key_table());
+            let room_id = format!("!room{room}:test");
+            let room_store = RoomStore::new(store.as_ref(), &room_id);
+            start.wait();
+            for number in 0..100 {
+                let entry = log
+                    .append_local(
+                        format!("$r{room}-{number}"),
+                        Some(StateKey::new("m.room.member", format!("@u{number}:test"))),
+                    )
+                    .unwrap()
+                    .clone();
+                room_store
+                    .commit_entry(&entry, &log, Durability::Relaxed)
+                    .unwrap();
+            }
+        }));
+    }
+    start.wait();
+    loop {
+        let checkpoint = store.snapshot().unwrap();
+        let pairs = checkpoint
+            .scan_prefix(&keyspace_prefix(Keyspace::StateKeyIntern))
+            .unwrap()
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    u64::from_be_bytes(key[2..10].try_into().unwrap()),
+                    decode_intern_pair(&value).unwrap(),
+                )
+            })
+            .collect();
+        let table: Arc<dyn spindle_core::StateKeyTable> =
+            Arc::new(MemStateKeyTable::from_pairs(pairs).unwrap());
+        for (_, value) in checkpoint
+            .scan_prefix(&keyspace_prefix(Keyspace::Log))
+            .unwrap()
+        {
+            let entry = EntryRecord::decode(&value).unwrap();
+            StateSnapshot::rehydrate(
+                spindle_core::StateRoot::from_bytes(entry.state_root),
+                &mut |root| {
+                    checkpoint
+                        .get(&content_addressed(Keyspace::StateNode, root.as_bytes()))
+                        .unwrap()
+                },
+                Arc::clone(&table),
+            )
+            .expect("visible state must resolve against checkpoint's durable intern rows");
+        }
+        if writers.iter().all(thread::JoinHandle::is_finished) {
+            break;
+        }
+        thread::yield_now();
+    }
+    for writer in writers {
+        writer.join().unwrap();
+    }
 }

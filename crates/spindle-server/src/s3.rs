@@ -95,6 +95,20 @@ impl S3Client {
             .map_err(|error| S3Error::Transport(error.to_string()))
     }
 
+    /// Remove the object under `key`. Removing one that is not there
+    /// succeeds, as S3 itself answers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`S3Error`] if the request cannot be sent or is refused.
+    pub async fn delete(&self, key: &str) -> Result<(), S3Error> {
+        let response = self.request("DELETE", key, Vec::new()).await?;
+        if !response.status().is_success() && response.status().as_u16() != 404 {
+            return Err(rejected(response).await);
+        }
+        Ok(())
+    }
+
     /// Whether an object exists under `key`, without fetching it.
     ///
     /// A HEAD rather than a GET because the caller only wants presence: an

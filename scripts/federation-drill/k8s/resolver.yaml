@@ -1,0 +1,87 @@
+# The drill's private resolver.
+#
+# It knows four names and nothing else:
+#   reilly.asia, matrix.reilly.asia     -> drill-b  (10.111.63.12)
+#   witness.lab, matrix.witness.lab     -> drill-a  (10.111.63.11)
+# Every other query is answered REFUSED. There is no `forward` plugin, so
+# the resolver itself never asks anybody. Every query is logged, which is
+# part of the isolation evidence: a lookup of any other name shows up here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: drill-resolver
+  labels: {app: drill-resolver, part-of: federation-drill}
+data:
+  Corefile: |
+    reilly.asia:1053 witness.lab:1053 {
+      log
+      hosts {
+        10.111.63.12 reilly.asia matrix.reilly.asia
+        10.111.63.11 witness.lab matrix.witness.lab
+        ttl 30
+      }
+    }
+    .:1053 {
+      log
+      template ANY ANY {
+        rcode REFUSED
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drill-resolver
+  labels: {app: drill-resolver, part-of: federation-drill}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: drill-resolver}
+  template:
+    metadata:
+      labels: {app: drill-resolver, part-of: federation-drill}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["127.0.0.1"]
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: coredns
+        image: registry.k8s.io/coredns/coredns:v1.11.3
+        args: [-conf, /etc/coredns/Corefile]
+        ports:
+        - {name: dns, containerPort: 1053, protocol: UDP}
+        - {name: dns-tcp, containerPort: 1053, protocol: TCP}
+        resources:
+          requests: {cpu: 10m, memory: 32Mi}
+          limits: {memory: 128Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          # The coredns binary carries a file capability; without it in the
+          # bounding set the exec itself is refused.
+          capabilities: {drop: [ALL], add: [NET_BIND_SERVICE]}
+        volumeMounts:
+        - {name: conf, mountPath: /etc/coredns, readOnly: true}
+      volumes:
+      - name: conf
+        configMap: {name: drill-resolver}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: drill-resolver
+  labels: {app: drill-resolver, part-of: federation-drill}
+spec:
+  type: ClusterIP
+  clusterIP: 10.111.63.10
+  selector: {app: drill-resolver}
+  ports:
+  - {name: dns, port: 53, targetPort: 1053, protocol: UDP}
+  - {name: dns-tcp, port: 53, targetPort: 1053, protocol: TCP}

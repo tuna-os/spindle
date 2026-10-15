@@ -1,0 +1,160 @@
+# Dark MAS for the #563 MAS gate: MAS 1.23.0 (production's version) on
+# mas_dark, a restore of the 2026-10-03 production mas.dump, in front of
+# dark-spindle-mas. Isolation, same layers as #558:
+#   - fresh secrets (no production MAS keys/encryption secret); no
+#     upstream_oauth2 providers (the dump has none); email transport
+#     blackhole
+#   - dnsPolicy None, nameserver 127.0.0.1; peers through hostAliases only
+#   - ClusterIP Service only, no Ingress
+#   - netwatch sidecar: anything not loopback / rehearsal-pg /
+#     dark-spindle-mas / inbound is logged as OUTBOUND
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dark-mas-config
+  labels: {app: dark-mas, part-of: spindle-mas-gate}
+data:
+  config.yaml: |
+    http:
+      public_base: "http://dark-mas.spindle-rehearsal.svc.cluster.local:18080/"
+      listeners:
+      - name: web
+        binds:
+        - address: "0.0.0.0:8080"
+        resources:
+        - name: human
+        - name: discovery
+        - name: oauth
+        - name: compat
+        - name: assets
+        - name: graphql
+          undocumented_oauth2_access: true
+        - name: adminapi
+      - name: internal
+        binds:
+        - address: "0.0.0.0:8081"
+        resources:
+        - name: health
+    database:
+      host: rehearsal-pg
+      port: 5432
+      username: postgres
+      password_file: /secrets/pg/POSTGRES_PASSWORD
+      database: mas_dark
+      ssl_mode: disable
+    email:
+      from: '"Dark MAS" <root@localhost>'
+      reply_to: '"Dark MAS" <root@localhost>'
+      transport: blackhole
+    matrix:
+      homeserver: "reilly.asia"
+      secret_file: /secrets/mas/matrix_secret
+      endpoint: "http://dark-spindle-mas.spindle-rehearsal.svc.cluster.local:18008"
+      kind: synapse_modern
+    secrets:
+      encryption_file: /secrets/mas/encryption
+      keys:
+      - key_file: /secrets/mas/rsa.pem
+      - key_file: /secrets/mas/ec.pem
+    passwords:
+      enabled: true
+    clients:
+    - client_id: 0000000000000000000MASADMN
+      client_auth_method: client_secret_basic
+      client_secret_file: /secrets/mas/admin_client_secret
+    policy:
+      data:
+        admin_clients: [0000000000000000000MASADMN]
+        admin_users: []
+        client_registration:
+          allow_host_mismatch: false
+          allow_insecure_uris: true
+    experimental:
+      session_limit:
+        soft_limit: 50
+        hard_limit: 50
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dark-mas
+  labels: {app: dark-mas, part-of: spindle-mas-gate}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: dark-mas}
+  template:
+    metadata:
+      labels: {app: dark-mas, part-of: spindle-mas-gate}
+    spec:
+      nodeName: ip-10-20-1-11
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["127.0.0.1"]
+        searches: []
+        options: [{name: ndots, value: "1"}, {name: attempts, value: "1"}, {name: timeout, value: "1"}]
+      hostAliases:
+      - ip: "__PG_IP__"
+        hostnames: [rehearsal-pg]
+      - ip: "__SPINDLE_IP__"
+        hostnames: [dark-spindle-mas.spindle-rehearsal.svc.cluster.local]
+      securityContext:
+        runAsUser: 10093
+        runAsGroup: 10093
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      initContainers:
+      - name: migrate
+        image: ghcr.io/element-hq/matrix-authentication-service:1.23.0
+        args: [database, migrate]
+        env: [{name: MAS_CONFIG, value: /conf/config.yaml}]
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+        volumeMounts: &mounts
+        - {name: conf, mountPath: /conf, readOnly: true}
+        - {name: mas, mountPath: /secrets/mas, readOnly: true}
+        - {name: pg, mountPath: /secrets/pg, readOnly: true}
+      - name: sync
+        image: ghcr.io/element-hq/matrix-authentication-service:1.23.0
+        args: [config, sync]
+        env: [{name: MAS_CONFIG, value: /conf/config.yaml}]
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+        volumeMounts: *mounts
+      containers:
+      - name: mas
+        image: ghcr.io/element-hq/matrix-authentication-service:1.23.0
+        args: [server, --no-migrate]
+        env: [{name: MAS_CONFIG, value: /conf/config.yaml}]
+        ports:
+        - {name: web, containerPort: 8080}
+        readinessProbe:
+          httpGet: {path: /health, port: 8081}
+          periodSeconds: 5
+        resources:
+          requests: {cpu: 50m, memory: 128Mi}
+          limits: {cpu: "500m", memory: 512Mi}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+        volumeMounts: *mounts
+      - name: netwatch
+        image: oci.element.io/synapse:v1.156.0
+        command: [python3, -u, /netwatch/netwatch.py]
+        env:
+        - {name: ALLOWED, value: "__PG_IP__:5432,__SPINDLE_IP__:8008,__SPINDLE_IP__:18008"}
+        - {name: LISTEN, value: "8080,8081"}
+        resources:
+          requests: {cpu: 10m, memory: 32Mi}
+          limits: {memory: 128Mi}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+        volumeMounts:
+        - {name: netwatch, mountPath: /netwatch, readOnly: true}
+      volumes:
+      - name: conf
+        configMap: {name: dark-mas-config}
+      - name: mas
+        secret: {secretName: dark-mas-secrets}
+      - name: pg
+        secret: {secretName: rehearsal-pg}
+      - name: netwatch
+        configMap: {name: mas-gate-netwatch}

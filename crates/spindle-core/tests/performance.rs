@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use spindle_core::{EventId, EventInput, RoomLog, StateKey, StateSnapshot};
+use spindle_core::{EventId, EventInput, MemStateKeyTable, RoomLog, StateKey, StateSnapshot};
 
 fn assert_budget(name: &str, elapsed: Duration, budget: Duration) {
     eprintln!(
@@ -15,10 +15,10 @@ fn assert_budget(name: &str, elapsed: Duration, budget: Duration) {
 #[ignore = "release-mode CI performance gate"]
 fn hamt_applies_twenty_thousand_unique_state_updates_within_budget() {
     let started = Instant::now();
-    let mut state = StateSnapshot::new();
+    let mut state = StateSnapshot::new(MemStateKeyTable::shared());
     for number in 0..20_000 {
         state = state.apply(
-            StateKey::new("m.room.member", format!("@user-{number}:example.org")),
+            &StateKey::new("m.room.member", format!("@user-{number}:example.org")),
             format!("$event-{number}"),
         );
     }
@@ -39,7 +39,7 @@ fn hamt_applies_twenty_thousand_unique_state_updates_within_budget() {
 #[test]
 #[ignore = "release-mode CI performance gate"]
 fn fork_window_walks_four_thousand_divergent_events_within_budget() {
-    let mut room = RoomLog::new();
+    let mut room = RoomLog::new(MemStateKeyTable::shared());
     room.append_local("$root", None).unwrap();
     let mut left = EventId::new("$root");
     let mut right = EventId::new("$root");

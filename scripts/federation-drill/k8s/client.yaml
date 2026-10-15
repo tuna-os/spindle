@@ -1,0 +1,76 @@
+# The drill's test clients: drill.py (client API, standard library) and the
+# drill-e2ee binary (matrix-sdk), built in mig-rig-toolbox onto the
+# mig-rig-work PVC.
+#
+# The clients are isolated like the servers: the lab resolver only, and
+# the two client ports through hostAliases. A client library that follows
+# the `well_known` in Synapse's login response would otherwise go to
+# https://matrix.reilly.asia/, which outside the lab is production.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: drill-client
+  labels: {part-of: federation-drill}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests: {storage: 1Gi}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: drill-client
+  labels: {app: drill-client, part-of: federation-drill}
+spec:
+  nodeSelector: {kubernetes.io/hostname: ip-10-20-1-11}
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  dnsPolicy: None
+  dnsConfig:
+    nameservers: ["10.111.63.10"]
+    searches: []
+    options: [{name: ndots, value: "1"}]
+  hostAliases:
+  - {ip: "10.111.63.11", hostnames: [drill-a]}
+  - {ip: "10.111.63.12", hostnames: [drill-b]}
+  securityContext:
+    runAsUser: 10093
+    runAsGroup: 10093
+    fsGroup: 10093
+    runAsNonRoot: true
+    seccompProfile: {type: RuntimeDefault}
+  containers:
+  - name: client
+    image: oci.element.io/synapse:v1.156.0
+    command: [sleep, infinity]
+    env:
+    - {name: DRILL_STATE, value: /state}
+    - {name: HOME, value: /state}
+    resources:
+      requests: {cpu: 50m, memory: 128Mi}
+      limits: {cpu: "1", memory: 1Gi}
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities: {drop: [ALL]}
+    volumeMounts:
+    - {name: state, mountPath: /state}
+    - {name: drill, mountPath: /drill, readOnly: true}
+    - {name: work, mountPath: /work, readOnly: true}
+    - {name: secrets-a, mountPath: /secrets/a, readOnly: true}
+    - {name: secrets-b, mountPath: /secrets/b, readOnly: true}
+  volumes:
+  - name: state
+    persistentVolumeClaim: {claimName: drill-client}
+  - name: drill
+    configMap: {name: drill-client, defaultMode: 0755}
+  - name: work
+    persistentVolumeClaim: {claimName: mig-rig-work, readOnly: true}
+  - name: secrets-a
+    secret:
+      secretName: drill-a-secrets
+      items: [{key: secrets.yaml, path: secrets.yaml}]
+  - name: secrets-b
+    secret:
+      secretName: drill-b-secrets
+      items: [{key: secrets.yaml, path: secrets.yaml}]

@@ -8,6 +8,9 @@
 //! every read is gated on the asking server having a joined member —
 //! an authenticated stranger is still a stranger.
 
+#[path = "support/federation_auth.rs"]
+mod federation_auth;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -151,6 +154,7 @@ fn now_millis() -> u64 {
 struct Harness {
     _dir: TempDir,
     app: axum::Router,
+    store: Arc<FjallStore>,
 }
 
 impl Harness {
@@ -162,8 +166,12 @@ impl Harness {
              [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n",
         )
         .unwrap();
-        let app = spindle_server::app(config, store).expect("the app builds");
-        Self { _dir: dir, app }
+        let app = spindle_server::app(config, store.clone()).expect("the app builds");
+        Self {
+            _dir: dir,
+            app,
+            store,
+        }
     }
 
     async fn call(&self, request: Request<Body>) -> (StatusCode, Value) {
@@ -251,17 +259,20 @@ impl Harness {
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let head = self.head_event(&room, alice).await;
-        let join = peer.event(&json!({
-            "type": "m.room.member",
-            "state_key": peer.user(),
-            "sender": peer.user(),
-            "room_id": room,
-            "content": { "membership": "join" },
-            "origin_server_ts": now_millis(),
-            "depth": 10,
-            "prev_events": [head],
-            "auth_events": [],
-        }));
+        let join = peer.event(&federation_auth::with_auth_events(
+            &self.store,
+            json!({
+                "type": "m.room.member",
+                "state_key": peer.user(),
+                "sender": peer.user(),
+                "room_id": room,
+                "content": { "membership": "join" },
+                "origin_server_ts": now_millis(),
+                "depth": 10,
+                "prev_events": [head],
+                "auth_events": [],
+            }),
+        ));
         let body = json!({ "origin": peer.name, "origin_server_ts": now_millis(), "pdus": [join] });
         let header = peer.put_header("/_matrix/federation/v1/send/join1", &body);
         let (status, response) = self

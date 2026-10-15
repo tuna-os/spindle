@@ -50,7 +50,10 @@ fn seed(config_path: &std::path::Path) {
     let config = spindle_server::Config::load(config_path.to_str().unwrap()).unwrap();
     let store = spindle_store::FjallStore::open(&config.storage.path).unwrap();
     let room_store = spindle_store::RoomStore::new(&store, "!seeded:example.org");
-    let mut log = spindle_core::RoomLog::new();
+    // The store's own table, not a fresh one: `commit_entry` refuses a log
+    // built against a foreign table, because persisting it would write the
+    // log's id numbering into a keyspace numbered by the store's.
+    let mut log = spindle_core::RoomLog::new(spindle_store::ReadView::key_table(&store));
     for number in 0..6 {
         let entry = log.append_local(format!("$seed-{number}"), None).unwrap();
         let entry = entry.clone();

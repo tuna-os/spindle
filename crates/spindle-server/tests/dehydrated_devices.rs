@@ -378,3 +378,68 @@ async fn the_requesting_session_cannot_be_the_dehydrated_device() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
+
+/// matrix-rust-sdk names a dehydrated device after its Curve25519 key in
+/// unpadded standard base64, so about half of them contain a '/'. Refusing
+/// those failed Element Web's dehydration setup after recovery, which
+/// aborted the step that loads the key-backup key: a verified fresh device
+/// that could not decrypt its history, on roughly every other login.
+#[tokio::test]
+async fn a_base64_device_id_with_a_slash_is_a_device_id() {
+    const ID: &str = "Yr2S/C3gH3k+uWq0Zp7Tb1Lr9mXcVdEaFhJkNoPqRsT";
+    const ENCODED: &str = "Yr2S%2FC3gH3k%2BuWq0Zp7Tb1Lr9mXcVdEaFhJkNoPqRsT";
+    let harness = Harness::new();
+    let (alice, _) = harness.register("alice").await;
+    let (bob, _) = harness.register("bob").await;
+    harness.dehydrate(&alice, ID, "AAAAAQ").await;
+
+    let (status, body) = harness
+        .request(
+            "GET",
+            &format!("{PREFIX}/dehydrated_device"),
+            &alice,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["device_id"], ID, "{body}");
+
+    let (status, body) = harness
+        .request(
+            "POST",
+            "/_matrix/client/v3/keys/query",
+            &bob,
+            &json!({ "device_keys": { "@alice:example.org": [] } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["device_keys"]["@alice:example.org"][ID].is_object(),
+        "{body}"
+    );
+
+    let (status, response) = harness
+        .request(
+            "PUT",
+            "/_matrix/client/v3/sendToDevice/m.room.encrypted/t1",
+            &bob,
+            &json!({ "messages": { "@alice:example.org": { ID: { "ciphertext": "for the parked device" } } } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    // The events route names the device in its path, percent-encoded.
+    let (status, events) = harness
+        .request(
+            "POST",
+            &format!("{PREFIX}/dehydrated_device/{ENCODED}/events"),
+            &alice,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{events}");
+    assert_eq!(
+        events["events"][0]["content"]["ciphertext"], "for the parked device",
+        "{events}"
+    );
+}

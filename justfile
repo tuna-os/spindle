@@ -76,7 +76,12 @@ bench-sitting group rounds="3":
       scripts/bench-sitting.sh --group {{group}} --rounds {{rounds}}
 
 # The whole thing from a bare checkout.
-bench group rounds="3": bench-field bench-build (bench-sitting group rounds) bench-render
+bench group rounds="3": bench-field bench-build (bench-sitting group rounds) bench-render (bench-gate group)
+
+# #42's three parity lines, judged on one committed sitting. Fails on a
+# separated loss; reports the workloads still unmeasured either way.
+bench-gate group:
+    python3 scripts/parity-gate.py docs/benchmarks/data {{group}}
 
 # The site, from the committed results, into site/.
 bench-render:
@@ -95,6 +100,12 @@ upkeep:
     python3 scripts/msc-ledger.py --upstream
     @echo
     python3 scripts/spec-drift.py --preview | sed -n '/^## Client-Server/,/^## Served beyond/p' | grep -E '^(##|[0-9]+ of)'
+
+# #21's disk-full drill: fill a 64 MiB tmpfs (mounted with sudo) under the
+# store and under a server. SPINDLE_DISK_FULL_DIR names a small filesystem
+# to use instead, with no mount. docs/lifecycle.md says what it proves.
+drill-disk-full:
+    scripts/disk-full-drill.sh
 
 # Regenerate the pages CI holds to the code: docs/spec-gaps.md from the
 # router and the pinned spec, docs/mscs.md from contrib/msc/ledger.toml.

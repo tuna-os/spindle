@@ -1,0 +1,15 @@
+[
+  {
+    "note": "fedcheck.py event, run against Spindle B with the #569 build only (before #570); every event gave the same result",
+    "event_id": "$VYE1LOW1ROwHJU_imxUfrAMzS1dJzKxU2avfZOYbPrw",
+    "origin_field": "reilly.asia",
+    "room_version": "10",
+    "extra_keys": [
+      "event_id"
+    ],
+    "missing_keys": [],
+    "error": "Synapse refuses the PDU as served: SynapseError('400: Invalid event JSON')",
+    "cause": "ValueError: Failed to parse event for room version 10: v2/v3 events must not have an explicit event_id",
+    "pass": false
+  }
+]

@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: dark-mas
+  labels: {app: dark-mas, part-of: spindle-mas-gate}
+spec:
+  type: ClusterIP
+  selector: {app: dark-mas}
+  ports:
+  - {name: web, port: 8080, targetPort: 8080}
+  - {name: web-alt, port: 18080, targetPort: 8080}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dark-spindle-mas
+  labels: {app: dark-spindle-mas, part-of: spindle-mas-gate}
+spec:
+  type: ClusterIP
+  selector: {app: dark-spindle-mas}
+  ports:
+  - {name: client, port: 8008, targetPort: 8008}
+  - {name: client-alt, port: 18008, targetPort: 8008}

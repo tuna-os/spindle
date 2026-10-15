@@ -200,6 +200,39 @@ impl Devices {
         Ok(())
     }
 
+    /// Store one fallback key with its `used` flag as another server held it.
+    ///
+    /// [`Self::upload_fallback_keys`] always clears the flag, which is right
+    /// for a client's upload. An import copies a key the old server may
+    /// already have handed out, and a used key reported as unused would stop
+    /// the device from rotating it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the write fails.
+    pub fn restore_fallback_key(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        key_id: &str,
+        key: &Value,
+        used: bool,
+    ) -> Result<(), StoreError> {
+        let algorithm = key_id.split(':').next().unwrap_or(key_id);
+        Store::put(
+            self.store.as_ref(),
+            &keys::device_scoped(
+                Keyspace::FallbackKeys,
+                user_id,
+                device_id,
+                algorithm.as_bytes(),
+            ),
+            json!({ "key_id": key_id, "key": key, "used": used })
+                .to_string()
+                .as_bytes(),
+        )
+    }
+
     /// The algorithms whose fallback key has not yet been handed out.
     ///
     /// `/sync` reports this so a device knows when to rotate: a used
@@ -523,8 +556,28 @@ impl Devices {
         device_id: &str,
         since: Option<u64>,
     ) -> Result<Vec<Value>, StoreError> {
+        self.take_pending_until(user_id, device_id, since, u64::MAX, None)
+            .map(|(events, _)| events)
+    }
+
+    /// Read only messages covered by this response's published position.
+    /// A limited response returns a cursor that acknowledges only its rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the scan or an acknowledged-row delete fails.
+    pub fn take_pending_until(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        since: Option<u64>,
+        until: u64,
+        limit: Option<usize>,
+    ) -> Result<(Vec<Value>, u64), StoreError> {
         let prefix = keys::device_scoped(Keyspace::ToDevice, user_id, device_id, &[]);
         let mut pending = Vec::new();
+        let mut cursor = until;
+        let mut last_returned = since.unwrap_or(0);
         for (key, bytes) in ReadView::scan_prefix(self.store.as_ref(), &prefix)? {
             let seq = key[prefix.len()..]
                 .try_into()
@@ -536,11 +589,19 @@ impl Devices {
                 Store::delete(self.store.as_ref(), &key)?;
                 continue;
             }
+            if seq > until {
+                break;
+            }
             if let Ok(message) = serde_json::from_slice::<Value>(&bytes) {
+                if limit.is_some_and(|limit| pending.len() >= limit.max(1)) {
+                    cursor = last_returned;
+                    break;
+                }
                 pending.push(message);
+                last_returned = seq;
             }
         }
-        Ok(pending)
+        Ok((pending, cursor))
     }
 }
 

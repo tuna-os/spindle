@@ -110,13 +110,47 @@ pub struct Registration {
     /// keys on. The unstable name is what shipping bridges write.
     #[serde(default, alias = "org.matrix.msc3202")]
     pub receive_device_lists: bool,
+    /// MSC4502: the scope tokens granted to the service. The one this
+    /// server knows is the membership look-up (`/rooms/{id}/is_joined`),
+    /// which lk-jwt-service uses to check a caller is in the room it asks a
+    /// token for without being in the room itself.
+    #[serde(default, alias = "io.element.msc4502.scopes")]
+    pub scopes: Vec<String>,
+    /// MSC4512: the part of the client-server and server-server API the
+    /// service answers in this server's place, and where to send it.
+    /// Both or neither.
+    #[serde(default, alias = "io.element.msc4512.proxy_prefix")]
+    pub proxy_prefix: Option<String>,
+    #[serde(default, alias = "io.element.msc4512.proxy_url")]
+    pub proxy_url: Option<String>,
 }
 
 fn default_rate_limited() -> bool {
     true
 }
 
+/// MSC4502's membership look-up scope, under its stable and its unstable
+/// name.
+pub const IS_JOINED_SCOPES: [&str; 2] = [
+    "urn:matrix:client:rooms:is_joined",
+    "urn:matrix:client:io.element.msc4502:rooms:is_joined",
+];
+
 impl Registration {
+    /// Whether the service holds MSC4502's membership look-up scope.
+    #[must_use]
+    pub fn may_look_up_membership(&self) -> bool {
+        self.scopes
+            .iter()
+            .any(|scope| IS_JOINED_SCOPES.contains(&scope.as_str()))
+    }
+
+    /// The prefix and URL the service claims (MSC4512), when it claims one.
+    #[must_use]
+    pub fn proxy(&self) -> Option<(&str, &str)> {
+        Some((self.proxy_prefix.as_deref()?, self.proxy_url.as_deref()?))
+    }
+
     /// The user the service acts as when it does not masquerade.
     #[must_use]
     pub fn sender_user(&self, server_name: &str) -> String {
@@ -176,6 +210,51 @@ impl Registration {
     }
 }
 
+/// Check and normalise a registration's MSC4512 claim: both properties or
+/// neither, a prefix of whole path segments with no `.` or `..`, and a URL
+/// that is one.
+fn validate_proxy(path: &str, registration: &mut Registration) -> Result<(), AppserviceError> {
+    let invalid = |why: &str| AppserviceError::Invalid(path.to_owned(), why.to_owned());
+    match (&registration.proxy_prefix, &registration.proxy_url) {
+        (None, None) => Ok(()),
+        (Some(_), None) | (None, Some(_)) => Err(invalid(
+            "proxy_prefix and proxy_url must be given together (MSC4512)",
+        )),
+        (Some(prefix), Some(url)) => {
+            let prefix = prefix.trim_matches('/').to_owned();
+            if prefix.is_empty()
+                || prefix
+                    .split('/')
+                    .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+            {
+                return Err(invalid("proxy_prefix must be a non-empty relative path"));
+            }
+            let parsed = reqwest::Url::parse(url).map_err(|error| invalid(&error.to_string()))?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(invalid("proxy_url must be an http or https URL"));
+            }
+            let url = url.trim_end_matches('/').to_owned();
+            registration.proxy_prefix = Some(prefix);
+            registration.proxy_url = Some(url);
+            Ok(())
+        }
+    }
+}
+
+/// Whether `prefix` claims the path remainder `rest`: equal to it, or a
+/// whole-segment prefix of it.
+pub(crate) fn claims_path(prefix: &str, rest: &str) -> bool {
+    rest == prefix
+        || rest
+            .strip_prefix(prefix)
+            .is_some_and(|after| after.starts_with('/'))
+}
+
+/// Whether two services' claims would compete for one path.
+fn claims_overlap(one: &str, other: &str) -> bool {
+    claims_path(one, other) || claims_path(other, one)
+}
+
 /// Why registrations could not be loaded. All startup-fatal.
 #[derive(Debug)]
 pub enum AppserviceError {
@@ -232,9 +311,32 @@ impl Appservices {
             }) {
                 return Err(AppserviceError::Duplicate(registration.id));
             }
+            validate_proxy(path, &mut registration)?;
+            if let Some((prefix, _)) = registration.proxy()
+                && list
+                    .iter()
+                    .filter_map(|existing| existing.proxy())
+                    .any(|(other, _)| claims_overlap(prefix, other))
+            {
+                return Err(AppserviceError::Duplicate(format!(
+                    "proxy prefix {prefix:?} ({})",
+                    registration.id
+                )));
+            }
             list.push(Arc::new(registration));
         }
         Ok(Self { list })
+    }
+
+    /// The service whose MSC4512 prefix claims `rest`, the part of a path
+    /// after `/_matrix/{client|federation}/{version}/`.
+    #[must_use]
+    pub fn proxy_for(&self, rest: &str) -> Option<&Arc<Registration>> {
+        self.list.iter().find(|registration| {
+            registration
+                .proxy()
+                .is_some_and(|(prefix, _)| claims_path(prefix, rest))
+        })
     }
 
     /// The registration presenting `as_token`, if any.

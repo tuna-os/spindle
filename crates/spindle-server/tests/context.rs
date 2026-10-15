@@ -380,3 +380,192 @@ async fn a_missing_event_says_so_and_a_missing_room_does_not() {
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+/// Both edges page on outwards without repeating the window: forward from
+/// `end` starts after the window's newest event, backward from `start`
+/// below its oldest. matrix-rust-sdk's `test_event_with_context` is this
+/// walk, and Element X's focused timeline (a permalink or a notification)
+/// is the same one; it failed while `/messages` read every `dir=f` as
+/// `dir=b` (#568, after #534).
+#[tokio::test]
+async fn paging_on_from_either_edge_continues_past_the_window() {
+    let harness = Harness::new();
+    let token = harness.register("alice").await;
+    let room = harness.room(&token).await;
+
+    let mut ids = Vec::new();
+    for index in 0..20 {
+        ids.push(
+            harness
+                .say(&room, &token, &format!("m{index}"), &format!("t{index}"))
+                .await,
+        );
+    }
+    let target = &ids[9];
+
+    // A window of three: one before and two after, Synapse's split.
+    let (status, context) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/context/{target}?limit=3"),
+            &token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{context}");
+    assert_eq!(bodies(&context["events_before"]), vec!["m8"]);
+    assert_eq!(bodies(&context["events_after"]), vec!["m10", "m11"]);
+
+    let end = context["end"].as_str().unwrap();
+    let (status, forward) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=f&from={end}&limit=10"),
+            &token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{forward}");
+    let later: Vec<String> = (12..20).map(|index| format!("m{index}")).collect();
+    assert_eq!(bodies(&forward["chunk"]), later);
+    assert_eq!(
+        forward["start"], end,
+        "start is the token the page began at"
+    );
+
+    // The newest event is not the room's last: a forward page that reaches
+    // it still names where to carry on, and only the empty page after it
+    // says there is nothing more.
+    let next = forward["end"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a forward page names its end: {forward}"));
+    let (_, empty) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=f&from={next}&limit=10"),
+            &token,
+        )
+        .await;
+    assert!(empty["chunk"].as_array().unwrap().is_empty(), "{empty}");
+    assert!(empty.get("end").is_none(), "{empty}");
+
+    // A message sent later is found from that same token.
+    harness.say(&room, &token, "m20", "t20").await;
+    let (_, live) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=f&from={next}&limit=10"),
+            &token,
+        )
+        .await;
+    assert_eq!(bodies(&live["chunk"]), vec!["m20"]);
+
+    let start = context["start"].as_str().unwrap();
+    let (_, backward) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&from={start}&limit=8"),
+            &token,
+        )
+        .await;
+    let earlier: Vec<String> = (0..8).rev().map(|index| format!("m{index}")).collect();
+    assert_eq!(bodies(&backward["chunk"]), earlier);
+}
+
+/// A full forward walk from the room's beginning sees every event once, in
+/// order, and a direction the spec does not name is refused.
+#[tokio::test]
+async fn forward_pages_walk_the_room_from_its_beginning() {
+    let harness = Harness::new();
+    let token = harness.register("alice").await;
+    let room = harness.room(&token).await;
+    for index in 0..7 {
+        harness
+            .say(&room, &token, &format!("m{index}"), &format!("t{index}"))
+            .await;
+    }
+
+    let mut seen = Vec::new();
+    let mut from = String::new();
+    loop {
+        let (status, page) = harness
+            .get(
+                &format!("/_matrix/client/v3/rooms/{room}/messages?dir=f&limit=3{from}"),
+                &token,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        seen.extend(bodies(&page["chunk"]));
+        match page["end"].as_str() {
+            Some(end) => from = format!("&from={end}"),
+            None => break,
+        }
+    }
+    let all: Vec<String> = (0..7).map(|index| format!("m{index}")).collect();
+    assert_eq!(seen, all);
+
+    let (status, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=sideways"),
+            &token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// `to` stops a page at a token in either direction: here, the two edges
+/// of a `/context` window bound pages that must not cross into it.
+#[tokio::test]
+async fn to_stops_a_page_at_a_token() {
+    let harness = Harness::new();
+    let token = harness.register("alice").await;
+    let room = harness.room(&token).await;
+    let mut ids = Vec::new();
+    for index in 0..10 {
+        ids.push(
+            harness
+                .say(&room, &token, &format!("m{index}"), &format!("t{index}"))
+                .await,
+        );
+    }
+    let (_, context) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/context/{}?limit=2", ids[5]),
+            &token,
+        )
+        .await;
+    let (start, end) = (
+        context["start"].as_str().unwrap(),
+        context["end"].as_str().unwrap(),
+    );
+
+    // From the head back to the window's upper edge: m9..m7, newest first.
+    let (status, page) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&to={end}&limit=50"),
+            &token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(bodies(&page["chunk"]), vec!["m9", "m8", "m7"]);
+
+    // From the window's upper edge forward, stopping nowhere: m7..m9.
+    let (_, page) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=f&from={end}&limit=50"),
+            &token,
+        )
+        .await;
+    assert_eq!(bodies(&page["chunk"]), vec!["m7", "m8", "m9"]);
+
+    // Forward from the room's first message up to the lower edge: m0..m3.
+    let (_, first) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/context/{}?limit=0", ids[0]),
+            &token,
+        )
+        .await;
+    let below_first = first["start"].as_str().unwrap();
+    let (_, page) = harness
+        .get(
+            &format!(
+                "/_matrix/client/v3/rooms/{room}/messages?dir=f&from={below_first}&to={start}&limit=50"
+            ),
+            &token,
+        )
+        .await;
+    assert_eq!(bodies(&page["chunk"]), vec!["m0", "m1", "m2", "m3"]);
+}
