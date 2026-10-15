@@ -176,9 +176,11 @@ pub(crate) fn receive_brokered_pdu(
 /// (MSC3995 hub mode, #22) through the ordinary receive path.
 ///
 /// The hub is the server that answered, but not the event's author: it is
-/// returning other servers' events this one has not received yet, so each
-/// verifies against its own sender's server, exactly as it will when that
-/// server's own delivery arrives -- which then finds it already held.
+/// returning other servers' events this one has not received yet. The
+/// receive path takes them as relayed PDUs (#631): each verifies against
+/// the keys of the servers its room version requires, its sender's server
+/// among them, exactly as it will when that server's own delivery arrives
+/// -- which then finds it already held.
 #[cfg(feature = "hub-mode")]
 pub(crate) async fn receive_from_hub(
     state: &AppState,
@@ -188,7 +190,7 @@ pub(crate) async fn receive_from_hub(
     let Some(signer) = pdu["sender"]
         .as_str()
         .and_then(|sender| sender.split_once(':'))
-        .map(|(_, domain)| domain.to_owned())
+        .map(|(_, domain)| domain)
     else {
         return ("$malformed".to_owned(), Err("no sender".to_owned()));
     };
@@ -197,8 +199,7 @@ pub(crate) async fn receive_from_hub(
         let event_id = pdu["event_id"].as_str().unwrap_or("$ours").to_owned();
         return (event_id, Ok(()));
     }
-    let keys = state.federation.peer_keys(&signer).await.ok();
-    recovery::receive(state, hub, &signer, keys.as_ref(), pdu).await
+    recovery::receive(state, hub, None, pdu).await
 }
 
 /// The version a received PDU is to be read under.
