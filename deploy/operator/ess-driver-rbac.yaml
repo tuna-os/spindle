@@ -13,7 +13,7 @@ rules:
     verbs: ["get", "list", "patch"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
-    verbs: ["get", "patch"]
+    verbs: ["get", "list", "patch"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]

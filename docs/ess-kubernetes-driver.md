@@ -5,6 +5,11 @@ Synapse-to-Spindle one-writer boundary. You can use it directly before the
 standalone operator API is complete. Its JSON plan and checkpoint are the
 same durable evidence that the migration workspace consumes.
 
+[`scripts/synapse-k8s-cutover.sh`](../scripts/synapse-k8s-cutover.sh) does
+only the quiesce and its rollback. This driver adds checkpoints, the traffic
+switch, and the validation gate. Use one of the two tools for an operation.
+Their state files are not the same.
+
 The driver does not infer an installation from names. Pass an explicit
 `ess-v1` topology, a kubeconfig, and a context. Discovery lists both workload
 kinds under the topology's deployment selector. It refuses to continue if
