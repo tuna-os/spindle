@@ -1,7 +1,7 @@
 // Contested forks resolved alike by Spindle and its peer (#563, ADR 0005).
 //
 // Three servers: hs1 (Spindle), hs2 (Spindle in the homogeneous run,
-// Synapse in the state-resolution-interop job), and Complement's own
+// Synapse in the CI interop run), and Complement's own
 // federation server, which signs whatever DAG the test asks for. The fake
 // server builds a fork no live server would author on purpose -- five
 // events, all naming the same parent, contesting the power levels, a

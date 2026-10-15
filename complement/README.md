@@ -22,8 +22,9 @@ each verified across two consecutive full local runs before entering the
 list. `scripts/complement-check.py` enforces it against a `go test -json`
 ledger and fails naming whatever regressed.
 
-CI (`complement-suite` in `.github/workflows/compliance.yml`) runs it two
-ways:
+CI (`complement-suite` in `.github/workflows/compliance.yml`, which also
+runs the image's startup checks and the state-resolution interop rooms
+against the same build) runs it two ways:
 
 - **pull requests** run exactly the protected subset, so the gate is fast
   and every merge proves the list still holds;
