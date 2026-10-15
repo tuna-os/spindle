@@ -1,0 +1,138 @@
+# Dark Spindle behind the dark MAS (#563 MAS gate). Same isolation as
+# dark-spindle.yaml in #558: federation/push/previews off, no DNS, peers
+# via hostAliases, ClusterIP only, netwatch sidecar.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dark-spindle-mas-import
+  labels: {app: dark-spindle-mas-import, part-of: spindle-mas-gate}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {app: dark-spindle-mas-import, part-of: spindle-mas-gate}
+    spec:
+      restartPolicy: Never
+      nodeName: ip-10-20-1-11
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["127.0.0.1"]
+        searches: []
+        options: [{name: ndots, value: "1"}, {name: attempts, value: "1"}, {name: timeout, value: "1"}]
+      hostAliases:
+      - ip: "__PG_IP__"
+        hostnames: [rehearsal-pg]
+      securityContext:
+        runAsUser: 10092
+        runAsGroup: 10092
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: import
+        image: rust:1.94-bookworm
+        command:
+        - /work/masgate/bin/spindle-rehearsal
+        - import-synapse-rehearsal
+        - /conf/spindle.toml
+        - host=rehearsal-pg port=5432 user=postgres dbname=synapse_dark
+        - "!Dob38JgXu0oXeH1bFP-fVwa578glny_u5Drl-KRQxlg,!gANCZAEzFswJvEzHbY:reilly.asia,!fJgacLfsDbkATqEtqO:reilly.asia,!YWbCmnOrmRNpLNKtft:reilly.asia"
+        - "@spindle-mig-a:reilly.asia,@spindle-mig-b:reilly.asia,@spindle-mig-c:reilly.asia"
+        env:
+        - name: SPINDLE_SYNAPSE_PASSWORD
+          valueFrom: {secretKeyRef: {name: rehearsal-pg, key: POSTGRES_PASSWORD}}
+        - {name: SPINDLE_REHEARSAL_PASSWORD_DIR, value: /secrets/passwords}
+        - {name: SPINDLE_SYNAPSE_SIGNING_KEY_FILE, value: /secrets/signing/signing.key}
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+          limits: {cpu: "1", memory: 2Gi}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+        volumeMounts:
+        - {name: conf, mountPath: /conf, readOnly: true}
+        - {name: work, mountPath: /work}
+        - {name: passwords, mountPath: /secrets/passwords, readOnly: true}
+        - {name: signing, mountPath: /secrets/signing, readOnly: true}
+      volumes:
+      - name: conf
+        secret: {secretName: dark-spindle-mas-config}
+      - name: work
+        persistentVolumeClaim: {claimName: mig-rig-work}
+      - name: passwords
+        secret:
+          secretName: spindle-mig-rig
+          items:
+          - {key: password-a, path: spindle-mig-a}
+          - {key: password-b, path: spindle-mig-b}
+          - {key: password-c, path: spindle-mig-c}
+      - name: signing
+        secret:
+          secretName: dark-synapse-secrets
+          items:
+          - {key: signing.key, path: signing.key}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dark-spindle-mas
+  labels: {app: dark-spindle-mas, part-of: spindle-mas-gate}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: dark-spindle-mas}
+  template:
+    metadata:
+      labels: {app: dark-spindle-mas, part-of: spindle-mas-gate}
+    spec:
+      nodeName: ip-10-20-1-11
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["127.0.0.1"]
+        searches: []
+        options: [{name: ndots, value: "1"}, {name: attempts, value: "1"}, {name: timeout, value: "1"}]
+      hostAliases:
+      - ip: "__MAS_IP__"
+        hostnames: [dark-mas.spindle-rehearsal.svc.cluster.local]
+      securityContext:
+        runAsUser: 10092
+        runAsGroup: 10092
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: spindle
+        image: rust:1.94-bookworm
+        command: [/work/masgate/bin/spindle, /conf/spindle.toml]
+        ports:
+        - {name: client, containerPort: 8008}
+        readinessProbe:
+          httpGet: {path: /_matrix/client/versions, port: 8008}
+          periodSeconds: 5
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+          limits: {cpu: "1", memory: 2Gi}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+        volumeMounts:
+        - {name: conf, mountPath: /conf, readOnly: true}
+        - {name: work, mountPath: /work}
+      - name: netwatch
+        image: oci.element.io/synapse:v1.156.0
+        command: [python3, -u, /netwatch/netwatch.py]
+        env:
+        - {name: ALLOWED, value: "__MAS_IP__:8080,__MAS_IP__:18080"}
+        - {name: LISTEN, value: "8008"}
+        resources:
+          requests: {cpu: 10m, memory: 32Mi}
+          limits: {memory: 128Mi}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+        volumeMounts:
+        - {name: netwatch, mountPath: /netwatch, readOnly: true}
+      volumes:
+      - name: conf
+        secret: {secretName: dark-spindle-mas-config}
+      - name: work
+        persistentVolumeClaim: {claimName: mig-rig-work}
+      - name: netwatch
+        configMap: {name: mas-gate-netwatch}

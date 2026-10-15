@@ -161,3 +161,181 @@ fn a_store_behind_the_schema_is_refused_by_every_command_that_opens_it() {
     let store = spindle_store::FjallStore::open_unchecked(&config_loaded.storage.path).unwrap();
     assert_eq!(spindle_store::migrate::marker_of(&store).unwrap(), stale);
 }
+
+const MAS_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$bWFzLW1pZ3JhdGlvbi0xNg$CEd7EMaeQK2QDHVNURFc/tH0y2Ja5MduCcmz5Gs8uIo";
+
+fn run_with_stdin(args: &[&std::ffi::OsStr], stdin: &str) -> std::process::Output {
+    use std::io::Write as _;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_spindle"))
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the spindle binary runs");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn set_password_hash_without_a_config_prints_usage_and_fails() {
+    let output = run(&[os("set-password-hash")]);
+    assert!(!output.status.success());
+    assert!(text(&output.stderr).contains("usage: spindle set-password-hash"));
+}
+
+/// #611, offline: one account's hash from stdin.
+#[test]
+fn set_password_hash_stores_one_hash_from_stdin() {
+    let work = TempDir::new().unwrap();
+    let config = config_for(&work, "data");
+    {
+        let store = store_of(&config);
+        spindle_server::accounts::Accounts::new(&store, "example.org")
+            .register("alice", "before")
+            .unwrap();
+    }
+    let output = run_with_stdin(
+        &[os("set-password-hash"), config.as_os_str(), os("alice")],
+        &format!("{MAS_HASH}\n"),
+    );
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let store = store_of(&config);
+    let accounts = spindle_server::accounts::Accounts::new(&store, "example.org");
+    assert!(
+        accounts
+            .verify_password("alice", "correct horse battery staple")
+            .unwrap()
+    );
+}
+
+/// The bulk form a MAS migration uses: each line applied on its own,
+/// refusals named by line and localpart without their hash, and a
+/// non-zero exit while anything was refused.
+#[test]
+fn set_password_hash_in_bulk_reports_each_refusal() {
+    let work = TempDir::new().unwrap();
+    let config = config_for(&work, "data");
+    {
+        let store = store_of(&config);
+        let accounts = spindle_server::accounts::Accounts::new(&store, "example.org");
+        accounts.register("alice", "before").unwrap();
+        accounts.register("bob", "bob's own").unwrap();
+    }
+    let input = format!(
+        "# localpart hash\n@alice:example.org {MAS_HASH}\nbob $2b$12$secretbcryptmaterial\nnobody {MAS_HASH}\n"
+    );
+    let output = run_with_stdin(&[os("set-password-hash"), config.as_os_str()], &input);
+    assert!(!output.status.success(), "refusals make the exit non-zero");
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("line 3: bob"), "{stderr}");
+    assert!(
+        stderr.contains("line 4: no account named nobody"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("secretbcryptmaterial"),
+        "a hash leaked: {stderr}"
+    );
+    assert!(
+        text(&output.stdout).contains("stored 1"),
+        "{}",
+        text(&output.stdout)
+    );
+
+    let store = store_of(&config);
+    let accounts = spindle_server::accounts::Accounts::new(&store, "example.org");
+    assert!(
+        accounts
+            .verify_password("alice", "correct horse battery staple")
+            .unwrap()
+    );
+    assert!(accounts.verify_password("bob", "bob's own").unwrap());
+}
+
+fn builtin_config(work: &TempDir) -> std::path::PathBuf {
+    let config_path = work.path().join("builtin.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[server]\nname = \"example.org\"\npublic_base_url = \"https://matrix.example.org\"\n\
+             [storage]\npath = \"{}\"\n[auth]\nbuiltin_oidc = true\n\
+             oidc_issuer = \"https://auth.example.org/\"\n",
+            work.path().join("data").display()
+        ),
+    )
+    .unwrap();
+    config_path
+}
+
+#[test]
+fn issue_reset_link_without_arguments_prints_usage_and_fails() {
+    let output = run(&[os("issue-reset-link")]);
+    assert!(!output.status.success());
+    assert!(text(&output.stderr).contains("usage: spindle issue-reset-link"));
+}
+
+/// A link for a server that sends no mail: printed once, on the issuer,
+/// for an existing account only, within the lifetime bounds.
+#[test]
+fn issue_reset_link_prints_a_link_on_the_issuer() {
+    let work = TempDir::new().unwrap();
+    let config = builtin_config(&work);
+    {
+        let store = store_of(&config);
+        spindle_server::accounts::Accounts::new(&store, "example.org")
+            .register("alice", "before")
+            .unwrap();
+    }
+    let output = run(&[os("issue-reset-link"), config.as_os_str(), os("nobody")]);
+    assert!(!output.status.success());
+    assert!(text(&output.stderr).contains("no account named nobody"));
+    let output = run(&[
+        os("issue-reset-link"),
+        config.as_os_str(),
+        os("alice"),
+        os("--ttl"),
+        os("8d"),
+    ]);
+    assert!(!output.status.success(), "a week at most");
+    let output = run(&[
+        os("issue-reset-link"),
+        config.as_os_str(),
+        os("@alice:example.org"),
+        os("--ttl"),
+        os("2h"),
+    ]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let url = text(&output.stdout);
+    let token = url
+        .trim()
+        .strip_prefix("https://auth.example.org/account/password/reset?token=")
+        .unwrap_or_else(|| panic!("{url}"));
+    assert_eq!(token.len(), 64);
+    assert!(text(&output.stderr).contains("120 minutes"));
+    // The store holds a digest, not the token.
+    let store = store_of(&config);
+    let leaked =
+        spindle_store::ReadView::scan_prefix(&store, &spindle_core::keys::email_token_prefix())
+            .unwrap()
+            .iter()
+            .any(|(key, value)| {
+                String::from_utf8_lossy(key).contains(token)
+                    || String::from_utf8_lossy(value).contains(token)
+            });
+    assert!(!leaked, "the token is at rest in clear");
+}
+
+#[test]
+fn issue_reset_link_needs_the_builtin_provider() {
+    let work = TempDir::new().unwrap();
+    let config = config_for(&work, "data");
+    let output = run(&[os("issue-reset-link"), config.as_os_str(), os("alice")]);
+    assert!(!output.status.success());
+    assert!(text(&output.stderr).contains("builtin_oidc"));
+}

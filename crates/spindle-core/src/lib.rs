@@ -27,15 +27,19 @@ pub mod keys;
 mod log;
 mod pdu;
 mod state;
+pub mod state_table;
 pub mod version;
 
 pub use log::{
     AppendError, ChainHash, DEFAULT_RESIDENT_WINDOW, EventId, EventInput, ForkWindow,
-    ForkWindowError, LinearIndex, LogEntry, NodeLoader, RestoreError, RestoredEntry, RestoredLog,
-    RoomLog, SetAside,
+    ForkWindowError, LinearIndex, LogEntry, LogRestore, MAX_AUTHORED_PREV_EVENTS, NodeLoader,
+    RestoreError, RestoredEntry, RestoredLog, RoomLog, RuntimeRestoredLog, Sideline,
+    SidelinedEntry, StateResolver, Strict,
 };
 pub use pdu::{Pdu, PduError};
 pub use state::{
     CONTENT_DIGEST_VERSION, EventType, RehydrateError, StateKey, StateRoot, StateSnapshot,
+    rehydrate_v2, v2_node_addresses,
 };
+pub use state_table::{AllocRecord, MemStateKeyTable, StateKeyTable};
 pub use version::{STATE_DAG_V12, VersionError, is_state_dag, rules_of};

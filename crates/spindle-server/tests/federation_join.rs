@@ -568,7 +568,10 @@ async fn a_room_that_does_not_accept_knocks_refuseses_the_template() {
     let alice = harness.register("alice").await;
     let room = harness.public_room(&alice).await;
 
-    let uri = format!("/_matrix/federation/v1/make_knock/{room}/{}", peer.user());
+    let uri = format!(
+        "/_matrix/federation/v1/make_knock/{room}/{}?ver=11",
+        peer.user()
+    );
     let header = peer.get_header(&uri);
     let (status, body) = harness
         .call(
@@ -580,6 +583,38 @@ async fn a_room_that_does_not_accept_knocks_refuseses_the_template() {
         )
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// `make_knock` carries the knocker's `ver` list like `make_join`, and a
+/// list without the room's version is refused naming the version needed.
+#[tokio::test]
+async fn a_knock_template_needs_the_room_version_offered() {
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.public_room(&alice).await;
+
+    let uri = format!(
+        "/_matrix/federation/v1/make_knock/{room}/{}?ver=7&ver=10",
+        peer.user()
+    );
+    let header = peer.get_header(&uri);
+    let (status, body) = harness
+        .call(
+            Request::builder()
+                .uri(&uri)
+                .header("authorization", header)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["errcode"],
+        json!("M_INCOMPATIBLE_ROOM_VERSION"),
+        "{body}"
+    );
+    assert_eq!(body["room_version"], json!("11"), "{body}");
 }
 
 #[tokio::test]
@@ -605,7 +640,10 @@ async fn a_knock_lands_as_membership_and_answers_with_stripped_state() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let room = body["room_id"].as_str().unwrap().to_owned();
 
-    let uri = format!("/_matrix/federation/v1/make_knock/{room}/{}", peer.user());
+    let uri = format!(
+        "/_matrix/federation/v1/make_knock/{room}/{}?ver=11",
+        peer.user()
+    );
     let header = peer.get_header(&uri);
     let (status, body) = harness
         .call(

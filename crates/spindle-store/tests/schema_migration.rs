@@ -1,18 +1,15 @@
 //! Moving a store between schema versions (#20).
 //!
-//! The real table is empty — no schema change has needed a data rewrite
-//! yet — so every test here drives `plan` and `run` with a **synthetic**
-//! table. That is not a weaker test than a real migration would be. The
-//! properties that decide whether an operator loses a store are properties
-//! of the machinery, not of any particular step: whether steps chain,
-//! whether an unreachable version is refused rather than half-applied,
-//! whether a dry run writes, and above all whether the marker can end up
-//! ahead of the data.
+//! Every test here drives `plan` and `run` with a **synthetic** table. That
+//! is not a weaker test than a real migration would be. The properties that
+//! decide whether an operator loses a store are properties of the machinery,
+//! not of any particular step: whether steps chain, whether an unreachable
+//! version is refused rather than half-applied, whether a dry run writes,
+//! and above all whether the marker can end up ahead of the data.
 //!
-//! Getting those right *before* the first real migration is the point.
-//! The first one will be written under whatever pressure produced the
-//! schema change, and that is the worst moment to be discovering that a
-//! failed step leaves the store claiming to be a version it is not.
+//! The first real step (#79) is proven separately, in
+//! `tests/state_migration.rs`, which migrates a version-2 store and reads
+//! it back with the ordinary open.
 
 use spindle_core::keys::store_marker;
 use spindle_store::migrate::{

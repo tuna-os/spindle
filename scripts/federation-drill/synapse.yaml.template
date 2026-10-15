@@ -1,0 +1,91 @@
+# Synapse for the federation drill. drill.sh renders one copy per server:
+#   __SERVER_NAME__  witness.lab | reilly.asia
+#   __FED_HOST__     matrix.witness.lab | matrix.reilly.asia
+#   __DB__           drill_a | drill_b
+#   __PEER_NAME__    the other lab server
+#   __PEER_IP__      the other server's front (ClusterIP)
+#
+# Isolation in Synapse itself (on top of the private resolver and netwatch):
+#   - federation_domain_whitelist names the two lab servers and nothing else
+#   - ip_range_blacklist covers every address; only the peer's front is
+#     whitelisted, so even a name that resolved elsewhere would be refused
+#   - no notary (trusted_key_servers: []), no push, no previews, no email,
+#     no identity server, no appservices
+server_name: __SERVER_NAME__
+public_baseurl: https://__FED_HOST__/
+pid_file: /tmp/homeserver.pid
+log_config: /conf/log_config.yaml
+signing_key_path: /secrets/signing.key
+report_stats: false
+enable_metrics: false
+serve_server_wellknown: false
+
+listeners:
+# Client API, reached by the drill client through the ClusterIP Service.
+- port: 8008
+  tls: false
+  type: http
+  x_forwarded: false
+  bind_addresses: ["0.0.0.0"]
+  resources:
+  - names: [client]
+    compress: false
+# Federation and keys, reached only through the TLS front in this pod.
+- port: 8009
+  tls: false
+  type: http
+  x_forwarded: true
+  bind_addresses: ["127.0.0.1"]
+  resources:
+  - names: [federation, keys]
+    compress: false
+
+database:
+  name: psycopg2
+  allow_unsafe_locale: true
+  args:
+    user: postgres
+    dbname: __DB__
+    host: rehearsal-pg
+    port: 5432
+    cp_min: 2
+    cp_max: 10
+    application_name: __DB__
+
+federation_domain_whitelist: [__SERVER_NAME__, __PEER_NAME__]
+federation_custom_ca_list: [/tls/ca.crt]
+federation_verify_certificates: true
+trusted_key_servers: []
+suppress_key_server_warning: true
+ip_range_blacklist: ['0.0.0.0/0', '::/0']
+ip_range_whitelist: ['__PEER_IP__/32']
+url_preview_enabled: false
+push:
+  enabled: false
+app_service_config_files: []
+
+enable_registration: false
+presence:
+  enabled: false
+media_store_path: /data/media_store
+max_upload_size: 10M
+rc_message: {per_second: 1000, burst_count: 1000}
+rc_login:
+  address: {per_second: 100, burst_count: 100}
+  account: {per_second: 100, burst_count: 100}
+  failed_attempts: {per_second: 100, burst_count: 100}
+rc_joins:
+  local: {per_second: 100, burst_count: 100}
+  remote: {per_second: 100, burst_count: 100}
+rc_invites:
+  per_room: {per_second: 100, burst_count: 100}
+  per_user: {per_second: 100, burst_count: 100}
+  per_issuer: {per_second: 100, burst_count: 100}
+rc_key_requests: {per_second: 1000, burst_count: 1000}
+rc_federation:
+  window_size: 1000
+  sleep_limit: 1000
+  sleep_delay: 10
+  reject_limit: 1000
+  concurrent: 100
+rc_admin_redaction: {per_second: 100, burst_count: 100}

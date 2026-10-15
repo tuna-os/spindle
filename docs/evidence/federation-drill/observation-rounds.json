@@ -1,0 +1,1550 @@
+{
+ "pingpong-obs1": {
+  "all_ok": false,
+  "at": "2026-10-03T22:55:23Z",
+  "label": "obs1",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$gu6obFRgVouuODHZBJjBnZsDFhw5KW-pphqddFKOrcI",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$xy1qWA331BydBvJOTws_Q21COef6Dwm8i6WGevIbDto",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "fork-v10": {
+    "A_to_B_event": "$qBbew6SN16GlqQRtd1zkc1rwZr3q0mvHYlv9MAPcFUE",
+    "A_to_B_s": null,
+    "B_to_A_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such room'}",
+    "ok": false
+   },
+   "history-v10": {
+    "A_to_B_event": "$r58yUwNfobHf0cqYJu_wcs-niftzWl9d_LZo4YtBATY",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$K2IF3rG9Zrx8QOF7EJiUSpbwzYKF4fhv35jozkFlcfI",
+    "B_to_A_s": 0.52,
+    "ok": true
+   },
+   "v1": {
+    "A_to_B_event": "$179106824610EHlVN:witness.lab",
+    "A_to_B_s": null,
+    "B_to_A_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such room'}",
+    "ok": false
+   },
+   "v10-general": {
+    "A_to_B_event": "$6NIgK8gXkKSRmMp13rfYQ2DrnmX7D1S29NtIpXdroe0",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$3jTn_Gs3o-TGarpMAUUC6IF1pZ1B4NAW8dKTzcrIU2g",
+    "B_to_A_s": 0.52,
+    "ok": true
+   },
+   "v12-witness-created": {
+    "A_to_B_event": "$eSN_lMWSF_uLKhUFGRyl8yoDRgx3v-hNtgF4V9MHfJY",
+    "A_to_B_s": null,
+    "B_to_A_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such event'}",
+    "ok": false
+   },
+   "v6": {
+    "A_to_B_event": "$KkPGUZdmQFndwtJp3JE0zsCbiUA11u4E2-p8TFqnidU",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$wazNjXHB2QkGaf4xFZV9mP_5Q4g82OagTgifvCNaaXY",
+    "B_to_A_s": 0.52,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$yJMJNx-YSm1rf6y0Z4iuwKxrsJ53iUEy1bg-in30M0o",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$TpMmCxfBrVKtTeZ5zIVz8-4qD5lt1VUT-pi4a9iMSeM",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs10": {
+  "all_ok": true,
+  "at": "2026-10-03T23:24:46Z",
+  "label": "obs10",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$1VApMyDWNpebeXnFJxmUTiqzzAxH68Pn1gi8-uhowWg",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$BMx-1641DuPp_RCOgxuXcKPE2rcEj1HX_iY0Vl6Z9vo",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$CS0Xs4B9yPLhlzzmdOVFQ0MMOou43uCfjGtqnHKJD5I",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$k-mhbG1CpS_ew1EijDW56Bing3q_lLmpsUBF5CQuykI",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$x5FkMFt9ISZjx5x4V20UVr0kk1X1pxQ0_mWFCaeVnms",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$mRXQ5Wd5VTcEgCMDk56zz9UbUQApJ9S8mSw8v174YMo",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$CJniSDbQP0kIrEIZ-z5z7mrB4gt8oN-jR33en6IuslU",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$r905iw5uGG5Dsex-RqV7GWOrgYVfalI7Bu6WtPfkvTY",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$XKMDDHRke_c-n9YvBpagmLl1-k3vRKximh-CHH2yjyQ",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$W_woqOL43bi-S-pSopjdk4twsve-MCyPtHdsCv6lGZs",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs11": {
+  "all_ok": true,
+  "at": "2026-10-03T23:31:13Z",
+  "label": "obs11",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$94gKEOXTGLEZJK8ZIucsniPllX6Bb_XvZ7OmtUpvGCM",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$GoBX8CQm8Id1AtFxjPqE6eNZNcCLWSxX6Qy7FqtAQ0E",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$n7qKq2IFX_zkmL5RtPqgGx9v00ORUbA-nJL4cVVWhZs",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$NYOVtDQ2qucmcNBkbUh47D3BuPXMuKKyq9clJqhs6Fs",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$1x5hsHDOSyelyK68FCkFgVf2lfafoNUI2XZtVMBmuds",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$R2ZsBTzeD9Jh9tzbvJNnOJQfeW4nzHqawBwzTRh9usQ",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$LkMhLJ2qtNMMzWXK1WkGUwO875ZhgRjH9TFTx1Bjde0",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$rfA3_-RPndwS-fwIqX0PJuyW412rXtwd_RXHjM7hOTo",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$SXoy943CcC-FBU8xwrNw79CyYB1w8fALmSS8bhag0Kg",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$OSVbZ_pISUZ8_J5MbkNrFZ4wiV0zCiwP65-BEfI3Bhg",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs12": {
+  "all_ok": true,
+  "at": "2026-10-03T23:33:19Z",
+  "label": "obs12",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$Mn4Nkn9lK0F8l0QzSepmI4Ul8Ueg8JBy-cirSIR78qw",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$CaXJVd_jRXPpD8XAAcB_uyjmAf1fYEiYxSIsBRUfKdQ",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$sonVUcJDFYTDCJkpbESArk7Ul6fAxhnVwYeSnekH1Zk",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$f8jhJN2wSLe7XaM9XtD5k6gbjLiLMSGzgcE-lJ2b0B4",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$xWkInU1sGr_flg3fRJ-IpsiQw6NmnpT-CWHgrBxTYF4",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$f3Rim2ueyZWgLuaN1gjEUQKXzu1IG20Y1ZtI_X0Wv6U",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$ylmpKBXLHSMqpDaupDm1NjUPgVQmgAMq6YRZB-ceM5I",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$CQJyGOmuxBPfJeHK4q_-MYwxwUzeWj9WR4ihejPGQfA",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$jn0YcLGlNgcj65nmWpc2oL_aq_1A9i3rucD_DdkCwoY",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$OmhgOvYudGPbLO0otp803pxvLq1D0PukVXovjZxHdUA",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs13": {
+  "all_ok": true,
+  "at": "2026-10-03T23:35:26Z",
+  "label": "obs13",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$0l4OXakLzbm0dLJHM5n5AZ1BdVCyXpCipLJgv973KAE",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$L1llWO1JyCB4l-dlmyyhqFUn0DQVX1aj9iJjp9LX398",
+    "B_to_A_s": 1.02,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$2mJ5UuGO1Q3hBV2Mn3Fi2yqWmfRq_cZMf7xNd6TkRo4",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$4h1c-Pm8ENmzm2cQdkxrYpIK43zGTcXKSSyFPCVSzS4",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$I9lkLp0xUSAzmlLBGR8HXwarbBRkii643CSnesvl0Xs",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$R2vlmmNi8uOh1w07UnTgvmdjNxE3xB5llBTS9j8L36E",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$yMTbU201qZWu5aAYiyDpKMvu_muSVNqQ7phqB5fUdGc",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$OLbaWu0rPZfOImtmeySa-hO3bIz7b2pvlmeJ2lL7VIo",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$rZszbOs2IsWFv5J53FQp_8fFLnQ1iinHjazcsZ207kU",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$6_zqWohcbJJ7ygBexEIoo2hCi-xZ5ShfRdt_XeXy_jk",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs14": {
+  "all_ok": true,
+  "at": "2026-10-03T23:37:33Z",
+  "label": "obs14",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$RPUezXdR34XBV_yLC4BKlYdoVzWPPYmAaL9tjvOCb_o",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$pzbhFgnwdjTg89CjJPJ80A1Dnd3u2a7uhdkkvhcseDs",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$P9_EPPIQAQBqfJWu5I8sG533xACi5w57tRrFaLNugDE",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$hY6PIdIpTv-wh9pfLrN9yaZR0dFPdN9ol5XdDZhcYdA",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$3_W7BFdEsVVOHbJ_SCPjKjhMgcVCIoZJYZPGsup65eY",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$Cwcw1IQ1kZDfYY4bQ1sl4NaTAFUpq9uhgto_PI2wGsU",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$DEnzC9JRNW-5-EGNvLZeHdbYEH_DxwE2DB4XyFE-MjU",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$C3KAN-ChMea0_xQsfxa7jl4ogxiE2L-M9qjzwbwb_EU",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$cR9eBAk6lve_dOhSK_eKkzhkyK5PLJejGG1vLnZSPYw",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$ua3Bgi_B9-8e0bEe7H5nSSi8YgKFY3KLIV9n4C3tcaQ",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs15": {
+  "all_ok": true,
+  "at": "2026-10-03T23:39:40Z",
+  "label": "obs15",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$PxkOrADrU_sHPR5dneZnUzhgZsHK06oBxKkx05U3jVc",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$GbKnxBMDzMxb53VnJw2-W2EuWsun-JBj2U94YPZ2zN4",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$2q-Q06AZdIAQQiIp2dJrvbL6EhX_2maYbACK-jqfUsI",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$mfcbBx7kJNRs4suAPusKfLLecdH6wq2Dbx6IX6XZrOE",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$H31aW-RHjw-exrcL1tHUnKa4M0fA6xu-lBsoDUHa3qA",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$U2lHSap3iH9ErzIZznuRrIGKLRUo_UJXO8UCojDE-Xo",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$893A2djuXA8mxeuN8jR7VOhoBYIPgEEEDxTt6FxEO0s",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$0X41is5p14z3FcLw8AEHJWEUQe9fiZQUmXgrO77-GqQ",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$85pzo6DxaXE7Vw4-8YNa6NHIbkabhWxu4P2dV5lOjeY",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$uqO0xZ8LaXQZYW4O6H3DjoX9lA8DCufNMYTHUv_K37E",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs16": {
+  "all_ok": true,
+  "at": "2026-10-03T23:46:06Z",
+  "label": "obs16",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$eC1JTdn5OQNqNvzcCFyjUv3byHl7a4zFvCD1Y6nHq7o",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$ZKrWF2y6IeoibOdQ6ZCIjClrrZHztsO1juaKUFIuNM0",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$Uk0xAjZtZ6HBqe6a6YhT5vzLKQCXxldUewUXO9yf7uw",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$FwDiU_aOyfJpm2mgeoem3DPZfREND3TczN-F7gOSh3A",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$mUie6FbYF7WmVIGREVJvMXh32UObxYZDcSZPg42H0Yw",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$Qv1RldyrXarB-teA_3tR6P7iRsXvhA0Gw2EfpZq5bOY",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$MzfbuVY4LKqneL53Cd3TarrO9irgbZ1Xn45W_gU1674",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$icj3hv3opm1vU6VONdAhql3C7_0PrVExbB87bTRXuFA",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$_FUqg41IHoqO06mQ9Ki3vQ4Sl4tATRiNx6nVzmOfqhQ",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$97hC5LincVKT9e7-Qt-LwN8YhCzcW6SdHAXatHMybIg",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs17": {
+  "all_ok": true,
+  "at": "2026-10-03T23:48:13Z",
+  "label": "obs17",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$FhNhLjZtpcMKtqgQhN8bds6upj76lvze2g3Z-zUF0Ek",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$g9ZLvoWWev2_iauatJ3wx6M6U6zaeE4Qu6uNtJWHdLY",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$TC_vXeUu2xs7DVI95lJx0HIdE_6Ve97jRJRxdfgLnTc",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$Z67wwT3PfOZNNs-DICFAQ-Xw0dQtg0uui6AHQux2cKU",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$6ebymPkx2WYQRnzGnTfNjyYXKnF9t0vT1Jcc1RUiyuU",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$9B9iHV68s9nWFxgrp7unSfLPwLLWICe-gDAfTftT0Ew",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$ARE6UMucn8zGFgCdMD8UsfxZ7hgGWUQs8_pzlHWYFk0",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$QXgDMEDfKG-eUbbJTMyRrsfYRMGaTyP446pFifAGQkk",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$Kzo7g3KB3cuNVnCZaUL4mdwU76DigRVtrxGYKb4qU4k",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$FhmsTot1zy-yamHWXh0aqfpfhNXKJgBZ-SF1A_pvF-E",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs18": {
+  "all_ok": true,
+  "at": "2026-10-03T23:50:19Z",
+  "label": "obs18",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$sH8lfDKBa8Dju-EsZBInyL9m58vIyIiTXX3L--q4GLc",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$gZN96psex714H-Qw1PHsccHuIZ4Uawa8tU1Rf6w9Uxc",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$l7ODDTWCjeM4wrqYjO9vLF-LF0pWcm-pAZlvyhaRuMo",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$9bOaitwZa_Pu_t8p0Wzlerpkk7A5dg3LIQTda9JyqFk",
+    "B_to_A_s": 1.02,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$eanuwSSrsy36MDX5GETpo0F-ZJ1u-EoQbobmZk5raCk",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$aXv7TWrnTj63SJh92H60-olcxuLz0Yo698-bKGcO0Iw",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$UsrTi_TRIme0kFdhjhpI7KihrTukt6lNNJujxNI5X3M",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$0yAMH_gPugR0LvUmDtafjZOk64oWn8_w7S5rvxSeBv0",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$DJ_Td5W41IEoVxY8R8cfYujUB413Ia2OEuyPIZbcec4",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$IuPB6chAxRv63Wu1iuFcDSd7RVRwPKfGLWAjsrldO3s",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs19": {
+  "all_ok": true,
+  "at": "2026-10-03T23:52:26Z",
+  "label": "obs19",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$ejMOEAWJ5SJ1RNFuAw8acjRsJY6bAsjWZbs2ODTR8YM",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$8MU4ObrNYSHGQz7oDwwfhTqMiK0XfNP4NoVYgShgAlg",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$8SHtn4vLG9F6lzvLmmMTYpt74QWu7aR2-0-HClOQn_0",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$dJhD4V8LpZyvfnlnzqw7RuCEpsUOj48VY7nc7yEdApI",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$K-UHtOOcY2A2qqhfhcrUasOzvvh178hTjIV9UG2FOlI",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$GSZYaOc_dXwqZdkqN7OXDUcDmaDq3OAfOxwzgifbHFY",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$GvWLyzws3eql2l4H0aYIsf90A_0VQUriGA4GV_o6KiU",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$HvHXpMP4DtpX_RXgkSdFFJfnmk0VRb_zGpMuqt7ibX8",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$vfi0QLfjN53ipfAM6sfx8L6pHQVG7HIFwNBz2CJeetE",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$youwUz6zNO8I8Qd-gcXrwcepDJiTNT8JYRCdP8ZMgxQ",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs2": {
+  "all_ok": true,
+  "at": "2026-10-03T23:03:31Z",
+  "label": "obs2",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$awnjO9S32VWJZEG19zcv984VGKdWqdlAy6hqgxcJWLc",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$yP8EXshDbDm8MEt_ue8R58HscDsiLB_sPDoFXZZXfsM",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$oq4g1QV381uOwO0UtPkGjt_wToL8JleQ5oBLz_amQM4",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$jFwp88bSDOkC5Ku99nEbGXMxiu-Ivu7ZwS5cxkpPGRI",
+    "B_to_A_s": 0.52,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$mWQPGrNb7ztmIl6mfUmO_m4fwZEZ60mr3nk7Ut4bOss",
+    "A_to_B_s": 0.51,
+    "B_to_A_event": "$l2nL0zvoPmSY6zX6n_vEafXX_x3cNQkhlKleRCy-WBw",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$pK5WKtf53XXHMZ0nZ1PerHsLeAw77QQxRQgcz5dbMLk",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$G64HdZG22VPYDE31H2AVpsw2w7_SnrgmvKM3J4DNrwU",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$f_zFpTkc9fM_p_V12DIvP97V3yDWF-LNa72PR6JYIFU",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$DrrH2Zum1tERCPg0v9lhop30joX5kv_MTqfJRDTLodc",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs20": {
+  "all_ok": true,
+  "at": "2026-10-03T23:54:33Z",
+  "label": "obs20",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$z8I80xGWaYsrg1IHHTuz7m5upnyPUZGOLNooZw8F9t8",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$nT285ePLFPcIZgR43zxNjlMF4QQKKJ87nddmF3tiZds",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$A3oGI3mXTbW5RzJGUq6ItAefPcPAIMZBrK9udlmesOg",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$JCmMZJ1Z4XAk58GQOebJvSFS_wJshVNiFCNt7bxwkKg",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$w0p8XqyJgbAzuAGz5VlV_SuiGZLRoXMd65BsqZQuPF4",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$rr4bItj7xJwjIP2Y26r9bgURZG3TKdC_tMu7RPOA9GI",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$K797Po3wX0dEU3fpZgp7Zbb18WGOY16_ydKJAnRpY7Y",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$XrLJ27UbCdVZuDUu6L0gY0EUd_lHpYgwMIPuUaxIuNE",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$O4we0zRF1PyM7maYtjvyj87wClD0q010K7Tfvxj4amc",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$E3dAcCyDQHEdjFqJcYCt5cZQmYuSHxgxly9wqwydiQg",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs21": {
+  "all_ok": true,
+  "at": "2026-10-04T00:00:59Z",
+  "label": "obs21",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$kG1spXXVSTtJulwNRg1SuXAq_ZVH--PajGWPooVFWz4",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$SdMrMy2DYNu1no2gPGA5G2bHaSmDq1mBQDpQ6FuR7m4",
+    "B_to_A_s": 0.52,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$biZPl0ecLETmUxjNtfaz9Zfv_Ensf5xKG-OPAb3Yo-E",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$Btcrz1m6pQgChJt3hpvuIcBiMOrErLM9kds7YxXctYQ",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$gb4gKkpOo68f-HTLIkM1evTUeZfDS3rkjIEOF1ILcv0",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$hXYiNGzn8JUvudePaAklcp3ZeJBktggmA8JSZItuUm4",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$9Eot9NsJyGbMS7iami5uYsn3TZCvAkxT7w4_5RlOP_w",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$VgknL8RdBGDdATcQB9FWBineLL152qbZROz4rB9z4TE",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$1P8kJ69FpQ15OY60CvC5w27HIqSw9EorsEpbeRH_r8w",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$0BdRzf36Fq4wUO2R_jovL2baKPUzbCPYDImD0ohvJjE",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs22": {
+  "all_ok": true,
+  "at": "2026-10-04T00:03:05Z",
+  "label": "obs22",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$yRB5stNDa_sxgJgHowKSroYwv4F-buULMPk1W5nL2ZA",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$HtlKncDxPJDNB1MBHB64Fp4WhwYHotRO3K5hmaxkReI",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$_yPZFgpXFJ20v5QyAUnFHAPvX1cdBdJfH-Ri2a1oG64",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$rd2egWAi-d0xj1RIpROMullhLRNQpxUIXVPSsCdd2MI",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$8Bq68zeZET0odg4Fz48VH16NzH9e7IePsdSGXtGSjrI",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$AKAMT0n3eLb0bAm9Pa9IFL8En1yZ4BdGbN4XP_vCLbc",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$Nr2xBxITWPv4LdmolrhOdnH-0rWxlVQSfoiOesBo24Y",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$HRiTH-_AWh1nGjuybkJU3lO1sPFsCxfn6svvEcpeQNU",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$j7ONtYkViUjU1IR65tPLlUeAG_SGL4R7rXR30SYxi4U",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$TzYrd5FYHJbXFj_LFtSMtmERDGKKUg2c_iUm27ZYhl4",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs23": {
+  "all_ok": true,
+  "at": "2026-10-04T00:05:12Z",
+  "label": "obs23",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$59KrmwpqikmQ4scfMD10JLeCjvPXyrCN_iPyS3HZ3_o",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$LYBYWe1hy3-AGDyZGEioOBRKoS4mIFsiGb3Pi_6ffn4",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$SwKR9Mv3nsc1wjCMKC0ZKJzpCG1l91W8y78JwHcxAC8",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$r0Hro6So4aZt6-fet7BTJgPX9uzC5D1lsCiwhOXzmnA",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$Uw9d6zYk4RzmKTdFbufwIZiNLwdRwtJ5QTX97399TQs",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$Iaba0FKtELtZ6hEf1G7oodDimvK72Roa58jIV92U1MA",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$YWkDJLkM8X8Wrsr91FjJxkC10sMygOG0JCNydZvVfpU",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$GXOUvqn5X8GeL1onzY0L4mfiFyeK4oXdN_xX7MGXeHs",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$v6ducvKfvLOz_iCIZrRBZRq-o13_Z_wFdkrIOZeA4Fc",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$8KulEwJ1CIt-BcYfzoBkkZMQqDKe4CnoPSpPm_O64mw",
+    "B_to_A_s": 1.02,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs24": {
+  "all_ok": true,
+  "at": "2026-10-04T00:07:19Z",
+  "label": "obs24",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$bPtEBPu8W1PWedKyKjRlhSKm5b0Te-esTaUWjp_s3DQ",
+    "A_to_B_s": 0.51,
+    "B_to_A_event": "$NgucmoQDf0YUk7S8pyIbYHRNV7NyK_GuVN4qmOjttDU",
+    "B_to_A_s": 0.53,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$-SPKZCBJiQoBcuMU9J04sj9YMYoFwuI7_Af0lIyFURE",
+    "A_to_B_s": 0.51,
+    "B_to_A_event": "$t2HEBCD7NlizcTXHrKeiK4UHAd4fjmMIOLU-WugBwac",
+    "B_to_A_s": 0.52,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$bwzJqZKW3ktGksVx-nBE1VbvQJl8NUhoVtMGf85L4OA",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$lk7N7RaU45rM-iBaFXsULP1dJd35PAbKHvaF27tdxcQ",
+    "B_to_A_s": 0.52,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$PQs1_L4yUMs43tqsAwVBnK7x0gQqkHxtEV6d1xMaTEs",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$yuJHOW51RankC-oqu_K9JM-sQkYuHuhTKjLCd1aEM8U",
+    "B_to_A_s": 0.52,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$KwD9sEsSGdNOkSuTxB0USX15z-V_pBQQ_pClfjmw6hA",
+    "A_to_B_s": 0.51,
+    "B_to_A_event": "$OVhFUqKqdmbiIziz8KNlhhcJhT7iBIBdpf6ujeeNVnQ",
+    "B_to_A_s": 0.52,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs25": {
+  "all_ok": true,
+  "at": "2026-10-04T00:09:26Z",
+  "label": "obs25",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$YihQyPKON5562jnHqcYG79cOxnJKx6sMv0CkLY2UyEo",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$kyT0j_cSPY3V2OyswDuHxi1BeBTVlOiP7EaprjGR-D4",
+    "B_to_A_s": 0.52,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$WortSGNVV1N4gtpvpcIEFEYR9vvCDJfF8o6LFKsOSLw",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$VcBS1rLPJtgJgxOJyl5__fhSwUdSL0YuQNRPg4vyiOs",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$blUYmb9MP_R960-FTk4kCkp3aehETrSnP62I6O2DPdQ",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$WKymEVHhTBzyhRTRqt9SDmOtwdM51RdLHq-KmvgH7kk",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$gIQ2P4IRjyIcauNgfxlhD1HAWdOePYfNdBYY2mdqX50",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$MyqV7xFMBgG6VnJ4L2jCIf6GfMoXSc7QvXVqVPkdfZA",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$X0_-yZe_Kd0z9ojSHBbEINJyIOqcoGgI_mQ50ZPg_us",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$S1dJ2G1N-fTLKNrGvjosdA0N__Q2mNfSTRUimkcizF0",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs3": {
+  "all_ok": true,
+  "at": "2026-10-03T23:05:38Z",
+  "label": "obs3",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$gEq5_APWqrOeXg5vXexX5lW-wpqMHYdLHJyhKBHNK5E",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$EofX4OvAHlfK_dNRS4_8KK6vmqnFqpW75Q6OJtgaZqs",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$EGZF0Z6h0C1LLul9LrSZwoNAcHKntnyjzeXdY-zlfU8",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$_S2lIdaDm38whzuCnEMIUSjfY2DfH-ir6fJ16mqN--Y",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$_MyvjCN378AwKuB5md-ieSQg5nKKkkXkiwGqIhFwFIY",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$6nvSgEOvJK5rRzrIfz3gZckd6hr4nBGr-_hOJCNP4Tk",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$yH39L_H5SJYGKs9Wmsm02vlEM-Q10XtWbJuYufzA4QM",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$fgx4IoDbxfvrjgo2V7rgzymrIi9sQEAg7a5sH1vRNtk",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$24pyzmzBF6vmUh7t93x8l8D5lA2b3UEO02Yn5MM02Fw",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$CYIFRRKBAYPZpowzcuFVxqLEsvCFaPcieFmTbdfgVK8",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs4": {
+  "all_ok": true,
+  "at": "2026-10-03T23:07:45Z",
+  "label": "obs4",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$3fErxe2h_d3z5m_k1lXVVEhA1ekVjpodhVVVLalc-8U",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$TVQZaTt6uXTAOts2HnPsOr_DoGsyG7CyiVhfxA-77Hg",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$zxDSnNcUR648FzeKDWOMQi5oxKRnMfLPBPV_2EO09Qc",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$C90NdMpYMMuCtIhsMiQifxQbDKFzANpZLtgptL40ZZQ",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$abjtuUUHrnFDMLKZLL64GLr37cuBC6tns7StoSJreMY",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$4_BQ8B6sG2UGmZdS7RjK1Ha4TqgGGayweZE9N3nth_U",
+    "B_to_A_s": 0.52,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$VTtrwoCSDGTpxettSeYfkRBhB2mPSGPf83wLjDvRx2Y",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$FUheq2AicIxwCpeud8LXlNlS7fioKjBEZ2c9qfOumLA",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$tUlsoN--x_BnN_7k2tLti8O-UGLct7KbFFXtEoUND3g",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$ULwDD-CDFmSO-La3LQluDzF4_W2J2ZvRi2bGdz1f1Cc",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs5": {
+  "all_ok": true,
+  "at": "2026-10-03T23:09:52Z",
+  "label": "obs5",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$1dc3v_vAPPlVzDDpRnobsqU0lB3f1h-AKsqqpVB1yck",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$D0q28enKLKOuC8ivjNyRojCjVBlooQrV8q3vFfwlSmI",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$iIn_QQ3NO5CrMpboqqw1cd2-i-Glq-cZB6oUdtzeNpQ",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$dbAbvE-lK3P4MYZaCMIcyMnLfINXxJmkGrOPAErEAcY",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$J_54twhPJA1kobXqIjsoz5yU3ZX52vxyPNrwaKkZzTw",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$_9gTW6PXGMc-kqKaGTsQ9r6pt8RtwgmBOBfquSfRqMI",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$pUy4f9mLl6nwBE6Y26vd7t-eqo9hIPhRMZ5AET9IO94",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$gKZmGlteK6u8ybKqdFbHGtvDaDPNLXpaa1-VOLby85E",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$xme9kP_P_pInaWJXPeZVy0zbXYXl4B8C88HfOZV6SWQ",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$tGop2tEYbgqnmD92CpUceHyDeItj_QQ6trbs54Kj3Rk",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs6": {
+  "all_ok": true,
+  "at": "2026-10-03T23:16:19Z",
+  "label": "obs6",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$LoW-mLmyhEDLXFMzry8V-bkTv7NNvKMbbQ6w1Jfnzh0",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$zdimYEzGFDd2M8JAuJ9DfgD_K-31MIe7gUiRmQ6YTXs",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$YeYjFT0XjfuXFJbAD_6ybngTd9zacgx7cbYJMoYgpKQ",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$mzYZcMFnJIzDkbsZJb7lpci_2IpVGJytdDPMZZnvjRA",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$qLrHN-x44I3nhOTL805VT2DSaT6XG3QxiUz6wWRi5B4",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$S84lT0ybC2aaE7RM3nW3jto4zurPCHXWOlT_GnfbOTs",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$5LEyPbnY0h_1l1G4tKI0vxkRgrLnBI3aB03Dxn4gbJg",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$pFDIU2TF7kMPDwAKOb45_CXctx6H3RkWdwfSxXc4lOc",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$HpxT7FS_fuSlikZKlATjXrvG_vdifqWDThYQwp-RSWU",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$u8s_mvJEEvjVw1VvbIefbn8XzT6rZL9XeDcoUoiyK_U",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs7": {
+  "all_ok": true,
+  "at": "2026-10-03T23:18:26Z",
+  "label": "obs7",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$CI3iiJ9W2BS55ZBWo0PlqzLYx3Splv7IrmVLatKSqFQ",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$B7MHaSlwP4D1jC6hFqS4a8qh8j26EAmnaCYXKLnqYi8",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$lKnrYvVliw6QinQfx_-l7xJa_UGyw6l1FaX1GBfBGsw",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$93a82fiNPoH55N8ApqvnLliddliLCYeqq4GravgG1Ho",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$g1jcI-JMi1HCQ-xUQFWLjWgIkv6hSRK70N6MwMUnnDY",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$5ditYnvescfLdoICl6YCn2wOsw1gJn9wb4IMqogzoGE",
+    "B_to_A_s": 1.01,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$_VQ2i6VVyZsBEEmk1B8sSSJpisYAGJLzrK7z4OtEWu4",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$JQaJ0rb8ohBTy9NR-dq4d6K9_Hwo_5Hz_5VFhomBk9s",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$x5d1og6-98EJjrXZ9EjtYA3DD19xelawdu9XQZrhxTc",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$9MB_QxgBFhzcDRiUb97-mJMIJt9YmxZGN7yKP3eXSDM",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs8": {
+  "all_ok": true,
+  "at": "2026-10-03T23:20:33Z",
+  "label": "obs8",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$cwjK0UFSp4eFoltNDjGnsbV2XHa45ulTUoVzcHQTwlM",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$96AZA8i6wW6LaRC7Zdf71gTBDzeksq8M8eRhKJ2Qe0Y",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$R25Q2K6nRARvrIyI115f3TbZREl1gZr1yjtIR8R-1hY",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$IB3qt9arPRckchMuTiEDo3Qbg9BSTV3TSi6-lVtX51w",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$b-uIPtQPq5w8EvvO7pZACywzMkuBmoOWliDU_MGzcYE",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$63pjayqdL4yYDKNileySbp3gxvyyYbiEAU0PjEC0z9o",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$by8anL9XcricQSa3pF1d4KWGxwHVkBSkSoWPJXQ90CA",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$OvG8P_wmgNCr4BgE9QIzrSaL0lDCR2BHAgr6t-O3uvU",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$OER5-5ZWdyp1AOom5tPZNvig-FTivkTphB1ee207ZTc",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$3bddZuNK8BLrFwsL9s9JNIFpNDqWbLy0ZAKoTKFHKvE",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "pingpong-obs9": {
+  "all_ok": true,
+  "at": "2026-10-03T23:22:40Z",
+  "label": "obs9",
+  "rooms": {
+   "encrypted-v10": {
+    "A_to_B_event": "$bLBhDRjUTggwdRM2NJOEnh-GmM2xu6uF1Ypl2H6KK2M",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$DWpUaLWr4z72_uDobDxGkwxNdT-gAtvB_uMErToKG5c",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "history-v10": {
+    "A_to_B_event": "$j28eHSRD5U5yq19w9-fJPt6pqs1Qpl2H7qnXx_jKi1c",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$vfZyShzZ4X7AvvuhIbjj9cLqgzW9mfZO6whlvWg85g0",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v10-general": {
+    "A_to_B_event": "$AwJL0_ojZgtyO8vKCBmNXmUjw1oD-Z1iITqRkgN6EXM",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$zTvxXdgH3QCr3CwzZZwIYtjDZnNhYl3xN4-GB11vLNg",
+    "B_to_A_s": 0.51,
+    "ok": true
+   },
+   "v6": {
+    "A_to_B_event": "$eEi_BxWeDt42MmJUQYQu4TjwOY1zKEs2Q4l5eJAuh20",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$B8EPmQof1CKNmQkzIjSDDtRmtwYk3T4udRxiCkKSHGY",
+    "B_to_A_s": 0.52,
+    "ok": true
+   },
+   "v9": {
+    "A_to_B_event": "$7_uh6Q8t1PSSncDh7p42a7nZcCtclh_PBf20HAM9TQs",
+    "A_to_B_s": 0.5,
+    "B_to_A_event": "$IfbV4_hPE8hmska64ncNpl2Iw_3EowH1MvwyfBq8FmA",
+    "B_to_A_s": 0.51,
+    "ok": true
+   }
+  }
+ },
+ "statechange-obs10": {
+  "all_ok": false,
+  "label": "obs10",
+  "rooms": {
+   "encrypted-v10": {
+    "A_event": "$ra2AGc4ZMO4gV3b9g_-uegrTjFracVW1bqk6i5PyxB4",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$hEA_5G6t3nr2Ru41x5yXYO7So79J6fr6Uyp3rihv5Kc",
+    "B_seen_by_peer_s": 0.51,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   },
+   "fork-v10": {
+    "A_error": "403 {'errcode': 'M_FORBIDDEN', 'error': '@drill-b1:reilly.asia is not in !XQcGaGIqHToDSLojtJ:reilly.asia'}",
+    "A_event": "$j2h9WYhDI9rWR4h-tshX5f7wd3_DhwIhVoy8rRqibnU",
+    "A_seen_by_peer_s": null,
+    "A_topic_on_A": true,
+    "B_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such room'}",
+    "ok": false,
+    "power_error": "403 {'errcode': 'M_FORBIDDEN', 'error': '@drill-b1:reilly.asia is not in !XQcGaGIqHToDSLojtJ:reilly.asia'}"
+   },
+   "history-v10": {
+    "A_event": "$0Yx3pwx6zvMo9bhPBVFmJRcQrUAiDfHSuiZtNvkCGzU",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$n14EAQgf1aUl7xwIaSbVi5z3ppl9TeLz8br7quywS8I",
+    "B_seen_by_peer_s": 0.52,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   },
+   "v1": {
+    "A_error": "403 {'errcode': 'M_FORBIDDEN', 'error': \"You don't have permission to post that to the room. user_level (0) < send_level (50)\"}",
+    "B_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such room'}",
+    "ok": false,
+    "power_error": "403 {'errcode': 'M_FORBIDDEN', 'error': '@drill-b1:reilly.asia is not in !GfNVdgJhOhlvfXUHSK:reilly.asia'}"
+   },
+   "v10-general": {
+    "A_event": "$rZ38pJYY-l9FDw2qDm0gqysF2IcNN_oD3ISM2yTg5Gk",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$oo3w5RkDMsAzEcwUMpygGTSfPRnx9js07dQ6i8E6PKc",
+    "B_seen_by_peer_s": 0.51,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   },
+   "v12-witness-created": {
+    "A_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such event'}",
+    "A_event": "$idXaR4XsSRJaBixYKP4L2Aoc67s2OcuBOv_fp7Q_NHA",
+    "A_seen_by_peer_s": null,
+    "A_topic_on_A": true,
+    "B_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such event'}",
+    "ok": false,
+    "power_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such event'}",
+    "power_on_A": true
+   },
+   "v6": {
+    "A_event": "$bHLjPiHA3aoUzfi4XlRoFZFecXbT1fl2lduidczz0mI",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$kgONocVs6ZLyr8vBaNQLUpgki0Pk9g2kGBWGl_arzeI",
+    "B_seen_by_peer_s": 1.01,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   },
+   "v9": {
+    "A_event": "$Ha5oFUBTNxOiPD4Wom5ezIb4luVBzoJCQhbjuj1i8Kw",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$lCzBWqUb_eTkZoF26WGEs75EKLTbx7TfgsiVvQuMrzs",
+    "B_seen_by_peer_s": 0.52,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   }
+  }
+ },
+ "statechange-obs15": {
+  "all_ok": false,
+  "label": "obs15",
+  "rooms": {
+   "encrypted-v10": {
+    "A_event": "$jiHj8iMK5oBfb8a579jVKCMyJ0npu5qVJcq5eVHP5LQ",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$moabSlkae0s9wRGAKVkmiolxvptm0fyKg_GlBFuO4Y8",
+    "B_seen_by_peer_s": 0.51,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   },
+   "fork-v10": {
+    "A_error": "403 {'errcode': 'M_FORBIDDEN', 'error': '@drill-b1:reilly.asia is not in !XQcGaGIqHToDSLojtJ:reilly.asia'}",
+    "A_event": "$Vn6W-sDz_vZQ-Lc7ZFGBRXIaNR5sSdn-FaoGpD4mzPo",
+    "A_seen_by_peer_s": null,
+    "A_topic_on_A": true,
+    "B_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such room'}",
+    "ok": false,
+    "power_error": "403 {'errcode': 'M_FORBIDDEN', 'error': '@drill-b1:reilly.asia is not in !XQcGaGIqHToDSLojtJ:reilly.asia'}"
+   },
+   "history-v10": {
+    "A_event": "$HqesjLUzxruSd3qk90G5eZmjASrupiz5hwuX5wtwDMY",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$qe70iAOn8PwtA3yqkufATnU_3v5H65-JTjnpY1ZhM_s",
+    "B_seen_by_peer_s": 0.51,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   },
+   "v1": {
+    "A_error": "403 {'errcode': 'M_FORBIDDEN', 'error': \"You don't have permission to post that to the room. user_level (0) < send_level (50)\"}",
+    "B_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such room'}",
+    "ok": false,
+    "power_error": "403 {'errcode': 'M_FORBIDDEN', 'error': '@drill-b1:reilly.asia is not in !GfNVdgJhOhlvfXUHSK:reilly.asia'}"
+   },
+   "v10-general": {
+    "A_event": "$0TD4NRIXAaL906P7_MbD9KuaFJtuA6SRFmYJaVo7cRU",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$lFNd9GcVtQIyqPpsdybB2_yc-rw0DKsJJCjy2suKdzo",
+    "B_seen_by_peer_s": 0.51,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   },
+   "v12-witness-created": {
+    "A_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such event'}",
+    "A_event": "$9Erpvi0DGhyNRagtVgfw49446UfNmYwUMJ6V6Uk72SY",
+    "A_seen_by_peer_s": null,
+    "A_topic_on_A": true,
+    "B_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such event'}",
+    "ok": false,
+    "power_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such event'}",
+    "power_on_A": true
+   },
+   "v6": {
+    "A_event": "$RWGWax1YevQuvM4Mz22BwsRt2xv6rwoUkYW0oByisGU",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$DgH5c1nnvz_yarzcHdwt_n_61hMMftYXtI4_3oYbw2A",
+    "B_seen_by_peer_s": 0.51,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   },
+   "v9": {
+    "A_event": "$lcUR9JBCVzzdz7lpUBfOrlMDEUR5-1JF6edRiL7ob3Q",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$lp7Kt9m0puDN82CM7BTYh35PkxSjnH05s9-6v3PY44w",
+    "B_seen_by_peer_s": 0.51,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   }
+  }
+ },
+ "statechange-obs20": {
+  "all_ok": false,
+  "label": "obs20",
+  "rooms": {
+   "encrypted-v10": {
+    "A_event": "$2xcMXkMa5xCE-_c6zgmevk-OFMgGiL2udC07wyrPzuc",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$P9iSZKC4fLpFoe_LRLy4pqlU4pAtusoHGUSmy1fwgrQ",
+    "B_seen_by_peer_s": 0.51,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   },
+   "fork-v10": {
+    "A_error": "403 {'errcode': 'M_FORBIDDEN', 'error': '@drill-b1:reilly.asia is not in !XQcGaGIqHToDSLojtJ:reilly.asia'}",
+    "A_event": "$EKSuIPV8RIj54gyYCLd_bHwB_U-lwEYttqh2BT5COvU",
+    "A_seen_by_peer_s": null,
+    "A_topic_on_A": true,
+    "B_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such room'}",
+    "ok": false,
+    "power_error": "403 {'errcode': 'M_FORBIDDEN', 'error': '@drill-b1:reilly.asia is not in !XQcGaGIqHToDSLojtJ:reilly.asia'}"
+   },
+   "history-v10": {
+    "A_event": "$qANvTVwnwoLcZttbfOkkePBXtPSwXMVJqfmu13P7pRc",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$j988pco0R0sfl2jWbS44uWOKSDhpBzrJ4Wk5KOwVGzY",
+    "B_seen_by_peer_s": 0.51,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   },
+   "v1": {
+    "A_error": "403 {'errcode': 'M_FORBIDDEN', 'error': \"You don't have permission to post that to the room. user_level (0) < send_level (50)\"}",
+    "B_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such room'}",
+    "ok": false,
+    "power_error": "403 {'errcode': 'M_FORBIDDEN', 'error': '@drill-b1:reilly.asia is not in !GfNVdgJhOhlvfXUHSK:reilly.asia'}"
+   },
+   "v10-general": {
+    "A_event": "$RxI4dXVdE38wOpe5JNty2jWwuEaZxjwBQOTcOsoYz4g",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$b6uLMFbpXiXAbr52XjRGfFnNTeEkEpDkxWoJGZydIxU",
+    "B_seen_by_peer_s": 0.51,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   },
+   "v12-witness-created": {
+    "A_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such event'}",
+    "A_event": "$2EpRKIIg7YgU-VP1h6zFmfEJan5AOXIDpO62is1VJ1k",
+    "A_seen_by_peer_s": null,
+    "A_topic_on_A": true,
+    "B_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such event'}",
+    "ok": false,
+    "power_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such event'}",
+    "power_on_A": true
+   },
+   "v6": {
+    "A_event": "$KVThfEDy-UAu0guUB13ftr80nYAc36nekB4bvnP_ke0",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$_26_9M6fNOQNPboJW-9bNLzDsHtoZTwM_hEcd81BqyA",
+    "B_seen_by_peer_s": 0.51,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   },
+   "v9": {
+    "A_event": "$bZNdDZr8VJ3UAnDbkBhdwAJy0JffAu56f-IKo2Lhqpk",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$T_GJI49nKGcYuj0jzvjFeR1IngqsIFY2ZAnSMTzkyOs",
+    "B_seen_by_peer_s": 0.51,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   }
+  }
+ },
+ "statechange-obs25": {
+  "all_ok": false,
+  "label": "obs25",
+  "rooms": {
+   "encrypted-v10": {
+    "A_event": "$Qkc4fmyjaXjHSc9lvn1GIrmPAw5jPn1DG5rInH1Z8xg",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$A6rbZ43SSbIosJy74uGqdf2jbYRKXuSa35H5T3n7CNw",
+    "B_seen_by_peer_s": 0.51,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   },
+   "fork-v10": {
+    "A_error": "403 {'errcode': 'M_FORBIDDEN', 'error': '@drill-b1:reilly.asia is not in !XQcGaGIqHToDSLojtJ:reilly.asia'}",
+    "A_event": "$L-cDeljnqhKHpfMg9A6OHmhVkSWD0ExD3VaIq3eB7p0",
+    "A_seen_by_peer_s": null,
+    "A_topic_on_A": true,
+    "B_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such room'}",
+    "ok": false,
+    "power_error": "403 {'errcode': 'M_FORBIDDEN', 'error': '@drill-b1:reilly.asia is not in !XQcGaGIqHToDSLojtJ:reilly.asia'}"
+   },
+   "history-v10": {
+    "A_event": "$fy_wrCXkotezeUjJEnfC4lInZrcuaXF7hotC2vCzEzg",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$J0aIu9ouAGx6q3Jhbc4qRsvCuenWzATtQ_MHt2W5UWg",
+    "B_seen_by_peer_s": 0.52,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   },
+   "v1": {
+    "A_error": "403 {'errcode': 'M_FORBIDDEN', 'error': \"You don't have permission to post that to the room. user_level (0) < send_level (50)\"}",
+    "B_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such room'}",
+    "ok": false,
+    "power_error": "403 {'errcode': 'M_FORBIDDEN', 'error': '@drill-b1:reilly.asia is not in !GfNVdgJhOhlvfXUHSK:reilly.asia'}"
+   },
+   "v10-general": {
+    "A_event": "$h3AT4gpDHz-Gi628Aw-MDvG-7-_VZmgvaqDIMqOXq0k",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$KI-yggIb1i6JtGIB3ElInA_DYt8Rqq2MQ-e4dcTTlS4",
+    "B_seen_by_peer_s": 0.51,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   },
+   "v12-witness-created": {
+    "A_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such event'}",
+    "A_event": "$QMSwYSn6K0B-6ZRVv49LRqiSz_-caKN3qgLpbLc8ub4",
+    "A_seen_by_peer_s": null,
+    "A_topic_on_A": true,
+    "B_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such event'}",
+    "ok": false,
+    "power_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such event'}",
+    "power_on_A": true
+   },
+   "v6": {
+    "A_event": "$9swLpbZfE5l6f1ORtHU-jcSALT3xkJ9BC8fNVlvniac",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$BmzWDPemBanIjyLm_gTpxAc-Y-bvtRbMfOuoxMZ4Cus",
+    "B_seen_by_peer_s": 1.02,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   },
+   "v9": {
+    "A_event": "$-nHuyY227k963u3TbzD52HlKHKOiTAR_U8DUTTwq60Y",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$k4IJ5GEJ4XI-uhcKyeXXomw_5qtVaxm0wLLTuj_8-UU",
+    "B_seen_by_peer_s": 0.52,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   }
+  }
+ },
+ "statechange-obs5": {
+  "all_ok": false,
+  "label": "obs5",
+  "rooms": {
+   "encrypted-v10": {
+    "A_event": "$wuVkRaBcx_yqHKSPS7gsNW-naKUJdOT5c9K8V4N2EKE",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$ueVvzg0W6xv0T-cRStXeujqKDvEembRx3DySaQ02G3g",
+    "B_seen_by_peer_s": 1.03,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   },
+   "fork-v10": {
+    "A_error": "403 {'errcode': 'M_FORBIDDEN', 'error': '@drill-b1:reilly.asia is not in !XQcGaGIqHToDSLojtJ:reilly.asia'}",
+    "A_event": "$7nTjK5gl1VTOeTsqXKVCXKhoi9Sp4ikXuEbER1ioSLc",
+    "A_seen_by_peer_s": null,
+    "A_topic_on_A": true,
+    "B_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such room'}",
+    "ok": false,
+    "power_error": "403 {'errcode': 'M_FORBIDDEN', 'error': '@drill-b1:reilly.asia is not in !XQcGaGIqHToDSLojtJ:reilly.asia'}"
+   },
+   "history-v10": {
+    "A_event": "$KWoWmf34383BQ0hEfufALkUKgAyoSF8NCdzFOjbSZTg",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$PHsLC8Dst8Uyp0ZUXSJB7x7lvJWnXxFQrfG_ymZpfZ8",
+    "B_seen_by_peer_s": 0.51,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   },
+   "v1": {
+    "A_error": "403 {'errcode': 'M_FORBIDDEN', 'error': \"You don't have permission to post that to the room. user_level (0) < send_level (50)\"}",
+    "B_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such room'}",
+    "ok": false,
+    "power_error": "403 {'errcode': 'M_FORBIDDEN', 'error': '@drill-b1:reilly.asia is not in !GfNVdgJhOhlvfXUHSK:reilly.asia'}"
+   },
+   "v10-general": {
+    "A_event": "$aRzO2zkb7fZrSAF0ZtefFlieSc4WFFhythoxNLAtVyo",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$wUkLxKcr1439Q--E3xHAO9JFQU_jyA_fzx8ixLVmCtE",
+    "B_seen_by_peer_s": 0.51,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   },
+   "v12-witness-created": {
+    "A_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such event'}",
+    "A_event": "$aZ9wXskZyFDt_xQdRJ2oudqAB4qGQJTcvSIStDvmT2w",
+    "A_seen_by_peer_s": null,
+    "A_topic_on_A": true,
+    "B_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such event'}",
+    "ok": false,
+    "power_error": "404 {'errcode': 'M_NOT_FOUND', 'error': 'no such event'}",
+    "power_on_A": true
+   },
+   "v6": {
+    "A_event": "$TrbGTA6j9r4GjZqkhURmvRwBVYkAbncsIHNeWBato4s",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$mosxqsFx_sxSn0gBR-Z9dEsPrvZc7MoVpN8olRVdHkg",
+    "B_seen_by_peer_s": 0.51,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   },
+   "v9": {
+    "A_event": "$XOVhPL7LOl3QOeQsp0Oi1fEz1QNoubL3VyOl0qYIGKs",
+    "A_seen_by_peer_s": 0.5,
+    "A_topic_on_A": true,
+    "A_topic_on_B": true,
+    "B_event": "$FFV7D1wbx7_a1bkjsLlVs4runQ-l3ZUSfkUayOSfcS8",
+    "B_seen_by_peer_s": 0.51,
+    "B_topic_on_A": true,
+    "B_topic_on_B": true,
+    "ok": true,
+    "power_on_A": true,
+    "power_on_B": true
+   }
+  }
+ }
+}

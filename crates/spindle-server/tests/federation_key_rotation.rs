@@ -9,6 +9,9 @@
 //! nothing; and a request signed with a retired key is refused, because a
 //! request is made now.
 
+#[path = "support/federation_auth.rs"]
+mod federation_auth;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -146,6 +149,7 @@ fn now_millis() -> u64 {
 struct Harness {
     _dir: TempDir,
     app: axum::Router,
+    store: Arc<FjallStore>,
 }
 
 impl Harness {
@@ -157,8 +161,12 @@ impl Harness {
              [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n",
         )
         .unwrap();
-        let app = spindle_server::app(config, store).expect("the app builds");
-        Self { _dir: dir, app }
+        let app = spindle_server::app(config, store.clone()).expect("the app builds");
+        Self {
+            _dir: dir,
+            app,
+            store,
+        }
     }
 
     async fn call(&self, request: Request<Body>) -> (StatusCode, Value) {
@@ -266,18 +274,27 @@ impl Harness {
     }
 }
 
-fn join_signed_before_rotation(peer: &RotatedPeer, room: &str, prev: &str, at: u64) -> Value {
-    peer.event_signed_with_retired_key(json!({
-        "type": "m.room.member",
-        "state_key": peer.user(),
-        "sender": peer.user(),
-        "room_id": room,
-        "content": { "membership": "join" },
-        "origin_server_ts": at,
-        "depth": 10,
-        "prev_events": [prev],
-        "auth_events": [],
-    }))
+fn join_signed_before_rotation(
+    store: &Arc<FjallStore>,
+    peer: &RotatedPeer,
+    room: &str,
+    prev: &str,
+    at: u64,
+) -> Value {
+    peer.event_signed_with_retired_key(federation_auth::with_auth_events(
+        store,
+        json!({
+            "type": "m.room.member",
+            "state_key": peer.user(),
+            "sender": peer.user(),
+            "room_id": room,
+            "content": { "membership": "join" },
+            "origin_server_ts": at,
+            "depth": 10,
+            "prev_events": [prev],
+            "auth_events": [],
+        }),
+    ))
 }
 
 fn only_result(body: &Value) -> Value {
@@ -294,7 +311,8 @@ async fn an_event_signed_with_the_retired_key_before_it_expired_lands() {
     let alice = harness.register("alice").await;
     let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
 
-    let join = join_signed_before_rotation(&peer, &room, &head, expired_ts - 60_000);
+    let join =
+        join_signed_before_rotation(&harness.store, &peer, &room, &head, expired_ts - 60_000);
     let (status, body) = harness
         .deliver(&peer, "t1", vec![join], &peer.current)
         .await;
@@ -321,7 +339,8 @@ async fn an_event_claimed_after_the_key_expired_is_refused() {
     let alice = harness.register("alice").await;
     let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
 
-    let join = join_signed_before_rotation(&peer, &room, &head, expired_ts + 30_000);
+    let join =
+        join_signed_before_rotation(&harness.store, &peer, &room, &head, expired_ts + 30_000);
     let (status, body) = harness
         .deliver(&peer, "t1", vec![join], &peer.current)
         .await;
@@ -338,7 +357,8 @@ async fn a_retired_key_published_without_an_expiry_verifies_nothing() {
     let alice = harness.register("alice").await;
     let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
 
-    let join = join_signed_before_rotation(&peer, &room, &head, now_millis() - 120_000);
+    let join =
+        join_signed_before_rotation(&harness.store, &peer, &room, &head, now_millis() - 120_000);
     let (status, body) = harness
         .deliver(&peer, "t1", vec![join], &peer.current)
         .await;
@@ -356,7 +376,8 @@ async fn a_request_signed_with_the_retired_key_is_refused() {
     let alice = harness.register("alice").await;
     let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
 
-    let join = join_signed_before_rotation(&peer, &room, &head, expired_ts - 60_000);
+    let join =
+        join_signed_before_rotation(&harness.store, &peer, &room, &head, expired_ts - 60_000);
     let (status, body) = harness
         .deliver(&peer, "t1", vec![join], &peer.retired)
         .await;

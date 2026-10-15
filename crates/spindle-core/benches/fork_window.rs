@@ -12,7 +12,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use spindle_core::{EventId, EventInput, LogEntry, RoomLog};
+use spindle_core::{EventId, EventInput, LogEntry, MemStateKeyTable, RoomLog};
 
 /// The pre-#30 walk: every ancestor of every tip, back to the room's first
 /// event, then intersect.
@@ -53,7 +53,7 @@ fn exhaustive(room: &RoomLog, tips: &[EventId]) -> usize {
 /// A linear room of `history` events with a two-event fork at the tip — the
 /// shape a concurrent send from a legacy peer actually produces.
 fn room_with_tip_fork(history: usize) -> (RoomLog, Vec<EventId>) {
-    let mut room = RoomLog::new();
+    let mut room = RoomLog::new(MemStateKeyTable::shared());
     room.append_local("$genesis", None).unwrap();
     for number in 0..history {
         room.append_local(format!("$live-{number}"), None).unwrap();

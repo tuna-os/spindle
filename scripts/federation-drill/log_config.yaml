@@ -1,0 +1,21 @@
+version: 1
+formatters:
+  precise:
+    format: '%(asctime)s - %(name)s - %(lineno)d - %(levelname)s - %(request)s - %(message)s'
+handlers:
+  console:
+    class: logging.StreamHandler
+    formatter: precise
+loggers:
+  synapse.storage.SQL: {level: INFO}
+  # Signature, key and event-rejection messages are what section 4.6 of
+  # the drill plan looks for, so the federation loggers stay at DEBUG.
+  synapse.http.matrixfederationclient: {level: DEBUG}
+  synapse.federation: {level: DEBUG}
+  synapse.crypto.keyring: {level: DEBUG}
+  synapse.handlers.federation_event: {level: DEBUG}
+  synapse.event_auth: {level: DEBUG}
+root:
+  level: INFO
+  handlers: [console]
+disable_existing_loggers: false
