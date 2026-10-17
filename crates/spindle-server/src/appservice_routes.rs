@@ -4,7 +4,7 @@
 //! application service proxy in [`crate::appservice_proxy`]. The ping endpoint
 //! allows an appservice to check whether this server will answer if called.
 
-use axum::extract::Path;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
@@ -17,8 +17,8 @@ use crate::errors::MatrixError;
 ///
 /// An appservice pings its homeserver to check connectivity.
 async fn appservice_ping(
-    axum::extract::State(state): axum::extract::State<AppState>,
-    axum::extract::Path(appservice_id): axum::extract::Path<String>,
+    State(state): State<AppState>,
+    Path(appservice_id): Path<String>,
     headers: axum::http::HeaderMap,
     body: Option<Json<Value>>,
 ) -> Result<Json<Value>, MatrixError> {
