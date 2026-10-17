@@ -9,6 +9,7 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{Value, json};
+use reqwest;
 
 use crate::AppState;
 use crate::errors::MatrixError;
