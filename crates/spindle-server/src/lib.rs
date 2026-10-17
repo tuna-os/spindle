@@ -15,6 +15,7 @@ pub mod admin_media;
 pub mod admin_tasks;
 pub mod admin_ui;
 pub mod appservice_proxy;
+pub mod appservice_routes;
 pub mod appservices;
 pub mod auth;
 pub mod authorize;
