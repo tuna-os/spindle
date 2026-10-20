@@ -1,12 +1,12 @@
-//! The browser console (#458): three static files compiled into the
+//! The browser console (#458): six task-focused pages compiled into the
 //! binary, so the console is up whenever the operator is, with nothing to
 //! deploy beside it and nothing fetched from another origin.
 //!
 //! The pages hold no credential. They sign in through the session routes,
 //! read only `/_spindle/operator/v1`, and send the session's CSRF token on
-//! the one write they make (a connection probe). The policy below lets a
-//! page load its own script and style and call its own origin, and
-//! nothing else: no inline script, no third-party content, no framing.
+//! writes. The policy below lets a page load its own script and style and
+//! call its own origin, and nothing else: no inline script, no third-party
+//! content, no framing.
 
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
