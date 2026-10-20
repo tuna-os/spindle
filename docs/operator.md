@@ -31,11 +31,8 @@ asks you to sign in and then shows six task-focused pages:
   failed probes. Authority and write state come from the latest assessment:
   a driver reports them as findings with the codes `authority` and `writes`.
   When no driver reports them, the header says so.
-- **Changes** separates active work from completed history. An operation page
-  shows its requested scope, risk, complete plan, step progress, approvals,
-  evidence and state-specific recovery action before it offers pause, resume,
-  cancel, rollback or independent approval controls. Resolving an interrupted
-  mutation requires the operator to record whether the change was applied.
+- **Changes** separates active work from completed history. An operation page shows its requested scope, risk, complete plan, step progress, approvals, evidence and state-specific recovery action.
+  It then offers pause, resume, cancel, rollback and independent approval controls. For an interrupted mutation, the operator needs to record whether it took effect.
 - **Investigate** correlates connection probes, deployment assessment findings,
   and failed or interrupted operations. Each target remains visible when
   another target is unavailable.
@@ -59,9 +56,7 @@ WCAG AA level, and they work on a narrow screen. They have no animation.
 Status always has a text label, not only a color.
 
 The console changes operator operations, not homeserver resources directly.
-Account locks, device sign-out, room blocks and room deletion therefore remain
-unavailable until a homeserver administration driver can plan them, record
-their approval and preserve their evidence.
+Account locks, device sign-out, room blocks and room deletion remain unavailable. A homeserver administration driver must plan these actions, record their approval and preserve their evidence.
 
 ### People and rooms
 
