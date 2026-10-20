@@ -2,6 +2,12 @@
 
 Two patches, applied in order, against hanthor/neutrino at 3fb6945.
 
+`hanthor/neutrino` and `hanthor/neutrino-iroh` are external upstream forks,
+not `tuna-os` projects. Their maintainers control their branches and
+releases. These patches are Spindle's local integration overlay, so keep the
+upstream revision pinned and review changes with the fork maintainers before
+updating it.
+
 ## 0001: gateway federation
 
 `0001-gateway-federation.patch` applies to hanthor/neutrino at 3fb6945

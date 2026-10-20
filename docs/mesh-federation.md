@@ -18,6 +18,15 @@ and it answers the open issues on the Companion side from Spindle's side.
 The rig that produced the evidence is `scripts/neutrino-interop.sh`; the
 Neutrino change it runs against is `contrib/neutrino/`.
 
+## External repositories and ownership
+
+The `hanthor/*` repositories used by this setup are external upstream forks.
+They are not part of the `tuna-os` organization, and Spindle does not own
+their branches, releases, or maintenance. The patches in
+`contrib/neutrino/` provide local integration changes for the pinned
+revisions used here; operators must keep those revisions pinned and review
+upstream changes before deployment.
+
 The short version: with the patch on the mesh side and MSC4242 on this
 side, **a mesh user joins a room on the Spindle, the Spindle joins a room
 on the mesh, and messages cross in both directions**, over plain
