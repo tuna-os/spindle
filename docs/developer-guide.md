@@ -1,7 +1,7 @@
 # Developer architecture guide
 
 This page maps the Rust workspace to the concerns a contributor is likely to
-change. It is a starting point for finding code, not a replacement for the
+change. It is a guide to code, not a replacement for the
 [specification](../SPEC.md), the [operator guide](operations.md), or the
 [maintenance guide](maintenance.md).
 
@@ -27,9 +27,9 @@ spindle-operator (standalone deployment control plane)
 | `spindle-operator` | A separate control plane for durable operations, deployment drivers, audit evidence, operator authentication and its browser console | `crates/spindle-operator/src/lib.rs`, then `engine.rs`, `driver.rs`, `api.rs` and `auth.rs` |
 
 `spindle-operator` intentionally has no path dependency on the homeserver
-crates. It stays available while a homeserver is stopped for migration,
-cutover or recovery. Do not add operator process logic to `spindle-server` just
-because both projects expose HTTP APIs.
+crates. It stays available while operators stop a homeserver for migration,
+cutover or recovery. Do not add operator process logic to `spindle-server`
+because both projects expose APIs over HTTP.
 
 ## Request and storage path
 
@@ -47,13 +47,14 @@ A normal client or federation request follows this shape:
    `Pdu` and `LinearIndex`. Core keeps Matrix ancestry (`prev_events`) and
    Spindle's linear storage order as separate concepts.
 5. `spindle-store` encodes records and reads or writes the durable keyspaces.
-   The server owns the request lifecycle; the store owns persistence details.
+   The server owns the request lifecycle; details about persistence belong to
+   the store.
 
 State resolution is not a server-only algorithm. The core log asks for a
 `StateResolver` when parent states differ. `spindle-server` supplies the
 room-version-specific implementation in `state_res.rs` and `state_res_v1.rs`.
-That boundary keeps the storage model reusable while keeping Matrix rules at
-the protocol edge.
+That boundary keeps the storage model reusable and leaves Matrix rules at the
+protocol edge.
 
 ## Where to make common changes
 
@@ -64,10 +65,10 @@ the API family. Then check all of these boundaries:
 
 - `routes.rs`: mount the route and keep `MOUNTED` accurate.
 - `auth.rs`: use `Authenticated` or another explicit extractor when the route
-  requires an identity. A handler that should authenticate must not parse a
-  bearer token ad hoc.
-- `surface.rs`: update the advertised Matrix surface only when the route is
-  implemented and tested.
+  needs an identity. A handler that should authenticate must not parse a bearer
+  token in an ad hoc way.
+- `surface.rs`: update the advertised Matrix surface only after the code
+  makes the route available and tests cover it.
 - `crates/spindle-server/tests/` or the owning module tests: prove the route's
   response and authorization behavior.
 - `docs/dashboard.md` and `docs/spec-gaps.md`: run the generated-page workflow
@@ -84,17 +85,16 @@ Separate caller identity from event authorization:
 - `crates/spindle-server/src/auth.rs` turns a bearer token into an identity and
   handles local sessions, appservice tokens and delegated authentication.
 - Route and room handlers apply resource-level checks. Follow the handler into
-  `rooms/` or the owning service rather than assuming authentication grants
-  room access.
+  `rooms/` or the service that owns it; authentication does not grant access to
+  a room.
 - `crates/spindle-server/src/authorize.rs` converts stored events and the
   materialized state into the input for Matrix's authorization predicate. It
   must not invent a second authorization algorithm.
 
 For state-dependent event rules, compare behavior with `ruma` and read
 [ADR 0005](architecture-decisions/0005-matrix-state-resolution-on-the-live-path.md)
-before changing the send or federation path. [divergence.md](divergence.md)
-records which rules are inherited from Matrix and which behaviors are
-Spindle-specific.
+before you change the send or federation path. [divergence.md](divergence.md)
+records which rules Matrix supplies and which behaviors are Spindle-specific.
 
 ### Change event order, state or fork handling
 
@@ -104,8 +104,7 @@ Use `spindle-core` first:
   forward extremities and the bounded federation-DAG overlay.
 - `crates/spindle-core/src/state.rs` owns state roots, snapshots, trie
   rehydration and state-resolution inputs.
-- `crates/spindle-core/src/pdu.rs` owns event parsing and validation of the
-  event value.
+- `crates/spindle-core/src/pdu.rs` parses events and validates their values.
 - `crates/spindle-core/src/state_table.rs` owns the state-key table used by
   the in-memory state representation.
 
@@ -120,7 +119,8 @@ for the current resolver boundary.
 
 Start in `crates/spindle-store/src/lib.rs`:
 
-- `codec.rs` defines the on-disk record representation and versioned encoding.
+- `codec.rs` defines the on-disk record representation and versioned record
+  format.
 - `backup.rs` defines store backup and restore behavior.
 - `migrate.rs` defines storage migrations.
 - The key names and content-addressed state layout come from
@@ -128,25 +128,24 @@ Start in `crates/spindle-store/src/lib.rs`:
 
 Keep storage operations narrow: the store provides ordered key-value reads,
 scans and writes; query or protocol policy belongs in the server. Check
-restore, migration and corruption behavior when changing a record or keyspace.
+restore, migration and corruption behavior for each record or keyspace change.
 The lifecycle contract is in [lifecycle.md](lifecycle.md).
 
 ### Change federation or room behavior
 
 The protocol-facing code lives in `crates/spindle-server/src/`:
 
-- `federation.rs` and `federation/` handle signed server-server requests,
+- `federation.rs` and `federation/` handle signed requests between servers,
   keys and federation-wide behavior.
-- `inbound.rs` and `inbound/` handle incoming events, gaps, backfill and
-  recovery.
+- `inbound.rs` and `inbound/` handle inbound events, gaps, backfill and recovery.
 - `rooms/` owns room reads, writes, extremities, policy and room-local
   services.
 - `state_res.rs` and `authorize.rs` connect those paths to the core state model
   and Matrix authorization rules.
 
-Use the Complement and federation tests before changing a boundary. The
-interoperability and divergence expectations are documented in
-[conformance-testing.md](conformance-testing.md) and [divergence.md](divergence.md).
+Use the Complement and federation tests before you change a boundary. The
+[conformance guide](conformance-testing.md) and [divergence.md](divergence.md)
+document the interoperability and divergence expectations.
 
 ### Change operator workflows
 
@@ -164,19 +163,19 @@ The standalone operator service is under
   references and redaction.
 
 Operator state has its own disk and journal. Changes to a deployment driver
-should not require changes to the homeserver request path.
+should not need changes to the homeserver request path.
 
 ## Before opening a pull request
 
 1. Read the relevant section above and the linked ADR or contract page.
 2. Add a behavior test at the boundary that would have failed before the
    change. Follow the test and generated-page requirements in
-   [CONTRIBUTING.md](../CONTRIBUTING.md).
+   [the contribution guide](../CONTRIBUTING.md).
 3. If a route, Matrix surface claim or generated page changed, run the
    regeneration and drift checks described in [maintenance.md](maintenance.md).
-4. Run the smallest relevant workspace checks, then the pull-request gates
-   from [CONTRIBUTING.md](../CONTRIBUTING.md).
+4. Run the smallest relevant checks in the workspace, then run the pull-request
+   gates from [the contribution guide](../CONTRIBUTING.md).
 
-When the code and this guide disagree, update the guide only after confirming
-the code and its tests express the intended boundary. The specification and
+When the code and this guide disagree, update the guide only after you confirm
+that the code and its tests express the intended boundary. The specification and
 accepted ADRs are the decision record for architectural changes.
