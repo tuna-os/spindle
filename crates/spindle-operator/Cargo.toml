@@ -14,7 +14,7 @@ publish = false
 axum.workspace = true
 # The OIDC ID token arrives as a JWT; its payload is base64url. Already in
 # the lock through reqwest, so this names a version rather than adding one.
-base64 = "0.22"
+base64 = "0.23"
 form_urlencoded.workspace = true
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 reqwest.workspace = true
