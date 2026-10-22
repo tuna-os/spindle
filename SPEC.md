@@ -1222,9 +1222,11 @@ a small, fixed set of words. No room, server or event becomes a label:
 
 **Interop.** The `hub-mode-interop` job in `compliance.yml` runs nightly and
 on demand. It builds the Complement image with `SPINDLE_FEATURES=hub-mode`
-and `SPINDLE_HUB_MODE=1` and runs `TestHubModeRoomStaysOrdinary` in two
-pairings: beside a second hub-mode Spindle, and beside Element's Synapse
-image. Both runs must pass.
+and `SPINDLE_HUB_MODE=1`. `TestHubModeRoomStaysOrdinary` runs beside both a
+second hub-mode Spindle and Element's Synapse image. A three-server
+`TestHubModeFailoverWithSynapse` then pauses the Spindle hub, has its Spindle
+backup claim the next epoch while Synapse remains in the room, and requires
+all three servers to converge after the old hub returns. Every run must pass.
 
 Still designed only: the LM room version and LPDUs (§12.4), relayed (star)
 delivery, publishing proofs to the room, and backups after the first

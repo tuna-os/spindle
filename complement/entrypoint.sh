@@ -106,13 +106,17 @@ tls_cert = "/certs/${SERVER_NAME}.crt"
 tls_key = "/certs/${SERVER_NAME}.key"
 TOML
 
-# MSC3995 hub mode (#22), for the hub-mode interop job's image only.
+# MSC3995 hub mode (#22), for the hub-mode interop job's image only. The
+# short timeouts keep the real-Synapse failover scenario bounded: this is a
+# disposable Complement image, never the operator-facing default.
 if [[ "${SPINDLE_HUB_MODE:-0}" == 1 ]]; then
     say "turning on hub mode"
     cat >> /data/spindle.toml <<TOML
 
 [federation.hub]
 enabled = true
+submit_timeout_ms = 500
+failover_after_ms = 250
 TOML
 fi
 
