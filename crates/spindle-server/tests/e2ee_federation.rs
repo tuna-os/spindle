@@ -334,3 +334,182 @@ async fn a_device_change_is_announced_to_the_server_sharing_a_room() {
         "{body}"
     );
 }
+
+/// A federation peer that takes `delay` to answer every request with an
+/// empty JSON object, or never answers when `delay` is `None`. Returns the
+/// server name it listens on.
+async fn slow_peer(delay: Option<std::time::Duration>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; 4096];
+                let _ = socket.read(&mut buffer).await;
+                let Some(delay) = delay else {
+                    std::future::pending::<()>().await;
+                    return;
+                };
+                tokio::time::sleep(delay).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                          content-length: 2\r\nconnection: close\r\n\r\n{}",
+                    )
+                    .await;
+            });
+        }
+    });
+    name
+}
+
+#[tokio::test]
+async fn remote_servers_are_asked_for_keys_concurrently() {
+    let a = Instance::start().await;
+    let alice = a.register("alice").await;
+    let delay = std::time::Duration::from_millis(800);
+    let mut asked = serde_json::Map::new();
+    for _ in 0..4 {
+        asked.insert(format!("@u:{}", slow_peer(Some(delay)).await), json!([]));
+    }
+
+    let started = std::time::Instant::now();
+    let (status, body) = a
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/keys/query",
+            Some(&alice.token),
+            Some(&json!({ "device_keys": asked })),
+        )
+        .await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, 200, "{body}");
+    // Four peers at 0.8s each: 3.2s one after another, about 0.8s together.
+    assert!(
+        elapsed < std::time::Duration::from_millis(2000),
+        "four slow peers were asked one at a time: {elapsed:?}"
+    );
+
+    let claim: serde_json::Map<String, Value> = asked
+        .keys()
+        .map(|user| (user.clone(), json!({ "DEVICE": "signed_curve25519" })))
+        .collect();
+    let started = std::time::Instant::now();
+    let (status, body) = a
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/keys/claim",
+            Some(&alice.token),
+            Some(&json!({ "one_time_keys": claim })),
+        )
+        .await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        elapsed < std::time::Duration::from_millis(2000),
+        "four slow peers were claimed from one at a time: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_peer_that_never_answers_is_reported_as_a_failure_within_the_deadline() {
+    let a = Instance::start().await;
+    let alice = a.register("alice").await;
+    let quick = slow_peer(Some(std::time::Duration::from_millis(50))).await;
+    let silent = slow_peer(None).await;
+    let quick_user = format!("@u:{quick}");
+    let silent_user = format!("@u:{silent}");
+
+    let started = std::time::Instant::now();
+    let (status, body) = a
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/keys/query",
+            Some(&alice.token),
+            Some(&json!({ "device_keys": { quick_user.clone(): [], silent_user.clone(): [] } })),
+        )
+        .await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "a silent peer held the request for {elapsed:?}"
+    );
+    let failures = body["failures"].as_object().unwrap();
+    assert!(failures.contains_key(&silent), "{body}");
+    assert!(!failures.contains_key(&quick), "{body}");
+}
+
+/// A peer that answers `{}` after `delay`, counting how many requests are
+/// being held open across every peer sharing `in_flight`/`peak`.
+async fn counting_peer(
+    delay: std::time::Duration,
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    peak: Arc<std::sync::atomic::AtomicUsize>,
+) -> String {
+    use std::sync::atomic::Ordering::SeqCst;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let (in_flight, peak) = (Arc::clone(&in_flight), Arc::clone(&peak));
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; 4096];
+                let _ = socket.read(&mut buffer).await;
+                peak.fetch_max(in_flight.fetch_add(1, SeqCst) + 1, SeqCst);
+                tokio::time::sleep(delay).await;
+                in_flight.fetch_sub(1, SeqCst);
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                          content-length: 2\r\nconnection: close\r\n\r\n{}",
+                    )
+                    .await;
+            });
+        }
+    });
+    name
+}
+
+#[tokio::test]
+async fn a_request_naming_many_servers_holds_a_bounded_number_open() {
+    let a = Instance::start().await;
+    let alice = a.register("alice").await;
+    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut asked = serde_json::Map::new();
+    for _ in 0..40 {
+        let peer = counting_peer(
+            std::time::Duration::from_millis(300),
+            Arc::clone(&in_flight),
+            Arc::clone(&peak),
+        )
+        .await;
+        asked.insert(format!("@u:{peer}"), json!([]));
+    }
+
+    let (status, body) = a
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/keys/query",
+            Some(&alice.token),
+            Some(&json!({ "device_keys": asked })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["failures"].as_object().unwrap().is_empty(), "{body}");
+    let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        peak > 1,
+        "the servers were not asked together (peak {peak})"
+    );
+    assert!(peak <= 16, "{peak} servers were held open at once");
+}

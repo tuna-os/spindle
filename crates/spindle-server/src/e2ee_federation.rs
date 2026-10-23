@@ -480,6 +480,88 @@ pub(crate) fn queue_remote_to_device(
     }
 }
 
+/// Which federation endpoint a fan-out asks.
+#[derive(Clone, Copy)]
+enum RemoteKeys {
+    Query,
+    Claim,
+}
+
+/// How long a client's `keys/query` or `keys/claim` waits for the remote
+/// servers it needs, all asked at once. A server that has not answered by
+/// then is reported under `failures` like one that refused, so a single
+/// dead peer costs the request this long, not the peer's own timeout, and
+/// never the sum of every dead peer's.
+const REMOTE_KEYS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The most remote servers one request has in flight at once. The server
+/// list comes from the client's request body, so it is not a number this
+/// server chose; servers past the cap wait for a slot and, if the deadline
+/// arrives first, are reported as failures without having been dialled.
+const MAX_REMOTE_KEYS_IN_FLIGHT: usize = 16;
+
+/// Ask every server in `by_server` at the same time, returning each one's
+/// answer in server order. A server still silent at [`REMOTE_KEYS_DEADLINE`]
+/// comes back as an error.
+async fn ask_remote_servers(
+    state: &AppState,
+    by_server: std::collections::BTreeMap<String, serde_json::Map<String, Value>>,
+    endpoint: RemoteKeys,
+) -> Vec<(
+    String,
+    serde_json::Map<String, Value>,
+    Result<Value, String>,
+)> {
+    let mut pending = by_server.clone();
+    let mut queue = by_server.into_iter();
+    let mut asks = tokio::task::JoinSet::new();
+    let spawn_next = |asks: &mut tokio::task::JoinSet<(String, Result<Value, String>)>,
+                      queue: &mut std::collections::btree_map::IntoIter<
+        String,
+        serde_json::Map<String, Value>,
+    >| {
+        if let Some((server, ask)) = queue.next() {
+            let federation = std::sync::Arc::clone(&state.federation);
+            asks.spawn(async move {
+                let answer = match endpoint {
+                    RemoteKeys::Query => federation.remote_keys_query(&server, &ask).await,
+                    RemoteKeys::Claim => federation.remote_keys_claim(&server, &ask).await,
+                };
+                (server, answer.map_err(|error| error.to_string()))
+            });
+        }
+    };
+    for _ in 0..MAX_REMOTE_KEYS_IN_FLIGHT {
+        spawn_next(&mut asks, &mut queue);
+    }
+    let mut answered = Vec::new();
+    let _ = tokio::time::timeout(REMOTE_KEYS_DEADLINE, async {
+        while let Some(joined) = asks.join_next().await {
+            spawn_next(&mut asks, &mut queue);
+            if let Ok((server, answer)) = joined
+                && let Some(ask) = pending.remove(&server)
+            {
+                answered.push((server, ask, answer));
+            }
+        }
+    })
+    .await;
+    // Whatever is left never answered; dropping the set aborts those asks.
+    drop(asks);
+    for (server, ask) in pending {
+        answered.push((
+            server,
+            ask,
+            Err(format!(
+                "no answer within {} seconds",
+                REMOTE_KEYS_DEADLINE.as_secs()
+            )),
+        ));
+    }
+    answered.sort_by(|left, right| left.0.cmp(&right.0));
+    answered
+}
+
 /// Ask each remote server for its users' device keys, merging the answers
 /// into the client's response. A server that does not answer is listed
 /// under `failures`, and its users' keys come from this server's last copy
@@ -501,8 +583,8 @@ pub(crate) async fn query_remote_keys(
                 .insert(user_id.clone(), wanted.clone());
         }
     }
-    for (server, ask) in by_server {
-        match state.federation.remote_keys_query(&server, &ask).await {
+    for (server, ask, answer) in ask_remote_servers(state, by_server, RemoteKeys::Query).await {
+        match answer {
             Ok(answer) => {
                 for section in ["device_keys", "master_keys", "self_signing_keys"] {
                     if let Some(theirs) = answer[section].as_object() {
@@ -570,8 +652,8 @@ pub(crate) async fn claim_remote_keys(
                 .insert(user_id.clone(), devices.clone());
         }
     }
-    for (server, ask) in by_server {
-        match state.federation.remote_keys_claim(&server, &ask).await {
+    for (server, _, answer) in ask_remote_servers(state, by_server, RemoteKeys::Claim).await {
+        match answer {
             Ok(answer) => {
                 if let Some(theirs) = answer["one_time_keys"].as_object() {
                     claimed.extend(theirs.clone());
