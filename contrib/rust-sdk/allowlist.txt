@@ -87,3 +87,16 @@ tests::timeline::test_stale_local_echo_time_abort_edit
 tests::sliding_sync::notification_client::test_notification
 tests::sliding_sync::room::test_room_preview
 tests::timeline::test_permalink_timelines_redecrypt
+
+# Runs 39571282662 and 39750011049 (matrix-sdk-0.19.1 at b18166c,
+# Spindle at b6fba41 and 79f0025): 43 passed, 15 failed, 5 ignored in
+# both. The new pin exercises dehydrated-device recovery, X.509
+# cross-signing, declining an empty-room invite and the repaired
+# `/context` walk. All seven passed twice; the protected total is 43.
+tests::e2ee::dehydrated_devices::test_dehydrated_device_direct_round_trip
+tests::e2ee::dehydrated_devices::test_dehydrated_device_start_via_recovery
+tests::e2ee::x509::test_user_is_not_verified_if_their_msk_is_not_signed
+tests::e2ee::x509::test_user_is_not_verified_if_we_dont_trust_their_cert
+tests::e2ee::x509::test_user_is_verified_if_their_msk_is_signed
+tests::room::test_empty_room_decline_invite
+tests::room::test_event_with_context
