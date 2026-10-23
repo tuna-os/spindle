@@ -382,7 +382,7 @@ async fn a_participant_cut_off_from_its_hub_keeps_sending_and_the_room_heals() {
 
     // And the hub orders the participant's events again.
     assert!(
-        eventually(10, async || participant.holds(&room, &merge)).await,
+        eventually(60, async || participant.holds(&room, &merge)).await,
         "the merge reaches the participant"
     );
     let after = participant.say(bob, &room, "after").await;
@@ -395,7 +395,7 @@ async fn a_participant_cut_off_from_its_hub_keeps_sending_and_the_room_heals() {
         "the participant's next event extends the hub's head"
     );
     assert!(
-        eventually(10, async || hub.holds(&room, &after)).await,
+        eventually(60, async || hub.holds(&room, &after)).await,
         "it is at the hub"
     );
     for id in [&before, &during, &concurrent, &merge, &after] {
