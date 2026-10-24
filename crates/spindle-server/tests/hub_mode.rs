@@ -707,10 +707,9 @@ async fn a_new_hub_that_drops_an_attested_entry_is_refused_with_a_portable_proof
         "the other participant holds the last attestation"
     );
     hub.partition(true);
-    backup.partition(false);
-
-    // The backup claims epoch 1 from what it alone heard, ignoring the
-    // other participant: the entry before `last`.
+    // Keep the claimant isolated while it publishes the claim locally. Send
+    // the signed event directly to the participant so an in-flight old-hub
+    // attestation cannot arrive after the claimant has accepted the epoch.
     let own = highest_attestation(&backup, &room, 0).expect("the backup heard the hub");
     let genesis = spindle_server::hub::designation(&backup.state, &room)
         .await
@@ -731,6 +730,20 @@ async fn a_new_hub_that_drops_an_attested_entry_is_refused_with_a_portable_proof
             }),
         )
         .await;
+    let (status, answer) = backup
+        .federation_put(
+            &other,
+            "/_matrix/federation/v1/send/failover-claim",
+            &json!({
+                "origin": backup.name,
+                "origin_server_ts": 0,
+                "pdus": [backup.pdu(&room, &claim)],
+                "edus": [],
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{answer}");
+
     assert!(
         eventually(10, async || other.holds(&room, &claim)).await,
         "the claim reaches the other participant"
