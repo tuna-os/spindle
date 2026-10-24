@@ -32,6 +32,7 @@ groups:
             resolver over the last hour; the target is under 0.1%. The design
             claim "no state resolution on the hot path" is not holding for
             this deployment's traffic, which is worth reporting upstream.
+          runbook_url: https://github.com/tuna-os/spindle/blob/main/runbooks/SpindleForkCase3Elevated.md
 
   - name: spindle.latency
     rules:
@@ -51,6 +52,7 @@ groups:
           description: >
             p99 commit time under group durability is {{ $value | humanizeDuration }}.
             Look at the store's disk before the code: this is the fsync path.
+          runbook_url: https://github.com/tuna-os/spindle/blob/main/runbooks/SpindleAppendLatencyHigh.md
       - alert: SpindleAppendP50AboveTarget
         expr: >
           histogram_quantile(0.50,
@@ -62,6 +64,7 @@ groups:
         annotations:
           summary: Append p50 above the 2 ms target
           description: Median commit time under group durability is {{ $value | humanizeDuration }}.
+          runbook_url: https://github.com/tuna-os/spindle/blob/main/runbooks/SpindleAppendLatencyHigh.md
 
   - name: spindle.delivery
     rules:
@@ -80,6 +83,7 @@ groups:
             {{ $value }} events have been waiting for {{ $labels.destination }}
             for half an hour. Check whether the peer is up, and whether it
             answers this server's transactions with an error.
+          runbook_url: https://github.com/tuna-os/spindle/blob/main/runbooks/SpindleFederationBacklog.md
       # The age of the newest event a /sync delivered, measured at delivery.
       # A client keeping up sees milliseconds.
       - alert: SpindleSyncLagHigh
@@ -94,6 +98,7 @@ groups:
           description: >
             p99 age of a delivered event is {{ $value | humanizeDuration }};
             the server is falling behind its own timeline.
+          runbook_url: https://github.com/tuna-os/spindle/blob/main/runbooks/SpindleSyncLagHigh.md
 
   - name: spindle.serving
     rules:
@@ -108,6 +113,7 @@ groups:
             No scrape has succeeded for five minutes. The client and
             federation listeners are separate from this one, so check them
             before assuming the server is down.
+          runbook_url: https://github.com/tuna-os/spindle/blob/main/runbooks/SpindleDown.md
       # Server-side failures as a fraction of everything served. Client
       # errors (4xx) are the callers' and are not counted.
       - alert: SpindleServerErrors
@@ -124,3 +130,4 @@ groups:
             {{ $value | humanizePercentage }} of requests answered 5xx over
             the last five minutes. The `route` label on the same metric says
             which endpoints.
+          runbook_url: https://github.com/tuna-os/spindle/blob/main/runbooks/SpindleServerErrors.md
