@@ -57,11 +57,14 @@ change the source database or the media PVC. Thus a rollback only starts the
 source again. It is not a reverse data migration. This is true until Spindle
 gets its first write.
 
-## Gates before an automated traffic switch exists
+## Gates before the traffic switch
 
-The script stops at a verified quiesce on purpose. We will add the Spindle
-start and the ingress patch only when each of these items has an executable
-check:
+The shell script stops at a verified quiesce on purpose. Use the checkpointed
+[`ess-kubernetes-driver.py`](../scripts/ess-kubernetes-driver.py) for discovery,
+quiesce, validation, the ingress switch, and the post-switch MAS restore. Do
+not mix the two tools in one operation: their state files and recovery
+boundaries differ. Traffic can switch only when each of these items has an
+executable check:
 
 - each retained room imports, or has an exclusion that the operator approves;
 - each room version in the source, also older federated rooms, passes the
@@ -79,8 +82,10 @@ check:
 - the operator patches ingress only after an offline job validates the client
   and federation paths. Synapse stays stopped until then.
 
-When those checks exist, the final sequence is: quiesce → import → validate
-→ start Spindle → switch MAS → switch ingress → smoke-test. If a step fails
-before the ingress switch, the script starts Synapse again. If a
-step fails after the switch, the operator first closes ingress, then does a
-forward fix or a rollback. The two homeservers never run at the same time.
+The final sequence is: quiesce → import → validate → start Spindle → switch
+ingress → restore MAS → smoke-test. If a step fails before the ingress switch,
+the driver can restore Synapse from its recorded discovery state. The first
+ingress mutation closes that ordinary rollback boundary because Spindle may
+already have accepted a write. A later failure needs the reviewed post-write
+recovery procedure. The two homeservers must never accept writes at the same
+time.

@@ -62,9 +62,11 @@ python3 scripts/ess-kubernetes-driver.py switch $COMMON \
 Quiesce fences MAS, `sliding-sync`, the federation sender, and Synapse in that
 order. Every scale uses a JSON-patch resource-version precondition, waits for
 desired/current/ready replicas to reach zero, then waits for relevant database
-sessions to drain. After a restart, the driver detects a mutation that it
-already applied and checkpoints it. It does not submit the mutation twice.
-Every actual mutation records the resource version before and after the
+sessions to drain. Switch changes every ingress route to Spindle before it
+restores MAS to its discovered replica count; the Synapse workers and
+`sliding-sync` remain fenced. After a restart, the driver detects a mutation
+that it already applied and checkpoints it. It does not submit the mutation
+twice. Every actual mutation records the resource version before and after the
 change.
 
 Switch needs fresh, redacted validation evidence:
@@ -84,6 +86,11 @@ zero database sessions remain. Each configured host/path must still resolve
 to one service that the driver knows as source or target. The driver reads
 until it observes the changed backend. A conflict or convergence timeout
 blocks the operation; a retry resumes from the checkpoint.
+
+MAS remains stopped while any ingress route still names Synapse. The driver
+records the completed traffic boundary before it restores MAS. A retry after
+that point finishes or verifies the MAS restore without requiring the MAS
+database to become idle again.
 
 `rollback` restores every ingress path and writer replica count to its precise
 discovery value. It applies while the seal holds on the source and before the
