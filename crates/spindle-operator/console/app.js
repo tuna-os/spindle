@@ -1,4 +1,4 @@
-// Spindle Operator console (#458): Now, People & access, Rooms & safety.
+// Spindle Operator console (#458): operational state, changes, investigations, access, rooms and audit.
 //
 // Reads only /_spindle/operator/v1. Holds no credential: the session is an
 // HttpOnly cookie the script cannot see, and the CSRF token it sends on
@@ -118,7 +118,7 @@ async function api(path, options = {}) {
   return body;
 }
 
-async function write(path, body) {
+async function write(path, body, headers = {}) {
   const key = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now()) + Math.random();
   return api(path, {
     method: "POST",
@@ -126,6 +126,7 @@ async function write(path, body) {
       "Content-Type": "application/json",
       "X-CSRF-Token": state.session.csrf_token,
       "Idempotency-Key": key,
+      ...headers,
     },
     body: JSON.stringify(body || {}),
   });
@@ -206,7 +207,7 @@ function pageHeading(text) {
 }
 
 function deploymentName(view, id) {
-  const found = (view.deployments || []).find((d) => d.deployment.id === id);
+  const found = ((view && view.deployments) || []).find((d) => d.deployment.id === id);
   return found ? found.deployment.name : id;
 }
 
@@ -272,7 +273,7 @@ function pageNow(main) {
   put(main, table(
     "Operations that need a person",
     ["Operation", "Deployment", "State", "Reason"],
-    (view.needs_attention || []).map((op) => [h("span", { class: "mono" }, op.id), deploymentName(view, op.deployment), badge(op.state.replaceAll("_", " "), op.state === "failed" ? "bad" : "warn"), op.reason || "—"]),
+    (view.needs_attention || []).map((op) => [h("a", { class: "mono", href: `#/changes/${encodeURIComponent(op.id)}` }, op.id), deploymentName(view, op.deployment), badge(op.state.replaceAll("_", " "), op.state === "failed" ? "bad" : "warn"), op.reason || "—"]),
     "No operation is waiting for a person.",
   ));
 
@@ -288,7 +289,7 @@ function pageNow(main) {
         const warnings = assessment.findings.filter((f) => f.severity === "warning").length;
         summary = h("span", {}, blockers ? badge(`${blockers} blocking`, "bad") : badge("no blockers", "ok"), " ", warnings ? `${warnings} warnings, ` : "", "assessed ", when(assessment.created_at));
       }
-      return [d.deployment.name, d.deployment.driver, d.active_operation ? `${d.active_operation.action} (${d.active_operation.state.replaceAll("_", " ")})` : "none", summary];
+      return [d.deployment.name, d.deployment.driver, d.active_operation ? h("a", { href: `#/changes/${encodeURIComponent(d.active_operation.id)}` }, `${d.active_operation.action} (${d.active_operation.state.replaceAll("_", " ")})`) : "none", summary];
     }),
     "No deployment is registered yet.",
   ));
@@ -576,7 +577,424 @@ async function pageRoom(main, connection, roomId) {
   }
 }
 
+function operationTone(value) {
+  if (value === "succeeded" || value === "rolled_back" || value === "completed" || value === "compensated") return "ok";
+  if (value === "failed") return "bad";
+  if (value === "awaiting_approval" || value === "attention_required" || value === "paused") return "warn";
+  return "info";
+}
+
+function operationBadge(value) {
+  return badge(value.replaceAll("_", " "), operationTone(value));
+}
+
+function terminalOperation(operation) {
+  return ["succeeded", "cancelled", "rolled_back"].includes(operation.state);
+}
+
+function operationTable(operations, caption, empty) {
+  return table(
+    caption,
+    ["Operation", "Deployment", "Action", "State", "Requested by", "Updated"],
+    operations.map((operation) => [
+      h("a", { class: "mono", href: `#/changes/${encodeURIComponent(operation.id)}` }, operation.id),
+      deploymentName(state.view, operation.deployment),
+      operation.action,
+      operationBadge(operation.state),
+      h("span", { class: "mono" }, operation.requested_by),
+      when(operation.updated_at),
+    ]),
+    empty,
+  );
+}
+
+async function pageChanges(main, route) {
+  put(main, pageHeading("Changes"));
+  if (route.parts[0]) return pageOperation(main, route.parts[0]);
+  put(main, h("p", {}, "Every change is a planned operation. Open one to inspect its risk, scope, approvals, progress, evidence and recovery path."));
+  const loading = h("p", { class: "muted" }, "Loading operations…");
+  put(main, loading);
+  try {
+    const result = await api("/operations");
+    loading.remove();
+    const current = result.items.filter((operation) => !terminalOperation(operation));
+    const history = result.items.filter(terminalOperation);
+    put(main, h("h2", {}, "Active and needs action"));
+    put(main, operationTable(current, "Active operations and operations that need a person", "No operation is active or waiting for a person."));
+    put(main, h("h2", {}, "Completed"));
+    put(main, operationTable(history, "Completed operations", "No operation has completed yet."));
+    announce(`${result.items.length} operations loaded.`);
+  } catch (error) {
+    loading.remove();
+    put(main, failurePanel(error, "Operations"));
+  }
+}
+
+function recoveryAdvice(operation) {
+  const boundary = operation.steps.find((step) => step.state === "completed" && step.mutation && !step.compensable);
+  const advice = {
+    running: "This operation is running. Pause before investigating a surprising result; cancel stops future steps without undoing completed ones.",
+    awaiting_approval: "An independent approver must compare the plan and evidence with the requested scope, then type the required confirmation.",
+    paused: boundary ? `This operation is paused after the irreversible step “${boundary.name}”. Recovery must move forward in a new operation.` : "This operation is paused. Resume after checking the open step, or roll back completed compensable steps.",
+    attention_required: "The engine cannot tell whether the interrupted mutation happened. Verify the target, then resume and record “applied” or “not applied”.",
+    failed: boundary ? `The operation failed after the irreversible step “${boundary.name}”. Inspect the failure evidence and recover with a new forward operation.` : "Inspect the failed step and its evidence. After correcting the cause, resume it or roll back completed changes.",
+    rolling_back: "Rollback is in progress. Completed compensations are recorded below.",
+    succeeded: "The plan completed. If the result must change, create a new forward operation; do not rewrite this history.",
+    cancelled: "The operation was cancelled. Completed steps were not undone.",
+    rolled_back: "Every compensable completed step was undone in reverse order.",
+  }[operation.state];
+  return panel(operation.state === "failed" ? "bad" : ["awaiting_approval", "attention_required", "paused"].includes(operation.state) ? "warn" : "info",
+    h("p", {}, h("strong", {}, "Recovery action: "), advice || "Review the operation state before acting."));
+}
+
+async function runOperationAction(operation, verb, body, button, errors) {
+  button.disabled = true;
+  errors.replaceChildren();
+  try {
+    await write(
+      `/operations/${encodeURIComponent(operation.id)}:${verb}`,
+      body,
+      { "If-Match": `"${operation.version}"` },
+    );
+    announce(`${operation.id}: ${verb.replaceAll("_", " ")} accepted.`);
+    await refreshView();
+    await render();
+  } catch (error) {
+    button.disabled = false;
+    put(errors, failurePanel(error, `The ${verb.replaceAll("_", " ")} action`));
+    announce(`${operation.id}: ${verb.replaceAll("_", " ")} failed. ${error.message}`);
+  }
+}
+
+function actionButton(operation, verb, label, errors, body = {}) {
+  const button = h("button", { type: "button" }, label);
+  button.addEventListener("click", () => runOperationAction(operation, verb, body, button, errors));
+  return button;
+}
+
+function operationControls(operation) {
+  const section = h("section", { "aria-labelledby": "operation-actions-heading" });
+  put(section, h("h2", { id: "operation-actions-heading" }, "Safe actions"));
+  const errors = h("div", { "aria-live": "assertive" });
+  if (!hasRole("operator") && !hasRole("approver")) {
+    put(section, h("p", { class: "muted" }, "An operator or approver role is needed to act."));
+    return section;
+  }
+  const actions = h("div", { class: "actions" });
+  if (hasRole("operator")) {
+    if (["running", "awaiting_approval"].includes(operation.state)) {
+      put(actions, actionButton(operation, "pause", "Pause before next step", errors));
+    }
+    if (["paused", "failed"].includes(operation.state)) {
+      put(actions, actionButton(operation, "resume", "Resume from open step", errors));
+    }
+    if (operation.state === "attention_required") {
+      put(
+        section,
+        panel("warn",
+          h("p", {}, h("strong", {}, "Verify the interrupted change before choosing."), " These two actions become part of the immutable audit trail."),
+          h("div", { class: "actions" },
+            actionButton(operation, "resume", "Change was applied", errors, { resolution: "applied" }),
+            actionButton(operation, "resume", "Change was not applied", errors, { resolution: "not_applied" }),
+          )),
+      );
+    }
+    const rollbackBoundary = operation.steps.some((step) => step.state === "completed" && step.mutation && !step.compensable);
+    if (["paused", "failed", "attention_required", "awaiting_approval"].includes(operation.state) && !rollbackBoundary) {
+      put(actions, actionButton(operation, "rollback", "Roll back completed changes", errors));
+    }
+    if (!terminalOperation(operation) && operation.state !== "rolling_back") {
+      put(actions, actionButton(operation, "cancel", "Cancel without undo", errors));
+    }
+  }
+  put(section, actions);
+
+  if (operation.state === "awaiting_approval") {
+    const step = operation.steps.find((candidate) => candidate.state === "pending");
+    const principal = state.session.principal;
+    if (!hasRole("approver")) {
+      put(section, h("p", { class: "muted" }, "An independent approver role is needed for the waiting step."));
+    } else if (operation.requested_by === principal.subject) {
+      put(section, h("p", { class: "muted" }, "You requested this operation, so you cannot approve it."));
+    } else if (step) {
+      const typed = Boolean(state.view && state.view.policy && state.view.policy.typed_confirmation);
+      const expected = `${operation.id}/${step.name}`;
+      const input = typed ? h("input", { id: "approval-confirmation", required: true, autocomplete: "off", "aria-describedby": "approval-help" }) : null;
+      const confirmation = typed
+        ? [
+          h("label", { for: "approval-confirmation" }, "Typed confirmation", input),
+          h("p", { id: "approval-help", class: "muted" }, "Type ", h("code", {}, expected), " after reviewing the plan and evidence."),
+        ]
+        : [h("p", { class: "muted" }, "Review the plan and evidence before recording approval.")];
+      const form = h("form", { class: "confirm" },
+        confirmation,
+        h("button", { type: "submit" }, `Approve “${step.name}”`));
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const button = form.querySelector("button");
+        button.disabled = true;
+        errors.replaceChildren();
+        try {
+          const body = { step: step.index };
+          if (typed) body.confirmation = input.value;
+          await write(
+            `/operations/${encodeURIComponent(operation.id)}/approvals`,
+            body,
+            { "If-Match": `"${operation.version}"` },
+          );
+          announce(`${operation.id}: approval recorded.`);
+          await refreshView();
+          await render();
+        } catch (error) {
+          button.disabled = false;
+          put(errors, failurePanel(error, "The approval"));
+          announce(`${operation.id}: approval failed. ${error.message}`);
+        }
+      });
+      put(section, form);
+    }
+  }
+  put(section, errors);
+  return section;
+}
+
+function evidenceDetails(artifact) {
+  return h("details", {},
+    h("summary", {}, artifact.name || artifact.id),
+    facts([
+      ["Artifact", h("span", { class: "mono" }, artifact.id)],
+      ["Step", String(artifact.step)],
+      ["SHA-256", h("span", { class: "mono" }, artifact.sha256)],
+      ["Created", when(artifact.created_at)],
+      ["Expires", when(artifact.expires_at)],
+    ]),
+    h("pre", { class: "evidence" }, JSON.stringify(artifact.content, null, 2)));
+}
+
+async function renderOperationEvidence(section, operation) {
+  const ids = [...new Set(operation.steps.flatMap((step) => step.artifacts || []))];
+  if (ids.length === 0) {
+    put(section, h("p", { class: "muted" }, "No evidence artifact was recorded."));
+    return;
+  }
+  const results = await Promise.allSettled(ids.map((id) => api(`/artifacts/${encodeURIComponent(id)}`)));
+  for (let index = 0; index < results.length; index += 1) {
+    const result = results[index];
+    if (result.status === "fulfilled") put(section, evidenceDetails(result.value));
+    else put(section, panel("warn", h("p", {}, h("strong", {}, `${ids[index]} is unavailable. `), result.reason.message)));
+  }
+}
+
+async function pageOperation(main, id) {
+  main.querySelector("h1").textContent = id;
+  put(main, h("p", {}, h("a", { href: "#/changes" }, "Back to changes")));
+  try {
+    const operation = await api(`/operations/${encodeURIComponent(id)}`);
+    main.querySelector("h1").textContent = `${operation.action} on ${deploymentName(state.view, operation.deployment)}`;
+    const mutations = operation.steps.filter((step) => step.mutation);
+    const highRisk = operation.steps.filter((step) => step.risk === "high");
+    put(main, recoveryAdvice(operation));
+    put(main, h("h2", {}, "Scope and risk"));
+    put(main, facts([
+      ["Operation", h("span", { class: "mono" }, operation.id)],
+      ["State", operationBadge(operation.state)],
+      ["Deployment", deploymentName(state.view, operation.deployment)],
+      ["Action", operation.action],
+      ["Requested by", h("span", { class: "mono" }, operation.requested_by)],
+      ["Created", when(operation.created_at)],
+      ["Updated", when(operation.updated_at)],
+      ["Scope", `${operation.steps.length} planned steps; ${mutations.length} mutate the deployment`],
+      ["Risk", highRisk.length ? `${highRisk.length} high-risk step${highRisk.length === 1 ? "" : "s"}` : "all steps low risk"],
+      ["Parameters", h("pre", { class: "inline-json" }, JSON.stringify(operation.params, null, 2))],
+      ["Reason", operation.reason || "none recorded"],
+    ]));
+    put(main, h("h2", {}, "Plan and progress"));
+    put(main, table(
+      "Planned operation steps",
+      [{ label: "#", num: true }, "Step", "Risk", "Scope", "Recovery", "State", { label: "Attempts", num: true }, "Result"],
+      operation.steps.map((step) => [
+        String(step.index + 1),
+        step.name,
+        badge(step.risk, step.risk === "high" ? "warn" : "info"),
+        step.mutation ? "changes deployment" : "read only",
+        step.compensable ? "can roll back" : step.mutation ? "forward recovery only" : "not needed",
+        operationBadge(step.state),
+        String(step.attempts),
+        step.error || (step.finished_at ? when(step.finished_at) : "—"),
+      ]),
+      "The driver returned no steps.",
+    ));
+    put(main, h("h2", {}, "Approvals"));
+    put(main, table(
+      "Recorded approvals",
+      [{ label: "Step", num: true }, "Approver", "When"],
+      operation.approvals.map((approval) => [String(approval.step + 1), h("span", { class: "mono" }, approval.approver), when(approval.at)]),
+      "No approval has been recorded.",
+    ));
+    const evidenceLoading = h("p", { class: "muted" }, "Loading evidence…");
+    const evidence = h("section", { "aria-labelledby": "evidence-heading" },
+      h("h2", { id: "evidence-heading" }, "Evidence"),
+      evidenceLoading);
+    put(main, evidence);
+    put(main, operationControls(operation));
+    put(main, h("p", {}, h("a", { href: `#/audit?operation=${encodeURIComponent(operation.id)}` }, "View the immutable audit trail for this operation")));
+    await renderOperationEvidence(evidence, operation);
+    evidenceLoading.remove();
+    announce(`Loaded operation ${operation.id}.`);
+  } catch (error) {
+    put(main, failurePanel(error, "This operation"));
+  }
+}
+
+async function pageInvestigate(main) {
+  put(main, pageHeading("Investigate"));
+  put(main, h("p", {}, "Correlate homeserver reachability, deployment findings and operations without shell access. Data remains useful when one target is unavailable."));
+  if (state.viewError) {
+    put(main, failurePanel(state.viewError, "The deployment view"));
+    return;
+  }
+  const connections = state.view.connections || [];
+  const canProbe = hasRole("operator");
+  put(main, h("h2", {}, "Reachability"));
+  put(main, table(
+    "Homeserver reachability probes",
+    ["Connection", "Address", "Observed", "Result", { label: "Latency", num: true }, "Investigate"],
+    connections.map((connection) => {
+      const probeResult = connection.last_probe;
+      const result = !probeResult ? badge("not observed", "warn") : probeResult.reachable ? badge(`reachable (${probeResult.status})`, "ok") : badge(probeResult.detail || "unreachable", "bad");
+      const actions = [];
+      if (connection.credential) {
+        actions.push(h("a", { href: `#/rooms/${encodeURIComponent(connection.id)}` }, "Rooms"), " · ", h("a", { href: `#/people/${encodeURIComponent(connection.id)}` }, "People"));
+      }
+      if (canProbe) {
+        const button = h("button", { type: "button", class: "link" }, "Probe now");
+        button.addEventListener("click", () => probe(connection, button));
+        if (actions.length) actions.push(" · ");
+        actions.push(button);
+      }
+      return [connection.name, h("span", { class: "mono" }, connection.base_url), probeResult ? when(probeResult.at) : "never", result, probeResult ? `${probeResult.latency_ms} ms` : "—", actions.length ? h("span", {}, actions) : "—"];
+    }),
+    "No homeserver connection is registered.",
+  ));
+
+  put(main, h("h2", {}, "Deployment findings"));
+  const loading = h("p", { class: "muted" }, "Loading assessments…");
+  put(main, loading);
+  try {
+    const result = await api("/assessments");
+    loading.remove();
+    const assessments = [...result.items].sort((left, right) => right.created_at - left.created_at);
+    const rows = assessments.flatMap((assessment) => {
+      if (assessment.findings.length === 0) {
+        return [[when(assessment.created_at), deploymentName(state.view, assessment.deployment), badge("no findings", "ok"), "—", "Assessment completed without a finding."]];
+      }
+      return assessment.findings.map((finding) => [
+        when(assessment.created_at),
+        deploymentName(state.view, assessment.deployment),
+        badge(finding.severity, finding.severity === "blocker" ? "bad" : finding.severity === "warning" ? "warn" : "info"),
+        h("span", { class: "mono" }, finding.code),
+        finding.summary,
+      ]);
+    });
+    put(main, table(
+      "Assessment findings, newest assessment first",
+      ["Observed", "Deployment", "Severity", "Code", "Finding"],
+      rows,
+      "No deployment assessment has been recorded.",
+    ));
+    const blocked = (state.view.needs_attention || []).filter((operation) => ["failed", "attention_required"].includes(operation.state));
+    put(main, h("h2", {}, "Interrupted and failed changes"));
+    put(main, table(
+      "Changes that need investigation",
+      ["Operation", "Deployment", "State", "Reason"],
+      blocked.map((operation) => [
+        h("a", { class: "mono", href: `#/changes/${encodeURIComponent(operation.id)}` }, operation.id),
+        deploymentName(state.view, operation.deployment),
+        operationBadge(operation.state),
+        operation.reason || "Inspect its step evidence.",
+      ]),
+      "No failed or interrupted change needs investigation.",
+    ));
+    announce(`${assessments.length} assessments loaded.`);
+  } catch (error) {
+    loading.remove();
+    put(main, failurePanel(error, "Assessments"));
+  }
+}
+
+function auditActor(event) {
+  return event.actor && event.actor.kind === "principal"
+    ? h("span", { class: "mono" }, event.actor.subject)
+    : "operator engine";
+}
+
+function auditSummary(event) {
+  const change = event.change || {};
+  const type = (change.type || "unknown_event").replaceAll("_", " ");
+  if (change.type === "operation_created") return `Created ${change.operation.action} operation`;
+  if (change.type === "operation_state") return `Operation became ${String(change.state).replaceAll("_", " ")}`;
+  if (change.type === "step_started") return `Started step ${change.step + 1}`;
+  if (change.type === "step_completed") return `Completed step ${change.step + 1}`;
+  if (change.type === "step_failed") return `Step ${change.step + 1} failed`;
+  if (change.type === "step_observed") return `Observed step ${change.step + 1} as ${change.applied ? "applied" : "not applied"}`;
+  if (change.type === "approval_recorded") return `Approved step ${change.approval.step + 1}`;
+  return type.charAt(0).toUpperCase() + type.slice(1);
+}
+
+async function pageAudit(main, route) {
+  put(main, pageHeading("Audit"));
+  put(main, h("p", {}, "Immutable operator history connects each request, actor, operation, step and outcome. Session secrets and idempotency bookkeeping are omitted by the API."));
+  const operation = route.params.get("operation") || "";
+  const input = h("input", { id: "audit-operation", value: operation, autocomplete: "off", placeholder: "op_…" });
+  const form = h("form", { class: "search" },
+    h("label", { for: "audit-operation" }, "Operation ID", input),
+    h("button", { type: "submit" }, "Filter"));
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const query = new URLSearchParams();
+    if (input.value.trim()) query.set("operation", input.value.trim());
+    location.hash = `#/audit${query.size ? `?${query}` : ""}`;
+  });
+  put(main, form);
+  const loading = h("p", { class: "muted" }, "Loading audit events…");
+  put(main, loading);
+  const query = new URLSearchParams({ limit: "200" });
+  if (operation) query.set("operation", operation);
+  if (route.params.get("after")) query.set("after", route.params.get("after"));
+  try {
+    const result = await api(`/audit?${query}`);
+    loading.remove();
+    put(main, table(
+      operation ? `Audit events for ${operation}` : "Operator audit events",
+      [{ label: "Sequence", num: true }, "When", "Actor", "Operation", "Event", "Request and details"],
+      result.events.map((event) => [
+        String(event.seq),
+        when(event.at),
+        auditActor(event),
+        event.operation ? h("a", { class: "mono", href: `#/changes/${encodeURIComponent(event.operation)}` }, event.operation) : "—",
+        auditSummary(event),
+        h("details", {},
+          h("summary", {}, event.request ? `Request ${event.request}` : "Event details"),
+          h("pre", { class: "evidence" }, JSON.stringify(event.change, null, 2))),
+      ]),
+      operation ? "No audit event matches this operation." : "No audit event has been recorded.",
+    ));
+    if (result.events.length === 200) {
+      const next = new URLSearchParams();
+      if (operation) next.set("operation", operation);
+      next.set("after", String(result.next));
+      put(main, h("p", { class: "pager" }, h("a", { href: `#/audit?${next}` }, "Next 200 events")));
+    }
+    announce(`${result.events.length} audit events loaded.`);
+  } catch (error) {
+    loading.remove();
+    put(main, failurePanel(error, "Audit history"));
+  }
+}
+
 // ---- session and routing --------------------------------------------------
+
+
 
 function renderWho() {
   const who = document.getElementById("who");
@@ -613,7 +1031,14 @@ function parseRoute() {
   return { page: segments[0] || "now", parts: segments.slice(1), params: new URLSearchParams(query || "") };
 }
 
-const PAGES = { now: { title: "Now", render: pageNow }, people: { title: "People & access", render: pagePeople }, rooms: { title: "Rooms & safety", render: pageRooms } };
+const PAGES = {
+  now: { title: "Now", render: pageNow },
+  changes: { title: "Changes", render: pageChanges },
+  investigate: { title: "Investigate", render: pageInvestigate },
+  people: { title: "People & access", render: pagePeople },
+  rooms: { title: "Rooms & safety", render: pageRooms },
+  audit: { title: "Audit", render: pageAudit },
+};
 
 // `moveFocus` is false for the first page a person opens, so the skip link
 // stays the first tab stop; on every later navigation focus moves to the new
