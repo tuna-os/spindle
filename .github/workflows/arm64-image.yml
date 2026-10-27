@@ -1,0 +1,31 @@
+# TEMPORARY: drop this file before the branch is deleted.
+#
+# Builds the arm64 image of exactly the code that production ran on 2026-10-25
+# (main + #723, the amd64 image ghcr.io/tuna-os/spindle:perf-723-de17805) so the
+# same store can be served from an Arm host (Oracle Always Free A1). Pushes
+# ghcr.io/tuna-os/spindle:perf-723-de17805-arm64. No cargo features, like the
+# production image.
+name: arm64 image (production commit)
+
+on:
+  push:
+    branches: [ops/arm64-perf-723]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Log in to the registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Build and push
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:perf-723-de17805-arm64"
+          docker build -t "$image" .
+          docker run --rm --entrypoint /usr/local/bin/spindle "$image" 2>&1 | head -5 || true
+          docker push "$image"
