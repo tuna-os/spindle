@@ -39,7 +39,7 @@ rand = "0.10"
 # `synapse-import` feature. `bundled` compiles SQLite itself: a one-shot
 # migration tool is not a reason to make every operator install a system
 # library, nor to make the default build pay for one.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 # Native reads from a live Synapse PostgreSQL database. Kept behind the same
 # one-shot migration feature as the SQLite fixture reader.
 postgres = "0.19"
