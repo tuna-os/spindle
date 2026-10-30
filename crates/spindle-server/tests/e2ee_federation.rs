@@ -334,3 +334,71 @@ async fn a_device_change_is_announced_to_the_server_sharing_a_room() {
         "{body}"
     );
 }
+
+/// A federation peer that answers every request, empty, but only once
+/// every peer sharing `barrier` has a request in flight. Returns the
+/// server name a user on it would carry.
+async fn peer_that_waits_for_the_others(barrier: Arc<tokio::sync::Barrier>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let app = axum::Router::new().fallback(move || {
+        let barrier = barrier.clone();
+        async move {
+            barrier.wait().await;
+            axum::Json(json!({ "device_keys": {}, "one_time_keys": {} }))
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    name
+}
+
+const PEERS: usize = 4;
+
+/// Every peer is asked at once. Each stub answers only when all four have
+/// a request in flight, so a server that asked them one after another
+/// would wait on the first for the whole peer request timeout and report
+/// it under `failures`. That is what `keys/query` did, and Element X,
+/// which blocks on it, sat for 10 to 30 seconds on every room it opened.
+/// Nothing here depends on how fast the runner is.
+#[tokio::test]
+async fn peers_are_asked_for_keys_together() {
+    let a = Instance::start().await;
+    let alice = a.register("alice").await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(PEERS));
+    let mut query = serde_json::Map::new();
+    let mut claim = serde_json::Map::new();
+    for n in 0..PEERS {
+        let peer = peer_that_waits_for_the_others(barrier.clone()).await;
+        let user = format!("@user{n}:{peer}");
+        query.insert(user.clone(), json!([]));
+        claim.insert(user, json!({ "DEVICE": "signed_curve25519" }));
+    }
+
+    let (status, body) = a
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/keys/query",
+            Some(&alice.token),
+            Some(&json!({ "device_keys": query })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["failures"].as_object().unwrap().is_empty(),
+        "keys/query asked its peers one by one: {body}"
+    );
+
+    let (status, body) = a
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/keys/claim",
+            Some(&alice.token),
+            Some(&json!({ "one_time_keys": claim })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["failures"].as_object().unwrap().is_empty(),
+        "keys/claim asked its peers one by one: {body}"
+    );
+}
