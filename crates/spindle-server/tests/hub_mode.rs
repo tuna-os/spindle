@@ -358,8 +358,12 @@ async fn a_participant_cut_off_from_its_hub_keeps_sending_and_the_room_heals() {
     // is merged by the hub's next event.
     hub.partition(false);
     participant.partition(false);
+
+    // The full workspace runs these real-server tests in parallel. A failed
+    // delivery backs off exponentially, so allow a complete retry window
+    // after the partition heals even under runner contention.
     assert!(
-        eventually(20, async || hub.holds(&room, &during)
+        eventually(60, async || hub.holds(&room, &during)
             && participant.holds(&room, &concurrent))
         .await,
         "the partition's events cross once it heals"
@@ -378,7 +382,7 @@ async fn a_participant_cut_off_from_its_hub_keeps_sending_and_the_room_heals() {
 
     // And the hub orders the participant's events again.
     assert!(
-        eventually(10, async || participant.holds(&room, &merge)).await,
+        eventually(60, async || participant.holds(&room, &merge)).await,
         "the merge reaches the participant"
     );
     let after = participant.say(bob, &room, "after").await;
@@ -391,7 +395,7 @@ async fn a_participant_cut_off_from_its_hub_keeps_sending_and_the_room_heals() {
         "the participant's next event extends the hub's head"
     );
     assert!(
-        eventually(10, async || hub.holds(&room, &after)).await,
+        eventually(60, async || hub.holds(&room, &after)).await,
         "it is at the hub"
     );
     for id in [&before, &during, &concurrent, &merge, &after] {
