@@ -212,6 +212,7 @@ The risks that would invalidate the headline claim are enumerated in
 | | |
 |---|---|
 | [**SPEC.md**](SPEC.md) | The design the code is held against — the log, state without state resolution, authorization, fork handling, trust model, concurrency, performance model, risks |
+| [docs/developer-guide.md](docs/developer-guide.md) | Crate boundaries and code paths for common contributor changes |
 | [docs/benchmarks.md](docs/benchmarks.md) | Method, every measurement, and the retractions |
 | [docs/divergence.md](docs/divergence.md) | The seam: what is inherited from Matrix, ruma and Complement; what is genuinely ours; what is deliberately deferred |
 | [docs/conformance-testing.md](docs/conformance-testing.md) | How interoperability is proven |
