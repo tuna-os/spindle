@@ -23,7 +23,7 @@ references of the form `env:NAME` or `file:/path`.
 ## Console
 
 Open the operator's public URL in a browser. `/` goes to `/console/`, which
-asks you to sign in and then shows three pages:
+asks you to sign in and then shows six task-focused pages:
 
 - **Now** tells you what needs a person, which change is active, and how each
   homeserver answered its last probe. It also gives the next safe action. A
@@ -31,10 +31,18 @@ asks you to sign in and then shows three pages:
   failed probes. Authority and write state come from the latest assessment:
   a driver reports them as findings with the codes `authority` and `writes`.
   When no driver reports them, the header says so.
+- **Changes** separates active work from completed history. An operation page shows its requested scope, risk, complete plan, step progress, approvals, evidence and state-specific recovery action.
+  It then offers pause, resume, cancel, rollback and independent approval controls. For an interrupted mutation, the operator needs to record whether it took effect.
+- **Investigate** correlates connection probes, deployment assessment findings,
+  and failed or interrupted operations. Each target remains visible when
+  another target is unavailable.
 - **People & access** finds accounts by user ID or display name. It shows an
   account's status, devices and rooms.
 - **Rooms & safety** lists rooms and recent reports. It shows a room's
   settings, block state, deletion tasks, reports and members.
+- **Audit** lists the immutable operator history and can filter it to one
+  operation. Each row connects its sequence, actor, request, operation and
+  structured change.
 
 The pages are three static files in the operator binary. They read only
 `/_spindle/operator/v1`, and the browser holds only the session cookie. Their
@@ -42,14 +50,13 @@ content security policy allows script, style and requests from the operator's
 own origin, and nothing else.
 
 The pages work with a keyboard and a screen reader. They have a skip link,
-landmarks, table captions and headers, visible focus, and a live region for
-results. In light and dark mode, their contrast meets the WCAG AA level, and they work on a
-narrow screen. They have no animation. Status always has a text label, not
-only a color.
+landmarks, table captions and headers, visible focus, and live regions for
+results and action failures. In light and dark mode, their contrast meets the
+WCAG AA level, and they work on a narrow screen. They have no animation.
+Status always has a text label, not only a color.
 
-The first version does not change anything on a homeserver. To lock an
-account or block a room, use an operation. The console does not offer those
-actions yet.
+The console changes operator operations, not homeserver resources directly.
+Account locks, device sign-out, room blocks and room deletion remain unavailable. A homeserver administration driver must plan these actions, record their approval and preserve their evidence.
 
 ### People and rooms
 

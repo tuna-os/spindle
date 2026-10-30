@@ -26,6 +26,11 @@ the rungs that involve phones have been climbed.
 | Companion app and harness | hanthor/indiafoss-companion | head; `tools/neutrino-probe` is the swarm harness |
 | Chat app | hanthor/indiafoss-chat-android | head |
 
+The `hanthor/*` repositories are external upstream forks, not `tuna-os`
+projects. Their maintainers control branches and releases; Spindle only
+pins revisions for this playbook and carries local integration patches.
+Review fork changes before changing the pinned revisions.
+
 Three roles run this software (docs/mesh-federation.md, "The system"):
 
 - **Phones** run Neutrino over BLE and Wi-Fi and federate with each other
