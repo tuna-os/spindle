@@ -441,11 +441,10 @@ jobs:
 
   # MSC3995 hub mode against a real Synapse (#22, SPEC section 12.6). The
   # image is built with the `hub-mode` feature and `[federation.hub]` on.
-  # Beside a second hub-mode Spindle, hs2's events go through hs1 as the
-  # room's hub; beside Synapse, which knows nothing of hub mode, the room
-  # must stay an ordinary Matrix room: every event accepted on both sides,
-  # the same state. Nightly and on demand, like the full interop run: the
-  # feature is off by default and off in production.
+  # The two-server pair proves ordinary-PDU interop. A three-server pair
+  # pauses the old Spindle hub, lets its Spindle backup claim the next epoch
+  # while Synapse remains in the room, then requires all three to converge.
+  # Nightly and on demand: the feature is off by default and off in production.
   hub-mode-interop:
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-24.04
@@ -500,10 +499,22 @@ jobs:
           COMPLEMENT_RUN: TestHubModeRoomStaysOrdinary
         run: scripts/complement.sh tmp/hub-mode-interop.jsonl
 
-      - name: Require the hub room to stay ordinary in both
+      - name: Fail over between Spindles with Synapse still in the room
+        env:
+          GOPROXY: https://proxy.golang.org|direct
+          COMPLEMENT_IMAGE: complement-spindle-hub:latest
+          COMPLEMENT_INTEROP_IMAGE: ghcr.io/element-hq/synapse/complement-synapse:latest
+          COMPLEMENT_INTEROP_HS: hs3
+          COMPLEMENT_PACKAGES: ./tests/spindle
+          COMPLEMENT_RUN: TestHubModeFailoverWithSynapse
+        run: scripts/complement.sh tmp/hub-mode-failover.jsonl
+
+      - name: Require ordinary-room interop and mixed-room failover
         run: |
           python3 scripts/complement-require.py TestHubModeRoomStaysOrdinary \
             tmp/hub-mode-homogeneous.jsonl tmp/hub-mode-interop.jsonl
+          python3 scripts/complement-require.py TestHubModeFailoverWithSynapse \
+            tmp/hub-mode-failover.jsonl
 
       - name: Keep the ledgers
         if: always()
