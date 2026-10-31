@@ -55,8 +55,8 @@ and a commit from a server outside the list travels as an
 
 Spindle gives each room a total order: the linear index (`li`) of SPEC §5.
 On one server, `li` order is commit order and the DS check is one state
-lookup. Across servers, #628's opt-in hub path now provides
-compare-and-append ordering, signed epochs and failover. That baseline is
+lookup. Across servers, #628's opt-in hub path now provides a
+compare-and-append order, signed epochs and failover. That baseline is
 on `main`, but #22 has not met its exit criteria, so an MLS prototype still
 waits for that gate.
 
