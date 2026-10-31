@@ -1,22 +1,24 @@
 # MLS: the go/no-go review
 
-**Decision on 2026-10-02: no-go.** Spindle does not start MLS work yet.
-This page records the evidence, what the proposals ask of a server, and
-the events that reopen the question. It is the design review that
-[#23](https://github.com/tuna-os/spindle/issues/23) asks for. When a
-trigger at the end of this page fires, update this page before you write
-code.
+**Decision refreshed on 2026-10-22: no-go.** The specification and client
+gates remain closed. A feature- and runtime-gated hub implementation has
+landed, but [#22](https://github.com/tuna-os/spindle/issues/22) has not met
+its exit criteria. This page records the evidence, what the proposals ask
+of a server, and the events that reopen the question. It is the design
+review that [#23](https://github.com/tuna-os/spindle/issues/23) asks for.
+When a trigger at the end of this page fires, update this page before you
+write code.
 
 ## The gates
 
 The exit criteria of #23 name four conditions. Only one passes today.
 
-| Gate | Result | Evidence on 2026-10-02 |
+| Gate | Result | Evidence on 2026-10-22 |
 |---|---|---|
 | Megolm compatibility is complete | Pass | The M2 row of [docs/dashboard.md](dashboard.md) is **Done**: E2EE transport, fallback keys, device lists, key backup and cross-signing. |
 | A stable specification | Fail | No MLS proposal has left review. The next table has the details. |
 | A maintained client | Fail | No client that people use speaks any of the proposals. The second table has the details. |
-| Hub mode is available | Fail | [#22](https://github.com/tuna-os/spindle/issues/22) (MSC3995) is open, and the M6 row of the dashboard says "Not started". |
+| Hub mode is complete | Fail | [#628](https://github.com/tuna-os/spindle/pull/628) put the opt-in implementation on `main`, but #22 remains open for room-class transitions and the real-Synapse failover scenario. |
 
 ### The proposals
 
@@ -51,10 +53,12 @@ MSC4244 that server is the DS. In MSC4256 it is the first entry of
 and a commit from a server outside the list travels as an
 `m.mls.pending_commit`.
 
-Spindle already gives each room a total order: the linear index (`li`) of
-SPEC §5. On one server, `li` order is commit order and the DS check is one
-state lookup. Across servers, `li` is a total order only under hub mode,
-so this requirement waits for #22.
+Spindle gives each room a total order: the linear index (`li`) of SPEC §5.
+On one server, `li` order is commit order and the DS check is one state
+lookup. Across servers, #628's opt-in hub path now provides
+compare-and-append ordering, signed epochs and failover. That baseline is
+on `main`, but #22 has not met its exit criteria, so an MLS prototype still
+waits for that gate.
 
 **Epoch.** Neither proposal defines a state event that holds the epoch. In
 MSC4256 the `m.mls.commit` state event is the current commit, and every
@@ -126,7 +130,7 @@ update the tables above with the new dates.
   draft and fills its `TODO` sections.
 - A client that people use ships an MLS mode, with commits in the last
   six months. A test client does not count.
-- #22 hub mode reaches `main`.
+- #22 hub mode meets its exit criteria and closes.
 
 When all three gates pass, the work follows #23 in order. First, put a
 prototype behind the `unstable-msc4244` or `unstable-msc4256` Cargo
