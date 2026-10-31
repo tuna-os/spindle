@@ -21,7 +21,7 @@ Never post account credentials or API keys in issues or pull requests.
 ## Build and test
 
 `rust-toolchain.toml` pins the compiler and rustup fetches it on its own.
-Storage is embedded, so there is nothing to provision.
+Spindle includes storage, so you do not need a database.
 
 ```sh
 cargo test --workspace --all-features
@@ -29,11 +29,11 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 ```
 
-`just lint` and `just test` run the same commands, and `just --list` names
-the rest: the generated pages (`just docs`) and the competitive benchmark
-sitting from a bare checkout (`just bench <group>`, or its three steps
-`bench-field`, `bench-build`, `bench-sitting`; docs/benchmarks.md says what
-each does and what the field is pinned to).
+`just lint` and `just test` run the same commands. `just --list` names the
+other tasks. These tasks generate pages (`just docs`) and run competitive
+benchmark trials from a bare checkout (`just bench <group>`). Its three steps
+are `bench-field`, `bench-build`, and `bench-sitting`. The benchmark notes in
+`docs/benchmarks.md` explain each step and identify the field's pinned versions.
 
 Those three are the pull-request gate, with a few checks that keep
 generated and hand-copied things honest:
@@ -60,38 +60,34 @@ where it runs.
 
 ## What a change is expected to carry
 
-- **A test that would have failed before it.** For a bug, the test
-  reproduces the bug; for a feature, the test is the claim. Performance
-  work arrives with a counting assertion (allocations, bytes, comparisons)
-  rather than a timing, because timings do not fail deterministically.
-- **No stubs.** An endpoint that is routed works; one that is not answers
-  404. `tests/surface.rs` enforces that `/versions` advertises only what
-  is built. A placeholder that returns `{}` is worse than a 404, because
-  a client cannot tell it from success.
-- **Honest numbers.** The dashboard, the README's counts and the
-  Complement allowlist are generated or gated. A claim about performance
-  links the benchmark that made it; a retracted claim stays retracted in
-  the text.
-- **Comments that say why.** The code says what; a comment earns its place
-  by recording the reason, the alternative that was rejected, or the
-  failure that motivated it.
+- **A test that fails before the change.** A bug test reproduces the bug. A
+  feature test states the claim. Performance work includes an assertion about
+  deterministic counts, such as allocations, bytes, or comparisons. Tests of
+  elapsed time do not fail deterministically.
+- **No stubs.** Every routed endpoint works; any other endpoint answers 404.
+  `tests/surface.rs` enforces that `/versions` advertises only built features.
+  A placeholder that returns `{}` is worse than a 404. A client cannot
+  distinguish that placeholder from success.
+- **Honest numbers.** Generators or gates control the dashboard, README counts,
+  and Complement allowlist. A performance claim links to its benchmark. The
+  text preserves a retracted claim as retracted.
+- **Comments that explain why.** The code says what it does. A comment records
+  a reason, a rejected alternative, or the failure that required the change.
 
 ## Adding an endpoint or an MSC
 
-Both have a generated page CI holds to the code. A new route must
-appear in `docs/dashboard.md` and leave `docs/spec-gaps.md` (run `just
-regen`); a new MSC surface needs an entry in `contrib/msc/ledger.toml`
-naming the test that proves it, and the flag it advertises. The whole
-procedure, with the spec-release and pin-bump cases, is in
-[docs/maintenance.md](docs/maintenance.md).
+CI holds generated pages to the code. Add each new route to
+`docs/dashboard.md` and remove it from `docs/spec-gaps.md`. Run `just regen`.
+Add each new MSC surface to `contrib/msc/ledger.toml`. Name the test that proves
+the surface and the flag it advertises. The procedure for spec releases and pin
+updates is in [docs/maintenance.md](docs/maintenance.md).
 
 ## Finding something to do
 
-Issues labelled `good first issue` are self-contained with a design in the
-issue; `help wanted` marks work that needs something this repository does
-not have (a client, a bridge, a second homeserver). The milestone table in
-the README is the roadmap in prose, and ROADMAP.md has the entry points
-for each track.
+Issues with the `good first issue` label include a design. The `help wanted`
+label identifies work that needs an unavailable client, bridge, or second
+homeserver. The README milestone table gives the roadmap in prose. ROADMAP.md
+has the entry points for each track.
 
 ## Pull requests
 
