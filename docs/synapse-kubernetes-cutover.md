@@ -86,6 +86,6 @@ The final sequence is: quiesce → import → validate → start Spindle → swi
 ingress → restore MAS → smoke-test. If a step fails before the ingress switch,
 the driver can restore Synapse from its recorded discovery state. The first
 ingress mutation closes that ordinary rollback boundary because Spindle may
-already have accepted a write. A later failure needs the reviewed post-write
-recovery procedure. The two homeservers must never accept writes at the same
-time.
+already have accepted a write. A later failure needs the reviewed recovery
+procedure for the post-write state. The two homeservers must never accept
+writes at the same time.

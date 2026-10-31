@@ -89,8 +89,8 @@ blocks the operation; a retry resumes from the checkpoint.
 
 MAS remains stopped while any ingress route still names Synapse. The driver
 records the completed traffic boundary before it restores MAS. A retry after
-that point finishes or verifies the MAS restore without requiring the MAS
-database to become idle again.
+that point finishes or verifies the MAS restore. The MAS database does not
+need to become idle again.
 
 `rollback` restores every ingress path and writer replica count to its precise
 discovery value. It applies while the seal holds on the source and before the
