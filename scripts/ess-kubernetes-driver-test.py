@@ -201,6 +201,15 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(discovered["postgres_sessions"], 0)
         self.assertTrue(plan["read_only"])
         self.assertEqual(self.kube.objects, before)
+        self.assertEqual(
+            plan["mutations"][-1],
+            {
+                "action": "scale",
+                "resource": "deployment/mas",
+                "replicas": 1,
+                "requires": "all ingress routes switched to Spindle",
+            },
+        )
         self.assertEqual(self.kube.patches, [])
 
     def test_ambiguous_selector_is_an_actionable_block(self):
@@ -254,6 +263,8 @@ class DriverTests(unittest.TestCase):
         route = self.kube.objects[("ingress", "matrix")]
         service = route["spec"]["rules"][0]["http"]["paths"][0]["backend"]["service"]["name"]
         self.assertEqual(service, "spindle-client")
+        self.assertEqual(self.kube.objects[("deployment", "mas")]["spec"]["replicas"], 1)
+        self.assertEqual(self.kube.objects[("statefulset", "synapse")]["spec"]["replicas"], 0)
 
     def test_failed_ingress_convergence_is_checkpointed_and_retryable(self):
         self.driver.quiesce()
@@ -268,6 +279,37 @@ class DriverTests(unittest.TestCase):
         self.kube.freeze_route = False
         switched = self.driver.switch(self.validation())
         self.assertEqual(switched["phase"], "target-written")
+        self.assertEqual(self.kube.objects[("deployment", "mas")]["spec"]["replicas"], 1)
+
+    def test_mas_restore_is_checkpointed_and_retryable_after_routes_switch(self):
+        self.driver.quiesce()
+        self.kube.freeze_workload = "mas"
+        with self.assertRaisesRegex(ess.Blocked, "did not converge"):
+            self.driver.switch(self.validation())
+        checkpoint = json.loads(self.state.read_text(encoding="utf-8"))
+        self.assertEqual(checkpoint["phase"], "routes-switched")
+        self.assertIn("post-switch:deployment/mas", checkpoint["completed"])
+        with self.assertRaisesRegex(ess.Blocked, "cannot quiesce"):
+            self.driver.quiesce()
+        mas = self.kube.objects[("deployment", "mas")]
+        self.assertEqual(mas["spec"]["replicas"], 1)
+        mas["status"].update({"replicas": 1, "readyReplicas": 1, "availableReplicas": 1})
+        patch_count = len(self.kube.patches)
+
+        self.kube.freeze_workload = None
+        switched = self.driver.switch(self.validation())
+        self.assertEqual(switched["phase"], "target-written")
+        self.assertEqual(len(self.kube.patches), patch_count)
+
+    def test_switch_retry_refuses_a_restarted_synapse_after_cutover(self):
+        self.driver.quiesce()
+        self.driver.switch(self.validation())
+        synapse = self.kube.objects[("statefulset", "synapse")]
+        synapse["spec"]["replicas"] = 1
+        synapse["status"].update({"replicas": 1, "readyReplicas": 1, "availableReplicas": 1})
+
+        with self.assertRaisesRegex(ess.Blocked, "is writable"):
+            self.driver.switch(self.validation())
 
     def test_pre_write_rollback_restores_exact_replicas_and_route(self):
         self.kube.objects[("statefulset", "federation_sender")]["spec"]["replicas"] = 3
