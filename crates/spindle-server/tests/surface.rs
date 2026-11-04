@@ -46,7 +46,11 @@ async fn get(path: &str) -> (StatusCode, Value) {
     let value = if bytes.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice(&bytes).expect("responses are JSON")
+        // Most verdicts are JSON, but a route can answer before its handler:
+        // a missing thumbnail query struct is a 400 with a plain-text body.
+        // That is still an answer from the route rather than the fallback,
+        // so an unparsable body counts as served, like an empty one.
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
     };
     (status, value)
 }
@@ -85,13 +89,20 @@ fn no_room_version_is_advertised_before_rooms_can_be_created_or_joined() {
 
 /// ...and the router's own claim about itself has to be true, or the test above
 /// is checking against a list rather than against reality.
+///
+/// "Served" means "not the fallback": an unmounted path answers 404
+/// `M_UNRECOGNIZED`, while a mounted route whose placeholder IDs name nothing
+/// answers its own verdict (a 401, a 405, or a handler 404 like `M_NOT_FOUND`).
+/// The errcode is the distinction the router itself documents, so it is the
+/// distinction this test checks.
 #[tokio::test]
 async fn every_route_the_table_claims_actually_answers() {
     for path in routes::MOUNTED {
-        let (status, _) = get(path).await;
-        assert_ne!(
-            status,
-            StatusCode::NOT_FOUND,
+        let (status, body) = get(path).await;
+        let unrecognized =
+            status == StatusCode::NOT_FOUND && body["errcode"] == "M_UNRECOGNIZED";
+        assert!(
+            !unrecognized,
             "{path} is in MOUNTED but the router does not serve it"
         );
     }
