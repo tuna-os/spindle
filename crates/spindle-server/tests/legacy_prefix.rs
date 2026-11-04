@@ -123,10 +123,7 @@ async fn r0_media_download_and_thumbnail_ride_the_frozen_v3_routes() {
         *pixel = image::Rgb([0, 0, 255]);
     }
     image::DynamicImage::ImageRgb8(image)
-        .write_to(
-            &mut std::io::Cursor::new(&mut png),
-            image::ImageFormat::Png,
-        )
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .unwrap();
     let response = client
         .post(format!(

@@ -443,7 +443,9 @@ async fn legacy_download_and_thumbnail_serve_without_a_token() {
     // recognition failure: the routes exist now.
     for uri in [
         format!("/_matrix/media/v3/download/{server}/deadbeefdeadbeefdeadbeefdeadbeef"),
-        format!("/_matrix/media/v3/thumbnail/{server}/deadbeefdeadbeefdeadbeefdeadbeef?width=50&height=50"),
+        format!(
+            "/_matrix/media/v3/thumbnail/{server}/deadbeefdeadbeefdeadbeefdeadbeef?width=50&height=50"
+        ),
     ] {
         let (status, body) = harness
             .call(Request::builder().uri(uri).body(Body::empty()).unwrap())

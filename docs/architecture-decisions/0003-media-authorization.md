@@ -62,17 +62,18 @@ to let back in.
 
 ## Amendment: the frozen unauthenticated surface is served
 
-The authenticated routes above were the whole story until clients
-showed otherwise: with no spec version past v1.3 advertised and no
-MSC3916 flag, nothing moves a client onto the authenticated endpoints,
-so every client that predates them — or gates on a version this server
-does not claim — fetched avatars and thumbnails from the frozen
-`/_matrix/media/v3/download` and `/thumbnail` endpoints and got 404s.
-The spec froze those endpoints without removing them, and every
-reference server still serves them.
+Clients showed that the authenticated routes were not the whole story.
+This server claims no spec version past v1.3 and sends no MSC3916 flag.
+So nothing moves a client to the authenticated endpoints.
 
-They are now served as pure capability URLs: the same bytes through the
-same content-addressed store, with no token bound alongside the URI.
-This extends decision 1 rather than contradicting it — the IDs are 128
-random bits, so holding the URI remains the authorization — and the
-`download_needs_a_token` pin keeps holding for the authenticated routes.
+Clients that predate those endpoints fetch avatars and thumbnails from
+the frozen
+`/_matrix/media/v3/download` and `/thumbnail` endpoints. Those fetches
+get 404s. The spec froze those endpoints but keeps them. All reference
+servers still serve them.
+
+The server now serves them as pure capability URLs. It returns the same
+bytes from the same content-addressed store. It binds no token next to
+the URI. This extends decision 1. The IDs hold 128 random bits, so the
+URI itself stays the authorization. The `download_needs_a_token` pin
+still guards the authenticated routes.
