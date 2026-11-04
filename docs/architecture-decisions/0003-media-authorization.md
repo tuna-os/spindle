@@ -59,3 +59,20 @@ to let back in.
   makes the route require a token at all, and the underscore records
   that the identity is authenticated and then, by this decision, not
   consulted.
+
+## Amendment: the frozen unauthenticated surface is served
+
+The authenticated routes above were the whole story until clients
+showed otherwise: with no spec version past v1.3 advertised and no
+MSC3916 flag, nothing moves a client onto the authenticated endpoints,
+so every client that predates them — or gates on a version this server
+does not claim — fetched avatars and thumbnails from the frozen
+`/_matrix/media/v3/download` and `/thumbnail` endpoints and got 404s.
+The spec froze those endpoints without removing them, and every
+reference server still serves them.
+
+They are now served as pure capability URLs: the same bytes through the
+same content-addressed store, with no token bound alongside the URI.
+This extends decision 1 rather than contradicting it — the IDs are 128
+random bits, so holding the URI remains the authorization — and the
+`download_needs_a_token` pin keeps holding for the authenticated routes.

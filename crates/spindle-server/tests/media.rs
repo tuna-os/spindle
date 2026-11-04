@@ -358,9 +358,8 @@ async fn a_filename_cannot_inject_a_response_header() {
 
 #[tokio::test]
 async fn download_needs_a_token() {
-    // The unauthenticated media endpoints are deliberately absent: an
-    // unauthenticated media URL is a capability that leaks the moment it is
-    // pasted anywhere.
+    // The authenticated download binds a token (and then, by ADR 0003, does
+    // not consult it): without one it is a 401, not a redirect to login.
     let harness = Harness::new();
     let alice = harness.register("alice").await;
     let (_, body) = harness.upload(&alice, "text/plain", None, b"private").await;
@@ -379,9 +378,24 @@ async fn download_needs_a_token() {
         )
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
 
-    // And the frozen unauthenticated surface is simply not served.
-    let (status, _, _) = harness
+#[tokio::test]
+async fn legacy_download_and_thumbnail_serve_without_a_token() {
+    // The frozen unauthenticated surface is served as pure capability URLs:
+    // clients that predate authenticated media, or gate on a spec version
+    // this server does not claim, fetch avatars and thumbnails here. The
+    // media ID is 128 random bits, so holding the URI is the authorization.
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let (_, body) = harness
+        .upload(&alice, "image/png", Some("dot.png"), &small_png())
+        .await;
+    let mxc = body["content_uri"].as_str().unwrap();
+    let rest = mxc.strip_prefix("mxc://").unwrap();
+    let (server, media_id) = rest.split_once('/').unwrap();
+
+    let (status, _, bytes) = harness
         .raw(
             Request::builder()
                 .uri(format!("/_matrix/media/v3/download/{server}/{media_id}"))
@@ -389,7 +403,54 @@ async fn download_needs_a_token() {
                 .unwrap(),
         )
         .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, small_png());
+
+    // The filename in the path is ignored in favour of the recorded one.
+    let (status, headers, bytes) = harness
+        .raw(
+            Request::builder()
+                .uri(format!(
+                    "/_matrix/media/v3/download/{server}/{media_id}/whatever.bin"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, small_png());
+    assert_eq!(
+        header(&headers, "content-disposition"),
+        r#"inline; filename="dot.png""#
+    );
+
+    // Thumbnails too: a decodable PNG at a ladder size, no token attached.
+    let (status, headers, bytes) = harness
+        .raw(
+            Request::builder()
+                .uri(format!(
+                    "/_matrix/media/v3/thumbnail/{server}/{media_id}?width=50&height=50"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(header(&headers, "content-type"), "image/png");
+    image::load_from_memory(&bytes).expect("a decodable thumbnail");
+
+    // An ID nothing is stored under is still a 404 with a reason, not a
+    // recognition failure: the routes exist now.
+    for uri in [
+        format!("/_matrix/media/v3/download/{server}/deadbeefdeadbeefdeadbeefdeadbeef"),
+        format!("/_matrix/media/v3/thumbnail/{server}/deadbeefdeadbeefdeadbeefdeadbeef?width=50&height=50"),
+    ] {
+        let (status, body) = harness
+            .call(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["errcode"], "M_NOT_FOUND", "{body}");
+    }
 }
 
 #[tokio::test]
