@@ -1,0 +1,30 @@
+# TEMPORARY: drop this file before the branch is deleted.
+#
+# Builds the arm64 image of the legacy-media-compat patch (production commit
+# + serving the frozen unauthenticated /_matrix/media/v3 download/thumbnail
+# endpoints) so the avatar/thumbnail fix can be verified on the Oracle A1
+# host. Pushes ghcr.io/tuna-os/spindle:legacy-media-compat-arm64.
+name: arm64 image (legacy media compat)
+
+on:
+  push:
+    branches: [ops/legacy-media-compat]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Log in to the registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Build and push
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:legacy-media-compat-arm64"
+          docker build -t "$image" .
+          docker run --rm --entrypoint /usr/local/bin/spindle "$image" 2>&1 | head -5 || true
+          docker push "$image"
