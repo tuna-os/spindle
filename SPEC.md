@@ -120,8 +120,8 @@ needing no resolution; both compute `auth_chain_difference` only inside
 Any framing of this project as "we skip state resolution and they don't" is
 false, and #56 measures the consequence: on a real fork our advantage over
 `ruma-state-res` is a flat 2.2–3.1× constant factor across the whole range out
-to a full `max_fork_window` — not the superlinear gap the cost column invites a
-reader to expect.
+to a 512-event fork, the window cap §9.1 then had — not the superlinear gap the
+cost column invites a reader to expect.
 
 What survives is the bottom four rows, and they have one thing in common:
 **they are bookkeeping, not algorithms.** Maintaining the extremity set,

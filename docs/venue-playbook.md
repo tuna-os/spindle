@@ -344,18 +344,19 @@ reconnect. If it does not come back, restore from the last backup; the
 gateways' outboxes redeliver what it missed.
 
 **Two gateways disagree about a session room** (a state-DAG fork that
-neither side names the other's event in). The Spindle sets the contested
-key aside and keeps taking writes; the gateways run state resolution and
-may pick the other branch until the resolver lands on Spindle. Expect a
-room name or topic to differ between sides, never a lost message.
+neither side names the other's event in). The Spindle resolves the fork
+with state resolution 2.1, as the gateways do (ADR 0005), and keeps
+taking writes. No run has yet compared the two sides' answers on such a
+fork; if they differ, expect a room name or topic to differ between
+sides, never a lost message.
 
 ## 7. Known gaps
 
-1. **State-DAG fork resolution on Spindle.** A contested key is set aside
-   rather than resolved (docs/divergence.md, #16). Two gateways cannot
-   produce a fork the Spindle cannot fold unless they write the same key
-   while partitioned from each other; harmless for a conference room,
-   and the next piece of work regardless.
+1. **State-DAG forks against Neutrino are untested.** Spindle resolves
+   them with the gateways' algorithm (ADR 0005), but no test drives a
+   state-DAG fork between the two. Producing one takes two gateways
+   writing the same key while partitioned from each other; harmless for
+   a conference room, and the next piece of work regardless.
 2. **Inbound request verification on the gateway.** The fork reads the
    `X-Matrix` origin and does not check its signature. On a venue LAN the
    operator runs, that is a network-layer trust the design accepts; on a

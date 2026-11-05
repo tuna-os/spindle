@@ -281,14 +281,13 @@ mesh's question, and the harder one; the Companion project's
    and `/capabilities` advertising it as unstable. When the number is
    assigned, the string changes and nothing else does.
 
-   What it does not do yet is resolve a state-DAG fork: two accepted
-   state events neither of which names the other. Today that is the
-   fork the log already classifies (docs/divergence.md), and the
-   contested key is set aside rather than resolved, exactly as for a
-   stock room. Neutrino runs state resolution 2.1 over the same inputs,
-   so on a fork the two can disagree until the resolver is wired in --
-   the same gap #16 names, now with a version whose whole point is that
-   the resolver's inputs are trustworthy.
+   What it does not have yet is evidence on a state-DAG fork: two
+   accepted state events neither of which names the other. Spindle
+   resolves one as it resolves any fork (ADR 0005): with state
+   resolution 2.1, the algorithm Neutrino runs, over the states of the
+   parents an event names. No test yet drives such a fork between
+   Spindle and Neutrino, so their agreement on one rests on the shared
+   algorithm rather than on an observed run.
 
 4. **MatrixRTC on the node: done here, as a patch.**
    `contrib/neutrino/0002-matrixrtc.patch` serves MSC4143 transports and

@@ -768,7 +768,8 @@ impl RoomLog {
             .map(|(_, entry)| entry)
     }
 
-    /// Every tip of the federation DAG, including any set aside.
+    /// Every tip of the federation DAG, including any beyond the newest
+    /// [`MAX_AUTHORED_PREV_EVENTS`] that a local event leaves unnamed.
     ///
     /// This is what a peer would compute from the same events, and what
     /// the store persists. It is not what a local event names -- that is

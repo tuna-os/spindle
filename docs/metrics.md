@@ -80,11 +80,12 @@ renamed metric cannot leave a rule that never fires.
 `spindle_fork_resolutions_total` is not a throughput metric. It is the
 instrument the architecture is falsified by.
 
-SPEC §9.2 splits every append into three cases, cheapest first:
+Every append is counted in one of three cases, cheapest first (SPEC §9.2):
 
-- **case 1** — a non-state event. Cannot conflict; no state resolution.
-- **case 2** — a state event whose key nothing in the fork window touched.
-  One `apply()`; no state resolution.
+- **case 1** — a non-state event whose parents hold one state. No state
+  resolution.
+- **case 2** — a state event whose parents hold one state. One `apply()`;
+  no state resolution.
 - **case 3** — an event whose parents' states differ. The expensive
   path: the room version's state resolution (ADR 0005).
 

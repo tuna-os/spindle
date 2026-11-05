@@ -36,10 +36,11 @@ use std::time::Duration;
 /// argument it exists to test.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ForkCase {
-    /// Case 1 — a non-state event. Cannot conflict; no resolution.
+    /// Case 1 — a non-state event whose parents hold one state. No
+    /// resolution.
     NonState,
-    /// Case 2 — a state event whose key nothing in the window touched.
-    /// One `apply()`; no resolution.
+    /// Case 2 — a state event whose parents hold one state. One `apply()`;
+    /// no resolution.
     StateUncontested,
     /// Case 3 — an event whose parents' states differ, so the room
     /// version's resolver ran (ADR 0005). The expensive path, and the one
