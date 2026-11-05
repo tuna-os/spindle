@@ -529,6 +529,16 @@ registrations = []
 #
 # Pushers one account may register. A client registers one per device.
 # pushers_per_user = 100
+#
+# The next two bound the whole process, not one account (#571). Every
+# password login, registration and password change runs one Argon2 hash,
+# and each hash needs a 19 MiB workspace. The process keeps at most
+# `password_hashes_at_once` workspaces and reuses them; at most
+# `password_hashes_waiting` callers wait for one, and the next is refused
+# with 429 `M_LIMIT_EXCEEDED`. A zero queue is allowed and means "refuse
+# rather than wait"; zero workspaces is not.
+# password_hashes_at_once = 2
+# password_hashes_waiting = 32
 
 [logging]
 # A `tracing-subscriber` filter directive.

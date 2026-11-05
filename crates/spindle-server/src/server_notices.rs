@@ -68,7 +68,7 @@ pub async fn send(state: &AppState, notice: &Notice<'_>) -> Result<String, Matri
     {
         accounts
             .register(&config.localpart, &unguessable_password())
-            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+            .map_err(|error| crate::routes::internal(&error))?;
         state
             .profiles
             .set(&sender, Some(Some(config.display_name.clone())), None)

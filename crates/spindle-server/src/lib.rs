@@ -443,6 +443,7 @@ fn app_state_with(
     metrics: Arc<metrics::Metrics>,
     mailer: Option<Arc<dyn email::Mailer>>,
 ) -> Result<AppState, AppError> {
+    passwords::configure(&config.limits);
     let key =
         Arc::new(signing::ServerKey::load_or_create(store.as_ref()).map_err(AppError::Signing)?);
     let rooms = Arc::new(rooms::Rooms::with_metrics(

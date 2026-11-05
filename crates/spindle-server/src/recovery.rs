@@ -420,7 +420,7 @@ async fn recover(
     web::forget_password_attempts(&state, &localpart, &source);
     accounts
         .set_password(&localpart, &form.new_password)
-        .map_err(|e| storage(&e))?;
+        .map_err(|e| crate::routes::internal(&e))?;
     accounts
         .logout_everywhere(&localpart)
         .map_err(|e| storage(&e))?;

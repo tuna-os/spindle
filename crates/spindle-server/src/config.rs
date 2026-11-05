@@ -409,6 +409,10 @@ const fn default_dummy_event_interval_secs() -> u64 {
 /// keys up to fifty -- and finite against one that has gone wrong or is
 /// trying to. A hit cap answers `M_LIMIT_EXCEEDED`, and a replacement of
 /// something already stored never counts against it.
+///
+/// The two `password_hashes_` fields are the exception: they bound the
+/// whole process, not one account, because the memory a password hash
+/// takes is the process's (#571).
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct LimitsConfig {
     /// Stored `/sync` filters per user.
@@ -422,6 +426,16 @@ pub struct LimitsConfig {
     pub one_time_keys_per_device: usize,
     #[serde(default = "default_pushers_per_user")]
     pub pushers_per_user: usize,
+    /// Argon2 computations (login, registration, password change) the
+    /// process runs at once, each in a workspace kept for reuse: the
+    /// process holds at most this many times 19 MiB for them.
+    #[serde(default = "default_password_hashes_at_once")]
+    pub password_hashes_at_once: usize,
+    /// Callers that may wait for a free workspace; the next one is
+    /// refused with 429 `M_LIMIT_EXCEEDED`. Zero refuses whenever every
+    /// workspace is in use.
+    #[serde(default = "default_password_hashes_waiting")]
+    pub password_hashes_waiting: usize,
 }
 
 impl Default for LimitsConfig {
@@ -431,6 +445,8 @@ impl Default for LimitsConfig {
             account_data_per_user: default_account_data_per_user(),
             one_time_keys_per_device: default_one_time_keys_per_device(),
             pushers_per_user: default_pushers_per_user(),
+            password_hashes_at_once: default_password_hashes_at_once(),
+            password_hashes_waiting: default_password_hashes_waiting(),
         }
     }
 }
@@ -460,6 +476,21 @@ pub const DEFAULT_PUSHERS_PER_USER: usize = 100;
 
 const fn default_pushers_per_user() -> usize {
     DEFAULT_PUSHERS_PER_USER
+}
+
+/// Two at once keeps a login answered while another is hashed, at twice
+/// the memory of one; more cores do not make a single login faster.
+pub const DEFAULT_PASSWORD_HASHES_AT_ONCE: usize = 2;
+/// About a second of default-cost hashes at two at once: a queue a person
+/// logging in will not notice, and a bound a flood of logins meets fast.
+pub const DEFAULT_PASSWORD_HASHES_WAITING: usize = 32;
+
+const fn default_password_hashes_at_once() -> usize {
+    DEFAULT_PASSWORD_HASHES_AT_ONCE
+}
+
+const fn default_password_hashes_waiting() -> usize {
+    DEFAULT_PASSWORD_HASHES_WAITING
 }
 
 /// The operational scrape surface (#166).
@@ -1693,6 +1724,12 @@ impl Config {
             (
                 "limits.one_time_keys_per_device",
                 self.limits.one_time_keys_per_device,
+            ),
+            // Zero workspaces would refuse every login. Zero waiting is a
+            // real choice -- refuse rather than queue -- so it is allowed.
+            (
+                "limits.password_hashes_at_once",
+                self.limits.password_hashes_at_once,
             ),
         ] {
             if value == 0 {

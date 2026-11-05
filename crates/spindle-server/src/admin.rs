@@ -250,7 +250,7 @@ async fn shared_secret_register(
         .map_err(|error| match error {
             crate::accounts::AccountError::UserInUse => MatrixError::user_in_use(),
             crate::accounts::AccountError::InvalidUsername => MatrixError::invalid_username(),
-            other => MatrixError::internal(&other.to_string()),
+            other => crate::routes::internal(&other),
         })?;
     if request.admin {
         accounts
@@ -760,11 +760,11 @@ async fn put_user(
             .unwrap_or_else(unguessable_password);
         accounts
             .register(&localpart, &password)
-            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+            .map_err(|error| crate::routes::internal(&error))?;
     } else if let Some(password) = &request.password {
         accounts
             .set_password(&localpart, password)
-            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+            .map_err(|error| crate::routes::internal(&error))?;
         if request.logout_devices.unwrap_or(true) {
             accounts
                 .logout_everywhere(&localpart)
@@ -866,7 +866,7 @@ async fn reset_password(
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     accounts
         .set_password(&localpart, &request.new_password)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        .map_err(|error| crate::routes::internal(&error))?;
     let logout = request.logout_devices.unwrap_or(true);
     if logout {
         accounts

@@ -154,7 +154,7 @@ fn appservice_identity(
     if !known {
         accounts
             .register(localpart, &crate::accounts::unguessable_password())
-            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+            .map_err(|error| crate::routes::internal(&error))?;
     }
     Ok(Identity {
         user_id,

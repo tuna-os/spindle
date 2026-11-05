@@ -248,7 +248,12 @@ async fn login(
     let verified = accounts
         .verify_password(&localpart, password)
         .map_err(|error| {
-            record_password_login(&state, LoginResult::Error);
+            let result = if matches!(error, AccountError::Busy) {
+                LoginResult::RateLimited
+            } else {
+                LoginResult::Error
+            };
+            record_password_login(&state, result);
             internal(&error)
         })?;
     if !verified {
@@ -511,7 +516,7 @@ async fn register(
         .map_err(|error| match error {
             AccountError::UserInUse => MatrixError::user_in_use(),
             AccountError::InvalidUsername => MatrixError::invalid_username(),
-            other => MatrixError::internal(&other.to_string()),
+            other => internal(&other),
         })?;
 
     let user_id = accounts.user_id(username);
@@ -577,7 +582,7 @@ fn register_appservice_user(
         .map_err(|error| match error {
             AccountError::UserInUse => MatrixError::user_in_use(),
             AccountError::InvalidUsername => MatrixError::invalid_username(),
-            other => MatrixError::internal(&other.to_string()),
+            other => internal(&other),
         })?;
     // MSC4190: a device-managing service gets no session even when it did
     // not ask to inhibit one — the as_token is its only credential, and
