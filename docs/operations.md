@@ -37,6 +37,9 @@ The v0.1 deployment envelope needs these controls:
   into a fresh directory and run `verify-media` before you resume traffic.
   Back up before migration; rollback restores the original backup using
   the old binary. An old binary refuses an upgraded directory.
+- Disk the state trie no longer references is reclaimed only by
+  `spindle gc <config>`, with the server stopped; `--dry-run` reports what
+  it would free. There is no online collector. See [lifecycle.md](lifecycle.md).
 
 [rate-limits.md](rate-limits.md) distinguishes caps on requests and work from
 account-driven history growth. These deployment controls complement the

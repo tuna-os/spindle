@@ -6,13 +6,18 @@
 //! every one of them fails *quietly* without a check: a backup nobody can
 //! restore looks exactly like a backup nobody has needed yet.
 
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use spindle_core::{RoomLog, StateKey};
+use spindle_core::{MemStateKeyTable, RoomLog, StateKey, StateKeyTable};
 use spindle_store::backup::{BackupError, read_backup, write_backup};
-use spindle_store::{Durability, FjallStore, ReadView, RoomStore, SchemaMarker, Store};
+use spindle_store::{
+    Durability, FjallStore, ReadView, Record, RoomStore, RowVisitor, SchemaMarker, Store,
+    StoreError,
+};
 use tempfile::TempDir;
 
 const ROOM: &str = "!backup:example.org";
@@ -249,4 +254,157 @@ fn a_backup_taken_under_writes_is_of_one_moment() {
          produces: {:?}",
         rebuilt.broken_chain,
     );
+}
+
+/// The stream exactly as #20 first wrote it: every row collected through
+/// `scan_prefix`, then framed. Kept here, spelled out byte by byte, as the
+/// definition the streaming writer (#743) must keep matching -- a backup
+/// taken by one binary has to restore under the next.
+fn reference_backup(view: &dyn ReadView) -> Vec<u8> {
+    let mut stream = Vec::new();
+    stream.extend_from_slice(b"SPINDLE-BACKUP\x00\x01");
+    stream.push(1);
+    let marker = SchemaMarker::current().encode();
+    stream.push(u8::try_from(marker.len()).unwrap());
+    stream.extend_from_slice(&marker);
+    let rows = view.scan_prefix(&[]).unwrap();
+    for (key, value) in &rows {
+        stream.extend_from_slice(&u32::try_from(key.len()).unwrap().to_be_bytes());
+        stream.extend_from_slice(key);
+        stream.extend_from_slice(&u32::try_from(value.len()).unwrap().to_be_bytes());
+        stream.extend_from_slice(value);
+    }
+    stream.extend_from_slice(&u32::MAX.to_be_bytes());
+    stream.extend_from_slice(&(rows.len() as u64).to_be_bytes());
+    let digest = blake3::hash(&stream);
+    stream.extend_from_slice(digest.as_bytes());
+    stream
+}
+
+/// Streaming the rows changed how they are read, not one byte of what is
+/// written: for a store with state, intern rows and a room's metadata, the
+/// stream is the collected-then-framed one, and it restores.
+#[test]
+fn the_streamed_backup_is_byte_for_byte_the_original_format() {
+    let dir = TempDir::new().unwrap();
+    let store = FjallStore::open(dir.path()).unwrap();
+    seed(&store, 40);
+    let streamed = backup_of(&store);
+    let snapshot = store.snapshot();
+    let view: &dyn ReadView = snapshot.as_deref().unwrap_or(&store);
+    assert_eq!(streamed, reference_backup(view));
+
+    let target_dir = TempDir::new().unwrap();
+    let target = FjallStore::open(target_dir.path()).unwrap();
+    read_backup(&mut streamed.as_slice(), &target).unwrap();
+    assert_eq!(
+        target.scan_prefix(&[]).unwrap(),
+        store.scan_prefix(&[]).unwrap()
+    );
+}
+
+const ROWS: u32 = 2_000;
+const VALUE: usize = 1_024;
+/// `row-00000000`: twelve bytes.
+const KEY: usize = 12;
+const FRAME: u64 = (4 + KEY + 4 + VALUE) as u64;
+
+/// A backend that makes its rows up, and records how far the backup's
+/// output had got each time it handed one out.
+///
+/// From that, `max_in_flight` is the most rows the backup held at once:
+/// rows handed out whose frame had not yet reached the writer. A writer
+/// that streams holds one; one that collects first holds all of them.
+struct Generated {
+    /// Bytes the writer has received, shared with [`Received`].
+    received: Rc<Cell<u64>>,
+    /// `received` at the moment each row was produced.
+    at_production: RefCell<Vec<u64>>,
+}
+
+impl Generated {
+    fn row(&self, index: u32) -> (Vec<u8>, Vec<u8>) {
+        self.at_production.borrow_mut().push(self.received.get());
+        let key = format!("row-{index:08}").into_bytes();
+        assert_eq!(key.len(), KEY);
+        (key, vec![u8::try_from(index % 251).unwrap(); VALUE])
+    }
+
+    fn max_in_flight(&self) -> u64 {
+        let produced = self.at_production.borrow();
+        // The header is written before the scan starts, so the first row's
+        // reading is where row frames begin.
+        let header = produced[0];
+        produced
+            .iter()
+            .zip(0_u64..)
+            .map(|(received, index)| index + 1 - (received - header) / FRAME)
+            .max()
+            .unwrap()
+    }
+}
+
+impl ReadView for Generated {
+    fn get(&self, _: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(None)
+    }
+
+    /// What a backend's collecting scan does: every row, then return.
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<Record>, StoreError> {
+        assert!(prefix.is_empty());
+        Ok((0..ROWS).map(|index| self.row(index)).collect())
+    }
+
+    fn visit_prefix(&self, prefix: &[u8], visit: &mut RowVisitor<'_>) -> Result<(), StoreError> {
+        assert!(prefix.is_empty());
+        for index in 0..ROWS {
+            let (key, value) = self.row(index);
+            visit(&key, &value)?;
+        }
+        Ok(())
+    }
+
+    fn scan_from(&self, _: &[u8], _: &[u8]) -> Result<Vec<Record>, StoreError> {
+        unreachable!("a backup reads the whole store")
+    }
+
+    fn key_table(&self) -> Arc<dyn StateKeyTable> {
+        MemStateKeyTable::shared()
+    }
+
+    fn scan_until(&self, _: &[u8], _: &[u8], _: &[u8]) -> Result<Vec<Record>, StoreError> {
+        unreachable!("a backup reads the whole store")
+    }
+}
+
+/// A writer that counts what reaches it and keeps none of it.
+struct Received(Rc<Cell<u64>>);
+
+impl std::io::Write for Received {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.set(self.0.get() + bytes.len() as u64);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The backup holds one row at a time (#743), however many the store has.
+///
+/// Before, `write_backup` collected `scan_prefix(&[])` and framed the Vec:
+/// all 2,000 rows -- two megabytes here, the whole store in production --
+/// were in memory before the first frame was written.
+#[test]
+fn a_backup_holds_one_row_at_a_time() {
+    let received = Rc::new(Cell::new(0));
+    let view = Generated {
+        received: Rc::clone(&received),
+        at_production: RefCell::new(Vec::new()),
+    };
+    let rows = write_backup(&view, &mut Received(Rc::clone(&received))).unwrap();
+    assert_eq!(rows, u64::from(ROWS));
+    assert_eq!(view.at_production.borrow().len(), ROWS as usize);
+    assert_eq!(view.max_in_flight(), 1, "rows held at once");
 }

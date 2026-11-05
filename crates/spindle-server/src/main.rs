@@ -128,25 +128,71 @@ async fn main() -> ExitCode {
         };
         return verify_media(&config_path).await;
     }
-    // `spindle migrate <config> [--dry-run]` -- move a store forward to the
-    // schema this binary speaks (#20).
-    //
-    // Its own command rather than something the server does on start. An
-    // upgrade that rewrites the store the moment a new binary boots is the
-    // change an operator cannot back out of: by the time they know it
-    // happened, the old bytes are gone. So `open` refuses and names this,
-    // and the rewrite waits for somebody to ask -- having had the chance to
-    // take a backup first.
-    if std::env::args().nth(1).as_deref() == Some("migrate") {
-        let Some(config_path) = std::env::args().nth(2) else {
-            eprintln!("usage: spindle migrate <config> [--dry-run]");
-            return ExitCode::FAILURE;
-        };
-        let dry_run = std::env::args().any(|argument| argument == "--dry-run");
-        return migrate(&config_path, dry_run);
+    if let Some(code) = store_maintenance_command() {
+        return code;
     }
 
     serve().await
+}
+
+/// The commands that rewrite the store in place, offline: `migrate` and
+/// `gc`. `None` when the command is neither.
+fn store_maintenance_command() -> Option<ExitCode> {
+    let command = std::env::args().nth(1)?;
+    let run: fn(&str, bool) -> ExitCode = match command.as_str() {
+        // `spindle migrate <config> [--dry-run]` -- move a store forward to
+        // the schema this binary speaks (#20).
+        //
+        // Its own command rather than something the server does on start.
+        // An upgrade that rewrites the store the moment a new binary boots
+        // is the change an operator cannot back out of: by the time they
+        // know it happened, the old bytes are gone. So `open` refuses and
+        // names this, and the rewrite waits for somebody to ask -- having
+        // had the chance to take a backup first.
+        "migrate" => migrate,
+        // `spindle gc <config> [--dry-run]` -- delete the state-trie nodes
+        // no stored root reaches (#742). Offline for the reason the
+        // collector's module docs give: a sweep racing an append can delete
+        // a node the append has just made live again. Opening the store
+        // takes the engine's directory lock, so a running server refuses it.
+        "gc" => gc,
+        _ => return None,
+    };
+    let Some(config_path) = std::env::args().nth(2) else {
+        eprintln!("usage: spindle {command} <config> [--dry-run]");
+        return Some(ExitCode::FAILURE);
+    };
+    let dry_run = std::env::args().any(|argument| argument == "--dry-run");
+    Some(run(&config_path, dry_run))
+}
+
+/// Collect the store's unreachable state-trie nodes, or with `dry_run`
+/// count them.
+fn gc(config_path: &str, dry_run: bool) -> ExitCode {
+    let Some(store) = open_store(config_path) else {
+        return ExitCode::FAILURE;
+    };
+    match spindle_store::gc::collect_state_nodes(&store, dry_run) {
+        Ok(report) => {
+            println!(
+                "gc: {} root-holding rows; {} reachable state nodes ({} bytes, {} node reads)",
+                report.holders, report.marked, report.marked_bytes, report.node_reads
+            );
+            let verb = if dry_run { "would sweep" } else { "swept" };
+            println!(
+                "gc: {verb} {} unreachable state nodes ({} bytes)",
+                report.swept, report.swept_bytes
+            );
+            if dry_run {
+                println!("gc: dry run, nothing deleted");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("gc: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Split a comma-separated command-line list, dropping empty entries.

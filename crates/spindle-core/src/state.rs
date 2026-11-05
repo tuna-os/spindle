@@ -1216,6 +1216,75 @@ impl StateSnapshot {
     }
 }
 
+/// Append the addresses a stored node links to onto `out`: a branch's
+/// children in slot order, nothing for a leaf.
+///
+/// For the store's mark-and-sweep (#742), which has to know what a node
+/// keeps alive without paying for what [`StateSnapshot::rehydrate`] builds:
+/// no `Arc` tree, no event-ID strings, no intern-table lookups. It parses
+/// exactly the fields [`rebuild_verified`] parses, so the children it names
+/// are the ones a read of this node would go on to load.
+///
+/// The node is checked against `address` before anything is appended. A
+/// collector that trusted corrupt bytes would mark whatever they happened
+/// to name and sweep the subtree the real node held, turning one damaged
+/// row into a lost state; refusing here leaves the decision to an operator.
+///
+/// # Errors
+///
+/// [`RehydrateError::Malformed`] for an unknown tag or truncated fields,
+/// [`RehydrateError::HashMismatch`] when the bytes are not the node stored
+/// under `address`. Nothing is appended on error.
+pub fn stored_node_children(
+    address: &StateRoot,
+    bytes: &[u8],
+    out: &mut Vec<StateRoot>,
+) -> Result<(), RehydrateError> {
+    let mut at = 1_usize;
+    let mut hasher = blake3::Hasher::new();
+    let first = out.len();
+    match bytes.first().copied() {
+        Some(TAG_LEAF) => {
+            let digest = take_array::<32>(bytes, &mut at)?;
+            let count = take_count(bytes, &mut at, 8 + 4)?;
+            hasher.update(HAMT_LEAF_TAG);
+            hasher.update(&digest);
+            hasher.update(&(count as u64).to_be_bytes());
+            for _ in 0..count {
+                let id = take_array::<8>(bytes, &mut at)?;
+                let start = at;
+                let len = take_len(bytes, &mut at)?;
+                let end = at.checked_add(len).ok_or(RehydrateError::Malformed)?;
+                // The stored frame is the hashed frame (`hash_bytes`): a
+                // big-endian `u32` length, then the bytes.
+                let framed = bytes.get(start..end).ok_or(RehydrateError::Malformed)?;
+                at = end;
+                hasher.update(&id);
+                hasher.update(framed);
+            }
+        }
+        Some(TAG_BRANCH) => {
+            let bitmap = take_array::<4>(bytes, &mut at)?;
+            let count = take_count(bytes, &mut at, 32)?;
+            hasher.update(HAMT_BRANCH_TAG);
+            hasher.update(&bitmap);
+            // `take_count` has proven `count` addresses fit, so nothing in
+            // this loop can fail after a push and leave `out` half-extended.
+            for _ in 0..count {
+                let child = take_array::<32>(bytes, &mut at)?;
+                hasher.update(&child);
+                out.push(StateRoot(child));
+            }
+        }
+        _ => return Err(RehydrateError::Malformed),
+    }
+    if hasher.finalize().as_bytes() != address.as_bytes() {
+        out.truncate(first);
+        return Err(RehydrateError::HashMismatch);
+    }
+    Ok(())
+}
+
 /// Rebuild the state at a version-2 root as a version-3 snapshot.
 ///
 /// Version-2 leaves hold `(event_type, state_key)` strings placed by the
@@ -2194,6 +2263,77 @@ mod cached_rehydrate_tests {
                     .map(|entry| entry.charge)
                     .sum::<usize>()
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod stored_children_tests {
+    use super::*;
+
+    /// Every node a snapshot persists, by address.
+    fn stored(count: usize) -> (StateSnapshot, HashMap<StateRoot, Vec<u8>>) {
+        let mut state = StateSnapshot::new(crate::state_table::MemStateKeyTable::shared());
+        for index in 0..count {
+            state = state.apply(
+                &StateKey::new("m.room.member", format!("@u{index}:test")),
+                format!("$e{index}"),
+            );
+        }
+        let nodes = state.delta_nodes(None).into_iter().collect();
+        (state, nodes)
+    }
+
+    /// Walking `stored_node_children` from the root reaches exactly the
+    /// nodes `delta_nodes` persisted: what the collector marks is what a
+    /// rehydrate would read, no more and no less.
+    #[test]
+    fn the_children_walk_reaches_every_persisted_node_and_nothing_else() {
+        let (state, nodes) = stored(600);
+        let mut reached = HashSet::new();
+        let mut stack = vec![state.root()];
+        while let Some(address) = stack.pop() {
+            if !reached.insert(address) {
+                continue;
+            }
+            let bytes = nodes.get(&address).expect("a named child is persisted");
+            stored_node_children(&address, bytes, &mut stack).expect("an honest node");
+        }
+        assert_eq!(reached.len(), nodes.len());
+        assert!(nodes.keys().all(|address| reached.contains(address)));
+    }
+
+    /// A leaf names no children; a flipped byte anywhere in a node is
+    /// refused before anything is appended, so a collector never marks
+    /// what corrupt bytes happen to name.
+    #[test]
+    fn corrupt_or_truncated_nodes_append_nothing() {
+        let (state, nodes) = stored(600);
+        let root = state.root();
+        let bytes = nodes.get(&root).expect("root");
+        assert_eq!(bytes.first(), Some(&TAG_BRANCH), "600 slots need a branch");
+        let (leaf, leaf_bytes) = nodes
+            .iter()
+            .find(|(_, bytes)| bytes.first() == Some(&TAG_LEAF))
+            .expect("a leaf");
+        let mut out = vec![root];
+        stored_node_children(leaf, leaf_bytes, &mut out).expect("leaf");
+        assert_eq!(out, vec![root], "a leaf has no children");
+
+        for corrupt in [leaf_bytes, bytes] {
+            let mut flipped = corrupt.clone();
+            let last = flipped.len() - 1;
+            flipped[last] ^= 1;
+            let address = if corrupt == bytes { &root } else { leaf };
+            assert_eq!(
+                stored_node_children(address, &flipped, &mut out),
+                Err(RehydrateError::HashMismatch)
+            );
+            assert_eq!(
+                stored_node_children(address, &corrupt[..corrupt.len() - 1], &mut out),
+                Err(RehydrateError::Malformed)
+            );
+            assert_eq!(out, vec![root], "nothing appended on error");
         }
     }
 }

@@ -68,23 +68,26 @@ pub fn write_backup(view: &dyn ReadView, out: &mut dyn Write) -> Result<u64, Bac
     sink.write_all(&[marker_len])?;
     sink.write_all(&marker)?;
 
-    // The empty prefix is every key. Held in memory because the backing scan
-    // already returns a Vec; streaming it is worth doing when a store is large
-    // enough to care, and is a change to `ReadView`, not to this format.
-    let rows = view.scan_prefix(&[])?;
+    // Streamed: each row is framed and written while the backend still owns
+    // it, so the backup holds one row whatever the store's size (#743). The
+    // `scan_prefix(&[])` this replaced copied the whole store into memory
+    // before writing a byte -- on a large deployment, more RAM than the
+    // server it is backing up, at a moment it is meant to stay up.
     let mut written = 0_u64;
-    for (key, value) in &rows {
-        let key_len = u32::try_from(key.len()).map_err(|_| BackupError::RowTooLarge)?;
-        if key_len == END_OF_ROWS {
-            return Err(BackupError::RowTooLarge);
-        }
-        let value_len = u32::try_from(value.len()).map_err(|_| BackupError::RowTooLarge)?;
-        sink.write_all(&key_len.to_be_bytes())?;
-        sink.write_all(key)?;
-        sink.write_all(&value_len.to_be_bytes())?;
-        sink.write_all(value)?;
-        written += 1;
+    let mut failure = None;
+    let scanned = view.visit_prefix(&[], &mut |key, value| {
+        frame_row(&mut sink, key, value)
+            .map(|()| written += 1)
+            .map_err(|error| {
+                failure = Some(error);
+                // Only stops the scan; `failure` is what is reported.
+                StoreError::Backend("backup stream stopped".to_owned())
+            })
+    });
+    if let Some(error) = failure {
+        return Err(error);
     }
+    scanned?;
 
     sink.write_all(&END_OF_ROWS.to_be_bytes())?;
     sink.write_all(&written.to_be_bytes())?;
@@ -92,6 +95,25 @@ pub fn write_backup(view: &dyn ReadView, out: &mut dyn Write) -> Result<u64, Bac
     out.write_all(digest.as_bytes())?;
     out.flush()?;
     Ok(written)
+}
+
+/// One row of the stream: big-endian `u32` key length, key, `u32` value
+/// length, value. A key as long as [`END_OF_ROWS`] would read back as the
+/// end of the stream, so it is refused rather than written.
+fn frame_row<W: Write + ?Sized>(
+    sink: &mut Digesting<'_, W>,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), BackupError> {
+    let key_len = u32::try_from(key.len()).map_err(|_| BackupError::RowTooLarge)?;
+    if key_len == END_OF_ROWS {
+        return Err(BackupError::RowTooLarge);
+    }
+    let value_len = u32::try_from(value.len()).map_err(|_| BackupError::RowTooLarge)?;
+    sink.write_all(&key_len.to_be_bytes())?;
+    sink.write_all(key)?;
+    sink.write_all(&value_len.to_be_bytes())?;
+    sink.write_all(value)
 }
 
 /// Read a backup stream into `store`.

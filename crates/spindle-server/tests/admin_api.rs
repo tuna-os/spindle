@@ -1341,6 +1341,89 @@ async fn deleting_with_purge_keeps_the_verifiable_spine() {
     );
 }
 
+/// #742: a history purge and a room deletion keep every log entry, so
+/// neither leaves a state node unreachable. The collector run after them
+/// sweeps only the stray nodes planted beside a live server's store, every
+/// stored root of every room still reads back, and a rerun finds nothing.
+#[tokio::test]
+async fn state_gc_after_purge_and_deletion_keeps_every_room_readable() {
+    use spindle_store::gc::collect_state_nodes;
+
+    let server = Instance::start().await;
+    let (admin_token, ops, unnamed) = rooms_fixture(&server).await;
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_spindle/admin/v1/rooms/{ops}/purge_history"),
+            Some(&admin_token),
+            Some(&json!({ "before_li": 9 })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/_spindle/admin/v1/rooms/{unnamed}"),
+            Some(&admin_token),
+            Some(&json!({ "purge": true })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let store = server.store.as_ref();
+    let table = spindle_store::ReadView::key_table(store);
+    let mut stray = spindle_core::StateSnapshot::new(Arc::clone(&table));
+    for number in 0..20 {
+        stray = stray.apply(
+            &spindle_core::StateKey::new("org.example.stray", number.to_string()),
+            format!("$stray-{number}"),
+        );
+    }
+    let writes: Vec<_> = stray
+        .delta_nodes(None)
+        .into_iter()
+        .map(|(address, bytes)| {
+            (
+                spindle_core::keys::content_addressed(
+                    spindle_core::keys::Keyspace::StateNode,
+                    address.as_bytes(),
+                ),
+                bytes,
+            )
+        })
+        .collect();
+    spindle_store::Store::commit_state_deferred(store, &writes, &table).unwrap();
+
+    let dry = collect_state_nodes(store, true).unwrap();
+    assert_eq!(dry.swept, writes.len() as u64, "only the strays: {dry:?}");
+    let swept = collect_state_nodes(store, false).unwrap();
+    assert_eq!(swept, dry);
+
+    for room in [&ops, &unnamed] {
+        let restored = spindle_store::RoomStore::new(store, room)
+            .load_exhaustive()
+            .unwrap()
+            .expect("the room is still stored");
+        assert!(restored.unverified.is_empty(), "{room}");
+        assert!(restored.log.entries().len() > 3, "{room}");
+    }
+    for li in 1..=8 {
+        let (status, body) = server
+            .request(
+                reqwest::Method::GET,
+                &format!("/_spindle/admin/v1/rooms/{ops}/state_at?li={li}"),
+                Some(&admin_token),
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "li {li}: {body}");
+    }
+
+    let again = collect_state_nodes(store, false).unwrap();
+    assert_eq!(again.swept, 0, "a rerun is a no-op: {again:?}");
+    assert_eq!(again.marked, swept.marked);
+}
+
 #[tokio::test]
 async fn make_room_admin_authors_a_real_event() {
     let server = Instance::start().await;
