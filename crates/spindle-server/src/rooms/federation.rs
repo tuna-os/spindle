@@ -228,6 +228,14 @@ impl Rooms {
                     .or_insert((body.clone(), candidate));
             }
             let mut accepted: BTreeMap<String, crate::authorize::StoredEvent> = BTreeMap::new();
+            // Held auth events, read and parsed once for the whole batch:
+            // ten thousand member events all cite the same create event,
+            // power levels and join rules, and nothing here writes until
+            // the commit at the end, so a held body cannot change under
+            // the cache (#766).
+            let held: std::cell::RefCell<
+                std::collections::HashMap<String, Option<crate::authorize::StoredEvent>>,
+            > = std::cell::RefCell::default();
             let mut writes = Vec::new();
             while !pending.is_empty() {
                 let ready: Vec<String> = pending
@@ -253,21 +261,13 @@ impl Rooms {
                         if let Some(event) = accepted.get(auth.as_str()) {
                             return Some(event.clone());
                         }
-                        let body = rooms
-                            .read_event(room_id, &EventId::new(auth.as_str()))
-                            .ok()?;
-                        let event = crate::authorize::StoredEvent::parse_auth_in(
-                            auth.as_str(),
-                            room_id,
-                            &body,
-                        )
-                        .ok()?;
-                        let rejected = log
-                            .sidelined(&EventId::new(auth.as_str()))
-                            .is_some_and(|entry| entry.kind == spindle_core::Sideline::Rejected);
-                        Some(event.with_rejected(rejected).with_preserved_rejection(
-                            log.historically_rejected(&EventId::new(auth.as_str())),
-                        ))
+                        if let Some(event) = held.borrow().get(auth.as_str()) {
+                            return event.clone();
+                        }
+                        let event = read_held_auth(rooms, log, room_id, auth.as_str());
+                        held.borrow_mut()
+                            .insert(auth.as_str().to_owned(), event.clone());
+                        event
                     };
                     ruma::state_res::check_state_independent_auth_rules(
                         &rules.authorization,
@@ -1962,4 +1962,24 @@ fn order_state_dag(events: Vec<(String, Value)>) -> Vec<(String, Value)> {
 /// The event ids an event's `auth_events` names.
 fn cited_auth_events(event: &Value) -> Vec<String> {
     super::edge_ids(&event["auth_events"])
+}
+
+/// A held auth event as the auth rules read it, with the rejection this
+/// log recorded for it, or `None` when it is not held or does not parse.
+fn read_held_auth(
+    rooms: &Rooms,
+    log: &RoomLog,
+    room_id: &str,
+    auth: &str,
+) -> Option<crate::authorize::StoredEvent> {
+    let body = rooms.read_event(room_id, &EventId::new(auth)).ok()?;
+    let event = crate::authorize::StoredEvent::parse_auth_in(auth, room_id, &body).ok()?;
+    let rejected = log
+        .sidelined(&EventId::new(auth))
+        .is_some_and(|entry| entry.kind == spindle_core::Sideline::Rejected);
+    Some(
+        event
+            .with_rejected(rejected)
+            .with_preserved_rejection(log.historically_rejected(&EventId::new(auth))),
+    )
 }

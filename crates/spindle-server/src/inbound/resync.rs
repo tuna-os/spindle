@@ -5,16 +5,17 @@
 //! and leaves a record (`crate::rooms::PartialState`). This loop reads the
 //! records and, for each room, asks a server for the full state at the
 //! join -- the server the join went through first, then the resident's
-//! `servers_in_room` -- the way Synapse's `_sync_partial_state_room` does:
+//! `servers_in_room`:
 //!
-//! 1. `/state_ids` at the join names the state before it and its auth
-//!    chain;
-//! 2. the bodies this server lacks are fetched -- with one `/state` when
-//!    they are a tenth or more of what was named, which for a large room's
-//!    omitted roster is nearly all of it, and an `/event` each otherwise,
-//!    the same split Synapse makes -- each named by its own hash and
-//!    signature-checked, then authorized against its auth events and
-//!    retained ([`crate::rooms::Rooms::retain_remote_auth`]);
+//! 1. one `/state` at the join carries the state before it and its auth
+//!    chain. Synapse asks `/state_ids` first and then `/state` when a
+//!    tenth or more is missing; a partial-state room always lacks its
+//!    omitted roster, so that test always passes and the first request
+//!    is a round trip saved (#766);
+//! 2. the bodies this server lacks are each named by their own hash,
+//!    signature-checked on every core, then authorized against their auth
+//!    events and retained ([`crate::rooms::Rooms::retain_remote_auth`]);
+//!    auth events they cite that are still missing come by `/event`;
 //! 3. [`crate::rooms::Rooms::complete_partial_state`] folds the member
 //!    events into every snapshot from the join on and ends the room's
 //!    partial state.
@@ -32,11 +33,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use ruma::{CanonicalJsonValue, RoomVersionId};
+use ruma::RoomVersionId;
 use serde_json::Value;
 
 use super::gap::fetch_state;
-use super::recovery::{Endpoint, Failure, Peers, RecoveryGate, verify};
+use super::recovery::{
+    Endpoint, Failure, Peers, RecoveryGate, check_signed, identify, signing_keys,
+};
 use crate::federation::{Federation, PeerKeys};
 use crate::metrics::Metrics;
 use crate::rooms::{PartialState, RoomError, Rooms};
@@ -240,66 +243,23 @@ async fn resync_from(
 ) -> Result<usize, Failure> {
     let room_id = record.room_id.as_str();
     let join_id = record.join_event_id.as_str();
-    let response = peers
-        .federation
-        .remote_state_ids(peer, room_id, join_id)
-        .await
-        .map_err(|error| Failure::from_peer_doing("/state_ids", &error))?;
-    let ids = |field: &str| -> Vec<String> {
-        response[field]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect()
-    };
-    let state_ids = ids("pdu_ids");
-    let auth_ids = ids("auth_chain_ids");
-    if state_ids.len().saturating_add(auth_ids.len()) > MAX_STATE_IDS {
-        return Err(Failure::Budget(format!(
-            "/state_ids from {peer} names more than {MAX_STATE_IDS} events"
-        )));
-    }
-    if state_ids.is_empty() {
-        return Err(Failure::Invalid(format!(
-            "/state_ids from {peer} names no state"
-        )));
-    }
-
-    let named: BTreeSet<String> = state_ids.iter().chain(&auth_ids).cloned().collect();
-    let mut missing = BTreeSet::new();
-    for id in &named {
-        match peers.rooms.pdu(room_id, id) {
-            Ok(_) => {}
-            Err(RoomError::MissingBody(_)) => {
-                missing.insert(id.clone());
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-
-    let mut fetched = BTreeMap::new();
-    if missing.len().saturating_mul(10) >= named.len() {
-        fetched = state_bodies(peers, peer, record, version, &missing, keys).await?;
-    }
-    // Whatever `/state` did not carry, or all of it when little is
-    // missing, and every auth event the fetched bodies cite that this
-    // server lacks: one `/event` each.
-    let mut rest: BTreeSet<String> = missing
-        .iter()
-        .filter(|id| !fetched.contains_key(*id))
-        .cloned()
-        .collect();
+    let State {
+        state_ids,
+        mut fetched,
+    } = state_at_join(peers, peer, record, version, keys).await?;
+    // Every auth event the fetched bodies cite that is neither among them
+    // nor held here: one `/event` each. Gathered over the whole batch, so
+    // the create event, power levels and join rules every member cites
+    // are looked up once rather than once per member.
+    let mut cited = BTreeSet::new();
     for body in fetched.values() {
-        rest.extend(
-            peers
-                .rooms
-                .missing_remote_dependencies(room_id, body)?
-                .1
-                .into_iter()
-                .filter(|id| !fetched.contains_key(id)),
-        );
+        cited.extend(auth_event_ids(body).filter(|id| !fetched.contains_key(*id)));
+    }
+    let mut rest = BTreeSet::new();
+    for id in cited {
+        if !holds(peers, room_id, id)? {
+            rest.insert(id.to_owned());
+        }
     }
     if !rest.is_empty() {
         fetched.extend(fetch_state(peers, peer, room_id, version, rest, join_id, keys).await?);
@@ -316,53 +276,188 @@ async fn resync_from(
         .map_err(|error| Failure::Invalid(format!("the state at the join: {error}")))
 }
 
-/// The bodies of `/state` at the join that this server lacks, each named
-/// by its own hash and signature-checked. Bodies it already holds are
-/// skipped before the signature check: their identity is all that is
-/// read of them.
-async fn state_bodies(
+/// The state at the join as one peer answers it.
+struct State {
+    /// The IDs of the state before the join, in the order `/state` gave.
+    state_ids: Vec<String>,
+    /// The bodies of state and auth chain this server lacked, verified.
+    fetched: BTreeMap<String, Value>,
+}
+
+/// One `/state` at the join, rather than `/state_ids` and then `/state`:
+/// a partial-state room lacks the omitted roster, which is nearly all of a
+/// large room's state, so the bodies are wanted anyway and the IDs are
+/// theirs to compute. The resident saves computing the state twice and
+/// the resync a round trip. Each body is named once by its own hash;
+/// bodies this server already holds are skipped before the signature
+/// check, since their identity is all that is read of them. Hashing and
+/// signature checks both run on every core ([`on_every_core`]).
+async fn state_at_join(
     peers: &Peers<'_>,
     peer: &str,
     record: &PartialState,
     version: &RoomVersionId,
-    missing: &BTreeSet<String>,
     keys: &mut HashMap<String, PeerKeys>,
-) -> Result<BTreeMap<String, Value>, Failure> {
+) -> Result<State, Failure> {
     let room_id = record.room_id.as_str();
-    let response = peers
+    let mut response = peers
         .federation
         .remote_state(peer, room_id, &record.join_event_id, MAX_STATE_BYTES)
         .await
         .map_err(|error| Failure::from_peer_doing("/state", &error))?;
-    let bodies: Vec<&Value> = ["pdus", "auth_chain"]
-        .iter()
-        .filter_map(|field| response[*field].as_array())
-        .flatten()
-        .collect();
-    let mut fetched = BTreeMap::new();
-    for body in bodies {
-        let Some(id) = reference_id(version, body) else {
-            continue;
-        };
-        if !missing.contains(&id) || fetched.contains_key(&id) {
+    let mut field = |name: &str| -> Vec<Value> {
+        match response[name].take() {
+            Value::Array(events) => events,
+            _ => Vec::new(),
+        }
+    };
+    let (pdus, auth_chain) = (field("pdus"), field("auth_chain"));
+    if pdus.len().saturating_add(auth_chain.len()) > MAX_STATE_IDS {
+        return Err(Failure::Budget(format!(
+            "/state from {peer} carries more than {MAX_STATE_IDS} events"
+        )));
+    }
+    if pdus.is_empty() {
+        return Err(Failure::Invalid(format!(
+            "/state from {peer} names no state"
+        )));
+    }
+    let state_len = pdus.len();
+    let named = {
+        let version = version.clone();
+        on_every_core(pdus.into_iter().chain(auth_chain).collect(), move |body| {
+            (identify(&version, &body), body)
+        })
+        .await?
+    };
+    let mut state_ids = Vec::with_capacity(state_len);
+    let mut wanted = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (index, (identified, body)) in named.into_iter().enumerate() {
+        let (id, canonical) =
+            identified.map_err(|why| Failure::Invalid(format!("/state: {why}")))?;
+        if index < state_len {
+            state_ids.push(id.clone());
+        }
+        if !seen.insert(id.clone()) || holds(peers, room_id, &id)? {
             continue;
         }
-        let verified = verify(peers, room_id, version, body, Some(&id), keys)
+        // v12's create event names no room: only a stated other room
+        // disqualifies, as in `verify`.
+        if body["room_id"]
+            .as_str()
+            .is_some_and(|named| named != room_id)
+        {
+            return Err(Failure::Invalid(format!(
+                "state event {id} belongs to another room"
+            )));
+        }
+        let public_keys = signing_keys(peers, version, &canonical, &body, keys)
             .await
             .map_err(|why| Failure::Invalid(format!("state event {id}: {why}")))?;
-        fetched.insert(verified.id, verified.body);
+        wanted.push(Unchecked {
+            id,
+            canonical,
+            body,
+            public_keys,
+        });
     }
-    Ok(fetched)
+    let checked = {
+        let (room_id, version) = (room_id.to_owned(), version.clone());
+        on_every_core(wanted, move |unchecked| {
+            let verdict = check_signed(
+                &room_id,
+                &version,
+                &unchecked.canonical,
+                &unchecked.id,
+                &unchecked.body,
+                &unchecked.public_keys,
+            );
+            (unchecked, verdict)
+        })
+        .await?
+    };
+    let mut fetched = BTreeMap::new();
+    for (unchecked, verdict) in checked {
+        let body = verdict.map_err(|refusal| {
+            let why = refusal.explain(peers, keys, &unchecked.body, version);
+            Failure::Invalid(format!("state event {}: {why}", unchecked.id))
+        })?;
+        fetched.insert(unchecked.id, body);
+    }
+    Ok(State { state_ids, fetched })
 }
 
-/// The ID a body hashes to under `version`, or `None` for one that is not
-/// an event; `verify` judges it properly once it is known to be wanted.
-fn reference_id(version: &RoomVersionId, body: &Value) -> Option<String> {
-    let CanonicalJsonValue::Object(canonical) = CanonicalJsonValue::try_from(body.clone()).ok()?
-    else {
-        return None;
-    };
-    spindle_core::Pdu::from_remote(version.clone(), canonical)
-        .ok()
-        .map(|pdu| pdu.event_id().as_str().to_owned())
+/// A body named and with its signers' keys gathered, not yet checked.
+struct Unchecked {
+    id: String,
+    canonical: ruma::CanonicalJsonObject,
+    body: Value,
+    public_keys: ruma::signatures::PublicKeyMap,
+}
+
+/// `work` over every item, off the async workers and split across the
+/// machine's cores, in the items' order. A 10,000-member resync hashes and
+/// signature-checks ten thousand events over canonical JSON; on one thread
+/// that was most of the resync (#766). Each item is judged alone, so the
+/// split changes nothing but the wall time.
+async fn on_every_core<T, U, F>(items: Vec<T>, work: F) -> Result<Vec<U>, Failure>
+where
+    T: Send + 'static,
+    U: Send + 'static,
+    F: Fn(T) -> U + Send + Sync + 'static,
+{
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    tokio::task::spawn_blocking(move || {
+        let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let chunk = items.len().div_ceil(threads).max(1);
+        let mut items = items;
+        let mut chunks = Vec::new();
+        while items.len() > chunk {
+            let tail = items.split_off(chunk);
+            chunks.push(std::mem::replace(&mut items, tail));
+        }
+        chunks.push(items);
+        let work = &work;
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = chunks
+                .into_iter()
+                .map(|chunk| scope.spawn(move || chunk.into_iter().map(work).collect::<Vec<_>>()))
+                .collect();
+            // A worker that panicked judged nothing: the whole batch is
+            // refused rather than missing its share.
+            let mut done = Vec::new();
+            for worker in workers {
+                done.extend(
+                    worker
+                        .join()
+                        .map_err(|_| Failure::Invalid("a parallel check panicked".to_owned()))?,
+                );
+            }
+            Ok(done)
+        })
+    })
+    .await
+    .map_err(|error| Failure::Invalid(format!("parallel checks stopped: {error}")))?
+}
+
+/// Whether this server holds `id`'s body in the room.
+fn holds(peers: &Peers<'_>, room_id: &str, id: &str) -> Result<bool, Failure> {
+    match peers.rooms.pdu(room_id, id) {
+        Ok(_) => Ok(true),
+        Err(RoomError::MissingBody(_)) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The auth event IDs a body cites: plain IDs from room version 3, and
+/// `[id, hashes]` pairs before it.
+fn auth_event_ids(body: &Value) -> impl Iterator<Item = &str> {
+    body["auth_events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.as_str().or_else(|| entry[0].as_str()))
 }

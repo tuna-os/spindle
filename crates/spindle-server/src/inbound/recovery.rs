@@ -324,14 +324,8 @@ pub(super) async fn verify(
     expected: Option<&str>,
     keys: &mut HashMap<String, PeerKeys>,
 ) -> Result<VerifiedPdu, String> {
-    let CanonicalJsonValue::Object(canonical) =
-        CanonicalJsonValue::try_from(body.clone()).map_err(|error| error.to_string())?
-    else {
-        return Err("event is not a canonical object".to_owned());
-    };
-    let pdu = spindle_core::Pdu::from_remote(version.clone(), canonical.clone())
-        .map_err(|error| format!("event: {error:?}"))?;
-    if expected.is_some_and(|expected| pdu.event_id().as_str() != expected) {
+    let (id, canonical) = identify(version, body)?;
+    if expected.is_some_and(|expected| id != expected) {
         return Err("recovered event ID does not match the requested event".to_owned());
     }
     if body["room_id"]
@@ -340,9 +334,45 @@ pub(super) async fn verify(
     {
         return Err("recovered event belongs to another room".to_owned());
     }
+    let public_keys = signing_keys(peers, version, &canonical, body, keys).await?;
+    let body = check_signed(room_id, version, &canonical, &id, body, &public_keys)
+        .map_err(|refusal| refusal.explain(peers, keys, body, version))?;
+    Ok(VerifiedPdu { id, body })
+}
+
+/// The canonical form of a body read off the wire and the ID it hashes to
+/// under `version`. The reference hash is the costly part of reading an
+/// event, so a caller that must know the ID before deciding to verify
+/// (`resync`) computes it here once and hands both to [`check_signed`].
+pub(super) fn identify(
+    version: &RoomVersionId,
+    body: &Value,
+) -> Result<(String, ruma::CanonicalJsonObject), String> {
+    let CanonicalJsonValue::Object(canonical) =
+        CanonicalJsonValue::try_from(body.clone()).map_err(|error| error.to_string())?
+    else {
+        return Err("event is not a canonical object".to_owned());
+    };
+    let pdu = spindle_core::Pdu::from_remote(version.clone(), canonical.clone())
+        .map_err(|error| format!("event: {error:?}"))?;
+    Ok((pdu.event_id().as_str().to_owned(), canonical))
+}
+
+/// The public keys of every server whose signature the room version
+/// requires on this event: our own, held keys, or keys looked for further
+/// -- the server itself, then the notaries -- when they are not held.
+/// `keys` accumulates what was fetched, so a batch from one server fetches
+/// once.
+pub(super) async fn signing_keys(
+    peers: &Peers<'_>,
+    version: &RoomVersionId,
+    canonical: &ruma::CanonicalJsonObject,
+    body: &Value,
+    keys: &mut HashMap<String, PeerKeys>,
+) -> Result<ruma::signatures::PublicKeyMap, String> {
     let rules = spindle_core::rules_of(version).ok_or_else(|| "unknown room version".to_owned())?;
     let required =
-        ruma::signatures::required_server_signatures_to_verify_event(&canonical, &rules.signatures)
+        ruma::signatures::required_server_signatures_to_verify_event(canonical, &rules.signatures)
             .map_err(|error| error.to_string())?;
     let mut public_keys = ruma::signatures::PublicKeyMap::new();
     for server in required {
@@ -359,8 +389,7 @@ pub(super) async fn verify(
             continue;
         }
         // The keys the server signed this event with, valid when it says
-        // it signed it: from what is held, or looked for further -- the
-        // server itself, then the notaries -- when it is not.
+        // it signed it.
         let at = body["origin_server_ts"].as_u64();
         let fetched = peers
             .federation
@@ -378,36 +407,71 @@ pub(super) async fn verify(
         public_keys.extend(fetched.map_for(at, rules.enforce_key_validity));
         keys.insert(server.to_owned(), fetched);
     }
-    let verdict =
-        spindle_core::version::verify(&public_keys, &canonical, version).map_err(|error| {
-            let error = error.to_string();
-            // Name the failing server for the classification: the first
-            // required one whose keys are held, which is the one ruma
-            // reports on when only one is required.
-            let server = keys.keys().find(|server| error.contains(server.as_str()));
-            let held = server.and_then(|server| keys.get(server));
-            signature_refusal(
-                peers.metrics,
-                held,
-                server.map(String::as_str),
-                body,
-                version,
-                &error,
-            )
-        })?;
+    Ok(public_keys)
+}
+
+/// Why [`check_signed`] refused an event: its signatures, which are
+/// classified and explained against the keys held, or anything else.
+pub(super) enum Refusal {
+    Signature(String),
+    Other(String),
+}
+
+impl Refusal {
+    /// The refusal as [`verify`] words it, counting a signature failure
+    /// by reason.
+    pub(super) fn explain(
+        self,
+        peers: &Peers<'_>,
+        keys: &HashMap<String, PeerKeys>,
+        body: &Value,
+        version: &RoomVersionId,
+    ) -> String {
+        match self {
+            Self::Other(why) => why,
+            Self::Signature(error) => {
+                // Name the failing server for the classification: the
+                // first required one whose keys are held, which is the one
+                // ruma reports on when only one is required.
+                let server = keys.keys().find(|server| error.contains(server.as_str()));
+                let held = server.and_then(|server| keys.get(server));
+                signature_refusal(
+                    peers.metrics,
+                    held,
+                    server.map(String::as_str),
+                    body,
+                    version,
+                    &error,
+                )
+            }
+        }
+    }
+}
+
+/// The CPU half of [`verify`]: check the signatures against keys already
+/// gathered, redact a body whose content hash does not match, and parse
+/// the result as an event of `room_id`. Synchronous and free of shared
+/// state, so a batch can run on several threads.
+pub(super) fn check_signed(
+    room_id: &str,
+    version: &RoomVersionId,
+    canonical: &ruma::CanonicalJsonObject,
+    id: &str,
+    body: &Value,
+    public_keys: &ruma::signatures::PublicKeyMap,
+) -> Result<Value, Refusal> {
+    let verdict = spindle_core::version::verify(public_keys, canonical, version)
+        .map_err(|error| Refusal::Signature(error.to_string()))?;
     let body = match verdict {
         ruma::signatures::Verified::All => body.clone(),
         ruma::signatures::Verified::Signatures => {
-            let redacted = spindle_core::version::redact(&canonical, version)
-                .map_err(|error| error.to_string())?;
-            serde_json::to_value(redacted).map_err(|error| error.to_string())?
+            let redacted = spindle_core::version::redact(canonical, version)
+                .map_err(|error| Refusal::Other(error.to_string()))?;
+            serde_json::to_value(redacted).map_err(|error| Refusal::Other(error.to_string()))?
         }
     };
-    crate::authorize::StoredEvent::parse_in(pdu.event_id().as_str(), room_id, &body)?;
-    Ok(VerifiedPdu {
-        id: pdu.event_id().as_str().to_owned(),
-        body,
-    })
+    crate::authorize::StoredEvent::parse_in(id, room_id, &body).map_err(Refusal::Other)?;
+    Ok(body)
 }
 
 /// Count a signature refusal by reason, and say why in the refusal: the
