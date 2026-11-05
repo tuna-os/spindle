@@ -8,7 +8,7 @@
 //! through a socket -- a real peer, a key pair, a served key document -- to
 //! assert things one function call deep. The policy functions at the top
 //! take no HTTP type; the handlers below them take the unwrapped request
-//! (state, headers, path parts, the raw body) and `routes.rs` keeps only the
+//! (state, headers, path parts, the raw body) and `federation_routes.rs` keeps only the
 //! axum extractor shells, so the route table stays the one list the
 //! dashboard and `surface.rs` check against. The outbound client
 //! (`federation.rs`) is the other half of the same protocol.
