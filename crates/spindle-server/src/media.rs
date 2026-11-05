@@ -11,8 +11,8 @@
 //! not become an addressing one. The ID is random and opaque, and the mapping
 //! from ID to hash lives in the store.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
 use spindle_core::keys;
@@ -158,12 +158,32 @@ pub struct MissingBlob {
     pub media_ids: Vec<String>,
 }
 
+/// Whether an upload is held to the uploader's byte quota. The caller
+/// decides, because who is exempt (appservice users, admins) is a question
+/// about accounts and registrations this module does not hold.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Quota {
+    Enforced,
+    Exempt,
+}
+
 /// Blobs in the configured backend, metadata in the store.
 pub struct Media {
     store: Arc<FjallStore>,
     blobs: crate::blobs::Blobs,
     server_name: String,
     max_upload_bytes: usize,
+    /// `[media] max_bytes_per_user`; `None` is no quota.
+    quota_bytes: Option<u64>,
+    /// Bytes each local account's uploads hold, built from the media
+    /// records the first time a quota is checked and kept in step by every
+    /// upload and delete after that.
+    ///
+    /// Derived rather than persisted: the records are the truth, so a
+    /// count rebuilt from them at each start cannot drift from them across
+    /// a crash, an import or a restore, and there is no second keyspace to
+    /// back up. One scan per process, and only on a server with a quota.
+    usage: Mutex<Option<HashMap<String, u64>>>,
 }
 
 impl Media {
@@ -178,6 +198,8 @@ impl Media {
             blobs,
             server_name: server_name.into(),
             max_upload_bytes: MAX_UPLOAD,
+            quota_bytes: None,
+            usage: Mutex::new(None),
         }
     }
 
@@ -186,6 +208,20 @@ impl Media {
     pub fn with_max_upload_bytes(mut self, max_upload_bytes: usize) -> Self {
         self.max_upload_bytes = max_upload_bytes;
         self
+    }
+
+    /// Hold each account's uploads to `quota_bytes` in total; `None` is
+    /// no quota.
+    #[must_use]
+    pub fn with_quota_bytes(mut self, quota_bytes: Option<u64>) -> Self {
+        self.quota_bytes = quota_bytes;
+        self
+    }
+
+    /// The configured per-account quota, if there is one.
+    #[must_use]
+    pub const fn quota_bytes(&self) -> Option<u64> {
+        self.quota_bytes
     }
 
     /// The same limit advertised by the media configuration endpoints.
@@ -198,7 +234,8 @@ impl Media {
     ///
     /// # Errors
     ///
-    /// Returns [`MediaError::TooLarge`] past [`Self::max_upload_bytes`], or
+    /// Returns [`MediaError::TooLarge`] past [`Self::max_upload_bytes`],
+    /// [`MediaError::QuotaExceeded`] past the uploader's quota, or
     /// [`MediaError`] if the blob or its record cannot be written.
     pub async fn put(
         &self,
@@ -206,6 +243,7 @@ impl Media {
         content_type: &str,
         filename: Option<&str>,
         uploaded_by: &str,
+        quota: Quota,
     ) -> Result<String, MediaError> {
         if bytes.len() > self.max_upload_bytes {
             return Err(MediaError::TooLarge {
@@ -213,25 +251,114 @@ impl Media {
                 limit: self.max_upload_bytes,
             });
         }
-        let hash = blake3::hash(bytes).to_hex().to_string();
-        // Identical bytes are one blob: the backend skips or overwrites with
-        // the same content, whichever it finds cheaper.
-        self.blobs.put(&hash, bytes).await?;
-
         let media_id = random_media_id();
         let record = MediaRecord {
-            hash,
+            hash: blake3::hash(bytes).to_hex().to_string(),
             content_type: content_type.to_owned(),
             filename: filename.map(str::to_owned),
             size: bytes.len(),
             uploaded_by: uploaded_by.to_owned(),
         };
+        self.store_upload(&media_id, bytes, &record, quota).await?;
+        Ok(media_id)
+    }
+
+    /// Charge an upload to its uploader's quota, then write its blob and
+    /// its record, giving the charge back if either write fails.
+    ///
+    /// The quota is checked before a byte is written, not after: a check
+    /// that ran once the blob was stored would refuse the upload and keep
+    /// the bytes, which is a quota that fills the disk it exists to guard.
+    async fn store_upload(
+        &self,
+        media_id: &str,
+        bytes: &[u8],
+        record: &MediaRecord,
+        quota: Quota,
+    ) -> Result<(), MediaError> {
+        let charged = self.charge(&record.uploaded_by, record.size, quota)?;
+        let written = self.write_upload(media_id, bytes, record).await;
+        if written.is_err() && charged {
+            self.refund(&record.uploaded_by, record.size);
+        }
+        written
+    }
+
+    async fn write_upload(
+        &self,
+        media_id: &str,
+        bytes: &[u8],
+        record: &MediaRecord,
+    ) -> Result<(), MediaError> {
+        // Identical bytes are one blob: the backend skips or overwrites with
+        // the same content, whichever it finds cheaper.
+        self.blobs.put(&record.hash, bytes).await?;
         Store::put(
             self.store.as_ref(),
-            &keys::media(&media_id),
-            &serde_json::to_vec(&record)?,
+            &keys::media(media_id),
+            &serde_json::to_vec(record)?,
         )?;
-        Ok(media_id)
+        Ok(())
+    }
+
+    /// Count `size` bytes to `user_id`, refusing them under
+    /// [`Quota::Enforced`] when they would take the account past its
+    /// quota. Returns whether anything was counted.
+    ///
+    /// An exempt upload is still counted, so an account that stops being
+    /// exempt is held to what it actually stores.
+    fn charge(&self, user_id: &str, size: usize, quota: Quota) -> Result<bool, MediaError> {
+        let Some(limit) = self.quota_bytes else {
+            return Ok(false);
+        };
+        let size = u64::try_from(size).unwrap_or(u64::MAX);
+        let mut usage = self.usage.lock().unwrap_or_else(PoisonError::into_inner);
+        // Built under the lock, so two first uploads cannot both scan, and
+        // an upload finishing meanwhile cannot land between the scan and
+        // the map it should have been counted in.
+        let totals = match usage.take() {
+            Some(totals) => totals,
+            None => self.usage_by_uploader()?,
+        };
+        let totals = usage.insert(totals);
+        let used = totals.get(user_id).copied().unwrap_or(0);
+        if quota == Quota::Enforced && used.saturating_add(size) > limit {
+            return Err(MediaError::QuotaExceeded {
+                used,
+                size,
+                quota: limit,
+            });
+        }
+        if let Some(total) = totals.get_mut(user_id) {
+            *total = total.saturating_add(size);
+        } else {
+            totals.insert(user_id.to_owned(), size);
+        }
+        Ok(true)
+    }
+
+    /// Give `size` bytes back to `user_id`: a failed write, or a delete.
+    fn refund(&self, user_id: &str, size: usize) {
+        let size = u64::try_from(size).unwrap_or(u64::MAX);
+        let mut usage = self.usage.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(total) = usage.as_mut().and_then(|totals| totals.get_mut(user_id)) {
+            *total = total.saturating_sub(size);
+        }
+    }
+
+    /// Bytes held by each local uploader, from the records.
+    fn usage_by_uploader(&self) -> Result<HashMap<String, u64>, MediaError> {
+        let mut totals: HashMap<String, u64> = HashMap::new();
+        for (media_id, record) in self.records()? {
+            // A cached copy of remote media is nobody's upload here.
+            if media_id.contains('/') {
+                continue;
+            }
+            let size = u64::try_from(record.size).unwrap_or(u64::MAX);
+            let total = totals.entry(record.uploaded_by).or_insert(0);
+            *total = total.saturating_add(size);
+        }
+        Ok(totals)
     }
 
     /// Store `bytes` under a media ID another server already handed out.
@@ -332,8 +459,9 @@ impl Media {
     /// [`MediaError::AlreadyUploaded`] when the ID already has bytes,
     /// [`MediaError::Unknown`] when no live reservation stands,
     /// [`MediaError::NotReserver`] when someone else reserved it,
-    /// [`MediaError::TooLarge`] past [`Self::max_upload_bytes`], or [`MediaError`] if
-    /// the blob or its record cannot be written.
+    /// [`MediaError::TooLarge`] past [`Self::max_upload_bytes`],
+    /// [`MediaError::QuotaExceeded`] past the uploader's quota, or
+    /// [`MediaError`] if the blob or its record cannot be written.
     pub async fn put_reserved(
         &self,
         media_id: &str,
@@ -341,6 +469,7 @@ impl Media {
         content_type: &str,
         filename: Option<&str>,
         uploaded_by: &str,
+        quota: Quota,
     ) -> Result<(), MediaError> {
         if self.record(media_id)?.is_some() {
             return Err(MediaError::AlreadyUploaded(media_id.to_owned()));
@@ -357,20 +486,14 @@ impl Media {
                 limit: self.max_upload_bytes,
             });
         }
-        let hash = blake3::hash(bytes).to_hex().to_string();
-        self.blobs.put(&hash, bytes).await?;
         let record = MediaRecord {
-            hash,
+            hash: blake3::hash(bytes).to_hex().to_string(),
             content_type: content_type.to_owned(),
             filename: filename.map(str::to_owned),
             size: bytes.len(),
             uploaded_by: uploaded_by.to_owned(),
         };
-        Store::put(
-            self.store.as_ref(),
-            &keys::media(media_id),
-            &serde_json::to_vec(&record)?,
-        )?;
+        self.store_upload(media_id, bytes, &record, quota).await?;
         Store::delete(self.store.as_ref(), &keys::media_reservation(media_id))?;
         Ok(())
     }
@@ -627,6 +750,11 @@ impl Media {
             return Ok(false);
         };
         Store::delete(self.store.as_ref(), &keys::media(media_id))?;
+        // The bytes stop counting with the record, whatever happens to the
+        // blob: from here the upload is not the account's to serve.
+        if !media_id.contains('/') {
+            self.refund(&record.uploaded_by, record.size);
+        }
         let shared = self
             .records()?
             .iter()
@@ -713,6 +841,12 @@ pub enum MediaError {
         size: usize,
         limit: usize,
     },
+    /// The upload would take its account past `[media] max_bytes_per_user`.
+    QuotaExceeded {
+        used: u64,
+        size: u64,
+        quota: u64,
+    },
     /// A type this server does not thumbnail.
     Unsupported(String),
     /// Bytes that do not decode as the format they were declared to be.
@@ -763,6 +897,11 @@ impl std::fmt::Display for MediaError {
             Self::TooLarge { size, limit } => {
                 write!(formatter, "{size} bytes exceeds the {limit}-byte limit")
             }
+            Self::QuotaExceeded { used, size, quota } => write!(
+                formatter,
+                "{size} more bytes would take this account past its {quota}-byte media \
+                 quota; its uploads already hold {used}"
+            ),
             Self::Unsupported(content_type) => {
                 write!(formatter, "no thumbnails for {content_type}")
             }

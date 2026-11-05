@@ -218,9 +218,17 @@ impl Previews {
         }
         let bytes = read_limited(response, MAX_IMAGE_BYTES).await?;
         let size = bytes.len() as u64;
+        // The server's own copy, not an account's upload: no quota to hold
+        // it to, and refusing it would only break the preview.
         let media_id = self
             .media
-            .put(&bytes, &content_type, None, "url-preview")
+            .put(
+                &bytes,
+                &content_type,
+                None,
+                "url-preview",
+                crate::media::Quota::Exempt,
+            )
             .await
             .map_err(|error| PreviewError::Storage(error.to_string()))?;
         Ok((self.media.mxc(&media_id), size))

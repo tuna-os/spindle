@@ -443,10 +443,10 @@ fn app_state_with(
     let presence = presence_for(&config, &store);
     let store_for_backups = Arc::clone(&store);
     let account_data = Arc::new(account_data::AccountData::new(Arc::clone(&store)));
-    let blobs = blobs_for(&config);
     let media = Arc::new(
-        media::Media::new(Arc::clone(&store), blobs, config.server.name.clone())
-            .with_max_upload_bytes(config.media.max_upload_bytes),
+        media::Media::new(Arc::clone(&store), blobs_for(&config), &config.server.name)
+            .with_max_upload_bytes(config.media.max_upload_bytes)
+            .with_quota_bytes(config.media.max_bytes_per_user),
     );
     let directory = Arc::new(directory::Directory::new(
         Arc::clone(&store),

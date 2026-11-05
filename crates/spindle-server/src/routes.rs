@@ -28,7 +28,10 @@ use crate::inbound::{
     sign_membership_template,
 };
 use crate::metrics::LoginResult;
-use crate::ratelimit::{FAILED_LOGIN_PER_ACCOUNT, FAILED_LOGIN_PER_SOURCE, REGISTER_PER_SOURCE};
+use crate::ratelimit::{
+    Budget, FAILED_LOGIN_PER_ACCOUNT, FAILED_LOGIN_PER_SOURCE, REGISTER_PER_SOURCE, limit_write,
+    limit_write_on,
+};
 use crate::rooms::ReadScope;
 use crate::{AppState, surface};
 
@@ -782,6 +785,7 @@ async fn upload_media(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, MatrixError> {
+    limit_write(&state, Budget::MediaUpload, &identity.user_id)?;
     // The uploader's claim about the type, not a guess at it. Sniffing would
     // mean the server deciding a file is HTML and then having to be right
     // about that forever; taking the claim and refusing to render anything
@@ -798,12 +802,64 @@ async fn upload_media(
             &content_type,
             query.filename.as_deref(),
             &identity.user_id,
+            upload_quota(&state, &identity.user_id)?,
         )
         .await
-        .map_err(|error| media_error(&error))?;
+        .map_err(|error| upload_error(&state, &error))?;
     Ok(Json(json!({
         "content_uri": format!("mxc://{}/{media_id}", state.config.server.name),
     })))
+}
+
+/// Whether `user_id`'s upload is held to the media quota: not when there is
+/// none, and not for the accounts the write budgets exempt.
+fn upload_quota(state: &AppState, user_id: &str) -> Result<crate::media::Quota, MatrixError> {
+    if state.media.quota_bytes().is_none()
+        || crate::ratelimit::exempt_from_write_limits(state, user_id)?
+    {
+        return Ok(crate::media::Quota::Exempt);
+    }
+    Ok(crate::media::Quota::Enforced)
+}
+
+/// [`media_error`], with the `admin_contact` the spec requires on
+/// `M_RESOURCE_LIMIT_EXCEEDED` when `[server.support]` names someone: the
+/// one thing a user over quota can usefully do is ask for more.
+fn upload_error(state: &AppState, error: &crate::media::MediaError) -> MatrixError {
+    let mut refusal = media_error(error);
+    if matches!(error, crate::media::MediaError::QuotaExceeded { .. })
+        && let Some(contact) = admin_contact(state)
+    {
+        let mut extra = serde_json::Map::new();
+        extra.insert("admin_contact".to_owned(), Value::String(contact));
+        refusal.extra = Some(Box::new(extra));
+    }
+    refusal
+}
+
+/// A URI for reaching this server's administrator, from
+/// `[server.support]`: the support page, else an admin's address, else
+/// anyone's.
+fn admin_contact(state: &AppState) -> Option<String> {
+    let support = state.config.server.support.as_ref()?;
+    if let Some(page) = &support.support_page {
+        return Some(page.clone());
+    }
+    let mut contacts: Vec<_> = support.contacts.iter().collect();
+    // Admins first; a stable sort keeps the operator's order otherwise.
+    contacts.sort_by_key(|contact| contact.role != "m.role.admin");
+    contacts.iter().find_map(|contact| {
+        contact
+            .email_address
+            .as_ref()
+            .map(|address| format!("mailto:{address}"))
+            .or_else(|| {
+                contact
+                    .matrix_id
+                    .as_ref()
+                    .map(|id| format!("https://matrix.to/#/{id}"))
+            })
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1167,6 +1223,18 @@ fn media_error(error: &crate::media::MediaError) -> MatrixError {
         Error::TooLarge { .. } => MatrixError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             "M_TOO_LARGE",
+            error.to_string(),
+        ),
+        // 403, because the spec's `/upload` lists "the user has reached a
+        // quota for uploaded content" under 403 -- not 413 `M_TOO_LARGE`,
+        // which says *this file* is too big and sends a client to
+        // `/media/config` to learn a limit the file is already under.
+        // `M_RESOURCE_LIMIT_EXCEEDED` rather than plain `M_FORBIDDEN` so a
+        // client can tell "over quota" from "not allowed", and because it
+        // is the code Synapse's `media_upload_limits` refuses with.
+        Error::QuotaExceeded { .. } => MatrixError::new(
+            StatusCode::FORBIDDEN,
+            "M_RESOURCE_LIMIT_EXCEEDED",
             error.to_string(),
         ),
         // The spec's own code for "this cannot be thumbnailed". Unreadable
@@ -3076,6 +3144,7 @@ async fn create_room(
     Authenticated(identity): Authenticated,
     Json(request): Json<CreateRoomRequest>,
 ) -> Result<Json<Value>, MatrixError> {
+    limit_write(&state, Budget::RoomCreation, &identity.user_id)?;
     let initial_state: Vec<(String, String, Value)> = request
         .initial_state
         .into_iter()
@@ -3477,6 +3546,12 @@ async fn invite_to_room(
     axum::extract::Path(room_id): axum::extract::Path<String>,
     Json(request): Json<TargetedMembershipRequest>,
 ) -> Result<Json<Value>, MatrixError> {
+    // Both budgets: the sender's, and the invitee's, which is what stops a
+    // handful of accounts taking turns at one person. Here rather than in
+    // `invite_user`, so `createRoom`'s own `invite` list is not counted:
+    // the room creation it rides on already was, as in Synapse.
+    limit_write(&state, Budget::Invite, &identity.user_id)?;
+    limit_write_on(&state, Budget::Invited, &identity.user_id, &request.user_id)?;
     invite_user(
         &state,
         &identity.user_id,
@@ -3727,6 +3802,9 @@ async fn knock_room(
     let request: SelfMembershipRequest = optional_body(&body)?;
     let mut servers = server_name_params(query.as_deref());
     let room_id = resolve_room_target(&state, &room_id_or_alias, &mut servers).await?;
+    // A knock is a request to join and costs what a join costs: one event
+    // here, or a `make_knock`/`send_knock` handshake with another server.
+    limit_write(&state, Budget::JoinLocal, &identity.user_id)?;
     match state
         .rooms
         .set_membership_with_checked(
@@ -3747,6 +3825,7 @@ async fn knock_room(
         // A room this server does not hold is knocked on through a server
         // that does.
         Err(crate::rooms::RoomError::UnknownRoom(_)) => {
+            limit_write(&state, Budget::JoinRemote, &identity.user_id)?;
             knock_remote(
                 &state,
                 &identity.user_id,
@@ -4294,8 +4373,10 @@ async fn join(
         .map(|record| record.is_some())
         .unwrap_or(false);
     if !resident && !invited && !blocked {
+        limit_write(state, Budget::JoinRemote, user_id)?;
         return join_remote(state, user_id, room_id, servers).await;
     }
+    limit_write(state, Budget::JoinLocal, user_id)?;
     match state
         .rooms
         .set_membership_with_checked(
@@ -4313,6 +4394,7 @@ async fn join(
         // A room this server has never held may still be joinable: through
         // the servers the client named, or the one in the room ID itself.
         Err(crate::rooms::RoomError::UnknownRoom(_)) => {
+            limit_write(state, Budget::JoinRemote, user_id)?;
             join_remote(state, user_id, room_id, servers).await
         }
         Err(error) => Err(room_error(error)),
@@ -8760,6 +8842,8 @@ async fn redact_event(
     Json(request): Json<RedactRequest>,
 ) -> Result<Json<Value>, MatrixError> {
     with_transaction(&state, &identity, &txn_id, || async {
+        // Inside the mint, so a replayed transaction spends nothing.
+        limit_write(&state, Budget::Message, &identity.user_id)?;
         state
             .rooms
             .redact_checked(
@@ -9803,6 +9887,7 @@ async fn set_room_state(
     axum::extract::Query(query): axum::extract::Query<DelayQuery>,
     Json(content): Json<Value>,
 ) -> Result<Json<Value>, MatrixError> {
+    limit_write(&state, Budget::Message, &identity.user_id)?;
     if let Some(delay_ms) = query.delay {
         if !state
             .rooms
@@ -10189,23 +10274,23 @@ fn as_seen_by(
     )
 }
 
-async fn send_event(
-    State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
-    axum::extract::Path((room_id, event_type, txn_id)): axum::extract::Path<(
-        String,
-        String,
-        String,
-    )>,
-    axum::extract::Query(query): axum::extract::Query<DelayQuery>,
-    Json(content): Json<Value>,
-) -> Result<Json<Value>, MatrixError> {
-    // A ring has a budget of its own (#39): it is the one event that makes
-    // every phone in the room sound, so it is counted per sender before
-    // anything else looks at it, delayed or not. Counted on the attempt, so
-    // a sender the room refuses still spends budget; the budget is against
-    // the trying.
-    if crate::push::is_ring(&event_type) {
+/// The budgets a `PUT /send` spends before anything else looks at it.
+///
+/// A ring has a budget of its own (#39): it is the one event that makes
+/// every phone in the room sound, so it is counted per sender, delayed or
+/// not. Counted on the attempt, so a sender the room refuses still spends
+/// budget; the budget is against the trying. Every send, ring or not, also
+/// spends the account's message budget (#741) -- except a retried
+/// transaction, which is answered from what it recorded and mints nothing,
+/// so a client retrying after a lost response is not refused for having
+/// already succeeded.
+fn limit_send(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    event_type: &str,
+    txn_id: &str,
+) -> Result<(), MatrixError> {
+    if crate::push::is_ring(event_type) {
         let limit = crate::ratelimit::Limit::new(
             state.config.ratelimit.rings_per_minute,
             std::time::Duration::from_secs(60),
@@ -10217,6 +10302,28 @@ async fn send_event(
             return Err(MatrixError::limit_exceeded(retry.as_millis()));
         }
     }
+    let key = spindle_core::keys::transaction(&identity.user_id, &identity.device_id, txn_id);
+    if matches!(
+        spindle_store::ReadView::get(state.store.as_ref(), &key),
+        Ok(Some(_))
+    ) {
+        return Ok(());
+    }
+    limit_write(state, Budget::Message, &identity.user_id)
+}
+
+async fn send_event(
+    State(state): State<AppState>,
+    Authenticated(identity): Authenticated,
+    axum::extract::Path((room_id, event_type, txn_id)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+    axum::extract::Query(query): axum::extract::Query<DelayQuery>,
+    Json(content): Json<Value>,
+) -> Result<Json<Value>, MatrixError> {
+    limit_send(&state, &identity, &event_type, &txn_id)?;
     // MSC4140 rides the existing send rather than adding a parallel one: the
     // event, its authorization and its transaction handling are identical,
     // and only *when* it is appended changes. A separate endpoint would be a
@@ -12174,6 +12281,9 @@ async fn create_media(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
 ) -> Result<Json<Value>, MatrixError> {
+    // Counted here, on the mint, and not again on the `PUT` that fills it:
+    // a create and its fill are one upload, as `POST /upload` is.
+    limit_write(&state, Budget::MediaUpload, &identity.user_id)?;
     let (media_id, unused_expires_at) = state
         .media
         .reserve(&identity.user_id)
@@ -12213,9 +12323,10 @@ async fn upload_reserved_media(
             &content_type,
             query.filename.as_deref(),
             &identity.user_id,
+            upload_quota(&state, &identity.user_id)?,
         )
         .await
-        .map_err(|error| media_error(&error))?;
+        .map_err(|error| upload_error(&state, &error))?;
     Ok(Json(json!({})))
 }
 

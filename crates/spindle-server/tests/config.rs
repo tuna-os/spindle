@@ -312,6 +312,69 @@ fn a_zero_ring_budget_is_refused_and_the_default_is_ten() {
     assert_eq!(config.ratelimit.rings_per_minute, 10);
 }
 
+/// The write budgets (#741) default to Synapse's numbers, take an
+/// operator's own, and refuse a budget that would refuse everything.
+#[test]
+fn write_budgets_default_to_synapse_and_refuse_an_empty_bucket() {
+    let config = parse("[server]\nname = \"example.org\"\n").expect("no section is fine");
+    assert_eq!(
+        config.ratelimit.messages,
+        spindle_server::config::Rate::new(0.2, 10)
+    );
+    assert_eq!(
+        config.ratelimit.joins_remote,
+        spindle_server::config::Rate::new(0.01, 10)
+    );
+    assert_eq!(config.media.max_bytes_per_user, None, "no quota by default");
+
+    let config = parse(
+        "[server]\nname = \"example.org\"\n[ratelimit]\n\
+         messages = { per_second = 5.0, burst = 100 }\n\
+         [media]\nmax_bytes_per_user = 1024\n",
+    )
+    .expect("an operator's numbers are taken");
+    assert_eq!(
+        config.ratelimit.messages,
+        spindle_server::config::Rate::new(5.0, 100)
+    );
+    assert_eq!(config.media.max_bytes_per_user, Some(1024));
+
+    for (budget, field) in [
+        (
+            "invites_per_target = { per_second = 1.0, burst = 0 }",
+            "ratelimit.invites_per_target",
+        ),
+        (
+            "room_creation = { per_second = 0.0, burst = 5 }",
+            "ratelimit.room_creation",
+        ),
+        (
+            "media_uploads = { per_second = -1.0, burst = 5 }",
+            "ratelimit.media_uploads",
+        ),
+        (
+            "joins_local = { per_second = nan, burst = 5 }",
+            "ratelimit.joins_local",
+        ),
+        (
+            "joins_remote = { per_second = 1e-300, burst = 5 }",
+            "ratelimit.joins_remote",
+        ),
+    ] {
+        let error = parse(&format!(
+            "[server]\nname = \"example.org\"\n[ratelimit]\n{budget}\n"
+        ))
+        .expect_err(budget);
+        assert!(error.to_string().contains(field), "{budget}: {error}");
+    }
+    let error = parse("[server]\nname = \"example.org\"\n[media]\nmax_bytes_per_user = 0\n")
+        .expect_err("a zero quota refuses every upload");
+    assert!(
+        error.to_string().contains("media.max_bytes_per_user"),
+        "{error}"
+    );
+}
+
 /// `[rooms]` (#626): Synapse's defaults without the section, and a
 /// threshold that would merge every fork refused at startup.
 #[test]
