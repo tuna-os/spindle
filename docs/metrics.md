@@ -80,7 +80,7 @@ renamed metric cannot leave a rule that never fires.
 `spindle_fork_resolutions_total` is not a throughput metric. It is the
 instrument the architecture is falsified by.
 
-Every append is counted in one of three cases, cheapest first (SPEC §9.2):
+Spindle counts every append in one of three cases, cheapest first (SPEC §9.2):
 
 - **case 1** — a non-state event whose parents hold one state. No state
   resolution.
@@ -125,12 +125,12 @@ pager. A brief spike during a federation catch-up is expected.
 
 ### One caveat, stated plainly
 
-Case 3 counts **appends whose parents' states differ**, each resolved by
-the room version's algorithm (ADR 0005); nothing is deferred, and no local
-send is refused for a fork. A fork is counted once, by the event that
-names its tips, local or received; later events build on that one. The
-room's current state over several extremities is resolved too, but that
-is not an append and is not counted here.
+Case 3 counts **appends whose parents' states differ**. The room version's
+algorithm resolves each of them (ADR 0005). Spindle does not defer a fork,
+and a fork does not stop a local send. The counter records a fork once, at
+the event that names its tips, local or received. Later events build on that
+event. Spindle also resolves the room's current state over several
+extremities, but that is not an append, so this counter ignores it.
 
 ## Checking the latency targets
 

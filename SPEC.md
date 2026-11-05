@@ -373,10 +373,10 @@ rather than with the size of the state.
 
 Snapshots are therefore retained for:
 
-- the most recent `resident_window` entries (512 by default). This bounds
-  memory, not which forks can be resolved: an older parent's state is
-  rehydrated from the store by its root when a resolution needs it, so the
-  window only decides which forks pay a store read;
+- the most recent `resident_window` entries (512 by default). This window
+  limits memory only. Spindle can still resolve a fork of any depth. If a
+  resolution needs the state of an older parent, Spindle reads it from the
+  store by its root. The window decides only which forks pay for that read;
 - every forward extremity, at any age. A class-D stale peer event can leave an
   extremity arbitrarily far back (ADR 0001), and the next local event has to
   merge that extremity's state with the head's;

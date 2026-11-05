@@ -281,13 +281,13 @@ mesh's question, and the harder one; the Companion project's
    and `/capabilities` advertising it as unstable. When the number is
    assigned, the string changes and nothing else does.
 
-   What it does not have yet is evidence on a state-DAG fork: two
-   accepted state events neither of which names the other. Spindle
-   resolves one as it resolves any fork (ADR 0005): with state
-   resolution 2.1, the algorithm Neutrino runs, over the states of the
-   parents an event names. No test yet drives such a fork between
-   Spindle and Neutrino, so their agreement on one rests on the shared
-   algorithm rather than on an observed run.
+   What it does not have yet is evidence on a state-DAG fork. In such a
+   fork, neither of two accepted events of state names the other. Spindle
+   resolves this fork as it resolves all forks (ADR 0005). It uses state
+   resolution 2.1, which Neutrino also uses, over the states of the
+   parents of an event. No test drives such a fork between Spindle and
+   Neutrino yet. Thus only the shared algorithm, not an observed run,
+   supports their agreement.
 
 4. **MatrixRTC on the node: done here, as a patch.**
    `contrib/neutrino/0002-matrixrtc.patch` serves MSC4143 transports and
