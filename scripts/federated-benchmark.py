@@ -746,6 +746,8 @@ def main() -> int:
     for name in ("spindle", "bench_bin", "synapse_venv", "out", "work"):
         if getattr(args, name):
             setattr(args, name, os.path.abspath(getattr(args, name)))
+    if args.work:
+        os.makedirs(args.work, exist_ok=True)
     os.environ["NO_PROXY"] = os.environ["no_proxy"] = "*"
     for variable in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
         os.environ.pop(variable, None)
