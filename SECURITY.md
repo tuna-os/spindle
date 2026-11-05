@@ -81,10 +81,10 @@ problem reachable.
 
 ## Finding these yourself
 
-- `scripts/authorization-rule.py` is the CI check that every room read
-  in a client or federation handler, in any module of the server crate,
-  asks who is asking; `.semgrep/room-authorization.yaml` is the shapes it
-  looks for, and says what they cannot see.
+- `scripts/authorization-rule.py` is the CI check for room reads. Each
+  client or federation handler, in each module of the server crate, must
+  ask who is asking. `.semgrep/room-authorization.yaml` holds the shapes
+  that the check looks for, and says what they cannot see.
 - `crates/spindle-server/tests/room_read_authorization.rs` and
   `room_route_authorization.rs` are the tests that pin the gates; a new
   bypass should come with a new case there.
