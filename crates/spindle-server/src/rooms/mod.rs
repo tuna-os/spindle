@@ -364,6 +364,19 @@ fn state_changed_in(events: &[Value]) -> Vec<Value> {
     latest.into_iter().map(|(_, event)| event).collect()
 }
 
+/// One room's share of a stream range, for a sliding-sync connection that
+/// holds the room as of the range's start: see [`Rooms::room_delta`].
+pub struct RoomDelta {
+    /// The newest events of the range, oldest first.
+    pub events: Vec<Value>,
+    /// Whether the range held more events than were kept.
+    pub limited: bool,
+    /// The linear index of the oldest event kept.
+    pub prev_batch: Option<i64>,
+    /// Every event in the range, kept or not.
+    pub event_ids: HashSet<String>,
+}
+
 /// One room's share of a sync response.
 pub struct SyncRoom {
     pub room_id: String,
@@ -4954,6 +4967,70 @@ impl Rooms {
             .collect();
         out.reverse();
         Ok((out, more.is_some() || cut, first))
+    }
+
+    /// What `room_id` did in the stream range `(since, until]`, for a
+    /// sliding-sync connection that holds the room as of `since`: the
+    /// newest `limit` events of the range (dummy events left out, as from
+    /// [`Self::timeline_tail_for_preview`]), oldest first; whether events of
+    /// the range were left out; where the window begins; and the ID of every
+    /// event in the range.
+    ///
+    /// The IDs answer "which state changed": a current state event the
+    /// client has not been sent is one whose ID is among them. Reading them
+    /// is the room's in-memory log, not its bodies, so the whole range costs
+    /// no more than the window's own reads -- however much the room said
+    /// while the client was looking elsewhere.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the index, the room or an event cannot be
+    /// read.
+    pub fn room_delta(
+        &self,
+        room_id: &str,
+        since: u64,
+        until: u64,
+        limit: usize,
+    ) -> Result<RoomDelta, RoomError> {
+        let slice = self.room_slice(room_id, since, until)?;
+        let ids: Vec<(i64, String)> = if slice.is_empty() {
+            Vec::new()
+        } else {
+            self.with_room_read(room_id, |_, log| {
+                Ok(slice
+                    .iter()
+                    .filter_map(|&li| {
+                        log.entry_at(li)
+                            .map(|entry| (li, entry.event_id.as_str().to_owned()))
+                    })
+                    .collect())
+            })?
+        };
+        let mut kept = Vec::new();
+        let mut limited = false;
+        let mut first = None;
+        // Newest first, stopping at the limit: a busy room's range is read
+        // only as far back as the window reaches.
+        for (li, event_id) in ids.iter().rev() {
+            let event = self.event(room_id, event_id)?;
+            if extremities::is_dummy_event(&event) {
+                continue;
+            }
+            if kept.len() == limit {
+                limited = true;
+                break;
+            }
+            first = Some(*li);
+            kept.push(event);
+        }
+        kept.reverse();
+        Ok(RoomDelta {
+            events: kept,
+            limited,
+            prev_batch: first,
+            event_ids: ids.into_iter().map(|(_, event_id)| event_id).collect(),
+        })
     }
 
     fn membership_rooms(&self, user_id: &str, wanted: &[u8]) -> Result<Vec<String>, RoomError> {

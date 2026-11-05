@@ -6691,33 +6691,23 @@ struct SlidingQuery {
     timeout: Option<u64>,
 }
 
-/// The stream position a sliding sync `pos` names.
-///
-/// A `pos` this server did not mint -- the one a client kept from the
-/// homeserver this one replaced -- is MSC4186's `M_UNKNOWN_POS`: the answer
-/// a client is built to handle, by dropping the position and starting the
-/// connection over. Anything else (a 400 `M_BAD_JSON`) is an error it
-/// retries with the same `pos`, forever.
-fn sliding_position(
-    identity: &crate::accounts::Identity,
-    pos: Option<&str>,
-) -> Result<Option<u64>, MatrixError> {
-    match crate::tokens::Sync::resume(pos)
-        .map_err(|error| MatrixError::bad_json(error.to_string()))?
-    {
-        crate::tokens::Resume::Foreign => {
-            tracing::info!(
-                user_id = %identity.user_id,
-                "sliding sync pos from another server; answering M_UNKNOWN_POS"
-            );
-            Err(MatrixError::new(
-                StatusCode::BAD_REQUEST,
-                "M_UNKNOWN_POS",
-                "unknown position; start the connection over without `pos`",
-            ))
-        }
-        resume => Ok(resume.position()),
-    }
+/// MSC4186's answer to a `pos` this server does not hold, which a client
+/// handles by dropping it and starting the connection over: one the
+/// connection retired or expired, one a restart forgot, one issued to
+/// another device or connection, and the one a client kept from the
+/// homeserver this one replaced. Anything else -- a 400 `M_BAD_JSON` -- is
+/// an error a client retries with the same `pos`, forever.
+fn unknown_pos(identity: &crate::accounts::Identity, conn_id: &str) -> MatrixError {
+    tracing::info!(
+        user_id = %identity.user_id,
+        conn_id,
+        "sliding sync pos not held; answering M_UNKNOWN_POS"
+    );
+    MatrixError::new(
+        StatusCode::BAD_REQUEST,
+        "M_UNKNOWN_POS",
+        "unknown position; start the connection over without `pos`",
+    )
 }
 
 /// Where a `/sync` resumes from.
@@ -6743,39 +6733,53 @@ fn sync_resume(
 
 /// `POST /_matrix/client/unstable/org.matrix.simplified_msc3575/sync`
 ///
-/// Stateless (`sliding.rs` explains why): `pos` is a stream position, and the
-/// request carries its lists in full each time. The response sends a room in
-/// full (`initial: true`) on an initial request, and after that only the
-/// rooms the stream says changed — the one scan `changed_rooms` exists for.
-#[allow(
-    clippy::too_many_lines,
-    reason = "the window-growth hotfix grew it past the line; split it with the next sliding change"
-)]
+/// One request on a connection (`sliding.rs` explains them): `pos` names
+/// what the connection held when it was answered, the request's parameters
+/// merge over the ones it held, and the response sends each room the client
+/// does not hold in full (`initial: true`) and each one it does as what
+/// changed since the client last held it current.
 async fn sliding_sync(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
     axum::extract::Query(query): axum::extract::Query<SlidingQuery>,
     Json(request): Json<crate::sliding::SlidingRequest>,
 ) -> Result<axum::response::Response, MatrixError> {
-    let (stream_pos, previous_windows) = match query.pos.as_deref() {
-        Some(pos) => {
-            let (stream, windows) = crate::sliding::decode_pos(pos);
-            (Some(stream), windows)
-        }
-        None => (None, None),
+    let key = crate::sliding::ConnectionKey {
+        user_id: identity.user_id.clone(),
+        device_id: identity.device_id.clone(),
+        conn_id: request.conn_id.clone().unwrap_or_default(),
     };
-    let since = sliding_position(&identity, stream_pos)?;
-    let lists = request.decoded_lists().map_err(MatrixError::bad_json)?;
-    let subscriptions = request
-        .decoded_subscriptions()
+    let previous = match query.pos.as_deref().or(request.pos.as_deref()) {
+        Some(pos) => Some(
+            state
+                .sliding
+                .resume(&key, pos, std::time::Instant::now())
+                .ok_or_else(|| unknown_pos(&identity, &key.conn_id))?,
+        ),
+        None => None,
+    };
+    let params = request
+        .params(previous.as_ref().map(|held| &held.params))
         .map_err(MatrixError::bad_json)?;
+    let since = previous.as_ref().map(|held| held.stream);
 
-    let timeout_ms = request.timeout.or(query.timeout).unwrap_or(0).min(60_000);
+    // A request that changes what it asks for -- a window grown, a room
+    // subscribed, a timeline lengthened -- wants the answer to that now, not
+    // whenever the next event lands. MSC4186 says so for an expanded
+    // timeline, and Element X grows its window one request after another.
+    let reconfigured = previous.as_ref().is_some_and(|held| held.params != params);
+    let timeout_ms = if reconfigured {
+        0
+    } else {
+        request.timeout.or(query.timeout).unwrap_or(0).min(60_000)
+    };
     // Timed apart from the rest (#625): a request that may wait its
     // timeout on purpose is not latency anybody should be paged about.
     let long_poll = since.is_some() && timeout_ms > 0;
     let position =
-        sliding_long_poll(&state, since, timeout_ms, request.extensions.typing.on()).await;
+        sliding_long_poll(&state, since, timeout_ms, params.extensions.typing.on()).await;
+    let to_device_since = request.extensions.to_device.since;
+    let txn_id = request.txn_id;
 
     // Everything below is synchronous room work -- for a cold room, a load
     // from the store -- so it runs on the blocking pool, not on one of the
@@ -6785,18 +6789,27 @@ async fn sliding_sync(
         std::sync::Arc::clone(&state.metrics),
         crate::metrics::BlockingTask::SlidingSync,
         move || {
-            sliding_answer(
+            let (mut body, connection) = sliding_answer(
                 &worker_state,
                 &identity,
-                &request,
                 SlidingInputs {
-                    since,
+                    previous: previous.as_deref(),
+                    params,
                     position,
-                    previous_windows: previous_windows.as_ref(),
-                    lists: &lists,
-                    subscriptions: &subscriptions,
+                    to_device_since: to_device_since.as_deref(),
                 },
-            )
+            )?;
+            let pos = worker_state.sliding.record(
+                key,
+                connection,
+                previous.is_none(),
+                std::time::Instant::now(),
+            );
+            body.insert("pos".to_owned(), json!(pos));
+            if let Some(txn_id) = txn_id {
+                body.insert("txn_id".to_owned(), json!(txn_id));
+            }
+            Ok(Json(Value::Object(body)))
         },
     )
     .await
@@ -6820,36 +6833,34 @@ fn mark_long_poll(
 /// is past the two the production pod has.
 const WINDOW_LOAD_PARALLELISM: usize = 4;
 
-/// What [`sliding_answer`] needs beyond the request itself, decoded and
+/// What [`sliding_answer`] needs beyond the state and the asker, decoded and
 /// positioned by the handler.
-#[derive(Clone, Copy)]
 struct SlidingInputs<'a> {
-    since: Option<u64>,
+    /// What the connection held at the request's `pos`; `None` for a
+    /// connection starting over.
+    previous: Option<&'a crate::sliding::Connection>,
+    params: crate::sliding::Params,
     position: u64,
-    previous_windows: Option<&'a crate::sliding::Windows>,
-    lists: &'a [(String, crate::sliding::ListRequest)],
-    subscriptions: &'a [(String, crate::sliding::RoomSubscription)],
+    to_device_since: Option<&'a str>,
 }
 
-/// The body of a sliding-sync response, assembled synchronously.
-#[allow(clippy::too_many_lines)]
+/// The body of a sliding-sync response, assembled synchronously, without
+/// its `pos`; and what the connection holds once the client has it.
 fn sliding_answer(
     state: &AppState,
     identity: &crate::accounts::Identity,
-    request: &crate::sliding::SlidingRequest,
     inputs: SlidingInputs<'_>,
-) -> Result<Json<Value>, MatrixError> {
+) -> Result<(serde_json::Map<String, Value>, crate::sliding::Connection), MatrixError> {
+    let SlidingInputs {
+        previous,
+        params,
+        position,
+        to_device_since,
+    } = inputs;
     state
         .rooms
-        .checkpoint_stream_position(inputs.position)
+        .checkpoint_stream_position(position)
         .map_err(room_error)?;
-    let SlidingInputs {
-        since,
-        position,
-        previous_windows,
-        lists,
-        subscriptions,
-    } = inputs;
 
     // The sorted room list: every joined room, newest activity first. The
     // sort is recomputed per request because it is what the ranges index
@@ -6873,141 +6884,190 @@ fn sliding_answer(
         .iter()
         .map(|(room_id, _)| room_id.as_str())
         .collect();
-
-    // Which rooms may appear at all in an incremental response. Asked only
-    // about rooms this response could mention, which is exactly `visible`:
-    // asking the server's whole stream instead would price a client's
-    // sliding sync at everyone else's traffic.
-    let changed: Option<std::collections::HashSet<String>> = match since {
-        Some(since) => {
-            let mut changed = state
-                .rooms
-                .changed_rooms(visible.iter().copied(), since, position)
-                .map_err(room_error)?;
-            // A room the reader just read is one whose counts moved for
-            // them, event or no event; silence about it would hand back the
-            // unread numbers the receipt has just made wrong.
-            changed.extend(state.rooms.rooms_read_since(
-                &identity.user_id,
-                visible.iter().copied(),
-                since,
-                position,
-            ));
-            Some(changed)
-        }
-        None => None,
-    };
-
-    let mut rooms_out: serde_json::Map<String, Value> = serde_json::Map::new();
-    let mut lists_out = serde_json::Map::new();
-
-    // What each room in view should carry: the union over every list whose
-    // window it is in, plus any direct subscription. A room in two windows is
-    // sent once, with the larger ask.
-    let mut wanted: std::collections::HashMap<String, (Vec<(String, String)>, usize)> =
-        std::collections::HashMap::new();
-    // Rooms in view now that were in no window this `pos` was answered for:
-    // the client has never been sent them, changed or not.
-    let mut newly_in_view: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (name, list) in lists {
-        let indices = crate::sliding::indices_in_view(&list.ranges, ordered.len());
-        for &index in &indices {
-            let room_id = &ordered[index].0;
-            if since.is_some() && !crate::sliding::was_in_view(previous_windows, name, index) {
-                newly_in_view.insert(room_id.clone());
-            }
-            let entry = wanted
-                .entry(room_id.clone())
-                .or_insert_with(|| (Vec::new(), 0));
-            entry.0.extend(list.required_state.iter().cloned());
-            entry.1 = entry.1.max(list.timeline_limit);
-        }
-        lists_out.insert(name.clone(), json!({ "count": ordered.len() }));
-    }
-    for (room_id, subscription) in subscriptions {
-        // Silence rather than an error: a client that subscribed to a room it
-        // has since left should get a response about its other rooms, not a
-        // rejected request -- and a client fishing for a room it was never in
-        // learns nothing from the difference between "no such room" and "not
-        // yours", which is the same reason the room directory does not
-        // distinguish them.
-        if !visible.contains(room_id.as_str()) {
-            continue;
-        }
-        let entry = wanted
-            .entry(room_id.clone())
-            .or_insert_with(|| (Vec::new(), 0));
-        entry.0.extend(subscription.required_state.iter().cloned());
-        entry.1 = entry.1.max(subscription.timeline_limit);
-    }
-
-    // The rooms in view, whether or not they changed: the room extensions
-    // below answer for all of them.
-    let in_view: Vec<String> = wanted.keys().cloned().collect();
-    // Every cold room about to be rendered is loaded first, several at once,
-    // rather than one after another as the loop below reaches it: after a
-    // restart a window of twenty cold rooms costs its slowest load, not the
-    // sum of all twenty (#614). Rooms answered silently, and invites (which
-    // have no log here to load), are left alone.
-    let cold: Vec<String> = in_view
-        .iter()
-        .filter(|room_id| {
-            !invited.contains(*room_id)
-                && (changed
-                    .as_ref()
-                    .is_none_or(|changed| changed.contains(*room_id))
-                    || newly_in_view.contains(*room_id))
-                && !state.rooms.is_resident(room_id)
-        })
-        .cloned()
+    let selection = crate::sliding::select(&params, &ordered, &visible);
+    let held_rooms = previous.map(|held| &held.rooms);
+    let plan = sliding_plan(state, identity, &selection, held_rooms, &invited, position)?;
+    let rooms_out = sliding_rooms(state, identity, plan, &invited, position)?;
+    let lists_out: serde_json::Map<String, Value> = params
+        .lists
+        .keys()
+        .map(|name| (name.clone(), json!({ "count": ordered.len() })))
         .collect();
-    state.rooms.warm_all(&cold, WINDOW_LOAD_PARALLELISM);
-    for (room_id, (required_state, timeline_limit)) in wanted {
-        // Incrementally, silence about an unchanged room *is* the answer.
-        let newly = newly_in_view.contains(&room_id);
-        if let Some(changed) = &changed
-            && !changed.contains(&room_id)
-            && !newly
-        {
-            continue;
-        }
-        let entry = if invited.contains(&room_id) {
-            sliding_invite_entry(state, identity, &room_id)?
-        } else {
-            sliding_room_entry(
-                state,
-                identity,
-                &room_id,
-                &required_state,
-                timeline_limit,
-                since.is_none() || newly,
-            )?
-        };
-        rooms_out.insert(room_id, entry);
-    }
-
-    let extensions = sliding_extensions(
+    let (extensions, receipts_current) = sliding_extensions(
         state,
         identity,
-        &request.extensions,
-        (since, position),
-        &in_view,
-        &newly_in_view,
+        &params.extensions,
+        ExtensionInputs {
+            since: previous.map(|held| held.stream),
+            position,
+            to_device_since,
+            selection: &selection,
+            receipts: previous.map(|held| &held.receipts),
+        },
     )?;
     state.metrics.observe_sync_phase(
         crate::metrics::SyncPhase::SlidingAssemble,
         assembling.elapsed(),
     );
 
-    Ok(Json(json!({
-        "pos": crate::sliding::encode_pos(
-            &crate::tokens::Sync(position).to_string(),
-            &crate::sliding::windows_of(lists),
-        ),
-        "lists": lists_out,
-        "rooms": rooms_out,
-        "extensions": extensions,
-    })))
+    // What the client holds once it has this response. A room it can no
+    // longer see is forgotten, so seeing it again -- a rejoin -- starts it
+    // over in full; one merely out of view keeps the position it was last
+    // current at, so its return is caught up from there.
+    let mut rooms: std::collections::HashMap<String, crate::sliding::SentRoom> = held_rooms
+        .into_iter()
+        .flatten()
+        .filter(|(room_id, _)| visible.contains(room_id.as_str()))
+        .map(|(room_id, held)| (room_id.clone(), held.clone()))
+        .collect();
+    for (room_id, config) in &selection.wanted {
+        let sent = crate::sliding::SentRoom {
+            at: position,
+            config: std::sync::Arc::clone(config),
+            invite: invited.contains(room_id),
+        };
+        rooms.insert(room_id.clone(), sent);
+    }
+    let mut receipts: std::collections::HashMap<String, u64> = previous
+        .map(|held| &held.receipts)
+        .into_iter()
+        .flatten()
+        .filter(|(room_id, _)| visible.contains(room_id.as_str()))
+        .map(|(room_id, at)| (room_id.clone(), *at))
+        .collect();
+    receipts.extend(
+        receipts_current
+            .into_iter()
+            .map(|room_id| (room_id, position)),
+    );
+
+    let mut body = serde_json::Map::new();
+    body.insert("lists".to_owned(), Value::Object(lists_out));
+    body.insert("rooms".to_owned(), Value::Object(rooms_out));
+    body.insert("extensions".to_owned(), extensions);
+    let connection = crate::sliding::Connection {
+        stream: position,
+        params,
+        rooms,
+        receipts,
+    };
+    Ok((body, connection))
+}
+
+/// One room of a response to render, and how.
+type PlannedRoom = (
+    String,
+    std::sync::Arc<crate::sliding::RoomConfig>,
+    crate::sliding::Need,
+);
+
+/// The rooms of `selection` this response speaks about. One the client does
+/// not hold goes in full; one it does goes if it changed since the client
+/// last held it current, or if the client now asks for more of it. Silence
+/// about the rest *is* the answer.
+///
+/// Whether a held room changed is asked once per distinct position the
+/// client holds rooms at, which is one question in the common case -- every
+/// room in view was current at the previous response -- and only the rooms
+/// coming back into view after an absence add more. The question is about
+/// the rooms this response could mention and nothing else: asking the
+/// server's whole stream would price a client's sliding sync at everyone
+/// else's traffic.
+fn sliding_plan(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    selection: &crate::sliding::Selection,
+    held: Option<&std::collections::HashMap<String, crate::sliding::SentRoom>>,
+    invited: &std::collections::HashSet<String>,
+    position: u64,
+) -> Result<Vec<PlannedRoom>, MatrixError> {
+    let needs: Vec<(
+        &String,
+        &std::sync::Arc<crate::sliding::RoomConfig>,
+        crate::sliding::Need,
+    )> = selection
+        .wanted
+        .iter()
+        .map(|(room_id, config)| {
+            let need = crate::sliding::Need::of(
+                held.and_then(|held| held.get(room_id)),
+                config,
+                invited.contains(room_id),
+            );
+            (room_id, config, need)
+        })
+        .collect();
+    let mut by_since: std::collections::BTreeMap<u64, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for (room_id, _, need) in &needs {
+        if let crate::sliding::Need::Since { since, .. } = need {
+            by_since.entry(*since).or_default().push(room_id.as_str());
+        }
+    }
+    let mut changed = std::collections::HashSet::new();
+    for (since, rooms) in by_since {
+        changed.extend(
+            state
+                .rooms
+                .changed_rooms(rooms.iter().copied(), since, position)
+                .map_err(room_error)?,
+        );
+        // A room the reader just read is one whose counts moved for them,
+        // event or no event; silence about it would hand back the unread
+        // numbers the receipt has just made wrong.
+        changed.extend(state.rooms.rooms_read_since(
+            &identity.user_id,
+            rooms.iter().copied(),
+            since,
+            position,
+        ));
+    }
+    Ok(needs
+        .into_iter()
+        .filter(|(room_id, _, need)| need.forced() || changed.contains(room_id.as_str()))
+        .map(|(room_id, config, need)| (room_id.clone(), std::sync::Arc::clone(config), need))
+        .collect())
+}
+
+/// The `rooms` object: each planned room's entry.
+fn sliding_rooms(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    plan: Vec<PlannedRoom>,
+    invited: &std::collections::HashSet<String>,
+    position: u64,
+) -> Result<serde_json::Map<String, Value>, MatrixError> {
+    // Every cold room about to be rendered is loaded first, several at once,
+    // rather than one after another as the loop below reaches it: after a
+    // restart a window of twenty cold rooms costs its slowest load, not the
+    // sum of all twenty (#614). Rooms answered silently, and invites (which
+    // have no log here to load), are left alone.
+    let cold: Vec<String> = plan
+        .iter()
+        .map(|(room_id, ..)| room_id)
+        .filter(|room_id| !invited.contains(*room_id) && !state.rooms.is_resident(room_id))
+        .cloned()
+        .collect();
+    state.rooms.warm_all(&cold, WINDOW_LOAD_PARALLELISM);
+    let mut rooms_out = serde_json::Map::new();
+    for (room_id, config, need) in plan {
+        let entry = if invited.contains(&room_id) {
+            sliding_invite_entry(state, identity, &room_id)?
+        } else {
+            sliding_room_entry(
+                state,
+                identity,
+                &RoomRender {
+                    room_id: &room_id,
+                    config: &config,
+                    need: &need,
+                    position,
+                },
+            )?
+        };
+        rooms_out.insert(room_id, entry);
+    }
+    Ok(rooms_out)
 }
 
 /// Long-poll before answering, not after assembling: an incremental request
@@ -7040,32 +7100,59 @@ async fn sliding_long_poll(
     state.rooms.stream_position()
 }
 
-/// The `extensions` object of a sliding-sync response.
+/// What [`sliding_extensions`] answers from.
+#[derive(Clone, Copy)]
+struct ExtensionInputs<'a> {
+    /// The stream position the connection's previous response answered at.
+    since: Option<u64>,
+    position: u64,
+    /// The to-device extension's token, from the request itself.
+    to_device_since: Option<&'a str>,
+    selection: &'a crate::sliding::Selection,
+    /// The receipts the connection holds, by room.
+    receipts: Option<&'a std::collections::HashMap<String, u64>>,
+}
+
+/// The `extensions` object of a sliding-sync response, and the rooms whose
+/// receipts the client is current to once it has it.
 ///
-/// The account data and typing extensions answer for every room in view,
-/// changed or not. Stateless as this endpoint is, there is no record of
-/// what a client was last told, and an account-data or typing change bumps
-/// no stream position; repeating a window's worth is the answer that
-/// cannot silently drop one, the same trade classic sync makes for room
+/// Each room extension speaks about its own scope (see
+/// [`crate::sliding::RoomExtension::scope`]). The account data and typing
+/// extensions answer for every room in theirs, changed or not: neither an
+/// account-data nor a typing change bumps a stream position, so there is
+/// no "since" to ask from, and repeating a scope's worth is the answer that
+/// cannot silently drop one -- the same trade classic sync makes for room
 /// account data. Receipts do bump one (`Rooms::mark_receipt`), so their
 /// extension is incremental: see [`receipts_extension`].
 fn sliding_extensions(
     state: &AppState,
     identity: &crate::accounts::Identity,
     extensions: &crate::sliding::Extensions,
-    (since, position): (Option<u64>, u64),
-    in_view: &[String],
-    newly_in_view: &std::collections::HashSet<String>,
-) -> Result<Value, MatrixError> {
+    inputs: ExtensionInputs<'_>,
+) -> Result<(Value, Vec<String>), MatrixError> {
+    let ExtensionInputs {
+        since,
+        position,
+        to_device_since,
+        selection,
+        receipts,
+    } = inputs;
     let mut out = serde_json::Map::new();
+    let mut receipts_current = Vec::new();
     if !extensions.any() {
-        return Ok(Value::Object(out));
+        return Ok((Value::Object(out), receipts_current));
     }
 
     if extensions.to_device.on() {
         out.insert(
             "to_device".to_owned(),
-            to_device_extension(state, identity, &extensions.to_device, position)?,
+            to_device_extension(
+                state,
+                identity,
+                to_device_since,
+                extensions.to_device.limit,
+                position,
+            )?,
         );
     }
     if extensions.e2ee.on() {
@@ -7075,28 +7162,38 @@ fn sliding_extensions(
         );
     }
     if extensions.account_data.on() {
+        let scope = extensions
+            .account_data
+            .scope(&selection.windows, &selection.subscribed);
         out.insert(
             "account_data".to_owned(),
-            account_data_extension(state, identity, in_view)?,
+            account_data_extension(state, identity, &scope)?,
         );
     }
     if extensions.receipts.on() {
+        let scope = extensions
+            .receipts
+            .scope(&selection.windows, &selection.subscribed);
         out.insert(
             "receipts".to_owned(),
-            receipts_extension(state, identity, in_view, (since, position), newly_in_view)?,
+            receipts_extension(state, identity, &scope, receipts, position)?,
         );
+        receipts_current = scope.into_iter().map(str::to_owned).collect();
     }
     if extensions.typing.on() {
         let mut rooms = serde_json::Map::new();
-        for room_id in in_view {
+        for room_id in extensions
+            .typing
+            .scope(&selection.windows, &selection.subscribed)
+        {
             if let Some(event) = state.typing.event(room_id) {
-                rooms.insert(room_id.clone(), event);
+                rooms.insert(room_id.to_owned(), event);
             }
         }
         out.insert("typing".to_owned(), json!({ "rooms": rooms }));
     }
 
-    Ok(Value::Object(out))
+    Ok((Value::Object(out), receipts_current))
 }
 
 /// The to-device extension: what is pending for this device, acknowledged
@@ -7107,12 +7204,13 @@ fn sliding_extensions(
 fn to_device_extension(
     state: &AppState,
     identity: &crate::accounts::Identity,
-    extension: &crate::sliding::ToDeviceExtension,
+    since: Option<&str>,
+    limit: Option<usize>,
     position: u64,
 ) -> Result<Value, MatrixError> {
     // Another server's to-device token acknowledges nothing here: every
     // pending message is delivered, which is the side to err on.
-    let acknowledged = crate::tokens::Sync::resume(extension.since.as_deref())
+    let acknowledged = crate::tokens::Sync::resume(since)
         .map_err(|error| MatrixError::bad_json(error.to_string()))?
         .position();
     let (events, delivered_until) = state
@@ -7122,7 +7220,7 @@ fn to_device_extension(
             &identity.device_id,
             acknowledged,
             position,
-            extension.limit,
+            limit,
         )
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
     Ok(json!({
@@ -7158,70 +7256,78 @@ fn e2ee_extension(
     }))
 }
 
-/// The account-data extension: the global events, and each room in view
+/// The account-data extension: the global events, and each room in scope
 /// that has any.
 fn account_data_extension(
     state: &AppState,
     identity: &crate::accounts::Identity,
-    in_view: &[String],
+    scope: &std::collections::BTreeSet<&str>,
 ) -> Result<Value, MatrixError> {
     let global = sync_account_data(state, identity, None, None, state.rooms.stream_position())?;
     let mut rooms = serde_json::Map::new();
-    for room_id in in_view {
+    for &room_id in scope {
         let data = state
             .account_data
             .all(&identity.user_id, room_id)
             .map_err(|error| account_data_error(&error))?;
         if !data.is_empty() {
-            rooms.insert(room_id.clone(), Value::Array(data));
+            rooms.insert(room_id.to_owned(), Value::Array(data));
         }
     }
     Ok(json!({ "global": global, "rooms": rooms }))
 }
 
-/// The receipts extension: one `m.receipt` event per room in view that has
+/// The receipts extension: one `m.receipt` event per room in scope that has
 /// any, keyed by event then by type then by reader, as the spec shapes it.
 /// A private receipt (and the `m.fully_read` marker) is shown to its owner
 /// and nobody else. Receipts from other servers are in the same rows.
 ///
-/// Incremental once the client has seen a room (#624): with federated
-/// readers a large room holds a receipt per member, and resending every
-/// one of them on every request priced each long-poll at the room's size.
-/// A room the client has not been sent yet -- the first request, or one
-/// newly in a window -- gets the caller's own receipts and the newest
-/// [`crate::receipts::MAX_INITIAL_RECEIPTS`] of everyone else's; after that,
-/// the receipts of readers who moved since `pos`.
+/// Incremental once the connection holds a room's receipts (#624): with
+/// federated readers a large room holds a receipt per member, and resending
+/// every one of them on every request priced each long-poll at the room's
+/// size. A room whose receipts the connection does not hold -- the first
+/// request, or the first time the room is in the extension's scope -- gets
+/// the caller's own receipts and the newest
+/// [`crate::receipts::MAX_INITIAL_RECEIPTS`] of everyone else's; after
+/// that, the receipts of readers who moved since the client was last
+/// current for that room, which for a room back in scope after an absence
+/// is further back than the previous request.
 fn receipts_extension(
     state: &AppState,
     identity: &crate::accounts::Identity,
-    in_view: &[String],
-    (since, position): (Option<u64>, u64),
-    newly_in_view: &std::collections::HashSet<String>,
+    scope: &std::collections::BTreeSet<&str>,
+    held: Option<&std::collections::HashMap<String, u64>>,
+    position: u64,
 ) -> Result<Value, MatrixError> {
-    let moved = since.map(|since| {
-        state
-            .rooms
-            .receipt_readers_since(in_view.iter().map(String::as_str), since, position)
-    });
+    let mut by_since: std::collections::BTreeMap<u64, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for &room_id in scope {
+        if let Some(&since) = held.and_then(|held| held.get(room_id)) {
+            by_since.entry(since).or_default().push(room_id);
+        }
+    }
+    let mut moved = std::collections::HashMap::new();
+    for (since, rooms) in by_since {
+        moved.extend(state.rooms.receipt_readers_since(rooms, since, position));
+    }
     let mut rooms = serde_json::Map::new();
-    for room_id in in_view {
-        let rows = match &moved {
-            Some(moved) if !newly_in_view.contains(room_id) => {
-                let Some(readers) = moved.get(room_id) else {
-                    continue;
-                };
-                readers_receipts(state, room_id, readers)?
-            }
-            _ => crate::receipts::newest(
+    for &room_id in scope {
+        let rows = if held.is_some_and(|held| held.contains_key(room_id)) {
+            let Some(readers) = moved.get(room_id) else {
+                continue;
+            };
+            readers_receipts(state, room_id, readers)?
+        } else {
+            crate::receipts::newest(
                 state.rooms.room_receipts(room_id).map_err(room_error)?,
                 &identity.user_id,
                 crate::receipts::MAX_INITIAL_RECEIPTS,
-            ),
+            )
         };
         let content = crate::receipts::event_content(rows, &identity.user_id);
         if !content.is_empty() {
             rooms.insert(
-                room_id.clone(),
+                room_id.to_owned(),
                 json!({ "type": "m.receipt", "content": content }),
             );
         }
@@ -7448,29 +7554,70 @@ fn sliding_required_state(
         .map_err(room_error)
 }
 
-fn sliding_room_entry(
+/// One room entry to render: which room, with what config, how the client
+/// holds it, and the stream position the response answers at.
+struct RoomRender<'a> {
+    room_id: &'a str,
+    config: &'a crate::sliding::RoomConfig,
+    need: &'a crate::sliding::Need,
+    position: u64,
+}
+
+/// A room entry's timeline, and for a room the client holds, the IDs of
+/// every event since it last held the room current -- what tells changed
+/// state from state it already has.
+fn sliding_timeline(
     state: &AppState,
     identity: &crate::accounts::Identity,
-    room_id: &str,
-    required_state: &[(String, String)],
-    timeline_limit: usize,
-    initial: bool,
-) -> Result<Value, MatrixError> {
-    let reader = state
-        .rooms
-        .reader(&identity.user_id, room_id)
-        .map_err(room_error)?;
-    let name = reader
-        .state_event("m.room.name", "")
-        .ok()
-        .and_then(|content| content["name"].as_str().map(str::to_owned));
-    let (events, limited, prev_batch) = if timeline_limit == 0 {
-        (Vec::new(), false, None)
-    } else {
-        state
-            .rooms
-            .timeline_tail_for_preview(room_id, timeline_limit.min(50))
-            .map_err(room_error)?
+    render: &RoomRender<'_>,
+) -> Result<
+    (
+        crate::sliding::Timeline,
+        Option<std::collections::HashSet<String>>,
+    ),
+    MatrixError,
+> {
+    let RoomRender {
+        room_id,
+        config,
+        need,
+        position,
+    } = *render;
+    let limit = config.timeline_limit.min(50);
+    let tail = || {
+        if limit == 0 {
+            Ok((Vec::new(), false, None))
+        } else {
+            state
+                .rooms
+                .timeline_tail_for_preview(room_id, limit)
+                .map_err(room_error)
+        }
+    };
+    let mut expanded = false;
+    let mut changed_ids = None;
+    let (events, limited, prev_batch) = match need {
+        crate::sliding::Need::Initial => tail()?,
+        crate::sliding::Need::Since {
+            since,
+            expanded_timeline,
+            ..
+        } => {
+            // An expanded timeline is the tail at the new limit, so the
+            // range is read for its IDs alone, no bodies.
+            let delta_limit = if *expanded_timeline { 0 } else { limit };
+            let delta = state
+                .rooms
+                .room_delta(room_id, *since, position, delta_limit)
+                .map_err(room_error)?;
+            changed_ids = Some(delta.event_ids);
+            if *expanded_timeline {
+                expanded = true;
+                tail()?
+            } else {
+                (delta.events, delta.limited, delta.prev_batch)
+            }
+        }
     };
     let events = state
         .rooms
@@ -7483,9 +7630,90 @@ fn sliding_room_entry(
             .collect(),
         limited,
         prev_batch: prev_batch.map(|li| crate::tokens::Pagination(li).to_string()),
+        expanded,
     };
-    let required_state = lazy_members_expanded(required_state, &timeline.events);
-    let state_events = sliding_required_state(state, identity, room_id, &required_state)?;
+    Ok((timeline, changed_ids))
+}
+
+/// The `required_state` of a room the client already holds: the state it
+/// asks for whose event is among `changed_ids` (it changed since), the state
+/// it asks for now and did not before (`widened`), and the members of the
+/// window's senders (`$LAZY`) -- a sender new to this client may have
+/// joined long before the window, so their member event is not "changed",
+/// and a client rendering the window needs it all the same.
+fn sliding_state_delta(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    room_id: &str,
+    (config, widened): (&crate::sliding::RoomConfig, &[(String, String)]),
+    window: &[Value],
+    changed_ids: &std::collections::HashSet<String>,
+) -> Result<Vec<Value>, MatrixError> {
+    let (lazy, eager): (Vec<_>, Vec<_>) = config
+        .required_state
+        .iter()
+        .cloned()
+        .partition(|(_, state_key)| state_key == "$LAZY");
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut keep = |event: Value, out: &mut Vec<Value>| {
+        if let Some(event_id) = event["event_id"].as_str()
+            && seen.insert(event_id.to_owned())
+        {
+            out.push(event);
+        }
+    };
+    if !changed_ids.is_empty() && !eager.is_empty() {
+        for event in sliding_required_state(state, identity, room_id, &eager)? {
+            if event["event_id"]
+                .as_str()
+                .is_some_and(|event_id| changed_ids.contains(event_id))
+            {
+                keep(event, &mut out);
+            }
+        }
+    }
+    let mut always = lazy;
+    always.extend(widened.iter().cloned());
+    let always = lazy_members_expanded(&always, window);
+    if !always.is_empty() {
+        for event in sliding_required_state(state, identity, room_id, &always)? {
+            keep(event, &mut out);
+        }
+    }
+    Ok(out)
+}
+
+fn sliding_room_entry(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    room: &RoomRender<'_>,
+) -> Result<Value, MatrixError> {
+    let room_id = room.room_id;
+    let reader = state
+        .rooms
+        .reader(&identity.user_id, room_id)
+        .map_err(room_error)?;
+    let name = reader
+        .state_event("m.room.name", "")
+        .ok()
+        .and_then(|content| content["name"].as_str().map(str::to_owned));
+    let (timeline, changed_ids) = sliding_timeline(state, identity, room)?;
+    let state_events = if let (crate::sliding::Need::Since { widened, .. }, Some(changed_ids)) =
+        (room.need, &changed_ids)
+    {
+        sliding_state_delta(
+            state,
+            identity,
+            room_id,
+            (room.config, widened),
+            &timeline.events,
+            changed_ids,
+        )?
+    } else {
+        let required_state = lazy_members_expanded(&room.config.required_state, &timeline.events);
+        sliding_required_state(state, identity, room_id, &required_state)?
+    };
     let roster = state.rooms.roster(room_id).map_err(room_error)?;
     let avatar = reader
         .state_event("m.room.avatar", "")
@@ -7513,7 +7741,7 @@ fn sliding_room_entry(
             notification_count: badge.notification_count,
             highlight_count: badge.highlight_count,
         },
-        initial,
+        *room.need == crate::sliding::Need::Initial,
     ))
 }
 

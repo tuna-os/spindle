@@ -91,6 +91,8 @@ pub struct AppState {
     pub key: Arc<signing::ServerKey>,
     pub rooms: Arc<rooms::Rooms>,
     pub typing: Arc<typing::Typing>,
+    /// Sliding-sync connections (MSC4186), in memory: `sliding.rs` says why.
+    pub sliding: Arc<sliding::Connections>,
     pub account_data: Arc<account_data::AccountData>,
     pub directory: Arc<directory::Directory>,
     pub filters: Arc<filters::Filters>,
@@ -487,6 +489,7 @@ fn app_state_with(
         key,
         rooms,
         typing: Arc::new(typing::Typing::new()),
+        sliding: Arc::new(sliding::Connections::new()),
         account_data,
         directory,
         filters: Arc::new(filters::Filters::new(Arc::clone(&store_for_filters))),
@@ -520,14 +523,18 @@ fn app_state_with(
         #[cfg(feature = "hub-mode")]
         hub: Arc::new(hub::Hub::new()),
     };
-    // Resident rooms are counted at scrape time, from the registry itself,
-    // rather than kept as a counter every admission path would have to
-    // remember to move. Weakly, so the registry never outlives the server.
+    probe_resident_rooms(&state);
+    Ok(state)
+}
+
+/// Resident rooms are counted at scrape time, from the registry itself,
+/// rather than kept as a counter every admission path would have to
+/// remember to move. Weakly, so the registry never outlives the server.
+fn probe_resident_rooms(state: &AppState) {
     let resident = Arc::downgrade(&state.rooms);
     state
         .metrics
         .set_resident_rooms_probe(move || resident.upgrade()?.resident_count());
-    Ok(state)
 }
 
 /// The delivery loops that run for the life of the process. Spawned only
