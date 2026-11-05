@@ -62,6 +62,7 @@ pub mod receipts;
 pub mod recovery;
 pub mod registration_tokens;
 pub mod rendezvous;
+pub mod room_routes;
 pub mod rooms;
 pub mod routes;
 pub mod s3;
