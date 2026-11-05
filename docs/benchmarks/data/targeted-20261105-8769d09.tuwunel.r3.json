@@ -1,0 +1,81 @@
+{
+  "benchmarks": {
+    "federated_join/1000": {
+      "join_returned_ns": 286452325.0,
+      "joined_members": 1002,
+      "lower_ns": 360355574.0,
+      "mean_ns": 360355574.0,
+      "samples": 1,
+      "upper_ns": 360355574.0
+    },
+    "federated_join/10000": {
+      "join_returned_ns": 1871939453.0,
+      "joined_members": 10002,
+      "lower_ns": 1970849859.0,
+      "mean_ns": 1970849859.0,
+      "samples": 1,
+      "upper_ns": 1970849859.0
+    },
+    "partition_catchup/200": {
+      "events_per_second": 331.26207572841236,
+      "heal_to_served_ns": 1626624709.0,
+      "lower_ns": 606770333.0,
+      "mean_ns": 606770333.0,
+      "resident_retry_ns": 1019854376.0,
+      "samples": 1,
+      "upper_ns": 606770333.0
+    },
+    "send_throughput/2": {
+      "clients": 2,
+      "latency_lower_ns": 923934.0,
+      "latency_median_ns": 1185560.5,
+      "latency_p99_ns": 1987192.0,
+      "latency_samples": 96,
+      "lower_ns": 612716.0416666667,
+      "mean_ns": 612716.0416666667,
+      "room_events": 200,
+      "samples": 1,
+      "sends_per_second": 1632.0773931099811,
+      "upper_ns": 612716.0416666667
+    },
+    "send_throughput/4": {
+      "clients": 4,
+      "latency_lower_ns": 915298.0,
+      "latency_median_ns": 2110588.0,
+      "latency_p99_ns": 3653427.0,
+      "latency_samples": 96,
+      "lower_ns": 572639.46875,
+      "mean_ns": 572639.46875,
+      "room_events": 200,
+      "samples": 1,
+      "sends_per_second": 1746.2994686392722,
+      "upper_ns": 572639.46875
+    },
+    "send_throughput/8": {
+      "clients": 8,
+      "latency_lower_ns": 1235130.0,
+      "latency_median_ns": 4736650.0,
+      "latency_p99_ns": 8616864.0,
+      "latency_samples": 96,
+      "lower_ns": 642556.4270833334,
+      "mean_ns": 642556.4270833334,
+      "room_events": 200,
+      "samples": 1,
+      "sends_per_second": 1556.2835540205556,
+      "upper_ns": 642556.4270833334
+    }
+  },
+  "clients": [
+    2,
+    4,
+    8
+  ],
+  "dimension": "targeted",
+  "members": [
+    1000,
+    10000
+  ],
+  "missed": 200,
+  "round": 3,
+  "server": "tuwunel"
+}

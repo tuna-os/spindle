@@ -1,0 +1,81 @@
+{
+  "benchmarks": {
+    "federated_join/1000": {
+      "join_returned_ns": 262833030.0,
+      "joined_members": 1002,
+      "lower_ns": 344104628.0,
+      "mean_ns": 344104628.0,
+      "samples": 1,
+      "upper_ns": 344104628.0
+    },
+    "federated_join/10000": {
+      "join_returned_ns": 1981563860.0,
+      "joined_members": 10002,
+      "lower_ns": 2078156166.0,
+      "mean_ns": 2078156166.0,
+      "samples": 1,
+      "upper_ns": 2078156166.0
+    },
+    "partition_catchup/200": {
+      "events_per_second": 336.8776527271543,
+      "heal_to_served_ns": 1623851920.0,
+      "lower_ns": 596655784.0,
+      "mean_ns": 596655784.0,
+      "resident_retry_ns": 1027196136.0,
+      "samples": 1,
+      "upper_ns": 596655784.0
+    },
+    "send_throughput/2": {
+      "clients": 2,
+      "latency_lower_ns": 947468.0,
+      "latency_median_ns": 1402156.0,
+      "latency_p99_ns": 1746417.0,
+      "latency_samples": 96,
+      "lower_ns": 705959.1875,
+      "mean_ns": 705959.1875,
+      "room_events": 200,
+      "samples": 1,
+      "sends_per_second": 1416.5124807586699,
+      "upper_ns": 705959.1875
+    },
+    "send_throughput/4": {
+      "clients": 4,
+      "latency_lower_ns": 1322952.0,
+      "latency_median_ns": 2247097.5,
+      "latency_p99_ns": 3273673.0,
+      "latency_samples": 96,
+      "lower_ns": 590081.8645833334,
+      "mean_ns": 590081.8645833334,
+      "room_events": 200,
+      "samples": 1,
+      "sends_per_second": 1694.680111387793,
+      "upper_ns": 590081.8645833334
+    },
+    "send_throughput/8": {
+      "clients": 8,
+      "latency_lower_ns": 1023771.0,
+      "latency_median_ns": 4226294.0,
+      "latency_p99_ns": 11031784.0,
+      "latency_samples": 96,
+      "lower_ns": 633195.03125,
+      "mean_ns": 633195.03125,
+      "room_events": 200,
+      "samples": 1,
+      "sends_per_second": 1579.2922411691777,
+      "upper_ns": 633195.03125
+    }
+  },
+  "clients": [
+    2,
+    4,
+    8
+  ],
+  "dimension": "targeted",
+  "members": [
+    1000,
+    10000
+  ],
+  "missed": 200,
+  "round": 4,
+  "server": "tuwunel"
+}

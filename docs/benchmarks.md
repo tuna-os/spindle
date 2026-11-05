@@ -1863,12 +1863,19 @@ can fail stark.
 
 The v1 close-out could not judge line 3, because three of its cells had
 no rival. #647 measures them with a rival in the seat. The
-`targeted-sitting` workflow ran
-`scripts/federated-benchmark.py` on a shared GitHub runner with 4 cores
-(run 41972144517). The files are `targeted-20261105.*`. The versions
-are Synapse 1.161.0 on Postgres and Tuwunel 1.9.2, the pins of the weekly
-comparison. The run has five rounds, and the even rounds reverse the
-order.
+`targeted-sitting` workflow did two runs of
+`scripts/federated-benchmark.py` on a shared GitHub runner with 4 cores.
+Each run has five rounds, and the even rounds reverse the order. The
+versions are Synapse 1.161.0 on Postgres and Tuwunel 1.9.2, the pins of
+the weekly comparison.
+
+- Run 42012452964, files `targeted-20261105-8769d09.*`: main with #760,
+  which adds partial-state joins (MSC3706) to Spindle. The gate judges
+  line 3 on this run.
+- Run 41972144517, files `targeted-20261105.*`: main before #760.
+
+The two runs had different runner CPUs, so compare a ratio between two
+runs, not a time.
 
 **The method.** One Spindle, the resident, holds the far side of each
 federation link. It is the same build and configuration for each
@@ -1909,39 +1916,61 @@ bench. CI tests the front: when it closes, it stops each live connection
 and refuses new ones. Thus a keep-alive connection cannot go across the
 partition.
 
+**The run on main with #760:**
+
 | cell | Spindle | Synapse | Tuwunel | vs Synapse | vs Tuwunel |
 |---|---|---|---|---|---|
-| join, 1,000 members | 132 ms | 2,060 ms | 211 ms | 15.6× win | 1.60× win |
-| join, 10,000 members | 1,104 ms | 19,692 ms | 1,536 ms | 17.8× win | 1.39× win |
-| catch-up, 200 events | 537 ms | 8,182 ms | 520 ms | 15.2× win | 0.97×, noise |
-| send, 2 clients | 2,267/s | 38/s | 1,922/s | 58.9× win | 1.18×, noise |
-| send, 4 clients | 2,628/s | 49/s | 2,333/s | 53.2× win | 1.13× win |
-| send, 8 clients | 2,488/s | 54/s | 2,183/s | 46.3× win | 1.14×, noise |
+| join, 1,000 members | 273 ms | 2,818 ms | 348 ms | 10.3× win | 1.27× win |
+| join, 10,000 members | 2,535 ms | 26,151 ms | 2,014 ms | 10.3× win | 1.26× slower, loss |
+| catch-up, 200 events | 337 ms | 10,042 ms | 607 ms | 29.8× win | 1.80× win |
+| send, 2 clients | 1,710/s | 37/s | 1,443/s | 45.8× win | 1.19×, noise |
+| send, 4 clients | 1,941/s | 41/s | 1,695/s | 47.0× win | 1.15× win |
+| send, 8 clients | 1,813/s | 42/s | 1,578/s | 43.4× win | 1.15× win |
 
 Each value is the median of five rounds. Each call uses the separation
 rule.
 
-**Against Synapse, Spindle takes all six cells by 15× or more.** Synapse
-does a full join here. Its partial-state join (MSC3706) needs a resident
-that offers partial state, and Spindle does not. Thus this result does
-not measure the faster join of Synapse. The `/join` of Synapse returned
-at the same time as its full membership.
+**Against Synapse, Spindle takes all six cells by 10× or more.** With
+#760, the resident offers partial state. Thus Synapse and Spindle both
+do a partial-state join. Tuwunel does a full join. The cell waits for
+the full membership, because before the resync a server cannot serve
+`/joined_members` for the room. The time to the `/join` answer is in
+the files as `join_returned_ns`:
 
-**Against Tuwunel, line 3 fails on four of six cells.** The join is a
-material win at 1,000 members (1.60×). At 10,000 members it is a win at
-1.39×, above the 1.38× line by a small amount. Its band of 1.17–1.56×
-goes below the line. The catch-up is a tie: 537 ms against 520 ms, and
-the rounds do not separate. Concurrent send is a tie at 2 and 8 clients.
-At 4 clients it is a win of 1.13×, but that win is not material.
+| `/join` answer | Spindle | Synapse | Tuwunel |
+|---|---|---|---|
+| 1,000 members | 50 ms | 223 ms | 278 ms |
+| 10,000 members | 67 ms | 246 ms | 1,916 ms |
 
-Thus Spindle stays near Tuwunel where the design targets a lead.
+**Against Tuwunel, line 3 fails on five of six cells.** The
+10,000-member join is a loss. Spindle answers the `/join` 29× sooner,
+but its resync to the full membership takes longer than the full join of
+Tuwunel. The band is 0.66–0.84×, so the rounds separate against us. The
+1,000-member join is a win of 1.27×, which is not material. The
+catch-up is a material win of 1.80×.
+
+Concurrent send is a win of 1.15× at 4 and 8 clients and a tie at 2
+clients. None of these wins is material.
+
+Thus Spindle stays near Tuwunel where the design targets a lead, and it
+loses the full 10,000-member join. The resync of #760 is the place to
+look.
+
+**The run before #760** also failed line 3, on four cells. In that run,
+each joiner did a full join. Against Tuwunel the joins were wins of
+1.60× and 1.39×, and the catch-up was a tie at 0.97×. Concurrent send
+was 1.13–1.18×. Against Synapse each cell was a win of 15× or more.
+
+Thus #760 moved the 10,000-member join from a small win to a loss
+against Tuwunel, as a ratio. The two runs had different CPUs, so this
+result is not a time comparison.
 
 **Parity verdict from `scripts/parity-gate.py docs/benchmarks/data
-ci-20261010 targeted-20261105`.** Line 1 passes on 33 cells. Line 2
-passes on 21. Line 3 fails on 36 cells. All the target workloads have a
-measurement now, so the gate gives line 3 a verdict. The failed cells are
-`partition_catchup/200`, `send_throughput/2`, `send_throughput/4` and
-`send_throughput/8`, each against Tuwunel.
+ci-20261010 targeted-20261105-8769d09`.** Line 1 passes on 33 cells.
+Line 2 passes on 21. Line 3 fails on 36 cells. All the target workloads
+have a measurement now, so the gate gives line 3 a verdict. The failed
+cells are `federated_join/1000`, `federated_join/10000` and
+`send_throughput` at 2, 4 and 8 clients, each against Tuwunel.
 
 ### The run that we did not keep
 
