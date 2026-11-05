@@ -8,6 +8,8 @@
 
 pub mod account;
 pub mod account_data;
+pub mod account_data_routes;
+pub mod account_routes;
 pub mod accounts;
 pub mod admin;
 pub mod admin_federation;
@@ -37,6 +39,7 @@ pub mod filters;
 pub mod hub;
 pub mod import;
 pub mod inbound;
+pub mod keys_routes;
 pub mod livekit;
 pub mod mas;
 pub mod media;
