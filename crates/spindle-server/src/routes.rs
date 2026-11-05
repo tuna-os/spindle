@@ -4805,14 +4805,14 @@ async fn room_members(
             )
         })?
         .position();
-    // A partial-state room (MSC3706) knows few of its members until its
-    // resync lands, and an E2EE client encrypts for the roster it is given:
-    // the roster waits, as Synapse's does (`rooms::partial`).
-    state.rooms.await_full_state(&room_id).await;
     let reader = state
         .rooms
         .reader(&identity.user_id, &room_id)
         .map_err(room_error)?;
+    // A partial-state room (MSC3706) knows few of its members until its
+    // resync lands, and an E2EE client encrypts for the roster it is given:
+    // the roster waits, as Synapse's does (`rooms::partial`).
+    state.rooms.await_full_state(&room_id).await;
     let events = match at {
         Some(position) => reader.members_at(position),
         None => reader.members(),
