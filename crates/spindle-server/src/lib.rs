@@ -139,7 +139,8 @@ pub struct AppState {
     pub registration_nonces: Arc<shared_secret_registration::RegistrationNonces>,
     pub rendezvous: Arc<rendezvous::Rendezvous>,
     /// One dependency recovery per room at a time, and the peers resting
-    /// after a 429 (`inbound::recovery`).
+    /// after a 429, and the turns inbound transactions take at room work
+    /// (`inbound::recovery`).
     pub recovery: Arc<inbound::RecoveryGate>,
     pub transactions: Arc<policy::TransactionLocks>,
     /// The background fill of recorded federation gaps, which a client

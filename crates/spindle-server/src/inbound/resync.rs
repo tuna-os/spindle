@@ -136,15 +136,31 @@ pub async fn run(sources: Sources) {
             if !retry.due(&record.room_id) {
                 continue;
             }
-            let peers = Peers {
-                rooms: &live.rooms,
-                federation: &live.federation,
-                key: &live.key,
-                server_name: &sources.server_name,
-                metrics: &live.metrics,
-                recovery: &live.recovery,
-            };
-            match Box::pin(resync(&peers, &record)).await {
+            // One room's resync on the blocking pool: it folds the whole
+            // state at the join into the room and resolves it, which for a
+            // big room is seconds of synchronous work that on a worker
+            // held the worker for as long (#614).
+            let server_name = sources.server_name.clone();
+            let metrics = Arc::clone(&live.metrics);
+            let room = record.clone();
+            let attempt = crate::blocking::offload_async(
+                metrics,
+                crate::metrics::BlockingTask::FederationCatchUp,
+                move || async move {
+                    let peers = Peers {
+                        rooms: &live.rooms,
+                        federation: &live.federation,
+                        key: &live.key,
+                        server_name: &server_name,
+                        metrics: &live.metrics,
+                        recovery: &live.recovery,
+                    };
+                    Box::pin(resync(&peers, &room)).await
+                },
+            )
+            .await
+            .unwrap_or_else(|_| Err(Failure::peer("the resync panicked")));
+            match attempt {
                 Ok(filled) => {
                     retry.succeeded(&record.room_id);
                     tracing::info!(

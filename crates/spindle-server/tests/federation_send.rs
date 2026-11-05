@@ -21,7 +21,8 @@ use axum::http::{Request, StatusCode};
 use ruma::RoomVersionId;
 use ruma::signatures::{Ed25519KeyPair, hash_and_sign_event};
 use serde_json::{Value, json};
-use spindle_server::metrics::{Metrics, PduOutcome};
+use spindle_server::inbound::INGEST_SLOTS;
+use spindle_server::metrics::{BlockingTask, Metrics, PduOutcome};
 use spindle_store::FjallStore;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -146,6 +147,7 @@ fn now_millis() -> u64 {
 struct Harness {
     _dir: TempDir,
     app: axum::Router,
+    state: spindle_server::AppState,
     store: Arc<FjallStore>,
     metrics: Arc<Metrics>,
 }
@@ -160,11 +162,13 @@ impl Harness {
         )
         .unwrap();
         let metrics = Arc::new(Metrics::new());
-        let app = spindle_server::app_with_metrics(config, store.clone(), Arc::clone(&metrics))
-            .expect("the app builds");
+        let (app, state) =
+            spindle_server::app_with_state(config, store.clone(), Arc::clone(&metrics))
+                .expect("the app builds");
         Self {
             _dir: dir,
             app,
+            state,
             store,
             metrics,
         }
@@ -1237,4 +1241,153 @@ async fn a_server_acl_drops_the_denied_servers_typing_and_receipts() {
         ephemeral(&after, "m.receipt")[&acl_event].is_null(),
         "the denied server's receipt is dropped: {after}"
     );
+}
+
+/// #614: a server back from an outage meets every peer's backlog at once,
+/// most of it for the same busy room. Here that room is held -- standing in
+/// for an ingest working through it -- while three times as many
+/// transactions as there are ingest slots arrive for it, on a runtime whose
+/// blocking pool has a few threads beyond the slots. Then as many room
+/// reads as there are workers arrive and wait on the same room, each
+/// handing its worker on (`blocking::section`), which takes a pool thread.
+///
+/// Liveness and readiness must still answer, with the room still held. The
+/// backlog beyond the slots waits as tasks, so the pool keeps threads for
+/// the readers' hand-offs. Admitted all at once, the backlog took every
+/// pool thread; each reader then held its worker while it waited for a
+/// thread that never came, and with both workers stopped `/health` was
+/// not polled again until the room was let go.
+///
+/// Waits here are on the test's own thread: once the workers stop, an
+/// async timer in this future would never fire.
+#[test]
+fn probes_answer_while_a_federation_backlog_waits_on_one_room() {
+    const WORKERS: usize = 2;
+    const SPARE_THREADS: usize = 8;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(WORKERS)
+        .max_blocking_threads(INGEST_SLOTS + SPARE_THREADS)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let peer = Arc::new(Peer::start().await);
+        let harness = Arc::new(Harness::new());
+        let alice = harness.register("alice").await;
+        let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
+        let join = join_event(&harness.store, &peer, &room, &head);
+        let (status, body) = harness.deliver(&peer, "join", vec![join]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let head = harness.head_event(&room, &alice).await;
+
+        let backlog = 3 * INGEST_SLOTS;
+        let messages: Vec<Value> = (0..backlog)
+            .map(|n| message_event(&harness.store, &peer, &room, &head, &format!("backlog {n}")))
+            .collect();
+
+        let (release, holder) = hold_on_a_thread(harness.state.rooms.lock_for_test(&room).unwrap());
+
+        let deliveries: Vec<_> = messages
+            .into_iter()
+            .enumerate()
+            .map(|(n, message)| {
+                let harness = Arc::clone(&harness);
+                let peer = Arc::clone(&peer);
+                tokio::spawn(async move {
+                    harness
+                        .deliver(&peer, &format!("backlog-{n}"), vec![message])
+                        .await
+                })
+            })
+            .collect();
+        let in_flight = |task| harness.metrics.blocking_in_flight(task);
+        wait_on_this_thread("the backlog reaches the held room", || {
+            in_flight(BlockingTask::FederationSend) >= INGEST_SLOTS as u64
+        });
+
+        let readers: Vec<_> = (0..2 * WORKERS)
+            .map(|_| {
+                let harness = Arc::clone(&harness);
+                let request = Request::builder()
+                    .uri(format!(
+                        "/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=1"
+                    ))
+                    .header("authorization", format!("Bearer {alice}"))
+                    .body(Body::empty())
+                    .unwrap();
+                tokio::spawn(async move { harness.call(request).await.0 })
+            })
+            .collect();
+        wait_on_this_thread("the readers wait on the held room", || {
+            in_flight(BlockingTask::LockWait) >= WORKERS as u64
+        });
+
+        let answered = probes_from_a_task(harness.app.clone());
+        for _ in 0..2 {
+            let (path, status) = answered
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the probes answer while the backlog waits on the room");
+            assert_eq!(status, StatusCode::OK, "{path}");
+        }
+        assert_eq!(
+            in_flight(BlockingTask::FederationSend),
+            INGEST_SLOTS as u64,
+            "the rest of the backlog waits for a turn, holding no thread"
+        );
+
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        for delivery in deliveries {
+            let (status, body) = delivery.await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(only_result(&body), &json!({}), "{body}");
+        }
+        for reader in readers {
+            assert_eq!(reader.await.unwrap(), StatusCode::OK);
+        }
+    });
+}
+
+/// Hold `lock` exclusively on a thread of its own until told to let go, or
+/// until the sender is dropped -- by a failed assertion, say -- so that the
+/// runtime can shut down.
+fn hold_on_a_thread<T: Send + Sync + 'static>(
+    lock: Arc<std::sync::RwLock<T>>,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _guard = lock.write().unwrap();
+        held_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    held_rx.recv().unwrap();
+    (release_tx, holder)
+}
+
+/// Poll `done` on the calling thread, never on a runtime timer.
+fn wait_on_this_thread(what: &str, done: impl Fn() -> bool) {
+    let started = std::time::Instant::now();
+    while !done() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "{what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Ask `/health`, then `/ready`, from a spawned task -- which needs a
+/// worker to run, as a kubelet's probe does -- and hand back each answer.
+fn probes_from_a_task(app: axum::Router) -> std::sync::mpsc::Receiver<(&'static str, StatusCode)> {
+    let (answered_tx, answered) = std::sync::mpsc::channel();
+    tokio::spawn(async move {
+        for path in ["/health", "/ready"] {
+            let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            // A test that gave up waiting has dropped the receiver.
+            let _ = answered_tx.send((path, response.status()));
+        }
+    });
+    answered
 }

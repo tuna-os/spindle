@@ -551,6 +551,9 @@ pub enum BlockingTask {
     RoomWarmup,
     /// An inbound federation transaction's PDUs (`spawn_blocking`).
     FederationSend,
+    /// Federation catch-up: a dependency recovery, one chunk of gap
+    /// backfill, one partial-state resync (`spawn_blocking`).
+    FederationCatchUp,
     /// A cold room load reached from async code (`block_in_place`).
     ColdLoad,
     /// A wait for a contended room lock (`block_in_place`).
@@ -558,11 +561,12 @@ pub enum BlockingTask {
 }
 
 impl BlockingTask {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::SlidingSync,
         Self::Sync,
         Self::RoomWarmup,
         Self::FederationSend,
+        Self::FederationCatchUp,
         Self::ColdLoad,
         Self::LockWait,
     ];
@@ -577,6 +581,7 @@ impl BlockingTask {
             Self::Sync => "sync",
             Self::RoomWarmup => "room_warmup",
             Self::FederationSend => "federation_send",
+            Self::FederationCatchUp => "federation_catch_up",
             Self::ColdLoad => "cold_load",
             Self::LockWait => "lock_wait",
         }
