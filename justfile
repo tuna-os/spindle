@@ -91,13 +91,16 @@ bench-render:
     @echo "site/comparisons.html"
 
 # --- Upkeep: what the spec, the proposals and the pinned upstreams did
-# since the last look. The weekly workflow (upkeep.yml) files the same three
+# since the last look. The weekly workflow (upkeep.yml) files the same four
 # reports into one issue; run this before bumping a pin, and read
-# docs/maintenance.md for what to do with what it says.
+# docs/maintenance.md for what to do with what it says. ruma-drift exits 1 on
+# drift; the `-` keeps the rest of the report printing after it.
 upkeep:
     python3 scripts/upstream-pins.py --upstream
     @echo
     python3 scripts/msc-ledger.py --upstream
+    @echo
+    -python3 scripts/ruma-drift.py --upstream
     @echo
     python3 scripts/spec-drift.py --preview | sed -n '/^## Client-Server/,/^## Served beyond/p' | grep -E '^(##|[0-9]+ of)'
 

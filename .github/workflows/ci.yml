@@ -94,6 +94,15 @@ jobs:
       - name: Check every upstream pin can still be read
         run: python3 scripts/upstream-pins.py --check
 
+      # vendor/ruma-state-res is a patched copy with no upstream path for
+      # the patch (ADR 0006). Hold it to the crates.io base plus exactly the
+      # hunks SPINDLE-PATCH.md lists, so the patch cannot grow silently; the
+      # test runs the same judgement on synthetic trees and an injected hunk.
+      - name: Check the vendored ruma-state-res is its base plus the listed hunks
+        run: |
+          python3 scripts/ruma-drift.py --check
+          python3 scripts/ruma-drift-test.py
+
       # The Complement ratchet decides whether a conformance regression can
       # merge, and its output is what somebody reads when one does. Both are
       # worth a test: #228 is a case where the gate was right, and #231 one
