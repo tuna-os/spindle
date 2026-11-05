@@ -43,6 +43,7 @@ pub mod keys_routes;
 pub mod livekit;
 pub mod mas;
 pub mod media;
+pub mod media_routes;
 pub mod metrics;
 pub mod moderation_routes;
 pub mod netguard;
