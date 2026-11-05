@@ -460,3 +460,22 @@ TestToDeviceMessagesOverFederation/good_connectivity
 TestTxnIdWithRefreshToken
 TestTxnInEvent
 TestTxnScopeOnLocalEcho
+
+# Promoted 2026-11-05 (#744), once presence (#755) and durable to-device
+# delivery (#759) were on main. Presence passed in every full run since
+# #755 merged: push runs 42003725672 (1e903d00) and 42008055230, and the
+# dispatched full run 42008112454 (both 048eec46). The to-device tests
+# passed in those three and in push run 41999898643 (70f08791), the first
+# full run after #759. The server ACL tests are protected above, by #764.
+TestMembersLocal/Parallel/Existing_members_see_new_members'_presence_(in_initial_sync)
+TestPresence
+TestPresence/Presence_can_be_set_from_sync
+TestPresence/Presence_changes_are_reported_to_local_room_members
+TestPresence/Presence_changes_to_UNAVAILABLE_are_reported_to_local_room_members
+TestPresenceSyncDifferentRooms
+TestRemotePresence
+TestRemotePresence/Presence_changes_are_also_reported_to_remote_room_members
+TestRemotePresence/Presence_changes_to_UNAVAILABLE_are_reported_to_remote_room_members
+TestToDeviceMessagesOverFederation
+TestToDeviceMessagesOverFederation/interrupted_connectivity
+TestToDeviceMessagesOverFederation/stopped_server
