@@ -281,7 +281,23 @@ pub(super) async fn fetch_state(
             }
             match peers.rooms.pdu(room_id, &id) {
                 Ok(_) => {}
-                Err(RoomError::MissingBody(_)) => wave.push(id),
+                Err(RoomError::MissingBody(_)) => {
+                    // This peer's body for it failed verification moments
+                    // ago (#725): fetching it again gets the same bytes and
+                    // the same verdict. Another peer's body may verify, so
+                    // the entry is this peer's alone.
+                    if peers
+                        .recovery
+                        .failed(room_id, Some(peer), [id.as_str()])
+                        .is_some()
+                    {
+                        return Err(Failure::Invalid(format!(
+                            "state event {id} from {peer} failed verification recently; \
+                             it is not fetched again until that expires"
+                        )));
+                    }
+                    wave.push(id);
+                }
                 Err(error) => return Err(error.into()),
             }
         }
@@ -317,14 +333,16 @@ pub(super) async fn fetch_state(
         bodies.sort_by(|left, right| left.0.cmp(&right.0));
         for (id, body) in bodies {
             charge(&body, &mut bytes, MAX_GAP_BYTES)?;
-            let verified = verify(peers, room_id, version, &body, Some(&id), keys)
-                .await
-                .map_err(|why| Failure::Invalid(format!("state event {id}: {why}")))?;
-            if verified.id != id {
-                return Err(Failure::Invalid(format!(
-                    "state event {id} does not match the body served for it"
-                )));
-            }
+            let verified = match verify(peers, room_id, version, &body, Some(&id), keys).await {
+                Ok(verified) if verified.id == id => verified,
+                failed => {
+                    peers.recovery.distrust(room_id, Some(peer), [id.as_str()]);
+                    return Err(Failure::Invalid(match failed {
+                        Ok(_) => format!("state event {id} does not match the body served for it"),
+                        Err(why) => format!("state event {id}: {why}"),
+                    }));
+                }
+            };
             pending.extend(
                 peers
                     .rooms

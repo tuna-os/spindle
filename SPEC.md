@@ -838,7 +838,10 @@ Rate limiting is per-origin and per-room, with a separate budget for events that
 trigger `/get_missing_events` — the classic amplification vector. Accepting an
 event across a gap (§6.6) fetches a room's state and auth chain, so it is
 capped separately, per room and per origin over a window
-(`gap_acceptances_per_room`, `gap_acceptances_per_origin`).
+(`gap_acceptances_per_room`, `gap_acceptances_per_origin`). When a dependency
+fails verification, Spindle does not get it again for
+`dependency_failure_ttl_secs`. In that time, Spindle refuses at once each event
+that names it, and sends no request to a peer.
 
 ### 11.5 Joining an existing large room
 

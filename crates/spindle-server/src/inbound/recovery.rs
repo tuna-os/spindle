@@ -51,6 +51,15 @@ const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 const MIN_COOLDOWN: Duration = Duration::from_secs(5);
 pub(super) const MAX_COOLDOWN: Duration = Duration::from_secs(600);
 
+/// Dependencies held as failed at once, across rooms (#725). Past it the
+/// entry nearest its expiry gives way: forgetting one costs one repeat of
+/// the work the entry saved, and a peer serving bad bodies for many event
+/// IDs cannot grow the cache past this.
+const MAX_FAILED_DEPENDENCIES: usize = 4096;
+/// The longest `dependency_failure_ttl_secs` holds an entry. Also what
+/// keeps `Instant + ttl` clear of overflow for any configured value.
+const MAX_FAILURE_TTL: Duration = Duration::from_secs(86_400);
+
 /// The requests a 429 cools down, separately: a peer limiting duplicate
 /// `get_missing_events` calls has said nothing about `/state_ids`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -117,12 +126,18 @@ enum GapScope {
 
 type CooldownKey = (String, String, Endpoint);
 
-/// Per-room single flight for dependency recovery, and the peers this
-/// server is leaving alone after they answered 429.
+/// An event that failed verification: its ID, and the peer that served the
+/// body which failed, or `None` for a dependency of a pushed PDU whose
+/// recovery and gap acceptance failed, whoever was asked.
+type FailedKey = (String, Option<String>);
+
+/// Per-room single flight for dependency recovery, the peers this server
+/// is leaving alone after they answered 429, and the dependencies that
+/// failed verification lately.
 ///
-/// Process-local on purpose: both are about requests in flight right now.
+/// Process-local on purpose: all of it is about requests made right now.
 /// A restart forgets them, which costs at most one more request per peer.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RecoveryGate {
     /// One async lock per room with a recovery in flight. Weak, so a room
     /// nobody is recovering holds nothing; dead entries are swept on entry.
@@ -132,12 +147,26 @@ pub struct RecoveryGate {
     /// When each room and each origin was last admitted to a gap
     /// acceptance, within the cap's window.
     gap_admissions: Mutex<HashMap<GapScope, VecDeque<Instant>>>,
+    /// `room` -> what failed verification there -> held until (#725).
+    /// Keyed by room first, so the check that every PDU with a missing
+    /// dependency makes costs one lookup in a room with no failures.
+    failed: Mutex<HashMap<String, HashMap<FailedKey, Instant>>>,
+    /// How long an entry of `failed` holds. Zero turns the cache off.
+    failure_ttl: Duration,
 }
 
 impl RecoveryGate {
+    /// A gate that holds a failed dependency for `failure_ttl`, at most
+    /// [`MAX_FAILURE_TTL`].
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(failure_ttl: Duration) -> Self {
+        Self {
+            rooms: Mutex::default(),
+            cooldowns: Mutex::default(),
+            gap_admissions: Mutex::default(),
+            failed: Mutex::default(),
+            failure_ttl: failure_ttl.min(MAX_FAILURE_TTL),
+        }
     }
 
     /// Wait for this room's turn to recover. The guard is the turn.
@@ -227,6 +256,117 @@ impl RecoveryGate {
         admissions.entry(room).or_default().push_back(now);
         admissions.entry(from).or_default().push_back(now);
         Ok(())
+    }
+
+    /// Hold `events` of `room_id` as failed for the TTL (#725): served by
+    /// `peer` in a body that failed verification, or, with no peer, named
+    /// by a pushed PDU whose recovery and gap acceptance failed.
+    pub(super) fn distrust<'e>(
+        &self,
+        room_id: &str,
+        peer: Option<&str>,
+        events: impl IntoIterator<Item = &'e str>,
+    ) {
+        self.distrust_at(Instant::now(), room_id, peer, events);
+    }
+
+    fn distrust_at<'e>(
+        &self,
+        now: Instant,
+        room_id: &str,
+        peer: Option<&str>,
+        events: impl IntoIterator<Item = &'e str>,
+    ) {
+        if self.failure_ttl.is_zero() {
+            return;
+        }
+        let until = now + self.failure_ttl;
+        let mut failed = self
+            .failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        failed.retain(|_, held| {
+            held.retain(|_, until| *until > now);
+            !held.is_empty()
+        });
+        let mut count: usize = failed.values().map(HashMap::len).sum();
+        for event in events {
+            let key = (event.to_owned(), peer.map(str::to_owned));
+            let known = failed
+                .get(room_id)
+                .is_some_and(|held| held.contains_key(&key));
+            if !known {
+                if count >= MAX_FAILED_DEPENDENCIES {
+                    evict_nearest_expiry(&mut failed);
+                } else {
+                    count += 1;
+                }
+            }
+            failed
+                .entry(room_id.to_owned())
+                .or_default()
+                .insert(key, until);
+        }
+    }
+
+    /// The first of `events` held as failed in `room_id` for `peer` (or,
+    /// with none, as a pushed PDU's dependency), if any.
+    pub(super) fn failed<'e>(
+        &self,
+        room_id: &str,
+        peer: Option<&str>,
+        events: impl IntoIterator<Item = &'e str>,
+    ) -> Option<&'e str> {
+        self.failed_at(Instant::now(), room_id, peer, events)
+    }
+
+    fn failed_at<'e>(
+        &self,
+        now: Instant,
+        room_id: &str,
+        peer: Option<&str>,
+        events: impl IntoIterator<Item = &'e str>,
+    ) -> Option<&'e str> {
+        let failed = self
+            .failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = failed.get(room_id)?;
+        let peer = peer.map(str::to_owned);
+        events.into_iter().find(|event| {
+            held.get(&((*event).to_owned(), peer.clone()))
+                .is_some_and(|until| *until > now)
+        })
+    }
+
+    /// Forget what failed in `room_id`: a recovery or gap acceptance there
+    /// just succeeded, so the room's history and the keys this server holds
+    /// have changed, and what failed before may verify now.
+    pub(super) fn forgive(&self, room_id: &str) {
+        self.failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(room_id);
+    }
+}
+
+/// Drop the entry of `failed` that expires first. Every entry holds for the
+/// same TTL, so that is also the oldest. A scan, but only when the cache is
+/// full, on a path that just failed a verification.
+fn evict_nearest_expiry(failed: &mut HashMap<String, HashMap<FailedKey, Instant>>) {
+    let Some((room, key)) = failed
+        .iter()
+        .flat_map(|(room, held)| held.iter().map(move |(key, until)| (*until, room, key)))
+        .min_by_key(|(until, ..)| *until)
+        .map(|(_, room, key)| (room.clone(), key.clone()))
+    else {
+        return;
+    };
+    if let Some(held) = failed.get_mut(&room) {
+        held.remove(&key);
+        if held.is_empty() {
+            failed.remove(&room);
+        }
     }
 }
 
@@ -583,6 +723,10 @@ fn unheld_room_version(state: &AppState, room_id: &str, pdu: &Value) -> Option<R
     Some(stated.unwrap_or_else(|| super::room_version_of(state, pdu)))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the receipt checks for one PDU, read top to bottom"
+)]
 async fn judge(
     state: &AppState,
     origin: &str,
@@ -659,9 +803,9 @@ async fn judge(
     if !matches!(error, RoomError::Append(_) | RoomError::MissingBody(_)) {
         return (event.id, classify(&error), Err(error.to_string()));
     }
-    if !has_missing(state, room_id, &event.body) {
+    let Some(missing) = missing_dependencies(state, room_id, &event.body) else {
         return (event.id, PduOutcome::Refused, Err(error.to_string()));
-    }
+    };
     // Recovery asks a participating peer about a room we hold; no unsigned
     // third-party name can trigger an arbitrary dependency fetch.
     if !state.rooms.server_in_room(room_id, origin).unwrap_or(false) {
@@ -670,6 +814,11 @@ async fn judge(
             PduOutcome::RefusedMissingDeps,
             Err(error.to_string()),
         );
+    }
+    // Before the room's turn: a PDU whose dependency failed a moment ago is
+    // refused at once, not after the recovery in flight ahead of it.
+    if let Some((outcome, result)) = failed_recently(state, room_id, &missing) {
+        return (event.id, outcome, result);
     }
 
     // The rest runs as its own task, so a sending server that gives up on
@@ -705,12 +854,49 @@ async fn judge(
     }
 }
 
-/// Whether the event names a predecessor or auth event this room lacks.
-fn has_missing(state: &AppState, room_id: &str, body: &Value) -> bool {
+/// The predecessors and auth events the event names that this room lacks,
+/// if there are any.
+fn missing_dependencies(
+    state: &AppState,
+    room_id: &str,
+    body: &Value,
+) -> Option<(Vec<String>, Vec<String>)> {
     state
         .rooms
         .missing_remote_dependencies(room_id, body)
-        .is_ok_and(|(predecessors, auth)| !predecessors.is_empty() || !auth.is_empty())
+        .ok()
+        .filter(|(predecessors, auth)| !predecessors.is_empty() || !auth.is_empty())
+}
+
+/// Every ID in a [`missing_dependencies`] answer.
+fn dependencies(missing: &(Vec<String>, Vec<String>)) -> impl Iterator<Item = &str> {
+    missing.0.iter().chain(&missing.1).map(String::as_str)
+}
+
+/// The refusal of an event that names a dependency which failed
+/// verification within the TTL (#725), if it does. The recovery and gap
+/// acceptance it would start ended in that failure moments ago; asking
+/// again costs every peer the same fetches for the same answer, once per
+/// PDU that names it. The sender retries the transaction, so the event is
+/// judged again once the entry expires.
+fn failed_recently(
+    state: &AppState,
+    room_id: &str,
+    missing: &(Vec<String>, Vec<String>),
+) -> Option<(PduOutcome, Result<(), String>)> {
+    let dependency = state
+        .recovery
+        .failed(room_id, None, dependencies(missing))?;
+    state
+        .metrics
+        .record_recovery(RecoveryResult::NegativeCached, Duration::ZERO);
+    Some((
+        PduOutcome::RefusedMissingDeps,
+        Err(format!(
+            "dependency {dependency} failed verification recently; \
+             it is not fetched again until that expires"
+        )),
+    ))
 }
 
 /// With the room's turn held: try the ordinary path again, then recovery
@@ -736,13 +922,14 @@ async fn resolve(
     if !matches!(error, RoomError::Append(_) | RoomError::MissingBody(_)) {
         return (classify(&error), Err(error.to_string()));
     }
-    let missing = match state
-        .rooms
-        .missing_remote_dependencies(room_id, &event.body)
-    {
-        Ok(missing) if !missing.0.is_empty() || !missing.1.is_empty() => missing,
-        _ => return (PduOutcome::Refused, Err(error.to_string())),
+    let Some(missing) = missing_dependencies(state, room_id, &event.body) else {
+        return (PduOutcome::Refused, Err(error.to_string()));
     };
+    // Again with the turn held: the recovery this PDU waited for may have
+    // failed on the same dependency.
+    if let Some(refusal) = failed_recently(state, room_id, &missing) {
+        return refusal;
+    }
 
     let mut last = error.to_string();
     for peer in recovery_peers(state, origin, room_id) {
@@ -758,6 +945,7 @@ async fn resolve(
                 state
                     .metrics
                     .record_recovery(RecoveryResult::Recovered, elapsed);
+                state.recovery.forgive(room_id);
                 return match state.rooms.receive_live(room_id, &event.id, &event.body) {
                     Ok(()) => (PduOutcome::Accepted, Ok(())),
                     Err(error) => (classify(&error), Err(error.to_string())),
@@ -805,6 +993,11 @@ async fn resolve(
                 state
                     .metrics
                     .record_recovery(RecoveryResult::Invalid, elapsed);
+                if matches!(failure, Failure::Invalid(_)) {
+                    state
+                        .recovery
+                        .distrust(room_id, None, dependencies(&missing));
+                }
                 return (PduOutcome::RefusedMissingDeps, Err(failure.message()));
             }
             Err(_) => {
@@ -849,6 +1042,7 @@ async fn resolve(
     let failure = match attempt {
         Ok(Ok(Some(missing))) => {
             state.metrics.record_gap(GapResult::Accepted);
+            state.recovery.forgive(room_id);
             tracing::info!(
                 room = room_id,
                 event_id = %event.id,
@@ -862,6 +1056,7 @@ async fn resolve(
         // Its parents arrived while the state was fetched: an ordinary append.
         Ok(Ok(None)) => {
             state.metrics.record_gap(GapResult::Accepted);
+            state.recovery.forgive(room_id);
             return (PduOutcome::Accepted, Ok(()));
         }
         Ok(Err(failure)) => failure,
@@ -882,7 +1077,14 @@ async fn resolve(
             ..
         } => (GapResult::RateLimited, PduOutcome::RefusedMissingDeps),
         Failure::Peer { .. } => (GapResult::PeerError, PduOutcome::RefusedMissingDeps),
-        Failure::Invalid(_) => (GapResult::Invalid, PduOutcome::RefusedMissingDeps),
+        Failure::Invalid(_) => {
+            // Nothing a peer can serve for these verifies now: refuse the
+            // next PDU that names them at once (#725).
+            state
+                .recovery
+                .distrust(room_id, None, dependencies(&missing));
+            (GapResult::Invalid, PduOutcome::RefusedMissingDeps)
+        }
         Failure::Verdict(error) => (GapResult::Invalid, classify(error)),
     };
     state.metrics.record_gap(result);
@@ -1171,5 +1373,77 @@ fn server_acl_admits(state: &AppState, room_id: &str, origin: &str) -> Result<()
         Ok(true) | Err(RoomError::UnknownRoom(_)) => Ok(()),
         Ok(false) => Err(format!("{origin} is denied by the room's server ACL")),
         Err(error) => Err(format!("the room's server ACL cannot be read: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn held(gate: &RecoveryGate) -> usize {
+        gate.failed.lock().unwrap().values().map(HashMap::len).sum()
+    }
+
+    /// A dependency is held for the TTL, in its room, for whoever served it,
+    /// and a success in the room forgets it.
+    #[test]
+    fn a_failed_dependency_is_held_for_the_ttl_and_forgiven_on_success() {
+        let gate = RecoveryGate::new(Duration::from_secs(60));
+        let now = Instant::now();
+        gate.distrust_at(now, "!room", None, ["$named"]);
+        gate.distrust_at(now, "!room", Some("bad.example"), ["$served"]);
+
+        assert_eq!(
+            gate.failed_at(now, "!room", None, ["$other", "$named"]),
+            Some("$named")
+        );
+        assert_eq!(gate.failed_at(now, "!elsewhere", None, ["$named"]), None);
+        assert_eq!(
+            gate.failed_at(now, "!room", Some("bad.example"), ["$served"]),
+            Some("$served")
+        );
+        assert_eq!(
+            gate.failed_at(now, "!room", Some("good.example"), ["$served"]),
+            None,
+            "another peer's body may verify"
+        );
+        assert_eq!(gate.failed_at(now, "!room", None, ["$served"]), None);
+
+        let expired = now + Duration::from_secs(60);
+        assert_eq!(gate.failed_at(expired, "!room", None, ["$named"]), None);
+
+        gate.forgive("!room");
+        assert_eq!(gate.failed_at(now, "!room", None, ["$named"]), None);
+        assert_eq!(held(&gate), 0);
+    }
+
+    /// Past the cap the oldest entry gives way, so the cache never grows
+    /// past [`MAX_FAILED_DEPENDENCIES`] however many IDs a peer names.
+    #[test]
+    fn the_cache_is_bounded_and_drops_the_oldest_entry() {
+        let gate = RecoveryGate::new(Duration::from_secs(600));
+        let start = Instant::now();
+        for index in 0..=MAX_FAILED_DEPENDENCIES {
+            let at = start + Duration::from_millis(u64::try_from(index).unwrap());
+            gate.distrust_at(at, "!room", None, [format!("${index}").as_str()]);
+        }
+        assert_eq!(held(&gate), MAX_FAILED_DEPENDENCIES);
+        let last = format!("${MAX_FAILED_DEPENDENCIES}");
+        assert_eq!(gate.failed_at(start, "!room", None, ["$0"]), None);
+        assert_eq!(gate.failed_at(start, "!room", None, ["$1"]), Some("$1"));
+        assert_eq!(
+            gate.failed_at(start, "!room", None, [last.as_str()]),
+            Some(last.as_str())
+        );
+    }
+
+    /// A TTL of zero turns the cache off.
+    #[test]
+    fn a_zero_ttl_holds_nothing() {
+        let gate = RecoveryGate::new(Duration::ZERO);
+        let now = Instant::now();
+        gate.distrust_at(now, "!room", None, ["$named"]);
+        assert_eq!(gate.failed_at(now, "!room", None, ["$named"]), None);
+        assert_eq!(held(&gate), 0);
     }
 }

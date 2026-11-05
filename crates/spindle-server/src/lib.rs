@@ -495,6 +495,8 @@ fn app_state_with(
     let push =
         Arc::new(push::Gateway::new(&config.push.allow_internal).map_err(AppError::PushConfig)?);
     let delayed_caps = config.delayed_events.clone();
+    let dependency_failure_ttl =
+        std::time::Duration::from_secs(config.federation.dependency_failure_ttl_secs);
     let config_for_sfu = config.clone();
     let store_for_sfu = Arc::clone(&store);
     let state = AppState {
@@ -531,7 +533,7 @@ fn app_state_with(
         push,
         registration_nonces: Arc::new(shared_secret_registration::RegistrationNonces::new()),
         rendezvous: Arc::new(rendezvous::Rendezvous::new()),
-        recovery: Arc::new(inbound::RecoveryGate::new()),
+        recovery: Arc::new(inbound::RecoveryGate::new(dependency_failure_ttl)),
         backfill: Arc::new(inbound::GapBackfill::new()),
         metrics,
         mailer,

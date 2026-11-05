@@ -1039,6 +1039,15 @@ pub struct FederationConfig {
     /// The window both gap acceptance caps count over, seconds.
     #[serde(default = "default_gap_acceptance_window_secs")]
     pub gap_acceptance_window_secs: u64,
+    /// How long a dependency that failed verification is not fetched
+    /// again, seconds (#725). In that time a pushed PDU that names it is
+    /// refused at once, without the recovery and gap acceptance that
+    /// failed for it last time, and a peer's body for it that failed is
+    /// not fetched from that peer again. The sender retries the
+    /// transaction, so the PDU is judged again after this expires. `0`
+    /// turns it off; at most a day.
+    #[serde(default = "default_dependency_failure_ttl_secs")]
+    pub dependency_failure_ttl_secs: u64,
     /// Notary servers asked for a peer's keys when the peer itself cannot
     /// answer: it is down, gone, or no longer publishes the key an old
     /// event was signed with. Each entry is a server name, or a table
@@ -1259,6 +1268,10 @@ const fn default_gap_acceptance_window_secs() -> u64 {
     600
 }
 
+const fn default_dependency_failure_ttl_secs() -> u64 {
+    300
+}
+
 impl Default for FederationConfig {
     fn default() -> Self {
         Self {
@@ -1279,6 +1292,7 @@ impl Default for FederationConfig {
             gap_acceptances_per_room: default_gap_acceptances_per_room(),
             gap_acceptances_per_origin: default_gap_acceptances_per_origin(),
             gap_acceptance_window_secs: default_gap_acceptance_window_secs(),
+            dependency_failure_ttl_secs: default_dependency_failure_ttl_secs(),
             trusted_key_servers: None,
             hub: HubConfig::default(),
         }
