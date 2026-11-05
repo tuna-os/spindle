@@ -133,6 +133,24 @@ federation. complement-crypto drives the real rust-sdk and js-sdk against a
 homeserver and can run them **against each other**, which is precisely the
 interop shape we need. Adopt it at M2 rather than writing E2EE tests by hand.
 
+It runs nightly and on demand as the `complement-crypto` job in
+`.github/workflows/compliance.yml`, through `contrib/complement-crypto/run.sh`:
+the suite at a pinned commit, unforked, with matrix-js-sdk clients (pinned to
+the version the suite's own lockfile resolves) in headless Chrome against two
+Spindles built from `complement/Dockerfile`, in the `jj` and `jJ`
+permutations — one server, then the same pair across two, which is where device lists
+travel by federation. The Rust SDK's clients are not run: they need the FFI
+bindings built through a forked `uniffi-bindgen-go`, and matrix-rust-sdk's own
+integration suite already drives Spindle nightly (`rust-sdk-suite`).
+
+The job is **report-only**. A failing test leaves it green and names itself in
+the log and the `complement-crypto` artifact; only a run that produced no
+results at all, a broken rig, turns it red. There is no recorded baseline yet,
+so a failure cannot be told apart from a regression, and a nightly that is red
+every night for a known reason is one nobody reads. Tests that pass on two
+consecutive runs go into an allowlist and the job becomes a ratchet like
+Complement's (§3.3); that is what "blocking from M2" in §6 means in practice.
+
 ### 4.3 Schema conformance from the spec itself
 
 `matrix-spec` ships OpenAPI definitions and JSON Schemas for every event type.
@@ -301,8 +319,8 @@ so it runs on every commit, and a counterexample is a release blocker.
 | Per commit | Unit tests, §5.3 property tests, schema validation (§4.3), fuzz corpus | Blocking |
 | Per PR | Complement with `spindle_blacklist`, blacklist-size ratchet | Blocking |
 | Per PR | §5.2 fork injection | Blocking |
-| Nightly | sytest, full fuzzing, §5.1 interop run against Synapse's Complement image (`compliance-interop`, report-only, both directions) | Non-blocking, tracked |
-| Nightly | complement-crypto | Blocking from M2 |
+| Nightly | full fuzzing, §5.1 interop run against Synapse's Complement image (`compliance-interop`, report-only, both directions); sytest is planned (§7, M5) and not yet run | Non-blocking, tracked |
+| Nightly | complement-crypto, JS SDK clients (`complement-crypto`, §4.2) | Report-only until it has a baseline, then a ratchet; blocking from M2 |
 | Weekly | Interop rig against Synapse `develop`; Element Web Playwright suite | Non-blocking, alerts |
 | Release | Full matrix + manual client pass + federation tester against a live deploy | Blocking |
 

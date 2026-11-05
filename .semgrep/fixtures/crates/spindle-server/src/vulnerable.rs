@@ -9,9 +9,10 @@
 //! structure, and a fixture that has to be kept building against the real
 //! crate would rot into being edited for reasons unrelated to the rule.
 //!
-//! `scripts/authorization-rule.py` asserts the rule fires here. If this
-//! file stops matching, the gate has stopped guarding and the CI job says so
-//! rather than passing quietly.
+//! `scripts/authorization-rule.py` asserts the rule fires on the line under
+//! each `ruleid:` marker and nowhere else. If this file stops matching, the
+//! gate has stopped guarding and the CI job says so rather than passing
+//! quietly.
 
 async fn room_messages(
     State(state): State<AppState>,
@@ -31,6 +32,7 @@ async fn room_messages(
     let limit = query.limit.unwrap_or(10).min(100);
     // No gate. The caller is authenticated, which says who they are and
     // nothing about what they may read.
+    // ruleid: room-read-without-authorization
     let (events, next) = state
         .rooms
         .messages(&room_id, from, limit)

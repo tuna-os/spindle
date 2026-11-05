@@ -7,15 +7,33 @@
 # on a path that already has the caller's identity in hand.
 #
 # Authenticating says who somebody is. It does not say what they may read.
+#
+# Scope (#744): every module of the server crate, not one file. The rule
+# used to read only routes.rs, while handlers live in a dozen modules
+# (moderation_routes.rs, appservice_proxy.rs, inbound.rs, hub/ ...), and a
+# handler moved out of routes.rs dropped out of the gate without anybody
+# deciding it should. The glob is the whole crate so that a module added
+# tomorrow is covered by default. Semgrep matches an include glob anywhere
+# in a path, so the fixtures live under .semgrep/fixtures/ at the same
+# relative path a real module has, and reach the rule only through this
+# glob: if it stops covering a module the fixtures named after modules stop
+# firing and scripts/authorization-rule.py fails.
+#
+# What the rule cannot see, said so nobody assumes otherwise:
+#   - handlers whose room ids arrive in a request body (sliding sync's
+#     room subscriptions) rather than the path;
+#   - reads made through a helper that is handed the room id -- the rule
+#     reads one function at a time;
+#   - admin handlers, which take an `AdminActor` rather than an
+#     `Authenticated`: the extractor itself refuses anyone who is not a
+#     server administrator, and an administrator may read any room.
 rules:
   - id: room-read-without-authorization
     languages: [rust]
     severity: ERROR
     paths:
       include:
-        - crates/spindle-server/src/routes.rs
-        - crates/spindle-server/src/*_routes.rs
-        - .semgrep/fixtures/*.rs
+        - crates/spindle-server/src/**/*.rs
     message: >-
       This handler takes an authenticated caller and a room id, reads that
       room, and never asks whether the caller may see it. Authenticating a
@@ -26,16 +44,79 @@ rules:
       decision somebody can find: gate it on the room's own visibility and
       say so where the gate would have gone.
     patterns:
-      # An authenticated handler ...
-      - pattern-inside: |
-          async fn $HANDLER(..., Authenticated($ID): Authenticated, ...) -> $RET {
-            ...
-          }
-      # ... that is handed a room id by the router ...
-      - pattern-inside: |
-          async fn $HANDLER(..., axum::extract::Path($ROOM): axum::extract::Path<String>, ...) -> $RET {
-            ...
-          }
+      # An authenticated handler, in each spelling the crate uses ...
+      - pattern-either:
+          - pattern-inside: |
+              async fn $HANDLER(..., Authenticated($ID): Authenticated, ...) -> $RET {
+                ...
+              }
+          - pattern-inside: |
+              async fn $HANDLER(..., crate::auth::Authenticated($ID): crate::auth::Authenticated, ...) -> $RET {
+                ...
+              }
+          - pattern-inside: |
+              async fn $HANDLER(..., $ID: Authenticated, ...) -> $RET {
+                ...
+              }
+      # ... that is handed a room id by the router: alone, or as one of the
+      # path's segments. Semgrep does not resolve `use axum::extract::Path`,
+      # so the qualified and the imported spelling are named separately.
+      # A single-segment path binds whatever it is called (a user id read
+      # out of `state.rooms` is as much a leak); a tuple binds the segment
+      # whose name says it is the room. Each tuple position carries its own
+      # name check: semgrep keeps one binding per matched span, so a shared
+      # check after the alternatives would only ever see the first segment.
+      - pattern-either:
+          - pattern-inside: |
+              async fn $HANDLER(..., axum::extract::Path($ROOM): axum::extract::Path<String>, ...) -> $RET {
+                ...
+              }
+          - pattern-inside: |
+              async fn $HANDLER(..., Path($ROOM): Path<String>, ...) -> $RET {
+                ...
+              }
+          - patterns:
+              - pattern-either:
+                  - pattern-inside: |
+                      async fn $HANDLER(..., axum::extract::Path(($ROOM, $SECOND)): $PATH, ...) -> $RET {
+                        ...
+                      }
+                  - pattern-inside: |
+                      async fn $HANDLER(..., axum::extract::Path(($ROOM, $SECOND, $THIRD)): $PATH, ...) -> $RET {
+                        ...
+                      }
+                  - pattern-inside: |
+                      async fn $HANDLER(..., Path(($ROOM, $SECOND)): $PATH, ...) -> $RET {
+                        ...
+                      }
+                  - pattern-inside: |
+                      async fn $HANDLER(..., Path(($ROOM, $SECOND, $THIRD)): $PATH, ...) -> $RET {
+                        ...
+                      }
+              - metavariable-regex:
+                  metavariable: $ROOM
+                  regex: room
+          - patterns:
+              - pattern-either:
+                  - pattern-inside: |
+                      async fn $HANDLER(..., axum::extract::Path(($FIRST, $ROOM)): $PATH, ...) -> $RET {
+                        ...
+                      }
+                  - pattern-inside: |
+                      async fn $HANDLER(..., axum::extract::Path(($FIRST, $ROOM, $THIRD)): $PATH, ...) -> $RET {
+                        ...
+                      }
+                  - pattern-inside: |
+                      async fn $HANDLER(..., Path(($FIRST, $ROOM)): $PATH, ...) -> $RET {
+                        ...
+                      }
+                  - pattern-inside: |
+                      async fn $HANDLER(..., Path(($FIRST, $ROOM, $THIRD)): $PATH, ...) -> $RET {
+                        ...
+                      }
+              - metavariable-regex:
+                  metavariable: $ROOM
+                  regex: room
       # ... and reads that room.
       - pattern: $STATE.rooms.$METHOD(&$ROOM, ...)
       # Writes are out of scope: an append is authorised by the room's own
@@ -43,9 +124,15 @@ rules:
       # than this rule knows how to ask for. Named rather than allow-listing
       # reads, so a *new* read method is flagged by default -- a security
       # rule should fail loud on the thing it has not been taught.
+      #
+      # A verb is a whole word, ended by `_` or the name: matched as a bare
+      # prefix, `join` also swallowed `joined`, `joined_members` and
+      # `joined_member_ids`, and `invite` swallowed `invited` -- the member
+      # lists, the very reads this rule exists for, waved through as writes
+      # (#744). `purge_watermark` reads a row, whatever its verb says.
       - metavariable-regex:
           metavariable: $METHOD
-          regex: ^(?!set_|send|append|create|redact|invite|kick|ban|leave|join|upgrade|purge|delete|forget).*
+          regex: ^(purge_watermark|(?!(set|send|append|create|redact|invite|kick|ban|leave|join|upgrade|purge|delete|forget)(_|$)).*)$
       # The gates this codebase actually uses. Semgrep matches Rust
       # statements structurally rather than textually, so each spelling has
       # to be named; a new gate shape must be added here, which is the point
@@ -85,5 +172,101 @@ rules:
           async fn $HANDLER(...) -> $RET {
             ...
             let $READER = $STATE.rooms.reader(...).map_err(...)?;
+            ...
+          }
+      # `may_read_room` minus its error mapping: `rooms.may_read` is the
+      # check `may_read_room` wraps, and `/joined_members` calls it directly.
+      - pattern-not-inside: |
+          async fn $HANDLER(...) -> $RET {
+            ...
+            $STATE.rooms.may_read(...).map_err(...)?;
+            ...
+          }
+
+  # The same defect on the other door. A federation handler that has
+  # verified the X-Matrix signature knows which *server* is asking; it does
+  # not yet know that server has any business in the room. `/state`,
+  # `/backfill` and `/event` answer only a server with a member in the room
+  # (or a world-readable one), and `federation_room_origin` is the call
+  # that asks. `federation_origin` alone authenticates and stops there.
+  - id: federation-room-read-without-membership
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - crates/spindle-server/src/**/*.rs
+    message: >-
+      This federation handler authenticates the requesting server with
+      `federation_origin` and then reads the room without asking whether
+      that server is in it. A valid signature says which server is asking,
+      not what it may read. Authenticate with
+      `federation_room_origin(&state, &headers, method, &uri, body, &room_id)`
+      instead, which refuses a server with no member in the room.
+    patterns:
+      # A handler that authenticated a peer server, through the import or
+      # the qualified path (hub/ and the router wrappers spell it in full,
+      # and semgrep does not resolve one to the other) ...
+      - pattern-either:
+          - pattern-inside: |
+              async fn $HANDLER(...) -> $RET {
+                ...
+                <... federation_origin(...) ...>;
+                ...
+              }
+          - pattern-inside: |
+              async fn $HANDLER(...) -> $RET {
+                ...
+                <... crate::inbound::federation_origin(...) ...>;
+                ...
+              }
+      # ... and holds a room id: as the plain argument the inbound
+      # handlers take from their router wrappers, or straight off the path.
+      - pattern-either:
+          - pattern-inside: |
+              async fn $HANDLER(..., $ROOM: String, ...) -> $RET {
+                ...
+              }
+          - pattern-inside: |
+              async fn $HANDLER(..., axum::extract::Path($ROOM): axum::extract::Path<String>, ...) -> $RET {
+                ...
+              }
+          - pattern-inside: |
+              async fn $HANDLER(..., Path($ROOM): Path<String>, ...) -> $RET {
+                ...
+              }
+      - metavariable-regex:
+          metavariable: $ROOM
+          regex: room
+      - pattern: $STATE.rooms.$METHOD(&$ROOM, ...)
+      # The membership handshake is how a server with nobody in the room
+      # gets somebody in, so it cannot require membership first. What
+      # authorises it is stronger than a membership check: each handler
+      # insists the user is the origin's own, and the signed event it
+      # returns for is judged by the room's auth rules (join rules, bans)
+      # before anything is read back out. Named here, not suppressed at
+      # each line, so the exemption is one list a reviewer can read.
+      - metavariable-regex:
+          metavariable: $HANDLER
+          regex: ^(?!(make|send)_(join|leave|knock)(_common)?$)
+      - pattern-not-inside: |
+          async fn $HANDLER(...) -> $RET {
+            ...
+            <... federation_room_origin(...) ...>;
+            ...
+          }
+      - pattern-not-inside: |
+          async fn $HANDLER(...) -> $RET {
+            ...
+            <... crate::inbound::federation_room_origin(...) ...>;
+            ...
+          }
+      # The hub's submission door (hub/submit.rs): `admit` refuses an
+      # origin with no member in the room (`server_in_room`) before
+      # verifying the event, so a handler holding its answer has been
+      # through the membership check.
+      - pattern-not-inside: |
+          async fn $HANDLER(...) -> $RET {
+            ...
+            let $ADMITTED = admit(...).await?;
             ...
           }

@@ -143,6 +143,9 @@ async fn is_joined(
                     "server_name is not a server name",
                 ));
             }
+            // Answering for a room the caller is not in is this endpoint's
+            // purpose; the scope-or-admin check above is its gate.
+            // nosemgrep: room-read-without-authorization
             state
                 .rooms
                 .server_in_room(&room_id, &server_name)

@@ -2,7 +2,8 @@
 //!
 //! Present so the rule is held to both halves. A rule that fires on
 //! everything is as useless as one that fires on nothing, and only this
-//! file distinguishes "the gate works" from "the gate is stuck on".
+//! file distinguishes "the gate works" from "the gate is stuck on". Each
+//! `ok:` marker names a line the rule must stay quiet on.
 
 async fn room_messages(
     State(state): State<AppState>,
@@ -21,6 +22,7 @@ async fn room_messages(
         None => None,
     };
     let limit = query.limit.unwrap_or(10).min(100);
+    // ok: room-read-without-authorization
     let (events, next) = state
         .rooms
         .messages(&room_id, from, limit)
@@ -43,6 +45,7 @@ async fn room_messages_bounded(
         ReadScope::UpTo(bound) => Some(bound),
     };
     let limit = query.limit.unwrap_or(10).clamp(1, 100);
+    // ok: room-read-without-authorization
     let (events, next) = state
         .rooms
         .messages_within(&room_id, None, limit, bound)
@@ -63,6 +66,7 @@ async fn room_messages_reader(
         .rooms
         .reader(&identity.user_id, &room_id)
         .map_err(room_error)?;
+    // ok: room-read-without-authorization
     if state.rooms.has_open_gap(&room_id).unwrap_or(false) {
         state.backfill.poke(&room_id);
     }
