@@ -1,0 +1,132 @@
+name: Targeted sitting
+
+# Parity line 3's three cells no client-server sitting can measure (#647):
+# the 10,000-member federated join, catch-up after a partition, and
+# concurrent send, each with Synapse (on Postgres) and Tuwunel in the
+# subject's seat and one Spindle holding the far side of the federation
+# (scripts/federated-benchmark.py says how and why). Spindle is measured
+# as a subject by the same driver in the same rounds, so every ratio is
+# same host, same run.
+#
+# Runs on demand, and on a pull request that changes the harness, so a
+# change to how the cells are measured is measured before it merges. The
+# results arrive as an artifact; a person commits them with the sidecar
+# read, as the weekly sitting's do. The same command runs it locally:
+# `just bench-field`, `just bench-build`, `just bench-targeted <group>`.
+on:
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: rounds per subject (3 is the floor at which a call means anything)
+        default: "3"
+  pull_request:
+    paths:
+      - .github/workflows/targeted-sitting.yml
+      - scripts/federated-benchmark.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: targeted-sitting-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  BENCH_BIN: tmp/bench-bin
+  SYNAPSE_VENV: tmp/synvenv
+  BENCH_SRC: tmp/bench-src
+
+jobs:
+  sitting:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: |
+            . -> target
+            tmp/bench-src/tuwunel -> target
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.24"
+      - name: Tuwunel's RocksDB wants liburing
+        run: sudo apt-get install -y -qq liburing-dev
+      # The field at the weekly sitting's pins, from the same script, so the
+      # Tuwunel and Synapse measured here are the builds line 1 and 2 judge.
+      # Restored and saved explicitly: a post-job save is skipped when a
+      # later step fails, and the Tuwunel build is the slow half hour.
+      - name: The field, from cache
+        id: field
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        with:
+          path: |
+            tmp/bench-bin
+            tmp/synvenv
+          key: bench-field-${{ hashFiles('scripts/bench-field.sh') }}
+      - name: The field, at its pins
+        run: scripts/bench-field.sh
+      - name: Keep the field for the next run
+        if: steps.field.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        with:
+          path: |
+            tmp/bench-bin
+            tmp/synvenv
+          key: bench-field-${{ hashFiles('scripts/bench-field.sh') }}
+      - name: Spindle, release build
+        run: cargo build --release -p spindle-server --bin spindle
+      # Synapse where its own documentation puts it, as in the weekly sitting.
+      - name: Postgres, so Synapse is measured on its production database
+        run: |
+          docker run -d --name bench-pg -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench \
+            -p 127.0.0.1:5433:5432 postgres:16-alpine
+          # Over TCP: the image's first, socket-only life answers a socket
+          # check and then restarts (bench-sitting.yml, run 34042463777).
+          for _ in $(seq 1 60); do
+            docker exec bench-pg pg_isready -U bench -h 127.0.0.1 -q && break
+            sleep 1
+          done
+          docker exec bench-pg pg_isready -U bench -h 127.0.0.1
+          echo "BENCH_PG_URL=postgres://bench:bench@127.0.0.1:5433/postgres" >> "$GITHUB_ENV"
+      - name: The targeted sitting
+        env:
+          BENCH_RUNNER: github-actions/ubuntu-24.04 (shared runner)
+        run: |
+          group="targeted-$(date -u +%Y%m%d)"
+          echo "GROUP=$group" >> "$GITHUB_ENV"
+          python3 scripts/federated-benchmark.py --group "$group" \
+            --rounds "${{ inputs.rounds || '3' }}" --work tmp/fedbench --keep
+      - name: Keep the results and the server logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: targeted-sitting
+          path: |
+            docs/benchmarks/data/targeted-*.json
+            tmp/fedbench/**/*.log
+            tmp/fedbench/**/*.toml
+            tmp/fedbench/**/rig.yaml
+          if-no-files-found: ignore
+      - name: Render the page with the new group, as a check
+        run: python3 scripts/render-comparisons.py docs/benchmarks/data /tmp/comparisons.html
+      # Line 3 judged on the newest committed weekly sitting (which holds
+      # back-pagination and deep history) beside this one. A failed line is
+      # a result to publish, not a broken harness, so it is reported here
+      # and in the summary and does not fail the run: this workflow's job
+      # is the measurement. bench-sitting.yml is the one that gates.
+      - name: Judge line 3 with the targeted cells beside the weekly sitting
+        run: |
+          sitting=$(ls docs/benchmarks/data/ci-*.sitting.json | sort | tail -1 | xargs basename | cut -d. -f1)
+          set +e
+          python3 scripts/parity-gate.py docs/benchmarks/data "$sitting" "$GROUP" --markdown tmp/parity.md
+          status=$?
+          set -e
+          cat tmp/parity.md >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" != 0 ]; then
+            echo "::warning title=A parity line failed::$sitting + $GROUP: see the step summary; publish the loss with the numbers."
+          fi

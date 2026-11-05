@@ -78,10 +78,19 @@ bench-sitting group rounds="3":
 # The whole thing from a bare checkout.
 bench group rounds="3": bench-field bench-build (bench-sitting group rounds) bench-render (bench-gate group)
 
-# #42's three parity lines, judged on one committed sitting. Fails on a
-# separated loss; reports the workloads still unmeasured either way.
-bench-gate group:
-    python3 scripts/parity-gate.py docs/benchmarks/data {{group}}
+# Parity line 3's federated and concurrent cells (#647): one Spindle holds
+# the far side of the federation while Spindle, Synapse and Tuwunel take
+# turns as the subject. Needs bench-field and bench-build; uses Postgres
+# for Synapse when BENCH_PG_URL is set (`just bench-pg`).
+bench-targeted group rounds="3":
+    BENCH_BIN="{{bench_bin}}" SYNAPSE_VENV="{{synapse_venv}}" \
+      python3 scripts/federated-benchmark.py --group {{group}} --rounds {{rounds}}
+
+# #42's three parity lines, judged on one committed sitting and any
+# targeted sitting named beside it (`just bench-gate "ci-20261010 targeted-..."`).
+# Fails on a separated loss; reports the workloads still unmeasured either way.
+bench-gate groups:
+    python3 scripts/parity-gate.py docs/benchmarks/data {{groups}}
 
 # The site, from the committed results, into site/.
 bench-render:
