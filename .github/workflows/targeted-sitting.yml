@@ -18,7 +18,8 @@ on:
     inputs:
       rounds:
         description: rounds per subject (3 is the floor at which a call means anything; 5 is the honest default)
-        default: "5"
+        type: number
+        default: 5
   pull_request:
     paths:
       - .github/workflows/targeted-sitting.yml
@@ -88,7 +89,7 @@ jobs:
       - name: Postgres, so Synapse is measured on its production database
         run: |
           docker run -d --name bench-pg -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench \
-            -p 127.0.0.1:5433:5432 postgres:16-alpine
+            -p 127.0.0.1:5433:5432 postgres:16-alpine@sha256:e0e53cfa0884f3cc216a621033e4f38dceb49e52218ac77facc8e48f02973093
           # Over TCP: the image's first, socket-only life answers a socket
           # check and then restarts (bench-sitting.yml, run 34042463777).
           for _ in $(seq 1 60); do
@@ -100,14 +101,21 @@ jobs:
       - name: The targeted sitting
         env:
           BENCH_RUNNER: github-actions/ubuntu-24.04 (shared runner)
+          # Through the environment, not `${{ }}` in the script, so the
+          # dispatch input is data to bash and never source (#516). A pull
+          # request has no inputs, hence the default.
+          ROUNDS: ${{ inputs.rounds || '5' }}
         run: |
+          case $ROUNDS in
+            '' | *[!0-9]* | 0*) echo "::error::rounds must be a positive integer, not '$ROUNDS'"; exit 1 ;;
+          esac
           # Date and commit: the harness runs on every pull request that
           # changes it, so two runs in a day are expected, and each keeps
           # its own files rather than overwriting the other's.
           group="targeted-$(date -u +%Y%m%d)-$(git rev-parse --short=7 HEAD)"
           echo "GROUP=$group" >> "$GITHUB_ENV"
           python3 scripts/federated-benchmark.py --group "$group" \
-            --rounds "${{ inputs.rounds || '5' }}" --work tmp/fedbench --keep
+            --rounds "$ROUNDS" --work tmp/fedbench --keep
       - name: Keep the results and the server logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -128,7 +136,8 @@ jobs:
       # is the measurement. bench-sitting.yml is the one that gates.
       - name: Judge line 3 with the targeted cells beside the weekly sitting
         run: |
-          sitting=$(ls docs/benchmarks/data/ci-*.sitting.json | sort | tail -1 | xargs basename | cut -d. -f1)
+          sittings=(docs/benchmarks/data/ci-*.sitting.json)
+          sitting=$(printf '%s\n' "${sittings[@]}" | sort | tail -1 | xargs basename | cut -d. -f1)
           set +e
           python3 scripts/parity-gate.py docs/benchmarks/data "$sitting" "$GROUP" --markdown tmp/parity.md
           status=$?

@@ -53,7 +53,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
       - name: coredns
-        image: registry.k8s.io/coredns/coredns:v1.11.3
+        image: registry.k8s.io/coredns/coredns:v1.11.3@sha256:9caabbf6238b189a65d0d6e6ac138de60d6a1c419e5a341fbbb7c78382559c6e
         args: [-conf, /etc/coredns/Corefile]
         ports:
         - {name: dns, containerPort: 1053, protocol: UDP}

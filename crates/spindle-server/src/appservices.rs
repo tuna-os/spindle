@@ -210,6 +210,19 @@ impl Registration {
     }
 }
 
+/// How registration files are read: YAML 1.2, the way `serde_yaml` read them
+/// before it was replaced (#653). `serde-saphyr`'s defaults are looser in two
+/// places, and both would load files the old parser refused: it takes YAML
+/// 1.1's `yes`/`no`/`on`/`off` as booleans, so `exclusive: on` would start
+/// granting a namespace, and it expands `<<` merge keys, so fields could
+/// arrive from an anchor the old parser ignored.
+fn registration_yaml_options() -> serde_saphyr::Options {
+    serde_saphyr::options! {
+        strict_booleans: true,
+        merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
+    }
+}
+
 /// Check and normalise a registration's MSC4512 claim: both properties or
 /// neither, a prefix of whole path segments with no `.` or `..`, and a URL
 /// that is one.
@@ -295,8 +308,9 @@ impl Appservices {
         for path in paths {
             let raw = std::fs::read_to_string(path)
                 .map_err(|error| AppserviceError::Unreadable(path.clone(), error.to_string()))?;
-            let mut registration: Registration = serde_yaml::from_str(&raw)
-                .map_err(|error| AppserviceError::Invalid(path.clone(), error.to_string()))?;
+            let mut registration: Registration =
+                serde_saphyr::from_str_with_options(&raw, registration_yaml_options())
+                    .map_err(|error| AppserviceError::Invalid(path.clone(), error.to_string()))?;
             for namespace in registration
                 .namespaces
                 .users
@@ -1093,5 +1107,194 @@ mod tests {
         // registration never wrote down.
         assert!(!namespace.matches("@bot:serverextra"));
         assert!(!namespace.matches("x@bot:server"));
+    }
+
+    /// Load one registration through the same path startup takes.
+    fn load_one(yaml: &str) -> Result<Appservices, AppserviceError> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("registration.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        Appservices::load(&[path.display().to_string()])
+    }
+
+    fn parse_one(yaml: &str) -> Arc<Registration> {
+        let loaded = load_one(yaml).unwrap_or_else(|error| panic!("{error}\n{yaml}"));
+        Arc::clone(&loaded.all()[0])
+    }
+
+    // The YAML parser was swapped (serde_yaml was deprecated, #653). These
+    // files are the shapes bridges ship and operators write by hand, and
+    // every one of them parsed the same way before the swap; a parser that
+    // reads any of them differently changes which users a bridge may act
+    // as, so the fields are checked, not only the absence of an error.
+    #[test]
+    fn registration_files_bridges_ship_still_parse() {
+        // mautrix: plain-scalar regexes with escapes, four-space indent,
+        // and the unstable MSC names.
+        let mautrix = parse_one(
+            "id: whatsapp\n\
+             url: http://localhost:29318\n\
+             as_token: rCb2pV3aLq\n\
+             hs_token: 9QbjJdS0Wx\n\
+             sender_localpart: SH98XxA4xvgFtlbx1NxJm9VYW6q3BdYg\n\
+             rate_limited: false\n\
+             namespaces:\n\
+             \x20   users:\n\
+             \x20       - regex: ^@whatsappbot:example\\.com$\n\
+             \x20         exclusive: true\n\
+             \x20       - regex: ^@whatsapp_.*:example\\.com$\n\
+             \x20         exclusive: true\n\
+             de.sorunome.msc2409.push_ephemeral: true\n\
+             io.element.msc4190: true\n\
+             org.matrix.msc3202: true\n",
+        );
+        assert_eq!(mautrix.url.as_deref(), Some("http://localhost:29318"));
+        assert!(!mautrix.rate_limited);
+        assert!(mautrix.receive_ephemeral);
+        assert!(mautrix.device_management);
+        assert!(mautrix.receive_device_lists);
+        assert_eq!(
+            mautrix.namespaces.users[1].regex,
+            "^@whatsapp_.*:example\\.com$"
+        );
+        assert!(mautrix.may_masquerade_as("@whatsapp_123:example.com", "example.com"));
+        assert!(!mautrix.may_masquerade_as("@whatsapp_123:example.org", "example.com"));
+
+        // The Synapse documentation's template: comments, keys this server
+        // does not read (`protocols`, `group_id`), empty flow sequences,
+        // a document marker, and a quoted regex.
+        let synapse = parse_one(
+            "---\n\
+             # The registration Synapse's docs print.\n\
+             id: \"irc\"\n\
+             url: \"http://127.0.0.1:9999\"\n\
+             as_token: \"30c05ae90a248a4188e620216fa72e349803310ec83e2a77b34fe90be6081f46\"\n\
+             hs_token: \"312df522183efd404ec1cd22d2ffa4bbc76a8c1ccf541dd692eef281356bb74e\"\n\
+             sender_localpart: \"_irc_bot\"  # the bot's localpart\n\
+             protocols: [\"irc\"]\n\
+             namespaces:\n\
+             \x20 users:\n\
+             \x20   - exclusive: true\n\
+             \x20     regex: \"@_irc_bridge_.*\"\n\
+             \x20     group_id: \"+irc:example.org\"\n\
+             \x20 aliases:\n\
+             \x20   - exclusive: false\n\
+             \x20     regex: \"#_irc_bridge_.*\"\n\
+             \x20 rooms: []\n",
+        );
+        assert_eq!(synapse.id, "irc");
+        assert_eq!(synapse.sender_localpart, "_irc_bot");
+        assert!(synapse.rate_limited, "the spec's default: rate-limited");
+        assert!(!synapse.receive_ephemeral);
+        assert!(synapse.namespaces.users[0].exclusive);
+        assert!(!synapse.namespaces.aliases[0].exclusive);
+        assert!(synapse.namespaces.rooms.is_empty());
+
+        // heisenbridge and hand-written files: a single-quoted regex, an
+        // explicit `~` URL, no namespaces at all, and the stable names.
+        let heisenbridge = parse_one(
+            "id: heisenbridge\n\
+             url: ~\n\
+             as_token: 'abc'\n\
+             hs_token: 'def'\n\
+             sender_localpart: heisenbridge\n\
+             receive_ephemeral: true\n\
+             device_management: false\n",
+        );
+        assert_eq!(heisenbridge.url, None);
+        assert!(heisenbridge.receive_ephemeral);
+        assert!(heisenbridge.namespaces.users.is_empty());
+        let quoted = parse_one(
+            "id: q\nas_token: a\nhs_token: h\nsender_localpart: q\n\
+             namespaces: {users: [{regex: '@q_.*:example\\.org', exclusive: true}]}\n",
+        );
+        assert_eq!(quoted.namespaces.users[0].regex, "@q_.*:example\\.org");
+
+        // lk-jwt-service and MSC4512 proxies, under the unstable names, with
+        // an anchor and alias in the namespace list.
+        let proxy = parse_one(
+            "id: lk\n\
+             as_token: lk_as\n\
+             hs_token: lk_hs\n\
+             sender_localpart: lk\n\
+             io.element.msc4502.scopes:\n\
+             \x20 - urn:matrix:client:io.element.msc4502:rooms:is_joined\n\
+             io.element.msc4512.proxy_prefix: /_matrix/client/unstable/lk/\n\
+             io.element.msc4512.proxy_url: https://lk.example.org/\n\
+             namespaces:\n\
+             \x20 users:\n\
+             \x20   - &lk {exclusive: true, regex: '@lk:example\\.org'}\n\
+             \x20 aliases:\n\
+             \x20   - *lk\n",
+        );
+        assert!(proxy.may_look_up_membership());
+        assert_eq!(
+            proxy.proxy(),
+            Some(("_matrix/client/unstable/lk", "https://lk.example.org"))
+        );
+        assert_eq!(proxy.namespaces.aliases[0].regex, "@lk:example\\.org");
+
+        // A token that YAML would read as a number is still the string the
+        // operator wrote, as it was before.
+        let numeric = parse_one("id: n\nas_token: 12345\nhs_token: 0x1F\nsender_localpart: n\n");
+        assert_eq!(numeric.as_token, "12345");
+        assert_eq!(numeric.hs_token, "0x1F");
+
+        // A flow sequence whose entries sit left of their key, which libyaml
+        // never minded and hand-edited files do contain.
+        let flow = parse_one(
+            "id: f\nas_token: a\nhs_token: h\nsender_localpart: f\n\
+             namespaces:\n  users: [\n{regex: '@f_.*', exclusive: true}\n  ]\n",
+        );
+        assert_eq!(flow.namespaces.users[0].regex, "@f_.*");
+    }
+
+    // The other half of keeping the surface: what failed to load before the
+    // swap still fails, so a file that was refused at startup cannot start
+    // being read as something its author did not write.
+    #[test]
+    fn registration_files_that_never_parsed_still_refuse_to_load() {
+        let base = "id: x\nas_token: a\nhs_token: h\nsender_localpart: x\n";
+        let refused = [
+            ("an empty file", String::new()),
+            (
+                "a missing as_token",
+                "id: x\nhs_token: h\nsender_localpart: x\n".to_owned(),
+            ),
+            (
+                "a sequence for a token",
+                "id: x\nas_token: [a]\nhs_token: h\nsender_localpart: x\n".to_owned(),
+            ),
+            ("a duplicate key", format!("{base}as_token: b\n")),
+            (
+                "YAML 1.1's `yes` for a boolean",
+                format!("{base}rate_limited: yes\n"),
+            ),
+            (
+                "YAML 1.1's `on` for exclusive",
+                format!("{base}namespaces:\n  users:\n    - {{regex: '@x_.*', exclusive: on}}\n"),
+            ),
+            (
+                "a token only a `<<` merge key would supply",
+                "defaults: &defaults {hs_token: h}\nid: x\nas_token: a\nsender_localpart: x\n\
+                 <<: *defaults\n"
+                    .to_owned(),
+            ),
+            ("two documents", format!("{base}---\n{base}")),
+            (
+                "a tab for indentation",
+                format!("{base}namespaces:\n\tusers: []\n"),
+            ),
+            (
+                "an unclosed flow sequence",
+                "id: x\nas_token: [not, a, string".to_owned(),
+            ),
+        ];
+        for (what, yaml) in refused {
+            assert!(
+                matches!(load_one(&yaml), Err(AppserviceError::Invalid(..))),
+                "{what} must not load:\n{yaml}"
+            );
+        }
     }
 }

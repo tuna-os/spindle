@@ -9,10 +9,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Read-only by default. Only the deploy job can write Pages (#521): the
+# measuring job runs `cargo bench` over every dependency's build script,
+# and none of that needs a token that can publish the site.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 # One publish at a time, and never cancel one half-done: a partially deployed
 # result set reads as "everything got fast".
@@ -80,6 +81,11 @@ jobs:
     if: github.ref == 'refs/heads/main'
     needs: measure
     runs-on: ubuntu-24.04
+    # deploy-pages publishes the artifact and proves who it is with an
+    # OIDC token; that is all this job does.
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}

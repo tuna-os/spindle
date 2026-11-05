@@ -62,21 +62,40 @@ updates:
       actions:
         patterns: ["*"]
 
-  # The Complement image. It pins a base image by tag, and nothing was
-  # watching it -- the conformance suite builds and runs against whatever
-  # that tag resolves to on the day CI happens to run.
+  # The two Dockerfiles: the runtime image at the root, which release.yml
+  # publishes, and the Complement image the conformance suite runs. Both
+  # pin their bases as `tag@sha256:digest` (#652, #687); Dependabot moves
+  # the tag and the digest together, and a new digest for the same tag
+  # arrives as an update too. One entry and `group-by` so a base bump lands
+  # in both files in one pull request: conformance has to test the
+  # compiler and runtime a release ships, never the one before.
   - package-ecosystem: docker
-    directory: /complement
+    directories: ["/", "/complement"]
     schedule:
       interval: weekly
     open-pull-requests-limit: 3
+    groups:
+      base-images:
+        patterns: ["*"]
+        group-by: dependency-name
 
-  # The runtime image at the root, which release.yml publishes.
+  # The Kubernetes rigs under scripts/. Their versions are chosen, not
+  # current: Synapse and MAS match the deployment a rehearsal copies, so a
+  # version bump is a decision for whoever runs the rig. Only the digest
+  # is kept fresh, for rebuilds of the same tag (security fixes in the
+  # base layers, mostly).
   - package-ecosystem: docker
-    directory: /
+    directories:
+      - /scripts/federation-drill/k8s
+      - /scripts/migration-e2ee-rig/k8s
+      - /scripts/migration-mas-rig/k8s
+      - /scripts/synapse-full-import
     schedule:
       interval: weekly
     open-pull-requests-limit: 3
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
 
   # The mautrix bridge harness under evidence/. Small, but it is a Go module
   # with its own lockfile, and "nothing updates it" was the finding that

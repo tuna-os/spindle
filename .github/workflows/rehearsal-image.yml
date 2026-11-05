@@ -11,9 +11,10 @@ on:
   push:
     branches: [m5/live-synapse-rehearsal-2]
 
+# Read-only by default; the jobs that push to the registry ask for it
+# themselves (#521).
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: rehearsal-image-${{ github.ref }}
@@ -24,6 +25,9 @@ jobs:
     name: Rehearsal image for ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
     strategy:
       matrix:
         include:
@@ -33,12 +37,18 @@ jobs:
             arch: arm64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Expressions stay out of `run:` (#516): the token and the arch reach
+      # the scripts as environment variables, as data rather than source.
       - name: Log in to the registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
       - name: Build and push the per-architecture image
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           tag="rehearsal-${GITHUB_SHA::7}"
-          image="ghcr.io/${GITHUB_REPOSITORY,,}:${tag}-${{ matrix.arch }}"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${tag}-${ARCH}"
           docker build --build-arg FEATURES=synapse-import -t "$image" .
           docker run --rm --entrypoint /usr/local/bin/spindle "$image" \
             import-synapse-rehearsal 2>&1 | tee usage.txt || true
@@ -53,9 +63,13 @@ jobs:
     needs: image
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      packages: write
     steps:
       - name: Log in to the registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
       - name: Push the multi-architecture tag
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY,,}"

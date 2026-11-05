@@ -41,7 +41,7 @@ generated and hand-copied things honest:
 ```sh
 python3 scripts/coverage-dashboard.py --check   # docs/dashboard.md matches the router
 python3 scripts/readme-numbers.py --check       # the README's headline numbers are the gated ones
-python3 scripts/actions-pinned.py               # every action is pinned to a commit
+python3 scripts/actions-pinned.py               # actions and images are pinned; workflows grant the least
 ```
 
 Pull requests also run the Complement protected subset
