@@ -162,6 +162,12 @@ jobs:
       - name: Check the parity gate
         run: python3 scripts/parity-gate-test.py
 
+      # The targeted sitting's partition is a TLS front that must break
+      # established flows, not only refuse new ones; a leak there turns the
+      # catch-up cell into a page read (#647).
+      - name: Check the federated benchmark's partition front
+        run: python3 scripts/federated-benchmark-test.py
+
       # The ESS driver owns the one-writer cutover boundary. Its fake API
       # exercises conflicts and failed convergence without cluster credentials.
       - name: Check the ESS/Kubernetes operation driver

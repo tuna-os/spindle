@@ -103,6 +103,68 @@ def test_unmeasured_workloads_are_named_every_time():
     assert "10,000-member" in missing and "catch-up" in missing and "concurrent" in missing
 
 
+# A targeted sitting's operations, at the sizes federated-benchmark.py
+# measures them: members joined, events missed, clients writing.
+TARGETED_CELLS = [
+    ("federated_join", 1000),
+    ("federated_join", 10000),
+    ("partition_catchup", 200),
+    ("send_throughput", 8),
+]
+
+
+def with_targeted(table: dict, rivals: dict[str, float], overrides=None) -> dict:
+    overrides = overrides or {}
+    for operation, size in TARGETED_CELLS:
+        servers = {"spindle": [0.98e9, 1.0e9, 1.02e9]}
+        for rival, factor in rivals.items():
+            f = overrides.get((rival, operation), factor)
+            servers[rival] = [0.98e9 * f, 1.0e9 * f, 1.02e9 * f]
+        table[(operation, size)] = servers
+    return table
+
+
+def test_material_wins_on_every_targeted_workload_pass_line_three():
+    table = with_targeted(cells({"synapse": 5, "tuwunel": 2}), {"synapse": 5, "tuwunel": 2})
+    assert statuses(table) == ["pass", "pass", "pass"]
+
+
+def test_a_targeted_win_that_is_not_material_fails_line_three():
+    table = with_targeted(
+        cells({"synapse": 5, "tuwunel": 2}),
+        {"synapse": 5, "tuwunel": 2},
+        {("tuwunel", "partition_catchup"): 1.1},
+    )
+    result = dict(gate.evaluate(table))
+    assert result[gate.LINES[2][0]]["status"] == "fail"
+    assert any(
+        item.startswith("partition_catchup/200 vs tuwunel")
+        for item in result[gate.LINES[2][0]]["failures"]
+    )
+
+
+def test_a_targeted_workload_without_a_named_rival_is_incomplete():
+    # Beating Synapse alone on concurrent send was the record before #647;
+    # it is not the line, which names Tuwunel too.
+    table = with_targeted(cells({"synapse": 5, "tuwunel": 2}), {"synapse": 5})
+    result = dict(gate.evaluate(table))
+    assert result[gate.LINES[2][0]]["status"] == "incomplete"
+    assert any("no tuwunel side" in item for item in result[gate.LINES[2][0]]["missing"])
+
+
+def test_targeted_cells_are_held_out_of_line_two():
+    # A targeted loss to Tuwunel inside line 2's allowance is still a line 3
+    # failure, and line 2 never sees it.
+    table = with_targeted(
+        cells({"synapse": 5, "tuwunel": 2}),
+        {"synapse": 5, "tuwunel": 2},
+        {("tuwunel", "federated_join"): 0.9},
+    )
+    result = dict(gate.evaluate(table))
+    assert result[gate.LINES[1][0]]["status"] == "pass"
+    assert result[gate.LINES[2][0]]["status"] == "fail"
+
+
 def run(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args], capture_output=True, text=True, check=False
@@ -141,10 +203,74 @@ def test_a_failing_sitting_exits_non_zero_and_writes_the_report():
         assert "**fail**" in report.read_text()
 
 
+def write_group(directory: Path, group: str, dimension: str, cells_by_server: dict) -> None:
+    for server, operations in cells_by_server.items():
+        for round_ in (1, 2, 3):
+            (directory / f"{group}.{server}.r{round_}.json").write_text(
+                json.dumps(
+                    {
+                        "server": server,
+                        "dimension": dimension,
+                        "benchmarks": {
+                            key: {"mean_ns": value * (1 + round_ / 100)}
+                            for key, value in operations.items()
+                        },
+                    }
+                )
+            )
+
+
+def test_a_targeted_group_is_judged_beside_the_sitting():
+    sitting_cells = {"send/200": 1e6, "messages_page/200": 1e6, "context_deep/200": 1e6}
+    targeted_cells = {
+        "federated_join/10000": 1e9,
+        "partition_catchup/200": 1e9,
+        "send_throughput/8": 1e6,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        write_group(
+            tmp,
+            "g",
+            "events",
+            {
+                server: {key: value * factor for key, value in sitting_cells.items()}
+                for server, factor in (("spindle", 1), ("synapse", 5), ("tuwunel", 2))
+            },
+        )
+        write_group(
+            tmp,
+            "t",
+            "targeted",
+            {
+                server: {key: value * factor for key, value in targeted_cells.items()}
+                for server, factor in (("spindle", 1), ("synapse", 5), ("tuwunel", 2))
+            },
+        )
+        alone = run(str(tmp), "g")
+        assert alone.returncode == 0, alone.stderr
+        assert "`federated_join` absent" in alone.stdout
+        beside = run(str(tmp), "g", "t", "--require-complete")
+        assert beside.returncode == 0, beside.stdout + beside.stderr
+        assert "| 3. Materially faster (>= 1.38x, separated) where targeted | **pass** | 10 |" in beside.stdout
+
+
+def test_a_cell_measured_in_two_groups_is_refused():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for group in ("g", "h"):
+            write_group(tmp, group, "events", {"spindle": {"send/200": 1e6}, "synapse": {"send/200": 5e6}})
+        proc = run(str(tmp), "g", "h")
+        assert proc.returncode != 0
+        assert "send/200 is in both g and h" in proc.stderr
+
+
 def test_a_throughput_group_is_refused():
+    # The concurrency dimension's mean_ns is a per-request latency under
+    # load, not a throughput; the targeted sitting records the throughput.
     proc = run(str(DATA), "concurrency")
     assert proc.returncode != 0
-    assert "latency" in proc.stderr
+    assert "measures concurrency" in proc.stderr
 
 
 def main() -> int:
