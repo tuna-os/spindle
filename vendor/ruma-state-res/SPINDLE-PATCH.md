@@ -10,8 +10,8 @@ Upstream: https://github.com/ruma/ruma. License: MIT; see LICENSE.
 
 Upstream commit: `13e95d7c5857928331d241290f112a4595ff268b`
 
-That is the commit the crate's `.cargo_vcs_info.json` names: 0.18.0 was
-packaged from ruma's `crates/ruma-state-res` at it.
+The crate's `.cargo_vcs_info.json` names this commit: ruma made the 0.18.0
+package from `crates/ruma-state-res` at it.
 
 The extension adds `resolve_with_candidate_policy`.
 Its predicate can skip a candidate during iterative auth checks.
@@ -40,17 +40,19 @@ cargo test --manifest-path vendor/ruma-state-res/Cargo.toml
 
 ## The patch surface
 
-ADR 0006 leaves this fork with no end date, so its size is held to the list
-below. `scripts/ruma-drift.py --check` runs in CI: it downloads the base
-crate, refuses it unless the checksum above matches, diffs it against this
-directory, and fails on any hunk or file the table does not list, or on a
-listed one that is gone. A hunk is named by its header and the first 16 hex
-digits of the sha256 of its lines, so editing one changes its row too.
+ADR 0006 gives this fork no end date, so the list below sets its size.
+`scripts/ruma-drift.py --check` runs in CI. It downloads the base crate and
+refuses it unless the checksum above matches.
 
-Growing the patch is therefore a reviewed edit to this table. Run
-`scripts/ruma-drift.py --hunks` for the rows as they stand; a row printed
-with an empty reason is new and needs one. The rebase onto a newer release
-is in docs/maintenance.md, "Rebasing vendor/ruma-state-res".
+It compares the crate with this directory. It fails on a hunk or file that
+the table does not list, and on a listed one that is gone. The script names
+a hunk by its header and the first 16 hex digits of the sha256 of its
+lines. An edit to a hunk thus changes its row too.
+
+A larger patch thus needs a reviewed edit to this table. Run
+`scripts/ruma-drift.py --hunks` for the current rows; a row with an empty
+reason is new and needs one. For the rebase onto a newer release, see
+docs/maintenance.md, "Rebase vendor/ruma-state-res".
 
 | File | Hunk | Digest | Why |
 |---|---|---|---|

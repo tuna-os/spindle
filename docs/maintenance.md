@@ -81,16 +81,19 @@ closed unmerged is one to stop planning for.
 main, so the size of the next release's work is known before the bump.
 
 **The vendored state resolver against upstream** (`ruma-drift.py
---upstream`). `vendor/ruma-state-res` is a patched copy of a release with
-no upstream path for the patch (ADR 0006), so Dependabot cannot see it and
-nothing else says when ruma fixes state resolution. The report diffs the
-newest crates.io release's `src/` against the vendored base's, hunk by
-hunk, and marks the files Spindle's patch also touches. A released change
-is *drift*: the report says so and the script exits 1 — rebase per §8.
-ruma's `main` is diffed the same way as a warning only; it moves daily, and
-an unreleased change can still change before it ships.
+--upstream`). `vendor/ruma-state-res` is a patched copy of a release. The
+patch has no upstream path (ADR 0006). Dependabot cannot see this copy, so
+no other job tells us about a ruma fix to state resolution.
 
-Nothing in the report is acted on automatically. Bumping a pin is §4.
+The report compares the `src/` of the newest crates.io release with the
+vendored base, hunk by hunk. It marks the files that Spindle's patch also changes.
+A released change is *drift*: the report says so and the script exits 1.
+Rebase per §8. The report also compares ruma's `main`, as a warning only:
+`main` moves daily, and an unreleased change can change again before
+release.
+
+The report does not start an action. A person decides; §4 tells how to
+bump a pin.
 
 ## 4. Bumping a pin
 
@@ -108,8 +111,8 @@ show what the bump changed. What to expect from each:
 Two pins are deliberately not automated: `rust-toolchain.toml` (the MSRV
 moves on its own decision, #193) and `ruma` (ADR-0002: the room-version,
 redaction and authorization rules are taken from ruma and a bump is read as
-a protocol change, not a dependency update). The vendored
-`ruma-state-res` is reported weekly but rebased by hand, §8.
+a protocol change, not a dependency update). The weekly report covers the
+vendored `ruma-state-res`, and a person rebases it by hand, §8.
 
 ## 5. Absorbing a spec release
 
@@ -174,7 +177,7 @@ list of the present.
   nothing but its own accuracy. Which of it to build is the roadmap's
   decision, made in an issue where the reasons are written down.
 
-## 8. Rebasing vendor/ruma-state-res
+## 8. Rebase vendor/ruma-state-res
 
 `vendor/ruma-state-res` is a release of ruma-state-res plus the hunks its
 `SPINDLE-PATCH.md` lists, each with the reason it exists (ADR 0006 says why
@@ -184,13 +187,12 @@ reviewed edit to the table. When the upkeep report says a release changed
 `src/`, the rebase is its own pull request:
 
 1. **Read the drift.** The report's hunks are upstream's change to state
-   resolution. A file marked "Spindle patches this file" is where the patch
-   will need carrying over by hand; read upstream's change to it first, in
-   case it already does what a hunk does. A hunk upstream made redundant
-   is dropped, not carried.
-2. **Rebase in git, not by eye.** Commit the old base, the vendored tree on
-   top of it, and the new release beside it, then let `git rebase` do the
-   three-way merge. From the repository root:
+   resolution. Read each file that the report marks "Spindle patches this
+   file" first. Upstream's change can make a hunk unnecessary. Drop that
+   hunk; do not carry it.
+2. **Rebase in git, not by eye.** Commit the old base. Commit the vendored
+   tree on top of it, and the new release beside it. Then let
+   `git rebase` do the three-way merge. From the repository root:
 
    ```sh
    repo=$PWD old=0.18.0 new=0.19.0   # the base, and the release the report names
@@ -209,9 +211,9 @@ reviewed edit to the table. When the upkeep report says a release changed
    git switch -q spindle && git rebase base   # a conflict is a hunk upstream touched
    ```
 
-   Resolve each conflict by the intent its table row states, not by line.
-   `Cargo.lock` conflicts are resolved by taking upstream's and letting the
-   test build in step 5 regenerate it. Then copy the result back:
+   Resolve each conflict by the intent of its table row, not by line.
+   For a `Cargo.lock` conflict, take upstream's file. The test build in
+   step 5 makes it again. Then copy the result back:
    `rm -rf "$repo/vendor/ruma-state-res" && mkdir "$repo/vendor/ruma-state-res"
    && git archive HEAD | tar x -C "$repo/vendor/ruma-state-res"`.
 3. **Record the new base.** In `SPINDLE-PATCH.md`: the version, the crate
@@ -219,13 +221,13 @@ reviewed edit to the table. When the upkeep report says a release changed
    `.cargo_vcs_info.json`. The vendored `Cargo.toml` carries the version,
    which is where the script reads it from.
 4. **Rewrite the table.** `ruma-drift.py --hunks` prints the rows for the
-   new tree, keeping each unchanged row's reason. A row it prints with an
-   empty reason moved or is new, and gets one. Then `ruma-drift.py --check`
-   passes and `--upstream` reports no drift.
-5. **Test.** Upstream's tests with the patch
-   (`cargo test --manifest-path vendor/ruma-state-res/Cargo.toml`), then
-   Spindle's state-resolution, imported-rejection and room-recovery tests,
-   which ADR 0006 names as the policy's gates, and `cargo update -p
-   ruma-state-res` so the workspace lock follows. The pull request's
-   description carries the report's drift section, so the reviewer reads
-   what upstream changed beside how the patch was carried over it.
+   new tree. It keeps the reason of each row that did not change. A row
+   with an empty reason moved or is new: write its reason. Then
+   `ruma-drift.py --check` passes and `--upstream` reports no drift.
+5. **Test.** Run upstream's tests with the patch
+   (`cargo test --manifest-path vendor/ruma-state-res/Cargo.toml`). Then
+   run Spindle's tests for state resolution, imported rejections and room
+   recovery, the gates ADR 0006 names. Then run
+   `cargo update -p ruma-state-res` to update the workspace lock.
+   Put the drift section of the report in the pull request description.
+   The reviewer then reads the upstream change next to the rebased patch.

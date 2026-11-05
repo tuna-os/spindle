@@ -365,7 +365,7 @@ def upstream_report(
     if surface(src(base), src(release_tree)):
         lines.append(
             f"**Drift:** upstream released state-resolution changes in {version}. Rebase the patch "
-            'onto it: docs/maintenance.md, "Rebasing vendor/ruma-state-res".'
+            'onto it: docs/maintenance.md, "Rebase vendor/ruma-state-res".'
         )
         return lines, 1
     lines.append("No drift: the newest release's `src/` is the vendored base's.")

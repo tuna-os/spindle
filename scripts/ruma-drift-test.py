@@ -26,6 +26,9 @@ import tempfile
 HERE = pathlib.Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("ruma_drift", HERE / "ruma-drift.py")
 drift = importlib.util.module_from_spec(spec)
+# @dataclass resolves its module through sys.modules on Python 3.12, so the
+# module must be registered before it runs or the class definition fails.
+sys.modules[spec.name] = drift
 spec.loader.exec_module(drift)
 
 UPSTREAM_SRC = "".join(f"fn upstream_{n}() {{}}\n" for n in range(40)).encode()
