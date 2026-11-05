@@ -170,6 +170,11 @@ pub struct DeliveryHealth {
     /// The outbox sequence number of the newest PDU the destination
     /// acknowledged, if it acknowledged any since this process started.
     pub last_successful_stream_ordering: Option<u64>,
+    /// Whether the last failed attempt got no HTTP answer at all: the name
+    /// did not resolve, the connection failed, or the peer said nothing in
+    /// time. A peer that answered with an error is reachable. False while
+    /// healthy.
+    pub unreachable: bool,
 }
 
 /// One trusted key server, and the keys its answers must carry if the
@@ -842,6 +847,24 @@ impl Federation {
             .clone()
     }
 
+    /// Whether the outbox is backing off from `destination` because its
+    /// last attempt got no answer at all. A request that must answer a
+    /// client soon -- a key query -- skips such a peer rather than spend
+    /// its whole deadline waiting on it (#723). A peer that answered with
+    /// an error is not counted: it is up, and may well answer a different
+    /// request.
+    #[must_use]
+    pub fn unreachable_backing_off(&self, destination: &str) -> bool {
+        self.delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(destination)
+            .is_some_and(|health| {
+                health.unreachable
+                    && health.retry_last_ts.saturating_add(health.retry_interval) > now_millis()
+            })
+    }
+
     /// Record that `destination` acknowledged a transaction. `last_seq` is
     /// the outbox sequence of the newest PDU in it, `None` for EDUs only.
     pub fn record_delivery_success(&self, destination: &str, last_seq: Option<u64>) {
@@ -853,6 +876,7 @@ impl Federation {
         health.retry_last_ts = 0;
         health.retry_interval = 0;
         health.failure_ts = None;
+        health.unreachable = false;
         if let Some(seq) = last_seq {
             health.last_successful_stream_ordering = Some(
                 health
@@ -862,9 +886,15 @@ impl Federation {
         }
     }
 
-    /// Record a failed attempt at `destination`, and how long the outbox
-    /// now waits before the next one.
-    pub fn record_delivery_failure(&self, destination: &str, retry_in: Duration) {
+    /// Record a failed attempt at `destination`, how long the outbox now
+    /// waits before the next one, and whether the peer gave no answer at
+    /// all (see [`DeliveryHealth::unreachable`]).
+    pub fn record_delivery_failure(
+        &self,
+        destination: &str,
+        retry_in: Duration,
+        unreachable: bool,
+    ) {
         let now = now_millis();
         let mut delivery = self
             .delivery
@@ -874,6 +904,7 @@ impl Federation {
         health.failure_ts.get_or_insert(now);
         health.retry_last_ts = now;
         health.retry_interval = u64::try_from(retry_in.as_millis()).unwrap_or(u64::MAX);
+        health.unreachable = unreachable;
     }
 
     /// Clear `destination`'s backoff so the outbox tries it on its next
@@ -889,6 +920,7 @@ impl Federation {
                 health.retry_last_ts = 0;
                 health.retry_interval = 0;
                 health.failure_ts = None;
+                health.unreachable = false;
                 true
             })
         };
@@ -2565,6 +2597,7 @@ impl Federation {
             &self.metrics,
         )
         .await
+        .1
     }
 
     /// Ask a room's policy server for a signature, stable first, then MSC4284.
@@ -2671,16 +2704,18 @@ struct PreparedTransaction {
 }
 
 /// Send one built transaction and read the peer's verdict, counting how it
-/// ended and how long it took.
+/// ended and how long it took. The [`TxnResult`](crate::metrics::TxnResult)
+/// comes back too: the outbox needs to know whether the peer answered at
+/// all.
 async fn deliver(
     prepared: PreparedTransaction,
     destination: &str,
     metrics: &crate::metrics::Metrics,
-) -> Result<(), FederationError> {
+) -> (crate::metrics::TxnResult, Result<(), FederationError>) {
     let started = Instant::now();
     let (result, outcome) = deliver_once(prepared, destination).await;
     metrics.observe_outbound_txn(result, started.elapsed());
-    outcome
+    (result, outcome)
 }
 
 async fn deliver_once(
@@ -2801,11 +2836,21 @@ pub async fn drain_outbox(
             request,
         } in transactions
         {
-            let sent = match request {
-                Ok(request) => deliver(request, &destination, &metrics).await,
+            // `unreachable`: the peer gave no answer at all. A request that
+            // could not be built never reached the network, so it says
+            // nothing about the peer.
+            let (unreachable, sent) = match request {
+                Ok(request) => {
+                    let (result, sent) = deliver(request, &destination, &metrics).await;
+                    let silent = matches!(
+                        result,
+                        crate::metrics::TxnResult::Error | crate::metrics::TxnResult::Timeout
+                    );
+                    (silent, sent)
+                }
                 Err(error) => {
                     metrics.observe_outbound_txn(crate::metrics::TxnResult::Error, Duration::ZERO);
-                    Err(error)
+                    (false, Err(error))
                 }
             };
             match sent {
@@ -2846,7 +2891,7 @@ pub async fn drain_outbox(
                         failures,
                         federation.peer_max_backoff(&destination),
                     );
-                    federation.record_delivery_failure(&destination, delay);
+                    federation.record_delivery_failure(&destination, delay, unreachable);
                     backoff.insert(destination, (failures, Instant::now() + delay));
                 }
             }

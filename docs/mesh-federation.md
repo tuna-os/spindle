@@ -181,7 +181,7 @@ over federation:
 | a peer asks for our users' device keys | `POST /_matrix/federation/v1/user/keys/query` | served |
 | a peer claims our users' one-time keys | `POST /_matrix/federation/v1/user/keys/claim` | served |
 | a peer wants a user's whole device list | `GET /_matrix/federation/v1/user/devices/{user}` | served |
-| our client asks for a remote user's keys | `/keys/query` and `/keys/claim` ask that user's server, one request per server, and keep the answer as a copy | the same, via the fork's `keys_query` client |
+| our client asks for a remote user's keys | `/keys/query` and `/keys/claim` send one request to each server, all at the same time, and keep the answer as a copy. They stop at the client's `timeout` (10 s if not given). A server that did not answer in time, or that the outbox could not reach recently, goes in `failures` | the same, via the fork's `keys_query` client |
 | a to-device message for a user elsewhere | one `m.direct_to_device` EDU per destination in the next transaction, named by the client's transaction so a retry does not deliver twice | the same |
 | a to-device message for a user here | delivered from the EDU to the device, or to every device for `*`, the sender checked against the origin | the same |
 | a device appears, changes or is deleted | `m.device_list_update` to every server sharing a room with the user, through the durable outbox, each naming the user's previous update as `prev_id`; on receipt an update that follows is applied as it stands, and one behind a lost update, or carrying no keys, re-fetches the whole list once | updates sent and received; the rig does not exercise the chain |
@@ -192,7 +192,9 @@ the claim that the server hands out once. It also pins to-device in both
 directions, with the `*` fan-out on the recipient's server. Last, it pins
 a device change that reaches the other room member as
 `device_lists.changed`. The rig runs the same six probes against the
-Neutrino node.
+Neutrino node. The suite also pins a request to two servers when one
+server never answers. The request stops at its `timeout`, it has the
+keys from the other server, and the silent server is in `failures`.
 
 `tests/e2ee_device_list_chain.rs` pins the chain. Each update names the
 previous update. A server applies a contiguous chain without a fetch.
