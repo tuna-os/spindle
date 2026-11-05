@@ -24,8 +24,8 @@
 #
 # Needs Docker, Go, Node with corepack, and Chrome (the GitHub runner image
 # ships it). Failing tests are data, not an error: this exits non-zero only
-# when the run produced no results at all, which means the rig, not the
-# server, is what broke.
+# when not one test passed, which means the rig, not the server, is what
+# broke.
 set -euo pipefail
 
 # Bump deliberately: what a newer suite asks of the server is what somebody
@@ -89,6 +89,29 @@ echo "complement-crypto: suite $COMPLEMENT_CRYPTO_REV, matrix-js-sdk $JS_SDK_VER
 cp -r "$CRYPTO_SRC/tests/logs" "$logs/" 2>/dev/null || true
 
 # Nothing is protected yet, so the check only reports: every passing test
-# is printed as a candidate, and an empty ledger -- the rig never ran a
-# test -- is the one outcome that fails.
+# is printed as a candidate, and an empty ledger fails.
 python3 scripts/complement-check.py "$results" --allowlist /dev/null
+
+# A ledger can be full and still say nothing. When Chrome could not start
+# its sandbox, every client aborted in its first second and every test
+# "failed" -- a run that looked like a report and measured only the runner.
+# A test that passed without skipping, a leaf with no subtests, is the
+# sign the clients really reached the servers; without one the run is
+# the rig's failure and is red.
+python3 - "$results" <<'PY'
+import json, sys
+outcomes = {}
+with open(sys.argv[1], encoding="utf-8") as ledger:
+    for line in ledger:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if record.get("Test") and record.get("Action") in {"pass", "fail", "skip"}:
+            outcomes[record["Test"]] = record["Action"]
+leaves = [test for test in outcomes if not any(other.startswith(test + "/") for other in outcomes)]
+passed = sum(outcomes[test] == "pass" for test in leaves)
+print(f"complement-crypto: {passed} of {len(leaves)} leaf tests passed")
+if not passed:
+    sys.exit("complement-crypto: no test passed; read the first failure, it is the rig")
+PY

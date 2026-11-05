@@ -528,16 +528,17 @@ jobs:
   # complement-crypto's matrix-js-sdk clients, in headless Chrome, against
   # two Spindles behind its mitmproxy -- key claims, to-device, device
   # lists over federation, backup, verification. Nightly and on demand,
-  # because it builds the SDK's browser bundle and runs for half an hour.
+  # because it builds the SDK's browser bundle and takes a quarter of an
+  # hour.
   #
   # Report-only: a failing test leaves the job green and names itself in
-  # the log and the ledger. Nothing here has passed on a recorded run yet,
-  # so there is no baseline a failure could be a regression from; gating
-  # on an unmeasured suite would make the nightly red for a known reason
-  # every night, which teaches everyone to stop reading it. Once a run has
-  # passed tests twice in a row they go into an allowlist and this becomes
-  # a ratchet like complement-suite's. What does fail the job is a run that
-  # produced no results at all: the rig broke, which is worth a red run.
+  # the log and the ledger. One recorded run (the probe for #744, 35 of 41
+  # tests that ran passed) is not a baseline, so a failure cannot yet be
+  # told from a regression, and gating on it would make the nightly red for
+  # a known reason every night, which teaches everyone to stop reading it.
+  # Tests that pass twice in a row go into an allowlist and this becomes a
+  # ratchet like complement-suite's. What does fail the job is a run in
+  # which nothing passed: the rig broke, which is worth a red run.
   complement-crypto:
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-24.04
@@ -563,6 +564,12 @@ jobs:
           tags: complement-spindle:latest
           load: true
           cache-from: type=gha,scope=complement-image
+      # Ubuntu 24.04's AppArmor refuses unprivileged user namespaces, which
+      # is Chrome's sandbox: a probe run of this job had every JS client abort
+      # with "No usable sandbox!" before a request was made. Lifted for
+      # this runner only, rather than running Chrome with --no-sandbox.
+      - name: Let headless Chrome start its sandbox
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Run complement-crypto against Spindle
         env:
           GOPROXY: https://proxy.golang.org|direct

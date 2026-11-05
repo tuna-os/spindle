@@ -149,9 +149,11 @@ matrix-rust-sdk tests against Spindle each night.
 
 The job only reports. When a test fails, the job stays green. The log and
 the `complement-crypto` artifact give the name of the test. The job fails
-only when the run gives no results, because then the rig has a fault.
+only when no test passes, because then the rig has a fault. In one probe
+run, Chrome could not start its sandbox, and all tests failed in the first
+second. The next probe run passed 35 of the 41 tests that ran.
 
-We do not have a baseline yet, so we cannot tell a new failure from an old
+One run is not a baseline, so we cannot yet tell a new failure from an old
 one. People ignore a nightly job that fails each night for a known reason.
 When tests pass on two consecutive runs, we put them in an allowlist. Then
 the job becomes a ratchet, as Complement is (§3.3). That is the first step to
