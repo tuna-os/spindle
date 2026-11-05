@@ -17,11 +17,13 @@ on:
     inputs:
       rounds:
         description: rounds per server (3 is the floor at which a call means anything)
-        default: "3"
+        type: number
+        default: 3
 
+# Nothing by default; the one job below asks for what it pushes and opens
+# (#521).
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: bench-sitting
@@ -37,6 +39,11 @@ jobs:
   sitting:
     runs-on: ubuntu-24.04
     timeout-minutes: 300
+    # It pushes the results to a `bench/` branch and opens the pull request
+    # that files them.
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
@@ -67,11 +74,15 @@ jobs:
       # Synapse's documentation puts SQLite down as a development database
       # and Postgres as the one to run; a comparison that used SQLite was a
       # floor for Synapse, not a measurement of it. One container, on
-      # loopback, and the sitting script does the rest.
+      # loopback, and the sitting script does the rest. The image is pinned
+      # by digest like the rest of the field (#652): a database that moved
+      # under a tag between two sittings would be a change in the numbers
+      # with no change in this repository. Bump it here, in
+      # targeted-sitting.yml and in the justfile's bench-pg together.
       - name: Postgres, so Synapse is measured where its own docs put it
         run: |
           docker run -d --name bench-pg -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench \
-            -p 127.0.0.1:5433:5432 postgres:16-alpine
+            -p 127.0.0.1:5433:5432 postgres:16-alpine@sha256:e0e53cfa0884f3cc216a621033e4f38dceb49e52218ac77facc8e48f02973093
           # Over TCP, not the socket: the image's entrypoint first runs a
           # throwaway server on the socket alone to initialise the cluster,
           # then stops it and starts the real one. A socket check answers
@@ -87,10 +98,18 @@ jobs:
       - name: The sitting
         env:
           BENCH_RUNNER: github-actions/ubuntu-24.04 (shared runner)
+          # Through the environment, never `${{ }}` in the script: an
+          # expression is pasted into the shell source before bash parses
+          # it, so a crafted dispatch input ran as code in a job that can
+          # push (#516). The schedule has no inputs, hence the default.
+          ROUNDS: ${{ inputs.rounds || '3' }}
         run: |
+          case $ROUNDS in
+            '' | *[!0-9]* | 0*) echo "::error::rounds must be a positive integer, not '$ROUNDS'"; exit 1 ;;
+          esac
           group="ci-$(date -u +%Y%m%d)"
           echo "GROUP=$group" >> "$GITHUB_ENV"
-          scripts/bench-sitting.sh --group "$group" --rounds "${{ inputs.rounds || '3' }}" --max-load 4
+          scripts/bench-sitting.sh --group "$group" --rounds "$ROUNDS" --max-load 4
       - name: Keep the results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -144,7 +163,7 @@ jobs:
           if ! gh pr create --title "Benchmark sitting $GROUP (shared runner)" \
             --body-file tmp/pr-body.md \
             --base main --head "$branch"; then
-            echo "::warning title=Sitting pushed, pull request not opened::The results are on branch $branch. Open the pull request by hand at https://github.com/${{ github.repository }}/compare/main...$branch, or allow GitHub Actions to create pull requests under Settings > Actions > General so the next sitting files its own."
+            echo "::warning title=Sitting pushed, pull request not opened::The results are on branch $branch. Open the pull request by hand at https://github.com/$GITHUB_REPOSITORY/compare/main...$branch, or allow GitHub Actions to create pull requests under Settings > Actions > General so the next sitting files its own."
           fi
       - name: The parity gate's verdict
         if: steps.parity.outputs.status != '0'

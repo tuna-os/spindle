@@ -49,11 +49,13 @@ render_deploy() { # template app server fed_host peer_ip data
 SPINDLE_IMAGE=${SPINDLE_IMAGE:-ghcr.io/tuna-os/spindle:rehearsal-35848ed}
 SPINDLE_BIN=${SPINDLE_BIN:-/usr/local/bin/spindle}
 
-# A throwaway pod on drill-b's node with the drill-b-data PVC at /d.
+# A throwaway pod on drill-b's node with the drill-b-data PVC at /d. The
+# image is pinned by digest: it mounts the drill's secrets.
+BUSYBOX_IMAGE=busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
 on_data() {
   $K delete pod drill-b-data-op --ignore-not-found --wait >/dev/null
-  $K run drill-b-data-op --rm -i --restart=Never --image=busybox:1.36 \
-    --overrides='{"spec":{"nodeSelector":{"kubernetes.io/hostname":"ip-10-20-1-11"},"automountServiceAccountToken":false,"securityContext":{"runAsUser":10093,"runAsGroup":10093,"fsGroup":10093},"volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"drill-b-data"}},{"name":"s","secret":{"secretName":"drill-b-secrets"}}],"containers":[{"name":"op","image":"busybox:1.36","command":["sh","-c","'"$1"'"],"volumeMounts":[{"name":"d","mountPath":"/d"},{"name":"s","mountPath":"/s"}]}]}}'
+  $K run drill-b-data-op --rm -i --restart=Never --image="$BUSYBOX_IMAGE" \
+    --overrides='{"spec":{"nodeSelector":{"kubernetes.io/hostname":"ip-10-20-1-11"},"automountServiceAccountToken":false,"securityContext":{"runAsUser":10093,"runAsGroup":10093,"fsGroup":10093},"volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"drill-b-data"}},{"name":"s","secret":{"secretName":"drill-b-secrets"}}],"containers":[{"name":"op","image":"'"$BUSYBOX_IMAGE"'","command":["sh","-c","'"$1"'"],"volumeMounts":[{"name":"d","mountPath":"/d"},{"name":"s","mountPath":"/s"}]}]}}'
 }
 
 front_cm() {

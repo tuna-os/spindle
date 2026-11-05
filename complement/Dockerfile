@@ -8,7 +8,10 @@
 # Build from the repository root:
 #   docker build -f complement/Dockerfile -t complement-spindle:latest .
 
-FROM rust:1.99-bookworm AS build
+# Pinned by digest, and to the same two bases as the release Dockerfile
+# (#652, #687), so conformance runs test the compiler and runtime a
+# release ships rather than whatever the tags point at that day.
+FROM rust:1.99-bookworm@sha256:7085845219c18e7c5b1f34ed9ce89b84f822f2e3d54a02774cedc996ac0f304f AS build
 WORKDIR /src
 
 # Cargo features to build with, e.g. `hub-mode` for the hub-mode interop job
@@ -64,7 +67,7 @@ COPY crates ./crates
 RUN find crates -name '*.rs' -exec touch {} + \
     && cargo build --release --locked --bin spindle ${SPINDLE_FEATURES:+--features "$SPINDLE_FEATURES"}
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 # 1 turns on `[federation.hub]` in the generated config; only meaningful in
 # an image built with SPINDLE_FEATURES=hub-mode, which any other refuses.

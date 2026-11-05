@@ -28,6 +28,7 @@ lint:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     ruff check scripts
     python3 scripts/actions-pinned.py
+    python3 scripts/actions-pinned-test.py
 
 test *ARGS:
     cargo test --workspace --all-features {{ARGS}}
@@ -54,7 +55,7 @@ bench-build:
 # says so. `just bench-pg-down` removes the container.
 bench-pg:
     docker run -d --name spindle-bench-pg -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench \
-      -p 127.0.0.1:5433:5432 postgres:16-alpine >/dev/null
+      -p 127.0.0.1:5433:5432 postgres:16-alpine@sha256:e0e53cfa0884f3cc216a621033e4f38dceb49e52218ac77facc8e48f02973093 >/dev/null
     @for _ in $(seq 1 30); do docker exec spindle-bench-pg pg_isready -U bench -q && break; sleep 1; done
     @echo 'export BENCH_PG_URL=postgres://bench:bench@127.0.0.1:5433/postgres'
 

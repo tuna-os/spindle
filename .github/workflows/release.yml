@@ -42,14 +42,11 @@ concurrency:
   group: release
   cancel-in-progress: false
 
+# Read-only by default. Each job below names the grants it uses and no
+# more (#599), so a compromised step in the build cannot push a tag and
+# the step that pushes the tag cannot sign anything.
 permissions:
-  contents: write
-  packages: write
-  # Sigstore signs the attestations with a short-lived certificate tied to
-  # this workflow's OIDC identity; `attestations` is where GitHub stores
-  # them so `gh attestation verify` can find them.
-  id-token: write
-  attestations: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -59,6 +56,10 @@ jobs:
     name: Decide the tag
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # Reads CI's check runs on the candidate commit, then pushes the tag.
+    permissions:
+      contents: write
+      checks: read
     outputs:
       tag: ${{ steps.decide.outputs.tag }}
       sha: ${{ steps.decide.outputs.sha }}
@@ -76,11 +77,14 @@ jobs:
         run: scripts/release-cut.sh
       - name: Tag
         if: github.event_name != 'push' && steps.decide.outputs.tag != '' && !inputs.dry_run
+        env:
+          TAG: ${{ steps.decide.outputs.tag }}
+          SHA: ${{ steps.decide.outputs.sha }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "${{ steps.decide.outputs.tag }}" -m "${{ steps.decide.outputs.tag }}: an addressable prerelease" "${{ steps.decide.outputs.sha }}"
-          git push origin "refs/tags/${{ steps.decide.outputs.tag }}"
+          git tag -a "$TAG" -m "$TAG: an addressable prerelease" "$SHA"
+          git push origin "refs/tags/$TAG"
 
   binaries:
     name: Build ${{ matrix.target }}
@@ -88,8 +92,16 @@ jobs:
     if: needs.cut.outputs.tag != '' && !inputs.dry_run
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
+    # Sigstore signs the attestations with a short-lived certificate tied
+    # to this workflow's OIDC identity; `attestations` is where GitHub
+    # stores them so `gh attestation verify` can find them.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     env:
       TAG: ${{ needs.cut.outputs.tag }}
+      TARGET: ${{ matrix.target }}
     strategy:
       matrix:
         include:
@@ -108,7 +120,7 @@ jobs:
         run: cargo build --release -p spindle-server --bin spindle --locked
       - name: Package
         run: |
-          name="spindle-${TAG}-${{ matrix.target }}"
+          name="spindle-${TAG}-${TARGET}"
           mkdir -p "dist/$name"
           cp target/release/spindle LICENSE-MIT LICENSE-APACHE README.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
@@ -148,8 +160,15 @@ jobs:
     if: needs.cut.outputs.tag != '' && !inputs.dry_run
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
+    # Pushes the image, and its attestation beside it in the registry.
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     env:
       TAG: ${{ needs.cut.outputs.tag }}
+      ARCH: ${{ matrix.arch }}
     strategy:
       matrix:
         include:
@@ -162,11 +181,13 @@ jobs:
         with:
           ref: ${{ needs.cut.outputs.sha }}
       - name: Log in to the registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
       - name: Build and push the per-architecture image
         id: push
         run: |
-          image="ghcr.io/${GITHUB_REPOSITORY,,}:${TAG}-${{ matrix.arch }}"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${TAG}-${ARCH}"
           docker build -t "$image" .
           docker push "$image"
           # The digest is the subject of the attestation: a tag can be moved,
@@ -187,6 +208,10 @@ jobs:
     needs: [cut, binaries, image]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    # Pushes the multi-architecture tag and creates the release.
+    permissions:
+      contents: write
+      packages: write
     env:
       TAG: ${{ needs.cut.outputs.tag }}
       SHA: ${{ needs.cut.outputs.sha }}
@@ -200,7 +225,9 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Log in to the registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
       - name: Join the per-architecture images under the tag
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY,,}"

@@ -236,7 +236,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
       - name: synapse
-        image: oci.element.io/synapse:v1.156.0
+        image: oci.element.io/synapse:v1.156.0@sha256:d2215c4a0e0bbd304489af228345b31d6857c1a228175471358d3fda187c0d91
         command: [python3, -m, synapse.app.homeserver, -c, /conf/homeserver.yaml, -c, /secrets/secrets.yaml]
         env:
         # libpq reads the database password from the environment, so the
@@ -260,7 +260,7 @@ spec:
         - {name: secrets, mountPath: /secrets, readOnly: true}
         - {name: media, mountPath: /media}
       - name: netwatch
-        image: oci.element.io/synapse:v1.156.0
+        image: oci.element.io/synapse:v1.156.0@sha256:d2215c4a0e0bbd304489af228345b31d6857c1a228175471358d3fda187c0d91
         command: [python3, -u, /conf/netwatch.py]
         env:
         - {name: ALLOWED_DB, value: "__PG_IP__:5432"}

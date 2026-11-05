@@ -206,6 +206,11 @@ jobs:
       # before our code does, in a job holding a token. This ran
       # `dtolnay/rust-toolchain@master` -- a mutable *branch* installing a
       # toolchain -- for its whole history. Pins drift back the moment nothing
-      # is watching, so the check ships with them.
-      - name: Check actions are pinned to commit SHAs
-        run: python3 scripts/actions-pinned.py
+      # is watching, so the check ships with them. The same script refuses
+      # an expression pasted into a `run:` script (#516), a write grant every
+      # job inherits (#521) and a container image named by tag alone (#652);
+      # its test holds each check to the case that made it.
+      - name: Check actions and images are pinned and workflows least-privileged
+        run: |
+          python3 scripts/actions-pinned.py
+          python3 scripts/actions-pinned-test.py

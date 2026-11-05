@@ -58,8 +58,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Appservice registration files are YAML by spec, and their namespaces are
 # anchored regular expressions — both formats arrive from the operator, not
-# the network.
-serde_yaml = "0.9"
+# the network. serde-saphyr rather than serde_yaml: that crate is deprecated
+# and parses through `unsafe-libyaml`, an unmaintained machine translation
+# of C (RUSTSEC-2024-0449, #653). This one is a maintained native Rust parser, and
+# only reading is needed, so only the deserializer is built.
+serde-saphyr = { version = "2.1", default-features = false, features = ["deserialize"] }
 regex = "1"
 tempfile = "3"
 # Tests only: the certificate a test server needs to bring up its TLS

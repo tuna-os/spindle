@@ -24,9 +24,9 @@ on:
     - cron: "23 4 * * 1"   # Mondays, 04:23 UTC, after the benchmark sitting
   workflow_dispatch:
 
+# Read-only by default; the job asks for the issue it writes (#521).
 permissions:
   contents: read
-  issues: write
 
 concurrency:
   group: upkeep
@@ -36,6 +36,10 @@ jobs:
   report:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # The report lands in the one `upkeep` issue, labelled on the way.
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Python dependencies
@@ -70,7 +74,7 @@ jobs:
       - name: Assemble the report
         run: |
           {
-            echo "_Written by the upkeep workflow on $(date -u +%Y-%m-%d) from run ${{ github.run_id }}. Edited in place each week; the history is in the run logs. The same report locally: \`just upkeep\`. How to act on it: [docs/maintenance.md](docs/maintenance.md)._"
+            echo "_Written by the upkeep workflow on $(date -u +%Y-%m-%d) from run ${GITHUB_RUN_ID}. Edited in place each week; the history is in the run logs. The same report locally: \`just upkeep\`. How to act on it: [docs/maintenance.md](docs/maintenance.md)._"
             echo
             echo "## Pins"
             echo
@@ -109,7 +113,7 @@ jobs:
           number=$(gh issue list --label upkeep --state open --json number --jq '.[0].number // empty')
           if [ -n "$number" ]; then
             gh issue edit "$number" --body-file tmp/upkeep/report.md
-            gh issue comment "$number" --body "Refreshed on $(date -u +%Y-%m-%d) by run ${{ github.run_id }}; the body above is the current report."
+            gh issue comment "$number" --body "Refreshed on $(date -u +%Y-%m-%d) by run ${GITHUB_RUN_ID}; the body above is the current report."
             echo "updated #$number"
           else
             gh issue create --title "Upkeep: what moved upstream" --label upkeep --body-file tmp/upkeep/report.md
