@@ -14,6 +14,7 @@ rules:
     paths:
       include:
         - crates/spindle-server/src/routes.rs
+        - crates/spindle-server/src/*_routes.rs
         - .semgrep/fixtures/*.rs
     message: >-
       This handler takes an authenticated caller and a room id, reads that
