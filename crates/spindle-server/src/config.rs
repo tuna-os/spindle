@@ -744,6 +744,19 @@ pub struct DelegatedAuthConfig {
     /// cannot manage accounts here.
     #[serde(default)]
     pub homeserver_secret: Option<String>,
+    /// How many seconds one introspection verdict is trusted before the
+    /// provider is asked again. This bounds only a revocation the provider
+    /// makes without telling this server: a logout, device deletion or
+    /// deactivation served here, or reported through `/_synapse/mas/*`,
+    /// ends the token at once. A verdict is never trusted past the token's
+    /// own `expires_in`. The default is Synapse's fixed two minutes; 0
+    /// asks the provider on every request.
+    #[serde(default = "default_introspection_cache_ttl_secs")]
+    pub introspection_cache_ttl_secs: u64,
+}
+
+const fn default_introspection_cache_ttl_secs() -> u64 {
+    120
 }
 
 impl DelegatedAuthConfig {

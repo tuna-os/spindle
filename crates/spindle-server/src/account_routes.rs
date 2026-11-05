@@ -604,25 +604,55 @@ fn register_appservice_user(
 /// `POST /_matrix/client/v3/logout`
 async fn logout(
     State(state): State<AppState>,
-    Authenticated(_identity): Authenticated,
+    Authenticated(identity): Authenticated,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<Value>, MatrixError> {
-    let token = headers
+    let token = bearer_token(&headers);
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    if introspected(&state, &accounts, token)? {
+        // The token is the provider's, and the provider may not hear of
+        // this logout. Dropping only the cached verdict would let the next
+        // introspection vouch for it again, so the logout ends the device,
+        // as the spec says a logout does and as MAS's own logout does
+        // through `delete_device` (#615).
+        crate::mas::remove_device(
+            &state,
+            &accounts,
+            &localpart_of(&identity.user_id),
+            &identity.device_id,
+            crate::mas::EndedBy::Server,
+        )?;
+        crate::mas::device_list_changed(&state, &identity.user_id);
+    } else {
+        accounts.logout(token).map_err(|error| internal(&error))?;
+    }
+    Ok(Json(json!({})))
+}
+
+/// The bearer token of a request the [`Authenticated`] extractor admitted.
+fn bearer_token(headers: &axum::http::HeaderMap) -> &str {
+    headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .unwrap_or_default()
         .trim()
-        .to_owned();
-    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
-    accounts.logout(&token).map_err(|error| internal(&error))?;
-    // Under delegation the token was vouched for by the provider and the
-    // verdict is cached; a logout that left it there would let the token
-    // keep working for the rest of the cache window (#615).
-    if let Some(delegated) = &state.delegated {
-        delegated.forget_token(&token);
-    }
-    Ok(Json(json!({})))
+}
+
+/// Whether `token` authenticated through the delegated provider's
+/// introspection rather than as a local session or an appservice.
+fn introspected(
+    state: &AppState,
+    accounts: &Accounts<'_, spindle_store::FjallStore>,
+    token: &str,
+) -> Result<bool, MatrixError> {
+    Ok(state.delegated.is_some()
+        && !token.is_empty()
+        && state.appservices.by_token(token).is_none()
+        && accounts
+            .identify(token)
+            .map_err(|error| internal(&error))?
+            .is_none())
 }
 
 /// `GET /_matrix/client/v3/account/whoami`
@@ -642,11 +672,34 @@ async fn whoami(AccountAuthenticated(identity): AccountAuthenticated) -> Json<Va
 async fn logout_all(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<Value>, MatrixError> {
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    let localpart = localpart_of(&identity.user_id);
+    // Asked before the local sessions go, or a local token would look like
+    // one only the provider knows.
+    let provider_session = introspected(&state, &accounts, bearer_token(&headers))?;
     accounts
-        .logout_everywhere(&localpart_of(&identity.user_id))
+        .logout_everywhere(&localpart)
         .map_err(|error| internal(&error))?;
+    if provider_session {
+        // Provider-vouched sessions have no local token to delete: ending
+        // their devices is what keeps the next introspection from vouching
+        // for them again (#615).
+        for device in accounts
+            .devices_of(&localpart)
+            .map_err(|error| internal(&error))?
+        {
+            crate::mas::remove_device(
+                &state,
+                &accounts,
+                &localpart,
+                &device.device_id,
+                crate::mas::EndedBy::Server,
+            )?;
+        }
+        crate::mas::device_list_changed(&state, &identity.user_id);
+    }
     if let Some(delegated) = &state.delegated {
         delegated.forget_user(&identity.user_id);
     }

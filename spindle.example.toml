@@ -326,6 +326,14 @@ registrations = []
 # `matrix_authentication_service` section does — so a MAS set up for that
 # (no client of its own for the homeserver) needs no change.
 # homeserver_secret = "..."
+#
+# How many seconds one introspection verdict is trusted before the provider
+# is asked again (default 120, Synapse's fixed window; 0 asks on every
+# request). It bounds only a revocation the provider makes without telling
+# this server: a logout, device deletion or deactivation served here, or
+# reported through /_synapse/mas/*, ends the token at once, and no verdict
+# outlives the token's own expires_in.
+# introspection_cache_ttl_secs = 120
 
 # Outgoing mail for the built-in provider (#608; needs builtin_oidc = true).
 # Entirely optional: without it, users recover a forgotten password with the

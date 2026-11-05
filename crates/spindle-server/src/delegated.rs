@@ -21,15 +21,6 @@ use crate::accounts::{Accounts, Identity};
 use crate::config::DelegatedAuthConfig;
 use crate::errors::MatrixError;
 
-/// How long one introspection verdict is trusted before the provider is
-/// asked again. This is the revocation lag only for a revocation this
-/// server is never told about: a logout it serves, and a device the
-/// provider deletes through `/_synapse/mas/delete_device`, evict the
-/// verdicts they end at once (#615), and a cached verdict whose device
-/// has gone is refused on sight, the check Synapse's `MasDelegatedAuth`
-/// makes for the same reason. Synapse ships the same two minutes.
-const INTROSPECTION_TTL: Duration = Duration::from_secs(120);
-
 /// The scope prefix MSC2967 uses to bind a token to one device.
 const DEVICE_SCOPE: &str = "urn:matrix:org.matrix.msc2967.client:device:";
 
@@ -44,11 +35,25 @@ struct Verdict {
     user_id: String,
     device_id: Option<String>,
     admin: bool,
+    /// The provider's `expires_in`: how long the token lives from the
+    /// moment it answered. A verdict is not cached past it, as Synapse's
+    /// `IntrospectionResponse::is_active` refuses a cached one past it.
+    expires_in: Option<Duration>,
 }
 
 /// The delegated provider, plus the caches that keep it off the hot path.
 pub struct Delegated {
     config: DelegatedAuthConfig,
+    /// How long one verdict is trusted before the provider is asked again
+    /// (`introspection_cache_ttl_secs`). This is the revocation lag only
+    /// for a revocation this server is never told about: a logout it
+    /// serves, a device or account it ends, and a device the provider
+    /// deletes through `/_synapse/mas/delete_device` evict the verdicts
+    /// they end at once (#615), and a cached verdict whose device has gone
+    /// is refused on sight, the check Synapse's `MasDelegatedAuth` makes
+    /// for the same reason. Synapse's cache is a fixed two minutes, the
+    /// default here.
+    ttl: Duration,
     client: reqwest::Client,
     /// Token-hash → verdict. Introspecting on every request would put
     /// the provider in every API call's latency; the hash keeps usable
@@ -69,6 +74,7 @@ impl Delegated {
     #[must_use]
     pub fn new(config: DelegatedAuthConfig) -> Self {
         Self {
+            ttl: Duration::from_secs(config.introspection_cache_ttl_secs),
             config,
             client: reqwest::Client::new(),
             verdicts: Mutex::new(HashMap::new()),
@@ -276,12 +282,17 @@ impl Delegated {
         let verdict = self
             .introspect(store, server_name, token, generation)
             .await?;
+        // Trusted for the configured window, and never past the token's
+        // own lifetime; a window of zero is not cached at all.
+        let lifetime = verdict
+            .expires_in
+            .map_or(self.ttl, |expires_in| expires_in.min(self.ttl));
         let mut verdicts = self
             .verdicts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.evictions.load(Ordering::SeqCst) == generation {
-            verdicts.insert(key, (verdict.clone(), Instant::now() + INTROSPECTION_TTL));
+        if !lifetime.is_zero() && self.evictions.load(Ordering::SeqCst) == generation {
+            verdicts.insert(key, (verdict.clone(), Instant::now() + lifetime));
         }
         Ok(verdict)
     }
@@ -356,33 +367,50 @@ impl Delegated {
             .to_lowercase();
 
         let accounts = Accounts::new(store, server_name);
-        let known = accounts
+        match accounts
             .account(&localpart)
             .map_err(|error| MatrixError::internal(&error.to_string()))?
-            .is_some();
-        if !known {
-            accounts
-                .register(&localpart, &crate::accounts::unguessable_password())
-                .map_err(|error| crate::routes::internal(&error))?;
+        {
+            // A deactivated account is refused whoever deactivated it: the
+            // admin API and `/account/deactivate` do not tell the provider,
+            // which may go on vouching for the user's sessions (#615).
+            Some(account) if account.deactivated => return Err(MatrixError::unknown_token()),
+            Some(_) => {}
+            None => {
+                accounts
+                    .register(&localpart, &crate::accounts::unguessable_password())
+                    .map_err(|error| crate::routes::internal(&error))?;
+            }
         }
         // The device row exists because the provider bound the token to
         // it — MSC3861's account/device mapping, written down so device
-        // lists and E2EE key uploads have something to hang off.
+        // lists and E2EE key uploads have something to hang off. Unless
+        // this server ended that device: then the provider vouches for a
+        // session that is over here, and the token is refused, as Synapse
+        // refuses a token whose device is gone (#615).
         if let Some(device_id) = &device_id
-            && self.evictions.load(Ordering::SeqCst) == generation
             && accounts
                 .device(&localpart, device_id)
                 .map_err(|error| MatrixError::internal(&error.to_string()))?
                 .is_none()
         {
-            accounts
-                .put_device(&localpart, device_id, None)
-                .map_err(|error| MatrixError::internal(&error.to_string()))?;
+            if accounts
+                .device_revoked(&localpart, device_id)
+                .map_err(|error| MatrixError::internal(&error.to_string()))?
+            {
+                return Err(MatrixError::unknown_token());
+            }
+            if self.evictions.load(Ordering::SeqCst) == generation {
+                accounts
+                    .put_device(&localpart, device_id, None)
+                    .map_err(|error| MatrixError::internal(&error.to_string()))?;
+            }
         }
         Ok(Verdict {
             user_id: accounts.user_id(&localpart),
             device_id,
             admin,
+            expires_in: verdict["expires_in"].as_u64().map(Duration::from_secs),
         })
     }
 }

@@ -26,7 +26,7 @@ With `[auth.delegated]` configured:
   (MSC2965) — this is how Element Web/X find the provider's login page.
 - Every bearer token that is not a local session or an appservice
   `as_token` is resolved by **token introspection** against the
-  provider, with the verdict cached for 120 seconds. The account and
+  provider, with the verdict cached for 120 seconds by default. The account and
   device are provisioned on first sight, bound to what the provider's
   scopes say (MSC2967), never to anything the client claims.
 - Tokens with `urn:synapse:admin:*` can use the admin API without a
@@ -55,12 +55,21 @@ With `[auth.delegated]` configured:
   registration (`m.login.application_service`): ghosts are the
   bridge's to mint, delegation or not.
 
-Two consequences worth knowing before you flip it on:
+Three consequences worth knowing before you flip it on:
 
-- **Revocation lags by at most 120 seconds.** A token the provider
-  revokes keeps working here until its cached introspection verdict
-  expires. That window is the price of not putting the provider in
-  every request's latency; Synapse ships the same order of magnitude.
+- **Revocation is immediate when Spindle knows of it.** A logout that
+  Spindle serves ends the token at once. So does an admin or client
+  call that ends the device or the account. So do the MAS calls
+  `delete_device`, `sync_devices` and `delete_user`. Spindle keeps a
+  record of a device that it ends. Thus a later introspection does not
+  make the device again, until MAS provisions it with `upsert_device`.
+- **Other revocations lag by at most 120 seconds.** MAS can revoke a
+  token and not tell Spindle. Then the token works until the cached
+  result of its introspection expires. Set the window with
+  `introspection_cache_ttl_secs`; 0 asks MAS on each request. Spindle
+  never trusts a result after the `expires_in` time that MAS gives
+  the token. Synapse has the same behavior, with a fixed window of two
+  minutes.
 - **Deactivation reserves the name forever.** `delete_user` kills every
   session and device but keeps the account row, because a released
   localpart would hand the old user's identity to whoever registers it
@@ -83,6 +92,9 @@ client_secret = "<introspection-secret>"
 # MAS cannot register users or manage devices here, so in practice
 # a MAS deployment always sets it.
 homeserver_secret = "<matrix-secret>"
+# Optional: how long a cached introspection result counts, in seconds.
+# This bounds only a revocation that MAS does not tell Spindle about.
+# introspection_cache_ttl_secs = 120
 ```
 
 ## MAS's side
