@@ -52,6 +52,13 @@ async fn hub_room_with(
     for (index, node) in others.iter().enumerate() {
         let (token, user) = node.register(&format!("user{index}")).await;
         node.join(&token, &room, hub).await;
+        // A remote join is a partial-state join (MSC3706) until its resync
+        // lands; the hub's handoff and failover judge the room's full
+        // membership, so every scenario here starts from a resynced room.
+        assert!(
+            eventually(20, async || !node.state.rooms.is_partial_state(&room)).await,
+            "{user}'s server resyncs the room's full state"
+        );
         // The join reaches every server already in the room before anyone
         // relies on it there.
         for server in std::iter::once(hub).chain(others[..=index].iter().copied()) {
