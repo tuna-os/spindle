@@ -501,6 +501,24 @@ pub enum Keyspace {
     /// became, for its sender only -- the same shape as
     /// [`Self::TransactionEcho`], and read at the same point.
     DelayEcho = 0x56,
+    /// `user_id` -> the `stream_id` of the newest `m.device_list_update`
+    /// this server minted for one of its own users (big-endian `u64`).
+    ///
+    /// The head of the user's device-list chain: the next update names it
+    /// as `prev_id`, and `GET /user/devices` serves it as `stream_id`, so a
+    /// peer that resynced from the snapshot recognises the next update as
+    /// following it. Unlike [`Self::DeviceListChange`] this is per user, not
+    /// a global stream position: two changes that share a sync position
+    /// (a batch device deletion) still need two links.
+    DeviceListOutbound = 0x5d,
+    /// `user_id` -> the newest device-list `stream_id` this server has
+    /// accounted for, for a user on another server (big-endian `u64`).
+    ///
+    /// An inbound update whose `prev_id` names something newer was preceded
+    /// by one that never arrived, and the user's device copy is refetched.
+    /// Left behind after a failed refetch, so the gap stays visible to the
+    /// next update rather than being papered over by it.
+    DeviceListInbound = 0x5e,
     /// `(room_id, epoch, li)` -> a hub's signed chain attestation for the
     /// entry it sequenced at `li` in that epoch (SPEC section 12.6, #22).
     /// Written only by a build with the `hub-mode` feature.
@@ -1432,6 +1450,18 @@ pub fn device_list_change_prefix() -> Vec<u8> {
 #[must_use]
 pub fn device_list_change(user_id: &str) -> Vec<u8> {
     user_prefix(Keyspace::DeviceListChange, user_id)
+}
+
+/// `user_id` key for [`Keyspace::DeviceListOutbound`].
+#[must_use]
+pub fn device_list_outbound(user_id: &str) -> Vec<u8> {
+    user_prefix(Keyspace::DeviceListOutbound, user_id)
+}
+
+/// `user_id` key for [`Keyspace::DeviceListInbound`].
+#[must_use]
+pub fn device_list_inbound(user_id: &str) -> Vec<u8> {
+    user_prefix(Keyspace::DeviceListInbound, user_id)
 }
 
 /// The user ID a [`Keyspace::DeviceListChange`] key names.

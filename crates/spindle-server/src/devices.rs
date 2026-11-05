@@ -6,7 +6,8 @@
 //! place the server could break E2EE is by losing or double-delivering the
 //! messages that carry session setup.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Weak};
 
 use serde_json::{Map, Value, json};
 use spindle_core::keys::{self, Keyspace};
@@ -15,12 +16,27 @@ use spindle_store::{FjallStore, ReadView, Store, StoreError};
 /// Key material and message queues, per device.
 pub struct Devices {
     store: Arc<FjallStore>,
+    /// Held from reading a local user's device-list head to queueing the
+    /// update that extends it. Two changes racing would otherwise both name
+    /// the same `prev_id`, or reach a peer's queue in the opposite order to
+    /// their ids, and the peer would see a gap that is not one and refetch.
+    chain: std::sync::Mutex<()>,
+    /// One turn per remote user whose device-list update is being applied,
+    /// held across the refetch a gap triggers. Updates that arrive while a
+    /// refetch is in flight wait for it and then find themselves covered by
+    /// the snapshot it stored, so concurrent gaps cost one refetch, not one
+    /// each. Weak, so a user nobody is updating holds no entry.
+    turns: std::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl Devices {
     #[must_use]
     pub fn new(store: Arc<FjallStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            chain: std::sync::Mutex::new(()),
+            turns: std::sync::Mutex::new(HashMap::new()),
+        }
     }
 
     /// Store a device's identity keys, replacing what was there.
@@ -426,6 +442,104 @@ impl Devices {
             &keys::device_list_change(user_id),
             &seq.to_be_bytes(),
         )
+    }
+
+    /// The `stream_id` of the newest device-list update for local `user_id`,
+    /// `0` before the first: what `GET /user/devices` serves, and what the
+    /// next update names as its `prev_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the read fails.
+    pub fn device_list_stream_id(&self, user_id: &str) -> Result<u64, StoreError> {
+        Ok(self
+            .read_u64(&keys::device_list_outbound(user_id))?
+            .unwrap_or(0))
+    }
+
+    /// Extend local `user_id`'s device-list chain by one link and hand the
+    /// new `stream_id` and the previous head (`None` before the first) to
+    /// `publish`, which runs while the chain is held so that what it queues
+    /// leaves in chain order.
+    ///
+    /// The id is at least `at_least`, the change's sync position, as well as
+    /// past the previous head: before the chain existed this server sent and
+    /// served sync positions as stream ids, and a peer still holding one of
+    /// those must not see the chain restart below it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the head cannot be read or written; nothing
+    /// is published then.
+    pub fn extend_device_list_chain<T>(
+        &self,
+        user_id: &str,
+        at_least: u64,
+        publish: impl FnOnce(u64, Option<u64>) -> T,
+    ) -> Result<T, StoreError> {
+        let _held = self
+            .chain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = keys::device_list_outbound(user_id);
+        let prev = self.read_u64(&key)?;
+        let stream_id = at_least.max(prev.map_or(1, |prev| prev.saturating_add(1)));
+        Store::put(self.store.as_ref(), &key, &stream_id.to_be_bytes())?;
+        Ok(publish(stream_id, prev))
+    }
+
+    /// The newest device-list `stream_id` accounted for remote `user_id`,
+    /// or `None` if this server has never tracked their list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the read fails.
+    pub fn remote_device_list_stream_id(&self, user_id: &str) -> Result<Option<u64>, StoreError> {
+        self.read_u64(&keys::device_list_inbound(user_id))
+    }
+
+    /// Record that remote `user_id`'s device list is accounted for up to
+    /// `stream_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the write fails.
+    pub fn set_remote_device_list_stream_id(
+        &self,
+        user_id: &str,
+        stream_id: u64,
+    ) -> Result<(), StoreError> {
+        Store::put(
+            self.store.as_ref(),
+            &keys::device_list_inbound(user_id),
+            &stream_id.to_be_bytes(),
+        )
+    }
+
+    /// Wait for, and take, the turn to apply device-list updates about
+    /// remote `user_id`; it is released when the guard drops.
+    pub async fn device_list_turn(&self, user_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let turn = {
+            let mut turns = self
+                .turns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            turns.retain(|_, turn| turn.strong_count() > 0);
+            if let Some(turn) = turns.get(user_id).and_then(Weak::upgrade) {
+                turn
+            } else {
+                let turn = Arc::new(tokio::sync::Mutex::new(()));
+                turns.insert(user_id.to_owned(), Arc::downgrade(&turn));
+                turn
+            }
+        };
+        turn.lock_owned().await
+    }
+
+    fn read_u64(&self, key: &[u8]) -> Result<Option<u64>, StoreError> {
+        Ok(ReadView::get(self.store.as_ref(), key)?
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes.get(..8)?).ok())
+            .map(u64::from_be_bytes))
     }
 
     /// Every user whose device list changed in `(since, until]`.

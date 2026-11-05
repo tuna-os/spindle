@@ -184,14 +184,17 @@ over federation:
 | our client asks for a remote user's keys | `/keys/query` and `/keys/claim` ask that user's server, one request per server, and keep the answer as a copy | the same, via the fork's `keys_query` client |
 | a to-device message for a user elsewhere | one `m.direct_to_device` EDU per destination in the next transaction, named by the client's transaction so a retry does not deliver twice | the same |
 | a to-device message for a user here | delivered from the EDU to the device, or to every device for `*`, the sender checked against the origin | the same |
-| a device appears, changes or is deleted | `m.device_list_update` to every server sharing a room with the user, through the durable outbox; on receipt the keys are stored, or the list re-fetched if the update carried none | the same |
+| a device appears, changes or is deleted | `m.device_list_update` to every server sharing a room with the user, through the durable outbox, each naming the user's previous update as `prev_id`; on receipt an update that follows is applied as it stands, and one behind a lost update, or carrying no keys, re-fetches the whole list once | updates sent and received; the rig does not exercise the chain |
 | cross-signing keys uploaded | `m.signing_key_update` to the same servers | not sent; stored if received |
 
 The two-Spindle suite `tests/e2ee_federation.rs` pins the directory, the
 claim handed out once, to-device both ways including the `*` fan-out
 resolved on the recipient's server, and a device change arriving as
 `device_lists.changed` on the server sharing a room. The rig runs the
-same six probes against the Neutrino node.
+same six probes against the Neutrino node. `tests/e2ee_device_list_chain.rs`
+pins the chain: each update names the last, a contiguous chain is applied
+without a fetch, a gap costs exactly one, and the served `stream_id` is the
+one the next update names.
 
 A note on what a gateway sees: ciphertext and keys, never plaintext.
 Which is the point of choosing federation over a bridge, and what makes
