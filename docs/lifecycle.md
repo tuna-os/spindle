@@ -28,6 +28,9 @@ The archive carries rows, **not media blobs**. Media lives outside the store
 file that inlined a terabyte of media would be a file nobody takes — but it
 means a restore is only half done when the rows are in.
 
+The command writes the rows from the snapshot to the file one at a time. Thus
+a backup needs memory for one row, not for the full store (#743).
+
 ## Restore
 
 ```
@@ -55,6 +58,40 @@ restore in sight — a bucket lifecycle rule, a half-copied directory, a disk
 that came back smaller. Exits non-zero when anything is absent, and names the
 media IDs rather than only the content hashes: the hash is what the backend
 calls it, the ID is what you have to look for in your other copy.
+
+## Collecting unreachable state
+
+```
+spindle gc <config> [--dry-run]
+```
+
+This command deletes the state-trie nodes that no stored record reaches
+(#742). The state of a room is a trie of content-addressed nodes. One node
+can occur in the state of many entries and rooms. To find a dead node, the
+command must examine all records. Before this command, nothing deleted
+nodes, and unused nodes stayed on disk. Examples are the intermediate states
+of a backfilled gap, the rows of an interrupted import, and the trie of a
+deleted room.
+
+The command marks each node that a stored root can reach. Log entries,
+sidelined events and backfilled gap events hold these roots. The command
+reads a shared node only once. Then it deletes all other nodes.
+
+The command prints the number of rows that hold roots, the reachable nodes
+and their bytes, and the deleted nodes and their bytes. `--dry-run` prints
+the same report and deletes nothing. A second run deletes nothing.
+
+**It does not guess.** It stops before any delete if a reachable node is
+missing or has the wrong hash. It also stops if it cannot read the root of a
+record. A sweep from an incomplete mark deletes live state.
+
+**Offline only**, and not available as a background task. The key of a node
+is its content. When a server makes a node again, it writes the same key
+that the sweep can delete. The two writes look the same.
+
+Thus a sweep that runs during an append can delete a node that the append
+needs. A snapshot does not help, because the snapshot already holds that
+row. Make a backup first if you want a way back.
 
 ## Importing password hashes
 

@@ -72,7 +72,8 @@ CI gate fails if a config field exists in the code and not in that file.
 **Other commands:** `promote-admin` (mints the first admin offline),
 `set-password-hash` (imports Argon2 hashes, e.g. from MAS),
 `issue-reset-link` (a password-reset link that needs no mail),
-`backup` / `restore` / `verify-media`, `migrate`. See
+`backup` / `restore` / `verify-media`, `migrate`, `gc` (frees unused state).
+See
 [docs/lifecycle.md](docs/lifecycle.md).
 
 ---

@@ -24,6 +24,7 @@
 
 pub mod backup;
 pub mod codec;
+pub mod gc;
 pub mod migrate;
 
 use std::path::Path;
