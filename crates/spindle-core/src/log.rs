@@ -20,11 +20,11 @@ const MAX_TIPS: usize = u64::BITS as usize;
 
 /// How many recent entries keep their materialized state resident, by default.
 ///
-/// Matched to SPEC §9.1's `max_fork_window`, and that coupling is the whole
-/// argument: a fork deeper than the window already falls back to full state
-/// resolution, which reads the trie from the store. So a window this size holds
-/// every snapshot the fast path can ask for, and nothing that only the slow
-/// path can.
+/// A bound on memory, not on which forks can be resolved: an older parent's
+/// state is rehydrated from the store by its root ([`RoomLog::state_after_any`]),
+/// so the window only decides which forks pay a store read. 512 was SPEC
+/// §9.1's old `max_fork_window`; ADR 0005 retired that cap, and nothing caps
+/// fork depth now.
 pub const DEFAULT_RESIDENT_WINDOW: usize = 512;
 
 /// A Matrix event ID, treated as an opaque value.
@@ -768,7 +768,8 @@ impl RoomLog {
             .map(|(_, entry)| entry)
     }
 
-    /// Every tip of the federation DAG, including any set aside.
+    /// Every tip of the federation DAG, including any beyond the newest
+    /// [`MAX_AUTHORED_PREV_EVENTS`] that a local event leaves unnamed.
     ///
     /// This is what a peer would compute from the same events, and what
     /// the store persists. It is not what a local event names -- that is

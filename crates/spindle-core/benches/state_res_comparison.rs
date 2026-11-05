@@ -128,7 +128,8 @@ fn append(log: &mut RoomLog, parent: Option<&str>, key: &StateKey, event_id: &st
 fn compare(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("fork resolution");
 
-    // Up to 256 a side, so the window is 512 -- SPEC §9.1's `max_fork_window`.
+    // Up to 256 a side, so the window is 512 -- the fork-window cap SPEC §9.1
+    // once had (ADR 0005 retired it).
     // #34 asks for the deep case precisely because it is where the advantage
     // should shrink, and a benchmark that stops before its unfavourable end is
     // not evidence.

@@ -14,11 +14,11 @@
 //! was before this server's own last append. That is exactly the "inject
 //! stale message" case #16 asks for, and it is reproducible.
 //!
-//! Nothing is resolved when that PDU lands: it appends at the tail with its
-//! own parent's state, and the log simply has two forward extremities. The
-//! merge happens on the *next local append*, which names both — so every
-//! test here ends by sending one more event, and that event is the one under
-//! examination.
+//! That PDU needs no resolution itself: it appends at the tail with its own
+//! parent's state, and the log has two forward extremities, whose
+//! resolution becomes the room's current state. The merge *event* is the
+//! *next local append*, which names both tips -- so every test here ends by
+//! sending one more event, and that event is the one under examination.
 //!
 //! `spindle-core`'s `state_res_comparison` bench measures the same merge on
 //! a hand-built log. This is the first place a fork reaches it through the
@@ -800,8 +800,8 @@ async fn a_fork_on_the_same_slot_is_counted_once_and_leaves_the_room_writable() 
         "the expensive path was taken without being counted: {delta:?}"
     );
 
-    // The room stays writable, and the fork that is still open is not
-    // counted again on every send that steps around it.
+    // The room stays writable. Later sends build on the merge, so the fork
+    // is not counted again.
     let before = Cases::read(&harness.metrics);
     for attempt in 0..3 {
         assert_eq!(
@@ -820,11 +820,11 @@ async fn a_fork_on_the_same_slot_is_counted_once_and_leaves_the_room_writable() 
     let delta = Cases::read(&harness.metrics).since(before);
     assert_eq!(
         delta.contested, 0,
-        "one open fork was counted again on later sends: {delta:?}"
+        "the merged fork was counted again on later sends: {delta:?}"
     );
 
-    // Set aside is not corrupted: the room still reads, and the last local
-    // write is what it now holds.
+    // The resolution corrupted nothing: the room still reads, and the last
+    // local write is what it now holds.
     let (status, topic) = harness
         .get(
             &format!("/_matrix/client/v3/rooms/{room}/state/m.room.topic"),
@@ -945,13 +945,11 @@ async fn a_disjoint_fork_on_preexisting_slots_merges_and_leaves_the_room_writabl
 ///
 /// The topic test above proves the same-slot fork is counted once and does
 /// not wedge the room. Power levels are the slot every later authorization
-/// reads, so this is the fork where "set aside" has to mean something more
-/// precise than "still writable": which branch the room holds afterwards
-/// decides who may write to it at all. #359's rule is that the linear head
-/// stays -- the entry this server's order puts last, whose state
-/// authorization already reads -- and the tip that contests it is set
-/// aside. The peer's PDU is appended after our write, so the peer's power
-/// levels are what the room now enforces, and both the client's view and
+/// reads, so here the resolver's choice decides who may write to the room
+/// at all. Both changes come from users at power 100 and neither cites the
+/// other, so state resolution orders them by `origin_server_ts` and applies
+/// the later one last: the peer's, signed after our write. Those are the
+/// power levels the room now enforces, and both the client's view and
 /// federation's must say so, or the two servers' disagreement (#16) would
 /// be joined by a disagreement inside this one.
 #[tokio::test]
@@ -959,7 +957,7 @@ async fn a_disjoint_fork_on_preexisting_slots_merges_and_leaves_the_room_writabl
     clippy::await_holding_lock,
     reason = "serializing the tests is the job"
 )]
-async fn a_fork_on_the_power_levels_is_set_aside_and_the_head_decides_who_may_write() {
+async fn a_fork_on_the_power_levels_is_resolved_and_decides_who_may_write() {
     let _guard = COUNTERS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1009,14 +1007,14 @@ async fn a_fork_on_the_power_levels_is_set_aside_and_the_head_decides_who_may_wr
         "the expensive path was taken without being counted: {delta:?}"
     );
 
-    // The head's branch is the one the room holds: theirs, because it was
-    // appended last. Ours is set aside, not lost -- it stays a forward
-    // extremity for the resolver -- but it is not what the room reads.
+    // The resolver's choice is the one the room holds: theirs, the later
+    // timestamp. Ours is outweighed, not lost -- it stays in the DAG -- but
+    // it is not what the room reads.
     let state = harness.state_ids(&room, &alice).await;
     assert_eq!(
         state.get("m.room.power_levels/"),
         Some(&theirs),
-        "the room does not hold the linear head's power levels (ours: {ours})"
+        "the room does not hold the resolved power levels (ours: {ours})"
     );
     let (_, held) = harness
         .get(
@@ -1034,8 +1032,8 @@ async fn a_fork_on_the_power_levels_is_set_aside_and_the_head_decides_who_may_wr
         "/state_ids disagrees with the client's view of the room"
     );
 
-    // The room stays writable under the levels it holds, and the fork that
-    // is still open is not counted again.
+    // The room stays writable under the levels it holds, and the fork,
+    // merged, is not counted again.
     let before = Cases::read(&harness.metrics);
     for attempt in 0..3 {
         assert_eq!(
@@ -1054,26 +1052,26 @@ async fn a_fork_on_the_power_levels_is_set_aside_and_the_head_decides_who_may_wr
     let delta = Cases::read(&harness.metrics).since(before);
     assert_eq!(
         delta.contested, 0,
-        "one open fork was counted again on later sends: {delta:?}"
+        "the merged fork was counted again on later sends: {delta:?}"
     );
 }
 
 /// Both branches move one user's membership: SPEC §9.2 case 3 on the slot
 /// #16's scope names alongside power levels.
 ///
-/// We kick charlie; the peer, from the same fork point, bans them. The
-/// same rule as the power-levels test decides the outcome -- the peer's
-/// ban is the linear head -- and the assertion that matters is that the
+/// We kick charlie; the peer, from the same fork point, bans them. Both are
+/// power events from equal-power senders, so resolution applies the later
+/// one, the peer's ban, last -- and the assertion that matters is that the
 /// room *enforces* the membership it holds: a banned user cannot be
 /// re-invited, so the invite that a kick would have allowed is refused.
-/// A room that read one membership and enforced another would be the
-/// inconsistency the set-aside rule exists to avoid.
+/// A room that read one membership and enforced another would disagree
+/// with itself.
 #[tokio::test]
 #[allow(
     clippy::await_holding_lock,
     reason = "serializing the tests is the job"
 )]
-async fn a_fork_on_one_membership_is_set_aside_and_the_head_is_what_is_enforced() {
+async fn a_fork_on_one_membership_is_resolved_and_is_what_is_enforced() {
     let _guard = COUNTERS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1125,7 +1123,7 @@ async fn a_fork_on_one_membership_is_set_aside_and_the_head_is_what_is_enforced(
     assert_eq!(
         state.get("m.room.member/@charlie:example.org"),
         Some(&theirs),
-        "the room does not hold the linear head's membership"
+        "the room does not hold the resolved membership"
     );
     let (_, held) = harness
         .get(
@@ -1171,7 +1169,7 @@ async fn a_fork_on_one_membership_is_set_aside_and_the_head_is_what_is_enforced(
     let delta = Cases::read(&harness.metrics).since(before);
     assert_eq!(
         delta.contested, 0,
-        "one open fork was counted again on later sends: {delta:?}"
+        "the merged fork was counted again on later sends: {delta:?}"
     );
 }
 
@@ -1369,4 +1367,80 @@ async fn a_partition_heals_into_one_state_the_client_and_the_peer_read_alike() {
             "{expected} is missing: {bodies:?}"
         );
     }
+}
+
+/// A local `PUT /send` onto a fork that contests one slot merges both tips,
+/// and the state it sits on is the room version's resolution (#738).
+///
+/// The peer's topic is appended last but carries the older
+/// `origin_server_ts`. Matrix state resolution orders two topics under the
+/// same power levels by timestamp, so ours wins; any "the linear head's
+/// branch wins" rule -- what #359 described and the retired 503 refusal
+/// stood in for -- would pick theirs. So this tells the resolver's answer
+/// apart from the head's, on top of proving the send is not refused.
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn a_local_send_on_a_contested_fork_merges_both_tips_by_the_room_versions_rules() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, fork_point) = harness.shared_room(&peer).await;
+
+    let (status, ours) = harness
+        .put_state(&room, &alice, "m.room.topic", &json!({ "topic": "ours" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let pdu = peer.event(federation_auth::with_auth_events(
+        &harness.store,
+        json!({
+            "type": "m.room.topic",
+            "state_key": "",
+            "sender": peer.user(),
+            "room_id": room,
+            "content": { "topic": "theirs" },
+            "origin_server_ts": now_millis() - 60_000,
+            "depth": 11,
+            "prev_events": [fork_point],
+            "auth_events": [],
+        }),
+    ));
+    let theirs = injected_id(&harness.inject(&peer, "fork_ts", pdu).await);
+
+    let before = Cases::read(&harness.metrics);
+    let (status, merge) = harness.send_message(&room, &alice, "after").await;
+    let delta = Cases::read(&harness.metrics).since(before);
+    assert_eq!(status, StatusCode::OK, "a local send on a contested fork");
+    assert_eq!(
+        delta.contested, 1,
+        "the send must resolve the fork, once: {delta:?}"
+    );
+
+    // The send is the merge: it names both tips, as signed.
+    let signed = harness.federation_event(&peer, &merge).await;
+    let parents: std::collections::BTreeSet<String> = signed["prev_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(parents, [ours.clone(), theirs.clone()].into());
+
+    // And the room holds the resolver's choice, not the linear head's.
+    let state = harness.state_ids(&room, &alice).await;
+    assert_eq!(
+        state.get("m.room.topic/"),
+        Some(&ours),
+        "the room holds the appended-last topic ({theirs}), not the resolved one"
+    );
+    let federation = harness.federation_state_ids(&peer, &room, &merge).await;
+    assert_eq!(
+        federation,
+        state.values().cloned().collect(),
+        "/state_ids disagrees with the client's view of the room"
+    );
 }

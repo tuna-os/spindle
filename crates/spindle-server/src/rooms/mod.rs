@@ -5658,7 +5658,7 @@ impl Rooms {
             let mut load = |root: &StateRoot| self.load_node(root);
             let state = log
                 .resolve_parents(parents, &mut spindle_core::Strict, &mut load)
-                .map_err(|error| self.append_error(&error))?;
+                .map_err(|error| Self::append_error(&error))?;
             return Ok((state, false));
         }
         let state = self.resolve_in(log, room_id, |log, resolver, load| {
@@ -5709,7 +5709,7 @@ impl Rooms {
                 "resolved a fork's state with the room version's algorithm"
             );
         }
-        result.map_err(|error| self.append_error(&error))
+        result.map_err(|error| Self::append_error(&error))
     }
 
     /// The room's auth DAG, created empty on first use.
@@ -5738,16 +5738,16 @@ impl Rooms {
 
     /// An append failure as a room error, naming a resolution failure as
     /// what it is.
-    fn append_error(&self, error: &AppendError) -> RoomError {
+    ///
+    /// `NeedsStateResolution` gets no case of its own. Only `Strict` raises
+    /// it, and the server hands `Strict` only parents whose state roots are
+    /// equal (`state_for_parents`), where it has nothing to refuse; every
+    /// other merge -- local, received or current state -- goes to the room
+    /// version's resolver, which decides or fails as `ResolutionFailed`
+    /// (ADR 0005). So reaching it here is a bug, answered as one: it once
+    /// meant "retry later" (503), and retrying a fork never folds it (#738).
+    fn append_error(error: &AppendError) -> RoomError {
         match error {
-            AppendError::NeedsStateResolution { key, .. } => {
-                self.metrics.record_contested_state();
-                RoomError::Contested {
-                    // The `type/state_key` spelling `/state_ids` uses, so an
-                    // operator can match this against what the room reports.
-                    key: format!("{}/{}", key.event_type().as_str(), key.state_key()),
-                }
-            }
             AppendError::ResolutionFailed(why) => {
                 RoomError::Append(format!("state resolution failed: {why}"))
             }
@@ -5918,7 +5918,7 @@ impl Rooms {
         let previous_tips = log.forward_extremities().clone();
         let entry = log
             .append_resolved(input, state_before)
-            .map_err(|error| self.append_error(&error))?
+            .map_err(|error| Self::append_error(&error))?
             .clone();
         self.metrics.record_append(
             crate::metrics::Origin::Local,
@@ -6173,7 +6173,7 @@ impl Rooms {
         if let Some((kind, reason)) = verdict {
             let entry = log
                 .sideline(input, state_before, kind)
-                .map_err(|error| self.append_error(&error))?
+                .map_err(|error| Self::append_error(&error))?
                 .clone();
             let state = log
                 .sidelined_state(&entry.event_id)
@@ -6209,7 +6209,7 @@ impl Rooms {
         let previous_tips = log.forward_extremities().clone();
         let entry = log
             .append_resolved(input, state_before)
-            .map_err(|error| self.append_error(&error))?
+            .map_err(|error| Self::append_error(&error))?
             .clone();
         self.metrics.record_append(
             crate::metrics::Origin::Federated,
@@ -7413,18 +7413,6 @@ pub enum RoomError {
     MissingBody(String),
     Build(String),
     Append(String),
-    /// SPEC §9.2 case 3: two branches of a fork moved the same state key
-    /// away from the value they both inherited, so the merge needs the
-    /// room-version resolver that is not yet wired into ingest (#16).
-    ///
-    /// Distinct from [`RoomError::Append`] because it is the one append
-    /// failure that is neither the caller's fault nor a bug: the room is in
-    /// a state this server cannot currently fold, and #225 recorded that
-    /// answering it with a bare 500 tells a client nothing it can act on
-    /// and an operator nothing they can diagnose.
-    Contested {
-        key: String,
-    },
     StateUnavailable(String),
     UnknownState(String),
     Forbidden(String),
@@ -7455,10 +7443,6 @@ impl std::fmt::Display for RoomError {
                     "this server does not support room version {version}"
                 )
             }
-            Self::Contested { key } => write!(
-                formatter,
-                "the state key {key} is contested between two branches of a                  fork and needs state resolution"
-            ),
             Self::InvalidPowerLevels(why) => {
                 write!(formatter, "invalid power_level_content_override: {why}")
             }
@@ -8342,6 +8326,21 @@ mod room_version_tests {
                 &serde_json::json!({ "msgtype": "m.text", "body": "hello" }),
             )
             .expect("an append with a cold cache must not hang or fail");
+    }
+
+    /// #738: a `Strict` refusal reaching the live path is a server bug, not
+    /// a fork to wait out. It was answered 503 "retry", which a client
+    /// obeys forever because no retry folds the fork.
+    #[test]
+    fn a_strict_refusal_is_a_bug_not_a_retryable_outage() {
+        let error = Rooms::append_error(&spindle_core::AppendError::NeedsStateResolution {
+            key: spindle_core::StateKey::new("m.room.topic", ""),
+            candidates: Vec::new(),
+        });
+        assert_eq!(
+            crate::routes::room_error(error).status,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }
 

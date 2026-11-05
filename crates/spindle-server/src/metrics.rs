@@ -36,14 +36,15 @@ use std::time::Duration;
 /// argument it exists to test.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ForkCase {
-    /// Case 1 — a non-state event. Cannot conflict; no resolution.
+    /// Case 1 — a non-state event whose parents hold one state. No
+    /// resolution.
     NonState,
-    /// Case 2 — a state event whose key nothing in the window touched.
-    /// One `apply()`; no resolution.
+    /// Case 2 — a state event whose parents hold one state. One `apply()`;
+    /// no resolution.
     StateUncontested,
-    /// Case 3 — a state event contested inside the window. The expensive
-    /// path, and the one §18.3 says must stay under 0.1% of federated
-    /// events.
+    /// Case 3 — an event whose parents' states differ, so the room
+    /// version's resolver ran (ADR 0005). The expensive path, and the one
+    /// §18.3 says must stay under 0.1% of federated events.
     StateContested,
 }
 
@@ -857,22 +858,6 @@ impl Metrics {
     pub fn record_append(&self, origin: Origin, case: ForkCase) {
         self.events[origin.index()].fetch_add(1, Ordering::Relaxed);
         self.fork_cases[case.index()].fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Record a fork that needed state resolution — case 3.
-    ///
-    /// Not an append, so not [`record_append`]: nothing enters the log when
-    /// this is recorded. Bounded resolution exists in `spindle-core` but is not
-    /// yet wired into ingest (#16), so a contested fork is *deferred* rather
-    /// than resolved. A federated event naming the contesting tips is refused;
-    /// a local send sets the contesting tip aside and is authored without it
-    /// (#225), and that send is then counted by [`record_append`] as the case
-    /// it took. Counting an event here as well would count that send twice.
-    /// The counter goes where the decision is made, so it keeps counting the
-    /// same thing when the resolver lands and the deferral becomes a
-    /// resolution.
-    pub fn record_contested_state(&self) {
-        self.fork_cases[ForkCase::StateContested.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a received PDU kept for the DAG but out of the timeline: one
@@ -2724,15 +2709,13 @@ mod tests {
         let metrics = Metrics::new();
         metrics.record_append(Origin::Local, ForkCase::NonState);
         metrics.record_append(Origin::Federated, ForkCase::StateUncontested);
-        metrics.record_contested_state();
+        metrics.record_append(Origin::Federated, ForkCase::StateContested);
 
         assert_eq!(metrics.fork_case_count(ForkCase::NonState), 1);
         assert_eq!(metrics.fork_case_count(ForkCase::StateUncontested), 1);
         assert_eq!(metrics.fork_case_count(ForkCase::StateContested), 1);
         assert_eq!(metrics.event_count(Origin::Local), 1);
-        // One federated event: a contested fork is a decision, not an
-        // append, and the send that steps around it is counted on its own.
-        assert_eq!(metrics.event_count(Origin::Federated), 1);
+        assert_eq!(metrics.event_count(Origin::Federated), 2);
     }
 
     /// The subscriber gauge is balanced: what goes up comes back down,

@@ -9703,24 +9703,6 @@ pub(crate) fn room_error(error: crate::rooms::RoomError) -> MatrixError {
             "M_UNSUPPORTED_ROOM_VERSION",
             format!("this server does not support room version {version}"),
         ),
-        // #225: this was a 500 with an empty body, which told a client
-        // nothing and an operator nothing. It is not an internal error --
-        // the server is working correctly and the *room* is in a state it
-        // cannot fold until #16 wires the resolver into ingest. 503 says
-        // "this server, this room, not now", which is the true shape of it,
-        // and naming the contested key makes it diagnosable. An ordinary
-        // local send no longer reaches this: it is authored around the
-        // contested tip instead. What still does is an event built before
-        // the fork landed and committed after, and a retry names the new
-        // head.
-        crate::rooms::RoomError::Contested { key } => MatrixError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "M_UNKNOWN",
-            format!(
-                "this room has a fork contesting {key}, which this server cannot \
-                 resolve yet; this event cannot be folded onto it, retry"
-            ),
-        ),
         other => MatrixError::internal(&other.to_string()),
     }
 }

@@ -120,8 +120,8 @@ needing no resolution; both compute `auth_chain_difference` only inside
 Any framing of this project as "we skip state resolution and they don't" is
 false, and #56 measures the consequence: on a real fork our advantage over
 `ruma-state-res` is a flat 2.2–3.1× constant factor across the whole range out
-to a full `max_fork_window` — not the superlinear gap the cost column invites a
-reader to expect.
+to a 512-event fork, the window cap §9.1 then had — not the superlinear gap the
+cost column invites a reader to expect.
 
 What survives is the bottom four rows, and they have one thing in common:
 **they are bookkeeping, not algorithms.** Maintaining the extremity set,
@@ -373,11 +373,10 @@ rather than with the size of the state.
 
 Snapshots are therefore retained for:
 
-- the most recent `resident_window` entries, defaulting to `max_fork_window`
-  (§9.1). The coupling is the argument: a fork deeper than the window already
-  falls back to full state resolution, which reads the trie from the store, so
-  a window this size holds everything the fast path can reach and nothing that
-  only the slow path can;
+- the most recent `resident_window` entries (512 by default). This window
+  limits memory only. Spindle can still resolve a fork of any depth. If a
+  resolution needs the state of an older parent, Spindle reads it from the
+  store by its root. The window decides only which forks pay for that read;
 - every forward extremity, at any age. A class-D stale peer event can leave an
   extremity arbitrarily far back (ADR 0001), and the next local event has to
   merge that extremity's state with the head's;
@@ -1445,7 +1444,7 @@ implements them, and G1 (unmodified existing clients) forbids depending on them.
 
 Single TOML file, no external dependencies required for a default deployment
 (embedded store, embedded media, no separate cache tier). Explicit knobs for
-everything this document names a default for: `max_fork_window`,
+everything this document names a default for:
 `durability`, `hot_tail_len`, `presence.enabled`, `shard_count`,
 `hub_failover_timeout`, retention.
 
@@ -1637,15 +1636,15 @@ forward extremities.
 
 | # | Risk | Assessment / mitigation |
 |---|---|---|
-| R1 | **Case-3 forks are more common than assumed.** If real federation produces frequent conflicting concurrent state changes, the exception path becomes the normal path. | Instrumented from day one (§17.2). The window cap bounds the worst case to correct-but-slow, never incorrect. If the assumption is wrong, the design degrades to a well-optimized DAG server — still a net improvement, but the headline claim would need retracting. |
+| R1 | **Case-3 forks are more common than assumed.** If real federation produces frequent conflicting concurrent state changes, the exception path becomes the normal path. | Instrumented from day one (§17.2). The exception path is the room version's resolver (§9.2, ADR 0005), so a frequent case 3 is slower, never incorrect: parents with equal state roots skip it, and its results are cached by input roots, so the merging send, current state and a peer's event over the same tips pay for one resolution. If the assumption is wrong, the design degrades to a well-optimized DAG server — still a net improvement, but the headline claim would need retracting. |
 | R2 | **Hub liveness.** A partitioned participant cannot send. DAG Matrix can. | Explicit trade (§13.1). Failover in 60 s (§13.2); clients already retry sends. Deployments that require partition-tolerant writes should keep class-D rooms. |
-| R3 | **`max_fork_window` overflow.** A long partition with a busy legacy peer exceeds the cap. | Falls back to full spec state resolution over the affected range. Correct, slow, logged, alerted. |
+| R3 | **A deep fork.** A long partition with a busy legacy peer leaves a fork far deeper than usual. | There is no fork-window cap and no fallback (ADR 0005): resolution takes the parents' whole states, which every entry addresses by root (§6), at any depth. Depth costs the auth-difference walk and store reads for states older than `resident_window`; `RoomLog::fork_window` is diagnostic only. Every resolution is counted (`spindle_fork_resolutions_total{case="3"}`) and logged with its duration. |
 | R4 | **Pre-rendered `client_json` doubles event storage and must be regenerated when spec rendering changes.** | Versioned; regeneration is a background range scan. Storage is the cheapest resource in the system. |
 | R5 | **Spec drift.** Matrix moves; a from-scratch server must keep up. | Ruma tracks the spec and is used by multiple servers; Complement is the gate. Budget continuous spec-tracking work, not a one-time implementation. |
 | R6 | **Client dependence on Synapse-specific behavior** not covered by the spec. | §19.3 finds it empirically; each instance is a Spindle bug. This is the historical failure mode for every alternative homeserver and should be assumed to cost real time. |
 | R7 | **MSC3995 and MSC4244 are unstable and may change.** | Gated behind Cargo features and unstable prefixes; nothing in the v1 critical path depends on them (native rooms are plain v11). |
 | R8 | **Single-node scale ceiling.** | v1 targets vertical scale. The shard-by-room design admits horizontal partitioning, but cross-node room migration and a distributed stream watermark are genuine v2 work, not a config flag. |
-| R9 | **The equivalence theorem (§9.3) is wrong in some edge case.** | §19.2 tests it against the reference implementation continuously. A counterexample is a release blocker, not a bug report. |
+| R9 | **The live resolver disagrees with the reference algorithm in some edge case.** `RoomResolver` computes the auth difference and v2.1's conflicted subgraph itself and caches by input roots (§9.2); a mistake in either diverges from peers. | §19.2 tests it against ruma over full auth chains in every room-version family, and the partition tests and Complement compare its result with other servers'. A counterexample is a release blocker, not a bug report. |
 
 ---
 

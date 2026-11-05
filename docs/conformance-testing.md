@@ -250,15 +250,17 @@ a delivery race. It produces each case and asserts on the counters:
 | Case | Injection | Assert |
 |---|---|---|
 | 1 — non-state event on a stale head | Send a message PDU pointing at an old event | Appended at tail, no state res invoked, client order sane |
-| 2 — state event, disjoint key | Fork with a `(type, state_key)` untouched in the window, one slot or several, preset or not | Single `apply()`, both branches' writes survive, every state read agrees |
-| 3 — genuine conflict | Two competing power-level or membership changes in-window | Counted once per tip; the room stays writable on its linear head (#359); the head's branch is what the client reads, what `/state_ids` reports and what the room enforces |
-| Partition and heal | Each side sets state and sends on its own branch, then the peer's branch lands at once | The heal event names both tips, no state res invoked, one state and one timeline |
-| Window overflow | Fork deeper than `max_fork_window` | Falls back to full state res, stays *correct*, and alerts — not yet driven |
+| 2 — state event, disjoint key | Fork with a `(type, state_key)` untouched in the window, one slot or several, preset or not | Parent states differ, so the merging send runs the room version's resolver once; both branches' writes survive, every state read agrees |
+| 3 — genuine conflict | Two competing topic, power-level or membership changes in-window | The local send that merges the tips succeeds, names both and runs the resolver once; the room holds the resolver's choice, and the client, `/state_ids` and authorization agree on it |
+| Partition and heal | Each side sets state and sends on its own branch, then the peer's branch lands at once | The heal event names both tips, runs the resolver once, one state and one timeline |
 
-Case 3 is *deferred*, not resolved: the resolver is not wired into ingest yet,
-and the row says what the executable behaviour is today rather than what the
-design targets. When the resolver lands, the same test must move from
-"the head's branch" to "what full state res v2 would choose".
+The room version's algorithm resolves every case-2 and case-3 merge
+(ADR 0005); no fork refuses a local send or is set aside. The resolver's choice is
+told apart from "the linear head's branch" by
+`a_local_send_on_a_contested_fork_merges_both_tips_by_the_room_versions_rules`,
+whose later-appended branch carries the older timestamp and loses. There is no
+fork-window cap to overflow: resolution takes the parents' whole states at any
+depth, and `RoomLog::fork_window` is diagnostic only.
 
 Instrument the case-1/2/3 counters (spec §17.2) and assert on them: a test that
 passes while silently taking the expensive path is a test that has stopped
