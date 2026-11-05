@@ -14,6 +14,8 @@
 #
 # Seeded 2026-08-27 against matrix-org/complement @ the revision pinned in
 # scripts/complement.sh (image: complement/Dockerfile at this commit).
+TestACLs
+TestACLsForEDUs
 TestAddAccountData
 TestAddAccountData/Can_add_global_account_data
 TestAddAccountData/Can_add_room_account_data

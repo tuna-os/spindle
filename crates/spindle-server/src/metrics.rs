@@ -2575,6 +2575,8 @@ pub enum ReceiptResult {
     ForeignUser,
     /// The reader is not joined to the room (or the room is unknown here).
     NotJoined,
+    /// The room's `m.room.server_acl` denies the origin.
+    Denied,
     /// None of the events the receipt names is one this server holds.
     UnknownEvent,
     /// A receipt type that does not federate (`m.read.private`, anything
@@ -2587,10 +2589,11 @@ pub enum ReceiptResult {
 }
 
 impl ReceiptResult {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Accepted,
         Self::ForeignUser,
         Self::NotJoined,
+        Self::Denied,
         Self::UnknownEvent,
         Self::UnsupportedType,
         Self::Malformed,
@@ -2602,6 +2605,7 @@ impl ReceiptResult {
             Self::Accepted => "accepted",
             Self::ForeignUser => "foreign_user",
             Self::NotJoined => "not_joined",
+            Self::Denied => "denied",
             Self::UnknownEvent => "unknown_event",
             Self::UnsupportedType => "unsupported_type",
             Self::Malformed => "malformed",

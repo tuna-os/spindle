@@ -207,6 +207,13 @@ fn apply_one(
     if event_ids.is_empty() || room_id.len() > MAX_ID_LEN || user_id.len() > MAX_ID_LEN {
         return ReceiptResult::Malformed;
     }
+    // MSC4163: a server the room's `m.room.server_acl` denies does not
+    // mark anything read in it.
+    match state.rooms.server_acl_permits(room_id, origin) {
+        Ok(true) => {}
+        Ok(false) => return ReceiptResult::Denied,
+        Err(_) => return ReceiptResult::NotJoined,
+    }
     let ts = receipt["data"]["ts"].as_u64().unwrap_or_else(now_ms);
     match state
         .rooms
