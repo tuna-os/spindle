@@ -9,13 +9,15 @@
 //!
 //! **Where the walk stops is not where delivery stops.** The one durable
 //! cursor (`Keyspace::PushCursor`) advances once a batch has been read and
-//! judged; what the judgement produced waits in memory, queued per
-//! gateway, until that gateway acknowledges it. So a gateway that is down
-//! delays only its own devices, and a crash loses only what was queued --
-//! which is the trade a push notification can make: a badge that arrives
-//! twice or a ring that arrives after the caller gave up is noise, and a
-//! notification path that stalls every phone for one dead gateway is
-//! worse than noise.
+//! judged; what the judgement produced waits, queued per gateway, until
+//! that gateway acknowledges it. So a gateway that is down delays only its
+//! own devices. The queue lives in memory and in `Keyspace::PushPending`:
+//! each notification's row is written in the same batch that moves the
+//! cursor past its event, and deleted once the gateway answers, so a
+//! crash loses nothing the cursor has passed (#739). A crash between an
+//! answer and the delete sends that one notification twice, which is the
+//! side to err on: a badge that arrives twice is noise, a message that
+//! never rings is a missed message.
 //!
 //! **A pusher URL is an outbound fetch somebody else chose**, which makes
 //! it the same request-forgery vector as a URL preview, and it is judged
@@ -58,13 +60,16 @@ const BATCH_LIMIT: usize = 256;
 /// thousand -- the first figure here -- dropped the first phone of
 /// exactly that ring in the latency benchmark. A pending notification is
 /// a few kilobytes, so ten thousand is tens of megabytes per gateway at
-/// the very worst, and only while it is down.
+/// the very worst, in memory and again in the store, and only while it
+/// is down; a dropped notification's row goes with it.
 const QUEUE_CAP: usize = 10_000;
 
 /// Attempts at one notification before it is dropped. With the retry
 /// base doubling to 64× that is the better part of two minutes at the
 /// default base, which is longer than any ring and long enough for a
-/// gateway to come back from a restart.
+/// gateway to come back from a restart. The count is not persisted: a
+/// restart gives every waiting notification its attempts afresh, which
+/// costs at most this many more requests per restart.
 const MAX_ATTEMPTS: u32 = 8;
 
 /// How often the loop looks for new events and due gateways.
@@ -226,12 +231,27 @@ pub struct Sources {
 /// One notification body bound for one gateway, with the pushkeys it
 /// carries so a `rejected` answer can be acted on.
 struct Pending {
+    /// Its `Keyspace::PushPending` row, deleted once it is done with.
+    seq: u64,
     user_id: String,
     body: Value,
     /// `(app_id, pushkey)` of every device in the body.
     devices: Vec<(String, String)>,
     attempts: u32,
 }
+
+/// What a pending notification's row holds: everything but its attempt
+/// count (see [`MAX_ATTEMPTS`]).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Stored<'a> {
+    url: std::borrow::Cow<'a, str>,
+    user_id: std::borrow::Cow<'a, str>,
+    body: std::borrow::Cow<'a, Value>,
+    devices: std::borrow::Cow<'a, [(String, String)]>,
+}
+
+/// Every gateway's waiting notifications, oldest first, by URL.
+type Queues = HashMap<String, VecDeque<Pending>>;
 
 /// The delivery loop: walk the stream, judge, queue, send.
 ///
@@ -244,7 +264,10 @@ struct Pending {
 ///
 /// Ends once the router is gone, like every delivery loop here.
 pub async fn deliver_loop(sources: Sources, retry_base: Duration) {
-    let mut queues: HashMap<String, VecDeque<Pending>> = HashMap::new();
+    let Some((mut queues, mut next_seq)) = sources.store.upgrade().map(|store| restore(&store))
+    else {
+        return;
+    };
     let mut backoff: HashMap<String, (u32, Instant)> = HashMap::new();
     loop {
         tokio::time::sleep(TICK).await;
@@ -278,16 +301,11 @@ pub async fn deliver_loop(sources: Sources, retry_base: Duration) {
             };
             match rooms.stream_events(cursor, position, BATCH_LIMIT) {
                 Ok((records, advance_to)) => {
-                    for (room_id, event) in records {
-                        for (url, pending) in pass.notifications_for(&room_id, &event) {
-                            let queue = queues.entry(url).or_default();
-                            if queue.len() >= QUEUE_CAP {
-                                queue.pop_front();
-                            }
-                            queue.push_back(pending);
-                        }
-                    }
-                    write_cursor(&store, advance_to);
+                    let judged = records
+                        .iter()
+                        .flat_map(|(room_id, event)| pass.notifications_for(room_id, event))
+                        .collect();
+                    queue_judged(&store, &mut queues, &mut next_seq, judged, advance_to);
                 }
                 Err(error) => tracing::warn!("push: reading the stream: {error}"),
             }
@@ -307,33 +325,130 @@ pub async fn deliver_loop(sources: Sources, retry_base: Duration) {
             .collect();
         queues.retain(|_, queue| !queue.is_empty());
 
-        let removals = send_batches(&gateway, due, &mut queues, &mut backoff, retry_base).await;
-        if !removals.is_empty() {
-            // The registrations outlive a shutdown either way: a rejected
-            // pushkey the loop could not forget is forgotten on the next
-            // answer from that gateway.
-            let Some(pushers) = sources.pushers.upgrade() else {
-                return;
-            };
-            for (user_id, app_id, pushkey) in removals {
-                let _ = pushers.remove(&user_id, &app_id, &pushkey);
-            }
+        let (removals, done) =
+            send_batches(&gateway, due, &mut queues, &mut backoff, retry_base).await;
+        if done.is_empty() && removals.is_empty() {
+            continue;
+        }
+        // Upgraded afresh, like the federation outbox's acknowledgement: if
+        // the router went while a request was in flight, the rows wait and
+        // the next start sends them again, and the registrations outlive a
+        // shutdown either way -- a rejected pushkey the loop could not
+        // forget is forgotten on the next answer from that gateway.
+        let (Some(store), Some(pushers)) = (sources.store.upgrade(), sources.pushers.upgrade())
+        else {
+            return;
+        };
+        for seq in done {
+            let _ = Store::delete(store.as_ref(), &spindle_core::keys::push_pending(seq));
+        }
+        for (user_id, app_id, pushkey) in removals {
+            let _ = pushers.remove(&user_id, &app_id, &pushkey);
         }
     }
+}
+
+/// Queue what a pass judged, and move the cursor past the events it came
+/// from, in one write.
+///
+/// Why the notifications are stored rather than the cursor held back
+/// until they are delivered: the cursor is one position for every
+/// gateway, so holding it for a gateway that is down would, after a
+/// restart, judge again and resend everything the healthy gateways
+/// already took -- every phone ringing twice for one dead URL. And a
+/// judgement made again later is a different one: unread counts and rules
+/// have moved on. A row per notification, in the batch that already
+/// writes the cursor, keeps exactly what was judged at the price of one
+/// write per notification and one delete per answer.
+fn queue_judged(
+    store: &FjallStore,
+    queues: &mut Queues,
+    next_seq: &mut u64,
+    mut judged: Vec<(String, Pending)>,
+    advance_to: u64,
+) {
+    let mut rows = Vec::with_capacity(judged.len() + 1);
+    for (url, pending) in &mut judged {
+        pending.seq = *next_seq;
+        *next_seq += 1;
+        let stored = Stored {
+            url: url.as_str().into(),
+            user_id: pending.user_id.as_str().into(),
+            body: std::borrow::Cow::Borrowed(&pending.body),
+            devices: pending.devices.as_slice().into(),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&stored) {
+            rows.push((spindle_core::keys::push_pending(pending.seq), bytes));
+        }
+    }
+    rows.push((
+        spindle_core::keys::push_cursor(),
+        advance_to.to_be_bytes().to_vec(),
+    ));
+    if let Err(error) = Store::commit_deferred(store, &rows) {
+        // Neither the rows nor the cursor: the next pass judges these
+        // events again, rather than sending what a restart would forget.
+        tracing::warn!("push: queueing notifications: {error}");
+        return;
+    }
+    for (url, pending) in judged {
+        let queue = queues.entry(url).or_default();
+        if queue.len() >= QUEUE_CAP
+            && let Some(dropped) = queue.pop_front()
+        {
+            let _ = Store::delete(store, &spindle_core::keys::push_pending(dropped.seq));
+        }
+        queue.push_back(pending);
+    }
+}
+
+/// What a previous run judged and its gateways never answered, back in
+/// the queues in the order it was judged; and the next row to write.
+fn restore(store: &FjallStore) -> (Queues, u64) {
+    let mut queues = Queues::new();
+    let mut next_seq = 0;
+    let rows = ReadView::scan_prefix(store, &spindle_core::keys::push_pending_all())
+        .unwrap_or_else(|error| {
+            tracing::warn!("push: reading pending notifications: {error}");
+            Vec::new()
+        });
+    for (key, value) in rows {
+        let Some(seq) = spindle_core::keys::push_pending_seq(&key) else {
+            continue;
+        };
+        next_seq = seq + 1;
+        let Ok(stored) = serde_json::from_slice::<Stored<'_>>(&value) else {
+            let _ = Store::delete(store, &key);
+            continue;
+        };
+        queues
+            .entry(stored.url.into_owned())
+            .or_default()
+            .push_back(Pending {
+                seq,
+                user_id: stored.user_id.into_owned(),
+                body: stored.body.into_owned(),
+                devices: stored.devices.into_owned(),
+                attempts: 0,
+            });
+    }
+    (queues, next_seq)
 }
 
 /// Send each gateway its batch, in order, stopping a gateway at its first
 /// transient failure: what was not sent goes back to the front of its
 /// queue and the gateway backs off. Returns the `(user_id, app_id,
-/// pushkey)` of every device a gateway reported `rejected`.
+/// pushkey)` of every device a gateway reported `rejected`, and the rows
+/// of every notification finished with -- answered, or given up on.
 async fn send_batches(
     gateway: &Gateway,
     due: Vec<(String, VecDeque<Pending>)>,
     queues: &mut HashMap<String, VecDeque<Pending>>,
     backoff: &mut HashMap<String, (u32, Instant)>,
     retry_base: Duration,
-) -> Vec<(String, String, String)> {
+) -> (Vec<(String, String, String)>, Vec<u64>) {
     let mut removals: Vec<(String, String, String)> = Vec::new();
+    let mut done = Vec::new();
     for (url, mut batch) in due {
         while let Some(mut pending) = batch.pop_front() {
             match gateway.notify(&url, &pending.body).await {
@@ -352,9 +467,11 @@ async fn send_batches(
                             ));
                         }
                     }
+                    done.push(pending.seq);
                 }
                 Err(Failure::Permanent(why)) => {
                     tracing::debug!("push to {url} dropped: {why}");
+                    done.push(pending.seq);
                 }
                 Err(Failure::Transient(why)) => {
                     tracing::debug!("push to {url}: {why}");
@@ -363,6 +480,8 @@ async fn send_batches(
                     pending.attempts += 1;
                     if pending.attempts < MAX_ATTEMPTS {
                         batch.push_front(pending);
+                    } else {
+                        done.push(pending.seq);
                     }
                     let queue = queues.entry(url.clone()).or_default();
                     for unsent in batch.into_iter().rev() {
@@ -376,7 +495,7 @@ async fn send_batches(
             }
         }
     }
-    removals
+    (removals, done)
 }
 
 /// The room facts the rules ask about, gathered once per room per pass.
@@ -500,6 +619,8 @@ impl Pass<'_> {
                 out.push((
                     url,
                     Pending {
+                        // Numbered when queued, in the batch that stores it.
+                        seq: 0,
                         user_id: reader.clone(),
                         body,
                         devices: device_ids,
@@ -674,14 +795,6 @@ fn read_cursor(store: &FjallStore) -> u64 {
         .flatten()
         .and_then(|raw| raw.get(..8).and_then(|bytes| bytes.try_into().ok()))
         .map_or(0, u64::from_be_bytes)
-}
-
-fn write_cursor(store: &FjallStore, position: u64) {
-    let _ = Store::put(
-        store,
-        &spindle_core::keys::push_cursor(),
-        &position.to_be_bytes(),
-    );
 }
 
 #[cfg(test)]

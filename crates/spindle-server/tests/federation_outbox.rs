@@ -6,7 +6,9 @@
 //! acknowledgement, retries of the same rows reusing the same transaction
 //! ID so the peer's replay table absorbs duplicates, a retry that carries
 //! more rows getting a new one so the replay table cannot swallow them,
-//! and delivery surviving a server rebuild over the same directory.
+//! and delivery surviving a server rebuild over the same directory -- for
+//! PDUs, and for the EDUs a peer cannot ask for again (to-device messages,
+//! device-list updates), while typing stays fire-once.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -124,6 +126,16 @@ impl Stub {
             .iter()
             .flat_map(|(_, _, body)| body["pdus"].as_array().cloned().unwrap_or_default())
             .collect()
+    }
+
+    /// All EDUs delivered so far, flattened.
+    fn edus(&self) -> Vec<Value> {
+        flat_edus(self.delivered().iter().map(|(_, _, body)| body))
+    }
+
+    /// All EDUs in refused attempts so far, flattened.
+    fn refused_edus(&self) -> Vec<Value> {
+        flat_edus(self.refused().iter().map(|(_, _, body)| body))
     }
 
     async fn wait_for<F: Fn(&Stub) -> bool>(&self, what: F) -> bool {
@@ -249,6 +261,72 @@ impl Harness {
                 &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/{txn}"),
                 token,
                 &json!({ "msgtype": "m.text", "body": text }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// A to-device message from `token`'s user to one device of `user`.
+    async fn send_to_device(&self, token: &str, user: &str, txn: &str, text: &str) {
+        let (status, body) = self
+            .send(
+                "PUT",
+                &format!("/_matrix/client/v3/sendToDevice/m.room_key/{txn}"),
+                token,
+                &json!({ "messages": { user: { "PHONE": { "body": text } } } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    async fn whoami(&self, token: &str) -> Value {
+        let (status, body) = self
+            .call(
+                Request::builder()
+                    .uri("/_matrix/client/v3/account/whoami")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    /// Publish device keys for `token`'s device: a device-list change every
+    /// server sharing a room with its user is told about.
+    async fn upload_device_keys(&self, token: &str) {
+        let whoami = self.whoami(token).await;
+        let user_id = whoami["user_id"].as_str().unwrap();
+        let device_id = whoami["device_id"].as_str().unwrap();
+        let (status, body) = self
+            .send(
+                "POST",
+                "/_matrix/client/v3/keys/upload",
+                token,
+                &json!({
+                    "device_keys": {
+                        "user_id": user_id,
+                        "device_id": device_id,
+                        "algorithms": ["m.olm.v1.curve25519-aes-sha2"],
+                        "keys": { format!("ed25519:{device_id}"): "edkey" },
+                        "signatures": {},
+                    },
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    async fn start_typing(&self, room: &str, token: &str) {
+        let whoami = self.whoami(token).await;
+        let user_id = whoami["user_id"].as_str().unwrap();
+        let (status, body) = self
+            .send(
+                "PUT",
+                &format!("/_matrix/client/v3/rooms/{room}/typing/{user_id}"),
+                token,
+                &json!({ "typing": true, "timeout": 30_000 }),
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -515,5 +593,115 @@ async fn pending_rows_survive_a_rebuild_and_deliver_after() {
         .await,
         "delivered after the rebuild: {:?}",
         stub.delivered()
+    );
+}
+
+fn flat_edus<'a>(bodies: impl Iterator<Item = &'a Value>) -> Vec<Value> {
+    bodies
+        .flat_map(|body| body["edus"].as_array().cloned().unwrap_or_default())
+        .collect()
+}
+
+fn carries_to_device(edus: &[Value], text: &str) -> bool {
+    edus.iter().any(|edu| {
+        edu["edu_type"] == "m.direct_to_device"
+            && edu["content"]["messages"]
+                .as_object()
+                .into_iter()
+                .flat_map(|users| users.values())
+                .any(|devices| devices["PHONE"]["body"] == json!(text))
+    })
+}
+
+fn carries(edus: &[Value], edu_type: &str) -> bool {
+    edus.iter().any(|edu| edu["edu_type"] == edu_type)
+}
+
+/// #739: the EDUs a peer cannot ask for again -- a to-device message, a
+/// device-list change -- queued while it was unreachable are still owed to
+/// it after this server restarts, and arrive once it answers.
+#[tokio::test]
+async fn to_device_and_device_list_edus_for_a_dark_peer_arrive_after_a_restart() {
+    let stub = Stub::start().await;
+    stub.refuse.store(usize::MAX / 2, Ordering::SeqCst);
+    let mut harness = Harness::new();
+    let alice = harness.register("alice").await;
+    harness.room_with_remote_invite(&alice, &stub.user()).await;
+    harness.upload_device_keys(&alice).await;
+    harness
+        .send_to_device(&alice, &stub.user(), "k1", "across the restart")
+        .await;
+    // Tried and refused: before #739 that attempt was the only one.
+    assert!(
+        stub.wait_for(|stub| {
+            let refused = stub.refused_edus();
+            carries_to_device(&refused, "across the restart")
+                && carries(&refused, "m.device_list_update")
+        })
+        .await,
+        "the EDUs were attempted: {:?}",
+        stub.refused_edus()
+    );
+
+    harness.restart();
+    stub.refuse.store(0, Ordering::SeqCst);
+    assert!(
+        stub.wait_for(|stub| {
+            let edus = stub.edus();
+            carries_to_device(&edus, "across the restart") && carries(&edus, "m.device_list_update")
+        })
+        .await,
+        "delivered after the restart: {:?}",
+        stub.edus()
+    );
+}
+
+/// #739: a refused transaction's to-device message is sent again, under
+/// the transaction ID it was refused under, and its typing notification
+/// is not -- typing redelivered late is a lie about the present.
+#[tokio::test]
+async fn a_refused_transaction_retries_to_device_but_not_typing() {
+    let stub = Stub::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.room_with_remote_invite(&alice, &stub.user()).await;
+    stub.refuse.store(usize::MAX / 2, Ordering::SeqCst);
+    harness.start_typing(&room, &alice).await;
+    harness
+        .send_to_device(&alice, &stub.user(), "k1", "retried")
+        .await;
+    assert!(
+        stub.wait_for(|stub| {
+            let refused = stub.refused_edus();
+            carries_to_device(&refused, "retried") && carries(&refused, "m.typing")
+        })
+        .await,
+        "both were attempted: {:?}",
+        stub.refused_edus()
+    );
+
+    stub.refuse.store(0, Ordering::SeqCst);
+    assert!(
+        stub.wait_for(|stub| carries_to_device(&stub.edus(), "retried"))
+            .await,
+        "the to-device message was retried: {:?}",
+        stub.delivered()
+    );
+    // Several passes later, still no typing: it went with the failure.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!carries(&stub.edus(), "m.typing"), "{:?}", stub.edus());
+
+    // The retry is a replay of a refused attempt, not a new transaction: a
+    // peer that took the refused one and lost its answer dedups it.
+    let refused: Vec<String> = stub.refused().into_iter().map(|(txn, _, _)| txn).collect();
+    let landed: Vec<String> = stub
+        .delivered()
+        .into_iter()
+        .filter(|(_, _, body)| carries_to_device(&flat_edus(std::iter::once(body)), "retried"))
+        .map(|(txn, _, _)| txn)
+        .collect();
+    assert!(
+        landed.iter().all(|txn| refused.contains(txn)),
+        "landed {landed:?} vs refused {refused:?}"
     );
 }

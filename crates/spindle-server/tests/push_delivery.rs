@@ -6,9 +6,10 @@
 //! body, and never at the sender's own; the rules decide, and a device
 //! that asked for `event_id_only` gets exactly that; a failed delivery is
 //! retried under the same event and a `rejected` pushkey is forgotten; a
-//! `MatrixRTC` ring (MSC4075) reaches the members it mentions at high
-//! priority and a decline (MSC4310) reaches nobody; and a gateway inside
-//! this server's network is refused at registration.
+//! notification still pending when the server stops is delivered after
+//! it restarts; a `MatrixRTC` ring (MSC4075) reaches the members it
+//! mentions at high priority and a decline (MSC4310) reaches nobody; and
+//! a gateway inside this server's network is refused at registration.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -118,9 +119,7 @@ struct Instance {
     _dir: TempDir,
     name: String,
     client: reqwest::Client,
-    #[cfg(feature = "synapse-import")]
     store: Arc<FjallStore>,
-    #[cfg(feature = "synapse-import")]
     server: tokio::task::JoinHandle<()>,
     #[cfg(feature = "synapse-import")]
     import_proof: Option<spindle_server::import::synapse::notifications::Proof>,
@@ -176,19 +175,38 @@ impl Instance {
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        #[cfg(not(feature = "synapse-import"))]
-        drop(server);
         Instance {
             _dir: dir,
             name,
             client: reqwest::Client::new(),
-            #[cfg(feature = "synapse-import")]
             store,
-            #[cfg(feature = "synapse-import")]
             server,
             #[cfg(feature = "synapse-import")]
             import_proof,
         }
+    }
+
+    /// Stop this server and start another over the same store and address:
+    /// a crash, for everything the first one held only in memory.
+    async fn restart(&mut self) {
+        self.server.abort();
+        let _ = (&mut self.server).await;
+        // Every connection the client kept alive holds a clone of the old
+        // router, and with it the old server's state: a new client closes
+        // them, and the old delivery loops end on their next tick.
+        self.client = reqwest::Client::new();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let listener = tokio::net::TcpListener::bind(&self.name).await.unwrap();
+        let config = spindle_server::Config::parse(&format!(
+            "[server]\nname = {:?}\n[ratelimit]\nenabled = false\n\
+             [federation]\nretry_base_ms = 25\n[push]\nallow_internal = [\"127.0.0.0/8\"]\n",
+            self.name,
+        ))
+        .unwrap();
+        let app = spindle_server::app(config, Arc::clone(&self.store)).unwrap();
+        self.server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
     }
 
     #[cfg(feature = "synapse-import")]
@@ -506,6 +524,33 @@ async fn a_failed_delivery_is_retried_and_a_rejected_pushkey_is_removed() {
     // And nothing further is sent for a device that no longer exists.
     hs.say(&alice, &room, "hello?").await;
     gateway.settle(5).await;
+}
+
+/// #739: a notification judged, tried and refused before a crash is still
+/// owed after it. The cursor had already moved past its event, so before
+/// the pending queue was stored the restarted server never sent it.
+#[tokio::test]
+async fn a_notification_pending_at_a_crash_is_delivered_after_the_restart() {
+    let (gateway, url) = Gateway::serve().await;
+    let mut hs = Instance::start().await;
+    let (alice, _, _, room) = alice_and_bob(&hs, &gateway, &url).await;
+
+    gateway.fail_next(u32::MAX);
+    let attempted = gateway.deliveries().len();
+    let event_id = hs.say(&alice, &room, "while you were down").await;
+    let tried = gateway.wait_for(attempted + 1).await;
+    assert_eq!(tried[attempted]["notification"]["event_id"], event_id);
+
+    hs.restart().await;
+    gateway.fail_next(0);
+    let restarted = gateway.deliveries().len();
+    let delivered = gateway.wait_for(restarted + 1).await;
+    assert_eq!(
+        delivered[restarted]["notification"]["event_id"], event_id,
+        "{delivered:?}"
+    );
+    // Answered, so its row is gone: nothing more arrives.
+    gateway.settle(restarted + 1).await;
 }
 
 #[tokio::test]

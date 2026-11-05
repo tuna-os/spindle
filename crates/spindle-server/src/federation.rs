@@ -22,6 +22,7 @@ use spindle_store::{FjallStore, ReadView, Store};
 use crate::netguard::{Cidr, VettingResolver, permits};
 use crate::signing::ServerKey;
 
+mod edu_outbox;
 mod keyring;
 mod srv;
 pub use keyring::{PeerKeys, signing_key_ids};
@@ -105,13 +106,17 @@ pub struct Federation {
     /// Origins whose key fetch failed, and until when not to try again.
     negative: std::sync::Mutex<HashMap<String, Instant>>,
     key_fetch_slots: tokio::sync::Semaphore,
-    /// EDUs waiting for the next transaction to each destination.
+    /// Ephemeral EDUs waiting for the next transaction to each destination.
     ///
-    /// In memory and nowhere else, deliberately: an EDU is ephemeral by
-    /// contract, and one that failed to deliver is dropped rather than
-    /// retried — stale typing redelivered late is a lie about the present,
-    /// and whoever is still typing says so again within seconds.
+    /// In memory and nowhere else, deliberately: typing and presence are
+    /// ephemeral by contract, and one that failed to deliver is dropped
+    /// rather than retried — stale typing redelivered late is a lie about
+    /// the present, and whoever is still typing says so again within
+    /// seconds. The classes that must arrive go to [`Self::durable_edus`].
     edu_queue: std::sync::Mutex<std::collections::HashMap<String, Vec<Value>>>,
+    /// To-device messages, device-list and cross-signing updates waiting
+    /// for each destination, in the store until acknowledged (#739).
+    durable_edus: edu_outbox::EduOutbox,
     /// Read receipts waiting for each destination, coalesced into
     /// `m.receipt` EDU contents rather than queued one EDU per receipt: a
     /// busy room's readers would otherwise fill [`Self::queue_edu`]'s
@@ -537,6 +542,7 @@ impl Federation {
             negative: std::sync::Mutex::new(HashMap::new()),
             key_fetch_slots: tokio::sync::Semaphore::new(MAX_CONCURRENT_KEY_FETCHES),
             edu_queue: std::sync::Mutex::new(std::collections::HashMap::new()),
+            durable_edus: edu_outbox::EduOutbox::default(),
             receipt_queue: std::sync::Mutex::new(std::collections::HashMap::new()),
             enabled: true,
             delegations: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -742,11 +748,28 @@ impl Federation {
 
     /// Queue one EDU for `destination`'s next transaction.
     ///
-    /// Bounded per destination: past a hundred waiting, the oldest are
-    /// dropped — the spec caps a transaction at a hundred EDUs, and an
-    /// unreachable peer must not grow an unbounded queue of claims about
-    /// a present it keeps missing.
+    /// To-device messages, device-list updates and cross-signing updates
+    /// are written to the durable EDU outbox and retried until the peer
+    /// acknowledges them (see `federation/edu_outbox.rs`); sorted here, by
+    /// type, so no caller can queue one of them where a failure loses it.
+    /// A store that refuses the write is logged: the callers answer their
+    /// client from writes already made, and this one is the peer's copy.
+    ///
+    /// Everything else is ephemeral and bounded per destination: past a
+    /// hundred waiting, the oldest are dropped — the spec caps a
+    /// transaction at a hundred EDUs, and an unreachable peer must not
+    /// grow an unbounded queue of claims about a present it keeps missing.
     pub fn queue_edu(&self, destination: &str, edu: Value) {
+        if edu_outbox::is_durable(&edu) {
+            if let Err(error) = self.durable_edus.push(&self.store, destination, &edu) {
+                tracing::warn!(
+                    destination,
+                    edu_type = edu["edu_type"].as_str(),
+                    "cannot queue a durable EDU: {error}"
+                );
+            }
+            return;
+        }
         let mut queue = self
             .edu_queue
             .lock()
@@ -781,12 +804,12 @@ impl Federation {
             .insert(receipt);
     }
 
-    /// Take everything queued for `destination`, leaving it empty --
-    /// coalesced receipts first, then the rest, at most a hundred EDUs (the
-    /// spec's per-transaction cap). What does not fit stays queued for the
-    /// next transaction.
+    /// Take the ephemeral EDUs queued for `destination`, at most `limit` --
+    /// coalesced receipts first (never more than [`MAX_RECEIPT_EDUS`], so
+    /// they always fit), then the rest. What does not fit stays queued for
+    /// the next transaction.
     #[must_use]
-    pub fn take_edus(&self, destination: &str) -> Vec<Value> {
+    pub fn take_edus(&self, destination: &str, limit: usize) -> Vec<Value> {
         let mut edus: Vec<Value> = self
             .receipt_queue
             .lock()
@@ -799,7 +822,7 @@ impl Federation {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(mut pending) = queue.remove(destination) {
-            let room = MAX_EDUS_PER_TRANSACTION.saturating_sub(edus.len());
+            let room = limit.saturating_sub(edus.len());
             if pending.len() > room {
                 let rest = pending.split_off(room);
                 queue.insert(destination.to_owned(), rest);
@@ -2674,11 +2697,13 @@ fn client_builder(allowed: &[Cidr]) -> reqwest::ClientBuilder {
 type OutboxRow = (Vec<u8>, Vec<u8>);
 
 /// One transaction a pass will send: where it goes, the rows it carries
-/// -- deleted once the peer acknowledges -- and the request, or the reason
-/// one could not be built, which backs the destination off like a refusal.
+/// -- PDU outbox keys and durable EDU rows, deleted once the peer
+/// acknowledges -- and the request, or the reason one could not be built,
+/// which backs the destination off like a refusal.
 struct OutboundTransaction {
     destination: String,
     keys: Vec<Vec<u8>>,
+    edus: Vec<edu_outbox::Carried>,
     request: Result<PreparedTransaction, FederationError>,
 }
 
@@ -2727,6 +2752,7 @@ pub async fn drain_outbox(
         for OutboundTransaction {
             destination,
             keys,
+            edus,
             request,
         } in transactions
         {
@@ -2752,6 +2778,9 @@ pub async fn drain_outbox(
                     }
                     backoff.remove(&destination);
                     if let Some(federation) = federation.upgrade() {
+                        federation
+                            .durable_edus
+                            .acknowledge(&store, &destination, &edus);
                         let last_seq = keys
                             .iter()
                             .filter_map(|key| key.get(key.len().saturating_sub(8)..))
@@ -2821,9 +2850,14 @@ fn plan_transactions(
                 .push((key, value));
         }
     }
+    let mut durable = edu_outbox::EduOutbox::waiting(store);
     // A destination with only EDUs waiting still gets a transaction:
-    // typing must not wait for the next event.
-    for destination in federation.edu_destinations() {
+    // typing must not wait for the next event, nor a to-device message.
+    for destination in federation
+        .edu_destinations()
+        .into_iter()
+        .chain(durable.keys().cloned())
+    {
         by_destination.entry(destination).or_default();
     }
     // The pass already holds the whole picture, so the gauge is set
@@ -2849,10 +2883,16 @@ fn plan_transactions(
             .iter()
             .filter_map(|(_, value)| serde_json::from_slice(value).ok())
             .collect();
-        // EDUs ride whatever transaction goes out next; on failure they
-        // are dropped, never retried — a stale ephemeral redelivered
-        // late is a lie about the present.
-        let edus = federation.take_edus(&destination);
+        // The durable EDUs first, deleted only on acknowledgement; then the
+        // ephemeral ones fill the transaction, taken from memory and so
+        // dropped if it fails -- a stale ephemeral redelivered late is a
+        // lie about the present.
+        let carried = durable.remove(&destination).unwrap_or_default();
+        let edus: Vec<Value> = carried
+            .iter()
+            .map(|(_, edu)| edu.clone())
+            .chain(federation.take_edus(&destination, MAX_EDUS_PER_TRANSACTION - carried.len()))
+            .collect();
         if pdus.is_empty() && edus.is_empty() {
             continue;
         }
@@ -2861,35 +2901,7 @@ fn plan_transactions(
                 .metrics()
                 .record_edu_sent(crate::metrics::EduType::of(edu["edu_type"].as_str()));
         }
-        let txn_id = if let Some((key, _)) = batch.first() {
-            let first_seq = key
-                .get(key.len() - 8..)
-                .and_then(|bytes| bytes.try_into().ok())
-                .map_or(0, u64::from_be_bytes);
-            // Deterministic by content, not by attempt: a retry of the same
-            // rows, after a refusal or a crash, reuses the ID, which is
-            // what makes redelivery a no-op on the peer. Named by every
-            // row it carries, not by the first alone: when the peer took an
-            // attempt but its answer was lost, a retry that carries rows
-            // queued since is a new transaction. Under the old ID the
-            // peer's replay table would answer for those rows unread, and
-            // they would be deleted here as delivered.
-            let mut digest = Sha256::new();
-            for (key, _) in &batch {
-                digest.update(key);
-            }
-            let rows = u64::from_be_bytes(digest.finalize()[..8].try_into().unwrap_or_default());
-            format!("o{first_seq}-{rows:016x}")
-        } else {
-            // EDU-only: fire-once by design, so uniqueness is all the
-            // ID owes anyone.
-            static EDU_TXN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            format!(
-                "e{}-{}",
-                now_millis(),
-                EDU_TXN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            )
-        };
+        let txn_id = transaction_id(&batch, &carried);
         let mut body = serde_json::json!({
             "origin": federation.server_name,
             "origin_server_ts": now_millis(),
@@ -2902,10 +2914,59 @@ fn plan_transactions(
         transactions.push(OutboundTransaction {
             destination,
             keys: batch.into_iter().map(|(key, _)| key).collect(),
+            edus: carried
+                .iter()
+                .map(|(seq, edu)| (*seq, edu_outbox::identity(edu).map(|(name, _)| name)))
+                .collect(),
             request,
         });
     }
     transactions
+}
+
+/// The ID of a transaction carrying the PDU outbox rows `pdus` and the
+/// durable EDU rows `durable`.
+///
+/// Deterministic by content, not by attempt: a retry of the same rows,
+/// after a refusal or a crash, reuses the ID, which is what makes
+/// redelivery a no-op on the peer. Named by every row it carries, not by
+/// the first alone: when the peer took an attempt but its answer was lost,
+/// a retry that carries rows queued since is a new transaction. Under the
+/// old ID the peer's replay table would answer for those rows unread, and
+/// they would be deleted here as delivered (#762). Durable EDUs name their
+/// range the same way; their sequences never repeat for a destination (the
+/// outbox keeps its high-water mark), so neither does the ID. A
+/// transaction of ephemeral EDUs alone is fire-once, and uniqueness is all
+/// its ID owes anyone.
+fn transaction_id(pdu_rows: &[OutboxRow], durable: &[(u64, Value)]) -> String {
+    let pdus = pdu_rows.first().map(|(first, _)| {
+        let first_seq = first
+            .get(first.len().saturating_sub(8)..)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map_or(0, u64::from_be_bytes);
+        let mut digest = Sha256::new();
+        for (key, _) in pdu_rows {
+            digest.update(key);
+        }
+        let rows = u64::from_be_bytes(digest.finalize()[..8].try_into().unwrap_or_default());
+        format!("o{first_seq}-{rows:016x}")
+    });
+    let edus = durable
+        .first()
+        .zip(durable.last())
+        .map(|((first, _), (last, _))| format!("d{first}-{last}"));
+    match (pdus, edus) {
+        (Some(pdus), Some(edus)) => format!("{pdus}{edus}"),
+        (Some(id), None) | (None, Some(id)) => id,
+        (None, None) => {
+            static EDU_TXN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            format!(
+                "e{}-{}",
+                now_millis(),
+                EDU_TXN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
+        }
+    }
 }
 
 /// The object the X-Matrix signature covers.

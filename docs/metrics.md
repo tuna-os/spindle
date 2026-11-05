@@ -169,6 +169,12 @@ the rest are summed into `other`**: a room full of fabricated server
 names must not be able to mint a series each and turn the scrape into
 the attack. The tail is added up, never dropped.
 
+The gauge counts PDUs only. The EDUs that a peer must get (to-device
+messages, device-list updates and key updates) wait in a different
+outbox. They go in the same transactions. Thus a peer that waits for
+only those EDUs shows 0 here. The admin API `federation/destinations`
+shows its failures and its backoff.
+
 ```promql
 topk(5, spindle_federation_queue_depth)
 ```
