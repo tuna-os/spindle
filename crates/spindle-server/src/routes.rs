@@ -4849,10 +4849,7 @@ async fn room_joined_members(
     Authenticated(identity): Authenticated,
     axum::extract::Path(room_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, MatrixError> {
-    state
-        .rooms
-        .may_read(&identity.user_id, &room_id)
-        .map_err(room_error)?;
+    may_read_room(&state, &identity.user_id, &room_id)?;
     // As `/members`: the roster of a partial-state room waits for its
     // resync.
     state.rooms.await_full_state(&room_id).await;
