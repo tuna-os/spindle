@@ -217,6 +217,8 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::AdminTask, 0x58),
         (Keyspace::FinalisedDelayById, 0x55),
         (Keyspace::DelayEcho, 0x56),
+        (Keyspace::DeviceListOutbound, 0x5d),
+        (Keyspace::DeviceListInbound, 0x5e),
         (Keyspace::HubAttestation, 0x70),
         (Keyspace::HubEquivocation, 0x71),
         (Keyspace::HubCheckpoint, 0x72),

@@ -137,7 +137,9 @@ pub(crate) fn claim_local(
 
 /// `GET /_matrix/federation/v1/user/devices/{userId}`: every device of one
 /// of this server's users, with the cross-signing keys, for a peer that
-/// has fallen behind on updates and wants the whole list.
+/// has fallen behind on updates and wants the whole list. Its `stream_id`
+/// is the head of the user's device-list chain, the id the next update
+/// names as `prev_id`, so the peer knows that update follows this snapshot.
 pub(crate) async fn user_devices(
     state: AppState,
     headers: axum::http::HeaderMap,
@@ -156,6 +158,15 @@ pub(crate) async fn user_devices(
             "the user does not live on this server".to_owned(),
         ));
     }
+    // The head is read before the devices: a change writes its keys before
+    // it extends the chain, so a snapshot read after the head holds at least
+    // what the head names. Read the other way round, a change landing in
+    // between would be named by the served id yet missing from the list,
+    // and the peer would skip its update as already covered.
+    let stream_id = state
+        .devices
+        .device_list_stream_id(&user_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
     let devices: Vec<Value> = state
         .devices
         .all_device_keys(&user_id)
@@ -165,7 +176,7 @@ pub(crate) async fn user_devices(
         .collect();
     let mut response = json!({
         "user_id": user_id,
-        "stream_id": state.rooms.stream_position(),
+        "stream_id": stream_id,
         "devices": devices,
     });
     for (name, key_type) in [
@@ -270,6 +281,42 @@ fn deliver_to_device(state: &AppState, origin: &str, content: &Value) {
     }
 }
 
+/// Where an inbound device-list update sits against what this server has
+/// accounted for about its user.
+#[derive(Debug, PartialEq, Eq)]
+enum Link {
+    /// At or below what is accounted for: a redelivery, or an update the
+    /// last snapshot already held. Applying it could put back a key the
+    /// snapshot had replaced.
+    Covered,
+    /// Follows what is accounted for, and applies as it stands.
+    Follows,
+    /// Names a predecessor this server never saw: an update was lost, and
+    /// only the user's whole list is a safe base for what comes next.
+    Gap,
+}
+
+/// Place an update after `known`, the newest id accounted for. A sender's
+/// ids rise per user, so a predecessor at or below `known` was applied or
+/// folded into the snapshot that set it. That is also why `prev_id` is
+/// compared rather than matched: a snapshot's `stream_id` need not be an id
+/// any update carried.
+fn place(known: Option<u64>, stream_id: u64, prev_id: &[u64]) -> Link {
+    match known {
+        Some(known) if stream_id <= known => Link::Covered,
+        Some(known) if prev_id.iter().all(|prev| *prev <= known) => Link::Follows,
+        // Never tracked: the start of a chain applies as it stands; anything
+        // later had predecessors this copy does not hold.
+        None if prev_id.is_empty() => Link::Follows,
+        _ => Link::Gap,
+    }
+}
+
+/// Apply an `m.device_list_update`: inline when it follows the last one
+/// accounted for, by refetching the user's whole list when it reveals a
+/// gap (spec, Server-Server API, "Device Management"). Updates about one
+/// user are applied one at a time, so a burst arriving behind a gap waits
+/// for the one refetch and is then covered by it.
 async fn apply_device_list_update(state: &AppState, origin: &str, content: &Value) {
     let Some(user_id) = content["user_id"].as_str() else {
         return;
@@ -285,21 +332,40 @@ async fn apply_device_list_update(state: &AppState, origin: &str, content: &Valu
     let Some(device_id) = content["device_id"].as_str() else {
         return;
     };
-    let outcome = if content["deleted"].as_bool().unwrap_or(false) {
-        state.devices.remove_device_material(user_id, device_id)
-    } else if content["keys"].is_object() {
-        state
-            .devices
-            .upload_device_keys(user_id, device_id, &content["keys"])
-    } else {
-        // An update without the keys is a notice to fetch: the peer's
-        // whole list, which also catches any update that was lost.
-        match state.federation.remote_user_devices(origin, user_id).await {
-            Ok(listing) => store_remote_devices(state, user_id, &listing),
-            Err(error) => {
-                tracing::debug!(%error, user_id, "cannot refresh a peer's device list");
-                Ok(())
-            }
+    let _turn = state.devices.device_list_turn(user_id).await;
+    let known = match state.devices.remote_device_list_stream_id(user_id) {
+        Ok(known) => known,
+        Err(error) => {
+            tracing::warn!(%error, user_id, "cannot read a peer's device-list position");
+            return;
+        }
+    };
+    let stream_id = content["stream_id"].as_u64();
+    let prev_id: Vec<u64> = content["prev_id"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_u64)
+        .collect();
+    // Without a `stream_id` an update cannot be placed at all, and is
+    // treated as the gap it might be.
+    let link = stream_id.map_or(Link::Gap, |id| place(known, id, &prev_id));
+    let carries_change =
+        content["deleted"].as_bool().unwrap_or(false) || content["keys"].is_object();
+    let outcome = match (link, stream_id) {
+        (Link::Covered, _) => return,
+        (Link::Follows, Some(stream_id)) if carries_change => {
+            apply_device_change(state, user_id, device_id, content).and_then(|()| {
+                state
+                    .devices
+                    .set_remote_device_list_stream_id(user_id, stream_id)
+            })
+        }
+        // An update without the keys is a notice to fetch, wherever it
+        // sits in the chain.
+        _ => {
+            let floor = stream_id.max(known).unwrap_or(0);
+            resync_device_list(state, origin, user_id, device_id, floor, content).await
         }
     };
     if let Err(error) = outcome {
@@ -307,6 +373,57 @@ async fn apply_device_list_update(state: &AppState, origin: &str, content: &Valu
         return;
     }
     note_remote_change(state, user_id);
+}
+
+/// One device's change, as an update carries it.
+fn apply_device_change(
+    state: &AppState,
+    user_id: &str,
+    device_id: &str,
+    content: &Value,
+) -> Result<(), spindle_store::StoreError> {
+    if content["deleted"].as_bool().unwrap_or(false) {
+        state.devices.remove_device_material(user_id, device_id)
+    } else if content["keys"].is_object() {
+        state
+            .devices
+            .upload_device_keys(user_id, device_id, &content["keys"])
+    } else {
+        Ok(())
+    }
+}
+
+/// Replace this server's copy of a remote user's devices with the peer's
+/// whole list, and account for it up to the snapshot's `stream_id` -- or
+/// `floor`, the update that prompted it, if that is higher: the peer sent
+/// the update before it was asked, so the snapshot holds it whatever scale
+/// its `stream_id` is on.
+///
+/// A peer that cannot be reached leaves the user stale: the update's own
+/// change is still applied, being the newest word on that device, but
+/// nothing is accounted for, so the next update still sees the gap and
+/// refetches rather than building on a copy known to be incomplete.
+async fn resync_device_list(
+    state: &AppState,
+    origin: &str,
+    user_id: &str,
+    device_id: &str,
+    floor: u64,
+    content: &Value,
+) -> Result<(), spindle_store::StoreError> {
+    match state.federation.remote_user_devices(origin, user_id).await {
+        Ok(listing) => {
+            store_remote_devices(state, user_id, &listing)?;
+            let served = listing["stream_id"].as_u64().unwrap_or(0);
+            state
+                .devices
+                .set_remote_device_list_stream_id(user_id, served.max(floor))
+        }
+        Err(error) => {
+            tracing::debug!(%error, user_id, "cannot refresh a peer's device list");
+            apply_device_change(state, user_id, device_id, content)
+        }
+    }
 }
 
 fn apply_signing_key_update(state: &AppState, origin: &str, content: &Value) {
@@ -397,8 +514,16 @@ fn servers_sharing_rooms(state: &AppState, user_id: &str) -> Vec<String> {
 
 /// Tell every server sharing a room with `user_id` that one of their
 /// devices changed: `keys` for a new or re-keyed device, `deleted` for one
-/// that is gone. Rides the durable outbox, so a peer that is dark hears it
-/// when it comes back.
+/// that is gone.
+///
+/// Each update is a link in the user's chain: a fresh `stream_id`, and the
+/// previous one as `prev_id`. The previous link is the user's, not the last
+/// one this destination was sent: a server that stopped sharing a room
+/// for a while missed the updates in between, and naming the newest one
+/// is what lets it see that and refetch, where naming the last it got
+/// would pass the gap off as continuous. The chain moves even when nobody
+/// is told, so the next server to hear of the user refetches the list it
+/// never had.
 pub(crate) fn announce_device_change(
     state: &AppState,
     user_id: &str,
@@ -406,19 +531,27 @@ pub(crate) fn announce_device_change(
     keys: Option<&Value>,
     seq: u64,
 ) {
-    let mut content = json!({
-        "user_id": user_id,
-        "device_id": device_id,
-        "stream_id": seq,
-        "prev_id": [],
-        "deleted": keys.is_none(),
-    });
-    if let Some(keys) = keys {
-        content["keys"] = keys.clone();
-    }
-    let edu = json!({ "edu_type": "m.device_list_update", "content": content });
-    for server in servers_sharing_rooms(state, user_id) {
-        state.federation.queue_edu(&server, edu.clone());
+    let servers = servers_sharing_rooms(state, user_id);
+    let queued = state
+        .devices
+        .extend_device_list_chain(user_id, seq, |stream_id, prev| {
+            let mut content = json!({
+                "user_id": user_id,
+                "device_id": device_id,
+                "stream_id": stream_id,
+                "prev_id": prev.into_iter().collect::<Vec<u64>>(),
+                "deleted": keys.is_none(),
+            });
+            if let Some(keys) = keys {
+                content["keys"] = keys.clone();
+            }
+            let edu = json!({ "edu_type": "m.device_list_update", "content": content });
+            for server in &servers {
+                state.federation.queue_edu(server, edu.clone());
+            }
+        });
+    if let Err(error) = queued {
+        tracing::warn!(%error, user_id, "cannot extend a device-list chain");
     }
 }
 
@@ -601,4 +734,25 @@ async fn read(
     let body: Value =
         serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
     Ok((uri, body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Link, place};
+
+    #[test]
+    fn an_update_is_placed_against_what_is_accounted_for() {
+        // Never tracked: only the start of a chain stands on its own.
+        assert_eq!(place(None, 5, &[]), Link::Follows);
+        assert_eq!(place(None, 5, &[4]), Link::Gap);
+        // Tracked: the next link follows, a skipped one is a gap.
+        assert_eq!(place(Some(4), 5, &[4]), Link::Follows);
+        assert_eq!(place(Some(4), 6, &[5]), Link::Gap);
+        assert_eq!(place(Some(4), 6, &[4, 5]), Link::Gap);
+        // A predecessor at or below a snapshot's id was folded into it.
+        assert_eq!(place(Some(9), 12, &[7]), Link::Follows);
+        // Anything at or below what is accounted for is old news.
+        assert_eq!(place(Some(9), 9, &[8]), Link::Covered);
+        assert_eq!(place(Some(9), 3, &[]), Link::Covered);
+    }
 }
