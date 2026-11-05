@@ -4484,7 +4484,7 @@ async fn join_remote(
 
         let response = match state
             .federation
-            .remote_send_join(server, room_id, &join_id, &join)
+            .remote_send_join(server, room_id, &join_id, &join, true)
             .await
         {
             Ok(body) => body,
@@ -4511,23 +4511,18 @@ async fn join_remote(
             return answer;
         }
 
-        let arrays =
-            |key: &str| -> Vec<Value> { response[key].as_array().cloned().unwrap_or_default() };
-        // A stock room answers with `state` and `auth_chain`; a state-DAG
-        // room (MSC4242) with `state_dag` and `timeline`. Both are the
-        // events to seed from, and the seeding tells them apart by the
-        // room's version.
-        let mut seed_state = arrays("state");
-        seed_state.extend(arrays("state_dag"));
-        let mut seed_rest = arrays("auth_chain");
-        seed_rest.extend(arrays("timeline"));
-        // MSC4354: a Spindle resident adds the room's unexpired sticky
-        // events, which a joiner that backfills nothing could not
-        // otherwise hold -- their predecessors are history it never sees.
-        seed_rest.extend(arrays("msc4354_sticky"));
+        let (seed_state, seed_rest) = join_seeds(&response);
+        let partial = partial_join(server, room_id, &join_id, &version, &response);
         state
             .rooms
-            .join_remote(room_id, &seed_state, &seed_rest, &join, &join_id)
+            .join_remote(
+                room_id,
+                &seed_state,
+                &seed_rest,
+                &join,
+                &join_id,
+                partial.as_ref(),
+            )
             .map_err(room_error)?;
         record_join_history(state, room_id, &join, &join_id, server);
         state.rooms.wake_sync_waiters();
@@ -4541,6 +4536,63 @@ async fn join_remote(
             format!("no server admitted the join: {last_refusal}"),
         )
     }))
+}
+
+/// The events a `send_join` answer seeds the room from: what becomes its
+/// state, and the rest.
+fn join_seeds(response: &Value) -> (Vec<Value>, Vec<Value>) {
+    let arrays =
+        |key: &str| -> Vec<Value> { response[key].as_array().cloned().unwrap_or_default() };
+    // A stock room answers with `state` and `auth_chain`; a state-DAG
+    // room (MSC4242) with `state_dag` and `timeline`. Both are the
+    // events to seed from, and the seeding tells them apart by the
+    // room's version.
+    let mut seed_state = arrays("state");
+    seed_state.extend(arrays("state_dag"));
+    let mut seed_rest = arrays("auth_chain");
+    seed_rest.extend(arrays("timeline"));
+    // MSC4354: a Spindle resident adds the room's unexpired sticky
+    // events, which a joiner that backfills nothing could not
+    // otherwise hold -- their predecessors are history it never sees.
+    seed_rest.extend(arrays("msc4354_sticky"));
+    (seed_state, seed_rest)
+}
+
+/// The partial-state record of a join the resident answered with
+/// `members_omitted` (MSC3706), or `None` for a full answer.
+///
+/// A state-DAG room (MSC4242) is never taken as partial: its answer is the
+/// whole state DAG, and Synapse does not offer partial joins there either.
+/// `servers_in_room` is the resident's to give; whatever it names that is
+/// not a server name is dropped, and the resident itself is always kept,
+/// because it is the one server certain to hold the room.
+fn partial_join(
+    via: &str,
+    room_id: &str,
+    join_id: &str,
+    version: &ruma::RoomVersionId,
+    response: &Value,
+) -> Option<crate::rooms::PartialState> {
+    if response["members_omitted"] != json!(true) || spindle_core::is_state_dag(version) {
+        return None;
+    }
+    let mut servers: Vec<String> = response["servers_in_room"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|server| ruma::ServerName::parse(server).is_ok())
+        .map(str::to_owned)
+        .collect();
+    if !servers.iter().any(|server| server == via) {
+        servers.insert(0, via.to_owned());
+    }
+    Some(crate::rooms::PartialState {
+        room_id: room_id.to_owned(),
+        join_event_id: join_id.to_owned(),
+        via: via.to_owned(),
+        servers_in_room: servers,
+    })
 }
 
 /// `send_join` brings state, not history. Record the history before the
@@ -4753,6 +4805,10 @@ async fn room_members(
             )
         })?
         .position();
+    // A partial-state room (MSC3706) knows few of its members until its
+    // resync lands, and an E2EE client encrypts for the roster it is given:
+    // the roster waits, as Synapse's does (`rooms::partial`).
+    state.rooms.await_full_state(&room_id).await;
     let reader = state
         .rooms
         .reader(&identity.user_id, &room_id)
@@ -4797,6 +4853,9 @@ async fn room_joined_members(
         .rooms
         .may_read(&identity.user_id, &room_id)
         .map_err(room_error)?;
+    // As `/members`: the roster of a partial-state room waits for its
+    // resync.
+    state.rooms.await_full_state(&room_id).await;
     let members = if state.rooms.erasure_active().map_err(room_error)? {
         state
             .rooms
@@ -7074,11 +7133,20 @@ fn sliding_plan(
         .wanted
         .iter()
         .map(|(room_id, config)| {
-            let need = crate::sliding::Need::of(
+            let mut need = crate::sliding::Need::of(
                 held.and_then(|held| held.get(room_id)),
                 config,
                 invited.contains(room_id),
             );
+            // A partial-state room whose resync landed after the client
+            // last held it (MSC3706) goes again in full: its filled roster
+            // was never a timeline event, so only an initial rendering of
+            // its state carries it.
+            if let crate::sliding::Need::Since { since, .. } = need
+                && state.rooms.resynced_between(room_id, since, position)
+            {
+                need = crate::sliding::Need::Initial;
+            }
             (room_id, config, need)
         })
         .collect();

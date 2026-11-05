@@ -215,6 +215,32 @@ pub struct SidelinedEntry {
     pub state_root: StateRoot,
 }
 
+/// What [`RoomLog::fill_partial_state`] changed: the entries and sidelined
+/// events whose state moved, each with the state it replaced, so the store
+/// writes only the trie nodes the fill created.
+#[derive(Clone, Debug, Default)]
+pub struct FilledStates {
+    pub entries: Vec<FilledEntry>,
+    pub sidelined: Vec<FilledSidelined>,
+}
+
+/// One entry whose state [`RoomLog::fill_partial_state`] filled.
+#[derive(Clone, Debug)]
+pub struct FilledEntry {
+    /// The entry as it now reads, its `state_root` the filled state's.
+    pub entry: LogEntry,
+    pub state: StateSnapshot,
+    pub replaced: StateSnapshot,
+}
+
+/// One sidelined event whose state [`RoomLog::fill_partial_state`] filled.
+#[derive(Clone, Debug)]
+pub struct FilledSidelined {
+    pub entry: SidelinedEntry,
+    pub state: StateSnapshot,
+    pub replaced: StateSnapshot,
+}
+
 /// The room version's state resolution algorithm, supplied from above.
 ///
 /// The core holds the states; what to do when they disagree is the room
@@ -1284,6 +1310,125 @@ impl RoomLog {
         self.entries.insert(li, entry);
         self.make_resident(li, state_after);
         Ok(self.issued_entry(li))
+    }
+
+    /// Fill the state slots a partial-state join left empty (MSC3706), in
+    /// the state after every entry from `from` on, every sidelined event,
+    /// and the recorded resolution of a fork.
+    ///
+    /// A resident answering `send_join` with `members_omitted` leaves most
+    /// member events out of the state before the join, so every snapshot
+    /// this server built from the join onward lacks them. The full state at
+    /// the join, fetched later, names them; each snapshot then gains the
+    /// ones it has no value for. A slot it does hold is kept: an event at or
+    /// after the join wrote it, and that is newer than anything the state
+    /// *before* the join can say. This is Synapse's de-partial-stating of
+    /// each partial-state event, done in place: the order, the chain and
+    /// the events are untouched, only the content address of the state
+    /// after each entry moves.
+    ///
+    /// The first snapshot is filled whole; each later one is the previous
+    /// filled snapshot patched with only the slots that changed between the
+    /// two old snapshots, so the cost is the fill once plus the room's state
+    /// changes since the join -- not the fill once per entry.
+    ///
+    /// # Errors
+    ///
+    /// [`AppendError::StateNotResident`] for a snapshot that is neither
+    /// resident nor readable through `load`; nothing has changed then.
+    pub fn fill_partial_state(
+        &mut self,
+        from: LinearIndex,
+        fill: &BTreeMap<StateKey, EventId>,
+        load: &mut dyn FnMut(&StateRoot) -> Option<Vec<u8>>,
+    ) -> Result<FilledStates, AppendError> {
+        let filled_whole = |state: &StateSnapshot| -> StateSnapshot {
+            let mut out = state.clone();
+            for (key, id) in fill {
+                if out.get(key).is_none() {
+                    out = out.apply(key, id.as_str());
+                }
+            }
+            out
+        };
+
+        // Read every old snapshot first and change nothing until all of
+        // them are in hand, so a failed rehydration leaves the log as it
+        // was rather than half filled.
+        let ids: Vec<(i64, EventId)> = self
+            .entries
+            .range(from.get()..)
+            .map(|(li, entry)| (*li, entry.event_id.clone()))
+            .collect();
+        let mut old: Vec<(i64, StateSnapshot)> = Vec::with_capacity(ids.len());
+        for (li, id) in &ids {
+            old.push((*li, self.state_after_any(id, load)?));
+        }
+        let sidelined_ids: Vec<EventId> = self.sidelined.keys().cloned().collect();
+        let mut old_sidelined = Vec::with_capacity(sidelined_ids.len());
+        for id in sidelined_ids {
+            let state = self.state_after_any(&id, load)?;
+            old_sidelined.push((id, state));
+        }
+
+        let mut entries = Vec::with_capacity(old.len());
+        let mut previous: Option<(StateSnapshot, StateSnapshot)> = None;
+        for (li, replaced) in old {
+            let state = match &previous {
+                None => filled_whole(&replaced),
+                Some((old_previous, new_previous)) => {
+                    let mut state = new_previous.clone();
+                    for (key, _, now) in old_previous.diff(&replaced) {
+                        state = match now.or_else(|| fill.get(&key).map(EventId::as_str)) {
+                            Some(id) => state.apply(&key, id),
+                            None => state.remove(&key),
+                        };
+                    }
+                    state
+                }
+            };
+            previous = Some((replaced.clone(), state.clone()));
+            if state.root() == replaced.root() {
+                continue;
+            }
+            let Some(entry) = self.entries.get_mut(&li) else {
+                continue;
+            };
+            entry.state_root = state.root();
+            let entry = entry.clone();
+            if let Some(resident) = self.resident.get_mut(&li) {
+                *resident = state.clone();
+            }
+            entries.push(FilledEntry {
+                entry,
+                state,
+                replaced,
+            });
+        }
+
+        let mut sidelined = Vec::with_capacity(old_sidelined.len());
+        for (id, replaced) in old_sidelined {
+            let state = filled_whole(&replaced);
+            if state.root() == replaced.root() {
+                continue;
+            }
+            let Some(entry) = self.sidelined.get_mut(&id) else {
+                continue;
+            };
+            entry.state_root = state.root();
+            let entry = entry.clone();
+            self.sidelined_state.insert(id, state.clone());
+            sidelined.push(FilledSidelined {
+                entry,
+                state,
+                replaced,
+            });
+        }
+
+        if let Some(current) = self.current.take() {
+            self.current = Some(filled_whole(&current));
+        }
+        Ok(FilledStates { entries, sidelined })
     }
 
     /// Place one backfilled event before everything currently held.

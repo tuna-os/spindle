@@ -462,6 +462,19 @@ pub enum Keyspace {
     /// [`Self::Presence`] row names its current position, and a row whose
     /// position disagrees is a superseded one a reader skips.
     PresenceStream = 0x5f,
+    /// `room_id` -> the record of a partial-state join (MSC3706, #746): the
+    /// join that `send_join` answered with `members_omitted`, the server it
+    /// went through and the resident's `servers_in_room`. Present for as
+    /// long as the room's state lacks the member events the resident left
+    /// out; the background resync deletes it once the full state is folded
+    /// in, and a restart finds it here and resumes the resync.
+    PartialStateRoom = 0x61,
+    /// `room_id` -> where a partial-state room's resync completed: the
+    /// room and the stream position, as JSON. An incremental `/sync`
+    /// spanning that position tells its client the room afresh, with the
+    /// state the resync filled in: the member events it brought were never
+    /// timeline events, so nothing else would carry them.
+    PartialStateResynced = 0x62,
     /// `(room_id, position)` -> one event of a filled federation gap: its
     /// ID and the root of the state after it. History backfilled into the
     /// *middle* of a room's timeline -- between the head this server held
@@ -862,6 +875,19 @@ pub fn pending_redaction(room_id: &str, target: &str) -> Vec<u8> {
     let mut key = room_prefix(Keyspace::PendingRedaction, room_id);
     key.extend_from_slice(target.as_bytes());
     key
+}
+
+/// A room's partial-state join record ([`Keyspace::PartialStateRoom`]).
+#[must_use]
+pub fn partial_state_room(room_id: &str) -> Vec<u8> {
+    room_prefix(Keyspace::PartialStateRoom, room_id)
+}
+
+/// Where a room's partial-state resync completed
+/// ([`Keyspace::PartialStateResynced`]).
+#[must_use]
+pub fn partial_state_resynced(room_id: &str) -> Vec<u8> {
+    room_prefix(Keyspace::PartialStateResynced, room_id)
 }
 
 /// An imported auth PDU held outside the accepted timeline.

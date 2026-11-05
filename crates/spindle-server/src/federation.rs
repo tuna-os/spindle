@@ -2050,6 +2050,42 @@ impl Federation {
         Ok(response)
     }
 
+    /// Fetch the state at an event with its auth chain, bodies and all
+    /// (`/state`): one request where `/state_ids` and an `/event` per
+    /// missing body would be thousands, for a resync that lacks most of a
+    /// large room's roster. Bodies are untrusted until verified.
+    ///
+    /// # Errors
+    /// Returns [`FederationError`] for a refusal, a response over
+    /// `max_bytes` or one without both PDU arrays.
+    pub async fn remote_state(
+        &self,
+        destination: &str,
+        room_id: &str,
+        event_id: &str,
+        max_bytes: usize,
+    ) -> Result<Value, FederationError> {
+        let encoded: String = form_urlencoded::byte_serialize(event_id.as_bytes()).collect();
+        let uri = format!(
+            "/_matrix/federation/v1/state/{}?event_id={encoded}",
+            path_segment(room_id),
+        );
+        let response = self
+            .signed_json_bounded(destination, &uri, None, "state", Some(max_bytes))
+            .await?;
+        for field in ["pdus", "auth_chain"] {
+            if !response[field]
+                .as_array()
+                .is_some_and(|events| events.iter().all(Value::is_object))
+            {
+                return Err(FederationError::Refused(format!(
+                    "state response has no valid {field} array"
+                )));
+            }
+        }
+        Ok(response)
+    }
+
     /// Ask a peer for its users' device keys (`user/keys/query`).
     ///
     /// # Errors
@@ -2189,6 +2225,11 @@ impl Federation {
 
     /// Send the signed join back — the client half of `send_join`.
     ///
+    /// `omit_members` asks the resident to leave out the member events this
+    /// server can resync later (MSC3706, spec v1.6); a resident that does
+    /// says so with `members_omitted`, and one that ignores the parameter
+    /// answers in full as before.
+    ///
     /// # Errors
     ///
     /// Returns [`FederationError`] if the request cannot be signed or sent,
@@ -2199,11 +2240,15 @@ impl Federation {
         room_id: &str,
         event_id: &str,
         join: &Value,
+        omit_members: bool,
     ) -> Result<Value, FederationError> {
-        let uri = format!(
+        let mut uri = format!(
             "/_matrix/federation/v2/send_join/{room_id}/{}",
             path_segment(event_id)
         );
+        if omit_members {
+            uri.push_str("?omit_members=true");
+        }
         let authorization = self.sign_request("PUT", &uri, destination, Some(join))?;
         let response = self
             .request(reqwest::Method::PUT, destination, &uri)

@@ -220,6 +220,8 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::DeviceListOutbound, 0x5d),
         (Keyspace::DeviceListInbound, 0x5e),
         (Keyspace::PresenceStream, 0x5f),
+        (Keyspace::PartialStateRoom, 0x61),
+        (Keyspace::PartialStateResynced, 0x62),
         (Keyspace::HubAttestation, 0x70),
         (Keyspace::HubEquivocation, 0x71),
         (Keyspace::HubCheckpoint, 0x72),

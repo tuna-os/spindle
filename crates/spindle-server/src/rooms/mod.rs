@@ -149,13 +149,14 @@ mod federation;
 mod gaps;
 #[cfg(feature = "hub-mode")]
 mod hub;
+mod partial;
 mod policy;
 mod read;
 mod synapse_positions;
 mod unread;
 
 pub use admin::AdminTimelineEntry;
-pub use federation::{JOIN_GAP_CAUSE, JOIN_HISTORY_EVENTS};
+pub use federation::{JOIN_GAP_CAUSE, JOIN_HISTORY_EVENTS, PartialJoinState};
 pub use read::{ReadScope, RoomReader};
 pub use synapse_positions::SynapseGap;
 
@@ -165,6 +166,7 @@ use unread::{ScoreTally, UnreadIndex};
 pub use gaps::{GapChunk, GapChunkOutcome, GapProgress};
 #[cfg(feature = "hub-mode")]
 pub use hub::{ChainEntry, HUB_EVENT_TYPE, Sequenced};
+pub use partial::PartialState;
 
 pub struct Rooms {
     policy_federation: Mutex<Option<std::sync::Weak<crate::federation::Federation>>>,
@@ -301,6 +303,9 @@ pub struct Rooms {
     /// to spin. SPEC §10.3 wants per-room subscriber lists; this is the same
     /// shape at server granularity, which is enough while there is one lock.
     appended: tokio::sync::Notify,
+    /// Rooms joined with `members_omitted` and still resyncing their full
+    /// state (`partial`, MSC3706).
+    partial: partial::PartialRooms,
 }
 
 /// The events around one event, and the state there.
@@ -546,6 +551,7 @@ impl Rooms {
                 stream_high,
             )),
             appended: tokio::sync::Notify::new(),
+            partial: partial::PartialRooms::load(store_for_stream.as_ref()),
         }
     }
 
@@ -1659,7 +1665,7 @@ impl Rooms {
                 || needed.contains(key.state_key())
         };
         let events = match (current, window_start) {
-            (false, Some(start)) => self.state_before(room_id, start, want)?,
+            (false, Some(start)) => self.state_before(room_id, start, timeline, want)?,
             _ => self.state_where(room_id, want)?,
         };
         Ok((events, false))
@@ -1669,6 +1675,14 @@ impl Rooms {
     /// `want` admits: the snapshot after the entry preceding `li`, or an
     /// empty room when nothing precedes it.
     ///
+    /// Plus every slot of the current state that neither that snapshot nor
+    /// a state event in `timeline` accounts for. In an ordinary room there
+    /// is none: a slot is set before the window or in it. A partial-state
+    /// join (MSC3706) makes some: the member events its resync filled in
+    /// are state the room has without any event of its timeline having set
+    /// them, and a window reaching back past the join would otherwise show
+    /// the client neither.
+    ///
     /// Decided on the key before the body is read, as [`Self::state_where`]
     /// does and for the same reason. The snapshot is rebuilt from its
     /// content address rather than taken from the resident window, because
@@ -1677,16 +1691,47 @@ impl Rooms {
         &self,
         room_id: &str,
         li: i64,
+        timeline: &[Value],
         want: impl Fn(&StateKey) -> bool,
     ) -> Result<Vec<Value>, RoomError> {
-        let root = self.with_room_read(room_id, |_, log| {
-            Ok(log
-                .entry_at_or_before(li.saturating_sub(1))
-                .filter(|entry| entry.li.get() < li)
-                .map(|entry| entry.state_root))
+        let (root, current) = self.with_room_read(room_id, |_, log| {
+            Ok((
+                log.entry_at_or_before(li.saturating_sub(1))
+                    .filter(|entry| entry.li.get() < li)
+                    .map(|entry| entry.state_root),
+                log.current_state().cloned(),
+            ))
         })?;
+        let in_window: HashSet<(&str, &str)> = timeline
+            .iter()
+            .filter_map(|event| Some((event["type"].as_str()?, event["state_key"].as_str()?)))
+            .collect();
+        let unexplained = |before: &spindle_core::StateSnapshot| -> Vec<String> {
+            let Some(current) = &current else {
+                return Vec::new();
+            };
+            before
+                .diff(current)
+                .into_iter()
+                .filter(|(key, ours, theirs)| {
+                    ours.is_none()
+                        && theirs.is_some()
+                        && want(key)
+                        && !in_window.contains(&(key.event_type().as_str(), key.state_key()))
+                })
+                .filter_map(|(_, _, theirs)| theirs.map(str::to_owned))
+                .collect()
+        };
         let Some(root) = root else {
-            return Ok(Vec::new());
+            let empty = spindle_core::StateSnapshot::new(spindle_store::ReadView::key_table(
+                self.store.as_ref(),
+            ));
+            let mut events = Vec::new();
+            for event_id in unexplained(&empty) {
+                let event = self.read_event(room_id, &EventId::new(event_id.as_str()))?;
+                events.push(stamp(event, &event_id));
+            }
+            return Ok(events);
         };
         let mut load = |address: &spindle_core::StateRoot| {
             spindle_store::ReadView::get(
@@ -1711,6 +1756,7 @@ impl Rooms {
                 ids.push(event_id.to_owned());
             }
         });
+        ids.extend(unexplained(&snapshot));
         let mut events = Vec::with_capacity(ids.len());
         for event_id in ids {
             let event = self.read_event(room_id, &EventId::new(event_id.as_str()))?;
@@ -3908,7 +3954,15 @@ impl Rooms {
                     } else {
                         self.membership_event(&room_id, user_id)?.map(|(_, li)| li)
                     };
-                    if joined_at.is_some_and(|li| slice.contains(&li)) {
+                    // A partial-state room whose resync completed in the
+                    // window is told afresh too (MSC3706): the members the
+                    // resync filled in were never timeline events, so the
+                    // state block of a fresh room is the only place a
+                    // client can learn of them. An in-memory check, so the
+                    // quiet room still costs no read.
+                    if joined_at.is_some_and(|li| slice.contains(&li))
+                        || self.resynced_between(&room_id, since, until)
+                    {
                         let (events, limited, prev_batch) =
                             self.timeline_tail(&room_id, timeline_limit)?;
                         (events, limited, prev_batch, true)
@@ -6089,6 +6143,29 @@ impl Rooms {
     /// reentrant. Same rule as [`Self::rules_in`], and the same deadlock if
     /// it is broken.
     fn destinations_in(&self, log: &RoomLog, room_id: &str) -> Result<Arc<Vec<String>>, RoomError> {
+        let members = self.member_destinations_in(log, room_id)?;
+        // A partial-state room (MSC3706) holds few member events, so its
+        // members name few servers; the resident's `servers_in_room` names
+        // the rest until the resync brings their members in.
+        let partial = self.partial_servers(room_id);
+        if partial.is_empty() {
+            return Ok(members);
+        }
+        let mut domains: BTreeSet<String> = members.iter().cloned().collect();
+        domains.extend(
+            partial
+                .into_iter()
+                .filter(|domain| *domain != self.server_name),
+        );
+        Ok(Arc::new(domains.into_iter().collect()))
+    }
+
+    /// [`Self::destinations_in`] from the members the room's state holds.
+    fn member_destinations_in(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+    ) -> Result<Arc<Vec<String>>, RoomError> {
         let Some(state) = log.current_state() else {
             return Ok(Arc::new(Vec::new()));
         };
@@ -6421,7 +6498,8 @@ impl Rooms {
     /// because our own current state is exactly what a gap makes stale.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the checks' inputs, each one named by the spec"
+        clippy::too_many_lines,
+        reason = "the checks' inputs, each one named by the spec, and the checks in order"
     )]
     fn receipt_checks(
         &self,
@@ -6454,6 +6532,8 @@ impl Rooms {
         // 1. The auth events. A state-DAG room (MSC4242) carries none: its
         // events are authorized by the state DAG, which 2 checks.
         let version = self.version_in_log(log, room_id)?;
+        let mut named: HashMap<(ruma::events::StateEventType, String), StoredEvent> =
+            HashMap::new();
         if !is_state_dag(&version) {
             let missing = std::cell::Cell::new(false);
             if let Err(why) = ruma::state_res::check_state_independent_auth_rules(
@@ -6476,8 +6556,6 @@ impl Rooms {
                 }
                 return Ok(Some((Sideline::Rejected, format!("auth events: {why}"))));
             }
-            let mut named: HashMap<(ruma::events::StateEventType, String), StoredEvent> =
-                HashMap::new();
             for id in candidate.auth_event_ids() {
                 let Some(event) = fetch(id) else {
                     return Err(RoomError::Append(format!(
@@ -6517,8 +6595,24 @@ impl Rooms {
         }
 
         // 2. The state before the event.
+        //
+        // In a partial-state room (MSC3706) the state lacks most member
+        // events, so a member slot it does not hold is read from the
+        // event's own auth events, which 1 has just verified -- Synapse's
+        // model, minus its resolution: a slot the room does hold, a ban
+        // included, is never overruled by what the event claims
+        // (`partial`).
+        let partial = self.is_partial_state(room_id);
         let by_state = |state: &StateSnapshot, kind: &ruma::events::StateEventType, key: &str| {
-            let id = state.get(&StateKey::new(kind.to_string().as_str(), key))?;
+            let Some(id) = state.get(&StateKey::new(kind.to_string().as_str(), key)) else {
+                if partial && *kind == ruma::events::StateEventType::RoomMember {
+                    return named
+                        .get(&(kind.clone(), key.to_owned()))
+                        .filter(|event| !event.rejected())
+                        .cloned();
+                }
+                return None;
+            };
             fetch(&ruma::OwnedEventId::try_from(id).ok()?).filter(|event| !event.rejected())
         };
         if let Err(why) =
