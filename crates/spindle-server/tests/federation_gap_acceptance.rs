@@ -197,11 +197,13 @@ impl Peer {
 
 /// A fresh app over `store`, serving on a socket of its own: its own
 /// `Rooms`, so every room it touches is cold-loaded from the store.
+/// `federation` is added to the `[federation]` section.
 async fn serve(
     store: &Arc<FjallStore>,
     metrics: &Arc<Metrics>,
+    federation: &str,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-    let config = spindle_server::Config::parse("[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n[federation]\ngap_backfill = false\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n").unwrap();
+    let config = spindle_server::Config::parse(&format!("[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n[federation]\ngap_backfill = false\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n{federation}")).unwrap();
     let app =
         spindle_server::app_with_metrics(config, Arc::clone(store), Arc::clone(metrics)).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -225,6 +227,8 @@ struct Harness {
     state: BTreeMap<(String, String), (String, Value)>,
     address: std::net::SocketAddr,
     task: tokio::task::JoinHandle<()>,
+    /// Added to the app's `[federation]` section, across restarts too.
+    federation: String,
 }
 
 impl Drop for Harness {
@@ -235,6 +239,10 @@ impl Drop for Harness {
 
 impl Harness {
     async fn new(version: u8) -> Self {
+        Self::with_federation(version, "").await
+    }
+
+    async fn with_federation(version: u8, federation: &str) -> Self {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
         let key = ServerKey::load_or_create(store.as_ref()).unwrap();
@@ -278,7 +286,7 @@ impl Harness {
             .collect();
         let version = RoomVersionId::try_from(version.to_string()).unwrap();
         let metrics = Arc::new(Metrics::new());
-        let (address, task) = serve(&store, &metrics).await;
+        let (address, task) = serve(&store, &metrics, federation).await;
         Self {
             _dir: dir,
             store,
@@ -290,6 +298,7 @@ impl Harness {
             state,
             address,
             task,
+            federation: federation.to_owned(),
         }
     }
 
@@ -410,7 +419,7 @@ impl Harness {
         self.task.abort();
         let _ = (&mut self.task).await;
         self.metrics = Arc::new(Metrics::new());
-        let (address, task) = serve(&self.store, &self.metrics).await;
+        let (address, task) = serve(&self.store, &self.metrics, &self.federation).await;
         self.address = address;
         self.task = task;
     }
@@ -652,6 +661,112 @@ async fn a_forged_or_unsigned_state_event_refuses_the_event() {
         assert_eq!(harness.metrics.pdu_count(PduOutcome::RefusedMissingDeps), 1);
         assert_eq!(harness.metrics.pdu_count(PduOutcome::GapAccepted), 0);
     }
+}
+
+/// The forged state event of (c), served by the peer and named by its
+/// `/state_ids` for any event, and the undivulged event after it that a
+/// pushed PDU names as its predecessor.
+fn forge_the_join(harness: &Harness) -> ((String, Value), (String, Value)) {
+    let bob = harness.user("bob");
+    let carol_join = harness.carol_joins(&harness.head);
+    let mut forged = carol_join.1.clone();
+    forged["signatures"][&harness.peer.name][harness.peer.key.key_id()] = json!("invalid");
+    harness.peer.serve(&(carol_join.0.clone(), forged));
+    harness.peer.served.lock().unwrap().state_ids = Some(harness.state_ids(&[&carol_join]));
+    let hidden = harness.message(&bob, &harness.head, &carol_join, "undivulged");
+    (carol_join, hidden)
+}
+
+/// #725: a dependency that failed verification is not fetched again while
+/// it is held. A PDU naming the same unverifiable dependency is refused
+/// with no request to any peer, and PDUs whose gap acceptance meets the
+/// same forged state event do not fetch it again. Before, each PDU did the
+/// whole recovery and gap acceptance again for the same failure.
+#[tokio::test]
+async fn an_unverifiable_dependency_is_fetched_once_while_it_is_held() {
+    let harness = Harness::new(10).await;
+    let bob = harness.user("bob");
+    let carol = harness.user("carol");
+    let (carol_join, hidden) = forge_the_join(&harness);
+    let join_fetches = format!("event:{}", carol_join.0);
+
+    let first = harness.message(&carol, &carol_join, &hidden, "first");
+    let response = harness.push(&[&first]).await;
+    assert!(
+        response["pdus"][&first.0]["error"].is_string(),
+        "{response}"
+    );
+    assert_eq!(harness.peer.calls(&join_fetches), 1);
+    assert_eq!(harness.metrics.gap_count(GapResult::Invalid), 1);
+    let requests = harness.peer.calls("");
+
+    // The same unverifiable dependencies: no request to any peer at all.
+    for index in 0..3 {
+        let again = harness.message(&carol, &carol_join, &hidden, &format!("again {index}"));
+        let response = harness.push(&[&again]).await;
+        let error = response["pdus"][&again.0]["error"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(error.contains("failed verification recently"), "{response}");
+    }
+    assert_eq!(harness.peer.calls(""), requests, "no outbound request");
+    assert_eq!(
+        harness
+            .metrics
+            .recovery_count(RecoveryResult::NegativeCached),
+        3
+    );
+    assert_eq!(harness.metrics.gap_count(GapResult::Invalid), 1);
+
+    // Other missing predecessors, so recovery and `/state_ids` run, but the
+    // forged join that state names is not fetched from this peer again.
+    for index in 0..3 {
+        let other = harness.message(&bob, &harness.head, &carol_join, &format!("other {index}"));
+        let next = harness.message(&bob, &harness.head, &other, &format!("next {index}"));
+        let response = harness.push(&[&next]).await;
+        assert!(response["pdus"][&next.0]["error"].is_string(), "{response}");
+    }
+    assert_eq!(harness.peer.calls("state_ids"), 4);
+    assert_eq!(harness.peer.calls(&join_fetches), 1, "fetched once");
+    assert_eq!(harness.metrics.gap_count(GapResult::Invalid), 4);
+    assert_eq!(harness.metrics.pdu_count(PduOutcome::RefusedMissingDeps), 7);
+    assert!(!harness.held(&carol_join.0));
+}
+
+/// #725: the entry expires, and the next PDU naming the dependency is
+/// judged in full again: its recovery and gap acceptance fetch the forged
+/// join a second time.
+#[tokio::test]
+async fn an_unverifiable_dependency_is_fetched_again_after_it_expires() {
+    let harness = Harness::with_federation(10, "dependency_failure_ttl_secs = 1\n").await;
+    let carol = harness.user("carol");
+    let (carol_join, hidden) = forge_the_join(&harness);
+    let join_fetches = format!("event:{}", carol_join.0);
+
+    let first = harness.message(&carol, &carol_join, &hidden, "first");
+    let response = harness.push(&[&first]).await;
+    assert!(
+        response["pdus"][&first.0]["error"].is_string(),
+        "{response}"
+    );
+    assert_eq!(harness.peer.calls(&join_fetches), 1);
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let again = harness.message(&carol, &carol_join, &hidden, "after expiry");
+    let response = harness.push(&[&again]).await;
+    let error = response["pdus"][&again.0]["error"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(error.contains("gap acceptance failed"), "{response}");
+    assert_eq!(harness.peer.calls(&join_fetches), 2, "fetched again");
+    assert_eq!(harness.peer.calls("state_ids"), 2);
+    assert_eq!(
+        harness
+            .metrics
+            .recovery_count(RecoveryResult::NegativeCached),
+        0
+    );
+    assert_eq!(harness.metrics.gap_count(GapResult::Invalid), 2);
 }
 
 /// The event itself is still judged: a sender the peer's state does not

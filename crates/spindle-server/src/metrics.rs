@@ -117,16 +117,20 @@ pub enum RecoveryResult {
     Timeout,
     /// What the peer sent failed verification or authorization.
     Invalid,
+    /// Not attempted: the event names a dependency that failed verification
+    /// within `dependency_failure_ttl_secs`, so it was refused at once (#725).
+    NegativeCached,
 }
 
 impl RecoveryResult {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Recovered,
         Self::BudgetExceeded,
         Self::PeerError,
         Self::RateLimited,
         Self::Timeout,
         Self::Invalid,
+        Self::NegativeCached,
     ];
 
     fn label(self) -> &'static str {
@@ -137,6 +141,7 @@ impl RecoveryResult {
             Self::RateLimited => "rate_limited",
             Self::Timeout => "timeout",
             Self::Invalid => "invalid",
+            Self::NegativeCached => "negative_cached",
         }
     }
 }
