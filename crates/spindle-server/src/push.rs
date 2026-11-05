@@ -176,7 +176,18 @@ impl Gateway {
             .body(body.to_string())
             .send()
             .await
-            .map_err(|error| Failure::Transient(error.to_string()))?;
+            .map_err(|error| {
+                // Not `error.to_string()`: reqwest quotes the whole URL in
+                // it, and the caller logs this text.
+                let kind = if error.is_timeout() {
+                    "timed out"
+                } else if error.is_connect() {
+                    "could not connect"
+                } else {
+                    "request failed"
+                };
+                Failure::Transient(kind.to_owned())
+            })?;
         let status = response.status();
         if status.is_success() {
             let answer: Value = response
@@ -354,10 +365,19 @@ async fn send_batches(
                     }
                 }
                 Err(Failure::Permanent(why)) => {
-                    tracing::debug!("push to {url} dropped: {why}");
+                    // Warn, not debug: the one question an operator asks of
+                    // push is why a phone was not told, and a dropped
+                    // notification is the answer. Only the host is logged:
+                    // a UnifiedPush gateway URL carries the device's topic,
+                    // which is as good as a credential.
+                    tracing::warn!("push to {} dropped: {why}", gateway_host(&url));
                 }
                 Err(Failure::Transient(why)) => {
-                    tracing::debug!("push to {url}: {why}");
+                    tracing::warn!(
+                        "push to {} failed, attempt {}: {why}",
+                        gateway_host(&url),
+                        pending.attempts + 1
+                    );
                     // The one that failed goes back first, then what
                     // was behind it, in order, and the gateway waits.
                     pending.attempts += 1;
@@ -377,6 +397,16 @@ async fn send_batches(
         }
     }
     removals
+}
+
+/// The host of a gateway URL, for a log line. The path, query and any
+/// `user:password@` part are left out: they can identify the device or be
+/// a credential, and a log is read by more people than the store is.
+fn gateway_host(url: &str) -> String {
+    url.parse::<reqwest::Url>()
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "an unparseable address".to_owned())
 }
 
 /// The room facts the rules ask about, gathered once per room per pass.
@@ -732,6 +762,19 @@ mod tests {
                 .vet_url("http://127.0.0.1:9000/_matrix/push/v1/notify")
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn a_gateway_is_named_in_the_log_by_its_host_alone() {
+        assert_eq!(
+            gateway_host("https://push.example.org/_matrix/push/v1/notify?topic=secret"),
+            "push.example.org"
+        );
+        assert_eq!(
+            gateway_host("https://user:hunter2@push.example.org:8443/_matrix/push/v1/notify"),
+            "push.example.org"
+        );
+        assert_eq!(gateway_host("not a url"), "an unparseable address");
     }
 
     #[test]
