@@ -233,6 +233,7 @@ The risks that would invalidate the headline claim are enumerated in
 | [docs/mscs.md](docs/mscs.md) | Every MSC served, partly served, planned or declined — generated from the ledger CI holds to the code |
 | [docs/spec-gaps.md](docs/spec-gaps.md) | What the pinned Matrix spec defines that the router does not serve, by the version that added it |
 | [docs/maintenance.md](docs/maintenance.md) | Keeping up: the gates, the ratchets, the weekly upkeep report, and how a spec release or an MSC is absorbed |
+| [docs/releasing.md](docs/releasing.md) | When the release workflow cuts a tag, what a release contains, and how to check a build |
 
 ---
 
@@ -251,9 +252,10 @@ so there is no database to provision.
 
 CI gates on all of the above plus the Complement ratchet, a config-drift check,
 a generated-dashboard drift check, and pinned-action and benchmark-tooling
-checks. CONTRIBUTING.md has the longer version, and docs/releasing.md what a
-tag does. New performance work is expected to arrive with a counting assertion
-rather than a timing one, for the reason given above.
+checks. [CONTRIBUTING.md](CONTRIBUTING.md) has the longer version, and
+[docs/releasing.md](docs/releasing.md) tells what a tag does. New performance
+work is expected to arrive with a counting assertion rather than a timing one,
+for the reason given above.
 
 ## License
 
