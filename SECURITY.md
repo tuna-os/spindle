@@ -11,81 +11,77 @@ homeserver produces that an installer or an image does not.
 
 **Do not open a public issue for a vulnerability.**
 
-1. Open **Security → Report a vulnerability** on this repository and
-   describe the affected route or component, a minimal reproduction, the
-   impact, and a suggested fix if you have one.
-2. The repository accepts private reports. If the button is unavailable to you,
-   open an ordinary issue titled `security contact request` with
-   **no details in it**. A maintainer will open a private advisory and add
-   you to it, and the conversation continues there.
+1. Open **Security → Report a vulnerability** on this repository.
+   Include the affected route or component, a minimal reproduction, and the
+   impact. Include a suggested fix if you have one.
+2. The repository accepts private reports. If the button is unavailable, open
+   an ordinary issue titled `security contact request`. Include **no details**
+   in it. A maintainer will open a private advisory, add you, and continue the
+   conversation there.
 
-The organisation's fallback (a draft advisory in `tuna-os/tunaos`) needs
-write access to that repository, so it is not a route for an outside
-reporter; the request issue above is.
+Outside reporters cannot use the organisation's fallback draft advisory in
+`tuna-os/tunaos` because it needs write access. Use the request issue above.
 
 ## What to report
 
-The classes this codebase produces, most likely first. Two of the first
-have already shipped and were found by reading (#257, #258), which is why
-#268 exists.
+The classes this codebase produces, most likely first. Reviewers found two of
+the first flaws after release (#257, #258), which is why #268 exists.
 
-- **Authorization bypass.** Any room read (timeline, state, members,
-  context, search, media in a room) served to an account that is not a
-  member or that has left; any admin route reachable without the admin
-  flag; history visibility not honoured for a former member.
-- **Federation.** An `X-Matrix` request accepted with a bad or missing
-  signature; an event accepted whose signature, content hash or sender
-  domain does not check out, or verified against a key outside its
-  validity window; a peer that is not in a room reading or writing it;
-  `send_join`/`send_leave` accepting an event other than the one we
+- **Authorization bypass.** Report any room read that serves an account
+  without current membership. Room reads include timelines, state, members,
+  context, search, and media in a room. Report any admin route without an
+  admin-flag check. Report failures to honor history visibility for former
+  members.
+- **Federation.** Report any accepted `X-Matrix` request with a bad or missing
+  signature. Report an event with an invalid signature, content hash, or sender
+  domain. Also report verification against a key outside its validity window.
+  Report peers that can read or write a room without membership. Report
+  `send_join` or `send_leave` if it accepts a different event than Spindle
   signed.
-- **Cross-account disclosure.** One user's account data, devices, keys,
-  to-device messages, receipts, pushers or search hits reaching another.
-- **Unauthenticated resource exhaustion.** A walk or a write whose cost a
-  peer or an unauthenticated client controls without bound: an
-  endpoint missing from the rate limiter, per-user or per-peer state
-  that grows without a cap, a backfill or key fetch a stranger can make
-  us repeat.
-- **Authentication.** Access-token or session handling, the built-in
-  OIDC provider, delegated authentication, appservice namespace escapes,
-  password and registration flows.
-- **Outbound requests.** Anything that reaches an internal address
-  through URL previews, federated media, key fetches or well-known
-  discovery despite `netguard`.
+- **Cross-account disclosure.** Report account data, devices, keys, to-device
+  messages, receipts, pushers, or search results that reach another user.
+- **Unauthenticated resource exhaustion.** Report unbounded work that a peer or
+  unauthenticated client controls. Examples include an endpoint absent from the
+  rate limiter and per-user or per-peer state without a cap. Also report
+  backfill or key fetches that a stranger can force Spindle to repeat.
+- **Authentication.** Report flaws in access tokens, sessions, the built-in
+  OIDC provider, delegated authentication, appservice namespaces, passwords,
+  or registration flows.
+- **Outbound requests.** Report internal-address access through URL previews,
+  federated media, key fetches, or well-known discovery despite `netguard`.
 
 The organisation's classes (supply chain, CI secrets, container images)
 apply to this repository's workflows and images as well.
 
 ## Disclosure
 
-We aim to acknowledge a report within **5 business days**, as the
-organisation's policy says, and to fix on `main` as fast as the fix can
-be made sound. We ask for a coordinated window of up to **90 days** from
-acknowledgement before details are published, shorter once the fix has
-landed.
+We aim to acknowledge a report within **5 business days**, per the
+organisation's policy. We aim to commit a sound fix to `main` quickly. We ask
+for a coordinated window of up to **90 days** from acknowledgement before
+public disclosure. We can shorten the window after the fix lands.
 
 The supported release line is **v0.1.x**; the first release is v0.1.0. Operators
-must run the newest patch in that line. Maintainers develop security fixes on
-`main` and include them in the next v0.1.x release. Advisories name the fix
-commit and first release with it. Older v0.0.x builds receive no
-backports. The line remains a prerelease: storage migrations
-can need downtime. Backup-based rollback is documented in `docs/lifecycle.md`.
+must run the newest patch in that line. Maintainers prepare each fix on `main`
+and add it to the next v0.1.x release. Advisories name the fix commit and first
+release with it. Older v0.0.x builds receive no backports.
+
+The line remains a prerelease, and storage migrations can need downtime.
+`docs/lifecycle.md` documents backup-based rollback.
 
 ## Scope
 
-In scope: this repository, the server it builds, the container image and
-the workflows that build them. Out of scope: the clients and libraries we
-depend on (Element, ruma, fjall, axum and the rest); report those to their
-maintainers, and tell us if Spindle's use of them is what makes the
-problem reachable.
+In scope: this repository, its server, its container image, and its build
+workflows. Clients and dependent libraries are out of scope. Examples include
+Element, ruma, fjall, and axum. Report those flaws to their maintainers. Tell us
+if Spindle's use of them makes a problem reachable.
 
 ## Finding these yourself
 
-- `scripts/authorization-rule.py` is the CI check that every room read
-  in the route table asks who is asking, and `.semgrep/room-authorization.yaml`
-  is the shape it looks for.
+- `scripts/authorization-rule.py` checks that each room-read route identifies
+  the requester. `.semgrep/room-authorization.yaml` defines the required
+  pattern.
 - `crates/spindle-server/tests/room_read_authorization.rs` and
-  `room_route_authorization.rs` are the tests that pin the gates; a new
-  bypass should come with a new case there.
-- #268 is the standing audit of the authorization surface, and the
-  intake counterpart of this document.
+  `room_route_authorization.rs` contain the tests that pin the gates. Add a test
+  case there for each new bypass.
+- Issue #268 tracks the authorization audit and is this document's intake
+  counterpart.
