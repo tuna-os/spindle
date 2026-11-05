@@ -22,6 +22,7 @@ artefact still tell the truth about the code":
 | `spec-drift.py --check` | `docs/spec-gaps.md`: what the pinned spec defines that the router does not serve | `just regen` |
 | `msc-ledger.py --check` | `docs/mscs.md`, and that `/versions`' flags and the `unstable/` routes are all owned by a served entry in `contrib/msc/ledger.toml` with a test naming the MSC | `just regen` after editing the ledger |
 | `upstream-pins.py --check` | that every hand-pinned upstream can still be read from its file | fix the regex or the file |
+| `ruma-drift.py --check` | `vendor/ruma-state-res` is its crates.io base plus exactly the hunks `SPINDLE-PATCH.md` lists | §8; `ruma-drift.py --hunks` prints the rows |
 | `openapi-check.py` | every response the scripted client gets validates against the pinned spec's schema | `scripts/openapi-allowlist.txt` for an explained divergence |
 | `readme-numbers.py --check` | the README's headline counts are the gated ones | `just regen` |
 | `config-drift.py` | the example config names every setting | edit `spindle.example.toml` |
@@ -61,7 +62,7 @@ reproductions of what the suite found.
 ## 3. The weekly upkeep report
 
 `upkeep.yml` runs on Mondays and edits one issue labelled `upkeep`. Locally,
-`just upkeep` prints the same three reports:
+`just upkeep` prints the same four reports:
 
 **Pins behind upstream** (`upstream-pins.py --upstream`). Every upstream
 this repository pins by hand, read from the file that uses it, against the
@@ -79,7 +80,20 @@ closed unmerged is one to stop planning for.
 `main`). The operations that differ between the pinned spec and today's
 main, so the size of the next release's work is known before the bump.
 
-Nothing in the report is acted on automatically. Bumping a pin is §4.
+**The vendored state resolver against upstream** (`ruma-drift.py
+--upstream`). `vendor/ruma-state-res` is a patched copy of a release. The
+patch has no upstream path (ADR 0006). Dependabot cannot see this copy, so
+no other job tells us about a ruma fix to state resolution.
+
+The report compares the `src/` of the newest crates.io release with the
+vendored base, hunk by hunk. It marks the files that Spindle's patch also changes.
+A released change is *drift*: the report says so and the script exits 1.
+Rebase per §8. The report also compares ruma's `main`, as a warning only:
+`main` moves daily, and an unreleased change can change again before
+release.
+
+The report does not start an action. A person decides; §4 tells how to
+bump a pin.
 
 ## 4. Bumping a pin
 
@@ -97,7 +111,8 @@ show what the bump changed. What to expect from each:
 Two pins are deliberately not automated: `rust-toolchain.toml` (the MSRV
 moves on its own decision, #193) and `ruma` (ADR-0002: the room-version,
 redaction and authorization rules are taken from ruma and a bump is read as
-a protocol change, not a dependency update).
+a protocol change, not a dependency update). The weekly report covers the
+vendored `ruma-state-res`, and a person rebases it by hand, §8.
 
 ## 5. Absorbing a spec release
 
@@ -161,3 +176,58 @@ list of the present.
 - **Scope.** The spec-gaps page lists everything unserved and gates on
   nothing but its own accuracy. Which of it to build is the roadmap's
   decision, made in an issue where the reasons are written down.
+
+## 8. Rebase vendor/ruma-state-res
+
+`vendor/ruma-state-res` is a release of ruma-state-res plus the hunks its
+`SPINDLE-PATCH.md` lists, each with the reason it exists (ADR 0006 says why
+the patch cannot go upstream). `ruma-drift.py --check` holds the tree to
+that list on every pull request, so the patch cannot grow without a
+reviewed edit to the table. When the upkeep report says a release changed
+`src/`, the rebase is its own pull request:
+
+1. **Read the drift.** The report's hunks are upstream's change to state
+   resolution. Read each file that the report marks "Spindle patches this
+   file" first. Upstream's change can make a hunk unnecessary. Drop that
+   hunk; do not carry it.
+2. **Rebase in git, not by eye.** Commit the old base. Commit the vendored
+   tree on top of it, and the new release beside it. Then let
+   `git rebase` do the three-way merge. From the repository root:
+
+   ```sh
+   repo=$PWD old=0.18.0 new=0.19.0   # the base, and the release the report names
+   work=$(mktemp -d)
+   for v in $old $new; do
+     curl -sSfL -A spindle -o "$work/$v.crate" \
+       "https://static.crates.io/crates/ruma-state-res/ruma-state-res-$v.crate"
+   done
+   sha256sum "$work"/*.crate   # $old: SPINDLE-PATCH.md's; $new: crates.io's `checksum` for it
+   git init -q -b base "$work/tree" && cd "$work/tree"
+   tar xzf "../$old.crate" --strip-components=1 && git add -A && git commit -qm "ruma-state-res $old"
+   git switch -qc spindle
+   git rm -rq . && cp -a "$repo/vendor/ruma-state-res/." . && git add -A && git commit -qm "Spindle patch"
+   git switch -q base
+   git rm -rq . && tar xzf "../$new.crate" --strip-components=1 && git add -A && git commit -qm "ruma-state-res $new"
+   git switch -q spindle && git rebase base   # a conflict is a hunk upstream touched
+   ```
+
+   Resolve each conflict by the intent of its table row, not by line.
+   For a `Cargo.lock` conflict, take upstream's file. The test build in
+   step 5 makes it again. Then copy the result back:
+   `rm -rf "$repo/vendor/ruma-state-res" && mkdir "$repo/vendor/ruma-state-res"
+   && git archive HEAD | tar x -C "$repo/vendor/ruma-state-res"`.
+3. **Record the new base.** In `SPINDLE-PATCH.md`: the version, the crate
+   checksum, and the upstream commit from the new crate's
+   `.cargo_vcs_info.json`. The vendored `Cargo.toml` carries the version,
+   which is where the script reads it from.
+4. **Rewrite the table.** `ruma-drift.py --hunks` prints the rows for the
+   new tree. It keeps the reason of each row that did not change. A row
+   with an empty reason moved or is new: write its reason. Then
+   `ruma-drift.py --check` passes and `--upstream` reports no drift.
+5. **Test.** Run upstream's tests with the patch
+   (`cargo test --manifest-path vendor/ruma-state-res/Cargo.toml`). Then
+   run Spindle's tests for state resolution, imported rejections and room
+   recovery, the gates ADR 0006 names. Then run
+   `cargo update -p ruma-state-res` to update the workspace lock.
+   Put the drift section of the report in the pull request description.
+   The reviewer then reads the upstream change next to the rebased patch.
