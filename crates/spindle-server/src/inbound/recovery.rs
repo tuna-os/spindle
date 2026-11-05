@@ -26,8 +26,9 @@ use ruma::{CanonicalJsonValue, RoomVersionId};
 use serde_json::{Value, json};
 
 use crate::AppState;
+use crate::blocking::spawn_detached;
 use crate::federation::{Federation, FederationError, PeerKeys};
-use crate::metrics::{FetchKind, GapResult, Metrics, PduOutcome, RecoveryResult};
+use crate::metrics::{BlockingTask, FetchKind, GapResult, Metrics, PduOutcome, RecoveryResult};
 use crate::rooms::{RoomError, Rooms};
 use crate::signing::ServerKey;
 
@@ -132,8 +133,9 @@ type CooldownKey = (String, String, Endpoint);
 type FailedKey = (String, Option<String>);
 
 /// Per-room single flight for dependency recovery, the peers this server
-/// is leaving alone after they answered 429, and the dependencies that
-/// failed verification lately.
+/// is leaving alone after they answered 429, the dependencies that
+/// failed verification lately, and the turns inbound transactions take at
+/// room work.
 ///
 /// Process-local on purpose: all of it is about requests made right now.
 /// A restart forgets them, which costs at most one more request per peer.
@@ -153,6 +155,8 @@ pub struct RecoveryGate {
     failed: Mutex<HashMap<String, HashMap<FailedKey, Instant>>>,
     /// How long an entry of `failed` holds. Zero turns the cache off.
     failure_ttl: Duration,
+    /// [`super::INGEST_SLOTS`] turns at room work (`blocking` says why).
+    ingest: tokio::sync::Semaphore,
 }
 
 impl RecoveryGate {
@@ -166,7 +170,17 @@ impl RecoveryGate {
             gap_admissions: Mutex::default(),
             failed: Mutex::default(),
             failure_ttl: failure_ttl.min(MAX_FAILURE_TTL),
+            ingest: tokio::sync::Semaphore::new(super::INGEST_SLOTS),
         }
+    }
+
+    /// Wait for a turn at inbound room work. The wait is a task waiting,
+    /// not a thread, and the semaphore is fair, so a backlog drains in
+    /// arrival order. The permit is the turn.
+    pub(super) async fn ingest_turn(
+        &self,
+    ) -> Result<tokio::sync::SemaphorePermit<'_>, tokio::sync::AcquireError> {
+        self.ingest.acquire().await
     }
 
     /// Wait for this room's turn to recover. The guard is the turn.
@@ -824,7 +838,9 @@ async fn judge(
     // The rest runs as its own task, so a sending server that gives up on
     // the transaction does not cancel a recovery halfway: the work finishes,
     // and the transaction's retry finds the event already placed. It holds
-    // the room's turn for as long as it runs.
+    // the room's turn for as long as it runs. A blocking-pool task rather
+    // than a spawned one: it ingests what it fetched and resolves state
+    // over it, which on a worker held that worker for as long (#614).
     let id = event.id.clone();
     let task = {
         let state = state.clone();
@@ -844,7 +860,8 @@ async fn judge(
             outcome
         }
     };
-    match tokio::spawn(task).await {
+    let metrics = Arc::clone(&state.metrics);
+    match spawn_detached(metrics, BlockingTask::FederationCatchUp, task).await {
         Ok((outcome, result)) => (id, outcome, result),
         Err(error) => (
             id,

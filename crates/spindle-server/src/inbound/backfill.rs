@@ -330,16 +330,30 @@ pub async fn run(sources: Sources, settings: Settings) {
             let Some(due) = next_due(&live) else {
                 break;
             };
-            let peers = Peers {
-                rooms: &live.rooms,
-                federation: &live.federation,
-                key: &live.key,
-                server_name: &sources.server_name,
-                metrics: &live.metrics,
-                recovery: &live.recovery,
-            };
-            Box::pin(step(&peers, &live.backfill, &due, settings)).await;
-            drop(live);
+            // The chunk on the blocking pool: it verifies and ingests up to
+            // a chunk of events and resolves state over them, synchronous
+            // work that on a worker held the worker for as long (#614).
+            // Awaited, so the loop still does one chunk at a time.
+            let server_name = sources.server_name.clone();
+            let metrics = Arc::clone(&live.metrics);
+            // A chunk that panicked is logged where the panic is caught, and
+            // its gap stays open for the next pass, after the same pause.
+            let _ = crate::blocking::offload_async(
+                metrics,
+                crate::metrics::BlockingTask::FederationCatchUp,
+                move || async move {
+                    let peers = Peers {
+                        rooms: &live.rooms,
+                        federation: &live.federation,
+                        key: &live.key,
+                        server_name: &server_name,
+                        metrics: &live.metrics,
+                        recovery: &live.recovery,
+                    };
+                    Box::pin(step(&peers, &live.backfill, &due, settings)).await;
+                },
+            )
+            .await;
             tokio::time::sleep(settings.interval).await;
         }
     }

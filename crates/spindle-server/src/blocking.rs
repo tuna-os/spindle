@@ -25,6 +25,15 @@
 //!
 //! Either way the work still happens and still takes as long; what changes
 //! is that it no longer takes the rest of the server with it.
+//!
+//! Both draw on one finite pool, and [`section`] needs a free thread
+//! before it can let go of its worker: the hand-off is itself a pool task.
+//! With every pool thread waiting on a busy room, a worker that reaches a
+//! contended lock waits for a thread that does not come, and keeps its
+//! queue while it waits; two such workers and nothing is polled at all.
+//! So work that arrives faster than it can finish -- a federation backlog
+//! -- is admitted a bounded number at a time (`inbound::INGEST_SLOTS`),
+//! and the rest waits as tasks, not as threads.
 
 use std::sync::Arc;
 
@@ -144,5 +153,35 @@ where
             "M_UNKNOWN",
             "internal error".to_owned(),
         )
+    })
+}
+
+/// [`offload_async`], as a task of its own that outlives its caller.
+///
+/// For work that must finish once begun even if whoever started it stops
+/// waiting: a dependency recovery, which a peer that gives up on its
+/// transaction must not cancel halfway. A blocking-pool task runs to the
+/// end whether or not its handle is awaited, as a spawned task does, but
+/// its synchronous stretches -- the ingest of what it fetched, state
+/// resolution over it -- hold a pool thread rather than an async worker.
+///
+/// On the current-thread runtime it is a plain [`tokio::spawn`], for the
+/// reason [`offload_async`] runs in place there.
+pub fn spawn_detached<F>(
+    metrics: Arc<Metrics>,
+    task: BlockingTask,
+    work: F,
+) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let handle = tokio::runtime::Handle::current();
+    if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+        return tokio::spawn(work);
+    }
+    tokio::task::spawn_blocking(move || {
+        let _in_flight = metrics.blocking_started(task);
+        handle.block_on(work)
     })
 }

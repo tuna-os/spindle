@@ -35,6 +35,27 @@ pub use recovery::RecoveryGate;
 pub use resync::Sources as ResyncSources;
 pub(crate) use resync::run as run_resync;
 
+/// How many inbound transactions do their room work at once (#614).
+///
+/// A server back from an outage meets every peer's backlog at once: one
+/// transaction in flight from each of hundreds of servers, most of them
+/// carrying events for the same few busy rooms. Each runs on a
+/// blocking-pool thread, and each waits there for the room the one before
+/// it holds. Admitted all at once they fill the pool -- after which a
+/// worker that reaches a contended room lock cannot hand its queue on and
+/// `/health` is never polled (`blocking` has the mechanics) -- and on the
+/// two cores a pod is given they share the CPU hundreds of ways with the
+/// workers that answer probes. Admitted this many at a time, the others
+/// wait as async tasks, holding no thread and no core, and are taken in
+/// arrival order.
+///
+/// Sixteen keeps the busy threads a small fraction of the pool's 512 and a
+/// few per core, while leaving room to overlap one transaction's network
+/// waits -- keys, missing events -- with another's room work. A room
+/// takes one writer at a time whatever this says, so more slots would add
+/// waiting threads, not throughput.
+pub const INGEST_SLOTS: usize = 16;
+
 /// Say that a peer's event was refused, and name what it was refused over.
 ///
 /// Otherwise this is silent. The transaction still answers 200 -- one bad
@@ -521,6 +542,10 @@ pub(crate) async fn send_transaction(
         })?)
     };
 
+    // A turn before any room work, held until the EDUs are applied too:
+    // receipts and presence touch rooms as PDUs do.
+    let _turn = ingest_turn(&state).await?;
+
     // Off the async workers: ingesting a backlog into a large room is
     // seconds of synchronous work per PDU -- cold loads, state resolution
     // -- and #614's liveness failures were four of these at once holding
@@ -595,6 +620,17 @@ pub(crate) async fn send_transaction(
     .map_err(|error| MatrixError::internal(&error.to_string()))?;
     state.rooms.wake_sync_waiters();
     Ok(Json(response))
+}
+
+/// A turn at inbound room work ([`INGEST_SLOTS`] at once), from the gate
+/// (`RecoveryGate::ingest_turn`).
+async fn ingest_turn(state: &AppState) -> Result<tokio::sync::SemaphorePermit<'_>, MatrixError> {
+    // Never closed, so this cannot fail; said rather than unwrapped.
+    state
+        .recovery
+        .ingest_turn()
+        .await
+        .map_err(|_| MatrixError::internal("inbound admission closed"))
 }
 
 /// Apply one inbound `m.presence` EDU (`presence::Presence::apply_edu`).
