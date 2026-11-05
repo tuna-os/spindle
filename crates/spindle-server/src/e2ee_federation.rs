@@ -14,9 +14,14 @@
 //! Nothing here reads plaintext. Keys and messages are stored and relayed
 //! as the clients uploaded them.
 
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::time::Duration;
+
 use axum::Json;
 use axum::http::StatusCode;
 use serde_json::{Value, json};
+use tokio::time::Instant;
 
 use crate::AppState;
 use crate::errors::MatrixError;
@@ -613,17 +618,63 @@ pub(crate) fn queue_remote_to_device(
     }
 }
 
-/// Ask each remote server for its users' device keys, merging the answers
-/// into the client's response. A server that does not answer is listed
-/// under `failures`, and its users' keys come from this server's last copy
-/// of them if there is one.
-pub(crate) async fn query_remote_keys(
+/// How long `/keys/query` and `/keys/claim` wait for other servers when
+/// the client does not say: the spec's default `timeout`.
+const DEFAULT_REMOTE_KEYS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The longest `timeout` a client can ask for. Each request to a peer
+/// gives up after 30 s on its own, so a longer wait buys nothing; the cap
+/// also keeps `now + timeout` from overflowing an `Instant`.
+const MAX_REMOTE_KEYS_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How many peers one client request asks at the same time: enough that
+/// a query naming every server in a large room waits about one round
+/// trip, few enough that one request cannot open an unbounded number of
+/// connections.
+const REMOTE_KEYS_CONCURRENCY: usize = 64;
+
+/// When a `/keys/query` or `/keys/claim` stops waiting for other servers:
+/// the client's `timeout` in milliseconds from now, or the spec's 10 s.
+/// A value that is not a non-negative integer counts as absent: the field
+/// was ignored until #723, and a client that sent something odd must not
+/// start to get errors for it.
+pub(crate) fn remote_keys_deadline(timeout: Option<&Value>) -> Instant {
+    let wait = timeout
+        .and_then(Value::as_u64)
+        .map_or(DEFAULT_REMOTE_KEYS_TIMEOUT, Duration::from_millis)
+        .min(MAX_REMOTE_KEYS_TIMEOUT);
+    Instant::now() + wait
+}
+
+/// Which `user/keys/*` request a client's request becomes for each peer.
+#[derive(Clone, Copy)]
+enum KeysRequest {
+    Query,
+    Claim,
+}
+
+impl KeysRequest {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Query => "keys/query",
+            Self::Claim => "keys/claim",
+        }
+    }
+}
+
+/// One server's part of a client's request, and what came of it.
+struct PeerAnswer {
+    server: String,
+    users: Arc<serde_json::Map<String, Value>>,
+    answer: Result<Value, String>,
+}
+
+/// A client's request for users on other servers, one part per server.
+fn by_remote_server(
     state: &AppState,
     requested: &serde_json::Map<String, Value>,
-    response: &mut serde_json::Map<String, Value>,
-) {
-    let mut by_server: std::collections::BTreeMap<String, serde_json::Map<String, Value>> =
-        std::collections::BTreeMap::new();
+) -> BTreeMap<String, serde_json::Map<String, Value>> {
+    let mut by_server: BTreeMap<String, serde_json::Map<String, Value>> = BTreeMap::new();
     for (user_id, wanted) in requested {
         if let Some(domain) = domain_of(user_id)
             && domain != state.config.server.name
@@ -634,8 +685,122 @@ pub(crate) async fn query_remote_keys(
                 .insert(user_id.clone(), wanted.clone());
         }
     }
-    for (server, ask) in by_server {
-        match state.federation.remote_keys_query(&server, &ask).await {
+    by_server
+}
+
+/// Ask every server in `by_server` its part, all at once (up to
+/// [`REMOTE_KEYS_CONCURRENCY`]), and stop waiting at `deadline`.
+///
+/// One after another, the client waited for the sum of every peer's
+/// latency, and each dead peer added its whole 30 s request timeout
+/// (#723). Asked together, the wait is the slowest answer, cut off at the
+/// client's deadline; a peer still silent then is a failure like any
+/// other. A peer the outbox is backing off from because it gave no
+/// answer at all is not asked: it would most likely spend the whole
+/// deadline saying nothing.
+async fn ask_peers(
+    state: &AppState,
+    kind: KeysRequest,
+    by_server: BTreeMap<String, serde_json::Map<String, Value>>,
+    deadline: Instant,
+) -> Vec<PeerAnswer> {
+    let mut answers = Vec::with_capacity(by_server.len());
+    let mut waiting = by_server.into_iter();
+    // What each request in flight is for, by task: a task that panicked
+    // still has to be reported as that server's failure.
+    let mut asking: HashMap<tokio::task::Id, (String, Arc<serde_json::Map<String, Value>>)> =
+        HashMap::new();
+    let mut requests = tokio::task::JoinSet::new();
+    loop {
+        while requests.len() < REMOTE_KEYS_CONCURRENCY
+            && let Some((server, users)) = waiting.next()
+        {
+            let users = Arc::new(users);
+            if state.federation.unreachable_backing_off(&server) {
+                answers.push(PeerAnswer {
+                    server,
+                    users,
+                    answer: Err("not asked: the server did not answer recently".to_owned()),
+                });
+                continue;
+            }
+            if Instant::now() >= deadline {
+                answers.push(PeerAnswer {
+                    server,
+                    users,
+                    answer: Err("not asked before the request's timeout".to_owned()),
+                });
+                continue;
+            }
+            let federation = Arc::clone(&state.federation);
+            let destination = server.clone();
+            let ask = Arc::clone(&users);
+            let task = requests.spawn(async move {
+                let started = Instant::now();
+                let request = async {
+                    match kind {
+                        KeysRequest::Query => {
+                            federation.remote_keys_query(&destination, &ask).await
+                        }
+                        KeysRequest::Claim => {
+                            federation.remote_keys_claim(&destination, &ask).await
+                        }
+                    }
+                };
+                let answer = match tokio::time::timeout_at(deadline, request).await {
+                    Ok(Ok(answer)) => Ok(answer),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(_) => Err("no answer within the request's timeout".to_owned()),
+                };
+                // Per peer, so a slow request can be traced to the server
+                // that made it slow.
+                tracing::debug!(
+                    server = destination,
+                    elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    answered = answer.is_ok(),
+                    "{}: peer asked",
+                    kind.name(),
+                );
+                answer
+            });
+            asking.insert(task.id(), (server, users));
+        }
+        let Some(joined) = requests.join_next_with_id().await else {
+            break;
+        };
+        let (id, answer) = match joined {
+            Ok((id, answer)) => (id, answer),
+            Err(error) => (error.id(), Err(format!("the request failed: {error}"))),
+        };
+        if let Some((server, users)) = asking.remove(&id) {
+            answers.push(PeerAnswer {
+                server,
+                users,
+                answer,
+            });
+        }
+    }
+    answers
+}
+
+/// Ask each remote server for its users' device keys, merging the answers
+/// into the client's response. A server that does not answer by
+/// `deadline` is listed under `failures`, and its users' keys come from
+/// this server's last copy of them if there is one.
+pub(crate) async fn query_remote_keys(
+    state: &AppState,
+    requested: &serde_json::Map<String, Value>,
+    deadline: Instant,
+    response: &mut serde_json::Map<String, Value>,
+) {
+    let by_server = by_remote_server(state, requested);
+    for PeerAnswer {
+        server,
+        users,
+        answer,
+    } in ask_peers(state, KeysRequest::Query, by_server, deadline).await
+    {
+        match answer {
             Ok(answer) => {
                 for section in ["device_keys", "master_keys", "self_signing_keys"] {
                     if let Some(theirs) = answer[section].as_object() {
@@ -657,17 +822,14 @@ pub(crate) async fn query_remote_keys(
                 }
             }
             Err(error) => {
-                tracing::debug!(%error, server, "keys/query: peer did not answer");
+                tracing::debug!(error, server, "keys/query: peer did not answer");
                 let failures = response
                     .entry("failures")
                     .or_insert_with(|| Value::Object(serde_json::Map::new()));
                 if let Some(failures) = failures.as_object_mut() {
-                    failures.insert(
-                        server.clone(),
-                        json!({ "errcode": "M_UNKNOWN", "error": error.to_string() }),
-                    );
+                    failures.insert(server, json!({ "errcode": "M_UNKNOWN", "error": error }));
                 }
-                for user_id in ask.keys() {
+                for user_id in users.keys() {
                     if let Ok(cached) = state.devices.all_device_keys(user_id)
                         && !cached.is_empty()
                         && let Some(device_keys) = response
@@ -684,38 +846,28 @@ pub(crate) async fn query_remote_keys(
 }
 
 /// Claim one-time keys from each remote server for its users, merging
-/// the answers into the client's response.
+/// the answers into the client's response. A server that does not answer
+/// by `deadline` is listed under `failures`.
 pub(crate) async fn claim_remote_keys(
     state: &AppState,
     requested: &serde_json::Map<String, Value>,
+    deadline: Instant,
     claimed: &mut serde_json::Map<String, Value>,
     failures: &mut serde_json::Map<String, Value>,
 ) {
-    let mut by_server: std::collections::BTreeMap<String, serde_json::Map<String, Value>> =
-        std::collections::BTreeMap::new();
-    for (user_id, devices) in requested {
-        if let Some(domain) = domain_of(user_id)
-            && domain != state.config.server.name
-        {
-            by_server
-                .entry(domain.to_owned())
-                .or_default()
-                .insert(user_id.clone(), devices.clone());
-        }
-    }
-    for (server, ask) in by_server {
-        match state.federation.remote_keys_claim(&server, &ask).await {
+    let by_server = by_remote_server(state, requested);
+    for PeerAnswer { server, answer, .. } in
+        ask_peers(state, KeysRequest::Claim, by_server, deadline).await
+    {
+        match answer {
             Ok(answer) => {
                 if let Some(theirs) = answer["one_time_keys"].as_object() {
                     claimed.extend(theirs.clone());
                 }
             }
             Err(error) => {
-                tracing::debug!(%error, server, "keys/claim: peer did not answer");
-                failures.insert(
-                    server,
-                    json!({ "errcode": "M_UNKNOWN", "error": error.to_string() }),
-                );
+                tracing::debug!(error, server, "keys/claim: peer did not answer");
+                failures.insert(server, json!({ "errcode": "M_UNKNOWN", "error": error }));
             }
         }
     }

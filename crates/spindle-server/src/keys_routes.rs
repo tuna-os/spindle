@@ -152,6 +152,9 @@ async fn upload_keys(
 #[derive(Debug, Deserialize)]
 struct QueryKeysRequest {
     device_keys: serde_json::Map<String, Value>,
+    /// How long to wait for other servers, in ms: see
+    /// [`crate::e2ee_federation::remote_keys_deadline`].
+    timeout: Option<Value>,
 }
 
 /// `POST /_matrix/client/v3/keys/query`
@@ -160,6 +163,7 @@ async fn query_keys(
     Authenticated(identity): Authenticated,
     Json(request): Json<QueryKeysRequest>,
 ) -> Result<Json<Value>, MatrixError> {
+    let deadline = crate::e2ee_federation::remote_keys_deadline(request.timeout.as_ref());
     let mut device_keys = serde_json::Map::new();
     let local = |user_id: &str| {
         user_id.split_once(':').map(|(_, domain)| domain) == Some(state.config.server.name.as_str())
@@ -241,14 +245,23 @@ async fn query_keys(
         Value::Object(user_signing_keys),
     );
     response.insert("failures".to_owned(), json!({}));
-    // Users elsewhere are asked of their servers, one request per server.
-    crate::e2ee_federation::query_remote_keys(&state, &request.device_keys, &mut response).await;
+    // Users elsewhere are asked of their servers, one request per server,
+    // all at once.
+    crate::e2ee_federation::query_remote_keys(
+        &state,
+        &request.device_keys,
+        deadline,
+        &mut response,
+    )
+    .await;
     Ok(Json(Value::Object(response)))
 }
 
 #[derive(Debug, Deserialize)]
 struct ClaimKeysRequest {
     one_time_keys: serde_json::Map<String, Value>,
+    /// As [`QueryKeysRequest::timeout`].
+    timeout: Option<Value>,
 }
 
 /// `POST /_matrix/client/v3/keys/claim`
@@ -257,11 +270,13 @@ async fn claim_keys(
     Authenticated(_identity): Authenticated,
     Json(request): Json<ClaimKeysRequest>,
 ) -> Result<Json<Value>, MatrixError> {
+    let deadline = crate::e2ee_federation::remote_keys_deadline(request.timeout.as_ref());
     let mut claimed = serde_json::Map::new();
     let mut failures = serde_json::Map::new();
     crate::e2ee_federation::claim_remote_keys(
         &state,
         &request.one_time_keys,
+        deadline,
         &mut claimed,
         &mut failures,
     )
