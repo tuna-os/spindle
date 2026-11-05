@@ -61,6 +61,7 @@ pub mod rooms;
 pub mod routes;
 pub mod s3;
 pub mod secrets;
+pub mod server_acl;
 pub mod server_notices;
 pub mod shared_secret_registration;
 pub mod signing;

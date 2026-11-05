@@ -455,6 +455,124 @@ async fn a_remote_join_and_message_land_and_read_back_over_the_cs_api() {
     assert_eq!(messages["chunk"][0]["sender"], json!(peer.user()));
 }
 
+/// `m.room.server_acl`, both halves: once the room denies the peer, its
+/// PDUs are refused before verification, its room reads are forbidden,
+/// and nothing further is queued to it on the outbox — the message sent
+/// before the ACL reached it, the ACL itself and the message after did
+/// not.
+#[tokio::test]
+async fn a_server_acl_closes_both_directions() {
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
+    let join = join_event(&harness.store, &peer, &room, &head);
+    let (status, body) = harness.deliver(&peer, "acl-join", vec![join]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["pdus"].as_object().unwrap().values().next().unwrap(),
+        &json!({})
+    );
+
+    let outbox_rows = |destination: &str| -> usize {
+        spindle_store::ReadView::scan_prefix(
+            harness.store.as_ref(),
+            &spindle_core::keys::federation_outbox_all(),
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|(key, _)| {
+            spindle_core::keys::federation_outbox_destination(key).as_deref() == Some(destination)
+        })
+        .count()
+    };
+    let before_acl = outbox_rows(&peer.name);
+    assert!(before_acl > 0, "the join's fan-out should have queued rows");
+
+    // Alice denies the peer. The ACL event itself is the last thing the
+    // peer is told.
+    let (status, body) = harness
+        .send(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.server_acl"),
+            &alice,
+            // The peer's name is `127.0.0.1:port`; the ACL matches hosts
+            // with the port stripped, so the deny names the host.
+            &json!({ "allow": ["*"], "deny": ["127.0.0.1"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let after_acl = outbox_rows(&peer.name);
+    assert_eq!(
+        after_acl, before_acl,
+        "the ACL event must not be sent to the server it denies"
+    );
+
+    let (status, body) = harness
+        .send(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/after-acl"),
+            &alice,
+            &json!({ "msgtype": "m.text", "body": "not for you" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        outbox_rows(&peer.name),
+        after_acl,
+        "nothing after the ACL goes to the denied server"
+    );
+
+    // Inbound: the peer's message is refused, naming the ACL, and lands
+    // nowhere.
+    let head = harness.head_event(&room, &alice).await;
+    let message = message_event(&harness.store, &peer, &room, &head, "let me in");
+    let (status, body) = harness.deliver(&peer, "acl-denied", vec![message]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, result) = body["pdus"].as_object().unwrap().iter().next().unwrap();
+    assert!(
+        result["error"].as_str().unwrap().contains("server ACL"),
+        "{body}"
+    );
+    assert_eq!(
+        harness.head_event(&room, &alice).await,
+        head,
+        "the denied message must not land"
+    );
+
+    // Room reads are forbidden too.
+    let uri = format!("/_matrix/federation/v1/state_ids/{room}?event_id={head}");
+    let mut object = json!({
+        "method": "GET",
+        "uri": uri,
+        "origin": peer.name,
+        "destination": "example.org",
+    });
+    sign_value(&peer.name, &peer.pair, &mut object);
+    let signature = object["signatures"][&peer.name]["ed25519:0"]
+        .as_str()
+        .unwrap();
+    let header = format!(
+        "X-Matrix origin=\"{}\",destination=\"example.org\",key=\"ed25519:0\",sig=\"{signature}\"",
+        peer.name
+    );
+    let (status, body) = harness
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .header("authorization", header)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("server ACL"),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 async fn bad_pdus_soft_fail_alone_and_good_neighbours_still_land() {
     let peer = Peer::start().await;
