@@ -30,14 +30,14 @@ nothing measured them with anyone but Spindle in the seat:
   (1e9 / sends-per-second), so lower is better and a ratio is the
   throughput ratio; the per-request latency spread is kept beside it.
 
-**The far side is held constant.** One Spindle, the *resident*, hosts every
-federated room and is the sender in every partition, for every subject.
-Only the subject -- Spindle, Synapse or Tuwunel -- changes, so a ratio
-between subjects is a ratio between joiners and between catching-up
-servers, not between pairs. Spindle is measured as a subject by the same
-driver in the same round as its rivals; the in-process bench
-(`cargo bench -p spindle-server --bench federated_timing`) is a different
-instrument and is not compared against.
+**The far side is held constant.** A Spindle, the *resident*, hosts every
+federated room and is the sender in every partition, built and configured
+the same for every subject. Only the subject -- Spindle, Synapse or
+Tuwunel -- changes, so a ratio between subjects is a ratio between joiners
+and between catching-up servers, not between pairs. Spindle is measured as
+a subject by the same driver in the same round as its rivals; the
+in-process bench (`cargo bench -p spindle-server --bench federated_timing`)
+is a different instrument and is not compared against.
 
 **Every federation link is TLS, terminated the same way for everyone.** Each
 server listens on plain HTTP on loopback and is named `127.0.0.1:<front>`,
@@ -56,14 +56,19 @@ rig setting: `retry_base_ms = 50`, as in the Rust bench, so a partition is
 followed by a retry within a few seconds rather than a minute -- the same
 for every subject, because the resident is the same.
 
-One round starts every server cold, measures every subject in turn
-(reversed on even rounds, so drift becomes spread rather than bias), and
-writes `<group>.<server>.r<N>.json` beside the sittings that
+In one round each subject is measured alone: it and a cold resident of its
+own start, every cell runs, and both stop before the next subject starts
+(the order reverses on even rounds, so drift becomes spread rather than
+bias). Nothing idles beside a measurement, because nothing idle is idle:
+Synapse's background work after a 10,000-member join took a third of the
+send throughput of whichever server was measured next, in the first run
+that kept a round's servers up together. Each round writes
+`<group>.<server>.r<N>.json` beside the sittings that
 `scripts/parity-gate.py` reads, with `<group>.sitting.json` as provenance.
 A request that fails aborts the run with nothing written for it, the
 driver's rule: a dropped failure makes a broken server look fast.
 
-    scripts/federated-benchmark.py --group targeted-20261105 --rounds 3 \\
+    scripts/federated-benchmark.py --group targeted-20261105 --rounds 5 \\
         --subject spindle --subject synapse --subject tuwunel
 
 Needs `target/release/spindle`, Synapse in SYNAPSE_VENV, Tuwunel in
@@ -620,12 +625,19 @@ def cell(value_ns: float, **detail) -> dict:
 # --- a round ----------------------------------------------------------------
 
 
-def run_round(args, round_number: int, order: list[str], ca, context, loop) -> dict[str, dict]:
-    work = pathlib.Path(tempfile.mkdtemp(prefix=f"fedbench-r{round_number}-", dir=args.work))
+def measure_subject(args, round_number: int, kind: str, work: pathlib.Path, ca, context, loop) -> dict:
+    """Every cell for one subject, with a cold resident of its own.
+
+    Nothing else runs meanwhile. The first workflow run kept every server of
+    a round up together, and whoever followed Synapse lost a third of its
+    send throughput to Synapse's background work after the 10,000-member
+    join: the order effect showed in the rounds as a subject's speed
+    depending on whom it followed.
+    """
     servers: list[Server] = []
 
-    def place(kind: str) -> tuple[pathlib.Path, Front, int]:
-        directory = work / kind
+    def place(role: str) -> tuple[pathlib.Path, Front, int]:
+        directory = work / f"{kind}-{role}"
         directory.mkdir()
         port = free_port()
         return directory, Front(loop, port, context), port
@@ -634,34 +646,38 @@ def run_round(args, round_number: int, order: list[str], ca, context, loop) -> d
         directory, front, port = place("resident")
         resident = start_spindle(directory, front, port, args.spindle, ca, resident=True)
         servers.append(resident)
-        subjects = {}
-        for kind in order:
-            directory, front, port = place(kind)
-            if kind == "spindle":
-                subjects[kind] = start_spindle(directory, front, port, args.spindle, ca)
-            elif kind == "synapse":
-                subjects[kind] = start_synapse(directory, front, port, args.synapse_venv, ca, args.pg_url, round_number)
-            else:
-                subjects[kind] = start_tuwunel(directory, front, port, pathlib.Path(args.bench_bin) / "tuwunel", ca)
-            servers.append(subjects[kind])
+        directory, front, port = place("subject")
+        if kind == "spindle":
+            subject = start_spindle(directory, front, port, args.spindle, ca)
+        elif kind == "synapse":
+            subject = start_synapse(directory, front, port, args.synapse_venv, ca, args.pg_url, round_number)
+        else:
+            subject = start_tuwunel(directory, front, port, pathlib.Path(args.bench_bin) / "tuwunel", ca)
+        servers.append(subject)
 
-        results = {}
-        for kind in order:
-            subject = subjects[kind]
-            tag = f"r{round_number}{kind}"
-            benchmarks = {}
-            print(f"round {round_number}: {kind}", flush=True)
-            benchmarks.update(send_throughput(subject, args.throughput_events, args.clients, args.samples, args.warmup))
-            for members in args.members:
-                benchmarks[f"federated_join/{members}"] = federated_join(resident, subject, members, f"{tag}m{members}")
-                print(f"  join {members}: {benchmarks[f'federated_join/{members}']['mean_ns'] / 1e9:.2f} s", flush=True)
-            benchmarks[f"partition_catchup/{args.missed}"] = partition_catchup(resident, subject, args.missed, tag)
-            print(f"  catch-up: {benchmarks[f'partition_catchup/{args.missed}']['mean_ns'] / 1e9:.2f} s", flush=True)
-            results[kind] = benchmarks
-        return results
+        tag = f"r{round_number}{kind}"
+        benchmarks = {}
+        print(f"round {round_number}: {kind}", flush=True)
+        benchmarks.update(send_throughput(subject, args.throughput_events, args.clients, args.samples, args.warmup))
+        for members in args.members:
+            benchmarks[f"federated_join/{members}"] = federated_join(resident, subject, members, f"{tag}m{members}")
+            print(f"  join {members}: {benchmarks[f'federated_join/{members}']['mean_ns'] / 1e9:.2f} s", flush=True)
+        benchmarks[f"partition_catchup/{args.missed}"] = partition_catchup(resident, subject, args.missed, tag)
+        print(f"  catch-up: {benchmarks[f'partition_catchup/{args.missed}']['mean_ns'] / 1e9:.2f} s", flush=True)
+        return benchmarks
     finally:
         for server in servers:
             server.stop()
+
+
+def run_round(args, round_number: int, order: list[str], ca, context, loop) -> dict[str, dict]:
+    work = pathlib.Path(tempfile.mkdtemp(prefix=f"fedbench-r{round_number}-", dir=args.work))
+    try:
+        return {
+            kind: measure_subject(args, round_number, kind, work, ca, context, loop)
+            for kind in order
+        }
+    finally:
         if not args.keep:
             shutil.rmtree(work, ignore_errors=True)
 
@@ -717,7 +733,10 @@ def write_sidecar(args, started: str, finished: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--group", required=True)
-    parser.add_argument("--rounds", type=int, default=3)
+    # Five, bench-rounds.sh's honest default: two identical servers separate
+    # by luck one time in 126 at five rounds, against one in ten at three.
+    # One subject's round is a few minutes, so the hour is available.
+    parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--subject", action="append", choices=("spindle", "synapse", "tuwunel"),
                         help="a server to measure; repeat. Default: all three")
     parser.add_argument("--members", default="1000,10000",

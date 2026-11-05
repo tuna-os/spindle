@@ -82,7 +82,7 @@ bench group rounds="3": bench-field bench-build (bench-sitting group rounds) ben
 # the far side of the federation while Spindle, Synapse and Tuwunel take
 # turns as the subject. Needs bench-field and bench-build; uses Postgres
 # for Synapse when BENCH_PG_URL is set (`just bench-pg`).
-bench-targeted group rounds="3":
+bench-targeted group rounds="5":
     BENCH_BIN="{{bench_bin}}" SYNAPSE_VENV="{{synapse_venv}}" \
       python3 scripts/federated-benchmark.py --group {{group}} --rounds {{rounds}}
 

@@ -17,8 +17,8 @@ on:
   workflow_dispatch:
     inputs:
       rounds:
-        description: rounds per subject (3 is the floor at which a call means anything)
-        default: "3"
+        description: rounds per subject (3 is the floor at which a call means anything; 5 is the honest default)
+        default: "5"
   pull_request:
     paths:
       - .github/workflows/targeted-sitting.yml
@@ -100,7 +100,7 @@ jobs:
           group="targeted-$(date -u +%Y%m%d)"
           echo "GROUP=$group" >> "$GITHUB_ENV"
           python3 scripts/federated-benchmark.py --group "$group" \
-            --rounds "${{ inputs.rounds || '3' }}" --work tmp/fedbench --keep
+            --rounds "${{ inputs.rounds || '5' }}" --work tmp/fedbench --keep
       - name: Keep the results and the server logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
