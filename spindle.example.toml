@@ -43,6 +43,12 @@ path = "./data"
 # advertised by both media config endpoints. Match the old server on migration.
 # [media]
 # max_upload_bytes = 52428800 # 50 MiB default; 104857600 for 100 MiB
+# Total bytes one account's uploads may hold. Unset (the default) is no
+# quota. Over it, an upload is refused 403 M_RESOURCE_LIMIT_EXCEEDED before
+# any byte is stored, with `admin_contact` from [server.support] when set;
+# deleting media gives the bytes back. Appservice users and server admins
+# are exempt, as from the write rates below. Zero is refused at startup.
+# max_bytes_per_user = 10737418240 # 10 GiB
 
 # Media blobs in an S3-compatible bucket instead of on local disk. The
 # metadata store stays local either way: it is the index, and an index a
@@ -72,6 +78,31 @@ enabled = true
 # at high priority, so it has a budget of its own (#39). Zero is refused at
 # startup. Off with `enabled = false`.
 rings_per_minute = 10
+# Per-account budgets for ordinary writes (#741): `burst` requests at once,
+# refilled at `per_second`. Synapse's names map across (`rc_message`,
+# `rc_joins.local`/`.remote`, `rc_invites.per_issuer`/`.per_user`,
+# `rc_room_creation`, `rc_media_create`) and so do its defaults, which these
+# are. Over budget is 429 M_LIMIT_EXCEEDED with `retry_after_ms` and a
+# Retry-After header. Exempt: each appservice's own sender, the users in the
+# namespaces of a registration with `rate_limited: false`, and server admins.
+# Burst 0 or a rate that is not positive is refused at startup; for no limit
+# at all, `enabled = false`.
+#
+# Room events: PUT /send (a ring spends this too), PUT /state, PUT /redact.
+messages = { per_second = 0.2, burst = 10 }
+# Joins and knocks on rooms this server is in, and ones it must ask another
+# server for (a federation handshake each, hence the tighter refill).
+joins_local = { per_second = 0.1, burst = 10 }
+joins_remote = { per_second = 0.01, burst = 10 }
+# POST /invite, against the sender and against the invitee; invites from
+# other servers spend the invitee's budget too. A createRoom's own `invite`
+# list is covered by room_creation instead.
+invites_per_issuer = { per_second = 0.3, burst = 10 }
+invites_per_target = { per_second = 0.003, burst = 5 }
+room_creation = { per_second = 0.016, burst = 10 }
+# New media IDs: POST /upload and POST /media/v1/create (filling a created
+# ID is not counted again).
+media_uploads = { per_second = 10.0, burst = 50 }
 
 [previews]
 # URL previews make the server fetch attacker-chosen URLs, which is the

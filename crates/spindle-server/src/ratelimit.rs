@@ -15,10 +15,20 @@
 //! Successful requests do not consume budget on the auth endpoints. A user
 //! logging in correctly is not the traffic being defended against, and counting
 //! them means a busy shared address locks out its legitimate users first.
+//!
+//! The ordinary writes of an authenticated account -- sends, joins, invites,
+//! room creation, uploads -- are the other half (#741), and the opposite case:
+//! every request counts, success or not, because the cost being bounded is
+//! the write itself. They are token buckets rather than windows, keyed per
+//! user, for the reason [`Rate`] gives; [`limit_write`] says who is exempt.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use crate::AppState;
+use crate::config::{Rate, RateLimitConfig};
+use crate::errors::MatrixError;
 
 /// Bound attacker-controlled counter cardinality and identifier allocation.
 const MAX_TRACKED_KEYS: usize = 65_536;
@@ -70,6 +80,10 @@ impl RetryAfter {
 pub struct RateLimiter {
     enabled: bool,
     windows: Mutex<HashMap<String, Window>>,
+    /// Token buckets, as the moment each would be full again with the
+    /// last request it took (GCRA's "theoretical arrival time"). One
+    /// instant per key is the whole state: no counter, no refill task.
+    buckets: Mutex<HashMap<String, Instant>>,
 }
 
 impl Default for RateLimiter {
@@ -95,6 +109,7 @@ impl RateLimiter {
         Self {
             enabled,
             windows: Mutex::new(HashMap::new()),
+            buckets: Mutex::new(HashMap::new()),
         }
     }
 
@@ -197,6 +212,197 @@ impl RateLimiter {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
     }
+
+    /// Spend one request of `rate` against `key`, or refuse it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RetryAfter`] -- how long until one request is earned
+    /// back -- when the bucket is empty.
+    pub fn check_rate(&self, key: &str, rate: Rate) -> Result<(), RetryAfter> {
+        self.check_rate_at(key, rate, Instant::now())
+    }
+
+    /// As [`RateLimiter::check_rate`], with the clock supplied.
+    ///
+    /// A bucket of `burst` refilled every `interval` is the GCRA: keep the
+    /// time `full` at which the bucket would be full again, admit a
+    /// request when `full + interval` is no more than `burst` intervals
+    /// away, and move `full` on by one interval. A refusal changes
+    /// nothing, so a client hammering an empty bucket does not push its
+    /// own recovery further away.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RetryAfter`] when the bucket is empty.
+    pub fn check_rate_at(&self, key: &str, rate: Rate, now: Instant) -> Result<(), RetryAfter> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let interval = rate.interval();
+        if key.len() > MAX_KEY_BYTES {
+            return Err(RetryAfter(interval));
+        }
+        let tolerance = interval.saturating_mul(rate.burst);
+        let mut buckets = self
+            .buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The same bound as the windows, for the same reason: a key is
+        // only reclaimed once its bucket has refilled, so flooding fresh
+        // keys cannot reset anyone's spent budget.
+        if buckets.len() >= MAX_TRACKED_KEYS && !buckets.contains_key(key) {
+            buckets.retain(|_, full| *full > now);
+            if buckets.len() >= MAX_TRACKED_KEYS {
+                return Err(RetryAfter(interval));
+            }
+        }
+        let full = buckets.get(key).map_or(now, |full| (*full).max(now));
+        let Some(next) = full.checked_add(interval) else {
+            return Err(RetryAfter(interval));
+        };
+        let ahead = next.duration_since(now);
+        if ahead > tolerance {
+            return Err(RetryAfter(ahead.saturating_sub(tolerance)));
+        }
+        if let Some(full) = buckets.get_mut(key) {
+            *full = next;
+        } else {
+            buckets.insert(key.to_owned(), next);
+        }
+        Ok(())
+    }
+
+    /// How many token buckets are currently tracked.
+    #[must_use]
+    pub fn tracked_rates(&self) -> usize {
+        self.buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+/// The per-user write budgets (#741), one per kind of write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Budget {
+    /// `PUT /send`, `PUT /state`, `PUT /redact`.
+    Message,
+    /// A join or knock this server answers itself.
+    JoinLocal,
+    /// A join or knock carried to another server.
+    JoinRemote,
+    /// An invite, against its sender.
+    Invite,
+    /// An invite, against the user it is to.
+    Invited,
+    /// `POST /createRoom`.
+    RoomCreation,
+    /// A new media ID: `POST /upload` or `POST /media/v1/create`.
+    MediaUpload,
+}
+
+impl Budget {
+    fn rate(self, config: &RateLimitConfig) -> Rate {
+        match self {
+            Self::Message => config.messages,
+            Self::JoinLocal => config.joins_local,
+            Self::JoinRemote => config.joins_remote,
+            Self::Invite => config.invites_per_issuer,
+            Self::Invited => config.invites_per_target,
+            Self::RoomCreation => config.room_creation,
+            Self::MediaUpload => config.media_uploads,
+        }
+    }
+
+    /// The key's namespace: every budget is its own, so a user who has
+    /// spent their sends can still join.
+    const fn prefix(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::JoinLocal => "join",
+            Self::JoinRemote => "join-remote",
+            Self::Invite => "invite",
+            Self::Invited => "invited",
+            Self::RoomCreation => "create-room",
+            Self::MediaUpload => "media",
+        }
+    }
+}
+
+/// Spend one of `actor`'s `class` budget, or refuse with 429
+/// `M_LIMIT_EXCEEDED` and `retry_after_ms`.
+///
+/// # Errors
+///
+/// The refusal, or a storage error reading whether `actor` is exempt.
+pub(crate) fn limit_write(state: &AppState, class: Budget, actor: &str) -> Result<(), MatrixError> {
+    limit_write_on(state, class, actor, actor)
+}
+
+/// As [`limit_write`], with the budget keyed on `subject` rather than the
+/// actor: the invitee's budget, spent by whoever invites them. Exemption
+/// is still the actor's -- an exempt bridge inviting is not limited by
+/// how many invites its target has had.
+///
+/// # Errors
+///
+/// As [`limit_write`].
+pub(crate) fn limit_write_on(
+    state: &AppState,
+    class: Budget,
+    actor: &str,
+    subject: &str,
+) -> Result<(), MatrixError> {
+    let key = format!("{}:{subject}", class.prefix());
+    let Err(retry) = state
+        .limiter
+        .check_rate(&key, class.rate(&state.config.ratelimit))
+    else {
+        return Ok(());
+    };
+    // Exemption is looked up only once the budget says no. The admin flag
+    // is a store read, and every write paying it so that the rare exempt
+    // account can skip a counter it would almost never exhaust is the
+    // wrong way round. The cost is that an exempt account's own sends
+    // still tick its bucket, which nothing ever reads but this branch.
+    if exempt_from_write_limits(state, actor)? {
+        return Ok(());
+    }
+    Err(MatrixError::limit_exceeded(retry.as_millis()))
+}
+
+/// Whether `user_id` is exempt from the write budgets and the media quota.
+///
+/// Synapse's rule for appservices, which is the spec's: a registration's
+/// own sender is never limited, and the users in its namespaces are exempt
+/// when the registration says `rate_limited: false`. A bridge relays a
+/// whole other network's traffic through one registration, and its
+/// operator is the one who has said whether that traffic is trusted.
+///
+/// Server admins too. Synapse gets there per account, through its
+/// rate-limit override table; this server has no such table, and the
+/// accounts an operator trusts with every room are the ones it would
+/// hold. An admin locked out of redacting a spam wave by the send rate
+/// would be the limit protecting the attack.
+///
+/// # Errors
+///
+/// A storage error reading the account.
+pub(crate) fn exempt_from_write_limits(
+    state: &AppState,
+    user_id: &str,
+) -> Result<bool, MatrixError> {
+    let server_name = &state.config.server.name;
+    let appservice = state.appservices.all().iter().any(|registration| {
+        registration.sender_user(server_name) == user_id
+            || (!registration.rate_limited && registration.may_masquerade_as(user_id, server_name))
+    });
+    if appservice {
+        return Ok(true);
+    }
+    crate::admin::is_server_admin(state, user_id)
+        .map_err(|error| MatrixError::internal(&error.to_string()))
 }
 
 /// Failed authentication attempts, per account.
@@ -273,5 +479,68 @@ mod capacity_tests {
                 .is_err()
         );
         assert_eq!(limiter.tracked(), 1);
+    }
+
+    /// `burst` at once, then one per interval; the wait reported is the
+    /// time to the next one, and a refusal does not push it further away.
+    #[test]
+    fn a_bucket_admits_its_burst_then_refills_at_its_rate() {
+        let limiter = RateLimiter::new();
+        let now = Instant::now();
+        let rate = Rate::new(2.0, 3);
+        let interval = Duration::from_millis(500);
+        for _ in 0..3 {
+            assert!(limiter.check_rate_at("alice", rate, now).is_ok());
+        }
+        assert_eq!(
+            limiter.check_rate_at("alice", rate, now),
+            Err(RetryAfter(interval))
+        );
+        assert_eq!(
+            limiter.check_rate_at("alice", rate, now),
+            Err(RetryAfter(interval)),
+            "refusals spend nothing"
+        );
+        assert!(limiter.check_rate_at("bob", rate, now).is_ok(), "per key");
+        let later = now + interval;
+        assert!(limiter.check_rate_at("alice", rate, later).is_ok());
+        assert!(limiter.check_rate_at("alice", rate, later).is_err());
+        // Idle long enough and the whole burst is back, not more.
+        let idle = now + interval * 10;
+        for _ in 0..3 {
+            assert!(limiter.check_rate_at("alice", rate, idle).is_ok());
+        }
+        assert!(limiter.check_rate_at("alice", rate, idle).is_err());
+    }
+
+    #[test]
+    fn bucket_flood_cannot_reset_live_budgets() {
+        let limiter = RateLimiter::new();
+        let now = Instant::now();
+        let rate = Rate::new(1.0, 1);
+        for number in 0..MAX_TRACKED_KEYS {
+            assert!(
+                limiter
+                    .check_rate_at(&number.to_string(), rate, now)
+                    .is_ok()
+            );
+        }
+        assert!(limiter.check_rate_at("new", rate, now).is_err());
+        assert!(limiter.check_rate_at("0", rate, now).is_err());
+        assert_eq!(limiter.tracked_rates(), MAX_TRACKED_KEYS);
+        // Refilled buckets are the ones reclaimed.
+        let later = now + Duration::from_secs(1);
+        assert!(limiter.check_rate_at("new", rate, later).is_ok());
+        assert_eq!(limiter.tracked_rates(), 1);
+    }
+
+    #[test]
+    fn a_disabled_limiter_has_no_buckets() {
+        let limiter = RateLimiter::with_enabled(false);
+        let rate = Rate::new(0.001, 1);
+        for _ in 0..10 {
+            assert!(limiter.check_rate("alice", rate).is_ok());
+        }
+        assert_eq!(limiter.tracked_rates(), 0);
     }
 }

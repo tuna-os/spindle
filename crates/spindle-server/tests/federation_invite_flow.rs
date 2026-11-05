@@ -24,6 +24,10 @@ struct Instance {
 
 impl Instance {
     async fn start() -> Instance {
+        Self::start_with("[ratelimit]\nenabled = false\n").await
+    }
+
+    async fn start_with(ratelimit: &str) -> Instance {
         static TRACING: std::sync::Once = std::sync::Once::new();
         TRACING.call_once(|| {
             let _ = tracing_subscriber::fmt()
@@ -35,7 +39,7 @@ impl Instance {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
         let config = spindle_server::Config::parse(&format!(
-            "[server]\nname = \"{name}\"\n[ratelimit]\nenabled = false\n\
+            "[server]\nname = \"{name}\"\n{ratelimit}\
              [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\nretry_base_ms = 50\n",
         ))
         .unwrap();
@@ -497,4 +501,43 @@ async fn a_leave_template_for_a_stranger_is_refused() {
         )
         .await;
     assert_ne!(status, 200, "leaving nothing is refused: {body}");
+}
+
+/// An invite from another server spends the invitee's budget like a local
+/// one (#741): past it, this server refuses to co-sign, so the invite never
+/// reaches the user or the room, while someone else here can still be
+/// invited.
+#[tokio::test]
+async fn invites_from_another_server_spend_the_invitees_budget() {
+    let remote = Instance::start().await;
+    let local = Instance::start_with(
+        "[ratelimit]\ninvites_per_target = { per_second = 0.001, burst = 1 }\n",
+    )
+    .await;
+    let alice = remote.register("alice").await;
+    let bob = local.register("bob").await;
+    local.register("carol").await;
+    let first = remote.named_room(&alice, "first").await;
+    let second = remote.named_room(&alice, "second").await;
+    let invite = async |room: &str, user: &str| {
+        remote
+            .request(
+                reqwest::Method::POST,
+                &format!("/_matrix/client/v3/rooms/{room}/invite"),
+                Some(&alice),
+                Some(&json!({ "user_id": format!("@{user}:{}", local.name) })),
+            )
+            .await
+    };
+
+    let (status, body) = invite(&first, "bob").await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = invite(&second, "bob").await;
+    assert_eq!(status, 502, "the peer refused to co-sign: {body}");
+    let (status, body) = invite(&second, "carol").await;
+    assert_eq!(status, 200, "the budget is bob's alone: {body}");
+
+    let sync = local.sync(&bob).await;
+    assert!(!sync["rooms"]["invite"][&first].is_null(), "{sync}");
+    assert!(sync["rooms"]["invite"][&second].is_null(), "{sync}");
 }

@@ -27,6 +27,11 @@ The v0.1 deployment envelope needs these controls:
   requests per source, request body size and timeouts in the reverse proxy.
   Allow uploads up to the configured size. Do not
   blindly apply a short timeout to long polls for Matrix sync.
+  The per-account write budgets (sends, joins, invites, room creation,
+  uploads) default to Synapse's numbers; a bot that is not an appservice
+  will meet them, so give it a registration with `rate_limited: false`,
+  make it an admin, or raise the budget in `[ratelimit]`. Setting
+  `[media] max_bytes_per_user` bounds what each account's uploads may hold.
 - Set a process/container memory ceiling and a finite storage quota for
   the database and media. Size them from the intended workload and measured
   usage. Monitor memory, free disk, health, federation backlog and errors.

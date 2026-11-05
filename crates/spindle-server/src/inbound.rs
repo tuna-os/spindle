@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use crate::AppState;
 use crate::accounts::Accounts;
 use crate::errors::MatrixError;
+use crate::ratelimit::{Budget, limit_write_on};
 use crate::routes::{MAX_TXN_ID_LEN, record_invite, room_error};
 
 mod backfill;
@@ -1167,6 +1168,12 @@ pub(crate) async fn invite(
         return Err(MatrixError::forbidden("no such user on this server"));
     }
     let target = target.to_owned();
+    // The invitee's budget (#741) is one budget whoever invites, so a
+    // stream of invites from another server spends it like local ones do:
+    // refused before this server co-signs or records anything, as Synapse's
+    // `rc_invites.per_user` refuses them.
+    let sender = event["sender"].as_str().unwrap_or_default();
+    limit_write_on(&state, Budget::Invited, sender, &target)?;
 
     let Ok(ruma::CanonicalJsonValue::Object(mut canonical)) =
         ruma::CanonicalJsonValue::try_from(event)

@@ -22,7 +22,13 @@ impl Harness {
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
-        let config = spindle_server::Config::parse("[server]\nname = \"example.org\"\n").unwrap();
+        // Pagination is tested over rooms of hundreds of events sent as fast
+        // as the harness can; the per-account send budget (#741) is
+        // tested in write_ratelimits.rs, not here.
+        let config = spindle_server::Config::parse(
+            "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n",
+        )
+        .unwrap();
         let app = spindle_server::app(config, store).expect("a signing key is established");
         Self { _dir: dir, app }
     }

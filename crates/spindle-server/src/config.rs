@@ -813,6 +813,68 @@ pub struct RateLimitConfig {
     /// `enabled` is off, like every other rate here.
     #[serde(default = "default_rings_per_minute")]
     pub rings_per_minute: u32,
+    /// Room events one account may send (#741): `PUT /send`, `PUT /state`
+    /// and `PUT /redact`, ring or not. Synapse's `rc_message`, and its
+    /// default, so a client tuned against Synapse backs off here the same.
+    #[serde(default = "default_messages")]
+    pub messages: Rate,
+    /// Joins and knocks on a room this server is already in.
+    #[serde(default = "default_joins_local")]
+    pub joins_local: Rate,
+    /// Joins and knocks that go over federation: each is a `make_join`
+    /// and `send_join` handshake and a copy of the room's state to check,
+    /// so it is the most expensive request an account can make and has
+    /// the tightest budget (Synapse's `rc_joins.remote`).
+    #[serde(default = "default_joins_remote")]
+    pub joins_remote: Rate,
+    /// Invites one account may send, whoever they are to.
+    #[serde(default = "default_invites_per_issuer")]
+    pub invites_per_issuer: Rate,
+    /// Invites one user here may receive, whoever sends them and from
+    /// whichever server: the budget that stops a set of accounts taking
+    /// turns to spam one person, which the per-issuer budget cannot see.
+    #[serde(default = "default_invites_per_target")]
+    pub invites_per_target: Rate,
+    /// `POST /createRoom`: a room is a durable log and a set of state
+    /// events nobody can delete.
+    #[serde(default = "default_room_creation")]
+    pub room_creation: Rate,
+    /// New media IDs one account may mint: `POST /upload` and
+    /// `POST /media/v1/create`. Filling a reserved ID is the second half
+    /// of a create and is not counted again.
+    #[serde(default = "default_media_uploads")]
+    pub media_uploads: Rate,
+}
+
+/// A per-user write budget: `burst` requests at once, refilled at
+/// `per_second`.
+///
+/// Burst and rate rather than "N per window", because these are the
+/// ordinary writes of an ordinary account: a person pasting five messages
+/// is a burst, a script is a sustained rate, and a budget has to tell the
+/// two apart. It is also Synapse's shape (`per_second`, `burst_count`), so
+/// an operator's existing numbers carry over.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Rate {
+    pub per_second: f64,
+    pub burst: u32,
+}
+
+impl Rate {
+    #[must_use]
+    pub const fn new(per_second: f64, burst: u32) -> Self {
+        Self { per_second, burst }
+    }
+
+    /// Time to earn back one request. Saturates rather than panics for a
+    /// rate too small to represent; config validation refuses those, so
+    /// this only matters to a `Rate` built in code.
+    #[must_use]
+    pub fn interval(&self) -> std::time::Duration {
+        std::time::Duration::try_from_secs_f64(1.0 / self.per_second)
+            .unwrap_or(std::time::Duration::MAX)
+    }
 }
 
 impl Default for RateLimitConfig {
@@ -820,12 +882,51 @@ impl Default for RateLimitConfig {
         Self {
             enabled: true,
             rings_per_minute: default_rings_per_minute(),
+            messages: default_messages(),
+            joins_local: default_joins_local(),
+            joins_remote: default_joins_remote(),
+            invites_per_issuer: default_invites_per_issuer(),
+            invites_per_target: default_invites_per_target(),
+            room_creation: default_room_creation(),
+            media_uploads: default_media_uploads(),
         }
     }
 }
 
 const fn default_rings_per_minute() -> u32 {
     10
+}
+
+// Synapse 1.164's defaults, every one: `rc_message`, `rc_joins.local`,
+// `rc_joins.remote`, `rc_invites.per_issuer`, `rc_invites.per_user`,
+// `rc_room_creation`, `rc_media_create`. Inventing different numbers would
+// make a migration from Synapse a silent change in what clients may do.
+const fn default_messages() -> Rate {
+    Rate::new(0.2, 10)
+}
+
+const fn default_joins_local() -> Rate {
+    Rate::new(0.1, 10)
+}
+
+const fn default_joins_remote() -> Rate {
+    Rate::new(0.01, 10)
+}
+
+const fn default_invites_per_issuer() -> Rate {
+    Rate::new(0.3, 10)
+}
+
+const fn default_invites_per_target() -> Rate {
+    Rate::new(0.003, 5)
+}
+
+const fn default_room_creation() -> Rate {
+    Rate::new(0.016, 10)
+}
+
+const fn default_media_uploads() -> Rate {
+    Rate::new(10.0, 50)
 }
 
 const fn default_true() -> bool {
@@ -1269,6 +1370,16 @@ pub struct MediaConfig {
     /// when migrating so existing clients retain their upload allowance.
     #[serde(default = "default_max_upload_bytes")]
     pub max_upload_bytes: usize,
+    /// Total bytes one account's uploads may hold (#741). Absent, which is
+    /// the default, there is no quota: the per-upload cap and the upload
+    /// rate bound how fast an account can fill the disk, not how far.
+    ///
+    /// Counted from the media records themselves, so it covers what was
+    /// uploaded before the quota was set, and deleting media gives the
+    /// bytes back. Appservice users and server admins are exempt, as from
+    /// the write rates: a bridge mirrors other networks' media by design.
+    #[serde(default)]
+    pub max_bytes_per_user: Option<u64>,
 }
 
 fn default_max_upload_bytes() -> usize {
@@ -1279,6 +1390,7 @@ impl Default for MediaConfig {
     fn default() -> Self {
         Self {
             max_upload_bytes: default_max_upload_bytes(),
+            max_bytes_per_user: None,
         }
     }
 }
@@ -1512,6 +1624,53 @@ impl Config {
                     .to_owned(),
             });
         }
+        // Zero is not "no quota" -- that is leaving it out -- but a quota
+        // that refuses every upload, which nobody means.
+        if self.media.max_bytes_per_user == Some(0) {
+            return Err(ConfigError::Invalid {
+                field: "media.max_bytes_per_user",
+                message: "must be greater than zero; omit it for no quota".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_ratelimit(&self) -> Result<(), ConfigError> {
+        // A ring budget of zero is not "unlimited" either: it refuses every
+        // ring, and a call nobody can be summoned to is a feature silently
+        // off.
+        if self.ratelimit.rings_per_minute == 0 {
+            return Err(ConfigError::Invalid {
+                field: "ratelimit.rings_per_minute",
+                message: "must be greater than zero; a zero budget refuses every ring".to_owned(),
+            });
+        }
+        let limits = &self.ratelimit;
+        for (field, rate) in [
+            ("ratelimit.messages", limits.messages),
+            ("ratelimit.joins_local", limits.joins_local),
+            ("ratelimit.joins_remote", limits.joins_remote),
+            ("ratelimit.invites_per_issuer", limits.invites_per_issuer),
+            ("ratelimit.invites_per_target", limits.invites_per_target),
+            ("ratelimit.room_creation", limits.room_creation),
+            ("ratelimit.media_uploads", limits.media_uploads),
+        ] {
+            // Same reasoning as the ring: zero burst or zero rate refuses
+            // every request forever, and NaN or a rate whose refill
+            // interval cannot be represented is a typo, not a policy.
+            // "Unlimited" is `enabled = false`.
+            let refill = 1.0 / rate.per_second;
+            if rate.burst == 0
+                || !rate.per_second.is_finite()
+                || rate.per_second <= 0.0
+                || std::time::Duration::try_from_secs_f64(refill).is_err()
+            {
+                return Err(ConfigError::Invalid {
+                    field,
+                    message: "burst must be at least 1 and per_second a positive number".to_owned(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -1523,15 +1682,7 @@ impl Config {
         self.validate_delayed_events()?;
         self.validate_rooms()?;
         self.validate_peers()?;
-        // A ring budget of zero is not "unlimited" either: it refuses every
-        // ring, and a call nobody can be summoned to is a feature silently
-        // off.
-        if self.ratelimit.rings_per_minute == 0 {
-            return Err(ConfigError::Invalid {
-                field: "ratelimit.rings_per_minute",
-                message: "must be greater than zero; a zero budget refuses every ring".to_owned(),
-            });
-        }
+        self.validate_ratelimit()?;
         for (field, value) in [
             ("limits.filters_per_user", self.limits.filters_per_user),
             (

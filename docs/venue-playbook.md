@@ -96,6 +96,10 @@ retry_base_ms = 1000
 [ratelimit]
 # Ring pushes are the expensive notification; ten a minute per user.
 rings_per_minute = 10
+# Organisers creating every session room in one sitting will meet the
+# room-creation budget (10, then one a minute): promote them to admin, or
+# raise it for the event.
+# room_creation = { per_second = 1.0, burst = 100 }
 
 [metrics]
 # Scrape from the operations laptop; the exposition names the peers.
