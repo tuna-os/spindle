@@ -26,6 +26,7 @@ pub mod blocking;
 pub mod config;
 pub mod dehydrated;
 pub mod delayed;
+pub mod delayed_routes;
 pub mod delegated;
 pub mod device_routes;
 pub mod devices;
