@@ -101,10 +101,9 @@ pub enum Durability {
     /// `group`: data is fsynced before the commit returns; file metadata is
     /// left to the OS.
     ///
-    /// Note this is not yet the batched fsync SPEC §8.3 describes — commits are
-    /// not currently coalesced across a time window, so this is "one data
-    /// fsync per commit" rather than "one fsync per batch of commits". The
-    /// coalescing needs the per-room executor and lands with it.
+    /// Concurrent commits share one fsync: `GroupCommit` below is SPEC §8.3's
+    /// batch, with no `N`/`T` constants -- the first writer syncs at once and
+    /// those who arrive meanwhile ride the next sync.
     #[default]
     Group,
     /// `relaxed`: the write reaches the OS page cache and is fsynced later.

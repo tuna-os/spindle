@@ -1370,3 +1370,79 @@ async fn a_partition_heals_into_one_state_the_client_and_the_peer_read_alike() {
         );
     }
 }
+
+/// A local `PUT /send` onto a fork that contests one slot merges both tips,
+/// and the state it sits on is the room version's resolution (#738).
+///
+/// The peer's topic is appended last but carries the older
+/// `origin_server_ts`. Matrix state resolution orders two topics under the
+/// same power levels by timestamp, so ours wins; any "the linear head's
+/// branch wins" rule -- what #359 described and the retired 503 refusal
+/// stood in for -- would pick theirs. So this tells the resolver's answer
+/// apart from the head's, on top of proving the send is not refused.
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn a_local_send_on_a_contested_fork_merges_both_tips_by_the_room_versions_rules() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, fork_point) = harness.shared_room(&peer).await;
+
+    let (status, ours) = harness
+        .put_state(&room, &alice, "m.room.topic", &json!({ "topic": "ours" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let pdu = peer.event(federation_auth::with_auth_events(
+        &harness.store,
+        json!({
+            "type": "m.room.topic",
+            "state_key": "",
+            "sender": peer.user(),
+            "room_id": room,
+            "content": { "topic": "theirs" },
+            "origin_server_ts": now_millis() - 60_000,
+            "depth": 11,
+            "prev_events": [fork_point],
+            "auth_events": [],
+        }),
+    ));
+    let theirs = injected_id(&harness.inject(&peer, "fork_ts", pdu).await);
+
+    let before = Cases::read(&harness.metrics);
+    let (status, merge) = harness.send_message(&room, &alice, "after").await;
+    let delta = Cases::read(&harness.metrics).since(before);
+    assert_eq!(status, StatusCode::OK, "a local send on a contested fork");
+    assert_eq!(
+        delta.contested, 1,
+        "the send must resolve the fork, once: {delta:?}"
+    );
+
+    // The send is the merge: it names both tips, as signed.
+    let signed = harness.federation_event(&peer, &merge).await;
+    let parents: std::collections::BTreeSet<String> = signed["prev_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(parents, [ours.clone(), theirs.clone()].into());
+
+    // And the room holds the resolver's choice, not the linear head's.
+    let state = harness.state_ids(&room, &alice).await;
+    assert_eq!(
+        state.get("m.room.topic/"),
+        Some(&ours),
+        "the room holds the appended-last topic ({theirs}), not the resolved one"
+    );
+    let federation = harness.federation_state_ids(&peer, &room, &merge).await;
+    assert_eq!(
+        federation,
+        state.values().cloned().collect(),
+        "/state_ids disagrees with the client's view of the room"
+    );
+}

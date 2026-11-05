@@ -522,7 +522,7 @@ impl Rooms {
             let previous_tips = log.forward_extremities().clone();
             let entry = log
                 .append_across_gap(input, state, json["depth"].as_u64().unwrap_or(0))
-                .map_err(|error| rooms.append_error(&error))?
+                .map_err(|error| Rooms::append_error(&error))?
                 .clone();
             rooms.metrics.record_append(
                 crate::metrics::Origin::Federated,

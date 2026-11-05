@@ -85,8 +85,8 @@ SPEC §9.2 splits every append into three cases, cheapest first:
 - **case 1** — a non-state event. Cannot conflict; no state resolution.
 - **case 2** — a state event whose key nothing in the fork window touched.
   One `apply()`; no state resolution.
-- **case 3** — a state event contested inside the window. The expensive
-  path: bounded state resolution.
+- **case 3** — an event whose parents' states differ. The expensive
+  path: the room version's state resolution (ADR 0005).
 
 SPEC §18.3 then states the target that makes the design testable rather
 than merely asserted:
@@ -124,18 +124,12 @@ pager. A brief spike during a federation catch-up is expected.
 
 ### One caveat, stated plainly
 
-Case 3 counts **forks that needed the resolver**. Today Spindle defers
-those rather than resolving them: bounded resolution is implemented in
-`spindle-core` (#8, #30) but is not yet wired into ingest (#16). A
-federated event naming the contesting tips is refused. A local send sets
-the contesting tip aside — it stays a forward extremity for the resolver,
-and local events are authored on the linear head without it (#225) — and
-the server logs a warning naming the room, the tip and the key. Each fork
-is counted once, when the tip is set aside, not once per send while it
-stays open. The counter sits at the decision point, so it counts the same
-fork before and after #16 lands — but until it does, a non-zero case 3
-means "a contested fork was found and stepped around", not "a resolution
-ran".
+Case 3 counts **appends whose parents' states differ**, each resolved by
+the room version's algorithm (ADR 0005); nothing is deferred, and no local
+send is refused for a fork. A fork is counted once, by the event that
+names its tips, local or received; later events build on that one. The
+room's current state over several extremities is resolved too, but that
+is not an append and is not counted here.
 
 ## Checking the latency targets
 
