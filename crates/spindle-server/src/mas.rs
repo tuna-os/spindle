@@ -253,7 +253,13 @@ async fn delete_device(
 ) -> Result<Json<Value>, MatrixError> {
     admit(&state, &headers)?;
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
-    remove_device(&state, &accounts, &request.localpart, &request.device_id)?;
+    remove_device(
+        &state,
+        &accounts,
+        &request.localpart,
+        &request.device_id,
+        EndedBy::Provider,
+    )?;
     device_list_changed(&state, &accounts.user_id(&request.localpart));
     Ok(Json(json!({})))
 }
@@ -304,7 +310,13 @@ async fn sync_devices(
     let mut changed = false;
     for device in &ours {
         if !request.devices.contains(&device.device_id) {
-            remove_device(&state, &accounts, &request.localpart, &device.device_id)?;
+            remove_device(
+                &state,
+                &accounts,
+                &request.localpart,
+                &device.device_id,
+                EndedBy::Provider,
+            )?;
             changed = true;
         }
     }
@@ -345,7 +357,7 @@ async fn delete_user(
     Json(request): Json<DeleteUserRequest>,
 ) -> Result<Json<Value>, MatrixError> {
     admit(&state, &headers)?;
-    deactivate_user(&state, &request.localpart, request.erase)?;
+    deactivate_user(&state, &request.localpart, request.erase, EndedBy::Provider)?;
     Ok(Json(json!({})))
 }
 
@@ -358,20 +370,22 @@ pub(crate) fn deactivate_user(
     state: &AppState,
     localpart: &str,
     erase: bool,
+    ended_by: EndedBy,
 ) -> Result<(), MatrixError> {
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     let devices = accounts
         .devices_of(localpart)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
     for device in devices {
-        remove_device(state, &accounts, localpart, &device.device_id)?;
+        remove_device(state, &accounts, localpart, &device.device_id, ended_by)?;
     }
     accounts
         .set_deactivated(localpart, true)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
     let user_id = accounts.user_id(localpart);
     // Device-less verdicts (an admin-scoped token) are not covered by the
-    // per-device evictions above.
+    // per-device evictions above. Re-introspection after this refuses the
+    // account as deactivated, whatever the provider still says.
     if let Some(delegated) = &state.delegated {
         delegated.forget_user(&user_id);
     }
@@ -458,13 +472,35 @@ async fn allow_cross_signing_reset(
     Ok(Json(json!({})))
 }
 
+/// Who ended a device, which decides whether the delegated provider's
+/// next "active" for the session may bring the device back.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndedBy {
+    /// The provider, through this surface. It has ended the session
+    /// itself, so the session's tokens already introspect inactive, and a
+    /// device it later upserts is a new statement of its own.
+    Provider,
+    /// This server -- the admin API, the client API -- without telling the
+    /// provider, which may go on vouching for the session. Under
+    /// delegation the device is marked revoked, so introspection refuses
+    /// the session rather than provision the device again, as Synapse
+    /// refuses a token whose device is gone (#615).
+    Server,
+}
+
 /// One device, gone whole: the row, its sessions, its E2E material.
 pub(crate) fn remove_device(
     state: &AppState,
     accounts: &Accounts<'_, spindle_store::FjallStore>,
     localpart: &str,
     device_id: &str,
+    ended_by: EndedBy,
 ) -> Result<(), MatrixError> {
+    if state.delegated.is_some() && ended_by == EndedBy::Server {
+        accounts
+            .revoke_device(localpart, device_id)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    }
     accounts
         .delete_device(localpart, device_id)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
@@ -472,10 +508,10 @@ pub(crate) fn remove_device(
         .devices
         .remove_device_material(&accounts.user_id(localpart), device_id)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    // The provider deletes the device when it ends the session (a logout
-    // through its compatibility layer included), and this is the only word
-    // of it this server gets: every cached verdict for the device goes now,
-    // not when the introspection cache would have expired them (#615).
+    // Every cached verdict for the device goes now, not when the
+    // introspection cache would have expired it (#615). When the provider
+    // ended the session (its logout, compatibility layer included, ends in
+    // `delete_device`), this call is the only word of it this server gets.
     if let Some(delegated) = &state.delegated {
         delegated.forget_device(&accounts.user_id(localpart), device_id);
     }

@@ -456,7 +456,6 @@ fn app_state_with(
     ));
     let store_for_filters = Arc::clone(&store);
     let store_for_devices = Arc::clone(&store);
-    let store_for_delayed = Arc::clone(&store);
     let presence = presence_for(&config, &store);
     let store_for_backups = Arc::clone(&store);
     let account_data = Arc::new(account_data::AccountData::new(Arc::clone(&store)));
@@ -495,7 +494,7 @@ fn app_state_with(
         .then(|| Arc::new(oidc::BuiltinOidc::new()));
     let push =
         Arc::new(push::Gateway::new(&config.push.allow_internal).map_err(AppError::PushConfig)?);
-    let delayed_caps = config.delayed_events.clone();
+    let delayed = delayed_for(&config, &store);
     let dependency_failure_ttl =
         std::time::Duration::from_secs(config.federation.dependency_failure_ttl_secs);
     let config_for_sfu = config.clone();
@@ -523,14 +522,7 @@ fn app_state_with(
         delegated,
         oidc: oidc_provider,
         federation,
-        delayed: Arc::new(
-            delayed::Delayed::with_limits(
-                Arc::clone(&store_for_delayed),
-                delayed_caps.max_delay_ms,
-                delayed_caps.max_per_room,
-            )
-            .with_user_cap(delayed_caps.max_per_user),
-        ),
+        delayed,
         push,
         registration_nonces: Arc::new(shared_secret_registration::RegistrationNonces::new()),
         rendezvous: Arc::new(rendezvous::Rendezvous::new()),
@@ -554,6 +546,15 @@ fn probe_resident_rooms(state: &AppState) {
     state
         .metrics
         .set_resident_rooms_probe(move || resident.upgrade()?.resident_count());
+}
+
+/// The delayed-event store (MSC4140), capped as `[delayed_events]` says.
+fn delayed_for(config: &Config, store: &Arc<FjallStore>) -> Arc<delayed::Delayed> {
+    let caps = &config.delayed_events;
+    Arc::new(
+        delayed::Delayed::with_limits(Arc::clone(store), caps.max_delay_ms, caps.max_per_room)
+            .with_user_cap(caps.max_per_user),
+    )
 }
 
 /// The presence store, switched as `[presence] enabled` says.

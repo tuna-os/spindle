@@ -475,6 +475,14 @@ pub enum Keyspace {
     /// state the resync filled in: the member events it brought were never
     /// timeline events, so nothing else would carry them.
     PartialStateResynced = 0x62,
+    /// `(localpart, device_id)` -> nothing: a delegated user's device that
+    /// this server ended on its own authority (#615) -- the admin API, the
+    /// client API's device deletion or logout -- while the provider may
+    /// still vouch for the session. Introspection provisions a missing
+    /// device on first sight, so without this row the provider's next
+    /// "active" would bring the device back and the ended session with it.
+    /// Deleted when the device row is written again.
+    RevokedDevice = 0x63,
     /// `(room_id, position)` -> one event of a filled federation gap: its
     /// ID and the root of the state after it. History backfilled into the
     /// *middle* of a room's timeline -- between the head this server held

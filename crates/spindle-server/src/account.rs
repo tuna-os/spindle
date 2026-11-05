@@ -744,7 +744,13 @@ async fn end_session(
         .is_some();
     if exists {
         let user_id = accounts.user_id(&session.localpart);
-        crate::mas::remove_device(&state, &accounts, &session.localpart, &form.device_id)?;
+        crate::mas::remove_device(
+            &state,
+            &accounts,
+            &session.localpart,
+            &form.device_id,
+            crate::mas::EndedBy::Server,
+        )?;
         let stream_write = state.rooms.reserve_stream_id();
         let seq = stream_write.id();
         state
@@ -835,7 +841,12 @@ async fn deactivate(
             )
             .await;
     }
-    crate::mas::deactivate_user(&state, &localpart, form.erase.as_deref() == Some("yes"))?;
+    crate::mas::deactivate_user(
+        &state,
+        &localpart,
+        form.erase.as_deref() == Some("yes"),
+        crate::mas::EndedBy::Server,
+    )?;
     accounts
         .logout_everywhere(&localpart)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;

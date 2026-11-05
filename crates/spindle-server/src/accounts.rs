@@ -545,6 +545,10 @@ impl<'a, S: Store> Accounts<'a, S> {
     /// credential and a token nobody will present is a credential nobody
     /// should hold.
     ///
+    /// Writing the row lifts any [`Self::revoke_device`] marker: whoever
+    /// writes it -- under delegation, the provider through
+    /// `/_synapse/mas/upsert_device` -- has said the device lives again.
+    ///
     /// # Errors
     ///
     /// Returns a storage error.
@@ -561,7 +565,37 @@ impl<'a, S: Store> Accounts<'a, S> {
         };
         self.store
             .put(&device_key(localpart, device_id), &encode(&device)?)?;
+        self.store
+            .delete(&revoked_device_key(localpart, device_id))?;
         Ok(())
+    }
+
+    /// Mark a delegated user's device as ended by this server (#615), so a
+    /// provider that was not told -- and so still vouches for the session --
+    /// cannot have introspection provision the device again. Written
+    /// *before* the row is deleted: an introspection that runs between the
+    /// two then finds either the row or the marker, never neither.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn revoke_device(&self, localpart: &str, device_id: &str) -> Result<(), AccountError> {
+        self.store
+            .put(&revoked_device_key(localpart, device_id), &[])?;
+        Ok(())
+    }
+
+    /// Whether [`Self::revoke_device`] marked this device and nothing has
+    /// written its row since.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn device_revoked(&self, localpart: &str, device_id: &str) -> Result<bool, AccountError> {
+        Ok(self
+            .store
+            .get(&revoked_device_key(localpart, device_id))?
+            .is_some())
     }
 
     /// Flip an account's admin flag. Returns whether the account
@@ -760,6 +794,12 @@ fn account_key(localpart: &str) -> Vec<u8> {
 
 fn device_key(localpart: &str, device_id: &str) -> Vec<u8> {
     let mut key = room_prefix(Keyspace::Device, localpart);
+    key.extend_from_slice(device_id.as_bytes());
+    key
+}
+
+fn revoked_device_key(localpart: &str, device_id: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::RevokedDevice, localpart);
     key.extend_from_slice(device_id.as_bytes());
     key
 }

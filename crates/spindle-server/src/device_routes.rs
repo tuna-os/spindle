@@ -160,13 +160,15 @@ async fn delete_device(
     {
         return Ok((StatusCode::UNAUTHORIZED, challenge));
     }
-    accounts
-        .delete_device(&localpart, &device_id)
-        .map_err(|error| internal(&error))?;
-    state
-        .devices
-        .remove_device_material(&identity.user_id, &device_id)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    // Through the shared removal, so a delegated user's device stays ended
+    // even while the provider still vouches for its session (#615).
+    crate::mas::remove_device(
+        &state,
+        &accounts,
+        &localpart,
+        &device_id,
+        crate::mas::EndedBy::Server,
+    )?;
     let stream_write = state.rooms.reserve_stream_id();
     let seq = stream_write.id();
     state
@@ -216,13 +218,13 @@ async fn delete_devices(
 
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     for device_id in &request.devices {
-        accounts
-            .delete_device(&localpart, device_id)
-            .map_err(|error| internal(&error))?;
-        state
-            .devices
-            .remove_device_material(&identity.user_id, device_id)
-            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        crate::mas::remove_device(
+            &state,
+            &accounts,
+            &localpart,
+            device_id,
+            crate::mas::EndedBy::Server,
+        )?;
     }
     if !request.devices.is_empty() {
         let stream_write = state.rooms.reserve_stream_id();

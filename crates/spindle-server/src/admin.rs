@@ -777,7 +777,7 @@ async fn put_user(
             .map_err(|error| MatrixError::internal(&error.to_string()))?;
     }
     if let Some(true) = request.deactivated {
-        crate::mas::deactivate_user(&state, &localpart, false)?;
+        crate::mas::deactivate_user(&state, &localpart, false, crate::mas::EndedBy::Server)?;
     } else if let Some(false) = request.deactivated {
         accounts
             .set_deactivated(&localpart, false)
@@ -838,7 +838,7 @@ async fn deactivate(
 ) -> Result<Json<Value>, MatrixError> {
     let (localpart, _) = target_account(&state, &user_id)?;
     let erase = body.is_some_and(|Json(body)| body.erase);
-    crate::mas::deactivate_user(&state, &localpart, erase)?;
+    crate::mas::deactivate_user(&state, &localpart, erase, crate::mas::EndedBy::Server)?;
     audit(
         &state,
         &actor.identity().user_id,
@@ -1215,7 +1215,13 @@ async fn delete_device(
 ) -> Result<Json<Value>, MatrixError> {
     let (localpart, _) = target_account(&state, &user_id)?;
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
-    crate::mas::remove_device(&state, &accounts, &localpart, &device_id)?;
+    crate::mas::remove_device(
+        &state,
+        &accounts,
+        &localpart,
+        &device_id,
+        crate::mas::EndedBy::Server,
+    )?;
     crate::mas::device_list_changed(&state, &accounts.user_id(&localpart));
     audit(
         &state,
@@ -1245,7 +1251,13 @@ async fn delete_devices(
     let (localpart, _) = target_account(&state, &user_id)?;
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     for device_id in &request.devices {
-        crate::mas::remove_device(&state, &accounts, &localpart, device_id)?;
+        crate::mas::remove_device(
+            &state,
+            &accounts,
+            &localpart,
+            device_id,
+            crate::mas::EndedBy::Server,
+        )?;
         audit(
             &state,
             &actor.identity().user_id,

@@ -20,6 +20,9 @@ use tempfile::TempDir;
 
 const AS_TOKEN: &str = "as_secret_token_for_tests";
 const MAS_TOKEN: &str = "mat_alice_access_token";
+const BOB_TOKEN: &str = "mat_bob_access_token";
+const SHORT_LIVED_TOKEN: &str = "mat_short_lived_access_token";
+const ADMIN_TOKEN: &str = "mat_admin_access_token";
 
 /// The mock provider: a discovery document and a scripted introspection
 /// endpoint that counts its calls.
@@ -88,6 +91,12 @@ impl Provider {
                         };
                         if token == "mat_compatibility_access_token" {
                             axum::Json(json!({ "active": true, "username": "alice", "scope": "urn:matrix:client:api:*", "device_id": "COMPATDEV" }))
+                        } else if token == BOB_TOKEN {
+                            axum::Json(json!({ "active": true, "username": "bob", "scope": "urn:matrix:client:api:* urn:matrix:client:device:BOBDEV" }))
+                        } else if token == SHORT_LIVED_TOKEN {
+                            // A token at the end of its life: MAS's access
+                            // tokens carry `expires_in`, as Synapse reads it.
+                            axum::Json(json!({ "active": true, "username": "alice", "scope": "urn:matrix:client:api:* urn:matrix:client:device:SHORTDEV", "expires_in": 0 }))
                         } else if let Some(scope) = scopes {
                             axum::Json(json!({ "active": true, "username": "alice", "scope": scope }))
                         } else if token == MAS_TOKEN {
@@ -346,6 +355,16 @@ async fn device_deletion_needs_no_uia_the_user_cannot_complete() {
         .await;
     assert_eq!(status, 401, "{body}");
     assert_eq!(body["errcode"], "M_UNKNOWN_TOKEN");
+    // And it stays ended. The provider was never told and still says
+    // active, so a re-introspection that provisioned the device again
+    // would bring the deleted session back on the request after.
+    for _ in 0..2 {
+        let (status, body) = whoami(&server, MAS_TOKEN).await;
+        assert_eq!(status, 401, "a deleted device stays deleted: {body}");
+        assert_eq!(body["errcode"], "M_UNKNOWN_TOKEN");
+    }
+    let accounts = spindle_server::accounts::Accounts::new(server.store.as_ref(), &server.name);
+    assert!(accounts.device("alice", "MASDEV1").unwrap().is_none());
 }
 
 #[tokio::test]
@@ -801,4 +820,251 @@ async fn a_cached_verdict_for_a_vanished_device_is_refused() {
     let (status, body) = whoami(&server, MAS_TOKEN).await;
     assert_eq!(status, 401, "{body}");
     assert_eq!(body["errcode"], "M_UNKNOWN_TOKEN");
+}
+
+async fn post(server: &Instance, path: &str, token: &str, body: &Value) -> (u16, Value) {
+    server
+        .request(reqwest::Method::POST, path, Some(token), Some(body))
+        .await
+}
+
+/// The token is refused on the very next request, and on the ones after,
+/// which no longer have a cached verdict to refuse and ask the provider.
+/// `/devices` as well as `/whoami`: `/whoami` refuses a deactivated
+/// account on its own, and an ordinary endpoint must refuse it as well.
+async fn assert_ended(server: &Instance, token: &str, why: &str) {
+    for attempt in ["next", "following"] {
+        for path in [
+            "/_matrix/client/v3/account/whoami",
+            "/_matrix/client/v3/devices",
+        ] {
+            let (status, body) = server
+                .request(reqwest::Method::GET, path, Some(token), None)
+                .await;
+            assert_eq!(status, 401, "{why} ({attempt} request, {path}): {body}");
+            assert_eq!(body["errcode"], "M_UNKNOWN_TOKEN", "{why}: {body}");
+        }
+    }
+}
+
+/// #615: a logout served here ends the token even when the provider is
+/// never told of it -- it goes on answering "active" -- because the logout
+/// ends the device, as the spec says a logout does.
+#[tokio::test]
+async fn a_logout_the_provider_never_hears_of_still_ends_the_token() {
+    let (_provider, url) = Provider::serve().await;
+    let server = Instance::start(Some(&url)).await;
+    assert_eq!(whoami(&server, MAS_TOKEN).await.0, 200);
+    assert_eq!(whoami(&server, "mat_stable_access_token").await.0, 200);
+
+    let (status, body) = post(&server, "/_matrix/client/v3/logout", MAS_TOKEN, &json!({})).await;
+    assert_eq!(status, 200, "{body}");
+
+    assert_ended(&server, MAS_TOKEN, "a logged-out token").await;
+    assert_eq!(
+        whoami(&server, "mat_stable_access_token").await.0,
+        200,
+        "the user's other session is not this logout's business"
+    );
+}
+
+/// #615: `/logout/all` ends every provider session of the user, not only
+/// the cached verdicts that a re-introspection would vouch for again.
+#[tokio::test]
+async fn logout_all_ends_every_provider_session_of_the_user() {
+    let (_provider, url) = Provider::serve().await;
+    let server = Instance::start(Some(&url)).await;
+    for token in [MAS_TOKEN, "mat_stable_access_token", BOB_TOKEN] {
+        assert_eq!(whoami(&server, token).await.0, 200);
+    }
+
+    let (status, body) = post(
+        &server,
+        "/_matrix/client/v3/logout/all",
+        MAS_TOKEN,
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    assert_ended(&server, MAS_TOKEN, "the session that logged out").await;
+    assert_ended(
+        &server,
+        "mat_stable_access_token",
+        "the user's other session",
+    )
+    .await;
+    assert_eq!(whoami(&server, BOB_TOKEN).await.0, 200, "another user");
+}
+
+/// #615: MAS deactivates through `delete_user`. Every session of the user
+/// ends with it, the device-less admin-scoped one included, even before
+/// the provider's own introspection catches up; reactivation lifts it.
+#[tokio::test]
+async fn mas_deleting_the_user_ends_every_session() {
+    let (_provider, url) = Provider::serve().await;
+    let server = Instance::start_with(
+        Some(&url),
+        &format!("client_id = \"spindle\"\nclient_secret = \"hush\"\nhomeserver_secret = \"{MAS_SECRET}\"\n"),
+    )
+    .await;
+    for token in [MAS_TOKEN, "mat_stable_access_token", ADMIN_TOKEN] {
+        assert_eq!(whoami(&server, token).await.0, 200);
+    }
+
+    let (status, body) = post(
+        &server,
+        "/_synapse/mas/delete_user",
+        MAS_SECRET,
+        &json!({ "localpart": "alice", "erase": false }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    assert_ended(&server, MAS_TOKEN, "a deactivated user's session").await;
+    assert_ended(
+        &server,
+        "mat_stable_access_token",
+        "a deactivated user's session",
+    )
+    .await;
+    assert_ended(&server, ADMIN_TOKEN, "a deactivated user's admin token").await;
+
+    let (status, body) = post(
+        &server,
+        "/_synapse/mas/reactivate_user",
+        MAS_SECRET,
+        &json!({ "localpart": "alice" }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(whoami(&server, MAS_TOKEN).await.0, 200, "reactivated");
+}
+
+/// #615: MAS's recovery path, `sync_devices`, deletes the devices it no
+/// longer has; their tokens end at once, the kept device's stay cached.
+#[tokio::test]
+async fn mas_syncing_a_device_away_ends_its_tokens() {
+    let (provider, url) = Provider::serve().await;
+    let server = Instance::start_with(
+        Some(&url),
+        &format!("client_id = \"spindle\"\nclient_secret = \"hush\"\nhomeserver_secret = \"{MAS_SECRET}\"\n"),
+    )
+    .await;
+    assert_eq!(whoami(&server, MAS_TOKEN).await.0, 200);
+    assert_eq!(whoami(&server, "mat_stable_access_token").await.0, 200);
+
+    provider.revoke(MAS_TOKEN);
+    let (status, body) = post(
+        &server,
+        "/_synapse/mas/sync_devices",
+        MAS_SECRET,
+        &json!({ "localpart": "alice", "devices": ["STABLEDEV"] }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    assert_ended(&server, MAS_TOKEN, "a device MAS no longer has").await;
+    let before = provider.introspections().len();
+    assert_eq!(whoami(&server, "mat_stable_access_token").await.0, 200);
+    assert_eq!(provider.introspections().len(), before, "still cached");
+}
+
+/// #615: an administrator's deactivation is not reported to the provider,
+/// which goes on vouching for the user's sessions. They end here anyway.
+#[tokio::test]
+async fn an_admin_deactivation_ends_the_users_sessions() {
+    let (_provider, url) = Provider::serve().await;
+    let server = Instance::start(Some(&url)).await;
+    assert_eq!(whoami(&server, BOB_TOKEN).await.0, 200);
+
+    let (status, body) = post(
+        &server,
+        &format!("/_synapse/admin/v1/deactivate/@bob:{}", server.name),
+        ADMIN_TOKEN,
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    assert_ended(&server, BOB_TOKEN, "a deactivated user's session").await;
+}
+
+/// #615: an administrator's device deletion, single or bulk, ends the
+/// session although the provider was not told; the provider brings the
+/// device back only by provisioning it again, as it would on Synapse.
+#[tokio::test]
+async fn an_admin_device_deletion_ends_the_session_until_the_provider_provisions_it() {
+    let (_provider, url) = Provider::serve().await;
+    let server = Instance::start_with(
+        Some(&url),
+        &format!("client_id = \"spindle\"\nclient_secret = \"hush\"\nhomeserver_secret = \"{MAS_SECRET}\"\n"),
+    )
+    .await;
+    assert_eq!(whoami(&server, BOB_TOKEN).await.0, 200);
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::DELETE,
+            &format!(
+                "/_synapse/admin/v2/users/@bob:{}/devices/BOBDEV",
+                server.name
+            ),
+            Some(ADMIN_TOKEN),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_ended(&server, BOB_TOKEN, "a device an admin deleted").await;
+
+    let upsert = json!({ "localpart": "bob", "device_id": "BOBDEV" });
+    let (status, body) = post(&server, "/_synapse/mas/upsert_device", MAS_SECRET, &upsert).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(whoami(&server, BOB_TOKEN).await.0, 200, "provisioned again");
+
+    let (status, body) = post(
+        &server,
+        &format!(
+            "/_synapse/admin/v2/users/@bob:{}/delete_devices",
+            server.name
+        ),
+        ADMIN_TOKEN,
+        &json!({ "devices": ["BOBDEV"] }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_ended(&server, BOB_TOKEN, "a device an admin bulk-deleted").await;
+}
+
+/// #615: the window a verdict is trusted for is the operator's to set; 0
+/// puts the provider in every request, so its revocation is immediate.
+#[tokio::test]
+async fn the_introspection_cache_window_is_configurable() {
+    let (provider, url) = Provider::serve().await;
+    let server = Instance::start_with(
+        Some(&url),
+        "client_id = \"spindle\"\nclient_secret = \"hush\"\nintrospection_cache_ttl_secs = 0\n",
+    )
+    .await;
+    assert_eq!(whoami(&server, MAS_TOKEN).await.0, 200);
+    assert_eq!(whoami(&server, MAS_TOKEN).await.0, 200);
+    assert_eq!(provider.introspections().len(), 2, "nothing cached");
+
+    provider.revoke(MAS_TOKEN);
+    assert_ended(&server, MAS_TOKEN, "a token the provider revoked").await;
+}
+
+/// #615, Synapse parity: a verdict is not trusted past the `expires_in`
+/// the provider gave the token, whatever the configured window.
+#[tokio::test]
+async fn a_verdict_is_not_trusted_past_the_tokens_expiry() {
+    let (provider, url) = Provider::serve().await;
+    let server = Instance::start(Some(&url)).await;
+    assert_eq!(whoami(&server, SHORT_LIVED_TOKEN).await.0, 200);
+    assert_eq!(whoami(&server, SHORT_LIVED_TOKEN).await.0, 200);
+    assert_eq!(
+        provider.introspections().len(),
+        2,
+        "a token at the end of its life is asked about again"
+    );
 }
