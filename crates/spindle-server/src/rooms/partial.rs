@@ -57,6 +57,10 @@ use spindle_store::{FjallStore, ReadView as _, RoomStore, Store as _};
 
 use super::{RoomError, Rooms};
 
+/// The member slots a resync fills, each with its event, and each member
+/// event's content by ID.
+type OmittedMembers = (BTreeMap<StateKey, EventId>, HashMap<String, Value>);
+
 /// What a `send_join` answered with `members_omitted` leaves to remember.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PartialState {
@@ -259,8 +263,8 @@ impl Rooms {
     /// Fold the full state at the join into a partial-state room and end
     /// its partial state.
     ///
-    /// `state_ids` is a server's `/state_ids` answer at the join: the
-    /// state before it, every body already fetched, verified and retained
+    /// `state_ids` names the state before the join, as a server's `/state`
+    /// at the join answered it, every body already fetched, verified and retained
     /// by the caller (`Rooms::retain_remote_auth`). Its member events fill
     /// the member slots each snapshot from the join on lacks
     /// (`RoomLog::fill_partial_state`); the rewritten entries, their trie
@@ -293,7 +297,7 @@ impl Rooms {
                 .get(&join)
                 .ok_or_else(|| RoomError::MissingBody(record.join_event_id.clone()))?
                 .li;
-            let fill = self.omitted_members(&log, room_id, state_ids)?;
+            let (fill, contents) = self.omitted_members(&log, room_id, state_ids)?;
             let mut load = |root: &StateRoot| self.load_node(root);
             let filled = log
                 .fill_partial_state(join_li, &fill, &mut load)
@@ -322,8 +326,8 @@ impl Rooms {
                     if current.get(key) != Some(id.as_str()) {
                         continue;
                     }
-                    let event = self.read_event(room_id, id)?;
-                    self.index_membership(room_id, Some(key.state_key()), &event["content"], 0)?;
+                    let content = contents.get(id.as_str()).unwrap_or(&Value::Null);
+                    self.index_membership(room_id, Some(key.state_key()), content, 0)?;
                     filled_members += 1;
                 }
             }
@@ -345,13 +349,15 @@ impl Rooms {
     }
 
     /// The member events of `state_ids`, keyed by their slot, after the
-    /// checks that make the set a state of this room.
+    /// checks that make the set a state of this room, with each member
+    /// event's content: the membership index needs it once the fill has
+    /// landed, and the body is read once here rather than again there.
     fn omitted_members(
         &self,
         log: &spindle_core::RoomLog,
         room_id: &str,
         state_ids: &[String],
-    ) -> Result<BTreeMap<StateKey, EventId>, RoomError> {
+    ) -> Result<OmittedMembers, RoomError> {
         let create_id = log
             .current_state()
             .and_then(|state| state.get(&StateKey::new("m.room.create", "")))
@@ -359,6 +365,7 @@ impl Rooms {
             .to_owned();
         let mut create_named = false;
         let mut fill = BTreeMap::new();
+        let mut contents = HashMap::new();
         for state_id in state_ids {
             let held = EventId::new(state_id.as_str());
             if log.historically_rejected(&held)
@@ -396,12 +403,13 @@ impl Rooms {
                     "the full state names two events for m.room.member/{state_key}"
                 )));
             }
+            contents.insert(state_id.clone(), body["content"].clone());
         }
         if !create_named {
             return Err(RoomError::Forbidden(
                 "the full state does not name this room's create event".to_owned(),
             ));
         }
-        Ok(fill)
+        Ok((fill, contents))
     }
 }

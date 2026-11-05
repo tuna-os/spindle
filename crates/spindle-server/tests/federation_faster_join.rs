@@ -4,8 +4,8 @@
 //! The joining server asks `send_join` to omit the room's member events,
 //! the resident leaves them out and names its servers, and the join
 //! returns at once with a partial-state room that is usable for reading
-//! and sending. The full state follows in the background, from the
-//! resident's `/state_ids` and `/state`, and the roster converges.
+//! and sending. The full state follows in the background, from one
+//! `/state` at the resident, and the roster converges.
 //!
 //! What makes "at once" a counted claim rather than a timing: the
 //! resident here sits behind a gate on its `/state_ids` and `/state`
@@ -30,6 +30,9 @@ const REFUSE: u8 = 2;
 struct Gate {
     mode: AtomicU8,
     served: AtomicUsize,
+    /// The `event_id` each answered request named, `/state_ids` and
+    /// `/state` apart.
+    asked: std::sync::Mutex<(Vec<String>, Vec<String>)>,
     refused: AtomicUsize,
     changed: tokio::sync::Notify,
 }
@@ -48,17 +51,34 @@ impl Gate {
         self.refused.load(Ordering::SeqCst)
     }
 
+    /// The events `/state_ids` and `/state` were answered at.
+    fn asked(&self) -> (Vec<String>, Vec<String>) {
+        self.asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     async fn pass(
         self: Arc<Self>,
         request: axum::extract::Request,
         next: axum::middleware::Next,
     ) -> axum::response::Response {
         let path = request.uri().path();
-        let gated = path.starts_with("/_matrix/federation/v1/state_ids/")
-            || path.starts_with("/_matrix/federation/v1/state/");
+        let ids = path.starts_with("/_matrix/federation/v1/state_ids/");
+        let gated = ids || path.starts_with("/_matrix/federation/v1/state/");
         if !gated {
             return next.run(request).await;
         }
+        let at = request
+            .uri()
+            .query()
+            .and_then(|query| {
+                form_urlencoded::parse(query.as_bytes())
+                    .find(|(key, _)| key == "event_id")
+                    .map(|(_, value)| value.into_owned())
+            })
+            .unwrap_or_default();
         loop {
             let changed = self.changed.notified();
             match self.mode.load(Ordering::SeqCst) {
@@ -75,6 +95,12 @@ impl Gate {
         }
         let response = next.run(request).await;
         self.served.fetch_add(1, Ordering::SeqCst);
+        let mut asked = self
+            .asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if ids { &mut asked.0 } else { &mut asked.1 }.push(at);
+        drop(asked);
         response
     }
 }
@@ -482,7 +508,22 @@ async fn a_partial_join_is_usable_at_once_and_converges_after_the_resync() {
     ];
     expected.sort();
     assert_eq!(members, expected, "the roster converged, without erin");
-    assert!(remote.gate.served() >= 1, "the resync asked the resident");
+    // One `/state` at the join and no `/state_ids` there (#766): the
+    // omitted roster is most of the state, so its bodies are wanted
+    // anyway and the IDs are theirs to compute. A round trip and the
+    // resident's second state computation are what this counts away.
+    // The backfill loop asks `/state_ids` at the oldest event it holds for
+    // the history before the join; that is another question.
+    let (ids_at, state_at) = remote.gate.asked();
+    assert_eq!(
+        state_at.len(),
+        1,
+        "the resync asked the resident /state once"
+    );
+    assert!(
+        !ids_at.contains(&state_at[0]),
+        "and no /state_ids at the same event: {ids_at:?}"
+    );
 
     // A client that synced while the room was partial is told the room
     // afresh once the resync lands, member events and all. Nothing else
