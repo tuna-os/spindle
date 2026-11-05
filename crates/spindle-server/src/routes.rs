@@ -83,9 +83,9 @@ pub const MOUNTED: &[&str] = &[
 ///
 /// Split by what a route is *about* rather than by spec section, because the
 /// spec's own grouping cuts across the same path prefixes: `/rooms/{id}/...`
-/// holds membership, timeline and state alike. Four builders also keep any one
-/// of them short enough to read at a glance, which a single chain of forty
-/// routes had stopped being.
+/// holds membership, timeline and state alike. Each domain's builder lives
+/// in the `*_routes` module that holds its handlers, so this function only
+/// assembles them.
 pub fn router(state: AppState) -> Router {
     let routes = Router::new()
         .merge(crate::account_routes::routes())
