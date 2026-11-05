@@ -41,13 +41,26 @@ use crate::metrics::{BlockingTask, Metrics};
 /// runtime the unit tests use, where `block_in_place` would panic -- it is
 /// a plain call, which is what blocking already meant there.
 pub fn section<T>(metrics: &Metrics, task: BlockingTask, work: impl FnOnce() -> T) -> T {
-    let on_worker = tokio::runtime::Handle::try_current()
-        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
-    if !on_worker {
+    if !on_worker() {
         return work();
     }
     let _in_flight = metrics.blocking_started(task);
     tokio::task::block_in_place(work)
+}
+
+/// [`section`] for code that has no [`Metrics`] to count itself in: the
+/// password hasher, which is reached through `Accounts` from every login,
+/// registration and password change, none of which carries the handle.
+pub(crate) fn unmetered_section<T>(work: impl FnOnce() -> T) -> T {
+    if !on_worker() {
+        return work();
+    }
+    tokio::task::block_in_place(work)
+}
+
+fn on_worker() -> bool {
+    tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
 }
 
 /// Run `work` on the blocking pool and wait for it without holding a

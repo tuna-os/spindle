@@ -363,7 +363,7 @@ impl Delegated {
         if !known {
             accounts
                 .register(&localpart, &crate::accounts::unguessable_password())
-                .map_err(|error| MatrixError::internal(&error.to_string()))?;
+                .map_err(|error| crate::routes::internal(&error))?;
         }
         // The device row exists because the provider bound the token to
         // it — MSC3861's account/device mapping, written down so device

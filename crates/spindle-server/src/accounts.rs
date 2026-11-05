@@ -14,7 +14,7 @@
 //! paid on login, which is rare; the alternative is paid by every user whose
 //! password is recovered from a stolen hash.
 
-use crate::passwords::ReusableArgon2;
+use crate::passwords;
 use argon2::password_hash::phc::{PasswordHash, Salt};
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use serde::{Deserialize, Serialize};
@@ -177,11 +177,7 @@ impl<'a, S: Store> Accounts<'a, S> {
             return Err(AccountError::UserInUse);
         }
 
-        let salt = salt();
-        let password_hash = ReusableArgon2
-            .hash_password_with_salt(password.as_bytes(), &salt)
-            .map_err(|error| AccountError::Hashing(error.to_string()))?
-            .to_string();
+        let password_hash = hash_password(password)?;
 
         let account = Account {
             localpart: localpart.to_owned(),
@@ -335,14 +331,16 @@ impl<'a, S: Store> Accounts<'a, S> {
     ///
     /// # Errors
     ///
-    /// Returns a storage or decoding error.
+    /// Returns a storage or decoding error, or [`AccountError::Busy`] if
+    /// every password-hashing workspace is in use and the queue for them is
+    /// full. Busy is not `false`: the password was never checked.
     pub fn verify_password(&self, localpart: &str, password: &str) -> Result<bool, AccountError> {
         let account = self.account(localpart)?;
         let hash = account.as_ref().map_or(DUMMY_HASH, |a| &a.password_hash);
         let parsed = PasswordHash::new(hash).map_err(|e| AccountError::Hashing(e.to_string()))?;
-        let matches = ReusableArgon2
-            .verify_password(password.as_bytes(), &parsed)
-            .is_ok();
+        let matches = passwords::with_workspace(|argon| {
+            argon.verify_password(password.as_bytes(), &parsed).is_ok()
+        })?;
         // A deactivated account keeps its hash (the row is the localpart
         // reservation) but no longer authenticates.
         Ok(matches && account.is_some_and(|account| !account.deactivated))
@@ -637,6 +635,9 @@ impl<'a, S: Store> Accounts<'a, S> {
     ///
     /// Returns a storage, decoding, or hashing error.
     pub fn set_password(&self, localpart: &str, password: &str) -> Result<bool, AccountError> {
+        // Hashed before the erasure lock is taken: the hash may wait for a
+        // workspace (#571), and every account update waits on that lock.
+        let password_hash = hash_password(password)?;
         // All account updates share the erasure lock so a concurrent
         // flag/password write cannot restore an older erasure decision.
         let _guard = ERASURE_POLICY_LOCK
@@ -645,11 +646,7 @@ impl<'a, S: Store> Accounts<'a, S> {
         let Some(mut account) = self.account(localpart)? else {
             return Ok(false);
         };
-        let salt = salt();
-        account.password_hash = ReusableArgon2
-            .hash_password_with_salt(password.as_bytes(), &salt)
-            .map_err(|error| AccountError::Hashing(error.to_string()))?
-            .to_string();
+        account.password_hash = password_hash;
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
         Ok(true)
@@ -982,6 +979,15 @@ pub enum AccountError {
     Storage(StoreError),
     Codec(String),
     Hashing(String),
+    /// Every password-hashing workspace is in use and the queue for them
+    /// is full (#571). Answered 429 `M_LIMIT_EXCEEDED`.
+    Busy,
+}
+
+impl From<passwords::Busy> for AccountError {
+    fn from(_: passwords::Busy) -> Self {
+        Self::Busy
+    }
 }
 
 impl From<StoreError> for AccountError {
@@ -1000,6 +1006,7 @@ impl std::fmt::Display for AccountError {
             Self::Storage(error) => write!(formatter, "storage: {error}"),
             Self::Codec(message) => write!(formatter, "unreadable record: {message}"),
             Self::Hashing(message) => write!(formatter, "password hashing: {message}"),
+            Self::Busy => write!(formatter, "too many passwords being checked; try again"),
         }
     }
 }
@@ -1010,13 +1017,17 @@ impl std::error::Error for AccountError {}
 ///
 /// # Errors
 ///
-/// Returns [`AccountError::Hashing`] if hashing fails.
+/// Returns [`AccountError::Hashing`] if hashing fails, or
+/// [`AccountError::Busy`] if every workspace is in use and the queue for
+/// them is full.
 pub fn hash_password(password: &str) -> Result<String, AccountError> {
     let salt = salt();
-    Ok(ReusableArgon2
-        .hash_password_with_salt(password.as_bytes(), &salt)
-        .map_err(|error| AccountError::Hashing(error.to_string()))?
-        .to_string())
+    passwords::with_workspace(|argon| {
+        argon
+            .hash_password_with_salt(password.as_bytes(), &salt)
+            .map(|hash| hash.to_string())
+    })?
+    .map_err(|error| AccountError::Hashing(error.to_string()))
 }
 
 #[cfg(test)]

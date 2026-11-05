@@ -28,7 +28,7 @@ use axum::routing::{get, post};
 use serde::Deserialize;
 
 use crate::AppState;
-use crate::accounts::Accounts;
+use crate::accounts::{AccountError, Accounts};
 use crate::errors::MatrixError;
 use crate::metrics::{AccountAction, LoginMethod, LoginResult};
 use crate::routes::ClientAddr;
@@ -482,14 +482,29 @@ async fn login(
         ));
     }
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
-    let good = accounts
-        .verify_password(&localpart, &form.password)
-        .map_err(|error| {
+    let good = match accounts.verify_password(&localpart, &form.password) {
+        Ok(good) => good,
+        // The password was never checked (#571): the same page as a spent
+        // attempt budget, since the answer to both is to wait.
+        Err(AccountError::Busy) => {
+            state
+                .metrics
+                .record_login(LoginMethod::Account, LoginResult::RateLimited);
+            return Ok(render_login(
+                &state,
+                &headers,
+                StatusCode::TOO_MANY_REQUESTS,
+                &next,
+                Some(web::HASHER_BUSY),
+            ));
+        }
+        Err(error) => {
             state
                 .metrics
                 .record_login(LoginMethod::Account, LoginResult::Error);
-            MatrixError::internal(&error.to_string())
-        })?;
+            return Err(MatrixError::internal(&error.to_string()));
+        }
+    };
     if !good {
         state
             .metrics
@@ -616,9 +631,15 @@ pub(crate) fn recheck_password(
             "Too many attempts. Wait a minute and try again.",
         )));
     }
-    let good = Accounts::new(state.store.as_ref(), &state.config.server.name)
+    let good = match Accounts::new(state.store.as_ref(), &state.config.server.name)
         .verify_password(localpart, password)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    {
+        Ok(good) => good,
+        Err(AccountError::Busy) => {
+            return Ok(Some((StatusCode::TOO_MANY_REQUESTS, web::HASHER_BUSY)));
+        }
+        Err(error) => return Err(MatrixError::internal(&error.to_string())),
+    };
     if !good {
         return Ok(Some((
             StatusCode::UNAUTHORIZED,
@@ -678,7 +699,7 @@ async fn change_password(
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     accounts
         .set_password(&session.localpart, &form.new_password)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        .map_err(|error| crate::routes::internal(&error))?;
     // The new hash ends every browser session that predates it — a
     // password change is exactly when a stolen one must stop working —
     // except this one, the user's own, which is carried over.

@@ -1022,7 +1022,7 @@ async fn reset(
     }
     let changed = accounts
         .set_password(&row.localpart, &form.new_password)
-        .map_err(|e| storage(&e))?;
+        .map_err(|e| crate::routes::internal(&e))?;
     if !changed {
         return Ok(dead_link(&state));
     }

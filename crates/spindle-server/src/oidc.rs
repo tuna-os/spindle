@@ -707,14 +707,23 @@ fn password_sign_in(
         )));
     }
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
-    let good = accounts
-        .verify_password(&localpart, password)
-        .map_err(|error| {
+    let good = match accounts.verify_password(&localpart, password) {
+        Ok(good) => good,
+        // The password was never checked (#571); back to the form, as for
+        // a spent attempt budget.
+        Err(crate::accounts::AccountError::Busy) => {
+            state
+                .metrics
+                .record_login(LoginMethod::Oidc, LoginResult::RateLimited);
+            return Ok(Err((StatusCode::TOO_MANY_REQUESTS, web::HASHER_BUSY)));
+        }
+        Err(error) => {
             state
                 .metrics
                 .record_login(LoginMethod::Oidc, LoginResult::Error);
-            MatrixError::internal(&error.to_string())
-        })?;
+            return Err(MatrixError::internal(&error.to_string()).into());
+        }
+    };
     if !good {
         // Back to the form, not an OAuth error: a typo'd password is the
         // human's business, and the flow is still alive.

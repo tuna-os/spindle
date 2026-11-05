@@ -332,8 +332,14 @@ pub(crate) fn localpart_of(user: &str) -> String {
         .to_lowercase()
 }
 
+/// An account operation that failed for none of the reasons a route
+/// answers itself: a 500, except a busy password hasher (#571). That is
+/// load, not a fault, and the caller is told when to try again.
 pub(crate) fn internal(error: &AccountError) -> MatrixError {
-    MatrixError::internal(&error.to_string())
+    match error {
+        AccountError::Busy => MatrixError::limit_exceeded(crate::passwords::BUSY_RETRY_AFTER_MS),
+        _ => MatrixError::internal(&error.to_string()),
+    }
 }
 
 /// The caller's address, as far as it can be known.

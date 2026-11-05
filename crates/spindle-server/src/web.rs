@@ -469,6 +469,10 @@ fn budget_keys(localpart: &str, source: &str) -> [String; 2] {
     ]
 }
 
+/// What a password form says when the password could not be checked
+/// because every hashing workspace was in use (#571).
+pub(crate) const HASHER_BUSY: &str = "Too many sign-ins at once. Wait a moment and try again.";
+
 /// Spend one password attempt against both budgets, before the Argon2
 /// work is done, or refuse.
 pub(crate) fn spend_password_attempt(

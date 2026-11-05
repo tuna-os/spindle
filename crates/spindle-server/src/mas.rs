@@ -183,7 +183,7 @@ async fn provision_user(
             .register(&request.localpart, &unguessable_password())
             .map_err(|error| match error {
                 AccountError::InvalidUsername => MatrixError::invalid_username(),
-                other => MatrixError::internal(&other.to_string()),
+                other => crate::routes::internal(&other),
             })?;
     }
     let displayname = match (&request.set_displayname, request.unset_displayname) {

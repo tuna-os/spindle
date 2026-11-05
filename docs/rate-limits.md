@@ -115,10 +115,12 @@ account can make the server *hold*.
 | Readers' receipts waiting per federation destination | 1,000 | `federation::MAX_PENDING_RECEIPTS` | a new reader's receipt is not queued; a waiting reader's is replaced |
 | Durable EDUs (to-device, device-list, cross-signing) per outbound transaction | 50 of the spec's 100 | `federation::edu_outbox::PER_TRANSACTION` | the rest wait, in order, for the next transaction; ephemeral EDUs fill the remaining slots |
 | Push notifications waiting per gateway URL | 10,000 | `push::QUEUE_CAP` | oldest dropped, with its stored row; each is stored until its gateway answers, so a restart resumes them |
+| Password hashes (login, registration, password change), for the whole process | 2 at once; 32 more wait | `[limits] password_hashes_at_once`, `password_hashes_waiting` | 429 `M_LIMIT_EXCEEDED` with `retry_after_ms`, at once, when the queue is full. Each hash at once keeps a 19 MiB workspace for reuse (#571). |
 
 Every configurable cap refuses zero at startup. A zero would reject every
 write, and a config that quietly disables a feature is worse than one that
-will not load.
+will not load. `password_hashes_waiting` is the exception. A zero there
+means no queue: a login gets a 429 when all workspaces are in use.
 
 ## Account-driven storage growth
 
