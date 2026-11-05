@@ -501,8 +501,8 @@ pub(crate) async fn query_remote_keys(
                 .insert(user_id.clone(), wanted.clone());
         }
     }
-    for (server, ask) in by_server {
-        match state.federation.remote_keys_query(&server, &ask).await {
+    for (server, ask, answer) in ask_servers(state, by_server, Ask::Query).await {
+        match answer {
             Ok(answer) => {
                 for section in ["device_keys", "master_keys", "self_signing_keys"] {
                     if let Some(theirs) = answer[section].as_object() {
@@ -570,8 +570,8 @@ pub(crate) async fn claim_remote_keys(
                 .insert(user_id.clone(), devices.clone());
         }
     }
-    for (server, ask) in by_server {
-        match state.federation.remote_keys_claim(&server, &ask).await {
+    for (server, ask, answer) in ask_servers(state, by_server, Ask::Claim).await {
+        match answer {
             Ok(answer) => {
                 if let Some(theirs) = answer["one_time_keys"].as_object() {
                     claimed.extend(theirs.clone());
@@ -586,6 +586,54 @@ pub(crate) async fn claim_remote_keys(
             }
         }
     }
+}
+
+/// Which federation request [`ask_servers`] sends.
+#[derive(Clone, Copy)]
+enum Ask {
+    Query,
+    Claim,
+}
+
+/// Ask every server in `by_server` at once and return the answers in server
+/// order.
+///
+/// A client asks about every user in every encrypted room it opens, so one
+/// request names many servers. Asked one after another, each dead or slow
+/// peer added its whole request timeout to the one the client was waiting
+/// on: a `keys/query` took the sum of the slow peers rather than the
+/// slowest of them, and Element X, which blocks on it, sat for 10 to 30
+/// seconds. The answers are merged by the caller in the same server order
+/// as before, so the response does not depend on which peer answered first.
+async fn ask_servers(
+    state: &AppState,
+    by_server: std::collections::BTreeMap<String, serde_json::Map<String, Value>>,
+    ask: Ask,
+) -> Vec<(
+    String,
+    serde_json::Map<String, Value>,
+    Result<Value, crate::federation::FederationError>,
+)> {
+    let mut pending = tokio::task::JoinSet::new();
+    for (server, wanted) in by_server {
+        let state = state.clone();
+        pending.spawn(async move {
+            let answer = match ask {
+                Ask::Query => state.federation.remote_keys_query(&server, &wanted).await,
+                Ask::Claim => state.federation.remote_keys_claim(&server, &wanted).await,
+            };
+            (server, wanted, answer)
+        });
+    }
+    let mut answers = Vec::with_capacity(pending.len());
+    while let Some(done) = pending.join_next().await {
+        match done {
+            Ok(answer) => answers.push(answer),
+            Err(error) => tracing::error!(%error, "keys: a peer request task failed"),
+        }
+    }
+    answers.sort_by(|a, b| a.0.cmp(&b.0));
+    answers
 }
 
 async fn read(
