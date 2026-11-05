@@ -75,6 +75,7 @@ pub mod state_res;
 pub mod state_res_v1;
 pub mod stream;
 pub mod surface;
+pub mod sync_routes;
 pub mod telemetry;
 pub mod tokens;
 pub mod typing;
