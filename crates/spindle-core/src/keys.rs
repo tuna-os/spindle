@@ -432,6 +432,27 @@ pub enum Keyspace {
     StateKeyIntern = 0x59,
     /// Highest global position issued to a client, retained after queue drains.
     StreamCheckpoint = 0x5a,
+    /// `(destination, seq)` -> one EDU that must reach the peer: a
+    /// to-device message, a device-list update or a cross-signing key
+    /// update (#739).
+    ///
+    /// The EDU half of [`Self::FederationOutbox`]'s at-least-once: these
+    /// three carry key material and messages a client is waiting on, and
+    /// a peer that missed one does not ask again, so a failed transaction
+    /// or a restart must not lose them the way it loses typing. Deleted
+    /// only once the destination acknowledged the transaction carrying the
+    /// row; `seq` is per destination and keeps them in the order queued.
+    /// The bare `destination` key holds the next `seq`, kept after the
+    /// queue drains so a sequence is never issued twice ([`edu_outbox_next`]).
+    EduOutbox = 0x5b,
+    /// `seq` -> one push notification judged and not yet acknowledged by
+    /// its gateway, with the gateway's URL (#739).
+    ///
+    /// Written in the same batch that advances [`Self::PushCursor`] past
+    /// the event that produced it, so a crash leaves either both or
+    /// neither; deleted once the gateway answers or the notification is
+    /// given up on.
+    PushPending = 0x5c,
     /// `(room_id, position)` -> one event of a filled federation gap: its
     /// ID and the root of the state after it. History backfilled into the
     /// *middle* of a room's timeline -- between the head this server held
@@ -1425,6 +1446,74 @@ pub fn federation_outbox_destination(key: &[u8]) -> Option<String> {
     let rest = key.strip_prefix(federation_outbox_all().as_slice())?;
     let len = usize::from(u16::from_be_bytes(rest.get(..2)?.try_into().ok()?));
     String::from_utf8(rest.get(2..2 + len)?.to_vec()).ok()
+}
+
+/// `(destination, seq)` key for [`Keyspace::EduOutbox`]: framed like
+/// [`federation_outbox`], so one destination's rows sort together and in
+/// the order they were queued.
+#[must_use]
+pub fn edu_outbox(destination: &str, seq: u64) -> Vec<u8> {
+    let mut key = edu_outbox_prefix(destination);
+    key.extend_from_slice(&seq.to_be_bytes());
+    key
+}
+
+/// The scan prefix for one destination's [`Keyspace::EduOutbox`] rows.
+#[must_use]
+pub fn edu_outbox_prefix(destination: &str) -> Vec<u8> {
+    let mut key = edu_outbox_all();
+    let (len, bytes) = framed(destination.as_bytes());
+    key.extend_from_slice(&len.to_be_bytes());
+    key.extend_from_slice(bytes);
+    key
+}
+
+/// The scan prefix covering every destination's [`Keyspace::EduOutbox`] rows.
+#[must_use]
+pub fn edu_outbox_all() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::EduOutbox as u8]
+}
+
+/// The row holding the next sequence [`edu_outbox`] issues for
+/// `destination`: the bare destination prefix, so it sorts before that
+/// destination's rows and is no row itself ([`edu_outbox_parts`] skips
+/// it). It outlives the queue draining, because transaction IDs are built
+/// from these sequences and one reused for different EDUs would be taken
+/// for a replay and dropped by the peer.
+#[must_use]
+pub fn edu_outbox_next(destination: &str) -> Vec<u8> {
+    edu_outbox_prefix(destination)
+}
+
+/// The destination and sequence an [`edu_outbox`] key names.
+#[must_use]
+pub fn edu_outbox_parts(key: &[u8]) -> Option<(String, u64)> {
+    let rest = key.strip_prefix(edu_outbox_all().as_slice())?;
+    let len = usize::from(u16::from_be_bytes(rest.get(..2)?.try_into().ok()?));
+    let destination = String::from_utf8(rest.get(2..2 + len)?.to_vec()).ok()?;
+    let seq = u64::from_be_bytes(rest.get(2 + len..)?.try_into().ok()?);
+    Some((destination, seq))
+}
+
+/// `seq` key for [`Keyspace::PushPending`].
+#[must_use]
+pub fn push_pending(seq: u64) -> Vec<u8> {
+    let mut key = push_pending_all();
+    key.extend_from_slice(&seq.to_be_bytes());
+    key
+}
+
+/// The scan prefix covering every [`Keyspace::PushPending`] row.
+#[must_use]
+pub fn push_pending_all() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::PushPending as u8]
+}
+
+/// The sequence a [`push_pending`] key names.
+#[must_use]
+pub fn push_pending_seq(key: &[u8]) -> Option<u64> {
+    let rest = key.strip_prefix(push_pending_all().as_slice())?;
+    Some(u64::from_be_bytes(rest.try_into().ok()?))
 }
 
 /// `(origin, txn_id)` key for [`Keyspace::FederationTxn`].

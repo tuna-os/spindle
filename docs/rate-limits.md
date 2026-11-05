@@ -75,6 +75,10 @@ if abuse ever needs one, and it belongs in `[ratelimit]` beside `enabled`.
 | PDUs per federation transaction | 50 | fixed (the spec's own number) | 400 `M_BAD_JSON` |
 | Federation transaction id length | 255 bytes | fixed | 400 `M_BAD_JSON`; the id is a replay key, and an unbounded key is a storage sink |
 | Peer key-document validity | 7 days regardless of what the peer claims | `federation::MAX_KEY_VALIDITY` | refetch |
+| Ephemeral EDUs (typing, presence) waiting per federation destination | 100 | `Federation::queue_edu` | oldest dropped; held in memory only, and dropped with a transaction that fails |
+| Readers' receipts waiting per federation destination | 1,000 | `federation::MAX_PENDING_RECEIPTS` | a new reader's receipt is not queued; a waiting reader's is replaced |
+| Durable EDUs (to-device, device-list, cross-signing) per outbound transaction | 50 of the spec's 100 | `federation::edu_outbox::PER_TRANSACTION` | the rest wait, in order, for the next transaction; ephemeral EDUs fill the remaining slots |
+| Push notifications waiting per gateway URL | 10,000 | `push::QUEUE_CAP` | oldest dropped, with its stored row; each is stored until its gateway answers, so a restart resumes them |
 
 Every configurable cap refuses zero at startup. A zero would reject every
 write, and a config that quietly disables a feature is worse than one that
@@ -95,6 +99,7 @@ next one is a small change and not a design discussion.
 | Room tags per room per user | `PUT /tags/{tag}` | per-user-per-room count |
 | Invites outstanding per sender | `POST /invite` | per-user count of pending invites |
 | Events per room, and rooms joined per user | `PUT /send`, `POST /join` | a per-account send rate (above), not a cap: a room's history is the product |
+| To-device messages, device-list and cross-signing updates owed to an unreachable server | `PUT /sendToDevice` to its users; key changes while sharing a room with it | per-destination count. Like the PDU outbox, these rows (`Keyspace::EduOutbox`) are kept until the peer acknowledges them, because dropping one is an undecryptable message later (#739) |
 
 
 
