@@ -30,6 +30,7 @@ pub mod delegated;
 pub mod device_routes;
 pub mod devices;
 pub mod directory;
+pub mod discovery_routes;
 pub mod e2ee_federation;
 pub mod email;
 pub mod errors;
