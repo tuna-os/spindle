@@ -42,7 +42,7 @@ stale on a runner change. Wall times do.
 | The same vs **Tuwunel** | Done from M2 close-out on, below |
 | All four at three rounds a side, under the separation rule (#171) | Done, below — the first sitting the page judges by its own repeatability |
 | The same vs **Dendrite** (Element's Go server), five in the field | Done from the second M7 sitting on, below |
-| The three parity lines of #42, pass or fail per sitting | Done, below; two federated workloads are not measured |
+| The three parity lines of #42, pass or fail per sitting | Done, below; line 3 has its federated and concurrent cells since #647, and fails against Tuwunel |
 
 Everything here is **algorithmic**, measured inside the library. None of it is a
 server throughput figure and none of it should be quoted as one. Server-to-
@@ -222,6 +222,8 @@ just bench-build                 # Spindle, release
 just bench-sitting m7-progress-2 # up, three rounds, down, and the sidecar
 just bench-render                # the site from the committed results
 just bench-gate m7-progress-2    # the three parity lines of #42, on that sitting
+just bench-targeted targeted-20261105             # line 3's federated cells (#647)
+just bench-gate "ci-20261010 targeted-20261105"  # a sitting and a targeted run, judged together
 ```
 
 - **`scripts/bench-field.sh`** holds the pins: Continuwuity 26.8.1 as its
@@ -257,6 +259,11 @@ just bench-gate m7-progress-2    # the three parity lines of #42, on that sittin
   reads the sidecar before the numbers join the record. That is what keeps
   the page current between milestones without letting a runner's noise
   overwrite a milestone's number.
+- **`scripts/federated-benchmark.py`** measures the three line 3 cells
+  that the client-server driver cannot make (#647). The
+  `targeted-sitting` workflow runs it on demand, and on each pull
+  request that changes it. "Line 3 against Synapse and Tuwunel" below
+  gives the method and the results.
 
 On the page itself, every rival is a toggle. Synapse's column is often ten
 times the Rust servers' and flattens their lines to the axis, so a reader
@@ -280,16 +287,18 @@ the rounds do not separate is noise, not a loss. For line 3, "much faster"
 means a separated win of 1.38× or more against each rival. 1.38× is the
 repeatability that this host showed for one round.
 
-Line 3 does not pass while a target workload has no measurement. The gate
-lists these workloads in each report:
+Line 3 does not pass while a target workload has no measurement. The
+weekly comparison does not hold three of the five target workloads: the
+10,000-member federated join, the catch-up after a partition, and
+concurrent send. `scripts/federated-benchmark.py` measures them in a
+`targeted-<date>` group. Give the gate the two group names, and it reads
+the two groups together.
 
-- the 10,000-member federated join,
-- the catch-up after a partition,
-- concurrent send against a rival other than Synapse.
-
-The first two need a fork workload, and the client-server driver cannot
-make one. A failed line gives a non-zero exit. The weekly workflow puts the
-report in the body of its pull request.
+The gate compares each cell only in the group that measured it, and it
+stops if two groups hold the same cell. It lists each target workload
+that no group holds, or that has no Synapse side or no Tuwunel side. A
+failed line gives a non-zero exit. The weekly workflow puts the report in
+the body of its pull request.
 
 ## Client-server API vs Synapse, at M1
 
@@ -1849,3 +1858,100 @@ Concurrent send has a result against Synapse sole. The record keeps
 that gap open. #42 shuts on lines 1 and 2, with both losses above on
 file. A lone follow-up tracks the federated rival harness, where it
 can fail stark.
+
+## Line 3 against Synapse and Tuwunel (#647): a fail, on Tuwunel
+
+The v1 close-out could not judge line 3, because three of its cells had
+no rival. #647 measures them with a rival in the seat. The
+`targeted-sitting` workflow ran
+`scripts/federated-benchmark.py` on a shared GitHub runner with 4 cores
+(run 41972144517). The files are `targeted-20261105.*`. The versions
+are Synapse 1.161.0 on Postgres and Tuwunel 1.9.2, the pins of the weekly
+comparison. The run has five rounds, and the even rounds reverse the
+order.
+
+**The method.** One Spindle, the resident, holds the far side of each
+federation link. It is the same build and configuration for each
+subject. The subject is Spindle, Synapse or Tuwunel. Thus a ratio gives
+the difference between two joiners, or between two servers that catch
+up, and not between two pairs. The driver measures Spindle as a subject
+in the same rounds as its rivals. The Rust bench from #644 is a
+different instrument, and the gate does not compare against it.
+
+- **Federated join** (`federated_join/<members>`): the time from
+  `POST /join` to the joiner that serves the full membership through
+  `/joined_members`. The resident seeds the room through an
+  appservice, so no password hash per member slows the seed.
+- **Catch-up after a partition** (`partition_catchup/200`): a front
+  refuses traffic in the two directions while the resident sends 200
+  events. Then the front opens and the resident sends a marker. The
+  cell starts when the retry of the resident first gets to the subject.
+  The cell stops when the subject serves the 200 events and the marker
+  through `/messages`. The time from the heal to that first connection
+  is the backoff of the resident. That time is the same for each
+  subject. It was most of the 0.9–3.2 s spread in the Rust bench.
+  The files record it as `resident_retry_ns`, beside the cell.
+- **Concurrent send** (`send_throughput/<clients>`): the workload of
+  `api-benchmark.py --dimension concurrency`, with 2, 4 and 8 clients.
+  Each client sends into its own room. The cell is the wall time per
+  send, so a ratio is the throughput ratio. One client is the `send`
+  cell that lines 1 and 2 judge already.
+
+Each federation link uses TLS through a front of the driver, with a
+certificate from a CA that the run makes. Each subject verifies that
+certificate. Synapse and Tuwunel both document a reverse proxy as their
+production shape, and a Tuwunel release build has no TLS listener.
+
+Each subject runs its default configuration. As in the weekly
+comparison, its rate limits are off, and it can federate to loopback.
+The resident has one rig setting, `retry_base_ms = 50`, as in the Rust
+bench. CI tests the front: when it closes, it stops each live connection
+and refuses new ones. Thus a keep-alive connection cannot go across the
+partition.
+
+| cell | Spindle | Synapse | Tuwunel | vs Synapse | vs Tuwunel |
+|---|---|---|---|---|---|
+| join, 1,000 members | 132 ms | 2,060 ms | 211 ms | 15.6× win | 1.60× win |
+| join, 10,000 members | 1,104 ms | 19,692 ms | 1,536 ms | 17.8× win | 1.39× win |
+| catch-up, 200 events | 537 ms | 8,182 ms | 520 ms | 15.2× win | 0.97×, noise |
+| send, 2 clients | 2,267/s | 38/s | 1,922/s | 58.9× win | 1.18×, noise |
+| send, 4 clients | 2,628/s | 49/s | 2,333/s | 53.2× win | 1.13× win |
+| send, 8 clients | 2,488/s | 54/s | 2,183/s | 46.3× win | 1.14×, noise |
+
+Each value is the median of five rounds. Each call uses the separation
+rule.
+
+**Against Synapse, Spindle takes all six cells by 15× or more.** Synapse
+does a full join here. Its partial-state join (MSC3706) needs a resident
+that offers partial state, and Spindle does not. Thus this result does
+not measure the faster join of Synapse. The `/join` of Synapse returned
+at the same time as its full membership.
+
+**Against Tuwunel, line 3 fails on four of six cells.** The join is a
+material win at 1,000 members (1.60×). At 10,000 members it is a win at
+1.39×, above the 1.38× line by a small amount. Its band of 1.17–1.56×
+goes below the line. The catch-up is a tie: 537 ms against 520 ms, and
+the rounds do not separate. Concurrent send is a tie at 2 and 8 clients.
+At 4 clients it is a win of 1.13×, but that win is not material.
+
+Thus Spindle stays near Tuwunel where the design targets a lead.
+
+**Parity verdict from `scripts/parity-gate.py docs/benchmarks/data
+ci-20261010 targeted-20261105`.** Line 1 passes on 33 cells. Line 2
+passes on 21. Line 3 fails on 36 cells. All the target workloads have a
+measurement now, so the gate gives line 3 a verdict. The failed cells are
+`partition_catchup/200`, `send_throughput/2`, `send_throughput/4` and
+`send_throughput/8`, each against Tuwunel.
+
+### The run that we did not keep
+
+The first full run (41969314661, three rounds) kept all the servers of a
+round up at the same time. The rounds showed an order effect. The
+server that came after Synapse lost about one third of its send
+throughput. Tuwunel did 1,548 and 1,592 sends/s after Synapse and 2,350
+before it. Spindle did 2,561 before Synapse and 1,770 after it.
+
+The cause was the background work of Synapse after its 10,000-member
+join. Now each subject runs alone beside its own cold resident, and the
+run has five rounds. The artifact of that run keeps its files. The
+record does not use them.

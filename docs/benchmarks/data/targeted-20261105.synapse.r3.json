@@ -1,0 +1,81 @@
+{
+  "benchmarks": {
+    "federated_join/1000": {
+      "join_returned_ns": 2066886279.0,
+      "joined_members": 1002,
+      "lower_ns": 2125885974.0,
+      "mean_ns": 2125885974.0,
+      "samples": 1,
+      "upper_ns": 2125885974.0
+    },
+    "federated_join/10000": {
+      "join_returned_ns": 19335478417.0,
+      "joined_members": 10002,
+      "lower_ns": 19391160536.0,
+      "mean_ns": 19391160536.0,
+      "samples": 1,
+      "upper_ns": 19391160536.0
+    },
+    "partition_catchup/200": {
+      "events_per_second": 22.75229071548614,
+      "heal_to_served_ns": 9044649208.0,
+      "lower_ns": 8834275305.0,
+      "mean_ns": 8834275305.0,
+      "resident_retry_ns": 210373903.0,
+      "samples": 1,
+      "upper_ns": 8834275305.0
+    },
+    "send_throughput/2": {
+      "clients": 2,
+      "latency_lower_ns": 34882211.0,
+      "latency_median_ns": 38662509.0,
+      "latency_p99_ns": 84259863.0,
+      "latency_samples": 96,
+      "lower_ns": 20675723.302083332,
+      "mean_ns": 20675723.302083332,
+      "room_events": 200,
+      "samples": 1,
+      "sends_per_second": 48.36590166106729,
+      "upper_ns": 20675723.302083332
+    },
+    "send_throughput/4": {
+      "clients": 4,
+      "latency_lower_ns": 59577686.0,
+      "latency_median_ns": 66823087.0,
+      "latency_p99_ns": 78879506.0,
+      "latency_samples": 96,
+      "lower_ns": 16880034.885416664,
+      "mean_ns": 16880034.885416664,
+      "room_events": 200,
+      "samples": 1,
+      "sends_per_second": 59.24158372823861,
+      "upper_ns": 16880034.885416664
+    },
+    "send_throughput/8": {
+      "clients": 8,
+      "latency_lower_ns": 81639228.0,
+      "latency_median_ns": 137799745.0,
+      "latency_p99_ns": 291941663.0,
+      "latency_samples": 96,
+      "lower_ns": 20207758.197916664,
+      "mean_ns": 20207758.197916664,
+      "room_events": 200,
+      "samples": 1,
+      "sends_per_second": 49.48594446775871,
+      "upper_ns": 20207758.197916664
+    }
+  },
+  "clients": [
+    2,
+    4,
+    8
+  ],
+  "dimension": "targeted",
+  "members": [
+    1000,
+    10000
+  ],
+  "missed": 200,
+  "round": 3,
+  "server": "synapse"
+}

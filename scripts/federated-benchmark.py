@@ -722,7 +722,8 @@ def write_sidecar(args, started: str, finished: str) -> None:
         "driver": "scripts/federated-benchmark.py",
         "workloads": {
             "federated_join": f"{args.members} members, POST /join to the full membership served",
-            "partition_catchup": f"{args.missed} events missed, heal to every one served",
+            "partition_catchup": f"{args.missed} events missed, the resident's first connection "
+                                 "after the heal to every one served",
             "send_throughput": f"{args.clients} clients, own room each, {args.throughput_events}-event rooms",
         },
     }
