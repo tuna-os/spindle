@@ -97,7 +97,10 @@ jobs:
         env:
           BENCH_RUNNER: github-actions/ubuntu-24.04 (shared runner)
         run: |
-          group="targeted-$(date -u +%Y%m%d)"
+          # Date and commit: the harness runs on every pull request that
+          # changes it, so two runs in a day are expected, and each keeps
+          # its own files rather than overwriting the other's.
+          group="targeted-$(date -u +%Y%m%d)-$(git rev-parse --short=7 HEAD)"
           echo "GROUP=$group" >> "$GITHUB_ENV"
           python3 scripts/federated-benchmark.py --group "$group" \
             --rounds "${{ inputs.rounds || '5' }}" --work tmp/fedbench --keep
