@@ -457,9 +457,9 @@ async fn a_remote_join_and_message_land_and_read_back_over_the_cs_api() {
 
 /// `m.room.server_acl`, both halves: once the room denies the peer, its
 /// PDUs are refused before verification, its room reads are forbidden,
-/// and nothing further is queued to it on the outbox — the message sent
-/// before the ACL reached it, the ACL itself and the message after did
-/// not.
+/// and nothing after the ACL is queued to it on the outbox. The ACL event
+/// itself is: it is how the peer learns it was denied (Complement's
+/// `TestACLs` waits for it on the denied server).
 #[tokio::test]
 async fn a_server_acl_closes_both_directions() {
     let peer = Peer::start().await;
@@ -504,8 +504,9 @@ async fn a_server_acl_closes_both_directions() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let after_acl = outbox_rows(&peer.name);
     assert_eq!(
-        after_acl, before_acl,
-        "the ACL event must not be sent to the server it denies"
+        after_acl,
+        before_acl + 1,
+        "the ACL event must reach the server it denies"
     );
 
     let (status, body) = harness
@@ -1130,5 +1131,110 @@ async fn a_typing_edu_is_applied_for_the_origins_own_joined_user_only() {
     assert!(
         !typing_of(&sync).contains(&"@alice:example.org".to_owned()),
         "the forged claim is ignored: {sync}"
+    );
+}
+
+/// MSC4163: a server the room's ACL denies has its typing and read
+/// receipts dropped like its PDUs. Before the ACL both land; after it,
+/// neither a stop-typing nor a newer receipt changes what alice sees.
+#[tokio::test]
+async fn a_server_acl_drops_the_denied_servers_typing_and_receipts() {
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
+    let join = join_event(&harness.store, &peer, &room, &head);
+    let (status, _) = harness.deliver(&peer, "edu-join", vec![join]).await;
+    assert_eq!(status, StatusCode::OK);
+    let joined_head = harness.head_event(&room, &alice).await;
+
+    let receipt_edu = |event_id: &str| {
+        json!({
+            "edu_type": "m.receipt",
+            "content": {
+                &room: { "m.read": { peer.user(): {
+                    "event_ids": [event_id],
+                    "data": { "ts": now_millis() },
+                } } }
+            },
+        })
+    };
+    let sync = || async {
+        let (status, body) = harness
+            .call(
+                Request::builder()
+                    .uri("/_matrix/client/v3/sync")
+                    .header("authorization", format!("Bearer {alice}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    };
+    let ephemeral = |body: &Value, kind: &str| -> Value {
+        body["rooms"]["join"][&room]["ephemeral"]["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|event| event["type"] == kind)
+            .map_or(Value::Null, |event| event["content"].clone())
+    };
+
+    let (status, body) = harness
+        .deliver_with_edus(
+            &peer,
+            "edu-before",
+            Vec::new(),
+            vec![
+                typing_edu(&room, &peer.user(), true),
+                receipt_edu(&joined_head),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let before = sync().await;
+    assert_eq!(
+        ephemeral(&before, "m.typing")["user_ids"],
+        json!([peer.user()]),
+        "{before}"
+    );
+    assert!(
+        ephemeral(&before, "m.receipt")[&joined_head]["m.read"][peer.user()].is_object(),
+        "{before}"
+    );
+
+    let (status, body) = harness
+        .send(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.server_acl"),
+            &alice,
+            &json!({ "allow": ["*"], "deny": ["127.0.0.1"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let acl_event = body["event_id"].as_str().unwrap().to_owned();
+
+    let (status, body) = harness
+        .deliver_with_edus(
+            &peer,
+            "edu-after",
+            Vec::new(),
+            vec![
+                typing_edu(&room, &peer.user(), false),
+                receipt_edu(&acl_event),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let after = sync().await;
+    assert_eq!(
+        ephemeral(&after, "m.typing")["user_ids"],
+        json!([peer.user()]),
+        "the denied server's stop-typing is dropped: {after}"
+    );
+    assert!(
+        ephemeral(&after, "m.receipt")[&acl_event].is_null(),
+        "the denied server's receipt is dropped: {after}"
     );
 }

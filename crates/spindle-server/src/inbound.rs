@@ -623,7 +623,8 @@ async fn apply_presence(
 }
 
 /// Apply one inbound `m.typing` EDU: only about the origin's own joined
-/// users, so no server can put words in another's hands.
+/// users, so no server can put words in another's hands, and only from
+/// an origin the room's `m.room.server_acl` admits (MSC4163).
 fn apply_typing(state: &AppState, origin: &str, content: &Value) -> crate::metrics::EduResult {
     let (Some(room_id), Some(user_id), Some(typing)) = (
         content["room_id"].as_str(),
@@ -636,6 +637,13 @@ fn apply_typing(state: &AppState, origin: &str, content: &Value) -> crate::metri
         return crate::metrics::EduResult::Ignored;
     }
     if !state.rooms.is_joined(user_id, room_id).unwrap_or(false) {
+        return crate::metrics::EduResult::Ignored;
+    }
+    if !state
+        .rooms
+        .server_acl_permits(room_id, origin)
+        .unwrap_or(false)
+    {
         return crate::metrics::EduResult::Ignored;
     }
     state

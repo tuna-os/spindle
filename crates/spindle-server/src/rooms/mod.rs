@@ -6111,8 +6111,31 @@ impl Rooms {
         // room nor hears it: the spec asks for both halves, and a kick of
         // a denied server's user is no exception — the server was told to
         // leave by the ACL already.
+        //
+        // The ACL event itself also goes to every server the ACL it
+        // replaces admitted. Like the kick above, it is the one event a
+        // newly denied server must hear: without it, that server's users
+        // see nothing change and keep sending into a room that refuses
+        // them.
         let acl = self.server_acl_in(log, room_id)?;
-        let admitted = |domain: &str| acl.as_ref().is_none_or(|acl| acl.permits(domain));
+        let replaced = if json["type"].as_str() == Some("m.room.server_acl")
+            && json["state_key"].as_str() == Some("")
+        {
+            let parents: Vec<EventId> = edge_ids(&json["prev_events"])
+                .into_iter()
+                .map(EventId::new)
+                .collect();
+            let (before, _) = self.state_for_parents(log, room_id, &parents)?;
+            Some(self.server_acl_at(Some(&before), room_id)?)
+        } else {
+            None
+        };
+        let admitted = |domain: &str| {
+            let permits = |acl: &Option<crate::server_acl::ServerAcl>| {
+                acl.as_ref().is_none_or(|acl| acl.permits(domain))
+            };
+            permits(&acl) || replaced.as_ref().is_some_and(permits)
+        };
 
         for destination in live
             .iter()
@@ -6227,8 +6250,17 @@ impl Rooms {
         log: &RoomLog,
         room_id: &str,
     ) -> Result<Option<crate::server_acl::ServerAcl>, RoomError> {
+        self.server_acl_at(log.current_state(), room_id)
+    }
+
+    /// The `m.room.server_acl` in `state`, or `None` when it holds none.
+    fn server_acl_at(
+        &self,
+        state: Option<&StateSnapshot>,
+        room_id: &str,
+    ) -> Result<Option<crate::server_acl::ServerAcl>, RoomError> {
         let wanted = StateKey::new("m.room.server_acl", "");
-        let Some(event_id) = current_state_id(log, &wanted) else {
+        let Some(event_id) = state.and_then(|state| state.get(&wanted)) else {
             return Ok(None);
         };
         let event = self.read_event(room_id, &EventId::new(event_id))?;
