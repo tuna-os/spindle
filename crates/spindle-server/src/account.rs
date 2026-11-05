@@ -594,7 +594,7 @@ async fn save_profile(
         .profiles
         .set(&user_id, field(displayname), field(avatar_url))
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    crate::routes::propagate_profile(&state, &user_id).await?;
+    crate::profile_routes::propagate_profile(&state, &user_id).await?;
     state.metrics.record_account_action(AccountAction::Profile);
     Ok(web::see_other(
         "/account/?action=org.matrix.profile&notice=profile_saved",

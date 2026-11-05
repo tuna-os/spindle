@@ -4,22 +4,6 @@
 //! what is actually mounted rather than against a second list that agrees with
 //! the first only until someone edits one of them.
 
-use axum::{
-    Json, Router,
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{get, post},
-};
-use serde::Deserialize;
-use std::collections::BTreeMap;
-
-use serde_json::value::RawValue;
-use serde_json::{Value, json};
-
-use axum::extract::ConnectInfo;
-use std::net::SocketAddr;
-
 use crate::accounts::{AccountError, Accounts};
 use crate::auth::{AccountAuthenticated, Authenticated};
 use crate::errors::MatrixError;
@@ -28,12 +12,23 @@ use crate::inbound::{
     sign_membership_template,
 };
 use crate::metrics::LoginResult;
+use crate::profile_routes::profile_of;
 use crate::ratelimit::{
     Budget, FAILED_LOGIN_PER_ACCOUNT, FAILED_LOGIN_PER_SOURCE, REGISTER_PER_SOURCE, limit_write,
     limit_write_on,
 };
 use crate::rooms::ReadScope;
 use crate::{AppState, surface};
+use axum::extract::ConnectInfo;
+use axum::{
+    Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get,
+    routing::post,
+};
+use serde::Deserialize;
+use serde_json::value::RawValue;
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
 
 /// Every path this server answers.
 ///
@@ -111,11 +106,11 @@ pub fn router(state: AppState) -> Router {
         .merge(account_routes())
         .merge(crate::moderation_routes::routes())
         .merge(profile_and_admin_routes())
+        .merge(crate::profile_routes::routes())
         .merge(push_routes())
         .merge(appservice_routes())
         .merge(crate::dehydrated::routes())
-        .merge(device_routes())
-        .merge(profile_routes())
+        .merge(crate::device_routes::routes())
         .merge(crate::presence_routes::routes())
         .merge(room_routes())
         .merge(timeline_routes())
@@ -321,21 +316,6 @@ fn unknown_endpoint() -> MatrixError {
     )
 }
 
-/// Registration, login, and the per-user data that is not in any room.
-/// The global-profile surface: read anyone's, write your own.
-fn profile_routes() -> Router<AppState> {
-    Router::new()
-        .route("/_matrix/client/v3/profile/{user_id}", get(get_profile))
-        .route(
-            "/_matrix/client/v3/profile/{user_id}/displayname",
-            get(get_profile_displayname).put(put_profile_displayname),
-        )
-        .route(
-            "/_matrix/client/v3/profile/{user_id}/avatar_url",
-            get(get_profile_avatar).put(put_profile_avatar),
-        )
-}
-
 /// The surface only an appservice speaks.
 fn appservice_routes() -> Router<AppState> {
     Router::new().route(
@@ -344,29 +324,11 @@ fn appservice_routes() -> Router<AppState> {
     )
 }
 
-/// Device management: listing, renaming, deletion — and MSC4190's
-/// appservice half, where PUT mints a device with no session behind it.
-fn device_routes() -> Router<AppState> {
-    Router::new()
-        .route("/_matrix/client/v3/devices", get(list_devices))
-        .route("/_matrix/client/v3/delete_devices", post(delete_devices))
-        .route(
-            "/_matrix/client/v3/devices/{device_id}",
-            get(get_device).put(put_device).delete(delete_device),
-        )
-}
-
 /// Reports, generic profile fields, `whois`, and the v1.18 holds: the
 /// first wave filled in from `docs/spec-gaps.md`.
 /// Profile fields, whois, and the v1.18 holds.
 fn profile_and_admin_routes() -> Router<AppState> {
     Router::new()
-        .route(
-            "/_matrix/client/v3/profile/{user_id}/{key}",
-            get(get_profile_field)
-                .put(put_profile_field)
-                .delete(delete_profile_field),
-        )
         .route("/_matrix/client/v3/admin/whois/{user_id}", get(admin_whois))
         .route(
             "/_matrix/client/v1/admin/lock/{user_id}",
@@ -2432,7 +2394,7 @@ async fn appservice_ping(
 /// appservice token. Deliberately not derived from the authenticated
 /// identity: device IDs are client-chosen at login, so anything derived
 /// from them can be worn as a costume by an ordinary account.
-fn appservice_of<'a>(
+pub(crate) fn appservice_of<'a>(
     state: &'a AppState,
     headers: &axum::http::HeaderMap,
 ) -> Option<&'a std::sync::Arc<crate::appservices::Registration>> {
@@ -2442,169 +2404,6 @@ fn appservice_of<'a>(
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim)?;
     state.appservices.by_token(token)
-}
-
-/// A device as the spec's `Device` object. Spindle does not track
-/// last-seen data, and the spec has those fields optional, so they are
-/// absent rather than present-and-wrong; a device never named has no
-/// `display_name` for the same reason, since the spec's field is a string
-/// and a null is neither absent nor one.
-fn device_body(device: &crate::accounts::Device) -> Value {
-    let mut body = json!({ "device_id": device.device_id });
-    if let Some(name) = &device.display_name {
-        body["display_name"] = json!(name);
-    }
-    body
-}
-
-/// `GET /_matrix/client/v3/devices`
-async fn list_devices(
-    State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
-) -> Result<Json<Value>, MatrixError> {
-    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
-    let devices = accounts
-        .devices_of(&localpart_of(&identity.user_id))
-        .map_err(|error| internal(&error))?;
-    Ok(Json(json!({
-        "devices": devices.iter().map(device_body).collect::<Vec<_>>(),
-    })))
-}
-
-/// `GET /_matrix/client/v3/devices/{deviceId}`
-async fn get_device(
-    State(state): State<AppState>,
-    axum::extract::Path(device_id): axum::extract::Path<String>,
-    Authenticated(identity): Authenticated,
-) -> Result<Json<Value>, MatrixError> {
-    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
-    accounts
-        .device(&localpart_of(&identity.user_id), &device_id)
-        .map_err(|error| internal(&error))?
-        .map(|device| Json(device_body(&device)))
-        .ok_or_else(|| MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", "no such device"))
-}
-
-/// `PUT /_matrix/client/v3/devices/{deviceId}`
-///
-/// For everyone, this renames an existing device. For a service whose
-/// registration declares MSC4190 device management, a PUT on a device
-/// that does not exist *creates* it — the deviceless registration's way
-/// of minting the device its encryption keys will hang off, with no
-/// access token behind it because the `as_token` is the only credential.
-async fn put_device(
-    State(state): State<AppState>,
-    axum::extract::Path(device_id): axum::extract::Path<String>,
-    headers: axum::http::HeaderMap,
-    Authenticated(identity): Authenticated,
-    body: Option<Json<Value>>,
-) -> Result<(StatusCode, Json<Value>), MatrixError> {
-    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
-    let localpart = localpart_of(&identity.user_id);
-    let named = body
-        .as_ref()
-        .and_then(|Json(body)| body.get("display_name").cloned());
-    let display_of = |named: Option<Value>, unchanged: Option<String>| match named {
-        None => Ok(unchanged),
-        Some(Value::Null) => Ok(None),
-        Some(Value::String(name)) => Ok(Some(name)),
-        Some(_) => Err(MatrixError::bad_json("display_name must be a string")),
-    };
-    if let Some(existing) = accounts
-        .device(&localpart, &device_id)
-        .map_err(|error| internal(&error))?
-    {
-        let display_name = display_of(named, existing.display_name)?;
-        accounts
-            .put_device(&localpart, &device_id, display_name)
-            .map_err(|error| internal(&error))?;
-        return Ok((StatusCode::OK, Json(json!({}))));
-    }
-    if !appservice_of(&state, &headers).is_some_and(|registration| registration.device_management) {
-        return Err(MatrixError::new(
-            StatusCode::NOT_FOUND,
-            "M_NOT_FOUND",
-            "no such device",
-        ));
-    }
-    let display_name = display_of(named, None)?;
-    accounts
-        .put_device(&localpart, &device_id, display_name)
-        .map_err(|error| internal(&error))?;
-    let stream_write = state.rooms.reserve_stream_id();
-    let seq = stream_write.id();
-    state
-        .devices
-        .mark_device_list_changed(&identity.user_id, seq)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    state.rooms.wake_sync_waiters();
-    Ok((StatusCode::CREATED, Json(json!({}))))
-}
-
-/// `DELETE /_matrix/client/v3/devices/{deviceId}`
-///
-/// A person re-proves their password (single-stage UIA); a service with
-/// MSC4190 device management deletes outright — its `as_token` outranks a
-/// password that, for a ghost, nobody holds. Deletion takes the sessions
-/// and the E2E material with it, and marks the device list changed so
-/// peers stop encrypting to the dead device.
-///
-/// Under MSC3861 delegation there is no UIA either: a delegated user's
-/// local password is unguessable by construction, so the challenge would
-/// be one nobody can answer — and the caller's identity was proven
-/// moments ago by the provider vouching for their live token, which is
-/// a stronger statement than re-typing a password. Synapse makes the
-/// same call in its delegated mode.
-async fn delete_device(
-    State(state): State<AppState>,
-    axum::extract::Path(device_id): axum::extract::Path<String>,
-    headers: axum::http::HeaderMap,
-    Authenticated(identity): Authenticated,
-    body: Option<Json<Value>>,
-) -> Result<(StatusCode, Json<Value>), MatrixError> {
-    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
-    let localpart = localpart_of(&identity.user_id);
-    if accounts
-        .device(&localpart, &device_id)
-        .map_err(|error| internal(&error))?
-        .is_none()
-    {
-        return Err(MatrixError::new(
-            StatusCode::NOT_FOUND,
-            "M_NOT_FOUND",
-            "no such device",
-        ));
-    }
-    let auth = body
-        .as_ref()
-        .and_then(|Json(body)| body.get("auth").cloned());
-    if let Some(challenge) =
-        password_uia(&state, &localpart, &headers, auth.as_ref(), "delete_device")?
-    {
-        return Ok((StatusCode::UNAUTHORIZED, challenge));
-    }
-    accounts
-        .delete_device(&localpart, &device_id)
-        .map_err(|error| internal(&error))?;
-    state
-        .devices
-        .remove_device_material(&identity.user_id, &device_id)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    let stream_write = state.rooms.reserve_stream_id();
-    let seq = stream_write.id();
-    state
-        .devices
-        .mark_device_list_changed(&identity.user_id, seq)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    state.rooms.wake_sync_waiters();
-    crate::e2ee_federation::announce_device_change(
-        &state,
-        &identity.user_id,
-        &device_id,
-        None,
-        seq,
-    );
-    Ok((StatusCode::OK, Json(json!({}))))
 }
 
 /// `@alice:example.org` and `alice` both mean the same localpart.
@@ -3243,282 +3042,6 @@ async fn joined_rooms(
         .joined(&identity.user_id)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
     Ok(Json(json!({ "joined_rooms": rooms })))
-}
-
-/// Read a profile, wherever the user lives.
-///
-/// A local user's profile is the stored row. A remote user's is their
-/// server's to answer, over `query/profile` — which is how a client here
-/// renders the name of someone it has never shared a room with.
-async fn profile_of(state: &AppState, user_id: &str) -> Result<Value, MatrixError> {
-    let domain = user_id.split_once(':').map(|(_, domain)| domain);
-    if domain == Some(state.config.server.name.as_str()) {
-        let localpart = user_id.strip_prefix('@').map_or(user_id, |rest| {
-            rest.split_once(':')
-                .map_or(rest, |(localpart, _)| localpart)
-        });
-        let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
-        let known = accounts
-            .account(localpart)
-            .map_err(|error| MatrixError::internal(&error.to_string()))?
-            .is_some();
-        // The classic appservice user query: a namespace ghost may exist
-        // the moment its service is asked, so an unknown local user gets
-        // one chance to be provisioned before the 404 stands.
-        let known = known
-            || (state
-                .appservices
-                .query_user(user_id, &state.config.server.name)
-                .await
-                && accounts
-                    .account(localpart)
-                    .map_err(|error| MatrixError::internal(&error.to_string()))?
-                    .is_some());
-        if !known {
-            return Err(MatrixError::new(
-                StatusCode::NOT_FOUND,
-                "M_NOT_FOUND",
-                format!("{user_id} is not here"),
-            ));
-        }
-        let profile = state
-            .profiles
-            .get(user_id)
-            .map_err(|error| MatrixError::internal(&error.to_string()))?;
-        return serde_json::to_value(profile)
-            .map_err(|error| MatrixError::internal(&error.to_string()));
-    }
-    let Some(domain) = domain else {
-        return Err(MatrixError::bad_json(format!("{user_id} is not a user ID")));
-    };
-    state
-        .federation
-        .remote_query_profile(domain, user_id)
-        .await
-        .map_err(|error| {
-            MatrixError::new(
-                StatusCode::NOT_FOUND,
-                "M_NOT_FOUND",
-                format!("{domain} did not answer for {user_id}: {error}"),
-            )
-        })
-}
-
-/// `GET /_matrix/client/v3/profile/{userId}`
-async fn get_profile(
-    State(state): State<AppState>,
-    axum::extract::Path(user_id): axum::extract::Path<String>,
-) -> Result<Json<Value>, MatrixError> {
-    Ok(Json(profile_of(&state, &user_id).await?))
-}
-
-/// `GET /_matrix/client/v3/profile/{userId}/displayname`
-async fn get_profile_displayname(
-    State(state): State<AppState>,
-    axum::extract::Path(user_id): axum::extract::Path<String>,
-) -> Result<Json<Value>, MatrixError> {
-    let profile = profile_of(&state, &user_id).await?;
-    let mut body = serde_json::Map::new();
-    if let Some(name) = profile.get("displayname").filter(|v| !v.is_null()) {
-        body.insert("displayname".to_owned(), name.clone());
-    }
-    Ok(Json(Value::Object(body)))
-}
-
-/// `GET /_matrix/client/v3/profile/{userId}/avatar_url`
-async fn get_profile_avatar(
-    State(state): State<AppState>,
-    axum::extract::Path(user_id): axum::extract::Path<String>,
-) -> Result<Json<Value>, MatrixError> {
-    let profile = profile_of(&state, &user_id).await?;
-    let mut body = serde_json::Map::new();
-    if let Some(url) = profile.get("avatar_url").filter(|v| !v.is_null()) {
-        body.insert("avatar_url".to_owned(), url.clone());
-    }
-    Ok(Json(Value::Object(body)))
-}
-
-#[derive(Debug, Deserialize)]
-struct DisplaynameRequest {
-    displayname: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AvatarRequest {
-    avatar_url: Option<String>,
-}
-
-/// `GET /_matrix/client/v3/profile/{userId}/{keyName}` (spec v1.16)
-///
-/// One field of a profile, `displayname` and `avatar_url` included; the
-/// literal routes for those two still answer first. A field that is not
-/// set is a 404, which is the spec's answer and the one a client can act
-/// on.
-async fn get_profile_field(
-    State(state): State<AppState>,
-    axum::extract::Path((user_id, key)): axum::extract::Path<(String, String)>,
-) -> Result<Json<Value>, MatrixError> {
-    let profile = profile_of(&state, &user_id).await?;
-    match profile.get(&key).filter(|value| !value.is_null()) {
-        Some(value) => Ok(Json(json!({ key: value }))),
-        None => Err(MatrixError::new(
-            StatusCode::NOT_FOUND,
-            "M_NOT_FOUND",
-            format!("{user_id} has no {key}"),
-        )),
-    }
-}
-
-/// The user's own profile, or a server admin acting for them.
-fn may_edit_profile(state: &AppState, actor: &str, user_id: &str) -> Result<(), MatrixError> {
-    if actor == user_id
-        || crate::admin::is_server_admin(state, actor).map_err(|error| internal(&error))?
-    {
-        Ok(())
-    } else {
-        Err(MatrixError::forbidden("a profile belongs to its user"))
-    }
-}
-
-fn field_refusal(refusal: crate::profiles::FieldRefusal) -> MatrixError {
-    match refusal {
-        crate::profiles::FieldRefusal::KeyTooLarge => MatrixError::new(
-            StatusCode::BAD_REQUEST,
-            "M_KEY_TOO_LARGE",
-            format!(
-                "a profile key is at most {} bytes",
-                crate::profiles::MAX_KEY_BYTES
-            ),
-        ),
-        crate::profiles::FieldRefusal::ProfileTooLarge => MatrixError::new(
-            StatusCode::BAD_REQUEST,
-            "M_PROFILE_TOO_LARGE",
-            format!(
-                "a profile is at most {} bytes",
-                crate::profiles::MAX_PROFILE_BYTES
-            ),
-        ),
-        crate::profiles::FieldRefusal::NotAString => {
-            MatrixError::bad_json("displayname and avatar_url are strings")
-        }
-    }
-}
-
-/// `PUT /_matrix/client/v3/profile/{userId}/{keyName}` (spec v1.16)
-///
-/// The body names the key again, as the spec has it; a body that names
-/// a different key is a request that does not agree with itself.
-async fn put_profile_field(
-    State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
-    axum::extract::Path((user_id, key)): axum::extract::Path<(String, String)>,
-    Json(mut request): Json<serde_json::Map<String, Value>>,
-) -> Result<Json<Value>, MatrixError> {
-    may_edit_profile(&state, &identity.user_id, &user_id)?;
-    let Some(value) = request.remove(&key) else {
-        return Err(MatrixError::bad_json(format!("the body must carry {key}")));
-    };
-    state
-        .profiles
-        .set_field(&user_id, &key, Some(value))
-        .map_err(|error| MatrixError::internal(&error.to_string()))?
-        .map_err(field_refusal)?;
-    if key == "displayname" || key == "avatar_url" {
-        propagate_profile(&state, &user_id).await?;
-    }
-    Ok(Json(json!({})))
-}
-
-/// `DELETE /_matrix/client/v3/profile/{userId}/{keyName}` (spec v1.16)
-async fn delete_profile_field(
-    State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
-    axum::extract::Path((user_id, key)): axum::extract::Path<(String, String)>,
-) -> Result<Json<Value>, MatrixError> {
-    may_edit_profile(&state, &identity.user_id, &user_id)?;
-    state
-        .profiles
-        .set_field(&user_id, &key, None)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?
-        .map_err(field_refusal)?;
-    if key == "displayname" || key == "avatar_url" {
-        propagate_profile(&state, &user_id).await?;
-    }
-    Ok(Json(json!({})))
-}
-
-/// Store one profile field and copy it into every joined room's member
-/// event — the propagation the spec asks for, and the step that carries a
-/// renamed user across federation, because member events fan out and
-/// profile rows do not.
-pub(crate) async fn propagate_profile(state: &AppState, user_id: &str) -> Result<(), MatrixError> {
-    let profile = state
-        .profiles
-        .get(user_id)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    let rooms = state
-        .rooms
-        .joined(user_id)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    for room_id in rooms {
-        let mut content = json!({ "membership": "join" });
-        if let Some(name) = &profile.displayname {
-            content["displayname"] = json!(name);
-        }
-        if let Some(url) = &profile.avatar_url {
-            content["avatar_url"] = json!(url);
-        }
-        state
-            .rooms
-            .set_state_checked(
-                &room_id,
-                user_id,
-                state.key.pair(),
-                "m.room.member",
-                user_id,
-                &content,
-            )
-            .await
-            .map_err(room_error)?;
-    }
-    state.rooms.wake_sync_waiters();
-    Ok(())
-}
-
-/// `PUT /_matrix/client/v3/profile/{userId}/displayname`
-async fn put_profile_displayname(
-    State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
-    axum::extract::Path(user_id): axum::extract::Path<String>,
-    Json(request): Json<DisplaynameRequest>,
-) -> Result<Json<Value>, MatrixError> {
-    if identity.user_id != user_id {
-        return Err(MatrixError::forbidden("a profile belongs to its user"));
-    }
-    state
-        .profiles
-        .set(&user_id, Some(request.displayname), None)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    propagate_profile(&state, &user_id).await?;
-    Ok(Json(json!({})))
-}
-
-/// `PUT /_matrix/client/v3/profile/{userId}/avatar_url`
-async fn put_profile_avatar(
-    State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
-    axum::extract::Path(user_id): axum::extract::Path<String>,
-    Json(request): Json<AvatarRequest>,
-) -> Result<Json<Value>, MatrixError> {
-    if identity.user_id != user_id {
-        return Err(MatrixError::forbidden("a profile belongs to its user"));
-    }
-    state
-        .profiles
-        .set(&user_id, None, Some(request.avatar_url))
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    propagate_profile(&state, &user_id).await?;
-    Ok(Json(json!({})))
 }
 
 /// The body every membership endpoint that names a target shares.
@@ -4906,7 +4429,7 @@ async fn forget_room(
 /// and only parsed when there are some. A body that is present but malformed
 /// is still an error -- silently defaulting there would swallow a client's
 /// typo'd `reason` rather than reporting it.
-fn optional_body<T: Default + serde::de::DeserializeOwned>(
+pub(crate) fn optional_body<T: Default + serde::de::DeserializeOwned>(
     body: &axum::body::Bytes,
 ) -> Result<T, MatrixError> {
     if body.is_empty() {
@@ -9122,12 +8645,12 @@ async fn federation_timestamp_to_event(
 #[derive(Debug, Deserialize)]
 struct DelayQuery {
     #[serde(rename = "org.matrix.msc4140.delay")]
-    delay: Option<u64>,
+    pub(crate) delay: Option<u64>,
     /// MSC4354's sticky duration, spelled as its unstable query parameter.
     /// Capped at an hour by the room layer rather than refused, as the
     /// MSC computes it.
     #[serde(rename = "org.matrix.msc4354.sticky_duration_ms")]
-    sticky: Option<u64>,
+    pub(crate) sticky: Option<u64>,
 }
 
 /// Turn a delay failure into the response a client can act on.
@@ -10741,26 +10264,26 @@ async fn get_room_visibility(
 /// One page of the room directory.
 #[derive(Debug, Default, Deserialize)]
 struct PublicRoomsQuery {
-    limit: Option<usize>,
-    since: Option<String>,
+    pub(crate) limit: Option<usize>,
+    pub(crate) since: Option<String>,
     /// Another server's directory. Not served yet -- see the handler.
-    server: Option<String>,
+    pub(crate) server: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct PublicRoomsFilter {
-    generic_search_term: Option<String>,
+pub(crate) struct PublicRoomsFilter {
+    pub(crate) generic_search_term: Option<String>,
     #[serde(default)]
-    room_types: Vec<Option<String>>,
+    pub(crate) room_types: Vec<Option<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct PublicRoomsRequest {
-    limit: Option<usize>,
-    since: Option<String>,
+    pub(crate) limit: Option<usize>,
+    pub(crate) since: Option<String>,
     #[serde(default)]
-    filter: PublicRoomsFilter,
-    server: Option<String>,
+    pub(crate) filter: PublicRoomsFilter,
+    pub(crate) server: Option<String>,
 }
 
 /// The directory's default and maximum page size.
@@ -10769,6 +10292,7 @@ struct PublicRoomsRequest {
 /// directory is the one endpoint a stranger can call to make this server
 /// render every published room's state at once.
 const DIRECTORY_PAGE: usize = 50;
+
 const DIRECTORY_PAGE_MAX: usize = 200;
 
 fn chunk_of(summary: &crate::rooms::RoomSummary) -> Value {
@@ -10934,6 +10458,7 @@ struct UserSearchRequest {
 
 /// The default and maximum number of users one search returns.
 const USER_SEARCH_LIMIT: usize = 10;
+
 const USER_SEARCH_LIMIT_MAX: usize = 50;
 
 /// Everyone `searcher` is allowed to find.
@@ -11062,6 +10587,7 @@ struct SearchQuery {
 
 /// The default and maximum number of results one search page returns.
 const SEARCH_LIMIT: usize = 10;
+
 const SEARCH_LIMIT_MAX: usize = 100;
 
 /// The spec's default for each side of a result's context.
@@ -11130,8 +10656,8 @@ fn search_matches(event: &Value, needle: &str, keys: &[String], filter: &SearchF
 
 /// One search hit, with where it came from.
 struct SearchHit {
-    room_id: String,
-    event: crate::rooms::TimelineEvent,
+    pub(crate) room_id: String,
+    pub(crate) event: crate::rooms::TimelineEvent,
 }
 
 /// What one walk of the rooms produced: the page's hits, the scope each
@@ -11344,7 +10870,7 @@ struct RoomRuleContext {
 impl RoomRuleContext {
     /// The room-kind facts the rules ask about: the joined count and the
     /// power levels.
-    fn of(state: &AppState, room_id: &str) -> Result<Self, MatrixError> {
+    pub(crate) fn of(state: &AppState, room_id: &str) -> Result<Self, MatrixError> {
         Ok(Self {
             member_count: state
                 .rooms
@@ -11358,7 +10884,7 @@ impl RoomRuleContext {
         })
     }
 
-    fn for_reader<'a>(
+    pub(crate) fn for_reader<'a>(
         &'a self,
         user_id: &'a str,
         display_name: Option<&'a str>,
@@ -11519,7 +11045,7 @@ struct RoomStreamOrder {
 }
 
 impl RoomStreamOrder {
-    fn new(mut rows: Vec<(i64, u64)>) -> Self {
+    pub(crate) fn new(mut rows: Vec<(i64, u64)>) -> Self {
         rows.sort_unstable();
         let mut high = 0;
         for row in &mut rows {
@@ -11529,7 +11055,7 @@ impl RoomStreamOrder {
         Self { rows }
     }
 
-    fn key(&self, li: i64) -> u64 {
+    pub(crate) fn key(&self, li: i64) -> u64 {
         match self.rows.partition_point(|(at, _)| *at <= li) {
             0 => 0,
             n => self.rows[n - 1].1,
@@ -11538,7 +11064,7 @@ impl RoomStreamOrder {
 
     /// The exclusive `from` that keeps a walk to the events at or before
     /// stream position `snapshot`, or `None` when that is all of them.
-    fn bound(&self, snapshot: u64) -> Option<i64> {
+    pub(crate) fn bound(&self, snapshot: u64) -> Option<i64> {
         let first_after = self.rows.partition_point(|(_, key)| *key <= snapshot);
         self.rows.get(first_after).map(|(li, _)| *li)
     }
@@ -11754,7 +11280,7 @@ async fn user_directory_search(
 /// acting for the user by a stronger credential than their password, and a
 /// server delegating auth (MSC3861) has no password to check -- the identity
 /// provider owns that stage.
-fn password_uia(
+pub(crate) fn password_uia(
     state: &AppState,
     localpart: &str,
     headers: &axum::http::HeaderMap,
@@ -11907,67 +11433,6 @@ async fn deactivate_account(
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct DeleteDevicesRequest {
-    #[serde(default)]
-    devices: Vec<String>,
-    auth: Option<Value>,
-}
-
-/// `POST /_matrix/client/v3/delete_devices`
-///
-/// The bulk form of `DELETE /devices/{deviceId}`, and it shares that
-/// endpoint's password stage. A device that does not exist is not an error:
-/// the request asks for it to be gone, and it is.
-async fn delete_devices(
-    State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
-) -> Result<(StatusCode, Json<Value>), MatrixError> {
-    let request: DeleteDevicesRequest = optional_body(&body)?;
-    let localpart = localpart_of(&identity.user_id);
-    if let Some(challenge) = password_uia(
-        &state,
-        &localpart,
-        &headers,
-        request.auth.as_ref(),
-        "delete_devices",
-    )? {
-        return Ok((StatusCode::UNAUTHORIZED, challenge));
-    }
-
-    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
-    for device_id in &request.devices {
-        accounts
-            .delete_device(&localpart, device_id)
-            .map_err(|error| internal(&error))?;
-        state
-            .devices
-            .remove_device_material(&identity.user_id, device_id)
-            .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    }
-    if !request.devices.is_empty() {
-        let stream_write = state.rooms.reserve_stream_id();
-        let seq = stream_write.id();
-        state
-            .devices
-            .mark_device_list_changed(&identity.user_id, seq)
-            .map_err(|error| MatrixError::internal(&error.to_string()))?;
-        state.rooms.wake_sync_waiters();
-        for device_id in &request.devices {
-            crate::e2ee_federation::announce_device_change(
-                &state,
-                &identity.user_id,
-                device_id,
-                None,
-                seq,
-            );
-        }
-    }
-    Ok((StatusCode::OK, Json(json!({}))))
-}
-
-#[derive(Debug, Default, Deserialize)]
 struct HierarchyQuery {
     from: Option<String>,
     limit: Option<usize>,
@@ -11983,7 +11448,9 @@ struct HierarchyQuery {
 /// server: one request, arbitrarily many room-state reads. So the cap is the
 /// server's, not the client's, and a client asking for more gets this.
 const HIERARCHY_PAGE: usize = 50;
+
 const HIERARCHY_PAGE_MAX: usize = 100;
+
 const HIERARCHY_DEPTH_MAX: usize = 8;
 
 /// May `user` see this room in a hierarchy at all?

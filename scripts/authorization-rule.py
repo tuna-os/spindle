@@ -10,7 +10,8 @@ lint about a construct that is present, it is a rule about a call that is
 This runs two checks, and the second is the one that keeps the first
 honest:
 
-1. `routes.rs` has no unguarded room read.
+1. `routes.rs` and the `*_routes.rs` modules split out of it (#689) have
+   no unguarded room read.
 2. The rule still fires on the code it was written for, and still stays
    quiet on the fixed version of that same handler.
 
@@ -38,6 +39,8 @@ import sys
 REPO = pathlib.Path(__file__).resolve().parent.parent
 RULE = REPO / ".semgrep" / "room-authorization.yaml"
 ROUTES = REPO / "crates" / "spindle-server" / "src" / "routes.rs"
+# The handlers moved out of routes.rs (#689) stay under the gate they had.
+ROUTE_MODULES = sorted(ROUTES.parent.glob("*_routes.rs"))
 FIXTURES = REPO / ".semgrep" / "fixtures"
 
 
@@ -59,6 +62,7 @@ def findings_by_file() -> collections.Counter[str]:
             "--quiet",
             "--json",
             str(ROUTES),
+            *(str(module) for module in ROUTE_MODULES),
             str(FIXTURES),
         ],
         capture_output=True,
@@ -80,13 +84,15 @@ def main() -> int:
     hits = findings_by_file()
     problems: list[str] = []
 
-    if hits["routes.rs"]:
-        problems.append(
-            f"{hits['routes.rs']} handler(s) in routes.rs read a room without "
-            "checking who is asking. Run semgrep directly for the lines:\n"
-            f"  semgrep scan --config {RULE.relative_to(REPO)} "
-            f"{ROUTES.relative_to(REPO)}"
-        )
+    for router in [ROUTES, *ROUTE_MODULES]:
+        if hits[router.name]:
+            problems.append(
+                f"{hits[router.name]} handler(s) in {router.name} read a room "
+                "without checking who is asking. Run semgrep directly for the "
+                "lines:\n"
+                f"  semgrep scan --config {RULE.relative_to(REPO)} "
+                f"{router.relative_to(REPO)}"
+            )
     if not hits["vulnerable.rs"]:
         problems.append(
             "the rule no longer fires on .semgrep/fixtures/vulnerable.rs, which "

@@ -242,7 +242,7 @@ def route_sources() -> list[pathlib.Path]:
     """
     source = ROUTES.read_text()
     files = [ROUTES]
-    for match in re.finditer(r"\.merge\(crate::(\w+)::routes\(\)\)", source):
+    for match in re.finditer(r"\.merge\(crate::(\w+)::routes\(", source):
         # A merge behind a Cargo feature (`hub-mode`'s, #22) is not in the
         # default build, which is the server this page inventories.
         if "#[cfg(feature" in source[max(0, match.start() - 400) : match.start()]:
