@@ -1,6 +1,6 @@
 # Spindle Roadmap
 
-**Last updated**: 2026-09-20 | **Status**: Experiment under construction — not a deployment
+**Last updated**: 2026-11-05 | **Status**: Experiment under construction — not a deployment
 
 Part of the [TunaOS](https://tunaos.org) ecosystem. A Matrix homeserver that
 stores rooms as a linear log, so state resolution never runs on the hot path.
@@ -39,9 +39,9 @@ experiment, and what is deliberately not being built yet.
 
 ## Release maturity
 
-Spindle has addressable `v0.0.x` prereleases. The next maturity boundary is
-`v0.1.0`, with candidate evidence in
-[docs/v0.1.0-readiness.md](docs/v0.1.0-readiness.md).
+Spindle tagged `v0.1.0` on 2026-10-10, and it is still a prerelease.
+[docs/v0.1.0-readiness.md](docs/v0.1.0-readiness.md) holds the gate evidence
+for that tag.
 
 ### `v0.0.x` — an addressable prerelease
 
@@ -53,9 +53,11 @@ to belong to something.
 |---|---|
 | Addressability | `v0.0.x` tags cut from `main` weekly by the release workflow when CI is green, with release notes stating what they are not: no upgrade path, no support window, storage format unstable |
 | Storage format identity | A storage-format version distinct from the binary version, with the already-broken transition recorded as a numbered format change in [docs/lifecycle.md](docs/lifecycle.md) |
-| Benchmark provenance | Every published comparison names the Spindle build it measured, as it already names Synapse 1.159.0 |
+| Benchmark provenance | Every published comparison names the Spindle build and the version of each competitor that it measured. Each sitting records them in its `sitting.json` sidecar ([docs/benchmarks.md](docs/benchmarks.md)) |
 
-Tracked by [#308](https://github.com/tuna-os/spindle/issues/308).
+All three gates are met, and [#308](https://github.com/tuna-os/spindle/issues/308)
+is closed. The release workflow cut `v0.0.1` to `v0.0.3`.
+[docs/lifecycle.md](docs/lifecycle.md) records the format versions.
 
 ### `v0.1.0` — the first release an outsider could reason about
 
@@ -65,7 +67,7 @@ commit, and the candidate's evidence links belong in the release notes.
 | Gate | Required evidence |
 |---|---|
 | Authorization surface | [#268](https://github.com/tuna-os/spindle/issues/268)'s systematic audit closed — the route table walked by a stranger for every room-scoped route, not "however much someone happened to look" |
-| Vulnerability intake | Private vulnerability reporting enabled on this repository and a `SECURITY.md` naming the server-software classes: authorization bypass, federation forgery, cross-account disclosure, unauthenticated resource exhaustion ([#307](https://github.com/tuna-os/spindle/issues/307)) |
+| Vulnerability intake | [#307](https://github.com/tuna-os/spindle/issues/307) closed — private vulnerability reporting is on for this repository, and `SECURITY.md` names the server-software classes: authorization bypass, federation forgery, cross-account disclosure, unauthenticated resource exhaustion |
 | The load-bearing claim | Scheduled differential checks against `ruma-state-res`, including the retired merge counterexamples and resolver delegation (ADR 0005), plus the exhaustive fork-window oracle. A disagreement on the live path is a release blocker |
 | Federation under adversity | [#16](https://github.com/tuna-os/spindle/issues/16)'s fork-proof rig green, and [#225](https://github.com/tuna-os/spindle/issues/225) — a federated fork wedging a room permanently — fixed with a regression test |
 | Lifecycle round trip | `backup` → `restore` → `verify-media` demonstrated across a version boundary, with at least one real migration in the migration table rather than synthetic fixtures |

@@ -50,6 +50,10 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.24"
+          # setup-go's own cache keys off a root go.mod, and this repository
+          # has none: the Go built here is Dendrite, cloned at its pin by
+          # scripts/bench-field.sh. The field cache below keeps that build.
+          cache: false
       - name: Tuwunel's RocksDB wants liburing
         run: sudo apt-get install -y -qq liburing-dev
       # The competitors' pinned binaries survive between runs, so the slow
