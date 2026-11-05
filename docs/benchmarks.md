@@ -1972,6 +1972,34 @@ have a measurement now, so the gate gives line 3 a verdict. The failed
 cells are `federated_join/1000`, `federated_join/10000` and
 `send_throughput` at 2, 4 and 8 clients, each against Tuwunel.
 
+### After #766: the 10,000-member loss is gone
+
+#766 made the resync of #760 cheaper. The resync now asks for one
+`/state` and not for `/state_ids` too. It hashes each event one time,
+and it checks the signatures on all the cores. It reads the shared
+auth events of the roster one time for the batch. The targeted sitting
+ran again on that commit (run 42062085399, five rounds,
+`targeted-20261105-62fd4b4`):
+
+| cell | Spindle | Synapse | Tuwunel | vs Synapse | vs Tuwunel |
+|---|---|---|---|---|---|
+| join, 1,000 members | 178 ms | 2,330 ms | 215 ms | 13.1× win | 1.21× win |
+| join, 10,000 members | 1,563 ms | 21,370 ms | 1,509 ms | 13.7× win | 0.97×, noise |
+| catch-up, 200 events | 347 ms | 9,433 ms | 580 ms | 27.2× win | 1.67× win |
+
+This runner was faster than the runner of the earlier run. Tuwunel did
+the 10,000-member join in 1,509 ms here and in 2,014 ms there. Thus
+compare the ratios, not the times. Against Tuwunel, the 10,000-member
+join went from a separated loss of 1.26× to noise at 0.97×. Line 3
+still fails. The joins and concurrent send are not material wins.
+
+**Parity verdict from `scripts/parity-gate.py docs/benchmarks/data
+ci-20261010 targeted-20261105-62fd4b4`.** Line 1 passes on 33 cells.
+Line 2 passes on 21. Line 3 fails on 36 cells. The failed cells are
+`federated_join/1000` (1.21×), `federated_join/10000` (0.97×) and
+`send_throughput` at 2, 4 and 8 clients (1.05–1.14×), each against
+Tuwunel.
+
 ### The run that we did not keep
 
 The first full run (41969314661, three rounds) kept all the servers of a
