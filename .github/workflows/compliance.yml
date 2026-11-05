@@ -524,6 +524,65 @@ jobs:
           path: tmp/hub-mode-*.jsonl
           if-no-files-found: ignore
 
+  # E2EE through real client SDKs (docs/conformance-testing.md §4.2, #744):
+  # complement-crypto's matrix-js-sdk clients, in headless Chrome, against
+  # two Spindles behind its mitmproxy -- key claims, to-device, device
+  # lists over federation, backup, verification. Nightly and on demand,
+  # because it builds the SDK's browser bundle and takes a quarter of an
+  # hour.
+  #
+  # Report-only: a failing test leaves the job green and names itself in
+  # the log and the ledger. One recorded run (the probe for #744, 35 of 41
+  # tests that ran passed) is not a baseline, so a failure cannot yet be
+  # told from a regression, and gating on it would make the nightly red for
+  # a known reason every night, which teaches everyone to stop reading it.
+  # Tests that pass twice in a row go into an allowlist and this becomes a
+  # ratchet like complement-suite's. What does fail the job is a run in
+  # which nothing passed: the rig broke, which is worth a red run.
+  complement-crypto:
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The Go upstream's own workflow uses, not `stable`: the pinned
+      # suite's go-json-experiment dependency does not build on newer Go,
+      # where it aliases encoding/json/v2 and finds names that are not there.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.25'
+          cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build the Spindle image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: complement/Dockerfile
+          tags: complement-spindle:latest
+          load: true
+          cache-from: type=gha,scope=complement-image
+      # Ubuntu 24.04's AppArmor refuses unprivileged user namespaces, which
+      # is Chrome's sandbox: a probe run of this job had every JS client abort
+      # with "No usable sandbox!" before a request was made. Lifted for
+      # this runner only, rather than running Chrome with --no-sandbox.
+      - name: Let headless Chrome start its sandbox
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Run complement-crypto against Spindle
+        env:
+          GOPROXY: https://proxy.golang.org|direct
+          COMPLEMENT_IMAGE: complement-spindle:latest
+        run: contrib/complement-crypto/run.sh tmp/complement-crypto/results.jsonl
+      - name: Keep the ledger and the logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: complement-crypto
+          path: tmp/complement-crypto/
+          if-no-files-found: ignore
+
   # Heterogeneous federation against a real Synapse (docs/conformance-testing.md
   # §5.1, #16): the suite above, unchanged, with Element's Complement image
   # of Synapse on the other end of the wire. Report-only, as tuwunel runs

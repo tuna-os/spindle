@@ -1479,7 +1479,10 @@ async fn set_typing(
         .set(&room_id, &user_id, request.typing, timeout);
     // The room's remote members hear about it as an m.typing EDU on the
     // next transaction out — and a start or stop with no event traffic
-    // still goes, because the drain sends EDU-only transactions.
+    // still goes, because the drain sends EDU-only transactions. The caller
+    // was checked against the joined list above, which is stricter than
+    // `may_read_room`: typing needs membership now, not history.
+    // nosemgrep: room-read-without-authorization
     if let Ok(domains) = state.rooms.remote_domains(&room_id) {
         for destination in domains {
             state.federation.queue_edu(
