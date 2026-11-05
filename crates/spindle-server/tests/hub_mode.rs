@@ -710,6 +710,8 @@ async fn a_new_hub_that_drops_an_attested_entry_is_refused_with_a_portable_proof
         eventually(10, async || has_attestation(&other, &room, 0, &hub, &last)).await,
         "the other participant holds the last attestation"
     );
+    // The hub goes away, outbox and all: what it still has queued for the
+    // backup -- `last` and its attestation -- never arrives there.
     hub.partition(true);
     backup.partition(false);
 

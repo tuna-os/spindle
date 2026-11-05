@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use ruma::{CanonicalJsonObject, CanonicalJsonValue};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use spindle_core::keys::{self};
 use spindle_store::{FjallStore, ReadView, Store};
 
@@ -2687,8 +2688,8 @@ struct OutboundTransaction {
 /// keyspace is a bounded prefix read, and the poll interval doubles as the
 /// floor of the retry backoff. Rows are deleted only after the destination
 /// acknowledged the transaction carrying them — a crash between send and
-/// delete re-sends, and the transaction ID being derived from the first
-/// row's sequence lets the peer's replay table absorb the duplicate.
+/// delete re-sends, and the transaction ID being derived from the rows it
+/// carries lets the peer's replay table absorb the duplicate.
 ///
 /// Holds the store and the federation weakly and ends when they are gone,
 /// for the reason `spawn_delivery_loops` gives. A pass upgrades them to
@@ -2865,10 +2866,20 @@ fn plan_transactions(
                 .get(key.len() - 8..)
                 .and_then(|bytes| bytes.try_into().ok())
                 .map_or(0, u64::from_be_bytes);
-            // Deterministic by content, not by attempt: a retry after a
-            // crash reuses the same ID, which is what makes redelivery
-            // a no-op on the peer.
-            format!("o{first_seq}")
+            // Deterministic by content, not by attempt: a retry of the same
+            // rows, after a refusal or a crash, reuses the ID, which is
+            // what makes redelivery a no-op on the peer. Named by every
+            // row it carries, not by the first alone: when the peer took an
+            // attempt but its answer was lost, a retry that carries rows
+            // queued since is a new transaction. Under the old ID the
+            // peer's replay table would answer for those rows unread, and
+            // they would be deleted here as delivered.
+            let mut digest = Sha256::new();
+            for (key, _) in &batch {
+                digest.update(key);
+            }
+            let rows = u64::from_be_bytes(digest.finalize()[..8].try_into().unwrap_or_default());
+            format!("o{first_seq}-{rows:016x}")
         } else {
             // EDU-only: fire-once by design, so uniqueness is all the
             // ID owes anyone.
