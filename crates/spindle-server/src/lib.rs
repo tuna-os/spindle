@@ -440,7 +440,7 @@ fn app_state_with(
     let store_for_filters = Arc::clone(&store);
     let store_for_devices = Arc::clone(&store);
     let store_for_delayed = Arc::clone(&store);
-    let store_for_presence = Arc::clone(&store);
+    let presence = presence_for(&config, &store);
     let store_for_backups = Arc::clone(&store);
     let account_data = Arc::new(account_data::AccountData::new(Arc::clone(&store)));
     let blobs = blobs_for(&config);
@@ -497,7 +497,7 @@ fn app_state_with(
         media,
         devices: Arc::new(devices::Devices::new(store_for_devices)),
         backups: Arc::new(backups::Backups::new(store_for_backups)),
-        presence: Arc::new(presence::Presence::new(Arc::clone(&store_for_presence))),
+        presence,
         previews,
         profiles,
         appservices,
@@ -537,6 +537,15 @@ fn probe_resident_rooms(state: &AppState) {
         .set_resident_rooms_probe(move || resident.upgrade()?.resident_count());
 }
 
+/// The presence store, switched as `[presence] enabled` says.
+fn presence_for(config: &Config, store: &Arc<FjallStore>) -> Arc<presence::Presence> {
+    Arc::new(presence::Presence::new(
+        Arc::clone(store),
+        config.presence.enabled,
+        config.server.name.clone(),
+    ))
+}
+
 /// The delivery loops that run for the life of the process. Spawned only
 /// when a runtime is running — which is every real caller; a build
 /// outside one gets a router that serves but never sends, and the
@@ -558,6 +567,16 @@ fn probe_resident_rooms(state: &AppState) {
 fn spawn_delivery_loops(state: &AppState) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
+    }
+    // Presence's clock -- idle, stopped syncing, a peer gone quiet -- at
+    // Synapse's cadence. A pass reads only the users not already offline.
+    if state.presence.enabled() {
+        tokio::spawn(presence::sweep_loop(
+            Arc::downgrade(&state.presence),
+            Arc::downgrade(&state.rooms),
+            Arc::downgrade(&state.federation),
+            presence::SWEEP_INTERVAL,
+        ));
     }
     // A tenth of a second, the push loop's tick, so a call's departure and
     // its ring land with the same delay. It was a second until #36's

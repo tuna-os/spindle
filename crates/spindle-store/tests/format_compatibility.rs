@@ -219,6 +219,7 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::DelayEcho, 0x56),
         (Keyspace::DeviceListOutbound, 0x5d),
         (Keyspace::DeviceListInbound, 0x5e),
+        (Keyspace::PresenceStream, 0x5f),
         (Keyspace::HubAttestation, 0x70),
         (Keyspace::HubEquivocation, 0x71),
         (Keyspace::HubCheckpoint, 0x72),

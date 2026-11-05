@@ -455,11 +455,10 @@ pub(crate) fn join_candidates(
 /// is judged alone — hash and signature against the origin's published
 /// keys, then the same authorization predicate local events pass — and a
 /// refusal soft-fails into the per-PDU results without poisoning the
-/// batch. Of the EDUs, `m.typing` and `m.receipt` are applied — for the
-/// origin's own joined users only, so no server can put words in another's
-/// hands — keys, to-device messages and device lists go to
-/// `e2ee_federation`, and the rest (presence among them; see `receipts`)
-/// are accepted, counted and dropped.
+/// batch. Of the EDUs, `m.typing`, `m.receipt` and `m.presence` are
+/// applied — for the origin's own users only, so no server can put words
+/// in another's hands — keys, to-device messages and device lists go to
+/// `e2ee_federation`, and the rest are accepted, counted and dropped.
 pub(crate) async fn send_transaction(
     state: AppState,
     headers: axum::http::HeaderMap,
@@ -575,9 +574,10 @@ pub(crate) async fn send_transaction(
                 crate::e2ee_federation::apply_edu(&state, &origin, edu).await;
                 crate::metrics::EduResult::Accepted
             }
-            crate::metrics::EduType::Presence | crate::metrics::EduType::Other => {
-                crate::metrics::EduResult::Unsupported
+            crate::metrics::EduType::Presence => {
+                apply_presence(&state, &origin, &edu["content"]).await
             }
+            crate::metrics::EduType::Other => crate::metrics::EduResult::Unsupported,
         };
         state.metrics.record_edu_received(edu_type, result);
     }
@@ -591,6 +591,31 @@ pub(crate) async fn send_transaction(
     .map_err(|error| MatrixError::internal(&error.to_string()))?;
     state.rooms.wake_sync_waiters();
     Ok(Json(response))
+}
+
+/// Apply one inbound `m.presence` EDU (`presence::Presence::apply_edu`).
+///
+/// Whether the user shares a room with anyone here can load a cold room:
+/// off the async workers, like receipts.
+async fn apply_presence(
+    state: &AppState,
+    origin: &str,
+    content: &Value,
+) -> crate::metrics::EduResult {
+    let state = state.clone();
+    let origin = origin.to_owned();
+    let content = content.clone();
+    crate::blocking::offload(
+        std::sync::Arc::clone(&state.metrics),
+        crate::metrics::BlockingTask::FederationSend,
+        move || {
+            Ok(state
+                .presence
+                .apply_edu(crate::presence::Peers::of(&state), &origin, &content))
+        },
+    )
+    .await
+    .unwrap_or(crate::metrics::EduResult::Ignored)
 }
 
 /// Apply one inbound `m.typing` EDU: only about the origin's own joined

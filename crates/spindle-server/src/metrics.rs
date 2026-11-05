@@ -2543,7 +2543,8 @@ pub enum EduResult {
     Ignored,
     /// Not the shape the spec gives this EDU type.
     Malformed,
-    /// A type this server does not act on (presence, unknown types).
+    /// A type this server does not act on: unknown types, and `m.presence`
+    /// with `[presence] enabled = false`.
     Unsupported,
 }
 

@@ -543,7 +543,7 @@ async fn receipts_the_origin_has_no_authority_for_are_ignored() {
                 receipt_edu(&room, "m.read", &peer.user(), &["$nope"], &json!({})),
                 // Not the shape the spec gives it.
                 json!({ "edu_type": "m.receipt", "content": [] }),
-                // Presence is not federated (see `receipts`): counted only.
+                // Presence with nobody in it: well-formed, nothing applied.
                 json!({ "edu_type": "m.presence", "content": { "push": [] } }),
             ],
         )
@@ -591,7 +591,7 @@ async fn receipts_the_origin_has_no_authority_for_are_ignored() {
         1
     );
     assert_eq!(
-        metrics.edu_received_count(EduType::Presence, EduResult::Unsupported),
+        metrics.edu_received_count(EduType::Presence, EduResult::Ignored),
         1
     );
 }

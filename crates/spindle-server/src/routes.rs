@@ -4784,6 +4784,9 @@ struct SyncQuery {
     #[serde(rename = "timeline_limit")]
     timeline_limit: Option<usize>,
     filter: Option<String>,
+    /// Whether this sync speaks for its user's presence: `online` (the
+    /// spec's default), `unavailable`, or `offline` for "it does not".
+    set_presence: Option<String>,
     /// MSC4222. Accepted under the unstable name too, because the MSC shipped
     /// in clients before it was adopted and both spellings are in the wild.
     #[serde(rename = "use_state_after")]
@@ -7873,6 +7876,9 @@ async fn sync(
     axum::extract::Query(query): axum::extract::Query<SyncQuery>,
 ) -> Result<axum::response::Response, MatrixError> {
     let resume = sync_resume(&identity, query.since.as_deref())?;
+    // Before the read, so a sync that brings its user online carries that
+    // change itself; held to the end, so a long-poll keeps them online.
+    let _presence = sync_presence_start(&state, &identity, query.set_presence.as_deref()).await?;
     let since = resume.position();
     let filter = requested_filter(&state, &identity.user_id, query.filter.as_deref())?;
     // A filter's own timeline limit outranks the query parameter: the client
@@ -7987,6 +7993,43 @@ async fn sync(
     .map(|response| mark_long_poll(response, long_poll))
 }
 
+/// What `/sync` does to its user's presence: online unless `set_presence`
+/// says otherwise. The guard keeps the user from timing out while held.
+async fn sync_presence_start(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    set_presence: Option<&str>,
+) -> Result<Option<crate::presence::SyncGuard>, MatrixError> {
+    let wanted = match set_presence {
+        None => crate::presence::State::Online,
+        Some(value) => crate::presence::State::parse(value).ok_or_else(|| {
+            MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                format!("set_presence must be 'online', 'offline' or 'unavailable', not {value:?}"),
+            )
+        })?,
+    };
+    if !state.presence.enabled() {
+        return Ok(None);
+    }
+    // Telling peers means finding the rooms the user shares with them,
+    // which can load a cold one: off the async workers.
+    let worker_state = state.clone();
+    let user_id = identity.user_id.clone();
+    crate::blocking::offload(
+        std::sync::Arc::clone(&state.metrics),
+        crate::metrics::BlockingTask::Sync,
+        move || {
+            worker_state
+                .presence
+                .sync_started(crate::presence::Peers::of(&worker_state), &user_id, wanted)
+                .map_err(|error| MatrixError::internal(&error.to_string()))
+        },
+    )
+    .await
+}
+
 /// The body of a `/sync` response, assembled synchronously from what the
 /// read found.
 fn sync_answer(
@@ -8042,6 +8085,9 @@ fn sync_answer(
     body.insert("device_one_time_keys_count", raw(&key_counts)?);
     body.insert("device_unused_fallback_key_types", raw(&unused_fallback)?);
     body.insert("account_data", raw(&json!({ "events": global }))?);
+    if let Some(presence) = sync_presence(state, identity, filter, since, result.next_batch)? {
+        body.insert("presence", raw(&json!({ "events": presence }))?);
+    }
 
     let window = (since, result.next_batch);
     if let Some(done) = finalised_delays(state, &identity.user_id, filter, window)? {
@@ -8088,6 +8134,66 @@ fn finalised_delays(
             .map(crate::delayed::FinalisedDelay::sync_view)
             .collect()
     }))
+}
+
+/// The `presence` section: `None` with presence off, so the key is absent
+/// rather than an empty list that would read as "nobody is online".
+///
+/// An initial sync carries everyone the user shares a room with who is not
+/// offline, themselves included -- offline is what a client assumes of
+/// anyone it has not been told about, so listing those would be bytes that
+/// say nothing. An incremental one carries the changes in its window, to
+/// the same audience.
+fn sync_presence(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    filter: Option<&crate::filters::Filter>,
+    since: Option<u64>,
+    until: u64,
+) -> Result<Option<Vec<Value>>, MatrixError> {
+    if !state.presence.enabled() {
+        return Ok(None);
+    }
+    let section = filter.and_then(|filter| filter.presence.as_ref());
+    // A filter that excludes every presence event is common -- clients that
+    // do not render presence say so -- and is honoured before any reading.
+    if section.is_some_and(|section| {
+        section.limit == Some(0) || section.types.as_ref().is_some_and(Vec::is_empty)
+    }) {
+        return Ok(Some(Vec::new()));
+    }
+    let store_error = |error: spindle_store::StoreError| MatrixError::internal(&error.to_string());
+    let mut events = Vec::new();
+    match since {
+        None => {
+            let around = state
+                .presence
+                .not_offline(everyone_sharing_a_room(state, identity)?)
+                .map_err(store_error)?;
+            for (user_id, status) in around {
+                events.push(status.event(&user_id));
+            }
+        }
+        Some(since) => {
+            let changes = state.presence.changes(since, until).map_err(store_error)?;
+            if !changes.is_empty() {
+                let mine = state.rooms.joined(&identity.user_id).map_err(room_error)?;
+                for (user_id, status) in changes {
+                    let visible = user_id == identity.user_id
+                        || state
+                            .rooms
+                            .joined(&user_id)
+                            .map_err(room_error)?
+                            .iter()
+                            .any(|room_id| mine.contains(room_id));
+                    if visible {
+                        events.push(status.event(&user_id));
+                    }
+                }
+            }
+        }
+    }
+    Ok(Some(crate::filters::Filter::apply(section, events)))
 }
 
 /// The account-level account data a sync carries, defaults included.
