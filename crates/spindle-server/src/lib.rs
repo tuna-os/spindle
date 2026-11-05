@@ -624,6 +624,22 @@ fn spawn_delivery_loops(state: &AppState) {
             inbound::BackfillSettings::of(&state.config.federation),
         ));
     }
+    // Rooms joined with `members_omitted` resync their full state in the
+    // background (`inbound::resync`), resuming after a restart. Not tied to
+    // `gap_backfill`: a partial room is unusable for its roster until this
+    // runs, where an unfilled gap only lacks history.
+    if state.config.federation.enabled {
+        tokio::spawn(inbound::run_resync(inbound::ResyncSources {
+            rooms: Arc::downgrade(&state.rooms),
+            federation: Arc::downgrade(&state.federation),
+            key: Arc::downgrade(&state.key),
+            metrics: Arc::downgrade(&state.metrics),
+            recovery: Arc::downgrade(&state.recovery),
+            wake: state.rooms.partial_state_wake(),
+            server_name: state.config.server.name.clone(),
+            retry: std::time::Duration::from_millis(state.config.federation.retry_base_ms),
+        }));
+    }
     // Push delivery shares the outbox's retry base for the same reason
     // the appservice push does, below.
     if state.config.push.enabled {

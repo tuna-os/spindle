@@ -105,6 +105,11 @@ impl Rooms {
         content: &Value,
         sticky_ms: Option<u64>,
     ) -> Result<String, RoomError> {
+        if event_type == "m.room.member"
+            && let Some(target) = state_key
+        {
+            self.await_member_state(room_id, target).await;
+        }
         // Preserve the single-lock path when no policy is active. Recheck
         // under the write guard so enabling a policy cannot race the send.
         let direct = self.with_room(room_id, |rooms, log| {
@@ -350,6 +355,7 @@ impl Rooms {
         is_direct: bool,
         key: &Ed25519KeyPair,
     ) -> Result<(String, Value), RoomError> {
+        self.await_member_state(room_id, target).await;
         let (id, mut event) =
             self.build_invite_event(room_id, sender, target, reason, is_direct, key)?;
         self.authorize_policy(room_id, &mut event).await?;

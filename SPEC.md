@@ -852,12 +852,26 @@ capped separately, per room and per origin over a window
 4. Records the history before the join as a gap at the join, and fills it
    in the background per §6.6.
 
-Faster room joins (MSC3706 partial state / MSC3902) are designed for on the
-receive side, and not yet built: the room would be usable with partial state,
-marked `partial_state`, with the remaining state resynced in the background and
-membership-dependent operations blocking only until the relevant slice of state
-has arrived. Nothing handles `members_omitted` today; `docs/mscs.md` records
-MSC3706 as planned, and this paragraph is the design it will be built to.
+Faster room joins (MSC3706, spec v1.6) are built on both sides. Every remote
+join asks `send_join` for `omit_members`; a resident that answers
+`members_omitted` hands over the non-member state, the joiner's own member
+event and, in an unnamed room, the heroes', with `servers_in_room`. The join
+returns with the room marked partial (a persisted record), usable at once for
+reading and sending: this server's events also go to `servers_in_room`, and an
+incoming event takes a member slot the partial state lacks from its own,
+already verified auth events. Membership-dependent operations wait instead:
+`/members`, `/joined_members` and a membership change aimed at another
+server's user. A background resync asks the joined-through server, then the
+others, for `/state_ids` at the join, fetches what it lacks (one `/state` when
+that is a tenth or more), verifies and authorizes it, and fills the missing
+member slots of every snapshot from the join on in place, in one batch. An
+incremental `/sync` spanning the resync tells its client the room afresh, and
+a sync's state block carries any slot of the current state that neither the
+state before its window nor an event in it set -- the filled members, when the
+history before the join has not been backfilled. A restart resumes an
+unfinished resync. As a resident, Spindle serves
+`omit_members` the way Synapse does. `docs/divergence.md` §4.9 records where
+the joining side differs from Synapse's.
 
 ### 11.6 Room versions
 

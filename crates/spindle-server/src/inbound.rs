@@ -27,10 +27,13 @@ use crate::routes::{MAX_TXN_ID_LEN, record_invite, room_error};
 mod backfill;
 mod gap;
 mod recovery;
+mod resync;
 
 pub(crate) use backfill::run as run_backfill;
 pub use backfill::{GapBackfill, Settings as BackfillSettings, Sources as BackfillSources};
 pub use recovery::RecoveryGate;
+pub use resync::Sources as ResyncSources;
+pub(crate) use resync::run as run_resync;
 
 /// Say that a peer's event was refused, and name what it was refused over.
 ///
@@ -654,6 +657,7 @@ pub(crate) async fn room_state(
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
     federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
+    refuse_partial_state(&state, &room_id)?;
     let (pdus, auth_chain) = state
         .rooms
         .federation_state(&room_id, &query.event_id)
@@ -683,6 +687,7 @@ pub(crate) async fn room_state_ids(
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
     federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
+    refuse_partial_state(&state, &room_id)?;
     let (pdus, auth_chain) = state
         .rooms
         .federation_state(&room_id, &query.event_id)
@@ -844,6 +849,7 @@ pub(crate) async fn make_join(
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
     let origin = federation_origin(&state, &headers, "GET", &uri, None).await?;
     require_server_acl(&state, &room_id, &origin)?;
+    refuse_partial_state(&state, &room_id)?;
     // A server makes joins for its own users only: a template for someone
     // else's user would be a forgery kit.
     if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin.as_str()) {
@@ -904,6 +910,7 @@ pub(crate) async fn make_leave(
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
     let origin = federation_origin(&state, &headers, "GET", &uri, None).await?;
     require_server_acl(&state, &room_id, &origin)?;
+    refuse_partial_state(&state, &room_id)?;
     // A server makes leaves for its own users only, same as joins: a
     // template for someone else's user would be a forgery kit.
     if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin.as_str()) {
@@ -940,6 +947,7 @@ pub(crate) async fn make_knock(
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
     let origin = federation_origin(&state, &headers, "GET", &uri, None).await?;
     require_server_acl(&state, &room_id, &origin)?;
+    refuse_partial_state(&state, &room_id)?;
     if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin.as_str()) {
         return Err(MatrixError::forbidden(
             "the user does not live on the requesting server",
@@ -976,6 +984,7 @@ pub(crate) async fn send_knock(
         serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
     let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&knock)).await?;
     require_server_acl(&state, &room_id, &origin)?;
+    refuse_partial_state(&state, &room_id)?;
 
     // Same smuggling rule as send_join and send_leave: this door admits
     // exactly one kind of event.
@@ -1322,6 +1331,7 @@ pub(crate) async fn send_leave_common(
         serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
     let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&leave)).await?;
     require_server_acl(&state, &room_id, &origin)?;
+    refuse_partial_state(&state, &room_id)?;
 
     // Shape first, same reasoning as send_join: this door admits exactly
     // one kind of event, and anything else through it is smuggling.
@@ -1368,6 +1378,7 @@ pub(crate) async fn send_join_common(
         .uri()
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let omit_members = omit_members(request.uri().query());
     let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
         .await
         .map_err(|error| MatrixError::bad_json(error.to_string()))?;
@@ -1375,6 +1386,7 @@ pub(crate) async fn send_join_common(
         serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
     let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&join)).await?;
     require_server_acl(&state, &room_id, &origin)?;
+    refuse_partial_state(&state, &room_id)?;
 
     // The shape is checked before the machinery runs: send_join admits one
     // kind of event, and anything else through this door — however well
@@ -1467,22 +1479,82 @@ pub(crate) async fn send_join_common(
         }));
     }
 
-    // The state *before* the join, with its auth chain: everything the new
-    // server needs to participate from this event onward.
-    let (state_pairs, auth_pairs) = state
-        .rooms
-        .federation_state(&room_id, &event_id)
-        .map_err(room_error)?;
+    join_answer(&state, &room_id, &event_id, &join, &sticky, omit_members)
+}
+
+/// The `send_join` answer of a stock room: the state *before* the join,
+/// with its auth chain -- everything the new server needs to participate
+/// from this event onward.
+///
+/// MSC3706 (spec v1.6): a joiner that asked `omit_members` can resync
+/// later, so it is spared the roster now -- the member events it can do
+/// without, and the auth chain entries the state already carries.
+fn join_answer(
+    state: &AppState,
+    room_id: &str,
+    event_id: &str,
+    join: &Value,
+    sticky: &[Value],
+    omit_members: bool,
+) -> Result<Value, MatrixError> {
     let bodies = |events: Vec<crate::rooms::IdentifiedEvent>| -> Vec<Value> {
         events.into_iter().map(|(_, event)| event).collect()
     };
+    if omit_members {
+        let joiner = join["state_key"].as_str().unwrap_or_default().to_owned();
+        let partial = state
+            .rooms
+            .partial_join_state(room_id, event_id, &joiner)
+            .map_err(room_error)?;
+        return Ok(json!({
+            "origin": state.config.server.name,
+            "event": join,
+            "state": bodies(partial.state),
+            "auth_chain": bodies(partial.auth_chain),
+            "members_omitted": true,
+            "servers_in_room": partial.servers_in_room,
+            "msc4354_sticky": sticky,
+        }));
+    }
+    let (state_pairs, auth_pairs) = state
+        .rooms
+        .federation_state(room_id, event_id)
+        .map_err(room_error)?;
     Ok(json!({
         "origin": state.config.server.name,
         "event": join,
         "state": bodies(state_pairs),
         "auth_chain": bodies(auth_pairs),
+        "members_omitted": false,
         "msc4354_sticky": sticky,
     }))
+}
+
+/// Whether a `send_join` asked for `omit_members` (spec v1.6). Only the
+/// stable name: Synapse, the one server that ever spoke the MSC's
+/// `org.matrix.msc3706.partial_state`, asks and answers in stable terms
+/// alone today, so the unstable spelling would be read by nobody.
+fn omit_members(query: Option<&str>) -> bool {
+    query.is_some_and(|query| {
+        form_urlencoded::parse(query.as_bytes())
+            .any(|(name, value)| name == "omit_members" && value == "true")
+    })
+}
+
+/// Refuse a federation request this server cannot answer completely while
+/// `room_id` is partial-state (MSC3706): it lacks member events, so the
+/// room's state, the servers in it and a join, knock or leave brokered
+/// through it would all be partial. A 404, as Synapse answers -- the same
+/// answer as not being in the room, which sends the peer to another server.
+pub(crate) fn refuse_partial_state(state: &AppState, room_id: &str) -> Result<(), MatrixError> {
+    if state.rooms.is_partial_state(room_id) {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            format!("this server is still resyncing the state of {room_id}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Judge and, if it holds up, apply one received PDU.

@@ -293,12 +293,20 @@ impl Harness {
         event_id: &str,
         join: &Value,
     ) -> (StatusCode, Value) {
-        let uri = format!("/_matrix/federation/v2/send_join/{room}/{event_id}");
-        let header = peer.put_header(&uri, join);
+        self.send_join_at(
+            peer,
+            &format!("/_matrix/federation/v2/send_join/{room}/{event_id}"),
+            join,
+        )
+        .await
+    }
+
+    async fn send_join_at(&self, peer: &Peer, uri: &str, join: &Value) -> (StatusCode, Value) {
+        let header = peer.put_header(uri, join);
         self.call(
             Request::builder()
                 .method("PUT")
-                .uri(&uri)
+                .uri(uri)
                 .header("authorization", header)
                 .header("content-type", "application/json")
                 .body(Body::from(join.to_string()))
@@ -306,6 +314,50 @@ impl Harness {
         )
         .await
     }
+
+    /// Register `username` and join it to `room` through this server.
+    async fn member(&self, room: &str, username: &str) {
+        let token = self.register(username).await;
+        let (status, body) = self
+            .send(
+                "POST",
+                &format!("/_matrix/client/v3/join/{room}"),
+                &token,
+                &json!({}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// The peer's join, through `send_join` with `omit_members=true`.
+    async fn join_omitting_members(&self, peer: &Peer, room: &str) -> Value {
+        let (status, body) = self.make_join(peer, room, &peer.user()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let join = peer.sign_event(&body["event"]);
+        let join_id = event_id_of(&join);
+        let (status, body) = self
+            .send_join_at(
+                peer,
+                &format!("/_matrix/federation/v2/send_join/{room}/{join_id}?omit_members=true"),
+                &join,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+}
+
+/// The `state_key`s of the member events in a `send_join` field.
+fn member_keys(body: &Value, field: &str) -> Vec<String> {
+    let mut keys: Vec<String> = body[field]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["type"] == json!("m.room.member"))
+        .map(|event| event["state_key"].as_str().unwrap().to_owned())
+        .collect();
+    keys.sort();
+    keys
 }
 
 #[tokio::test]
@@ -692,4 +744,136 @@ async fn a_knock_lands_as_membership_and_answers_with_stripped_state() {
         .await;
     assert_eq!(status, StatusCode::OK, "{membership}");
     assert_eq!(membership["membership"], json!("knock"));
+}
+
+/// MSC3706 (spec v1.6): a joiner that asks `omit_members` is spared the
+/// roster. A named room keeps no heroes, so no member event is in `state`;
+/// the auth chain carries only what the state cites and does not repeat
+/// the state; and the answer says what it left out and who else can say.
+#[tokio::test]
+async fn omit_members_leaves_the_roster_out_and_names_the_servers() {
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.public_room(&alice).await;
+    let (status, body) = harness
+        .send(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.name"),
+            &alice,
+            &json!({ "name": "named" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for name in ["bob", "carol"] {
+        harness.member(&room, name).await;
+    }
+
+    let body = harness.join_omitting_members(&peer, &room).await;
+    assert_eq!(body["members_omitted"], json!(true), "{body}");
+    assert_eq!(body["servers_in_room"], json!(["example.org"]), "{body}");
+    assert_eq!(
+        member_keys(&body, "state"),
+        Vec::<String>::new(),
+        "a named room keeps no member event in the state: {body}"
+    );
+    let kinds: Vec<&str> = body["state"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["type"].as_str())
+        .collect();
+    for kind in [
+        "m.room.create",
+        "m.room.power_levels",
+        "m.room.join_rules",
+        "m.room.name",
+    ] {
+        assert!(kinds.contains(&kind), "{kind} is not omitted: {body}");
+    }
+    // Alice's join is cited by everything she set, so the auth chain
+    // carries it; bob and carol cite nothing and are nowhere.
+    assert_eq!(
+        member_keys(&body, "auth_chain"),
+        vec!["@alice:example.org".to_owned()],
+        "{body}"
+    );
+    let state_ids: Vec<String> = body["state"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(event_id_of)
+        .collect();
+    assert!(
+        body["auth_chain"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| !state_ids.contains(&event_id_of(event))),
+        "the auth chain does not repeat the state: {body}"
+    );
+
+    // The join is no less a join for it.
+    let (status, members) = harness
+        .send(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room}/joined_members"),
+            &alice,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{members}");
+    assert!(members["joined"].get(peer.user()).is_some(), "{members}");
+}
+
+/// A room with neither a name nor a canonical alias is named by its heroes,
+/// so their member events stay: the first five joined members other than
+/// the joiner, in the order they joined. The sixth is omitted.
+#[tokio::test]
+async fn omit_members_keeps_the_heroes_of_an_unnamed_room() {
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.public_room(&alice).await;
+    for name in ["bob", "carol", "dave", "erin", "frank"] {
+        harness.member(&room, name).await;
+    }
+
+    let body = harness.join_omitting_members(&peer, &room).await;
+    assert_eq!(body["members_omitted"], json!(true), "{body}");
+    assert_eq!(
+        member_keys(&body, "state"),
+        ["alice", "bob", "carol", "dave", "erin"]
+            .iter()
+            .map(|name| format!("@{name}:example.org"))
+            .collect::<Vec<_>>(),
+        "{body}"
+    );
+}
+
+/// Without `omit_members` the answer is the whole state, as before, and
+/// says so.
+#[tokio::test]
+async fn a_join_that_does_not_ask_gets_every_member() {
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.public_room(&alice).await;
+    harness.member(&room, "bob").await;
+
+    let (status, body) = harness.make_join(&peer, &room, &peer.user()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let join = peer.sign_event(&body["event"]);
+    let join_id = event_id_of(&join);
+    let (status, body) = harness.send_join(&peer, &room, &join_id, &join).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["members_omitted"], json!(false), "{body}");
+    assert!(body.get("servers_in_room").is_none(), "{body}");
+    assert_eq!(
+        member_keys(&body, "state"),
+        vec![
+            "@alice:example.org".to_owned(),
+            "@bob:example.org".to_owned()
+        ]
+    );
 }

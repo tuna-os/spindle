@@ -25,6 +25,14 @@ use super::{
     event_body_key, version_in,
 };
 
+/// A `send_join` answer with the roster left out
+/// ([`Rooms::partial_join_state`]).
+pub struct PartialJoinState {
+    pub state: Vec<IdentifiedEvent>,
+    pub auth_chain: Vec<IdentifiedEvent>,
+    pub servers_in_room: Vec<String>,
+}
+
 /// The `cause` a remote join's gap marker carries ([`Rooms::record_join_gap`]).
 pub const JOIN_GAP_CAUSE: &str = "remote_join";
 
@@ -44,6 +52,18 @@ impl Rooms {
     ///
     /// Returns [`RoomError`] if the room or its indexes cannot be read.
     pub fn server_in_room(&self, room_id: &str, domain: &str) -> Result<bool, RoomError> {
+        // A partial-state room (MSC3706) holds few member events, so the
+        // resident's `servers_in_room` stands in for the ones it lacks until
+        // the resync -- Synapse's approximation in the same place. Without
+        // it, an omitted member's server is a stranger whose events cannot
+        // even have their dependencies recovered.
+        if self
+            .partial_servers(room_id)
+            .iter()
+            .any(|server| server == domain)
+        {
+            return Ok(true);
+        }
         let members = self.with_room_read(room_id, |_, log| {
             let Some(state) = log.current_state() else {
                 return Ok(Vec::new());
@@ -1176,6 +1196,116 @@ impl Rooms {
         Ok((pdus, auth_chain))
     }
 
+    /// The `send_join` answer for a joiner that asked `omit_members`
+    /// (MSC3706, spec v1.6): the state before the join without the member
+    /// events the joiner can do without, the auth chain without what the
+    /// state already carries, and the servers with joined members.
+    ///
+    /// Kept, as Synapse keeps them (`_get_event_ids_for_partial_state_join`):
+    /// every non-member event; the joiner's own member event, an auth event
+    /// of the join it is about to receive; and, in a room with neither a
+    /// name nor a canonical alias, the heroes' member events, without which
+    /// the joiner's client cannot name the room until the resync. The rest
+    /// reach the joiner through its resync, and the auth events that cite
+    /// them through the auth chain.
+    ///
+    /// Heroes are the first five joined or invited members other than the
+    /// joiner, in the order this server placed their member events -- the
+    /// spec's "stream ordering" -- read until five are found rather than
+    /// for every member. The servers are those with a member the membership
+    /// index has as joined, one read per member of a server not yet found.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::federation_state`].
+    pub fn partial_join_state(
+        &self,
+        room_id: &str,
+        join_id: &str,
+        joiner: &str,
+    ) -> Result<PartialJoinState, RoomError> {
+        const HEROES: usize = 5;
+        let before = self.state_before_event(room_id, join_id)?;
+        let mut kept = Vec::new();
+        let mut members = Vec::new();
+        before.for_each(|key, id| {
+            if key.event_type().as_str() != "m.room.member" || key.state_key() == joiner {
+                kept.push(id.to_owned());
+            } else {
+                members.push((key.state_key().to_owned(), id.to_owned()));
+            }
+        });
+        let named = [("m.room.name", ""), ("m.room.canonical_alias", "")]
+            .iter()
+            .any(|(kind, key)| before.get(&StateKey::new(*kind, *key)).is_some());
+        if !named {
+            let mut placed = self.with_room_read(room_id, |_, log| {
+                Ok(members
+                    .iter()
+                    .map(|(_, id)| {
+                        let li = log
+                            .get(&EventId::new(id.as_str()))
+                            .map_or(i64::MAX, |entry| entry.li.get());
+                        (li, id.clone())
+                    })
+                    .collect::<Vec<_>>())
+            })?;
+            placed.sort();
+            let mut heroes = 0;
+            for (_, id) in placed {
+                if heroes == HEROES {
+                    break;
+                }
+                let event = self.read_event(room_id, &EventId::new(id.as_str()))?;
+                if matches!(
+                    event["content"]["membership"].as_str(),
+                    Some("join" | "invite")
+                ) {
+                    kept.push(id);
+                    heroes += 1;
+                }
+            }
+        }
+
+        let mut servers = std::collections::BTreeSet::from([self.server_name.clone()]);
+        for (user, _) in &members {
+            let Some((_, domain)) = user.split_once(':') else {
+                continue;
+            };
+            if servers.contains(domain) {
+                continue;
+            }
+            if self.is_joined(user, room_id)? {
+                servers.insert(domain.to_owned());
+            }
+        }
+
+        let mut pdus = Vec::with_capacity(kept.len());
+        for id in kept {
+            let event = self.pdu(room_id, &id)?;
+            pdus.push((id, event));
+        }
+        // The auth chain of what is sent, less what is sent: the joiner
+        // holds the state events already, and a member event it lacks is
+        // here only if something sent cites it.
+        let sent: std::collections::BTreeSet<&str> =
+            pdus.iter().map(|(id, _)| id.as_str()).collect();
+        let frontier: Vec<String> = pdus
+            .iter()
+            .flat_map(|(_, event)| cited_auth_events(event))
+            .collect();
+        let auth_chain = self
+            .auth_chain_from(room_id, frontier)
+            .into_iter()
+            .filter(|(id, _)| !sent.contains(id.as_str()))
+            .collect();
+        Ok(PartialJoinState {
+            state: pdus,
+            auth_chain,
+            servers_in_room: servers.into_iter().collect(),
+        })
+    }
+
     /// The state the room was in just before `event_id`: its parents'
     /// states, resolved by the room version's algorithm when they differ
     /// (ADR 0005) -- exactly what the event was authorized against when it
@@ -1377,6 +1507,14 @@ impl Rooms {
     /// federation-hardening pass; the hash check is what keeps the seeded
     /// room internally consistent.
     ///
+    /// A `partial` join (MSC3706: the resident answered `members_omitted`)
+    /// is recorded as such before anything is seeded (`partial`), and
+    /// seeds `state` alone: the auth chain then carries member events the
+    /// resident left out of the state -- a since-departed member's join
+    /// cited by the topic they set -- and folding those in would seat
+    /// members who are gone. They are kept as bodies, which is all their
+    /// role as auth events needs.
+    ///
     /// # Errors
     ///
     /// Returns [`RoomError`] when an event fails validation or the room is
@@ -1389,6 +1527,7 @@ impl Rooms {
         auth_chain: &[Value],
         join: &Value,
         join_id: &str,
+        partial: Option<&super::PartialState>,
     ) -> Result<(), RoomError> {
         let mut open = self
             .open
@@ -1435,9 +1574,25 @@ impl Rooms {
         // the timestamp and ID only break ties deterministically.
         let mut events: std::collections::BTreeMap<String, Value> =
             std::collections::BTreeMap::new();
-        for event in state.iter().chain(auth_chain) {
+        for event in state {
             let (id, body) = identify(event)?;
             events.insert(id, body);
+        }
+        let mut auth_only: Vec<(String, Value)> = Vec::new();
+        for event in auth_chain {
+            let (id, body) = identify(event)?;
+            // Sticky events (MSC4354) ride beside the auth chain and are
+            // timeline, not state: they are seeded either way.
+            if partial.is_some() && body.get("state_key").is_some() {
+                if !events.contains_key(&id) {
+                    auth_only.push((id, body));
+                }
+            } else {
+                events.insert(id, body);
+            }
+        }
+        if let Some(record) = partial {
+            self.record_partial_state(record)?;
         }
         if events.contains_key(join_id) {
             // A state-DAG resident answers with the DAG *after* the join,
@@ -1540,6 +1695,24 @@ impl Rooms {
                 ));
             }
             room_store.journal_entry_with(&entry, &log, &extra)?;
+        }
+
+        // A partial join's auth-chain-only events: bodies for the auth
+        // checks that cite them, outside the log and the state.
+        let mut outliers = Vec::with_capacity(auth_only.len().saturating_mul(2));
+        for (id, event) in &auth_only {
+            outliers.push((event_body_key(room_id, id), serde_json::to_vec(event)?));
+            outliers.push((
+                spindle_core::keys::event_room(id),
+                room_id.as_bytes().to_vec(),
+            ));
+        }
+        if !outliers.is_empty() {
+            spindle_store::Store::commit(
+                self.store.as_ref(),
+                &outliers,
+                spindle_store::Durability::Group,
+            )?;
         }
 
         // The join itself is new activity: it goes through the shared

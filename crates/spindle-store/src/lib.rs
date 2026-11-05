@@ -1711,6 +1711,62 @@ impl<'a, S: Store> RoomStore<'a, S> {
         self.store.commit_state_deferred(&writes, state.table())
     }
 
+    /// Persist what [`RoomLog::fill_partial_state`] changed, with the
+    /// caller's records, as one durable batch: every rewritten entry and
+    /// sidelined record, the trie nodes each filled state adds over the
+    /// state it replaced, and the room's metadata.
+    ///
+    /// One batch because a restore trusts each record's root: a crash that
+    /// kept some rewritten records and not others would leave a room whose
+    /// state jumps between full and partial along its history, with nothing
+    /// left to say which records are which.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the batch cannot be committed.
+    pub fn commit_filled(
+        &self,
+        filled: &spindle_core::FilledStates,
+        log: &RoomLog,
+        extra: &[Record],
+    ) -> Result<(), StoreError> {
+        let mut writes = vec![(
+            room_prefix(Keyspace::RoomMeta, &self.room_id),
+            Self::meta(log).encode(),
+        )];
+        for filled in &filled.entries {
+            self.check_state_table(&filled.state)?;
+            writes.push((
+                room_li(Keyspace::Log, &self.room_id, filled.entry.li),
+                EntryRecord::from_entry(&filled.entry).encode(),
+            ));
+            for (address, node) in filled.state.delta_nodes(Some(&filled.replaced)) {
+                writes.push((
+                    content_addressed(Keyspace::StateNode, address.as_bytes()),
+                    node,
+                ));
+            }
+        }
+        for filled in &filled.sidelined {
+            self.check_state_table(&filled.state)?;
+            writes.push((
+                spindle_core::keys::sidelined(&self.room_id, filled.entry.event_id.as_str()),
+                SidelinedRecord::from_entry(&filled.entry).encode(),
+            ));
+            for (address, node) in filled.state.delta_nodes(Some(&filled.replaced)) {
+                writes.push((
+                    content_addressed(Keyspace::StateNode, address.as_bytes()),
+                    node,
+                ));
+            }
+        }
+        writes.extend_from_slice(extra);
+        // Every snapshot the fill made shares the log's table, so its
+        // newly interned keys ride this batch with the nodes that use them.
+        self.store.commit_state_deferred(&writes, log.table())?;
+        self.store.sync(Durability::Strict)
+    }
+
     /// Put the room's sidelined events back into a restored log, each with
     /// its state rehydrated from the stored trie.
     fn restore_sidelined(&self, log: &mut RoomLog) -> Result<(), StoreError> {
