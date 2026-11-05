@@ -5975,7 +5975,20 @@ impl Rooms {
             .filter(|domain| *domain != self.server_name)
             .filter(|domain| !live.iter().any(|known| known == *domain));
 
-        for destination in live.iter().map(String::as_str).chain(departing) {
+        // The room's ACL, read after the event landed so an ACL change
+        // applies from itself onward. A denied server neither feeds the
+        // room nor hears it: the spec asks for both halves, and a kick of
+        // a denied server's user is no exception — the server was told to
+        // leave by the ACL already.
+        let acl = self.server_acl_in(log, room_id)?;
+        let admitted = |domain: &str| acl.as_ref().is_none_or(|acl| acl.permits(domain));
+
+        for destination in live
+            .iter()
+            .map(String::as_str)
+            .chain(departing)
+            .filter(|domain| admitted(domain))
+        {
             let stream_write = self.reserve_stream_id();
             let seq = stream_write.id();
             spindle_store::Store::put(
@@ -6048,6 +6061,41 @@ impl Rooms {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(room_id.to_owned(), (root, Arc::clone(&domains)));
         Ok(domains)
+    }
+
+    /// The room's `m.room.server_acl`, from a log the caller holds, or
+    /// `None` when the room has set none (every server admitted).
+    ///
+    /// Takes the log for the same reason as [`Self::destinations_in`]: the
+    /// append path calls it under the room lock.
+    fn server_acl_in(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+    ) -> Result<Option<crate::server_acl::ServerAcl>, RoomError> {
+        let wanted = StateKey::new("m.room.server_acl", "");
+        let Some(event_id) = current_state_id(log, &wanted) else {
+            return Ok(None);
+        };
+        let event = self.read_event(room_id, &EventId::new(event_id))?;
+        Ok(Some(crate::server_acl::ServerAcl::from_content(
+            &event["content"],
+        )))
+    }
+
+    /// Whether the room's `m.room.server_acl` admits `domain`. A room with
+    /// no ACL admits everyone; an unknown room admits nobody, which is the
+    /// answer every read gate already gives a stranger.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room or the ACL event cannot be read.
+    pub fn server_acl_permits(&self, room_id: &str, domain: &str) -> Result<bool, RoomError> {
+        self.with_room_read(room_id, |rooms, log| {
+            Ok(rooms
+                .server_acl_in(log, room_id)?
+                .is_none_or(|acl| acl.permits(domain)))
+        })
     }
 
     /// Whether `user_id` is currently joined to `room_id`, by the

@@ -552,6 +552,13 @@ async fn judge(
         },
         Err(_) => super::room_version_of(state, pdu),
     };
+    if let Err(refusal) = server_acl_admits(state, room_id, origin) {
+        return (
+            pdu_id_or_malformed(&version, pdu),
+            PduOutcome::Refused,
+            Err(refusal),
+        );
+    }
     // The room is known before any key is fetched. Thus a relayed PDU
     // cannot cause key fetches for a room this server does not hold.
     let mut keys = HashMap::new();
@@ -561,18 +568,11 @@ async fn judge(
     let mut event = match verify(&Peers::of(state), room_id, &version, pdu, None, &mut keys).await {
         Ok(event) => event,
         Err(error) => {
-            let id = CanonicalJsonValue::try_from(pdu.clone())
-                .ok()
-                .and_then(|value| {
-                    let CanonicalJsonValue::Object(canonical) = value else {
-                        return None;
-                    };
-                    spindle_core::Pdu::from_remote(version.clone(), canonical)
-                        .ok()
-                        .map(|event| event.event_id().as_str().to_owned())
-                })
-                .unwrap_or_else(|| "$malformed".to_owned());
-            return (id, PduOutcome::Refused, Err(error));
+            return (
+                pdu_id_or_malformed(&version, pdu),
+                PduOutcome::Refused,
+                Err(error),
+            );
         }
     };
     if let Err(error) = state.rooms.authorize_policy(room_id, &mut event.body).await {
@@ -1078,4 +1078,34 @@ pub(super) fn charge(body: &Value, bytes: &mut usize, limit: usize) -> Result<()
 /// A collection's length as a counter increment.
 pub(super) fn count(length: usize) -> u64 {
     u64::try_from(length).unwrap_or(u64::MAX)
+}
+
+/// The event's ID if the body parses as a PDU of `version`, else
+/// `$malformed`: the name a refusal is filed under before verification.
+fn pdu_id_or_malformed(version: &RoomVersionId, pdu: &Value) -> String {
+    CanonicalJsonValue::try_from(pdu.clone())
+        .ok()
+        .and_then(|value| {
+            let CanonicalJsonValue::Object(canonical) = value else {
+                return None;
+            };
+            spindle_core::Pdu::from_remote(version.clone(), canonical)
+                .ok()
+                .map(|event| event.event_id().as_str().to_owned())
+        })
+        .unwrap_or_else(|| "$malformed".to_owned())
+}
+
+/// The room's `m.room.server_acl` judges the origin before a key is
+/// fetched or a signature checked: a denied server gets no work done on
+/// its behalf. A room this server does not hold has no ACL to consult,
+/// and the one event such a room may deliver (`unheld_room_version`) is
+/// about our own user's invite, which no ACL is for. A store error fails
+/// closed.
+fn server_acl_admits(state: &AppState, room_id: &str, origin: &str) -> Result<(), String> {
+    match state.rooms.server_acl_permits(room_id, origin) {
+        Ok(true) | Err(RoomError::UnknownRoom(_)) => Ok(()),
+        Ok(false) => Err(format!("{origin} is denied by the room's server ACL")),
+        Err(error) => Err(format!("the room's server ACL cannot be read: {error}")),
+    }
 }

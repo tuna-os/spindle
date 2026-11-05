@@ -817,6 +817,7 @@ pub(crate) async fn make_join(
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
     let origin = federation_origin(&state, &headers, "GET", &uri, None).await?;
+    require_server_acl(&state, &room_id, &origin)?;
     // A server makes joins for its own users only: a template for someone
     // else's user would be a forgery kit.
     if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin.as_str()) {
@@ -876,6 +877,7 @@ pub(crate) async fn make_leave(
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
     let origin = federation_origin(&state, &headers, "GET", &uri, None).await?;
+    require_server_acl(&state, &room_id, &origin)?;
     // A server makes leaves for its own users only, same as joins: a
     // template for someone else's user would be a forgery kit.
     if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin.as_str()) {
@@ -911,6 +913,7 @@ pub(crate) async fn make_knock(
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
     let origin = federation_origin(&state, &headers, "GET", &uri, None).await?;
+    require_server_acl(&state, &room_id, &origin)?;
     if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin.as_str()) {
         return Err(MatrixError::forbidden(
             "the user does not live on the requesting server",
@@ -946,6 +949,7 @@ pub(crate) async fn send_knock(
     let knock: Value =
         serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
     let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&knock)).await?;
+    require_server_acl(&state, &room_id, &origin)?;
 
     // Same smuggling rule as send_join and send_leave: this door admits
     // exactly one kind of event.
@@ -1072,6 +1076,7 @@ pub(crate) async fn invite(
     let body: Value =
         serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
     let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&body)).await?;
+    require_server_acl(&state, &room_id, &origin)?;
 
     // The version check comes first: an event from a room version this
     // server does not speak cannot be reasoned about, let alone signed.
@@ -1220,11 +1225,13 @@ pub(crate) async fn federation_origin(
         })
 }
 
-/// Authenticate a federation request AND require the origin in the room.
+/// Authenticate a federation request AND require the origin in the room
+/// AND admitted by the room's `m.room.server_acl`.
 ///
-/// The two checks always travel together on room-data reads: an
-/// authenticated stranger is still a stranger, and room state belongs to
-/// the servers in the room.
+/// The checks always travel together on room-data reads: an
+/// authenticated stranger is still a stranger, room state belongs to
+/// the servers in the room, and a server the room has denied is no
+/// longer one of them whatever its members' membership says.
 pub(crate) async fn federation_room_origin(
     state: &AppState,
     headers: &axum::http::HeaderMap,
@@ -1243,7 +1250,26 @@ pub(crate) async fn federation_room_origin(
             "your server has no joined member in that room",
         ));
     }
+    require_server_acl(state, room_id, &origin)?;
     Ok(origin)
+}
+
+/// Refuse `origin` if the room's `m.room.server_acl` denies it. A room
+/// this server does not hold (an invite to a remote room) has no ACL to
+/// consult and passes; a store error fails closed.
+fn require_server_acl(state: &AppState, room_id: &str, origin: &str) -> Result<(), MatrixError> {
+    let admitted = match state.rooms.server_acl_permits(room_id, origin) {
+        Ok(admitted) => admitted,
+        Err(crate::rooms::RoomError::UnknownRoom(_)) => true,
+        Err(error) => return Err(MatrixError::internal(&error.to_string())),
+    };
+    if admitted {
+        Ok(())
+    } else {
+        Err(MatrixError::forbidden(
+            "your server is denied by the room's server ACL",
+        ))
+    }
 }
 
 pub(crate) async fn send_leave_common(
@@ -1263,6 +1289,7 @@ pub(crate) async fn send_leave_common(
     let leave: Value =
         serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
     let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&leave)).await?;
+    require_server_acl(&state, &room_id, &origin)?;
 
     // Shape first, same reasoning as send_join: this door admits exactly
     // one kind of event, and anything else through it is smuggling.
@@ -1315,6 +1342,7 @@ pub(crate) async fn send_join_common(
     let join: Value =
         serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
     let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&join)).await?;
+    require_server_acl(&state, &room_id, &origin)?;
 
     // The shape is checked before the machinery runs: send_join admits one
     // kind of event, and anything else through this door — however well
