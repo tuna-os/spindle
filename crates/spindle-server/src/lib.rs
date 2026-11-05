@@ -59,6 +59,7 @@ pub mod previews;
 pub mod profile_routes;
 pub mod profiles;
 pub mod push;
+pub mod push_routes;
 pub mod push_rules;
 pub mod pushers;
 pub mod ratelimit;
