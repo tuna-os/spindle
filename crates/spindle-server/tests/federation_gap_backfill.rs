@@ -1534,3 +1534,173 @@ async fn a_peer_with_nothing_for_the_frontier_is_not_asked_again() {
     let distinct: HashSet<&String> = backfills.iter().collect();
     assert_eq!(distinct.len(), backfills.len(), "{backfills:?}");
 }
+
+/// The root every backfilled gap event of `room` names, from its row.
+fn gap_roots(store: &FjallStore, room: &str) -> Vec<spindle_core::StateRoot> {
+    let prefix =
+        spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::FederationGapEvent, room);
+    spindle_store::ReadView::scan_prefix(store, &prefix)
+        .unwrap()
+        .into_iter()
+        .map(|(_, value)| spindle_core::StateRoot::from_bytes(value[..32].try_into().unwrap()))
+        .collect()
+}
+
+/// Fork the room at its head: bob renames himself on one branch while
+/// carol joins on the other, so the room's current state is a resolution
+/// that neither branch's entry holds. Returns `(renamed, carol_join)`.
+async fn fork_at_head(harness: &Harness) -> ((String, Value), (String, Value)) {
+    let bob = harness.user("bob");
+    let head = harness.head.clone();
+    let renamed = harness.event(
+        &bob,
+        "m.room.member",
+        Some(&bob),
+        &json!({"membership":"join","displayname":"Bob on one branch"}),
+        head.1["depth"].as_u64().unwrap() + 1,
+        &[harness.edge(&head)],
+        &[
+            &harness.held_state("m.room.create", ""),
+            &harness.held_state("m.room.join_rules", ""),
+            &harness.held_state("m.room.power_levels", ""),
+            &head,
+        ],
+    );
+    let carol_join = harness.carol_joins(&head);
+    for event in [&renamed, &carol_join] {
+        harness.peer.serve(event);
+        let response = harness.push(&[event]).await;
+        assert_eq!(response["pdus"][&event.0], json!({}), "{response}");
+    }
+    (renamed, carol_join)
+}
+
+/// The room's current state as event IDs, and as a snapshot against the
+/// store's table.
+fn current_state(harness: &Harness) -> (Vec<String>, spindle_core::StateSnapshot) {
+    let current = harness.rooms().state(&harness.room).unwrap();
+    let table = spindle_store::ReadView::key_table(harness.store.as_ref());
+    let mut snapshot = spindle_core::StateSnapshot::new(table);
+    let mut ids = Vec::new();
+    for event in &current {
+        let id = event["event_id"].as_str().unwrap();
+        snapshot = snapshot.apply(
+            &spindle_core::StateKey::new(
+                event["type"].as_str().unwrap(),
+                event["state_key"].as_str().unwrap(),
+            ),
+            id,
+        );
+        ids.push(id.to_owned());
+    }
+    (ids, snapshot)
+}
+
+/// A gap filled into a forked room stores every node its state names.
+///
+/// A forked room's current state is the resolution of its tips: computed
+/// in memory, never written. The chunk's nodes used to be written as a
+/// diff against it, so a chunk whose state *is* that resolution wrote no
+/// nodes at all and its rows named a root nothing had stored. Here the
+/// fork is bob renaming himself beside carol's join, the gap is carol's
+/// messages on the resolved state, and `spindle gc` runs between the fork
+/// and the fill. Afterwards every gap event's state reads back from the
+/// store alone, `/context` serves it, and a second collection finds every
+/// node it needs.
+#[tokio::test]
+async fn a_gap_filled_into_a_forked_room_stores_every_node_its_state_names() {
+    use spindle_store::gc::collect_state_nodes;
+
+    let mut harness = Harness::new(Setup {
+        backfill: false,
+        ..Setup::default()
+    })
+    .await;
+    let carol = harness.user("carol");
+    let (renamed, carol_join) = fork_at_head(&harness).await;
+    let mut parent = carol_join.clone();
+    let mut messages = Vec::new();
+    for index in 0..5 {
+        let message = harness.message(&carol, &carol_join, &parent, &format!("gap {index}"));
+        harness.peer.serve(&message);
+        messages.push(message.clone());
+        parent = message;
+    }
+    let latest = harness.message(&carol, &carol_join, &parent, "after the gap");
+    {
+        let mut served = harness.peer.served.lock().unwrap();
+        served.limit_missing = true;
+        served.state_ids = Some(harness.state_ids(&[&carol_join]));
+    }
+    accept_gap(&harness, &latest).await;
+
+    // The precondition: the room's current state is the resolution of the
+    // branches, and no node of it is stored.
+    let (ids, resolved) = current_state(&harness);
+    assert!(
+        ids.contains(&renamed.0) && ids.contains(&carol_join.0),
+        "{ids:?}"
+    );
+    let table = Arc::clone(resolved.table());
+    let store = Arc::clone(&harness.store);
+    let node = |root: &spindle_core::StateRoot| {
+        spindle_store::ReadView::get(
+            store.as_ref(),
+            &spindle_core::keys::content_addressed(
+                spindle_core::keys::Keyspace::StateNode,
+                root.as_bytes(),
+            ),
+        )
+        .unwrap()
+    };
+    assert!(
+        node(&resolved.root()).is_none(),
+        "the fixture needs a current state that is not stored"
+    );
+    harness.peer.served.lock().unwrap().state_ids_at.insert(
+        messages[0].0.clone(),
+        json!({"pdu_ids":ids,"auth_chain_ids":ids}),
+    );
+
+    collect_state_nodes(harness.store.as_ref(), false).unwrap();
+    harness.restart(Setup::default()).await;
+    harness
+        .until(30, "the gap is backfilled", Harness::filled)
+        .await;
+
+    let roots = gap_roots(harness.store.as_ref(), &harness.room);
+    assert_eq!(roots.len(), messages.len(), "every gap event is placed");
+    for root in &roots {
+        assert_eq!(*root, resolved.root(), "the gap sits on the resolved state");
+        spindle_core::StateSnapshot::rehydrate(
+            *root,
+            &mut |address| node(address),
+            Arc::clone(&table),
+        )
+        .expect("the gap event's state reads back from the store");
+    }
+    let report = collect_state_nodes(harness.store.as_ref(), true)
+        .expect("every node a gap row names is stored");
+    assert_eq!(report.swept, 0, "{report:?}");
+
+    let token = harness.login_alice().await;
+    let context = harness
+        .client(
+            "GET",
+            &format!(
+                "/_matrix/client/v3/rooms/{}/context/{}?limit=2",
+                harness.room, messages[2].0
+            ),
+            &token,
+            None,
+        )
+        .await;
+    assert!(
+        context["state"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event_id"] == renamed.0.as_str()),
+        "{context}"
+    );
+}

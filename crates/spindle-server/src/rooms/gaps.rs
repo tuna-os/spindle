@@ -1144,9 +1144,20 @@ impl Rooms {
             let mut rewritten: HashSet<String> = HashSet::new();
             if !chunk.events.is_empty() {
                 let mut state = rooms.gap_state(log, room_id, chunk.state_before, &create_id)?;
-                // Only the nodes the room's current state lacks: the
-                // chunk's state is usually that state less a few changes.
-                for (address, node) in state.delta_nodes(log.current_state()) {
+                // Only the nodes a stored state lacks: the chunk's state is
+                // usually the room's state less a few changes. The base must
+                // be a state whose nodes are on disk, which `current_state()`
+                // is not in a forked room -- there it is the tips'
+                // resolution, computed in memory and never written, so a node
+                // the chunk shared with it was referenced and never stored,
+                // and `spindle gc` sweeps any stray copy that happened to
+                // exist. The newest log entry's state was written with the
+                // entry and stays resident; without it, write the whole trie.
+                let persisted = log
+                    .entries()
+                    .next_back()
+                    .and_then(|head| log.state_after(head.li));
+                for (address, node) in state.delta_nodes(persisted) {
                     writes.push((
                         spindle_core::keys::content_addressed(
                             spindle_core::keys::Keyspace::StateNode,

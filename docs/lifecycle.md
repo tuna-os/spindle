@@ -1,8 +1,8 @@
 # Running a Spindle over time
 
 The commands an operator uses between installing a server and retiring one:
-backing it up, restoring it, checking its media, reclaiming unreachable state,
-and moving its store forward when the on-disk format changes. Part of #20.
+backing it up, restoring it, checking its media, and moving its store forward
+when the on-disk format changes. Part of #20.
 
 Every one of these opens the store directly, and fjall holds an exclusive
 lock, so **they run with the server stopped**. For a restore that is not just
@@ -28,8 +28,8 @@ The archive carries rows, **not media blobs**. Media lives outside the store
 file that inlined a terabyte of media would be a file nobody takes — but it
 means a restore is only half done when the rows are in.
 
-Rows are streamed from the snapshot to the file one at a time, so a backup
-needs memory for one row, not for the store (#743).
+The command writes the rows from the snapshot to the file one at a time. Thus
+a backup needs memory for one row, not for the full store (#743).
 
 ## Restore
 
@@ -65,31 +65,33 @@ calls it, the ID is what you have to look for in your other copy.
 spindle gc <config> [--dry-run]
 ```
 
-Deletes the state-trie nodes no stored record reaches (#742). A room's state
-is a trie of content-addressed nodes shared across its history and across
-rooms, so no node can be deleted on its own say-so; nothing deleted them at
-all, and nodes that stopped being referenced — the intermediate states a
-backfilled gap walks through, the rows an interrupted import leaves, the trie
-of a room whose records were removed — stayed on disk for good.
+This command deletes the state-trie nodes that no stored record reaches
+(#742). The state of a room is a trie of content-addressed nodes. One node
+can occur in the state of many entries and rooms. To find a dead node, the
+command must examine all records. Before this command, nothing deleted
+nodes, and unused nodes stayed on disk. Examples are the intermediate states
+of a backfilled gap, the rows of an interrupted import, and the trie of a
+deleted room.
 
-The command marks every node reachable from a root some record names (log
-entries, sidelined events, backfilled gap events), reading each shared node
-once, and deletes the rest. It prints the root-holding rows, the reachable
-nodes and their bytes, and the nodes swept and theirs. `--dry-run` prints the
-same report and deletes nothing. A second run sweeps nothing.
+The command marks each node that a stored root can reach. Log entries,
+sidelined events and backfilled gap events hold these roots. The command
+reads a shared node only once. Then it deletes all other nodes.
 
-It **refuses rather than guesses**: a reachable node that is missing or does
-not hash to its address, or a record whose root cannot be read, stops it
-before anything is deleted. A sweep from an incomplete mark would delete live
-state.
+The command prints the number of rows that hold roots, the reachable nodes
+and their bytes, and the deleted nodes and their bytes. `--dry-run` prints
+the same report and deletes nothing. A second run deletes nothing.
 
-**Offline only**, and not offered as a background task. A node's key is its
-content, so a server re-deriving a node the sweep has judged dead writes the
-same key the sweep is about to delete, and nothing tells the two apart: a
-sweep racing an append can delete a node that append made live again.
-Snapshots do not help, because the race is on a row the snapshot already
-held. Take a backup first if you want a way back; the sweep only deletes
-rows nothing reads, but it is still a delete.
+**It does not guess.** It stops before any delete if a reachable node is
+missing or has the wrong hash. It also stops if it cannot read the root of a
+record. A sweep from an incomplete mark deletes live state.
+
+**Offline only**, and not available as a background task. The key of a node
+is its content. When a server makes a node again, it writes the same key
+that the sweep can delete. The two writes look the same.
+
+Thus a sweep that runs during an append can delete a node that the append
+needs. A snapshot does not help, because the snapshot already holds that
+row. Make a backup first if you want a way back.
 
 ## Importing password hashes
 
