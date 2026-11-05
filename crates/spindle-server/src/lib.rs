@@ -34,6 +34,7 @@ pub mod e2ee_federation;
 pub mod email;
 pub mod errors;
 pub mod federation;
+pub mod federation_routes;
 pub mod filters;
 #[cfg(feature = "hub-mode")]
 pub mod hub;
