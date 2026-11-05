@@ -42,6 +42,8 @@ pub struct Config {
     #[serde(default)]
     pub push: PushConfig,
     #[serde(default)]
+    pub presence: PresenceConfig,
+    #[serde(default)]
     pub registration: RegistrationConfig,
     #[serde(default)]
     pub rooms: RoomsConfig,
@@ -269,6 +271,29 @@ impl Default for PushConfig {
             enabled: true,
             allow_internal: Vec::new(),
         }
+    }
+}
+
+/// Presence (#745): whether this server tracks who is online, tells
+/// clients in `/sync`, and trades `m.presence` with its peers.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PresenceConfig {
+    /// On by default, as Synapse's `presence.enabled` is: clients render
+    /// an online indicator and expect it to move. Off is for a server
+    /// whose federation traffic matters more than that indicator --
+    /// presence is the largest EDU volume on the network. Off, `PUT
+    /// /presence` is still answered (the spec gives a client no way to
+    /// learn presence is off, so refusing would only break it) but
+    /// nothing is stored, `/sync` carries no `presence` section, and no
+    /// `m.presence` EDU is sent or applied.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for PresenceConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 

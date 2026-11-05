@@ -453,6 +453,15 @@ pub enum Keyspace {
     /// neither; deleted once the gateway answers or the notification is
     /// given up on.
     PushPending = 0x5c,
+    /// `(position, user_id)` -> nothing: the stream position at which a
+    /// user's presence last visibly changed (#745).
+    ///
+    /// Position first, so an incremental `/sync` reads "whose presence
+    /// changed since my token" as one range rather than a scan of every
+    /// user who ever set one. At most one live row per user: the
+    /// [`Self::Presence`] row names its current position, and a row whose
+    /// position disagrees is a superseded one a reader skips.
+    PresenceStream = 0x5f,
     /// `(room_id, position)` -> one event of a filled federation gap: its
     /// ID and the root of the state after it. History backfilled into the
     /// *middle* of a room's timeline -- between the head this server held
@@ -1748,4 +1757,50 @@ pub fn delay_echo(user_id: &str, event_id: &str) -> Vec<u8> {
 #[must_use]
 pub fn presence(user_id: &str) -> Vec<u8> {
     user_prefix(Keyspace::Presence, user_id)
+}
+
+/// Every presence row, for the one scan that seeds the sweeper.
+#[must_use]
+pub fn presence_prefix() -> Vec<u8> {
+    keyspace_prefix(Keyspace::Presence)
+}
+
+/// The user a [`presence`] key names.
+#[must_use]
+pub fn presence_user(key: &[u8]) -> Option<String> {
+    let rest = key.strip_prefix(presence_prefix().as_slice())?;
+    let len = usize::from(u16::from_be_bytes(rest.get(..2)?.try_into().ok()?));
+    String::from_utf8(rest.get(2..2 + len)?.to_vec()).ok()
+}
+
+/// One [`Keyspace::PresenceStream`] row: the position, then the user.
+#[must_use]
+pub fn presence_stream(position: u64, user_id: &str) -> Vec<u8> {
+    let mut key = presence_stream_at(position);
+    key.extend_from_slice(user_id.as_bytes());
+    key
+}
+
+/// Every [`Keyspace::PresenceStream`] row.
+#[must_use]
+pub fn presence_stream_prefix() -> Vec<u8> {
+    keyspace_prefix(Keyspace::PresenceStream)
+}
+
+/// Where the rows at `position` begin: a range bound for
+/// [`presence_stream`] scans, inclusive as a start, exclusive as an end.
+#[must_use]
+pub fn presence_stream_at(position: u64) -> Vec<u8> {
+    let mut key = presence_stream_prefix();
+    key.extend_from_slice(&position.to_be_bytes());
+    key
+}
+
+/// Read a [`presence_stream`] key back: `(position, user_id)`.
+#[must_use]
+pub fn presence_stream_parts(key: &[u8]) -> Option<(u64, String)> {
+    let rest = key.strip_prefix(presence_stream_prefix().as_slice())?;
+    let position: [u8; 8] = rest.get(..8)?.try_into().ok()?;
+    let user = String::from_utf8(rest.get(8..)?.to_vec()).ok()?;
+    Some((u64::from_be_bytes(position), user))
 }

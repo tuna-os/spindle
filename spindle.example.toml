@@ -101,6 +101,16 @@ allow_private = []
 # display_name = "Server Notices"
 # room_name = "Server Notices"
 
+[presence]
+# Track who is online: `PUT /presence`, a client's `/sync` (online unless
+# it says otherwise), idle after five minutes, offline thirty seconds after
+# its last sync -- Synapse's timings. Changes reach room-mates' `/sync` and,
+# as `m.presence` EDUs, every server sharing a room with the user. Off,
+# `PUT /presence` is answered and ignored, `/sync` has no `presence`
+# section, and no `m.presence` is sent or applied: presence is the largest
+# EDU volume on the network, and some operators would rather not carry it.
+enabled = true
+
 [push]
 # Deliver notifications to the push gateways clients register (`POST
 # /pushers/set`). Off keeps the registrations and sends nothing.

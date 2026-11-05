@@ -19,15 +19,7 @@
 //! [`crate::federation::Federation::queue_receipt`]. Private receipts and
 //! `m.fully_read` stay home.
 //!
-//! **Presence is not federated** (#624 asked whether it was cheap): this
-//! server has no `/sync` presence block for an inbound `m.presence` to land
-//! in -- a peer's update would be readable only by polling
-//! `GET /presence/{user}/status` -- and the outbound half is a fan-out of
-//! every local user's every state change to every server they share a room
-//! with, which is the load other homeservers ship presence switched off to
-//! avoid. Inbound `m.presence` is counted as `unsupported` in
-//! `spindle_federation_edus_received_total` so its volume is visible before
-//! anyone builds it.
+//! **Presence** rides the same envelope rule and lives in `presence`.
 
 use serde_json::Value;
 

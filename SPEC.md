@@ -690,7 +690,7 @@ linear log underneath.
 | Events | `/send`, `/state`, `/event`, `/context`, `/messages`, `/relations`, `/redact` | §10.4–10.5 |
 | Threads | `/relations/{id}/m.thread`, `m.thread` aggregation, `/threads` (MSC3856) | Server-side aggregation from the `relations` index |
 | Receipts | `/receipt`, `/read_markers`, `m.fully_read` | Ephemeral stream |
-| Typing / presence | `/typing`, `/presence` | Presence off by default (§18.4) |
+| Typing / presence | `/typing`, `/presence` | Presence switchable, on by default (§18.4) |
 | E2EE | `/keys/upload`, `/keys/query`, `/keys/claim`, `/keys/changes`, `/sendToDevice`, `/room_keys/*`, cross-signing, key backup, dehydrated devices | Server is a transport; §16 |
 | Media | `/_matrix/client/v1/media/*` (authenticated media, Matrix 1.11) with legacy `/_matrix/media/v3` for compatibility | §17.3 |
 | Spaces | `/hierarchy`, `m.space.child`, `m.space.parent` | Hierarchy walked from the `relations` and state indexes |
@@ -1528,10 +1528,17 @@ measurements. They exist so the design can be falsified.
 ### 18.4 Presence
 
 Presence is the single largest source of federation traffic in the Matrix
-network and delivers little. It is **off by default**, configurable, and when
-enabled is rate-limited and coalesced per destination. This is a policy choice,
-stated explicitly because it materially affects the numbers above and because
-operators deserve to know it was deliberate.
+network and delivers little. It is switchable (`[presence] enabled`), and on
+by default because clients render an online indicator and Synapse ships it
+on; an operator who would rather not carry the traffic turns it off, and the
+server then answers `PUT /presence` without storing it, sends no `presence`
+section in `/sync`, and neither sends nor applies `m.presence`. When on, a
+change is announced only to servers sharing a room with the user, a sync's
+activity rewrites the row at most once a minute, and only visible changes
+(state, message, currently-active) take a stream position or an EDU. The
+EDUs ride the ephemeral queue one per change; they are not yet coalesced per
+destination, which is the next step if the volume measured by
+`spindle_federation_edus_sent_total{edu_type="m.presence"}` calls for it.
 
 ---
 

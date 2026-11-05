@@ -43,9 +43,16 @@ async fn put_presence(
             request.presence
         ))
     })?;
+    // Peers sharing a room with the caller hear about it as an `m.presence`
+    // EDU on the next transaction out, as typing does.
     state
         .presence
-        .set(&identity.user_id, presence, request.status_msg.as_deref())
+        .set(
+            crate::presence::Peers::of(&state),
+            &identity.user_id,
+            presence,
+            request.status_msg.as_deref(),
+        )
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
     Ok(Json(json!({})))
 }
@@ -71,15 +78,7 @@ async fn get_presence(
         .presence
         .get(&user_id)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    let mut body = json!({
-        "presence": status.state.as_str(),
-        "last_active_ago": status.last_active_ago,
-        "currently_active": status.currently_active,
-    });
-    if let Some(message) = status.status_msg {
-        body["status_msg"] = Value::String(message);
-    }
-    Ok(Json(body))
+    Ok(Json(status.content()))
 }
 
 /// Whether two users are in a room together.
