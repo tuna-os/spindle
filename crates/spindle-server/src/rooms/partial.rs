@@ -297,7 +297,7 @@ impl Rooms {
             let mut load = |root: &StateRoot| self.load_node(root);
             let filled = log
                 .fill_partial_state(join_li, &fill, &mut load)
-                .map_err(|error| self.append_error(&error))?;
+                .map_err(|error| Self::append_error(&error))?;
             let stream_write = self.reserve_stream_id();
             let resynced = (
                 spindle_core::keys::partial_state_resynced(room_id),
