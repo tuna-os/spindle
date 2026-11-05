@@ -1,0 +1,81 @@
+{
+  "benchmarks": {
+    "federated_join/1000": {
+      "join_returned_ns": 50802703.0,
+      "joined_members": 1002,
+      "lower_ns": 177681413.0,
+      "mean_ns": 177681413.0,
+      "samples": 1,
+      "upper_ns": 177681413.0
+    },
+    "federated_join/10000": {
+      "join_returned_ns": 26689958.0,
+      "joined_members": 10002,
+      "lower_ns": 1681532302.0,
+      "mean_ns": 1681532302.0,
+      "samples": 1,
+      "upper_ns": 1681532302.0
+    },
+    "partition_catchup/200": {
+      "events_per_second": 579.9825196731153,
+      "heal_to_served_ns": 1385617448.0,
+      "lower_ns": 346562169.0,
+      "mean_ns": 346562169.0,
+      "resident_retry_ns": 1039055279.0,
+      "samples": 1,
+      "upper_ns": 346562169.0
+    },
+    "send_throughput/2": {
+      "clients": 2,
+      "latency_lower_ns": 772037.0,
+      "latency_median_ns": 1225907.0,
+      "latency_p99_ns": 2043449.0,
+      "latency_samples": 96,
+      "lower_ns": 642513.65625,
+      "mean_ns": 642513.65625,
+      "room_events": 200,
+      "samples": 1,
+      "sends_per_second": 1556.3871526660644,
+      "upper_ns": 642513.65625
+    },
+    "send_throughput/4": {
+      "clients": 4,
+      "latency_lower_ns": 739285.0,
+      "latency_median_ns": 1892173.5,
+      "latency_p99_ns": 3526708.0,
+      "latency_samples": 96,
+      "lower_ns": 509220.3229166667,
+      "mean_ns": 509220.3229166667,
+      "room_events": 200,
+      "samples": 1,
+      "sends_per_second": 1963.7865085043923,
+      "upper_ns": 509220.3229166667
+    },
+    "send_throughput/8": {
+      "clients": 8,
+      "latency_lower_ns": 1062650.0,
+      "latency_median_ns": 3639536.0,
+      "latency_p99_ns": 7138168.0,
+      "latency_samples": 96,
+      "lower_ns": 521573.1666666667,
+      "mean_ns": 521573.1666666667,
+      "room_events": 200,
+      "samples": 1,
+      "sends_per_second": 1917.2765470105026,
+      "upper_ns": 521573.1666666667
+    }
+  },
+  "clients": [
+    2,
+    4,
+    8
+  ],
+  "dimension": "targeted",
+  "members": [
+    1000,
+    10000
+  ],
+  "missed": 200,
+  "round": 5,
+  "server": "spindle"
+}
