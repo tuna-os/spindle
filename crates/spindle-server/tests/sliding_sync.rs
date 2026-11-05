@@ -1,9 +1,10 @@
-//! Simplified Sliding Sync (MSC4186), statelessly.
+//! Simplified Sliding Sync (MSC4186).
 //!
 //! The property under test is the windowing: a client with many rooms asks
 //! for the visible slice of a sorted list, and gets those rooms and no
 //! others — sorted by activity, newest first, because that is the order a
-//! room list renders in.
+//! room list renders in. And the connection: what a `pos` remembers of the
+//! parameters it was asked with and of the rooms it already sent.
 
 use std::sync::Arc;
 
@@ -150,16 +151,75 @@ impl Harness {
     }
 
     async fn sliding(&self, token: &str, pos: Option<&str>, body: &Value) -> Value {
+        let (status, response) = self.sliding_status(token, pos, body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        response
+    }
+
+    async fn sliding_status(
+        &self,
+        token: &str,
+        pos: Option<&str>,
+        body: &Value,
+    ) -> (StatusCode, Value) {
         let path = match pos {
             Some(pos) => {
                 format!("/_matrix/client/unstable/org.matrix.simplified_msc3575/sync?pos={pos}")
             }
             None => "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync".to_owned(),
         };
-        let (status, response) = self.request("POST", &path, token, body).await;
-        assert_eq!(status, StatusCode::OK, "{response}");
-        response
+        self.request("POST", &path, token, body).await
     }
+
+    /// A second device of an existing account.
+    async fn login(&self, username: &str) -> String {
+        let (status, body) = self
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_matrix/client/v3/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "type": "m.login.password",
+                            "identifier": { "type": "m.id.user", "user": username },
+                            "password": "hunter2",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["access_token"].as_str().unwrap().to_owned()
+    }
+}
+
+fn pos(response: &Value) -> String {
+    response["pos"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a pos: {response}"))
+        .to_owned()
+}
+
+fn state_types(entry: &Value) -> Vec<String> {
+    let mut types: Vec<String> = entry["required_state"]
+        .as_array()
+        .unwrap_or_else(|| panic!("required_state: {entry}"))
+        .iter()
+        .map(|event| event["type"].as_str().unwrap().to_owned())
+        .collect();
+    types.sort();
+    types
+}
+
+fn bodies(entry: &Value) -> Vec<String> {
+    entry["timeline"]
+        .as_array()
+        .unwrap_or_else(|| panic!("timeline: {entry}"))
+        .iter()
+        .filter_map(|event| event["content"]["body"].as_str().map(str::to_owned))
+        .collect()
 }
 
 async fn joined_count(harness: &Harness, token: &str, room: &str) -> u64 {
@@ -454,26 +514,296 @@ async fn a_growing_window_sends_quiet_rooms_that_enter_it() {
     );
 }
 
-/// A `pos` minted before windows were recorded heals the client: every room
-/// in view is re-sent once.
+/// A `pos` names a position of one connection of one device. One the server
+/// does not hold -- from before connections, made up, issued to another
+/// connection or device, or retired -- is MSC4186's `M_UNKNOWN_POS`, which
+/// a client answers by starting over; anything else it retries forever.
 #[tokio::test]
-async fn a_pos_without_windows_resends_the_rooms_in_view() {
+async fn a_pos_the_server_does_not_hold_is_unknown() {
     let harness = Harness::new();
     let alice = harness.register("alice").await;
-    let room = harness.named_room(&alice, "only").await;
+    let laptop = harness.login("alice").await;
+    harness.named_room(&alice, "only").await;
 
     let first = harness.sliding(&alice, None, &window()).await;
-    let pos = first["pos"].as_str().unwrap();
-    let legacy = pos
-        .split_once('.')
-        .map_or(pos, |(stream, _)| stream)
-        .to_owned();
+    let held = pos(&first);
+    let mut elsewhere = window();
+    elsewhere["conn_id"] = json!("encryption");
 
-    let second = harness.sliding(&alice, Some(&legacy), &window()).await;
-    assert!(
-        second["rooms"].as_object().unwrap().contains_key(&room),
-        "an old pos re-sends the window: {second}"
+    let stream = held.split_once('.').unwrap().0.to_owned();
+    let cases = [
+        (
+            &alice,
+            stream.clone(),
+            window(),
+            "a pos from before connections",
+        ),
+        (
+            &alice,
+            format!("{stream}.7b7d"),
+            window(),
+            "a pos carrying windows",
+        ),
+        (&alice, "nonsense".to_owned(), window(), "garbage"),
+        (&alice, held.clone(), elsewhere, "another connection's pos"),
+        (&laptop, held.clone(), window(), "another device's pos"),
+    ];
+    for (token, pos, body, case) in cases {
+        let (status, response) = harness.sliding_status(token, Some(&pos), &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {response}");
+        assert_eq!(response["errcode"], "M_UNKNOWN_POS", "{case}: {response}");
+    }
+
+    // The pos it was issued still works, and using the one after it retires
+    // it: the client has moved on, so an old pos is a client gone wrong.
+    let second = harness.sliding(&alice, Some(&held), &window()).await;
+    harness
+        .sliding(&alice, Some(&pos(&second)), &window())
+        .await;
+    let (status, response) = harness.sliding_status(&alice, Some(&held), &window()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert_eq!(response["errcode"], "M_UNKNOWN_POS", "{response}");
+}
+
+/// Sticky parameters: a request that leaves its lists out runs with the
+/// connection's previous ones, and a list named with one field keeps the
+/// others.
+#[tokio::test]
+async fn a_request_without_lists_keeps_the_previous_lists() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let quiet = harness.named_room(&alice, "quiet").await;
+    let loud = harness.named_room(&alice, "loud").await;
+    let third = harness.named_room(&alice, "third").await;
+    harness.say(&third, &alice, "bump", "t0").await;
+    harness.say(&loud, &alice, "bump", "t1").await;
+
+    let first = harness.sliding(&alice, None, &window()).await;
+    assert!(!first["rooms"].as_object().unwrap().contains_key(&quiet));
+
+    harness.say(&loud, &alice, "again", "t2").await;
+    let second = harness
+        .sliding(&alice, Some(&pos(&first)), &json!({}))
+        .await;
+    assert_eq!(
+        second["lists"]["main"]["count"],
+        json!(3),
+        "the list stands: {second}"
     );
+    assert_eq!(
+        bodies(&second["rooms"][&loud]),
+        vec!["again"],
+        "and its window is answered: {second}"
+    );
+
+    // Only the ranges sent: the quiet room enters with the list's
+    // required_state and timeline limit from the first request.
+    let wider = json!({ "lists": { "main": { "ranges": [[0, 9]] } } });
+    let widened = harness.sliding(&alice, Some(&pos(&second)), &wider).await;
+    let entry = &widened["rooms"][&quiet];
+    assert_eq!(entry["initial"], json!(true), "{widened}");
+    assert_eq!(state_types(entry), vec!["m.room.name"], "{widened}");
+    assert_eq!(entry["timeline"].as_array().unwrap().len(), 3, "{widened}");
+}
+
+/// A room the connection already sent is sent again as what changed: the
+/// new events, the state that changed, `initial: false` -- not the room in
+/// full every time it moves.
+#[tokio::test]
+async fn a_room_already_sent_is_sent_as_what_changed() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.named_room(&alice, "before").await;
+    harness.say(&room, &alice, "one", "t1").await;
+    harness.say(&room, &alice, "two", "t2").await;
+
+    let first = harness.sliding(&alice, None, &window()).await;
+    let entry = &first["rooms"][&room];
+    assert_eq!(entry["initial"], json!(true), "{first}");
+    assert_eq!(state_types(entry), vec!["m.room.name"], "{first}");
+
+    // Nothing changed: nothing sent, not the room in full again.
+    let quiet = harness.sliding(&alice, Some(&pos(&first)), &window()).await;
+    assert!(quiet["rooms"].as_object().unwrap().is_empty(), "{quiet}");
+
+    harness.say(&room, &alice, "three", "t3").await;
+    let second = harness.sliding(&alice, Some(&pos(&quiet)), &window()).await;
+    let entry = &second["rooms"][&room];
+    assert_eq!(entry["initial"], json!(false), "{second}");
+    assert_eq!(
+        bodies(entry),
+        vec!["three"],
+        "only the new event, though the limit is 3: {second}"
+    );
+    assert_eq!(entry["limited"], json!(false), "{second}");
+    assert!(
+        state_types(entry).is_empty(),
+        "the name did not change, so it is not resent: {second}"
+    );
+
+    // A rename is state that changed.
+    let (status, body) = harness
+        .request(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.name"),
+            &alice,
+            &json!({ "name": "after" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let third = harness
+        .sliding(&alice, Some(&pos(&second)), &window())
+        .await;
+    let entry = &third["rooms"][&room];
+    assert_eq!(entry["initial"], json!(false), "{third}");
+    assert_eq!(
+        entry["required_state"][0]["content"]["name"], "after",
+        "{third}"
+    );
+    assert_eq!(entry["name"], "after", "{third}");
+}
+
+/// A room out of view while it changed is caught up from where the client
+/// left it when it comes back, not from the previous request.
+#[tokio::test]
+async fn a_room_back_in_view_is_caught_up_from_where_the_client_left_it() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.named_room(&alice, "roamer").await;
+    harness.say(&room, &alice, "seen", "t1").await;
+
+    let first = harness.sliding(&alice, None, &window()).await;
+    assert_eq!(first["rooms"][&room]["initial"], json!(true), "{first}");
+
+    // Out of view (an empty list) while it says something.
+    let empty = json!({ "lists": { "main": { "ranges": [] } } });
+    let away = harness.sliding(&alice, Some(&pos(&first)), &empty).await;
+    harness.say(&room, &alice, "missed", "t2").await;
+    let still_away = harness.sliding(&alice, Some(&pos(&away)), &empty).await;
+    assert!(still_away["rooms"].as_object().unwrap().is_empty());
+
+    let back = harness
+        .sliding(&alice, Some(&pos(&still_away)), &window())
+        .await;
+    let entry = &back["rooms"][&room];
+    assert_eq!(entry["initial"], json!(false), "{back}");
+    assert_eq!(bodies(entry), vec!["missed"], "{back}");
+}
+
+/// A client that asks for more state of a room it holds is sent the state
+/// it did not have, without waiting for the room to change, and not the
+/// state it had.
+#[tokio::test]
+async fn widened_required_state_sends_the_newly_asked_state() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.named_room(&alice, "deep").await;
+
+    let first = harness.sliding(&alice, None, &window()).await;
+    assert_eq!(state_types(&first["rooms"][&room]), vec!["m.room.name"]);
+
+    let mut wider = window();
+    wider["lists"]["main"]["required_state"] = json!([["m.room.name", ""], ["m.room.create", ""]]);
+    let second = harness.sliding(&alice, Some(&pos(&first)), &wider).await;
+    let entry = &second["rooms"][&room];
+    assert_eq!(entry["initial"], json!(false), "{second}");
+    assert_eq!(
+        state_types(entry),
+        vec!["m.room.create"],
+        "the new key only: {second}"
+    );
+    assert!(bodies(entry).is_empty(), "nothing new to say: {second}");
+
+    // Asked again at the same width, nothing.
+    let third = harness.sliding(&alice, Some(&pos(&second)), &wider).await;
+    assert!(third["rooms"].as_object().unwrap().is_empty(), "{third}");
+}
+
+/// A timeline limit that grows sends the newest events up to it at once,
+/// already-sent ones included, and says so (MSC4186 `expanded_timeline`).
+#[tokio::test]
+async fn a_longer_timeline_limit_expands_the_timeline() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.named_room(&alice, "long").await;
+    for (index, text) in ["one", "two", "three"].iter().enumerate() {
+        harness.say(&room, &alice, text, &format!("t{index}")).await;
+    }
+    let mut short = window();
+    short["lists"]["main"]["timeline_limit"] = json!(1);
+    let first = harness.sliding(&alice, None, &short).await;
+    assert_eq!(bodies(&first["rooms"][&room]), vec!["three"]);
+
+    let second = harness.sliding(&alice, Some(&pos(&first)), &window()).await;
+    let entry = &second["rooms"][&room];
+    assert_eq!(bodies(entry), vec!["one", "two", "three"], "{second}");
+    assert_eq!(entry["unstable_expanded_timeline"], json!(true), "{second}");
+    assert_eq!(entry["initial"], json!(false), "{second}");
+}
+
+/// Two connections of one device are two connections: each keeps its own
+/// parameters and its own record of what it sent, and neither's pos is the
+/// other's.
+#[tokio::test]
+async fn connections_of_one_device_are_independent() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.named_room(&alice, "shared").await;
+
+    let mut rooms = window();
+    rooms["conn_id"] = json!("room-list");
+    let keys = json!({
+        "conn_id": "encryption",
+        "extensions": { "e2ee": { "enabled": true } },
+    });
+    let list = harness.sliding(&alice, None, &rooms).await;
+    let encryption = harness.sliding(&alice, None, &keys).await;
+    assert!(encryption["rooms"].as_object().unwrap().is_empty());
+
+    // The room-list connection moves on; the encryption one is untouched.
+    harness.say(&room, &alice, "news", "t1").await;
+    let list_next = harness
+        .sliding(
+            &alice,
+            Some(&pos(&list)),
+            &json!({ "conn_id": "room-list" }),
+        )
+        .await;
+    assert_eq!(
+        bodies(&list_next["rooms"][&room]),
+        vec!["news"],
+        "{list_next}"
+    );
+    let keys_again = json!({ "conn_id": "encryption" });
+    let encryption_next = harness
+        .sliding(&alice, Some(&pos(&encryption)), &keys_again)
+        .await;
+    assert!(
+        encryption_next["rooms"].as_object().unwrap().is_empty(),
+        "the encryption connection never had lists: {encryption_next}"
+    );
+    assert!(
+        encryption_next["extensions"]["e2ee"].is_object(),
+        "and keeps its own extensions: {encryption_next}"
+    );
+
+    // Starting one over does not start the other over.
+    let restarted = harness.sliding(&alice, None, &rooms).await;
+    assert_eq!(restarted["rooms"][&room]["initial"], json!(true));
+    let (status, response) = harness
+        .sliding_status(&alice, Some(&pos(&encryption_next)), &keys_again)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+}
+
+#[tokio::test]
+async fn the_txn_id_is_echoed() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let mut body = window();
+    body["txn_id"] = json!("abc123");
+    let response = harness.sliding(&alice, None, &body).await;
+    assert_eq!(response["txn_id"], json!("abc123"), "{response}");
 }
 
 #[tokio::test]
@@ -904,6 +1234,108 @@ async fn the_typing_extension_says_who_is_typing() {
         response["extensions"]["typing"]["rooms"][&room].is_null(),
         "{response}"
     );
+}
+
+/// An extension's `lists` and `rooms` say which rooms it speaks about: the
+/// windows of the lists it names and the subscriptions it names, `*` for
+/// all of them. And the scoping is sticky with the rest of the extension's
+/// config.
+#[tokio::test]
+async fn an_extension_speaks_only_about_the_lists_and_rooms_it_names() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let one = harness.named_room(&alice, "one").await;
+    let two = harness.named_room(&alice, "two").await;
+    for room in [&one, &two] {
+        harness.invite(room, &alice, "bob").await;
+        harness.join(room, &bob).await;
+    }
+    // `one` spoke last, so it is index 0 and `two` index 1.
+    let mut said = Vec::new();
+    for (room, txn) in [(&two, "t2"), (&one, "t1")] {
+        // Recency is a timestamp: a millisecond apart, or a tie sorts by id.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let (status, sent) = harness
+            .request(
+                "PUT",
+                &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/{txn}"),
+                &alice,
+                &json!({ "msgtype": "m.text", "body": txn }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{sent}");
+        said.push((room.clone(), sent["event_id"].as_str().unwrap().to_owned()));
+    }
+    for (room, event_id) in &said {
+        for (method, path, body) in [
+            (
+                "POST",
+                format!("/_matrix/client/v3/rooms/{room}/receipt/m.read/{event_id}"),
+                json!({}),
+            ),
+            (
+                "PUT",
+                format!("/_matrix/client/v3/user/@bob:example.org/rooms/{room}/account_data/m.tag"),
+                json!({ "tags": { "m.favourite": {} } }),
+            ),
+            (
+                "PUT",
+                format!("/_matrix/client/v3/rooms/{room}/typing/@alice:example.org"),
+                json!({ "typing": true, "timeout": 30_000 }),
+            ),
+        ] {
+            let token = if path.contains("typing") {
+                &alice
+            } else {
+                &bob
+            };
+            let (status, response) = harness.request(method, &path, token, &body).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {response}");
+        }
+    }
+
+    let body = json!({
+        "lists": {
+            "first": { "ranges": [[0, 0]], "timeline_limit": 1 },
+            "second": { "ranges": [[1, 1]], "timeline_limit": 1 },
+        },
+        "room_subscriptions": { &two: { "timeline_limit": 1 } },
+        "extensions": {
+            "typing": { "enabled": true, "lists": ["first"], "rooms": [] },
+            "receipts": { "enabled": true, "lists": ["second"], "rooms": [] },
+            "account_data": { "enabled": true, "lists": [], "rooms": ["*"] },
+        },
+    });
+    let keys = |response: &Value, extension: &str| -> Vec<String> {
+        response["extensions"][extension]["rooms"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{extension}: {response}"))
+            .keys()
+            .cloned()
+            .collect()
+    };
+    let response = harness.sliding(&bob, None, &body).await;
+    assert_eq!(
+        response["rooms"].as_object().unwrap().len(),
+        2,
+        "{response}"
+    );
+    assert_eq!(keys(&response, "typing"), vec![one.clone()], "{response}");
+    assert_eq!(keys(&response, "receipts"), vec![two.clone()], "{response}");
+    assert_eq!(
+        keys(&response, "account_data"),
+        vec![two.clone()],
+        "only the subscription: {response}"
+    );
+
+    // A request that restates nothing keeps the scopes: typing, which is
+    // repeated every time, is still about the first list alone.
+    let next = harness
+        .sliding(&bob, Some(&pos(&response)), &json!({}))
+        .await;
+    assert_eq!(keys(&next, "typing"), vec![one.clone()], "{next}");
+    assert_eq!(keys(&next, "account_data"), vec![two.clone()], "{next}");
 }
 
 #[tokio::test]
