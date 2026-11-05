@@ -443,6 +443,41 @@ impl Presence {
         Ok(Some(guard))
     }
 
+    /// Of `users`, those not offline, and what their presence is now.
+    ///
+    /// Asked of the in-memory set of users not offline before any row is
+    /// read, so an initial sync in a large room reads the users who are
+    /// around rather than one row per member (`tests/read_budget.rs`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if a row cannot be read.
+    pub fn not_offline(
+        &self,
+        users: impl IntoIterator<Item = String>,
+    ) -> Result<Vec<(String, Status)>, StoreError> {
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        let around: Vec<String> = {
+            let live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+            users
+                .into_iter()
+                .filter(|user| live.contains(user))
+                .collect()
+        };
+        let now = now_ms();
+        let mut out = Vec::with_capacity(around.len());
+        for user_id in around {
+            if let Some(row) = self.read_row(&user_id)?
+                && row.state() != State::Offline
+            {
+                out.push((user_id, row.status(now)));
+            }
+        }
+        Ok(out)
+    }
+
     /// Whose presence visibly changed at a position in `(since, until]`,
     /// and what it is now.
     ///

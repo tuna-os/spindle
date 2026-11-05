@@ -8166,11 +8166,12 @@ fn sync_presence(
     let mut events = Vec::new();
     match since {
         None => {
-            for user_id in everyone_sharing_a_room(state, identity)? {
-                let status = state.presence.get(&user_id).map_err(store_error)?;
-                if status.state != crate::presence::State::Offline {
-                    events.push(status.event(&user_id));
-                }
+            let around = state
+                .presence
+                .not_offline(everyone_sharing_a_room(state, identity)?)
+                .map_err(store_error)?;
+            for (user_id, status) in around {
+                events.push(status.event(&user_id));
             }
         }
         Some(since) => {
