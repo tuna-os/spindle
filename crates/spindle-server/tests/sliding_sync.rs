@@ -1637,3 +1637,53 @@ async fn a_long_poll_answers_news_in_a_room_in_view() {
         "{response}"
     );
 }
+
+/// A connection with no lists or rooms, only the E2EE and to-device
+/// extensions -- matrix-rust-sdk's encryption connection -- still answers
+/// an event in one of its user's rooms once the device holds keys, as
+/// Synapse does. The client uploads the room key of its own message to
+/// the backup after processing such an answer; without it the key never
+/// reached the backup, and a second device recovering from the backup
+/// could not decrypt the message.
+#[tokio::test]
+async fn an_encryption_connection_answers_its_users_room_events() {
+    let harness = Arc::new(Harness::new());
+    let alice = harness.register("alice").await;
+    let room = harness.named_room(&alice, "Hers").await;
+    let (status, body) = harness
+        .request(
+            "POST",
+            "/_matrix/client/v3/keys/upload",
+            &alice,
+            &json!({ "one_time_keys": { "signed_curve25519:AAAAAQ": { "key": "one" } } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let encryption = json!({
+        "extensions": { "e2ee": { "enabled": true }, "to_device": { "enabled": true } },
+    });
+    let first = harness.sliding(&alice, None, &encryption).await;
+    let since = pos(&first);
+    let mut poll = encryption;
+    poll["timeout"] = json!(30_000);
+    poll["extensions"]["to_device"]["since"] =
+        first["extensions"]["to_device"]["next_batch"].clone();
+
+    let waiting = {
+        let harness = Arc::clone(&harness);
+        let alice = alice.clone();
+        tokio::spawn(async move { harness.sliding(&alice, Some(&since), &poll).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    harness.say(&room, &alice, "her own message", "t1").await;
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("the encryption connection slept through its user's own message")
+        .unwrap();
+    assert_eq!(
+        response["extensions"]["e2ee"]["device_one_time_keys_count"]["signed_curve25519"], 1,
+        "{response}"
+    );
+}

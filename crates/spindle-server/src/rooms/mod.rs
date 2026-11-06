@@ -5077,6 +5077,27 @@ impl Rooms {
         Ok(changed)
     }
 
+    /// Whether any of `rooms` had an event in `(since, until]`:
+    /// [`Self::changed_rooms`] for a caller that needs only the answer, so
+    /// it stops at the first room that did.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the index cannot be read.
+    pub fn any_changed<'a>(
+        &self,
+        rooms: impl IntoIterator<Item = &'a str>,
+        since: u64,
+        until: u64,
+    ) -> Result<bool, RoomError> {
+        for room_id in rooms {
+            if !self.room_slice(room_id, since, until)?.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The newest `limit` timeline events of a room, oldest first, stamped.
     ///
     /// # Errors

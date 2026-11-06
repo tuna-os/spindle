@@ -454,9 +454,10 @@ struct SlidingInputs<'a> {
 /// The body of a sliding-sync response, assembled synchronously, without
 /// its `pos`; what the connection holds once the client has it; and whether
 /// the answer tells the client anything it does not hold: a room, a list
-/// count, or an extension's news. The one-time-key counts, the account data
-/// and the typing rooms are in every answer, so being there is not news:
-/// see [`sliding_extensions`].
+/// count, or an extension's news. With the E2EE extension on and keys held,
+/// an event in any of the user's rooms is news too. The one-time-key
+/// counts, the account data and the typing rooms are in every answer, so
+/// being there is not news: see [`sliding_extensions`].
 fn sliding_answer(
     state: &AppState,
     identity: &crate::accounts::Identity,
@@ -559,9 +560,30 @@ fn sliding_answer(
             .map(|room_id| (room_id, position)),
     );
 
-    let news = previous.is_none_or(|held| held.listed != ordered.len())
+    let mut news = previous.is_none_or(|held| held.listed != ordered.len())
         || !rooms_out.is_empty()
-        || extension_news;
+        || extension_news.news;
+    // Synapse counts its E2EE extension as data whenever the device holds
+    // keys, so a wake from any of the user's rooms answers the connection
+    // that carries it. matrix-rust-sdk depends on that: it uploads new room
+    // keys to the backup after its encryption connection, which has no
+    // rooms, processes an answer. Without these answers, a key for the
+    // user's own message did not reach the backup before the client stopped
+    // (its `test_pinned_events_are_decrypted_after_recovering_*` and
+    // `test_permalink_timelines_redecrypt`).
+    if let Some(held) = previous
+        && !news
+        && extension_news.rooms_wake
+    {
+        let joined = ordered
+            .iter()
+            .map(|(room_id, _)| room_id.as_str())
+            .filter(|room_id| !invited.contains(*room_id));
+        news = state
+            .rooms
+            .any_changed(joined, held.stream, position)
+            .map_err(room_error)?;
+    }
     let mut body = serde_json::Map::new();
     body.insert("lists".to_owned(), Value::Object(lists_out));
     body.insert("rooms".to_owned(), Value::Object(rooms_out));
@@ -701,6 +723,16 @@ fn sliding_rooms(
     Ok(rooms_out)
 }
 
+/// What the extensions say about whether an answer is news.
+#[derive(Clone, Copy, Default)]
+struct ExtensionNews {
+    /// An extension says something the client does not hold.
+    news: bool,
+    /// The E2EE extension reports one-time or fallback keys, which makes an
+    /// event in any of the user's rooms news: see [`sliding_answer`].
+    rooms_wake: bool,
+}
+
 /// What [`sliding_extensions`] answers from.
 #[derive(Clone, Copy)]
 struct ExtensionInputs<'a> {
@@ -732,7 +764,7 @@ fn sliding_extensions(
     identity: &crate::accounts::Identity,
     extensions: &crate::sliding::Extensions,
     inputs: ExtensionInputs<'_>,
-) -> Result<(Value, Vec<String>, bool), MatrixError> {
+) -> Result<(Value, Vec<String>, ExtensionNews), MatrixError> {
     let ExtensionInputs {
         since,
         position,
@@ -742,7 +774,7 @@ fn sliding_extensions(
     } = inputs;
     let mut out = serde_json::Map::new();
     let mut receipts_current = Vec::new();
-    let mut news = false;
+    let mut news = ExtensionNews::default();
     if !extensions.any() {
         return Ok((Value::Object(out), receipts_current, news));
     }
@@ -755,12 +787,13 @@ fn sliding_extensions(
             extensions.to_device.limit,
             position,
         )?;
-        news |= delivered;
+        news.news |= delivered;
         out.insert("to_device".to_owned(), to_device);
     }
     if extensions.e2ee.on() {
-        let (e2ee, changed) = e2ee_extension(state, identity, since, position)?;
-        news |= changed;
+        let (e2ee, changed, holds_keys) = e2ee_extension(state, identity, since, position)?;
+        news.news |= changed;
+        news.rooms_wake = holds_keys;
         out.insert("e2ee".to_owned(), e2ee);
     }
     if extensions.account_data.on() {
@@ -772,9 +805,9 @@ fn sliding_extensions(
             account_data_extension(state, identity, &scope)?,
         );
         if let Some(since) = since
-            && !news
+            && !news.news
         {
-            news = account_data_moved(state, identity, &scope, since, position)?;
+            news.news = account_data_moved(state, identity, &scope, since, position)?;
         }
     }
     if extensions.receipts.on() {
@@ -782,7 +815,7 @@ fn sliding_extensions(
             .receipts
             .scope(&selection.windows, &selection.subscribed);
         let (receipts, any) = receipts_extension(state, identity, &scope, receipts, position)?;
-        news |= any;
+        news.news |= any;
         out.insert("receipts".to_owned(), receipts);
         receipts_current = scope.into_iter().map(str::to_owned).collect();
     }
@@ -861,14 +894,15 @@ fn to_device_extension(
 }
 
 /// The E2EE extension: the same three things classic sync carries at the
-/// top level, for the same reasons; and whether a device list changed. The
-/// key counts are in every answer, so they are not news on their own.
+/// top level, for the same reasons; whether a device list changed; and
+/// whether the device holds one-time or fallback keys. The key counts are
+/// in every answer, so they are not news on their own.
 fn e2ee_extension(
     state: &AppState,
     identity: &crate::accounts::Identity,
     since: Option<u64>,
     position: u64,
-) -> Result<(Value, bool), MatrixError> {
+) -> Result<(Value, bool, bool), MatrixError> {
     let changed = match since {
         Some(since) => visible_device_changes(state, identity, since, position)?,
         None => Vec::new(),
@@ -882,6 +916,10 @@ fn e2ee_extension(
         .unused_fallback_algorithms(&identity.user_id, &identity.device_id)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
     let any = !changed.is_empty();
+    let holds_keys = !unused_fallback.is_empty()
+        || key_counts
+            .values()
+            .any(|count| count.as_u64().is_some_and(|count| count > 0));
     Ok((
         json!({
             "device_lists": { "changed": changed, "left": [] },
@@ -889,6 +927,7 @@ fn e2ee_extension(
             "device_unused_fallback_key_types": unused_fallback,
         }),
         any,
+        holds_keys,
     ))
 }
 
