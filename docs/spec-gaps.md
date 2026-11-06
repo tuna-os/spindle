@@ -10,20 +10,16 @@ and the diff is the work the release brought.
 
 ## Client-Server API
 
-135 of 166 operations served.
+140 of 166 operations served.
 
 ### Not served, in the spec since before v1.1
 
 8 of these are deprecated upstream and can stay unserved.
 
 - `POST /_matrix/client/v3/account/3pid` *(deprecated)* — `administrative_contact.yaml`
-- `POST /_matrix/client/v3/account/3pid/add` — `administrative_contact.yaml`
 - `POST /_matrix/client/v3/account/3pid/bind` — `administrative_contact.yaml`
-- `POST /_matrix/client/v3/account/3pid/delete` — `administrative_contact.yaml`
-- `POST /_matrix/client/v3/account/3pid/email/requestToken` — `administrative_contact.yaml`
 - `POST /_matrix/client/v3/account/3pid/msisdn/requestToken` — `administrative_contact.yaml`
 - `POST /_matrix/client/v3/account/3pid/unbind` — `administrative_contact.yaml`
-- `POST /_matrix/client/v3/account/password/email/requestToken` — `password_management.yaml`
 - `POST /_matrix/client/v3/account/password/msisdn/requestToken` — `password_management.yaml`
 - `PUT /_matrix/client/v3/directory/list/appservice/{networkId}/{roomId}` — `appservice_room_directory.yaml`
 - `GET /_matrix/client/v3/events` *(deprecated)* — `old_sync.yaml`
@@ -31,7 +27,6 @@ and the diff is the work the release brought.
 - `GET /_matrix/client/v3/events/{eventId}` *(deprecated)* — `old_sync.yaml`
 - `GET /_matrix/client/v3/initialSync` *(deprecated)* — `old_sync.yaml`
 - `GET /_matrix/client/v3/pushrules/global/` — `pushrules.yaml`
-- `POST /_matrix/client/v3/register/email/requestToken` — `registration.yaml`
 - `POST /_matrix/client/v3/register/msisdn/requestToken` — `registration.yaml`
 - `GET /_matrix/client/v3/rooms/{roomId}/initialSync` — `room_initial_sync.yaml`
 - `GET /_matrix/client/v3/thirdparty/location` — `third_party_lookup.yaml`
@@ -71,7 +66,7 @@ and the diff is the work the release brought.
 
 ## Served beyond the spec at this pin
 
-153 routes the pinned spec does not define: MSC surfaces under
+154 routes the pinned spec does not define: MSC surfaces under
 `unstable/`, the admin and MAS-compatibility APIs, and stable spellings
 newer than the pin. Each MSC route must be accounted for in
 `contrib/msc/ledger.toml`; `scripts/msc-ledger.py --check` enforces that.
@@ -210,6 +205,7 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_synapse/mas/update_device_display_name`
 - `/_synapse/mas/upsert_device`
 - `/account`
+- `/account/3pid/validate`
 - `/account/deactivate`
 - `/account/emails/add`
 - `/account/emails/remove`

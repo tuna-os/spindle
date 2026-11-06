@@ -118,9 +118,12 @@ struct PendingCode {
 
 /// The provider's in-flight state. Codes are memory-only on purpose: a
 /// code that does not survive a restart costs the user one more login
-/// page, while a durable code would be a credential at rest.
+/// page, while a durable code would be a credential at rest. The client
+/// API's email validation sessions (`threepid.rs`) are held the same way
+/// for the same reason.
 pub struct BuiltinOidc {
     codes: Mutex<HashMap<String, PendingCode>>,
+    pub(crate) threepid: crate::threepid::Sessions,
 }
 
 impl BuiltinOidc {
@@ -128,6 +131,7 @@ impl BuiltinOidc {
     pub fn new() -> Self {
         Self {
             codes: Mutex::new(HashMap::new()),
+            threepid: crate::threepid::Sessions::default(),
         }
     }
 }

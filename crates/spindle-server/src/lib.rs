@@ -85,6 +85,7 @@ pub mod stream;
 pub mod surface;
 pub mod sync_routes;
 pub mod telemetry;
+pub mod threepid;
 pub mod timeline_routes;
 pub mod tokens;
 pub mod typing;

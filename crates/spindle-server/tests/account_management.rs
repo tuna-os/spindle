@@ -1675,3 +1675,337 @@ async fn an_admin_reset_link_needs_no_mail() {
     // Not an email reset.
     assert_eq!(server.metrics.password_reset_counts(), (0, 0));
 }
+
+// ---- The client API's email flows (#608) -------------------------------
+
+async fn request_token(
+    server: &Instance,
+    path: &str,
+    token: Option<&str>,
+    address: &str,
+    attempt: u64,
+) -> String {
+    let (status, body) = server
+        .api(
+            reqwest::Method::POST,
+            path,
+            token,
+            Some(json!({
+                "client_secret": "cl1ent.s3cret",
+                "email": address,
+                "send_attempt": attempt,
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{path}: {body}");
+    body["sid"].as_str().expect("a sid").to_owned()
+}
+
+const ADD_TOKEN: &str = "/_matrix/client/v3/account/3pid/email/requestToken";
+const RESET_TOKEN: &str = "/_matrix/client/v3/account/password/email/requestToken";
+const VALIDATE: &str = "/account/3pid/validate";
+
+fn password_auth(server: &Instance, localpart: &str) -> Value {
+    json!({
+        "type": "m.login.password",
+        "identifier": { "type": "m.id.user", "user": server.user(localpart) },
+        "password": PASSWORD,
+        "session": "s",
+    })
+}
+
+/// Element's email settings: request a token, follow the link, then
+/// `/3pid/add` behind the password; remove with `/3pid/delete`.
+#[tokio::test]
+async fn the_client_api_adds_and_removes_an_address() {
+    let (server, mailer) = Instance::with_mail("[ratelimit]\nenabled = false\n").await;
+    let token = server.register("alice").await;
+    let sid = request_token(&server, ADD_TOKEN, Some(&token), "Alice@Example.org", 1).await;
+    let sent = mail(&mailer, 1).await;
+    assert_eq!(sent[0].to, "alice@example.org");
+    // A retry with the same attempt number is the same session, no mail.
+    assert_eq!(
+        request_token(&server, ADD_TOKEN, Some(&token), "alice@example.org", 1).await,
+        sid
+    );
+    let link = token_in(&sent[0], VALIDATE);
+    let add = |auth: Option<Value>| {
+        let mut body = json!({ "client_secret": "cl1ent.s3cret", "sid": sid });
+        if let Some(auth) = auth {
+            body["auth"] = auth;
+        }
+        server.api(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/account/3pid/add",
+            Some(&token),
+            Some(body),
+        )
+    };
+    let (status, body) = add(Some(password_auth(&server, "alice"))).await;
+    assert_eq!(
+        (status, body["errcode"].as_str()),
+        (400, Some("M_SESSION_NOT_VALIDATED"))
+    );
+
+    // Opening the link, as a mail scanner does, validates nothing.
+    let mut browser = Browser::default();
+    let page = browser
+        .get(&server, &format!("{VALIDATE}?token={link}"))
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("alice@example.org"), "{}", page.body);
+    let (status, _) = add(Some(password_auth(&server, "alice"))).await;
+    assert_eq!(status, 400);
+    let page = browser.post(&server, VALIDATE, &[("token", &link)]).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    // The button works once.
+    let page = browser.post(&server, VALIDATE, &[("token", &link)]).await;
+    assert_eq!(page.status, 400, "{}", page.body);
+
+    let (status, body) = add(None).await;
+    assert_eq!(status, 401, "the password stage first: {body}");
+    let (status, body) = add(Some(password_auth(&server, "alice"))).await;
+    assert_eq!(status, 200, "{body}");
+    let (_, listed) = server
+        .api(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/3pid",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        listed["threepids"][0]["address"], "alice@example.org",
+        "{listed}"
+    );
+    let (status, body) = add(Some(password_auth(&server, "alice"))).await;
+    assert_eq!(
+        (status, body["errcode"].as_str()),
+        (400, Some("M_THREEPID_AUTH_FAILED")),
+        "a session is spent once"
+    );
+
+    // Another account asking for the address gets a session and no mail.
+    let bob = server.register("bob").await;
+    request_token(&server, ADD_TOKEN, Some(&bob), "alice@example.org", 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(mailer.sent().len(), 1, "a taken address is mailed nothing");
+
+    let (status, body) = server
+        .api(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/account/3pid/delete",
+            Some(&token),
+            Some(json!({ "medium": "email", "address": "alice@example.org" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["id_server_unbind_result"], "no-support");
+    let (_, listed) = server
+        .api(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/3pid",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(listed["threepids"], json!([]), "{listed}");
+}
+
+/// Element's "Forgot password?": no access token, a mailed link, then
+/// `POST /account/password` with the `m.login.email.identity` stage.
+#[tokio::test]
+async fn a_forgotten_password_is_reset_through_the_client_api() {
+    let (server, mailer) = Instance::with_mail("[ratelimit]\nenabled = false\n").await;
+    let old_token = server.register("alice").await;
+    let mut browser = Browser::default();
+    browser.sign_in(&server, "alice", PASSWORD).await;
+    add_and_confirm(&server, &mailer, &mut browser, "alice@example.org", 0).await;
+
+    // Without a token or a stage, the challenge names the email stage.
+    let (status, body) = server
+        .api(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/account/password",
+            None,
+            Some(json!({ "new_password": "a-new-passphrase" })),
+        )
+        .await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(
+        body["flows"][0]["stages"][0], "m.login.email.identity",
+        "{body}"
+    );
+
+    // An unknown address answers the same, and nobody is mailed.
+    request_token(&server, RESET_TOKEN, None, "nobody@example.org", 1).await;
+    let sid = request_token(&server, RESET_TOKEN, None, "alice@example.org", 1).await;
+    let sent = mail(&mailer, 2).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(mailer.sent().len(), 2, "only alice's address was mailed");
+    assert_eq!(sent[1].to, "alice@example.org");
+    let link = token_in(&sent[1], VALIDATE);
+
+    let reset = || {
+        server.api(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/account/password",
+            None,
+            Some(json!({
+                "new_password": "a-new-passphrase",
+                // Element sends both spellings and no UIA session.
+                "auth": {
+                    "type": "m.login.email.identity",
+                    "threepid_creds": { "sid": sid, "client_secret": "cl1ent.s3cret" },
+                    "threepidCreds": { "sid": sid, "client_secret": "cl1ent.s3cret" },
+                },
+            })),
+        )
+    };
+    let (status, body) = reset().await;
+    assert_eq!(
+        (status, body["errcode"].as_str()),
+        (401, Some("M_UNAUTHORIZED")),
+        "not confirmed yet: {body}"
+    );
+    let page = browser.post(&server, VALIDATE, &[("token", &link)]).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    let (status, body) = reset().await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, _) = server.password_login("alice", PASSWORD, "D1").await;
+    assert_eq!(status, 403, "the old password is gone");
+    let (status, _) = server
+        .password_login("alice", "a-new-passphrase", "D2")
+        .await;
+    assert_eq!(status, 200);
+    let (status, _) = server
+        .api(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/whoami",
+            Some(&old_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 401, "every device signed out");
+    let (status, _) = reset().await;
+    assert_eq!(status, 401, "the session is spent");
+    assert_eq!(server.metrics.password_reset_counts(), (2, 1));
+}
+
+#[tokio::test]
+async fn without_mail_the_client_api_email_flows_are_absent() {
+    let server = Instance::builtin().await;
+    let token = server.register("carol").await;
+    for path in [ADD_TOKEN, RESET_TOKEN] {
+        let (status, body) = server
+            .api(
+                reqwest::Method::POST,
+                path,
+                Some(&token),
+                Some(json!({ "client_secret": "x", "email": "c@example.org", "send_attempt": 1 })),
+            )
+            .await;
+        assert_eq!(
+            (status, body["errcode"].as_str()),
+            (404, Some("M_UNRECOGNIZED")),
+            "{path}"
+        );
+    }
+    // And a password change without a token is refused as it always was.
+    let (status, body) = server
+        .api(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/account/password",
+            None,
+            Some(json!({ "new_password": "x" })),
+        )
+        .await;
+    assert_eq!(
+        (status, body["errcode"].as_str()),
+        (401, Some("M_MISSING_TOKEN"))
+    );
+}
+
+/// Element's sign-up form with an address: the email stage is offered
+/// beside the dummy one, and completing it binds the address to the new
+/// account. With a registration token required it is not offered at all.
+#[tokio::test]
+async fn registration_can_confirm_an_address() {
+    let (server, mailer) = Instance::with_mail("[ratelimit]\nenabled = false\n").await;
+    let register = |auth: Option<Value>| {
+        let mut body = json!({ "username": "dora", "password": PASSWORD });
+        if let Some(auth) = auth {
+            body["auth"] = auth;
+        }
+        server.api(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/register",
+            None,
+            Some(body),
+        )
+    };
+    let (status, body) = register(None).await;
+    assert_eq!(status, 401);
+    assert_eq!(
+        body["flows"],
+        json!([{ "stages": ["m.login.dummy"] }, { "stages": ["m.login.email.identity"] }]),
+        "{body}"
+    );
+
+    let sid = request_token(
+        &server,
+        "/_matrix/client/v3/register/email/requestToken",
+        None,
+        "dora@example.org",
+        1,
+    )
+    .await;
+    let sent = mail(&mailer, 1).await;
+    let link = token_in(&sent[0], VALIDATE);
+    let email_auth = json!({
+        "type": "m.login.email.identity",
+        "session": "register",
+        "threepid_creds": { "sid": sid, "client_secret": "cl1ent.s3cret" },
+    });
+    let (status, body) = register(Some(email_auth.clone())).await;
+    assert_eq!(
+        (status, body["errcode"].as_str()),
+        (401, Some("M_UNAUTHORIZED")),
+        "not confirmed yet: {body}"
+    );
+    let mut browser = Browser::default();
+    let page = browser.post(&server, VALIDATE, &[("token", &link)]).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    let (status, body) = register(Some(email_auth)).await;
+    assert_eq!(status, 200, "{body}");
+    let (_, listed) = server
+        .api(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/account/3pid",
+            body["access_token"].as_str(),
+            None,
+        )
+        .await;
+    assert_eq!(
+        listed["threepids"][0]["address"], "dora@example.org",
+        "{listed}"
+    );
+
+    let (server, _mailer) =
+        Instance::with_mail("[ratelimit]\nenabled = false\n[registration]\nrequire_token = true\n")
+            .await;
+    let (status, body) = server
+        .api(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/register/email/requestToken",
+            None,
+            Some(json!({ "client_secret": "x", "email": "e@example.org", "send_attempt": 1 })),
+        )
+        .await;
+    assert_eq!(
+        (status, body["errcode"].as_str()),
+        (403, Some("M_THREEPID_DENIED")),
+        "{body}"
+    );
+}

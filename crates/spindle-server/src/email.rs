@@ -279,7 +279,7 @@ pub(crate) fn addresses_of(
 }
 
 /// Who an address belongs to, if anyone.
-fn owner_of(state: &AppState, address: &str) -> Result<Option<String>, MatrixError> {
+pub(crate) fn owner_of(state: &AppState, address: &str) -> Result<Option<String>, MatrixError> {
     Ok(
         ReadView::get(state.store.as_ref(), &keys::email_owner(address))
             .map_err(|e| storage(&e))?
@@ -287,7 +287,7 @@ fn owner_of(state: &AppState, address: &str) -> Result<Option<String>, MatrixErr
     )
 }
 
-fn bind(state: &AppState, localpart: &str, address: &str) -> Result<(), MatrixError> {
+pub(crate) fn bind(state: &AppState, localpart: &str, address: &str) -> Result<(), MatrixError> {
     state
         .store
         .commit(
@@ -305,7 +305,7 @@ fn bind(state: &AppState, localpart: &str, address: &str) -> Result<(), MatrixEr
         .map_err(|e| storage(&e))
 }
 
-fn unbind(state: &AppState, localpart: &str, address: &str) -> Result<(), MatrixError> {
+pub(crate) fn unbind(state: &AppState, localpart: &str, address: &str) -> Result<(), MatrixError> {
     let store = state.store.as_ref();
     if owner_of(state, address)?.as_deref() == Some(localpart) {
         Store::delete(store, &keys::email_owner(address)).map_err(|e| storage(&e))?;
@@ -485,7 +485,7 @@ pub fn issue_reset_link(
 
 /// Hand a message to the mailer in a task of its own, counting the
 /// outcome. The caller's response never waits on, or varies with, it.
-fn dispatch(state: &AppState, kind: EmailKind, email: OutgoingEmail) {
+pub(crate) fn dispatch(state: &AppState, kind: EmailKind, email: OutgoingEmail) {
     let Some(mailer) = state.mailer.clone() else {
         return;
     };
@@ -499,7 +499,7 @@ fn dispatch(state: &AppState, kind: EmailKind, email: OutgoingEmail) {
     });
 }
 
-fn link(state: &AppState, path: &str, token: &str) -> String {
+pub(crate) fn link(state: &AppState, path: &str, token: &str) -> String {
     format!("{}{path}?token={token}", crate::oidc::issuer(state))
 }
 
@@ -678,7 +678,7 @@ struct TokenQuery {
     token: Option<String>,
 }
 
-fn dead_link(state: &AppState) -> Response {
+pub(crate) fn dead_link(state: &AppState) -> Response {
     crate::account::message_page(
         state,
         StatusCode::BAD_REQUEST,
@@ -756,7 +756,7 @@ async fn verify(
     ))
 }
 
-fn not_configured() -> MatrixError {
+pub(crate) fn not_configured() -> MatrixError {
     MatrixError::new(
         StatusCode::NOT_FOUND,
         "M_UNRECOGNIZED",
@@ -1048,10 +1048,10 @@ async fn reset(
 }
 
 /// `GET /_matrix/client/v3/account/3pid` — the account's confirmed
-/// addresses. Adding and removing them is the account pages' job (the
-/// client API's `requestToken` flows are not served); this is the read
-/// clients show in their settings. Under delegation the provider owns
-/// identity, and this answers as the endpoint always did there: absent.
+/// addresses, however they were added: the account pages, or the client
+/// API's `requestToken` and `/3pid/add` (`threepid.rs`). Under delegation
+/// the provider owns identity, and this answers as the endpoint always did
+/// there: absent.
 async fn threepids(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,

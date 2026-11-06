@@ -290,9 +290,26 @@ Configure an SMTP relay with `[email]` (see `spindle.example.toml`:
   per address (3 per hour), for an address with no account too. It limits confirmation
   mails per account (5 per hour).
 - `GET /_matrix/client/v3/account/3pid` lists the confirmed addresses.
-  The server does not serve the client API calls that add and remove them
-  (`requestToken` and friends); use the account pages. Under
-  `[auth.delegated]` the endpoint stays absent, as before.
+  Under `[auth.delegated]` the endpoint stays absent, as before.
+- **The client API flows.** Clients that log in with a password use the
+  spec calls, and these work too:
+  - `POST /account/password/email/requestToken`, then
+    `POST /account/password` with the `m.login.email.identity` stage.
+    The client does not need an access token. This is "Forgot password?"
+    in Element. All devices and browsers sign out.
+  - `POST /account/3pid/email/requestToken`, then `POST /account/3pid/add`
+    (with the password). `POST /account/3pid/delete` removes an address.
+  - `POST /register/email/requestToken`, then `POST /register` with the
+    `m.login.email.identity` stage. Registration shows this stage beside
+    `m.login.dummy`, so an address is optional. With
+    `require_token`, the server does not show it and refuses the request.
+
+  Each mail has a link to `/account/3pid/validate`, which opens a
+  confirmation button. The client continues after the user pushes it.
+  A `requestToken` gives a `sid` for each address, but an unknown address
+  or an address of another account gets no mail. The limits of the
+  forgotten-password page apply. The validation sessions are in memory
+  and work once.
 - Nothing logs an address, a token or a link. The log records a delivery
   failure only by class (permanent, transient, connection).
 
