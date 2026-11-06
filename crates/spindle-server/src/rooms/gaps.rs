@@ -1198,12 +1198,14 @@ impl Rooms {
                 // Only the nodes a stored state lacks: the chunk's state is
                 // usually the room's state less a few changes. The base must
                 // be a state whose nodes are on disk, which `current_state()`
-                // is not in a forked room -- there it is the tips'
-                // resolution, computed in memory and never written, so a node
-                // the chunk shared with it was referenced and never stored,
-                // and `spindle gc` sweeps any stray copy that happened to
-                // exist. The newest log entry's state was written with the
-                // entry and stays resident; without it, write the whole trie.
+                // need not be in a forked room -- there it is the tips'
+                // resolution, computed in memory and stored only as a cache
+                // (`Keyspace::CurrentState`) that the next resolution
+                // replaces and a failed write leaves out, so a node the
+                // chunk shared with it could be referenced and never stored,
+                // and `spindle gc` sweeps any stray copy. The newest log
+                // entry's state was written with the entry and stays
+                // resident; without it, write the whole trie.
                 let persisted = log
                     .entries()
                     .next_back()

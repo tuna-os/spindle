@@ -663,3 +663,211 @@ fn the_pipelined_restore_reports_the_first_corruption_in_log_order() {
         assert!(expected, "row {li}: {error}");
     }
 }
+
+// -- what a runtime restore reads -----------------------------------------
+
+/// A room of forty members whose topic then changes `changes` times: every
+/// entry has a state of its own and the state stays one size, so what a
+/// restore reads of it says how many states it hydrated, not how big each
+/// one was.
+fn topic_room(store: &FjallStore, room_id: &str, changes: usize) -> Log {
+    let room = RoomStore::new(store, room_id);
+    let mut log = Log::new(store.key_table());
+    for i in 0..40 {
+        let entry = log
+            .append_local(
+                format!("${room_id}-member{i}"),
+                Some(StateKey::new("m.room.member", format!("@u{i}:test"))),
+            )
+            .unwrap()
+            .clone();
+        room.commit_entry(&entry, &log, Durability::Relaxed)
+            .unwrap();
+    }
+    for i in 0..changes {
+        let entry = log
+            .append_local(
+                format!("${room_id}-topic{i}"),
+                Some(StateKey::new("m.room.topic", "")),
+            )
+            .unwrap()
+            .clone();
+        room.commit_entry(&entry, &log, Durability::Relaxed)
+            .unwrap();
+    }
+    store.flush().unwrap();
+    log
+}
+
+/// Store reads one runtime restore of `room_id` makes.
+fn restore_reads(store: &FjallStore, room_id: &str) -> u64 {
+    let before = store.reads();
+    RoomStore::new(store, room_id)
+        .load_runtime()
+        .unwrap()
+        .unwrap();
+    store.reads() - before
+}
+
+/// A runtime restore reads the state its resident window and its tips
+/// need, and nothing else: not more for a room with four times the
+/// history, and not one read for any of the hundreds of events the room
+/// has sidelined. Hydrating every sidelined event's state was a quarter of
+/// an 88,670-entry room's seven-second cold load (#724).
+#[test]
+fn a_runtime_restore_reads_state_for_its_window_not_its_history_or_its_sidelined_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FjallStore::open(dir.path()).unwrap();
+    topic_room(&store, "!short:test", 1_000);
+    let mut log = topic_room(&store, "!long:test", 4_000);
+    let short_reads = restore_reads(&store, "!short:test");
+    let long_reads = restore_reads(&store, "!long:test");
+    assert_eq!(
+        long_reads, short_reads,
+        "a room of four times the history read more to restore"
+    );
+
+    let room = RoomStore::new(&store, "!long:test");
+    let head = log.entries().next_back().unwrap().event_id.clone();
+    let head_state = log.state_after_event(&head).unwrap().clone();
+    for i in 0..300 {
+        let sidelined = log
+            .sideline(
+                EventInput::new(format!("$soft{i}"), vec![head.clone()])
+                    .with_state_key(StateKey::new("m.room.member", format!("@soft{i}:test"))),
+                head_state.clone(),
+                Sideline::SoftFailed,
+            )
+            .unwrap()
+            .clone();
+        let after = log.sidelined_state(&sidelined.event_id).unwrap().clone();
+        room.journal_sidelined(&sidelined, &after, Some(&head_state), &log, &[])
+            .unwrap();
+    }
+    store.flush().unwrap();
+    assert_eq!(
+        restore_reads(&store, "!long:test"),
+        long_reads,
+        "restoring 300 sidelined events read their states"
+    );
+
+    // Their states are still there for whatever names one.
+    let restored = room.load_runtime().unwrap().unwrap().log;
+    assert_eq!(restored.sidelined_entries().count(), 300);
+    let mut load = |address: &spindle_core::StateRoot| {
+        store
+            .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
+            .unwrap()
+    };
+    let state = restored
+        .state_after_any(&EventId::new("$soft7"), &mut load)
+        .unwrap();
+    assert_eq!(
+        state.get(&StateKey::new("m.room.member", "@soft7:test")),
+        Some("$soft7")
+    );
+    assert_eq!(
+        state.get(&StateKey::new("m.room.topic", "")),
+        head_state.get(&StateKey::new("m.room.topic", ""))
+    );
+}
+
+/// A fork's recorded resolution is the reopened room's current state, and
+/// only while what it resolved still holds: a new rejection or a new tip
+/// is a different question, and the room comes back unresolved for the
+/// caller to resolve (#724).
+#[test]
+fn a_recorded_fork_resolution_is_taken_only_while_what_it_resolved_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FjallStore::open(dir.path()).unwrap();
+    let mut log = varied_room(&store);
+    let room = RoomStore::new(&store, ROOM);
+    assert!(
+        !room.journal_current(&log).unwrap(),
+        "nothing to record before anyone resolves the fork"
+    );
+    assert!(
+        !room
+            .load_runtime()
+            .unwrap()
+            .unwrap()
+            .log
+            .current_is_settled()
+    );
+
+    // What a resolver might answer: one tip's state with a slot of its own.
+    let head = log.entries().next_back().unwrap().event_id.clone();
+    let resolved = log
+        .state_after_event(&head)
+        .unwrap()
+        .apply(&StateKey::new("m.room.name", ""), "$resolved");
+    log.set_current(resolved.clone());
+    assert!(room.journal_current(&log).unwrap());
+    for (label, restored) in [
+        ("runtime", room.load_runtime().unwrap().unwrap().log),
+        ("exhaustive", room.load_exhaustive().unwrap().unwrap().log),
+    ] {
+        assert!(restored.current_is_settled(), "{label}");
+        assert_eq!(
+            restored.current_state().map(StateSnapshot::root),
+            Some(resolved.root()),
+            "{label}"
+        );
+        assert_eq!(
+            restored
+                .current_state()
+                .unwrap()
+                .get(&StateKey::new("m.room.name", "")),
+            Some("$resolved"),
+            "{label}: the recorded state reads back whole"
+        );
+    }
+
+    // A rejection the resolution never weighed.
+    let state = log.state_after_event(&head).unwrap().clone();
+    let rejected = log
+        .sideline(
+            EventInput::new("$rejected", vec![head.clone()]),
+            state.clone(),
+            Sideline::Rejected,
+        )
+        .unwrap()
+        .clone();
+    room.journal_sidelined(&rejected, &state, Some(&state), &log, &[])
+        .unwrap();
+    assert!(
+        !room
+            .load_runtime()
+            .unwrap()
+            .unwrap()
+            .log
+            .current_is_settled(),
+        "a resolution recorded before a rejection was taken after it"
+    );
+    // Recorded again, it holds again.
+    assert!(room.journal_current(&log).unwrap());
+    assert!(
+        room.load_runtime()
+            .unwrap()
+            .unwrap()
+            .log
+            .current_is_settled()
+    );
+
+    // A new tip on the head's branch: the fork it resolved is gone.
+    let next = log
+        .append_remote(EventInput::new("$next", vec![head]))
+        .unwrap()
+        .clone();
+    room.commit_entry(&next, &log, Durability::Relaxed).unwrap();
+    assert!(log.forward_extremities().len() > 1, "still forked");
+    assert!(
+        !room
+            .load_runtime()
+            .unwrap()
+            .unwrap()
+            .log
+            .current_is_settled(),
+        "a resolution of other tips was taken"
+    );
+}

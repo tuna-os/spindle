@@ -1771,15 +1771,16 @@ fn current_state(harness: &Harness) -> (Vec<String>, spindle_core::StateSnapshot
 
 /// A gap filled into a forked room stores every node its state names.
 ///
-/// A forked room's current state is the resolution of its tips: computed
-/// in memory, never written. The chunk's nodes used to be written as a
-/// diff against it, so a chunk whose state *is* that resolution wrote no
-/// nodes at all and its rows named a root nothing had stored. Here the
-/// fork is bob renaming himself beside carol's join, the gap is carol's
-/// messages on the resolved state, and `spindle gc` runs between the fork
-/// and the fill. Afterwards every gap event's state reads back from the
-/// store alone, `/context` serves it, and a second collection finds every
-/// node it needs.
+/// A forked room's current state is the resolution of its tips, computed
+/// in memory and stored only as a cache record (#724) that the next
+/// resolution replaces. The chunk's nodes used to be written as a diff
+/// against it, so a chunk whose state *is* that resolution wrote no nodes
+/// at all and its rows named a root nothing had stored. Here the fork is
+/// bob renaming himself beside carol's join, the gap is carol's messages on
+/// the resolved state, and the record is dropped and `spindle gc` run
+/// between the fork and the fill, so the resolution's own nodes are gone.
+/// Afterwards every gap event's state reads back from the store alone,
+/// `/context` serves it, and a second collection finds every node it needs.
 #[tokio::test]
 async fn a_gap_filled_into_a_forked_room_stores_every_node_its_state_names() {
     use spindle_store::gc::collect_state_nodes;
@@ -1808,7 +1809,8 @@ async fn a_gap_filled_into_a_forked_room_stores_every_node_its_state_names() {
     accept_gap(&harness, &latest).await;
 
     // The precondition: the room's current state is the resolution of the
-    // branches, and no node of it is stored.
+    // branches, and once its cache record is dropped and collected, no node
+    // of it is stored.
     let (ids, resolved) = current_state(&harness);
     assert!(
         ids.contains(&renamed.0) && ids.contains(&carol_join.0),
@@ -1826,16 +1828,21 @@ async fn a_gap_filled_into_a_forked_room_stores_every_node_its_state_names() {
         )
         .unwrap()
     };
-    assert!(
-        node(&resolved.root()).is_none(),
-        "the fixture needs a current state that is not stored"
-    );
     harness.peer.served.lock().unwrap().state_ids_at.insert(
         messages[0].0.clone(),
         json!({"pdu_ids":ids,"auth_chain_ids":ids}),
     );
 
+    spindle_store::Store::delete(
+        harness.store.as_ref(),
+        &spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::CurrentState, &harness.room),
+    )
+    .unwrap();
     collect_state_nodes(harness.store.as_ref(), false).unwrap();
+    assert!(
+        node(&resolved.root()).is_none(),
+        "the fixture needs a current state that is not stored"
+    );
     harness.restart(Setup::default()).await;
     harness
         .until(30, "the gap is backfilled", Harness::filled)

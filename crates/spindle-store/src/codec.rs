@@ -368,6 +368,45 @@ impl RoomRecord {
     }
 }
 
+/// A room's recorded fork resolution ([`spindle_core::keys::Keyspace::CurrentState`]):
+/// the digest of what it resolved and the root of the state it chose.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CurrentStateRecord {
+    pub inputs: [u8; 32],
+    pub root: [u8; 32],
+}
+
+impl CurrentStateRecord {
+    const LEN: usize = 1 + 32 + 32;
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::LEN);
+        out.push(RECORD_VERSION);
+        out.extend_from_slice(&self.inputs);
+        out.extend_from_slice(&self.root);
+        out
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] for an unknown version, a truncated record
+    /// or trailing bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut cursor = Cursor { bytes, at: 0 };
+        let version = cursor.byte()?;
+        if version != RECORD_VERSION {
+            return Err(CodecError::UnsupportedVersion(version));
+        }
+        let inputs = cursor.array::<32>()?;
+        let root = cursor.array::<32>()?;
+        if let Some(extra) = bytes.get(cursor.at) {
+            return Err(CodecError::Malformed(*extra));
+        }
+        Ok(Self { inputs, root })
+    }
+}
+
 fn put_len(out: &mut Vec<u8>, len: usize) {
     let len = u32::try_from(len).unwrap_or(u32::MAX);
     out.extend_from_slice(&len.to_be_bytes());

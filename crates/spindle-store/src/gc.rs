@@ -10,8 +10,9 @@
 //! whose records were removed -- stayed on disk for good.
 //!
 //! The collector decides globally instead. **Mark**: every row that names a
-//! state root (a log entry, a sidelined event, a backfilled gap event) has
-//! its trie walked, and every node reached is live. A visited set of
+//! state root (a log entry, a sidelined event, a backfilled gap event, a
+//! room's recorded fork resolution) has its trie walked, and every node
+//! reached is live. A visited set of
 //! addresses makes a shared subtree cost one read however many roots reach
 //! it -- without it the walk is the sum of every state's size, which for a
 //! room of a million events with an unchanged ten-thousand-member subtree is
@@ -38,13 +39,14 @@ use std::collections::HashSet;
 use spindle_core::StateRoot;
 use spindle_core::keys::{KEY_SCHEMA_VERSION, Keyspace, content_addressed, keyspace_prefix};
 
-use crate::codec::{EntryRecord, SidelinedRecord};
+use crate::codec::{CurrentStateRecord, EntryRecord, SidelinedRecord};
 use crate::{ReadView, Store, StoreError};
 
 /// What one collection found, and what it removed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GcReport {
-    /// Root-holding rows read: log entries, sidelined events, gap events.
+    /// Root-holding rows read: log entries, sidelined events, gap events,
+    /// recorded fork resolutions.
     pub holders: u64,
     /// Distinct nodes reachable from those roots.
     pub marked: u64,
@@ -171,6 +173,13 @@ pub fn collect_state_nodes<S: Store>(store: &S, dry_run: bool) -> Result<GcRepor
     // (`rooms::gaps`, and the migration that rewrites these in place).
     marker.holders(Keyspace::FederationGapEvent, |value| {
         value.get(..32).and_then(|root| root.try_into().ok())
+    })?;
+    // A cache, but one whose nodes a reopened room reads: sweeping them
+    // would turn the next restart's cheap load back into a resolution.
+    marker.holders(Keyspace::CurrentState, |value| {
+        CurrentStateRecord::decode(value)
+            .ok()
+            .map(|record| record.root)
     })?;
     let Marker {
         marked, mut report, ..
