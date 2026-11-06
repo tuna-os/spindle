@@ -33,13 +33,14 @@
 //! old head's side of it and the gap event's.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use ruma::events::StateEventType;
 use ruma::state_res::events::Event as _;
 use serde_json::{Value, json};
 use spindle_core::{EventId, RoomLog, Sideline, StateKey, StateRoot, StateSnapshot};
 
-use super::{RoomError, Rooms, canonical_to_json, current_state, event_body_key, power_level};
+use super::{RoomError, Rooms, canonical_to_json, event_body_key, power_level};
 use crate::authorize::StoredEvent;
 
 /// The band of positions segments live in.
@@ -675,43 +676,93 @@ impl Rooms {
     /// The remote servers with a member joined to the room right now, the
     /// most-joined first (#620).
     ///
-    /// Read from the current state's member events themselves, not from
-    /// the membership index, and counting only `join` -- an invite is not
-    /// a server in the room, and a server whose users all left answers a
-    /// request about the room with 403. Ordered by how many members each
-    /// has joined, because the server with the most is the likeliest to
-    /// hold the room's history and to still be in it; ties by name, so the
-    /// order is stable.
+    /// Read from the current state's member keys and the membership index,
+    /// counting only `join`: an invite is not a server in the room, and a
+    /// server whose users all left answers a request about the room with
+    /// 403. That is [`Self::server_in_room`]'s rule, so every server named
+    /// here is one this server would itself answer as in the room. Ordered
+    /// by how many members each has joined, because the server with the
+    /// most is the likeliest to hold the room's history and to still be in
+    /// it; ties by name, so the order is stable.
+    ///
+    /// The ranking is cached against the state root it was read from, as
+    /// [`Self::destinations_in`] is: it costs a point read per member, the
+    /// recovery and gap paths ask for it per received PDU, and only a
+    /// state change can change the answer -- a cache keyed by time, as the
+    /// backfill loop once kept, served a departed server for minutes.
+    ///
+    /// A partial-state room (MSC3706) holds few member events, so the
+    /// resident's `servers_in_room` follows the ranked ones, the server the
+    /// join went through first, until the resync brings the members in --
+    /// [`Self::server_in_room`] counts them as in the room meanwhile.
     ///
     /// # Errors
-    /// Returns [`RoomError`] if the room or a member event cannot be read.
+    /// Returns [`RoomError`] if the room or the membership index cannot be
+    /// read.
     pub fn participating_servers(&self, room_id: &str) -> Result<Vec<String>, RoomError> {
-        let members = self.with_room_read(room_id, |rooms, log| {
-            Ok(current_state(log)
-                .into_iter()
-                .filter(|(key, _)| {
-                    key.event_type().as_str() == "m.room.member"
-                        && domain_of(key.state_key())
-                            .is_some_and(|domain| domain != rooms.server_name)
-                })
-                .map(|(key, event_id)| (key.state_key().to_owned(), event_id))
-                .collect::<Vec<_>>())
-        })?;
-        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-        for (user_id, event_id) in members {
-            let Ok(body) = self.read_event(room_id, &EventId::new(event_id.as_str())) else {
-                continue;
-            };
-            if body["content"]["membership"].as_str() != Some(super::JOIN_STR) {
-                continue;
+        let ranked = self.with_room_read(room_id, |rooms, log| rooms.ranked_in(log, room_id))?;
+        let mut servers = ranked.as_ref().clone();
+        if let Some(partial) = self.partial_state(room_id) {
+            let resident = std::iter::once(&partial.via).chain(&partial.servers_in_room);
+            for server in resident {
+                if *server != self.server_name && !servers.contains(server) {
+                    servers.push(server.clone());
+                }
             }
-            if let Some(domain) = domain_of(&user_id) {
+        }
+        Ok(servers)
+    }
+
+    /// [`Self::participating_servers`] from the members the room's state
+    /// holds, from a log the caller holds: the membership index is read
+    /// under the same lock the append path writes it under, so the ranking
+    /// cached against this root is the one this root implies.
+    fn ranked_in(&self, log: &RoomLog, room_id: &str) -> Result<Arc<Vec<String>>, RoomError> {
+        let Some(state) = log.current_state() else {
+            return Ok(Arc::new(Vec::new()));
+        };
+        let root = *state.root().as_bytes();
+        if let Some((cached, ranked)) = self
+            .participants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(room_id)
+            && *cached == root
+        {
+            return Ok(Arc::clone(ranked));
+        }
+        let mut members = Vec::new();
+        state.for_each(|key, _| {
+            if key.event_type().as_str() == "m.room.member"
+                && domain_of(key.state_key()).is_some_and(|domain| domain != self.server_name)
+            {
+                members.push(key.state_key().to_owned());
+            }
+        });
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for user_id in members {
+            let membership = spindle_store::ReadView::get(
+                self.store.as_ref(),
+                &spindle_core::keys::user_room(
+                    spindle_core::keys::Keyspace::Membership,
+                    &user_id,
+                    room_id,
+                ),
+            )?;
+            if membership.as_deref() == Some(super::JOIN_STR.as_bytes())
+                && let Some(domain) = domain_of(&user_id)
+            {
                 *counts.entry(domain.to_owned()).or_default() += 1;
             }
         }
         let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
         ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-        Ok(ranked.into_iter().map(|(domain, _)| domain).collect())
+        let ranked = Arc::new(ranked.into_iter().map(|(domain, _)| domain).collect());
+        self.participants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(room_id.to_owned(), (root, Arc::clone(&ranked)));
+        Ok(ranked)
     }
 
     /// Of `ids`, the ones a gap walk still has to fetch: not in the log,

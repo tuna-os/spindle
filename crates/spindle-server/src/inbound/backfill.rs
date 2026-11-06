@@ -67,8 +67,6 @@ const MAX_STATE_IDS: usize = 200_000;
 const MAX_RETRY: Duration = Duration::from_secs(3600);
 /// Consecutive chunks refused as invalid before a gap is given up on.
 const MAX_INVALID_ATTEMPTS: u32 = 10;
-/// How long a room's ranked participants are reused between chunks.
-const PARTICIPANTS_TTL: Duration = Duration::from_secs(300);
 /// Verifications between two yields to the runtime.
 const VERIFY_BATCH: usize = 16;
 /// How long a peer that had nothing for a frontier is not asked about that
@@ -84,9 +82,6 @@ pub struct GapBackfill {
     wake: tokio::sync::Notify,
     /// Rooms whose gap a client paged into, served first.
     wanted: Mutex<BTreeSet<String>>,
-    /// Ranked participants per room, reused for a few minutes: ranking
-    /// reads every member event of the room.
-    participants: Mutex<HashMap<String, (Instant, Vec<String>)>>,
     /// What each peer was last asked about each room's gap and how it went,
     /// so the same question is not put to it again and again: a peer
     /// refuses repeats ("Too many duplicate requests"), and one that had
@@ -644,8 +639,8 @@ async fn fill(
     let mut keys = HashMap::new();
     let mut last = candidates.is_empty().then(|| Failure::Peer {
         message: format!(
-            "every participating server is cooling down, or already said it has nothing \
-             for the frontier at {}",
+            "no server in the room is left to ask: none has a member joined, every one is \
+             cooling down, or every one already said it has nothing for the frontier at {}",
             frontier[0]
         ),
         rate_limited: Some(Duration::ZERO),
@@ -885,9 +880,12 @@ fn commit(
 
 /// The servers to ask, in order: whoever served the gap event's state,
 /// the gap event's own server, then the servers with the most members
-/// joined (#620), leaving out this server, any peer still cooling down
-/// from a 429 or a 403 for this room, and any that already said it has
-/// nothing for this exact frontier.
+/// joined (#620). Only servers in the room right now are asked -- the
+/// first two are preferences among them, not exceptions: a gap event's
+/// sender may have left since, and a server out of the room answers 403.
+/// This server, any peer still cooling down from a 429 or a 403 for this
+/// room, and any that already said it has nothing for this exact frontier
+/// are left out.
 fn candidates(
     peers: &Peers<'_>,
     backfill: &GapBackfill,
@@ -896,6 +894,10 @@ fn candidates(
     anchor_event: &str,
     digest: u64,
 ) -> Vec<String> {
+    let participants = peers
+        .rooms
+        .participating_servers(room_id)
+        .unwrap_or_default();
     let mut ordered: Vec<String> = Vec::new();
     if let Some(from) = marker["state_from"].as_str() {
         ordered.push(from.to_owned());
@@ -905,12 +907,12 @@ fn candidates(
     {
         ordered.push(domain.to_owned());
     }
-    ordered.extend(participants(peers.rooms, backfill, room_id));
+    ordered.extend(participants.iter().cloned());
     let mut seen = HashSet::new();
     ordered
         .into_iter()
         .filter(|peer| {
-            peer != peers.server_name
+            participants.contains(peer)
                 && seen.insert(peer.clone())
                 && !peers.recovery.cooling(room_id, peer, Endpoint::Backfill)
                 && !peers.recovery.cooling(room_id, peer, Endpoint::StateIds)
@@ -918,21 +920,6 @@ fn candidates(
         })
         .take(MAX_PEERS)
         .collect()
-}
-
-/// The room's participating servers, ranked, from a short-lived cache.
-fn participants(rooms: &Rooms, backfill: &GapBackfill, room_id: &str) -> Vec<String> {
-    let mut cache = backfill
-        .participants
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    cache.retain(|_, (at, _)| at.elapsed() < PARTICIPANTS_TTL);
-    if let Some((_, ranked)) = cache.get(room_id) {
-        return ranked.clone();
-    }
-    let ranked = rooms.participating_servers(room_id).unwrap_or_default();
-    cache.insert(room_id.to_owned(), (Instant::now(), ranked.clone()));
-    ranked
 }
 
 /// A chunk fetched from one peer and verified, ready to be committed.

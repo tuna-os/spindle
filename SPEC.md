@@ -455,7 +455,11 @@ until backfill brings the target in.
 
 Peers are chosen as for recovery — the server that served `G`'s state, `G`'s
 origin, then the servers with the most joined members — leaving out any still
-cooling down from a 429 or a 403 for that room. Chunks are paced
+cooling down from a 429 or a 403 for that room. Only a server with a member
+joined now is asked. A server whose users all left is not asked, and a gap
+with no such server waits. The ranking comes from the membership index and is
+cached against the state root. In a partial-state room, the resident's
+`servers_in_room` follow the ranked servers. Chunks are paced
 (`gap_backfill_interval_ms`), a failed gap backs off, and a gap that outgrows
 `gap_backfill_max_events` is left truncated rather than fetched without end.
 
