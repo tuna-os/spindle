@@ -205,9 +205,10 @@ async fn a_full_disk_takes_the_server_out_of_rotation_and_keeps_it_alive() {
     // The refused send can be served too. A 5xx does not say that the event
     // was not stored. fjall's background flush can fill the disk after the
     // send's batch is in the journal, and the flush poisons the database.
-    // Then the next write of the send fails: the sync that acknowledges the
-    // batch, or the transaction record after it. The batch stays in the
-    // journal, and the server serves it after a restart too (#770).
+    // Then the sync that acknowledges the batch fails. The batch stays in
+    // the journal, and the server serves it after a restart too (#770). Its
+    // transaction is recorded in the same batch, so a retry is answered
+    // with it rather than sent again (#779).
     let (status, messages) = authed(
         &app,
         "GET",

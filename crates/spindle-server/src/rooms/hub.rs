@@ -18,7 +18,7 @@ use ruma::signatures::Ed25519KeyPair;
 use serde_json::Value;
 use spindle_core::EventId;
 
-use super::{RoomError, Rooms, edge_ids};
+use super::{ClientTransaction, RoomError, Rooms, edge_ids};
 
 /// The state event that names a room's hub (MSC3995).
 pub const HUB_EVENT_TYPE: &str = "m.room.hub";
@@ -177,6 +177,10 @@ impl Rooms {
     /// instead -- this server is the event's origin, and nobody else will
     /// send it to the room's other servers.
     ///
+    /// `transaction` is the client's, for a `PUT /send`. Its rows ride the
+    /// event's own batch (#779). An event that is already here landed
+    /// without them, so they are written now, in a batch of their own.
+    ///
     /// # Errors
     ///
     /// As [`Self::commit_cosigned`].
@@ -185,12 +189,19 @@ impl Rooms {
         room_id: &str,
         event_id: &str,
         json: &Value,
+        transaction: Option<&ClientTransaction<'_>>,
     ) -> Result<(), RoomError> {
         self.with_room(room_id, |rooms, log| {
             if log.get(&EventId::new(event_id)).is_some() {
+                if let Some(transaction) = transaction {
+                    spindle_store::Store::commit_deferred(
+                        rooms.store.as_ref(),
+                        &transaction.rows(event_id),
+                    )?;
+                }
                 return rooms.enqueue_outbound(log, room_id, json);
             }
-            rooms.ingest(log, room_id, event_id, json, true)
+            rooms.ingest_checked(log, room_id, event_id, json, true, false, transaction)
         })
     }
 

@@ -28,7 +28,7 @@ pub mod gc;
 pub mod migrate;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 // fjall 3 renamed the two levels: what was a `Keyspace` (the whole store) is
@@ -584,6 +584,22 @@ impl GroupCommit {
     }
 }
 
+/// When [`FjallStore::inject_fault`] starts to refuse writes.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Fault {
+    /// The next write or sync, and everything after it.
+    Now,
+    /// The next sync, and everything after it. Batches journalled before
+    /// that sync stay journalled: the send whose batch landed and whose
+    /// sync then failed.
+    AtNextSync,
+}
+
+const NO_FAULT: u8 = 0;
+const FAULT_AT_SYNC: u8 = 1;
+const FAULT_REFUSING: u8 = 2;
+
 pub struct FjallStore {
     db: FjallDatabase,
     partition: FjallPartition,
@@ -630,6 +646,9 @@ pub struct FjallStore {
     /// to ask, short of attempting a write, so the store remembers, and the
     /// server's readiness probe reads it (#21's disk-full drill).
     write_refused: AtomicBool,
+    /// What [`Self::inject_fault`] armed: [`NO_FAULT`], [`FAULT_AT_SYNC`]
+    /// or [`FAULT_REFUSING`].
+    fault: AtomicU8,
     /// The intern table every snapshot in this process shares (#79).
     ///
     /// Loaded whole from [`Keyspace::StateKeyIntern`] at open: a room's
@@ -722,6 +741,49 @@ impl FjallStore {
         result
     }
 
+    /// Refuse writes from now on, or from the next sync, as a full disk does
+    /// once fjall is poisoned. For tests only.
+    ///
+    /// From the trigger on, every write and every sync fails and latches
+    /// [`Store::accepts_writes`] off. That is what fjall does after a write
+    /// or a sync fails. A real full disk refuses whichever write does not
+    /// fit, and the server tests for #779 and #780 must choose the write.
+    #[doc(hidden)]
+    pub fn inject_fault(&self, fault: Fault) {
+        let state = match fault {
+            Fault::Now => FAULT_REFUSING,
+            Fault::AtNextSync => FAULT_AT_SYNC,
+        };
+        self.fault.store(state, Ordering::Release);
+    }
+
+    /// Fail, and latch, if [`Self::inject_fault`] refuses this write or
+    /// sync. `sync` says whether the caller is a sync, which is what
+    /// [`Fault::AtNextSync`] waits for.
+    fn injected(&self, sync: bool) -> Result<(), StoreError> {
+        let refused = match self.fault.load(Ordering::Acquire) {
+            NO_FAULT => false,
+            // Whichever sync swaps the state is the first refused one, and
+            // a sync that lost the swap is refused after it.
+            FAULT_AT_SYNC => {
+                sync && self
+                    .fault
+                    .compare_exchange(
+                        FAULT_AT_SYNC,
+                        FAULT_REFUSING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .map_or_else(|now| now == FAULT_REFUSING, |_| true)
+            }
+            _ => true,
+        };
+        if refused {
+            return self.latch(Err(StoreError::Backend("injected fault".to_owned())));
+        }
+        Ok(())
+    }
+
     /// Rows written outside any batch since this store was opened.
     ///
     /// The append path's own gate: an event's body, its stream row, its
@@ -811,6 +873,7 @@ impl FjallStore {
             journalled: AtomicU64::new(0),
             group: GroupCommit::default(),
             write_refused: AtomicBool::new(false),
+            fault: AtomicU8::new(NO_FAULT),
             db,
             partition,
             state_table,
@@ -1213,6 +1276,7 @@ impl Store for FjallStore {
     }
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        self.injected(false)?;
         self.latch(self.partition.insert(key, value).map_err(StoreError::from))?;
         self.written.fetch_add(1, Ordering::Relaxed);
         self.unbatched.fetch_add(1, Ordering::Relaxed);
@@ -1224,6 +1288,7 @@ impl Store for FjallStore {
         // returns. The non-waiting variant queues the rotation, which for a
         // fixture generator means writing the directory before the segment
         // it is supposed to contain.
+        self.injected(false)?;
         self.latch(
             self.partition
                 .rotate_memtable_and_wait()
@@ -1233,6 +1298,7 @@ impl Store for FjallStore {
     }
 
     fn delete(&self, key: &[u8]) -> Result<(), StoreError> {
+        self.injected(false)?;
         self.latch(self.partition.remove(key).map_err(StoreError::from))?;
         self.written.fetch_add(1, Ordering::Relaxed);
         self.unbatched.fetch_add(1, Ordering::Relaxed);
@@ -1259,6 +1325,7 @@ impl Store for FjallStore {
     }
 
     fn commit_deferred(&self, writes: &[Record]) -> Result<(), StoreError> {
+        self.injected(false)?;
         let mut batch = self.db.batch();
         for (key, value) in writes {
             batch.insert(&self.partition, key.as_slice(), value.as_slice());
@@ -1288,6 +1355,7 @@ impl Store for FjallStore {
         // `durability_modes_map_to_distinct_syscalls` keeps pinning
         // something real.
         let mode = durability.persist_mode();
+        self.injected(true)?;
         match durability {
             // `Buffer` is the absence of a barrier, and the bytes are already
             // in the journal. A promise not to sync now, kept.
@@ -1303,6 +1371,7 @@ impl Store for FjallStore {
     }
 
     fn flush(&self) -> Result<(), StoreError> {
+        self.injected(true)?;
         self.latch(
             self.db
                 .persist(PersistMode::SyncAll)

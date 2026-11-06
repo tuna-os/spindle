@@ -560,6 +560,7 @@ impl Rooms {
                     sender: &sender,
                     content: &content,
                     json,
+                    transaction: None,
                 },
             )?;
             // Two extremities now, ours and the peer's: their resolution is
@@ -1733,6 +1734,7 @@ impl Rooms {
                 sender: &sender,
                 content: &content,
                 json: &join_body,
+                transaction: None,
             },
         )?;
 
@@ -1858,7 +1860,7 @@ impl Rooms {
         json: &Value,
     ) -> Result<(), RoomError> {
         self.with_room(room_id, |rooms, log| {
-            rooms.ingest_checked(log, room_id, event_id, json, true, true)
+            rooms.ingest_checked(log, room_id, event_id, json, true, true, None)
         })
     }
 
