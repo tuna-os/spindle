@@ -1706,6 +1706,37 @@ impl Rooms {
             )?;
         }
 
+        // The membership the join replaces -- usually the invite it accepts
+        // -- rides the join as `unsigned`, as `build_event` stamps a local one:
+        // matrix-js-sdk reads an accepted invite's `is_direct` from the
+        // join's `prev_content`, so without it a DM joined over federation
+        // is not a DM to the joiner's client, and its ring shows as a
+        // group call (#795). Found among the join's auth events, which
+        // cite the joiner's current membership whether or not a partial
+        // state left it out.
+        let mut join_body = join_body;
+        let cited = super::edge_ids(&join_body["auth_events"]);
+        let replaced = ordered
+            .iter()
+            .chain(&auth_only)
+            .find(|(id, event)| {
+                cited.contains(id)
+                    && event["type"] == "m.room.member"
+                    && event["state_key"] == join_body["state_key"]
+            })
+            .map(|(id, event)| {
+                serde_json::json!({
+                    "replaces_state": id,
+                    "prev_content": event["content"],
+                    "prev_sender": event["sender"],
+                })
+            });
+        if let Some(unsigned) = replaced
+            && let Some(object) = join_body.as_object_mut()
+        {
+            object.insert("unsigned".to_owned(), unsigned);
+        }
+
         // The join itself is new activity: it goes through the shared
         // persistence spine, so it gets a stream row (the joiner's sync must
         // surface the room), the membership index, and waiter notification.

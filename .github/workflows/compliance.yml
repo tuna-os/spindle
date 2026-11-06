@@ -848,6 +848,7 @@ jobs:
           path: |
             tmp/element-call-results/
             tmp/element-call/playwright-report/
+            tmp/element-call/test-results/
           if-no-files-found: ignore
 
   # The mesh seam, nightly and in its turn on main: a Neutrino node built

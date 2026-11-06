@@ -721,3 +721,68 @@ async fn an_invite_whose_stripped_state_leaves_out_the_invite_still_renders() {
         "the inviter's own membership is kept: {events:?}"
     );
 }
+
+/// matrix-js-sdk learns that a room is a DM from the invite the user
+/// accepted: its `is_direct` and sender, read off the join's
+/// `unsigned.prev_content` and `prev_sender`. A join made over federation
+/// was stored as it was signed, with no `unsigned`, so a DM from another
+/// server was not a DM to the invitee's client and its ring showed as a
+/// group call (#795, found by Element Call's rig with Synapse in the second
+/// seat).
+#[tokio::test]
+async fn a_federated_join_carries_the_invite_it_accepts() {
+    let remote = Instance::start().await;
+    let local = Instance::start().await;
+    let alice = remote.register("alice").await;
+    let bob = local.register("bob").await;
+    let alice_id = format!("@alice:{}", remote.name);
+    let bob_id = format!("@bob:{}", local.name);
+
+    let (status, body) = remote
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(&json!({
+                "preset": "trusted_private_chat",
+                "is_direct": true,
+                "invite": [bob_id],
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = local
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/join/{room}"),
+            Some(&bob),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let sync = local.sync(&bob).await;
+    let joined = &sync["rooms"]["join"][&room];
+    let join = ["state", "timeline"]
+        .iter()
+        .filter_map(|section| joined[section]["events"].as_array())
+        .flatten()
+        .find(|event| {
+            event["type"] == "m.room.member"
+                && event["state_key"] == json!(bob_id)
+                && event["content"]["membership"] == "join"
+        })
+        .unwrap_or_else(|| panic!("bob's join is in his sync: {joined}"));
+    assert_eq!(
+        join["unsigned"]["prev_content"]["membership"],
+        json!("invite"),
+        "{join}"
+    );
+    assert_eq!(
+        join["unsigned"]["prev_content"]["is_direct"],
+        json!(true),
+        "{join}"
+    );
+    assert_eq!(join["unsigned"]["prev_sender"], json!(alice_id), "{join}");
+}
