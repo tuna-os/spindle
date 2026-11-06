@@ -8,18 +8,138 @@
 //! from a room the caller is not in, or from after they left, is the
 //! room's contents handed to someone who may not read them.
 
+#[path = "support/federation_auth.rs"]
+mod federation_auth;
+
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use ruma::RoomVersionId;
+use ruma::signatures::{Ed25519KeyPair, hash_and_sign_event};
 use serde_json::{Value, json};
 use spindle_store::FjallStore;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+/// A remote server whose events reach the harness over `PUT /send`, so a
+/// hit can carry whatever `origin_server_ts` its sender's clock said.
+struct Peer {
+    name: String,
+    pair: Ed25519KeyPair,
+}
+
+impl Peer {
+    async fn start() -> Peer {
+        let document = Ed25519KeyPair::generate();
+        let pair = Ed25519KeyPair::from_der(&document, "0".to_owned()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address: SocketAddr = listener.local_addr().unwrap();
+        let name = format!("127.0.0.1:{}", address.port());
+        let mut key_document = json!({
+            "server_name": name,
+            "valid_until_ts": now_millis() + 60_000,
+            "verify_keys": { "ed25519:0": { "key": unpadded(&pair.public_key()) } },
+        });
+        sign_value(&name, &pair, &mut key_document);
+        let router = axum::Router::new()
+            .route(
+                "/_matrix/key/v2/server",
+                axum::routing::get(move || {
+                    let body = key_document.clone();
+                    async move { axum::Json(body) }
+                }),
+            )
+            // The invite handshake's other half: echoing the event back is
+            // a valid answer, since signatures sit outside the hash the
+            // inviter checks.
+            .route(
+                "/_matrix/federation/v2/invite/{_room_id}/{_event_id}",
+                axum::routing::put(
+                    |axum::extract::Json(body): axum::extract::Json<Value>| async move {
+                        axum::Json(json!({ "event": body["event"] }))
+                    },
+                ),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        Peer { name, pair }
+    }
+
+    fn user(&self) -> String {
+        format!("@bob:{}", self.name)
+    }
+
+    /// A V11 event of this peer's making, its auth events chosen from the
+    /// harness's own view of the room: hashed and signed like the real
+    /// thing.
+    fn event(&self, store: &Arc<FjallStore>, event: Value) -> Value {
+        let event = federation_auth::with_auth_events(store, event);
+        let ruma::CanonicalJsonValue::Object(mut canonical) =
+            ruma::CanonicalJsonValue::try_from(event).unwrap()
+        else {
+            unreachable!()
+        };
+        let rules = RoomVersionId::V11.rules().unwrap();
+        hash_and_sign_event(&self.name, &self.pair, &mut canonical, &rules.redaction).unwrap();
+        serde_json::to_value(&canonical).unwrap()
+    }
+
+    fn transaction_header(&self, txn_id: &str, body: &Value) -> String {
+        let mut object = json!({
+            "method": "PUT",
+            "uri": format!("/_matrix/federation/v1/send/{txn_id}"),
+            "origin": self.name,
+            "destination": "example.org",
+            "content": body,
+        });
+        sign_value(&self.name, &self.pair, &mut object);
+        let signature = object["signatures"][&self.name]["ed25519:0"]
+            .as_str()
+            .unwrap();
+        format!(
+            "X-Matrix origin=\"{}\",destination=\"example.org\",key=\"ed25519:0\",sig=\"{signature}\"",
+            self.name
+        )
+    }
+}
+
+fn sign_value(entity: &str, pair: &Ed25519KeyPair, value: &mut Value) {
+    let ruma::CanonicalJsonValue::Object(mut object) =
+        ruma::CanonicalJsonValue::try_from(value.clone()).unwrap()
+    else {
+        unreachable!()
+    };
+    ruma::signatures::sign_json(entity, pair, &mut object).unwrap();
+    *value = serde_json::to_value(&object).unwrap();
+}
+
+fn unpadded(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let byte = |index: usize| -> u32 { chunk.get(index).copied().unwrap_or(0).into() };
+        let triple = (byte(0) << 16) | (byte(1) << 8) | byte(2);
+        for position in 0..=chunk.len() {
+            out.push(ALPHABET[((triple >> (18 - 6 * position)) & 0x3f) as usize] as char);
+        }
+    }
+    out
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap()
+}
+
 struct Harness {
     _dir: TempDir,
     app: axum::Router,
+    store: Arc<FjallStore>,
     txn: std::sync::atomic::AtomicU64,
 }
 
@@ -28,13 +148,15 @@ impl Harness {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
         let config = spindle_server::Config::parse(
-            "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n",
+            "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n\
+             [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n",
         )
         .unwrap();
-        let app = spindle_server::app(config, store).expect("a signing key is established");
+        let app = spindle_server::app(config, store.clone()).expect("a signing key is established");
         Self {
             _dir: dir,
             app,
+            store,
             txn: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -137,12 +259,102 @@ impl Harness {
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        // Search orders across rooms by `origin_server_ts`, which is a
-        // millisecond, and two sends here can land in the same one; the
-        // server then breaks the tie by room ID, which is random. Let the
-        // clock move on so "newest first" means what the test says.
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         body["event_id"].as_str().unwrap().to_owned()
+    }
+
+    /// The newest event in `room`, for a remote event's `prev_events`.
+    async fn head_event(&self, room: &str, token: &str) -> String {
+        let (_, body) = self
+            .call(
+                Request::builder()
+                    .uri(format!(
+                        "/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=1"
+                    ))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        body["chunk"][0]["event_id"].as_str().unwrap().to_owned()
+    }
+
+    /// Deliver `pdu` from `peer` in a transaction of its own, and expect it
+    /// accepted. Returns its event ID.
+    async fn deliver(&self, peer: &Peer, txn_id: &str, pdu: Value) -> String {
+        let body = json!({ "origin": peer.name, "origin_server_ts": now_millis(), "pdus": [pdu] });
+        let (status, answer) = self
+            .call(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/_matrix/federation/v1/send/{txn_id}"))
+                    .header("authorization", peer.transaction_header(txn_id, &body))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        let (event_id, outcome) = answer["pdus"].as_object().unwrap().iter().next().unwrap();
+        assert_eq!(outcome, &json!({}), "{answer}");
+        event_id.clone()
+    }
+
+    /// A room of `alice`'s that the peer's user has joined over federation.
+    async fn room_with_peer(&self, alice: &str, peer: &Peer) -> String {
+        let room = self.create_room(alice, json!({})).await;
+        let (status, body) = self
+            .post(
+                &format!("/_matrix/client/v3/rooms/{room}/invite"),
+                alice,
+                &json!({ "user_id": peer.user() }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let head = self.head_event(&room, alice).await;
+        let join = peer.event(
+            &self.store,
+            json!({
+                "type": "m.room.member",
+                "state_key": peer.user(),
+                "sender": peer.user(),
+                "room_id": room,
+                "content": { "membership": "join" },
+                "origin_server_ts": now_millis(),
+                "depth": 10,
+                "prev_events": [head],
+                "auth_events": [],
+            }),
+        );
+        self.deliver(peer, "join", join).await;
+        room
+    }
+
+    /// A message from the peer's user, stamped `origin_server_ts` by its
+    /// sender's clock. Returns its event ID.
+    async fn say_remotely(
+        &self,
+        peer: &Peer,
+        room: &str,
+        alice: &str,
+        text: &str,
+        origin_server_ts: u64,
+    ) -> String {
+        let head = self.head_event(room, alice).await;
+        let message = peer.event(
+            &self.store,
+            json!({
+                "type": "m.room.message",
+                "sender": peer.user(),
+                "room_id": room,
+                "content": { "msgtype": "m.text", "body": text },
+                "origin_server_ts": origin_server_ts,
+                "depth": 11,
+                "prev_events": [head],
+                "auth_events": [],
+            }),
+        );
+        let txn = self.txn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.deliver(peer, &format!("m{txn}"), message).await
     }
 
     /// Invite and join, so `user` is a member of `room`.
@@ -350,6 +562,141 @@ async fn pages_walk_every_hit_once_across_rooms() {
     assert_eq!(status, StatusCode::OK, "{page}");
     assert_eq!(bodies(&page), vec!["needle 1"]);
     assert!(page.get("next_batch").is_none(), "{page}");
+}
+
+fn event_ids(page: &Value) -> Vec<String> {
+    page["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["result"]["event_id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Search for "needle" at `limit` from `next_batch` until the pages run
+/// out, asserting nothing comes back twice; returns the event IDs and the
+/// number of pages.
+async fn walk(
+    h: &Harness,
+    token: &str,
+    limit: usize,
+    next_batch: Option<String>,
+) -> (Vec<String>, usize) {
+    let mut seen: Vec<String> = Vec::new();
+    let mut next = next_batch;
+    let mut pages = 0;
+    loop {
+        let (status, page) = h
+            .search(
+                token,
+                json!({ "search_term": "needle", "filter": { "limit": limit } }),
+                next.as_deref(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        pages += 1;
+        assert!(pages <= 20, "paging at {limit} does not end");
+        for id in event_ids(&page) {
+            assert!(!seen.contains(&id), "{id} came back twice at limit {limit}");
+            seen.push(id);
+        }
+        match page["next_batch"].as_str() {
+            Some(token) => next = Some(token.to_owned()),
+            None => return (seen, pages),
+        }
+    }
+}
+
+/// #637: newest first is the order hits reached the server, not their
+/// `origin_server_ts`. A remote server whose clock runs an hour behind
+/// stamps a hit older than the ones on either side of it; a timestamp
+/// order then takes the hit below it in the same room first, moves that
+/// room's cursor past it, and never serves it. Local sends, back to back,
+/// also tie on the millisecond across rooms. Every page size serves every
+/// hit once, in arrival order.
+#[tokio::test]
+async fn every_page_size_serves_every_hit_once_when_a_clock_runs_behind() {
+    let peer = Peer::start().await;
+    let h = Harness::new();
+    let alice = h.register("alice").await;
+    let local = h.create_room(&alice, json!({})).await;
+    let shared = h.room_with_peer(&alice, &peer).await;
+    let behind = now_millis() - 3_600_000;
+    let mut said = vec![
+        h.say(&local, &alice, "needle 0").await,
+        h.say(&shared, &alice, "needle 1").await,
+        h.say_remotely(&peer, &shared, &alice, "needle 2, an hour behind", behind)
+            .await,
+        h.say(&local, &alice, "needle 3").await,
+        h.say(&shared, &alice, "needle 4").await,
+    ];
+    said.reverse();
+    for limit in 1..=said.len() + 1 {
+        let (seen, pages) = walk(&h, &alice, limit, None).await;
+        assert_eq!(seen, said, "limit {limit}: every hit, newest first, once");
+        assert!(
+            pages <= said.len().div_ceil(limit) + 1,
+            "limit {limit}: {pages} pages"
+        );
+    }
+}
+
+/// Two rooms with hits sent back to back, newest first.
+async fn two_rooms(h: &Harness) -> (String, Vec<String>, Vec<String>) {
+    let alice = h.register("alice").await;
+    let rooms = vec![
+        h.create_room(&alice, json!({})).await,
+        h.create_room(&alice, json!({})).await,
+    ];
+    let mut said = Vec::new();
+    for (n, room) in [0, 1, 1, 0, 1, 0].into_iter().enumerate() {
+        said.push(h.say(&rooms[room], &alice, &format!("needle {n}")).await);
+    }
+    said.reverse();
+    (alice, rooms, said)
+}
+
+/// A walk is cut to where its first page stood: a hit sent mid-walk is not
+/// served out of order on a later page, and leads the next walk.
+#[tokio::test]
+async fn a_walk_is_a_snapshot() {
+    let h = Harness::new();
+    let (alice, rooms, said) = two_rooms(&h).await;
+    let (_, first) = walk_one(&h, &alice, 2).await;
+    let token = first["next_batch"].as_str().unwrap().to_owned();
+    let late = h.say(&rooms[0], &alice, "needle, late").await;
+    let (rest, _) = walk(&h, &alice, 2, Some(token)).await;
+    let mut seen = event_ids(&first);
+    seen.extend(rest);
+    assert_eq!(seen, said);
+    let (_, fresh) = walk_one(&h, &alice, 1).await;
+    assert_eq!(event_ids(&fresh), vec![late]);
+}
+
+/// A `next_batch` from before the snapshot was added (the bare per-room
+/// cursor) still parses, and resumes each room it names exactly.
+#[tokio::test]
+async fn a_token_without_a_snapshot_still_resumes() {
+    let h = Harness::new();
+    let (alice, _, said) = two_rooms(&h).await;
+    let (_, first) = walk_one(&h, &alice, 2).await;
+    let token = first["next_batch"].as_str().unwrap();
+    let (snapshot, old) = token.split_once(';').unwrap();
+    assert!(snapshot.starts_with('s'), "{token}");
+    let (rest, _) = walk(&h, &alice, 2, Some(old.to_owned())).await;
+    let mut seen = event_ids(&first);
+    seen.extend(rest);
+    assert_eq!(seen, said);
+}
+
+/// The first page of a "needle" search at `limit`.
+async fn walk_one(h: &Harness, token: &str, limit: usize) -> (StatusCode, Value) {
+    h.search(
+        token,
+        json!({ "search_term": "needle", "filter": { "limit": limit } }),
+        None,
+    )
+    .await
 }
 
 #[tokio::test]

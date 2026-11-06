@@ -6,8 +6,9 @@ use crate::auth::Authenticated;
 use crate::errors::MatrixError;
 use crate::rooms::ReadScope;
 use crate::routes::{
-    PublicRoomsQuery, PublicRoomsRequest, SEARCH_LIMIT_MAX, SearchHit, as_seen_by, directory_error,
-    directory_page, origin_server_ts, parse_search_cursor, room_error, search_cursor,
+    PublicRoomsQuery, PublicRoomsRequest, RoomStreamOrder, SEARCH_LIMIT_MAX, SearchHit, as_seen_by,
+    directory_error, directory_page, page_by_stream, parse_stream_cursor, room_error,
+    stream_cursor,
 };
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get, routing::post};
 use serde::Deserialize;
@@ -552,9 +553,10 @@ struct SearchPage {
 /// rooms they are joined to, or the `filter.rooms` they name, each under
 /// its own [`crate::rooms::Rooms::read_scope`] so a former member searches only the stretch
 /// they may read and a room the caller may not see contributes nothing
-/// rather than refusing the whole search. Newest first, by
-/// `origin_server_ts` across rooms and by position within one; `rank` is
-/// the same order, since nothing here scores.
+/// rather than refusing the whole search. Newest first in the server-wide
+/// stream order, the order events reached this server, not
+/// `origin_server_ts` (see [`page_by_stream`] for why); `rank` is the same
+/// order, since nothing here scores.
 ///
 /// `count` is the number on this page. The spec calls the field an
 /// approximation of the total, and a true total would mean walking every
@@ -591,19 +593,23 @@ async fn search(
         .limit
         .unwrap_or(SEARCH_LIMIT)
         .clamp(1, SEARCH_LIMIT_MAX);
-    let mut cursor = match query.next_batch.as_deref() {
-        Some(token) => parse_search_cursor(token)?,
-        None => BTreeMap::new(),
+    let (snapshot, mut cursor) = match query.next_batch.as_deref() {
+        Some(token) => parse_stream_cursor(token, "next_batch")?,
+        None => (None, BTreeMap::new()),
     };
+    // A token from before the snapshot existed resumes against the stream
+    // as it stands now; the token handed back carries that position.
+    let snapshot = snapshot.unwrap_or_else(|| state.rooms.stream_position());
+    let matches = |event: &Value| search_matches(event, &needle, &keys, &criteria.filter);
 
     let SearchPage { hits, scopes, more } = search_rooms(
         &state,
         &identity.user_id,
-        &criteria,
-        &needle,
-        &keys,
+        criteria.filter.rooms.as_deref(),
+        &criteria.filter.not_rooms,
+        &matches,
         limit,
-        &mut cursor,
+        (snapshot, &mut cursor),
     )?;
 
     let results: Vec<Value> = hits
@@ -633,7 +639,10 @@ async fn search(
     );
     room_events.insert("results".to_owned(), Value::Array(results));
     if more {
-        room_events.insert("next_batch".to_owned(), json!(search_cursor(&cursor)));
+        room_events.insert(
+            "next_batch".to_owned(),
+            json!(stream_cursor(snapshot, &cursor)),
+        );
     }
     if criteria.include_state {
         room_events.insert(
@@ -646,30 +655,31 @@ async fn search(
     })))
 }
 
-/// Walk every room the search covers and gather its hits: the caller's
-/// joined rooms, or the `filter.rooms` named, each under its own
-/// [`crate::rooms::Rooms::read_scope`], and each resumed from `cursor`. Returns the hits
-/// newest first and cut to `limit`, the scope of each room that was
-/// searched (the context needs it again), and whether a further page
-/// exists; `cursor` is advanced to where that page starts.
+/// Walk every room the search covers and gather what `matches` accepts:
+/// the caller's joined rooms, or the `rooms` named, less `not_rooms`, each
+/// under its own [`crate::rooms::Rooms::read_scope`], resumed from the
+/// cursor and cut to what had reached the snapshot's stream position.
+/// Returns the hits newest first and cut to `limit`, the scope of each
+/// room that was searched (the context needs it again), and whether a
+/// further page exists; the cursor is advanced to where that page starts.
 fn search_rooms(
     state: &AppState,
     user_id: &str,
-    criteria: &RoomEventsCriteria,
-    needle: &str,
-    keys: &[String],
+    rooms: Option<&[String]>,
+    not_rooms: &[String],
+    matches: &(dyn Fn(&Value) -> bool + Sync),
     limit: usize,
-    cursor: &mut BTreeMap<String, i64>,
+    (snapshot, cursor): (u64, &mut BTreeMap<String, i64>),
 ) -> Result<SearchPage, MatrixError> {
-    let rooms = match &criteria.filter.rooms {
-        Some(rooms) => rooms.clone(),
+    let rooms = match rooms {
+        Some(rooms) => rooms.to_vec(),
         None => state.rooms.joined(user_id).map_err(room_error)?,
     };
     let mut scopes: BTreeMap<String, ReadScope> = BTreeMap::new();
-    let mut hits: Vec<SearchHit> = Vec::new();
+    let mut hits: Vec<(u64, SearchHit)> = Vec::new();
     let mut more = false;
     for room_id in rooms {
-        if criteria.filter.not_rooms.contains(&room_id) {
+        if not_rooms.contains(&room_id) {
             continue;
         }
         // A room the caller may not read contributes nothing, rather than
@@ -677,52 +687,28 @@ fn search_rooms(
         let Ok(scope) = state.rooms.read_scope(user_id, &room_id) else {
             continue;
         };
-        let matches = |event: &Value| search_matches(event, needle, keys, &criteria.filter);
+        let order = RoomStreamOrder::new(state.rooms.stream_rows(&room_id).map_err(room_error)?);
+        let from = order.start(cursor.get(&room_id).copied(), snapshot);
         let (found, next) = state
             .rooms
             .reader_with(user_id, &room_id, scope.clone())
-            .search(cursor.get(&room_id).copied(), limit, &matches)
+            .search(from, limit, matches)
             .map_err(room_error)?;
         more |= next.is_some();
-        hits.extend(found.into_iter().map(|event| SearchHit {
-            room_id: room_id.clone(),
-            event,
+        hits.extend(found.into_iter().map(|event| {
+            (
+                order.key(event.li),
+                SearchHit {
+                    room_id: room_id.clone(),
+                    event,
+                },
+            )
         }));
         scopes.insert(room_id, scope);
     }
-    more |= page_newest_first(&mut hits, limit, cursor);
+    more |= page_by_stream(&mut hits, limit, cursor);
+    let hits = hits.into_iter().map(|(_, hit)| hit).collect();
     Ok(SearchPage { hits, scopes, more })
-}
-
-/// Cut a walk's hits to one page, newest first across rooms, and advance
-/// the per-room cursor to where the next page starts. Returns whether the
-/// cut left anything behind.
-///
-/// Ties by room and then position, so a page boundary falls in the same
-/// place however the rooms were walked. Each room resumes below the oldest
-/// position taken from it; a room nothing was taken from resumes where it
-/// was, and finds the same hits again -- which is what makes the pages
-/// neither skip nor repeat.
-fn page_newest_first(
-    hits: &mut Vec<SearchHit>,
-    limit: usize,
-    cursor: &mut BTreeMap<String, i64>,
-) -> bool {
-    hits.sort_by(|a, b| {
-        origin_server_ts(b)
-            .cmp(&origin_server_ts(a))
-            .then_with(|| a.room_id.cmp(&b.room_id))
-            .then_with(|| b.event.li.cmp(&a.event.li))
-    });
-    let more = hits.len() > limit;
-    hits.truncate(limit);
-    for hit in hits.iter() {
-        cursor
-            .entry(hit.room_id.clone())
-            .and_modify(|from| *from = (*from).min(hit.event.li))
-            .or_insert(hit.event.li);
-    }
-    more
 }
 
 /// The current state of each room with a hit, for `include_state`: the

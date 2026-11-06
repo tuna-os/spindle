@@ -996,32 +996,53 @@ pub(crate) fn directory_page(
 
 pub(crate) const SEARCH_LIMIT_MAX: usize = 100;
 
-/// Where each room's next page starts, as the opaque `next_batch` a client
-/// hands back: `li:room_id` pairs joined by `;`, the position first because
-/// a room ID has colons of its own. Per room rather than one global
-/// position because positions are per room, and a page that stops in the
-/// middle of one room's hits must resume exactly there while the other
-/// rooms resume where they were.
-pub(crate) fn parse_search_cursor(token: &str) -> Result<BTreeMap<String, i64>, MatrixError> {
+/// A `/search` `next_batch` or `/notifications` `next_token`, parsed:
+/// `s<stream position>;` and then the per-room cursor (see
+/// [`page_by_stream`]). The position is where the walk's first page
+/// stood; every later page is cut to it, so an event or a room arriving
+/// mid-walk waits for the next walk instead of landing out of order on a
+/// later page.
+///
+/// A token from before the position was added is the bare per-room
+/// cursor. It still parses, with no position, and resumes each room where
+/// it says (no repeats, no skips within a room it names). `param` names
+/// the query parameter in the error a malformed token gets.
+pub(crate) fn parse_stream_cursor(
+    token: &str,
+    param: &str,
+) -> Result<(Option<u64>, BTreeMap<String, i64>), MatrixError> {
+    let malformed = || MatrixError::bad_json(format!("{param} is not a pagination token"));
+    // A cursor pair starts with a position (a digit or `-`), so a leading
+    // `s` is unambiguous.
+    let (position, rooms) = match token.strip_prefix('s') {
+        Some(rest) => {
+            let (position, rooms) = rest.split_once(';').unwrap_or((rest, ""));
+            (
+                Some(position.parse::<u64>().map_err(|_| malformed())?),
+                rooms,
+            )
+        }
+        None => (None, token),
+    };
+    // Each room's pair is `li:room_id`, the position first because a room
+    // ID has colons of its own.
     let mut cursor = BTreeMap::new();
-    for pair in token.split(';').filter(|pair| !pair.is_empty()) {
-        let (li, room_id) = pair
-            .split_once(':')
-            .ok_or_else(|| MatrixError::bad_json("next_batch is not a search token"))?;
-        let li = li
-            .parse::<i64>()
-            .map_err(|_| MatrixError::bad_json("next_batch is not a search token"))?;
+    for pair in rooms.split(';').filter(|pair| !pair.is_empty()) {
+        let (li, room_id) = pair.split_once(':').ok_or_else(malformed)?;
+        let li = li.parse::<i64>().map_err(|_| malformed())?;
         cursor.insert(room_id.to_owned(), li);
     }
-    Ok(cursor)
+    Ok((position, cursor))
 }
 
-pub(crate) fn search_cursor(cursor: &BTreeMap<String, i64>) -> String {
-    cursor
+/// The token [`parse_stream_cursor`] reads back.
+pub(crate) fn stream_cursor(snapshot: u64, cursor: &BTreeMap<String, i64>) -> String {
+    let rooms = cursor
         .iter()
         .map(|(room_id, li)| format!("{li}:{room_id}"))
         .collect::<Vec<_>>()
-        .join(";")
+        .join(";");
+    format!("s{snapshot};{rooms}")
 }
 
 /// One search hit, with where it came from.
@@ -1032,6 +1053,92 @@ pub(crate) struct SearchHit {
 
 pub(crate) fn origin_server_ts(hit: &SearchHit) -> i64 {
     hit.event.json["origin_server_ts"].as_i64().unwrap_or(0)
+}
+
+/// One room's events placed in the server-wide stream order.
+///
+/// Each event's key is the highest stream id at or below its position in
+/// the room. An indexed event gets its own id (ids rise with position, as
+/// both are assigned under the room's append lock); an event with no index
+/// row inherits the one below it. Taking the running maximum makes the key
+/// never fall as the position rises, which is what [`page_by_stream`]
+/// needs, whatever the index holds.
+pub(crate) struct RoomStreamOrder {
+    /// `(li, key)`, ascending in both.
+    rows: Vec<(i64, u64)>,
+}
+
+impl RoomStreamOrder {
+    /// The order of the room whose reverse stream index is `rows`
+    /// ([`crate::rooms::Rooms::stream_rows`]).
+    pub(crate) fn new(mut rows: Vec<(i64, u64)>) -> Self {
+        rows.sort_unstable();
+        let mut high = 0;
+        for row in &mut rows {
+            high = high.max(row.1);
+            row.1 = high;
+        }
+        Self { rows }
+    }
+
+    pub(crate) fn key(&self, li: i64) -> u64 {
+        match self.rows.partition_point(|(at, _)| *at <= li) {
+            0 => 0,
+            n => self.rows[n - 1].1,
+        }
+    }
+
+    /// The exclusive `from` that keeps a walk to the events at or before
+    /// stream position `snapshot`, or `None` when that is all of them.
+    pub(crate) fn bound(&self, snapshot: u64) -> Option<i64> {
+        let first_after = self.rows.partition_point(|(_, key)| *key <= snapshot);
+        self.rows.get(first_after).map(|(li, _)| *li)
+    }
+
+    /// Where this room's walk starts: below `resume`, the room's entry in
+    /// the token, and below what arrived after `snapshot`.
+    pub(crate) fn start(&self, resume: Option<i64>, snapshot: u64) -> Option<i64> {
+        match (resume, self.bound(snapshot)) {
+            (Some(resume), Some(bound)) => Some(resume.min(bound)),
+            (resume, bound) => resume.or(bound),
+        }
+    }
+}
+
+/// Cut a walk of several rooms to one page, newest first by stream key
+/// (see [`RoomStreamOrder`]), then room, then position: a total order.
+/// Advances the per-room cursor to where the next page starts and returns
+/// whether the cut left anything behind.
+///
+/// Each room is walked by position and resumes below the oldest position
+/// taken from it; a room nothing was taken from resumes where it was, and
+/// finds the same hits again. The merge across rooms is exact only if the
+/// sort key never rises as the position falls, which is why the key is
+/// not `origin_server_ts`: a federated event can carry any `ts`, and the
+/// local clock can step back. Then a page takes an older position first,
+/// the cursor drops below a newer one, and that event is never served
+/// (#635 for `/notifications`, #637 for `/search`). The stream key cannot
+/// do this.
+pub(crate) fn page_by_stream(
+    hits: &mut Vec<(u64, SearchHit)>,
+    limit: usize,
+    cursor: &mut BTreeMap<String, i64>,
+) -> bool {
+    hits.sort_by(|(a_key, a), (b_key, b)| {
+        b_key
+            .cmp(a_key)
+            .then_with(|| a.room_id.cmp(&b.room_id))
+            .then_with(|| b.event.li.cmp(&a.event.li))
+    });
+    let more = hits.len() > limit;
+    hits.truncate(limit);
+    for (_, hit) in hits.iter() {
+        cursor
+            .entry(hit.room_id.clone())
+            .and_modify(|from| *from = (*from).min(hit.event.li))
+            .or_insert(hit.event.li);
+    }
+    more
 }
 
 /// What the evaluator needs of a room, gathered once per room per page.
@@ -1187,4 +1294,194 @@ pub(crate) fn space_children(state: &AppState, room_id: &str, suggested_only: bo
         key(left).cmp(&key(right))
     });
     children
+}
+
+#[cfg(test)]
+mod stream_order_tests {
+    use std::collections::BTreeMap;
+
+    use serde_json::json;
+
+    use super::{RoomStreamOrder, SearchHit, page_by_stream, parse_stream_cursor, stream_cursor};
+
+    /// One stored event: its room, position, stream id and timestamp.
+    #[derive(Clone)]
+    struct Stored {
+        room: &'static str,
+        li: i64,
+        stream: u64,
+        ts: i64,
+    }
+
+    /// Events in arrival order across three rooms, every one stamped the
+    /// same millisecond (the tie the CI flake hit), and one late federated
+    /// event in `!c` whose `ts` is older than everything else (the case a
+    /// timestamp order skips).
+    fn history() -> Vec<Stored> {
+        let rooms = [
+            "!c:x", "!a:x", "!b:x", "!a:x", "!c:x", "!b:x", "!b:x", "!a:x", "!c:x",
+        ];
+        let mut next_li: BTreeMap<&str, i64> = BTreeMap::new();
+        rooms
+            .iter()
+            .enumerate()
+            .map(|(n, room)| {
+                let li = next_li.entry(room).or_insert(10);
+                *li += 1;
+                Stored {
+                    room,
+                    li: *li,
+                    stream: n as u64 + 1,
+                    ts: if n == 8 { 5 } else { 1_000 },
+                }
+            })
+            .collect()
+    }
+
+    /// The room walk the store does: the newest `limit` positions below
+    /// `from`, and whether more remain.
+    fn walk(
+        history: &[Stored],
+        room: &str,
+        from: Option<i64>,
+        limit: usize,
+    ) -> (Vec<Stored>, bool) {
+        let mut below: Vec<Stored> = history
+            .iter()
+            .filter(|event| event.room == room && from.is_none_or(|from| event.li < from))
+            .cloned()
+            .collect();
+        below.sort_by_key(|event| std::cmp::Reverse(event.li));
+        let more = below.len() > limit;
+        below.truncate(limit);
+        (below, more)
+    }
+
+    fn hit(event: &Stored) -> SearchHit {
+        SearchHit {
+            room_id: event.room.to_owned(),
+            event: crate::rooms::TimelineEvent {
+                event_id: format!("${}", event.stream),
+                li: event.li,
+                json: json!({ "origin_server_ts": event.ts }),
+            },
+        }
+    }
+
+    /// Page through `history` at `limit` the way the handler does, a token
+    /// round trip between pages, and return the stream ids served. `after`
+    /// arrives once the first page is out.
+    fn page_through(history: &[Stored], after: &[Stored], limit: usize) -> Vec<u64> {
+        let mut store = history.to_vec();
+        let mut token: Option<String> = None;
+        let mut served = Vec::new();
+        for _ in 0..=store.len() + after.len() {
+            let (snapshot, mut cursor) = match &token {
+                Some(token) => parse_stream_cursor(token, "from").unwrap(),
+                None => (None, BTreeMap::new()),
+            };
+            let snapshot =
+                snapshot.unwrap_or_else(|| store.iter().map(|e| e.stream).max().unwrap_or(0));
+            let mut hits = Vec::new();
+            let mut more = false;
+            for room in ["!a:x", "!b:x", "!c:x", "!d:x"] {
+                let order = RoomStreamOrder::new(
+                    store
+                        .iter()
+                        .filter(|e| e.room == room)
+                        .map(|e| (e.li, e.stream))
+                        .collect(),
+                );
+                let from = order.start(cursor.get(room).copied(), snapshot);
+                let (found, next) = walk(&store, room, from, limit);
+                more |= next;
+                hits.extend(found.iter().map(|e| (order.key(e.li), hit(e))));
+            }
+            more |= page_by_stream(&mut hits, limit, &mut cursor);
+            served.extend(hits.iter().map(|(key, _)| *key));
+            if token.is_none() {
+                store.extend_from_slice(after);
+            }
+            if !more {
+                return served;
+            }
+            token = Some(stream_cursor(snapshot, &cursor));
+        }
+        panic!("paging at {limit} did not end");
+    }
+
+    #[test]
+    fn every_page_size_serves_the_stream_newest_first_exactly_once() {
+        let history = history();
+        let expected: Vec<u64> = (1..=history.len() as u64).rev().collect();
+        for limit in 1..=history.len() + 1 {
+            assert_eq!(
+                page_through(&history, &[], limit),
+                expected,
+                "limit {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn what_arrives_mid_walk_waits_for_the_next_walk() {
+        let history = history();
+        let next = history.len() as u64 + 1;
+        // A newer event in a room already walked, and one in a room the
+        // first page never saw.
+        let after = [
+            Stored {
+                room: "!a:x",
+                li: 100,
+                stream: next,
+                ts: 2_000,
+            },
+            Stored {
+                room: "!d:x",
+                li: 1,
+                stream: next + 1,
+                ts: 2_000,
+            },
+        ];
+        let expected: Vec<u64> = (1..=history.len() as u64).rev().collect();
+        for limit in 1..=history.len() {
+            assert_eq!(
+                page_through(&history, &after, limit),
+                expected,
+                "limit {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_event_with_no_index_row_takes_the_key_below_it() {
+        let order = RoomStreamOrder::new(vec![(5, 40), (2, 10), (8, 30)]);
+        assert_eq!(order.key(1), 0);
+        assert_eq!(order.key(2), 10);
+        assert_eq!(order.key(4), 10);
+        assert_eq!(order.key(5), 40);
+        // A row out of step with its position cannot make the key fall.
+        assert_eq!(order.key(8), 40);
+        assert_eq!(order.bound(10), Some(5));
+        assert_eq!(order.bound(40), None);
+        assert_eq!(order.bound(0), Some(2));
+    }
+
+    #[test]
+    fn a_token_from_before_the_snapshot_still_parses() {
+        let parse = |token: &str| parse_stream_cursor(token, "from");
+        let (snapshot, rooms) = parse("12:!a:x;7:!b:x").unwrap();
+        assert_eq!(snapshot, None);
+        assert_eq!(rooms.get("!a:x"), Some(&12));
+        assert_eq!(rooms.get("!b:x"), Some(&7));
+        let (snapshot, rooms) = parse("s99;12:!a:x").unwrap();
+        assert_eq!(snapshot, Some(99));
+        assert_eq!(rooms.get("!a:x"), Some(&12));
+        assert_eq!(
+            parse(&stream_cursor(5, &BTreeMap::new())).unwrap(),
+            (Some(5), BTreeMap::new())
+        );
+        assert!(parse("sx;1:!a:x").is_err());
+        assert!(parse("garbage").is_err());
+    }
 }
