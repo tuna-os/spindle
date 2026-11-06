@@ -1390,30 +1390,7 @@ async fn room_joined_members(
     // As `/members`: the roster of a partial-state room waits for its
     // resync.
     state.rooms.await_full_state(&room_id).await;
-    let members = if state.rooms.erasure_active().map_err(room_error)? {
-        state
-            .rooms
-            .reader(&identity.user_id, &room_id)
-            .map_err(room_error)?
-            .members()
-            .map_err(room_error)?
-            .into_iter()
-            .filter(|event| event["content"]["membership"] == "join")
-            .filter_map(|event| {
-                event["state_key"].as_str().map(|user| {
-                    (
-                        user.to_owned(),
-                        json!({
-                            "display_name": event["content"]["displayname"],
-                            "avatar_url": event["content"]["avatar_url"]
-                        }),
-                    )
-                })
-            })
-            .collect()
-    } else {
-        state.rooms.joined_members(&room_id).map_err(room_error)?
-    };
+    let members = state.rooms.joined_members(&room_id).map_err(room_error)?;
     Ok(Json(json!({ "joined": members })))
 }
 
@@ -1534,13 +1511,7 @@ async fn room_summary(
         room_id_or_alias
     };
 
-    let user_id = viewer
-        .as_ref()
-        .map_or("", |identity| identity.user_id.as_str());
-    let summary = state
-        .rooms
-        .summary_for(user_id, &room_id)
-        .map_err(room_error)?;
+    let summary = state.rooms.summary(&room_id).map_err(room_error)?;
     let membership = match viewer {
         Some(identity) => {
             let joined = state.rooms.joined(&identity.user_id).map_err(room_error)?;
@@ -1815,7 +1786,7 @@ fn hierarchy_visible(
     user: &str,
     room_id: &str,
 ) -> Option<crate::rooms::RoomSummary> {
-    let summary = state.rooms.summary_for(user, room_id).ok()?;
+    let summary = state.rooms.summary(room_id).ok()?;
     if state.rooms.is_joined(user, room_id).unwrap_or(false) {
         return Some(summary);
     }

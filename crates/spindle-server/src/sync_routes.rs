@@ -1043,25 +1043,6 @@ fn lazy_members_expanded(
         .collect()
 }
 
-fn sliding_heroes(
-    state: &AppState,
-    reader: &crate::rooms::RoomReader<'_>,
-    roster: &crate::rooms::Roster,
-    viewer: &str,
-) -> Result<Vec<Value>, MatrixError> {
-    let mut heroes = roster.heroes.clone();
-    if state.rooms.erasure_active().map_err(room_error)? {
-        for hero in &mut heroes {
-            let member = reader
-                .state_event("m.room.member", &hero.user_id)
-                .map_err(room_error)?;
-            hero.displayname = member["displayname"].as_str().map(str::to_owned);
-            hero.avatar_url = member["avatar_url"].as_str().map(str::to_owned);
-        }
-    }
-    Ok(crate::sliding::heroes(&heroes, viewer))
-}
-
 fn sliding_required_state(
     state: &AppState,
     identity: &crate::accounts::Identity,
@@ -1118,10 +1099,8 @@ fn sliding_required_state(
             })
             .collect()
     };
-    state
-        .rooms
-        .prune_erased_events(&identity.user_id, room_id, state_events)
-        .map_err(room_error)
+    // Unpruned for an erased sender, as Synapse serves room state.
+    Ok(state_events)
 }
 
 /// One room entry to render: which room, with what config, how the client
@@ -1260,12 +1239,9 @@ fn sliding_room_entry(
     room: &RoomRender<'_>,
 ) -> Result<Value, MatrixError> {
     let room_id = room.room_id;
-    let reader = state
+    let name = state
         .rooms
-        .reader(&identity.user_id, room_id)
-        .map_err(room_error)?;
-    let name = reader
-        .state_event("m.room.name", "")
+        .state_event_unscoped(room_id, "m.room.name", "")
         .ok()
         .and_then(|content| content["name"].as_str().map(str::to_owned));
     let (timeline, changed_ids) = sliding_timeline(state, identity, room)?;
@@ -1285,11 +1261,12 @@ fn sliding_room_entry(
         sliding_required_state(state, identity, room_id, &required_state)?
     };
     let roster = state.rooms.roster(room_id).map_err(room_error)?;
-    let avatar = reader
-        .state_event("m.room.avatar", "")
+    let avatar = state
+        .rooms
+        .state_event_unscoped(room_id, "m.room.avatar", "")
         .ok()
         .and_then(|content| content["url"].as_str().map(str::to_owned));
-    let heroes = sliding_heroes(state, &reader, &roster, &identity.user_id)?;
+    let heroes = crate::sliding::heroes(&roster.heroes, &identity.user_id);
     let bump_stamp = state.rooms.last_activity(room_id).map_err(room_error)?;
     let unread = state
         .rooms

@@ -27,6 +27,16 @@ fn erasure_policy_key() -> Vec<u8> {
     room_prefix(Keyspace::ErasurePolicy, "")
 }
 
+/// The generation an erasure marker holds; 0 means no account was ever
+/// erased. Stores written before generations existed hold one byte, `[0]`
+/// or `[1]`, which read as generations 0 and 1.
+fn erasure_generation_of(value: &[u8]) -> u64 {
+    <[u8; 8]>::try_from(value).map_or_else(
+        |_| value.first().copied().map_or(0, u64::from),
+        u64::from_be_bytes,
+    )
+}
+
 /// How many bytes of entropy an access token carries.
 ///
 /// 32 bytes is 256 bits, which is not guessable by anyone, ever. The token is
@@ -68,8 +78,8 @@ pub struct Account {
     /// Erased (GDPR): the user asked for their data to be forgotten when
     /// the account was deactivated. Carried from Synapse's `erased_users`
     /// and set by a deactivation with `erase`. Spindle clears the profile
-    /// on erasure; it does not yet hide an erased user's events from
-    /// members who join later, which Synapse does (#576).
+    /// on erasure, and serves the user's events pruned to readers who were
+    /// not joined when they were sent, as Synapse does (#576).
     #[serde(default)]
     pub erased: bool,
 }
@@ -266,8 +276,20 @@ impl<'a, S: Store> Accounts<'a, S> {
         };
         account.erased = erased;
         let mut writes = vec![(account_key(localpart), encode(&account)?)];
-        if erased {
-            writes.push((erasure_policy_key(), vec![1]));
+        // Every change moves the generation, un-erasing included: readers
+        // cache the erased set per generation, so a change that left it
+        // alone would leave them serving a stale set. Nothing ever erased
+        // and nothing erased now keeps the marker unwritten, which is what
+        // lets an untouched server skip the policy entirely.
+        let current = self
+            .store
+            .get(&erasure_policy_key())?
+            .map_or(0, |value| erasure_generation_of(&value));
+        if erased || current != 0 {
+            writes.push((
+                erasure_policy_key(),
+                current.saturating_add(1).to_be_bytes().to_vec(),
+            ));
         }
         self.store
             .commit(&writes, spindle_store::Durability::Group)?;
@@ -275,21 +297,32 @@ impl<'a, S: Store> Accounts<'a, S> {
     }
 
     /// Whether client events may need erasure filtering. Once true, this
-    /// marker stays true; each sender's current account flag still decides.
+    /// stays true; each sender's current account flag still decides.
     ///
     /// # Errors
     ///
     /// Returns a storage or account decoding error.
     pub fn erasure_active(&self) -> Result<bool, AccountError> {
+        Ok(self.erasure_generation()? != 0)
+    }
+
+    /// How many times an erasure flag has changed, or 0 when no account has
+    /// ever been erased. Two equal readings bracket no change to the set
+    /// [`Self::erased_user_ids`] returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or account decoding error.
+    pub fn erasure_generation(&self) -> Result<u64, AccountError> {
         let key = erasure_policy_key();
         if let Some(value) = self.store.get(&key)? {
-            return Ok(value != [0]);
+            return Ok(erasure_generation_of(&value));
         }
         let _guard = ERASURE_POLICY_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(value) = self.store.get(&key)? {
-            return Ok(value != [0]);
+            return Ok(erasure_generation_of(&value));
         }
         // Upgrade stores written before the marker existed. The same lock
         // protects erasure writes so initialization cannot overwrite one.
@@ -306,11 +339,32 @@ impl<'a, S: Store> Accounts<'a, S> {
         // failed would take reads down with writes (#21's disk-full
         // drill). Serve the computed answer and leave the marker
         // unwritten; the next read scans again.
+        let generation = u64::from(active);
         match self.store.put(&key, &[u8::from(active)]) {
-            Ok(()) => Ok(active),
-            Err(_) if !self.store.accepts_writes() => Ok(active),
+            Ok(()) => Ok(generation),
+            Err(_) if !self.store.accepts_writes() => Ok(generation),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// The full user IDs of every erased local account.
+    ///
+    /// A scan of every account: read it once per
+    /// [`Self::erasure_generation`], not per question.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or account decoding error.
+    pub fn erased_user_ids(&self) -> Result<std::collections::HashSet<String>, AccountError> {
+        let prefix = [keys::KEY_SCHEMA_VERSION, Keyspace::Account as u8];
+        let mut erased = std::collections::HashSet::new();
+        for (_, bytes) in self.store.scan_prefix(&prefix)? {
+            let account = decode::<Account>(&bytes)?;
+            if account.erased {
+                erased.insert(format!("@{}:{}", account.localpart, self.server_name));
+            }
+        }
+        Ok(erased)
     }
 
     /// # Errors
@@ -1126,6 +1180,38 @@ mod erasure_policy_tests {
         let accounts = Accounts::new(&store, "example.org");
         accounts.set_erased("missing", true).unwrap();
         assert!(!accounts.erasure_active().unwrap());
+    }
+
+    /// Readers cache the erased set per generation, so every flag change
+    /// must move it -- un-erasing too, or a cache would keep pruning an
+    /// account that is no longer erased.
+    #[test]
+    fn every_erasure_change_moves_the_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        put_account(&store, "alice", false);
+        put_account(&store, "bob", false);
+        let accounts = Accounts::new(&store, "example.org");
+        assert_eq!(accounts.erasure_generation().unwrap(), 0);
+        // Un-erasing on a server that never erased writes nothing.
+        accounts.set_erased("alice", false).unwrap();
+        assert_eq!(accounts.erasure_generation().unwrap(), 0);
+        accounts.set_erased("alice", true).unwrap();
+        let erased = accounts.erasure_generation().unwrap();
+        assert_ne!(erased, 0);
+        assert_eq!(
+            accounts.erased_user_ids().unwrap(),
+            std::collections::HashSet::from(["@alice:example.org".to_owned()])
+        );
+        accounts.set_erased("alice", false).unwrap();
+        let restored = accounts.erasure_generation().unwrap();
+        assert!(restored > erased);
+        assert!(accounts.erased_user_ids().unwrap().is_empty());
+        // A store from before generations holds `[1]`; the next change
+        // moves on from it.
+        store.put(&erasure_policy_key(), &[1]).unwrap();
+        accounts.set_erased("bob", true).unwrap();
+        assert_eq!(accounts.erasure_generation().unwrap(), 2);
     }
 }
 

@@ -935,7 +935,6 @@ fn matches_term(summary: &crate::rooms::RoomSummary, term: &str) -> bool {
 /// failing.
 pub(crate) fn directory_page(
     state: &AppState,
-    user_id: &str,
     limit: Option<usize>,
     since: Option<&str>,
     term: Option<&str>,
@@ -960,7 +959,7 @@ pub(crate) fn directory_page(
     // whole listing down with it.
     let mut visible: Vec<crate::rooms::RoomSummary> = Vec::new();
     for room_id in &published {
-        let Ok(summary) = state.rooms.summary_for(user_id, room_id) else {
+        let Ok(summary) = state.rooms.summary(room_id) else {
             continue;
         };
         if term.is_some_and(|term| !matches_term(&summary, term)) {

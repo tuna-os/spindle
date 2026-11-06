@@ -769,13 +769,17 @@ pub(crate) async fn event(
     };
     federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
     let event = state.rooms.pdu(&room_id, &event_id).map_err(room_error)?;
+    let pdus = state
+        .rooms
+        .prune_erased_pdus(&room_id, vec![event])
+        .map_err(room_error)?;
     Ok(Json(json!({
         "origin": state.config.server.name,
         "origin_server_ts": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0),
-        "pdus": [event],
+        "pdus": pdus,
     })))
 }
 
@@ -812,6 +816,10 @@ pub(crate) async fn backfill(
     let pdus = state
         .rooms
         .backfill(&room_id, &from, limit)
+        .map_err(room_error)?;
+    let pdus = state
+        .rooms
+        .prune_erased_pdus(&room_id, pdus)
         .map_err(room_error)?;
     Ok(Json(json!({
         "origin": state.config.server.name,
@@ -875,6 +883,10 @@ pub(crate) async fn missing_events(
             min_depth,
             state_dag,
         )
+        .map_err(room_error)?;
+    let events = state
+        .rooms
+        .prune_erased_pdus(&room_id, events)
         .map_err(room_error)?;
     Ok(Json(json!({ "events": events })))
 }
