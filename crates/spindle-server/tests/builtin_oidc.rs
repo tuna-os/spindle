@@ -23,14 +23,18 @@ impl Instance {
         Self::start_with(builtin, "").await
     }
 
-    /// As [`Instance::start`], with more `[auth]` keys appended.
+    /// As [`Instance::start`], with more `[auth]` keys appended; `{name}`
+    /// in them becomes the server's `host:port`.
     async fn start_with(builtin: bool, extra_auth: &str) -> Instance {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
         let auth = if builtin {
-            format!("[auth]\nbuiltin_oidc = true\n{extra_auth}")
+            format!(
+                "[auth]\nbuiltin_oidc = true\n{}",
+                extra_auth.replace("{name}", &name)
+            )
         } else {
             String::new()
         };
@@ -570,4 +574,150 @@ async fn a_configured_issuer_moves_every_advertised_url() {
         format!("http://{}", server.name),
         "{well_known}"
     );
+}
+
+/// #609 behind a reverse proxy at a subpath: an issuer of
+/// `http://host/auth/` advertises every endpoint under `/auth`, answers
+/// there (a proxy passing the path through) and at the root (a proxy
+/// stripping it), and every page link, form and redirect it sends carries
+/// the path, so a browser never leaves it.
+#[tokio::test]
+async fn an_issuer_with_a_path_serves_the_provider_under_it() {
+    let server = Instance::start_with(true, "oidc_issuer = \"http://{name}/auth/\"\n").await;
+    let base = format!("http://{}", server.name);
+    server.register_user("alice").await;
+
+    let discovery: Value = read_json(
+        server
+            .client
+            .get(format!("{base}/auth/.well-known/openid-configuration"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(discovery["issuer"], format!("{base}/auth/"), "{discovery}");
+    assert_eq!(
+        discovery["authorization_endpoint"],
+        format!("{base}/auth/oauth2/authorize"),
+        "{discovery}"
+    );
+    assert_eq!(
+        discovery["account_management_uri"],
+        format!("{base}/auth/account/"),
+        "{discovery}"
+    );
+
+    // Registration and the authorization page at the advertised URLs, as
+    // a proxy that passes the path through delivers them.
+    let response = server
+        .client
+        .post(format!("{base}/auth/oauth2/registration"))
+        .header("content-type", "application/json")
+        .body(json!({ "redirect_uris": [REDIRECT], "client_name": "Test Element" }).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 201);
+    let client_id = read_json(response).await["client_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let verifier = "a-code-verifier-of-sufficient-length-for-rfc7636";
+    let query = format!(
+        "response_type=code&client_id={client_id}&redirect_uri={}&scope={}&state=st4te\
+         &code_challenge_method=S256&code_challenge={}",
+        urlencode(REDIRECT),
+        urlencode(STABLE_SCOPE),
+        pkce(verifier),
+    );
+    let page = server
+        .client
+        .get(format!("{base}/auth/oauth2/authorize?{query}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status().as_u16(), 200);
+    let html = page.text().await.unwrap();
+    assert!(
+        html.contains("action=\"/auth/oauth2/authorize\""),
+        "the form posts under the path: {html}"
+    );
+    assert!(!html.contains("action=\"/oauth2"), "{html}");
+    assert!(!html.contains("href=\"/account"), "{html}");
+
+    let response = server
+        .client
+        .post(format!("{base}/auth/oauth2/authorize"))
+        .form(&[
+            ("username", "alice"),
+            ("password", "hunter2hunter2"),
+            ("client_id", client_id.as_str()),
+            ("redirect_uri", REDIRECT),
+            ("scope", STABLE_SCOPE),
+            ("state", "st4te"),
+            ("code_challenge", pkce(verifier).as_str()),
+            ("code_challenge_method", "S256"),
+            ("response_mode", "query"),
+            ("response_type", "code"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 303);
+    let location = response.headers()["location"].to_str().unwrap().to_owned();
+    assert!(
+        location.starts_with(REDIRECT),
+        "the client's own redirect is left alone: {location}"
+    );
+    let code = location
+        .split_once("code=")
+        .map(|(_, rest)| rest.split('&').next().unwrap().to_owned())
+        .unwrap();
+
+    // The token endpoint without the path, as a stripping proxy sends it.
+    let (status, body) = server.exchange(&client_id, REDIRECT, &code, verifier).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, _) = server.whoami(body["access_token"].as_str().unwrap()).await;
+    assert_eq!(status, 200);
+}
+
+/// #609 again: the account pages under an issuer path, reached without it
+/// (a stripping proxy), redirect and link under it.
+#[tokio::test]
+async fn the_account_pages_keep_the_issuer_path() {
+    let server = Instance::start_with(true, "oidc_issuer = \"http://{name}/auth/\"\n").await;
+    let base = format!("http://{}", server.name);
+    let response = server
+        .client
+        .get(format!("{base}/account/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 303);
+    let location = response.headers()["location"].to_str().unwrap().to_owned();
+    assert!(
+        location.starts_with("/auth/account/login"),
+        "to the sign-in page under the path: {location}"
+    );
+    let html = server
+        .client
+        .get(format!("{base}/auth/account/login"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("action=\"/auth/account/login\""), "{html}");
+    assert!(html.contains("href=\"/auth/account/recover\""), "{html}");
+
+    // The Matrix API is not the provider's and is not moved.
+    let response = server
+        .client
+        .get(format!("{base}/auth/_matrix/client/versions"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 404);
 }

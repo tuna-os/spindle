@@ -188,8 +188,8 @@ public_base_url = "https://matrix.example.org"
 
 [auth]
 builtin_oidc = true
-# Optional (#609): an issuer on a host of its own. Omitted, the issuer is
-# the client base URL above.
+# Optional (#609): an issuer on a host of its own, or under a path.
+# Omitted, the issuer is the client base URL above.
 # oidc_issuer = "https://auth.example.org/"
 ```
 
@@ -203,9 +203,13 @@ the clients already know. This covers the discovery document,
 `/_matrix/client/v1/auth_metadata` and its MSC2965 unstable alias, the
 `/.well-known/matrix/client` authentication block, and each endpoint.
 
-The value must be an origin. Spindle serves the provider routes at the root
-of each host that gets to it, so a path would advertise URLs that nothing
-serves. The server does not start with a path.
+The value can have a path, for example `https://example.org/auth/`. Use
+this when a reverse proxy publishes the provider under that path. The
+proxy can keep the path or remove it: Spindle answers on both. The links,
+forms and redirects of the pages keep the path. The first segment of the
+path cannot be a route of the server (`account`, `oauth2`, `upstream`,
+or a segment that starts with `_` or `.`). A query, a fragment or
+credentials stop the server at startup.
 
 With that, Spindle itself serves the small provider surface those
 clients need — discovery (`/.well-known/openid-configuration`, relayed
@@ -286,9 +290,26 @@ Configure an SMTP relay with `[email]` (see `spindle.example.toml`:
   per address (3 per hour), for an address with no account too. It limits confirmation
   mails per account (5 per hour).
 - `GET /_matrix/client/v3/account/3pid` lists the confirmed addresses.
-  The server does not serve the client API calls that add and remove them
-  (`requestToken` and friends); use the account pages. Under
-  `[auth.delegated]` the endpoint stays absent, as before.
+  Under `[auth.delegated]` the endpoint stays absent, as before.
+- **The client API flows.** Clients that log in with a password use the
+  spec calls, and these work too:
+  - `POST /account/password/email/requestToken`, then
+    `POST /account/password` with the `m.login.email.identity` stage.
+    The client does not need an access token. This is "Forgot password?"
+    in Element. All devices and browsers sign out.
+  - `POST /account/3pid/email/requestToken`, then `POST /account/3pid/add`
+    (with the password). `POST /account/3pid/delete` removes an address.
+  - `POST /register/email/requestToken`, then `POST /register` with the
+    `m.login.email.identity` stage. Registration shows this stage beside
+    `m.login.dummy`, so an address is optional. With
+    `require_token`, the server does not show it and refuses the request.
+
+  Each mail has a link to `/account/3pid/validate`, which opens a
+  confirmation button. The client continues after the user pushes it.
+  A `requestToken` gives a `sid` for each address, but an unknown address
+  or an address of another account gets no mail. The limits of the
+  forgotten-password page apply. The validation sessions are in memory
+  and work once.
 - Nothing logs an address, a token or a link. The log records a delivery
   failure only by class (permanent, transient, connection).
 
@@ -350,26 +371,52 @@ What carries over, and how:
    this once, because the browser session then covers the rest.
 4. **Email addresses** do not carry over yet: users add them again on
    the Email page.
-5. **Upstream identity providers** (MAS `upstream_oauth2`) are not
-   supported. A user who only signed in through one has no password here.
-   Give that user an administrator's reset link (above), with or without
-   mail.
+5. **Upstream identity providers** (MAS `upstream_oauth2`). Configure
+   each provider as `[[auth.upstream_oidc]]` (below). Use the ULID of the
+   MAS provider as `id`, so the callback URL at the provider stays the same.
+   The links of MAS do not carry over yet. A first sign-in links by name
+   only when the name is free. For a user whose account exists, give an
+   administrator's reset link (above), or set `link_existing_by_email`.
 
-### Upstream identity providers (#610): not yet
+### Upstream identity providers (#610)
 
-Sign-in through another OIDC provider is the next step. It is not in
-this release.
+Sign-in can go to another OIDC provider (Authelia, Keycloak, Kanidm).
+The issuer that clients know stays the issuer of Spindle.
+`spindle.example.toml` shows each key of `[[auth.upstream_oidc]]`.
+Register `{issuer}/upstream/callback/{id}` as the redirect URI at the
+provider. The server does not start if `[auth.delegated]` is also set.
+The issuer must use https, but Spindle accepts plain http on loopback, or
+with `insecure_http = true` for a test rig.
 
-The design hook is the authorization page. `authorize` in
-`oidc.rs` finds *who* signs in (today: a password, or a browser session)
-and then mints a code. An upstream provider becomes a third way to find
-the localpart. It adds a redirect to the upstream with its own PKCE and
-state. It adds a callback that validates the ID token and maps the
-subject to a localpart.
+- The sign-in pages show a "Sign in with …" button for each provider.
+  `GET /login` shows `m.login.sso` with the providers, and
+  `/login/sso/redirect` and `/login/sso/redirect/{idpId}` start the flow.
+- The flow is the authorization code flow with PKCE `S256`, a `state`
+  and a `nonce`. The server keeps no flow. It seals each flow into the
+  cookie that binds it to the browser (ChaCha20-Poly1305, with a key per
+  process). Thus open flows use no memory on the server. A flow works
+  once and stops after ten minutes.
+- A failed callback spends the login budget of its source (30 a minute).
+  A successful callback resets it.
+- Spindle reads the discovery document and the JWKS at first use and
+  keeps them for an hour. Spindle checks the signature of the ID token
+  (RS256, PS256, ES256, ES384 or EdDSA). It also checks the issuer, the
+  audience, the expiry time and the nonce of the flow.
+- The link table (keyspace `0x49`) maps the provider `id` and the `sub`
+  to an account. A second sign-in uses the link, not the name.
+- A first sign-in makes an account from `localpart_claim`. It sets the
+  display name. It also binds the `email` claim if `email_verified` is
+  true, because that flag applies to that claim only. Spindle refuses
+  addresses with characters that are not ASCII: in Unicode, two different
+  addresses can become equal in lowercase. If an account has that
+  name, the sign-in fails: Spindle does not give an existing account to a
+  new identity. With `link_existing_by_email`, a verified address that an
+  account here holds links to that account. This is off by default.
+- For the client API, the callback shows a page with a link back to the
+  client. The link has a single-use login token for `m.login.token`.
 
-That map is a link table with issuer and subject as its key, beside the `BrowserSession` and `EmailOwner` keyspaces. After
-that come the same browser session and code issue as a password sign-in.
-Nothing downstream of the localpart changes.
+The metric `spindle_auth_logins_total{method="upstream"}` counts each
+callback by result.
 
 The proof it works — Element Web completing the whole OIDC-native flow
 against a lone Spindle process, with nothing else running — is

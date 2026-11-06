@@ -116,6 +116,8 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::oidc::routes())
         .merge(crate::account::routes())
         .merge(crate::email::routes())
+        .merge(crate::threepid::routes())
+        .merge(crate::upstream::routes())
         .merge(crate::recovery::routes())
         .merge(crate::openid::routes())
         .merge(crate::rendezvous::routes())
@@ -130,6 +132,7 @@ pub fn router(state: AppState) -> Router {
     } else {
         routes
     };
+    let issuer_path = state.config.oidc_issuer_path();
     let routes = routes
         // SPEC: an endpoint the server does not recognize answers 404
         // M_UNRECOGNIZED — a JSON verdict, not a bare status. Clients (and
@@ -148,10 +151,95 @@ pub fn router(state: AppState) -> Router {
     // The prefix rewrite has to run *before* routing, and a layer on a
     // router runs after it, so the router sits behind the rewrite as the
     // only service of an outer one.
+    let routes = tower::Layer::layer(&axum::middleware::map_request(legacy_prefix), routes);
+    if issuer_path.is_empty() {
+        return Router::new().fallback_service(routes);
+    }
     Router::new().fallback_service(tower::Layer::layer(
-        &axum::middleware::map_request(legacy_prefix),
+        &axum::middleware::from_fn_with_state(
+            std::sync::Arc::<str>::from(issuer_path),
+            issuer_path_prefix,
+        ),
         routes,
     ))
+}
+
+/// Whether `path` is one of the built-in provider's own: its discovery
+/// document, the OAuth endpoints, the account pages and the upstream
+/// sign-in. These are what an issuer with a path (#609) moves.
+fn is_provider_path(path: &str) -> bool {
+    path == "/account"
+        || path == "/.well-known/openid-configuration"
+        || ["/account/", "/oauth2/", "/upstream/"]
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
+}
+
+/// Serve the built-in provider under the path of its issuer (#609).
+///
+/// A reverse proxy publishing the provider at `https://example.org/auth/`
+/// either strips `/auth` or passes it through; both work, because a
+/// provider path arriving with the prefix has it taken off before routing.
+/// The pages are written as if they lived at the root, so on the way out
+/// the prefix goes back on: on a `Location` that is a path on this
+/// server, and on the `href="/` and `action="/` of a page. That rewrite
+/// is sound because every value a page interpolates is HTML-escaped, so
+/// no `"` from a request can make one of those sequences appear.
+async fn issuer_path_prefix(
+    State(prefix): State<std::sync::Arc<str>>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = request.uri().path();
+    let stripped = path
+        .strip_prefix(&*prefix)
+        .filter(|rest| is_provider_path(rest))
+        .map(str::to_owned);
+    if let Some(rest) = stripped {
+        let with_query = match request.uri().query() {
+            Some(query) => format!("{rest}?{query}"),
+            None => rest,
+        };
+        let mut parts = request.uri().clone().into_parts();
+        if let Ok(path_and_query) = with_query.parse() {
+            parts.path_and_query = Some(path_and_query);
+            if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+                *request.uri_mut() = uri;
+            }
+        }
+    }
+    if !is_provider_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+    let response = next.run(request).await;
+    let (mut parts, body) = response.into_parts();
+    if let Some(location) = parts
+        .headers
+        .get(axum::http::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .filter(|location| location.starts_with('/') && !location.starts_with("//"))
+        .and_then(|location| axum::http::HeaderValue::from_str(&format!("{prefix}{location}")).ok())
+    {
+        parts.headers.insert(axum::http::header::LOCATION, location);
+    }
+    let html = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/html"));
+    if !html {
+        return axum::response::Response::from_parts(parts, body);
+    }
+    // The pages are a few kilobytes; the bound only keeps a mistake from
+    // buffering something that is not one.
+    let Ok(bytes) = axum::body::to_bytes(body, 1 << 20).await else {
+        return axum::response::Response::from_parts(parts, axum::body::Body::empty());
+    };
+    let page = String::from_utf8_lossy(&bytes)
+        .replace("href=\"/", &format!("href=\"{prefix}/"))
+        .replace("action=\"/", &format!("action=\"{prefix}/"));
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    axum::response::Response::from_parts(parts, axum::body::Body::from(page))
 }
 
 /// Serve the `r0` client and media API prefixes as the `v3` ones.

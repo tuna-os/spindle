@@ -124,18 +124,23 @@ fn session_body(user_id: &str, session: &crate::accounts::Session) -> Value {
 /// `GET /_matrix/client/v3/login`
 ///
 /// Password login, and token login for the tokens `POST /login/get_token`
-/// mints (spec v1.7), which is what `get_login_token: true` tells an
-/// unauthenticated client. SSO is advertised by servers that implement it;
+/// and the SSO callback mint (spec v1.7), which is what
+/// `get_login_token: true` tells an unauthenticated client. `m.login.sso`
+/// is listed only with upstream identity providers configured (#610):
 /// listing a flow we cannot complete would send a client down a path that
 /// dead-ends.
 async fn login_flows(State(state): State<AppState>) -> Result<Json<Value>, MatrixError> {
     if state.delegated.is_some() {
         return Err(delegated_refusal());
     }
-    Ok(Json(json!({ "flows": [
-        { "type": "m.login.password" },
-        { "type": "m.login.token", "get_login_token": true },
-    ] })))
+    let mut flows = vec![
+        json!({ "type": "m.login.password" }),
+        json!({ "type": "m.login.token", "get_login_token": true }),
+    ];
+    if let Some(providers) = crate::upstream::identity_providers(&state) {
+        flows.push(json!({ "type": "m.login.sso", "identity_providers": providers }));
+    }
+    Ok(Json(json!({ "flows": flows })))
 }
 
 /// The `m.login.token` half of `POST /login`: one token, one session.
@@ -356,18 +361,7 @@ fn registration_stage(state: &AppState, auth: Option<&Value>) -> Result<StageOut
     } else {
         "m.login.dummy"
     };
-    let challenge = |error: Option<(&str, &str)>| {
-        let mut body = json!({
-            "flows": [{ "stages": [uia_stage] }],
-            "params": {},
-            "session": "register",
-        });
-        if let Some((errcode, message)) = error {
-            body["errcode"] = json!(errcode);
-            body["error"] = json!(message);
-        }
-        (StatusCode::UNAUTHORIZED, Json(body))
-    };
+    let challenge = |error: Option<(&str, &str)>| registration_challenge(state, error);
     let stage_completed = if require_token {
         auth.is_some_and(|auth| auth["type"] == uia_stage && auth["token"].is_string())
     } else {
@@ -394,6 +388,35 @@ fn registration_stage(state: &AppState, auth: Option<&Value>) -> Result<StageOut
         )))));
     }
     Ok(Ok(Some(token)))
+}
+
+/// Registration's 401: the one-stage flow the configuration asks for and,
+/// when this server can mail and needs no token, the email stage beside it
+/// (#608) — optional, as Synapse offers it, so a client without an address
+/// still registers.
+fn registration_challenge(
+    state: &AppState,
+    error: Option<(&str, &str)>,
+) -> (StatusCode, Json<Value>) {
+    let uia_stage = if state.config.registration.require_token {
+        "m.login.registration_token"
+    } else {
+        "m.login.dummy"
+    };
+    let mut flows = vec![json!({ "stages": [uia_stage] })];
+    if crate::threepid::registration_by_email(state) {
+        flows.push(json!({ "stages": ["m.login.email.identity"] }));
+    }
+    let mut body = json!({
+        "flows": flows,
+        "params": {},
+        "session": "register",
+    });
+    if let Some((errcode, message)) = error {
+        body["errcode"] = json!(errcode);
+        body["error"] = json!(message);
+    }
+    (StatusCode::UNAUTHORIZED, Json(body))
 }
 
 /// `GET /_matrix/client/v3/register/available`
@@ -499,8 +522,8 @@ async fn register(
     // dummy stage carries no state a session would tie back to, and
     // Synapse accepts it. Its integration suite was refused here on every
     // test until this did.
-    let registration_token = match registration_stage(&state, request.auth.as_ref())? {
-        Ok(token) => token,
+    let (registration_token, address) = match registration_auth(&state, &request)? {
+        Ok(done) => done,
         Err(challenge) => return Ok(challenge),
     };
 
@@ -525,6 +548,9 @@ async fn register(
             .consume(&token)
             .map_err(|error| MatrixError::internal(&error.to_string()))?;
     }
+    if let Some(address) = address {
+        crate::email::bind(&state, username, &address)?;
+    }
     if request.inhibit_login {
         return Ok((StatusCode::OK, Json(json!({ "user_id": user_id }))));
     }
@@ -538,6 +564,46 @@ async fn register(
         )
         .map_err(|error| internal(&error))?;
     Ok((StatusCode::OK, Json(session_body(&user_id, &session))))
+}
+
+/// What completed registration's auth: `(token, address)` — the
+/// registration token to spend once the account exists, or the address
+/// the email stage proved (#608), to bind to it. `Err(challenge)` is the
+/// 401 to send back.
+type RegistrationAuth = Result<(Option<String>, Option<String>), (StatusCode, Json<Value>)>;
+
+fn registration_auth(
+    state: &AppState,
+    request: &RegisterRequest,
+) -> Result<RegistrationAuth, MatrixError> {
+    let email = request.auth.as_ref().filter(|auth| {
+        auth["type"] == "m.login.email.identity" && crate::threepid::registration_by_email(state)
+    });
+    let Some(auth) = email else {
+        return Ok(registration_stage(state, request.auth.as_ref())?.map(|token| (token, None)));
+    };
+    // The validated session is spent below, so what would fail after it
+    // is checked first: a malformed request costs a retry, not the link.
+    if request.username.is_none() || request.password.is_none() {
+        return Err(MatrixError::bad_json("no username or password"));
+    }
+    let Some(address) = crate::threepid::email_identity_register(state, auth)? else {
+        return Ok(Err(registration_challenge(
+            state,
+            Some((
+                "M_UNAUTHORIZED",
+                "the email address has not been confirmed yet",
+            )),
+        )));
+    };
+    if crate::email::owner_of(state, &address)?.is_some() {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_THREEPID_IN_USE",
+            "that address is on another account",
+        ));
+    }
+    Ok(Ok((None, Some(address))))
 }
 
 /// The `m.login.application_service` branch of registration.
@@ -867,23 +933,64 @@ struct PasswordChangeRequest {
 }
 
 /// `POST /_matrix/client/v3/account/password`
+///
+/// Two ways through the auth stage. Signed in, the current password, as
+/// before. With or without a token, `m.login.email.identity`: a session
+/// from `/account/password/email/requestToken` whose mailed link was
+/// confirmed (#608) — the forgotten-password path, so the access token is
+/// optional here, as the spec has it.
 async fn change_password(
     State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
-    headers: axum::http::HeaderMap,
+    mut parts: axum::http::request::Parts,
     body: axum::body::Bytes,
 ) -> Result<(StatusCode, Json<Value>), MatrixError> {
+    // A token that is present still has to be good, and its account not
+    // locked: the full extractor, not `MaybeAuthenticated`.
+    let identity = if crate::auth::bearer(&parts).is_some() {
+        let Authenticated(identity) = <Authenticated as axum::extract::FromRequestParts<
+            AppState,
+        >>::from_request_parts(&mut parts, &state)
+        .await?;
+        Some(identity)
+    } else {
+        None
+    };
     let request: PasswordChangeRequest = optional_body(&body)?;
-    let localpart = localpart_of(&identity.user_id);
-    if let Some(challenge) = password_uia(
-        &state,
-        &localpart,
-        &headers,
-        request.auth.as_ref(),
-        "change_password",
-    )? {
-        return Ok((StatusCode::UNAUTHORIZED, challenge));
-    }
+    let by_email = request
+        .auth
+        .as_ref()
+        .filter(|auth| auth["type"] == "m.login.email.identity");
+    let (localpart, by_email) = if let Some(auth) = by_email {
+        // Checked before the session is spent, so a malformed request
+        // costs a retry rather than the confirmed link.
+        if request.new_password.as_deref().is_none_or(str::is_empty) {
+            return Err(MatrixError::bad_json("no new_password"));
+        }
+        let caller = identity
+            .as_ref()
+            .map(|identity| localpart_of(&identity.user_id));
+        match crate::threepid::email_identity_reset(&state, caller.as_deref(), auth)? {
+            Ok(owner) => (owner, true),
+            Err(challenge) => return Ok((StatusCode::UNAUTHORIZED, challenge)),
+        }
+    } else if let Some(identity) = &identity {
+        let localpart = localpart_of(&identity.user_id);
+        if let Some(challenge) = password_uia(
+            &state,
+            &localpart,
+            &parts.headers,
+            request.auth.as_ref(),
+            "change_password",
+        )? {
+            return Ok((StatusCode::UNAUTHORIZED, challenge));
+        }
+        (localpart, false)
+    } else {
+        return match crate::threepid::email_identity_challenge(&state) {
+            Some(challenge) => Ok((StatusCode::UNAUTHORIZED, challenge)),
+            None => Err(MatrixError::missing_token()),
+        };
+    };
     let new_password = request
         .new_password
         .as_deref()
@@ -898,6 +1005,13 @@ async fn change_password(
         accounts
             .logout_everywhere(&localpart)
             .map_err(|error| internal(&error))?;
+    }
+    if by_email {
+        // What the reset page does after a mailed link: the browsers that
+        // were signed in go too, and no older link can undo this one.
+        crate::web::end_browser_sessions_of(&state, &localpart, None)?;
+        crate::email::drop_reset_links(state.store.as_ref(), &localpart)?;
+        state.metrics.record_password_reset_completed();
     }
     Ok((StatusCode::OK, Json(json!({}))))
 }
@@ -959,6 +1073,10 @@ async fn deactivate_account(
     accounts
         .logout_everywhere(&localpart)
         .map_err(|error| internal(&error))?;
+    // The addresses go with the account, as the account page's
+    // deactivation releases them: an address `/3pid/add` bound here must
+    // not stay held by an account nobody can use.
+    crate::email::forget_account(&state, &localpart)?;
     if let Some(delegated) = &state.delegated {
         delegated.forget_user(&identity.user_id);
     }

@@ -3384,6 +3384,7 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest 0.12.28",
+ "ring",
  "ruma",
  "rusqlite",
  "rustls",

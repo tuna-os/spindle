@@ -32,6 +32,7 @@ hmac.workspace = true
 hickory-resolver.workspace = true
 lettre.workspace = true
 blake3.workspace = true
+ring.workspace = true
 image.workspace = true
 rand.workspace = true
 ruma.workspace = true

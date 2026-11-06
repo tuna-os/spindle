@@ -419,13 +419,14 @@ fn render_login(
         format!("<p class=\"error\">{}</p>", escape(text))
     });
     let forgot = crate::recovery::recovery_links(state);
+    let upstream = crate::upstream::buttons(state, next);
     let body = format!(
         "<h1>Sign in to {server}</h1>{error}\
          <form method=\"post\" action=\"/account/login\">{csrf}{next}\
          <input name=\"username\" placeholder=\"Username\" autocomplete=\"username\" required>\
          <input name=\"password\" type=\"password\" placeholder=\"Password\" \
          autocomplete=\"current-password\" required>\
-         <button type=\"submit\">Sign in</button></form>{forgot}",
+         <button type=\"submit\">Sign in</button></form>{upstream}{forgot}",
         server = escape(&state.config.server.name),
         csrf = hidden("csrf", &csrf),
         next = hidden("next", next),

@@ -545,6 +545,12 @@ pub enum Keyspace {
     /// still open: applied when backfill brings the target in, so history
     /// filled late is never served unredacted.
     PendingRedaction = 0x48,
+    /// `(upstream provider id, subject)` -> the localpart that upstream
+    /// identity signs in as (#610): the account link, as MAS keeps it in
+    /// `upstream_oauth_links`. Keyed by the provider's configured id
+    /// rather than its issuer, so an operator can move a provider to a new
+    /// URL without orphaning every link.
+    UpstreamLink = 0x49,
     /// `(room_id, synapse_stream_ordering)` -> the linear index the
     /// importer gave that event (#568). Lets a Synapse pagination token
     /// a client kept across the migration name a place in this room.
@@ -1294,6 +1300,14 @@ pub fn user_email_prefix(localpart: &str) -> Vec<u8> {
 pub fn email_owner(address: &str) -> Vec<u8> {
     let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::EmailOwner as u8];
     key.extend_from_slice(address.as_bytes());
+    key
+}
+
+/// The account link of one upstream identity ([`Keyspace::UpstreamLink`]).
+#[must_use]
+pub fn upstream_link(provider: &str, subject: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::UpstreamLink, provider);
+    key.extend_from_slice(subject.as_bytes());
     key
 }
 

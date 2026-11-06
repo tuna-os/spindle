@@ -566,8 +566,32 @@ fn the_builtin_issuer_can_live_on_its_own_host() {
     }
 }
 
+/// #609: a reverse proxy may publish the provider under a path; the path
+/// is kept in the advertised base and is what the routes are served under.
 #[test]
-fn a_builtin_issuer_must_be_an_origin_of_an_enabled_provider() {
+fn the_builtin_issuer_can_live_under_a_path() {
+    for issuer in ["https://example.org/auth/", "https://example.org/auth"] {
+        let config = parse(&format!(
+            "[server]\nname = \"example.org\"\n[auth]\nbuiltin_oidc = true\noidc_issuer = \"{issuer}\"\n"
+        ))
+        .unwrap();
+        assert_eq!(config.oidc_issuer_base(), "https://example.org/auth");
+        assert_eq!(config.oidc_issuer_path(), "/auth");
+    }
+    let config = parse(
+        "[server]\nname = \"example.org\"\npublic_base_url = \"https://example.org/matrix\"\n\
+         [auth]\nbuiltin_oidc = true\n",
+    )
+    .unwrap();
+    assert_eq!(
+        config.oidc_issuer_path(),
+        "",
+        "no configured issuer, no path: the routes stay where they were"
+    );
+}
+
+#[test]
+fn a_builtin_issuer_must_be_a_servable_url_of_an_enabled_provider() {
     for (auth, why) in [
         (
             "oidc_issuer = \"https://auth.example.org/\"\n",
@@ -578,8 +602,16 @@ fn a_builtin_issuer_must_be_an_origin_of_an_enabled_provider() {
             "not a URL",
         ),
         (
-            "builtin_oidc = true\noidc_issuer = \"https://example.org/auth/\"\n",
-            "a path",
+            "builtin_oidc = true\noidc_issuer = \"https://example.org/account/\"\n",
+            "a path that is one of the provider's own routes",
+        ),
+        (
+            "builtin_oidc = true\noidc_issuer = \"https://example.org/_matrix/\"\n",
+            "a path inside the Matrix API",
+        ),
+        (
+            "builtin_oidc = true\noidc_issuer = \"https://example.org/a/../b\"\n",
+            "a dot segment",
         ),
         (
             "builtin_oidc = true\noidc_issuer = \"https://example.org/?x=1\"\n",
@@ -679,4 +711,37 @@ fn the_smtp_password_can_come_from_a_file() {
         config.email.unwrap().resolve_password().unwrap(),
         "from-a-file"
     );
+}
+
+fn upstream(issuer: &str, extra: &str) -> Result<Config, ConfigError> {
+    parse(&format!(
+        "[server]\nname = \"example.org\"\n[auth]\nbuiltin_oidc = true\n\
+         [[auth.upstream_oidc]]\nid = \"sso\"\nissuer = \"{issuer}\"\nclient_id = \"c\"\n\
+         client_secret = \"s\"\n{extra}"
+    ))
+}
+
+/// #610 review: an upstream's discovery, keys and token answer decide who
+/// signs in, so they travel over TLS — plain http only on loopback, or
+/// when the operator says so for a test rig.
+#[test]
+fn an_upstream_issuer_is_https_unless_loopback_or_explicitly_insecure() {
+    assert!(upstream("https://sso.example.org", "").is_ok());
+    for loopback in [
+        "http://127.0.0.1:8080",
+        "http://localhost:8080/realm",
+        "http://[::1]:9000",
+    ] {
+        assert!(upstream(loopback, "").is_ok(), "{loopback}");
+    }
+    let error = upstream("http://sso.example.org", "").expect_err("plain http off loopback");
+    assert!(error.to_string().contains("insecure_http"), "{error}");
+    assert!(upstream("http://sso.example.org", "insecure_http = true\n").is_ok());
+}
+
+/// #610 review: `email_verified` speaks for the `email` claim only, so
+/// there is no setting that reads an address from another claim.
+#[test]
+fn an_upstream_email_claim_cannot_be_redirected() {
+    assert!(upstream("https://sso.example.org", "email_claim = \"mail\"\n").is_err());
 }

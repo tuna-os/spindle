@@ -706,12 +706,140 @@ pub struct AuthConfig {
     /// The built-in provider's issuer, when it should differ from the
     /// client base URL (#609) — e.g. `https://auth.example.org/` to keep
     /// the issuer a retired MAS used, so clients that stored it keep
-    /// working. An origin only: the provider's routes are served at the
-    /// root of whichever host reaches this process, so a path here would
-    /// advertise endpoints nothing serves. Absent, the issuer is the
-    /// client base URL, as before.
+    /// working. It may carry a path (`https://example.org/auth/`) for a
+    /// reverse proxy that publishes the provider under one: the provider's
+    /// routes answer with that path in front and without it (for a proxy
+    /// that strips it), and every page link and redirect carries it.
+    /// Absent, the issuer is the client base URL, as before.
     #[serde(default)]
     pub oidc_issuer: Option<String>,
+    /// Upstream OIDC identity providers (#610): sign-in delegated to
+    /// Authelia, Keycloak, Kanidm and the like, with each upstream
+    /// identity linked to one account here, as MAS's `upstream_oauth2`
+    /// does. The built-in provider's authorization and account pages offer
+    /// them as buttons, and the client API offers them as `m.login.sso`.
+    /// Never beside `[auth.delegated]`, whose provider owns sign-in.
+    #[serde(default)]
+    pub upstream_oidc: Vec<UpstreamOidcConfig>,
+}
+
+/// One upstream identity provider.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamOidcConfig {
+    /// A stable name: part of the callback URL registered at the provider
+    /// (`{issuer}/upstream/callback/{id}`) and of every account link, so it
+    /// must not change. A MAS provider's ULID keeps MAS's callback URL.
+    pub id: String,
+    /// The button's label; the `id` when absent.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The provider's issuer; its discovery document is read from
+    /// `{issuer}/.well-known/openid-configuration` on first use.
+    pub issuer: String,
+    pub client_id: String,
+    /// The client secret inline. Prefer `client_secret_file`.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// A file holding the client secret (trailing newline ignored).
+    #[serde(default)]
+    pub client_secret_file: Option<PathBuf>,
+    /// How the secret is presented at the token endpoint.
+    #[serde(default)]
+    pub token_endpoint_auth_method: UpstreamClientAuth,
+    /// Must include `openid`.
+    #[serde(default = "default_upstream_scopes")]
+    pub scopes: Vec<String>,
+    /// The claim a new account's localpart is taken from.
+    #[serde(default = "default_localpart_claim")]
+    pub localpart_claim: String,
+    /// The claim a new account's display name is taken from.
+    #[serde(default = "default_displayname_claim")]
+    pub displayname_claim: String,
+    /// Link a first sign-in to the existing account whose confirmed address
+    /// is the provider's verified one — the standard `email` claim, with
+    /// `email_verified: true`, which is the only claim that flag vouches
+    /// for. Off by default: it hands the account
+    /// to whoever controls that address at the provider, which is only as
+    /// safe as the provider's own address verification.
+    #[serde(default)]
+    pub link_existing_by_email: bool,
+    /// Read the claims from the userinfo endpoint too, for a provider
+    /// (Authelia, by default) that puts only `sub` in its ID token.
+    #[serde(default)]
+    pub fetch_userinfo: bool,
+    /// Allow a plain-http `issuer` on a host other than loopback. Off: the
+    /// discovery document, the keys and the token answer would otherwise
+    /// cross the network unauthenticated, and whoever sits in between
+    /// could sign anyone in. A test rig's provider on another container may
+    /// need it.
+    #[serde(default)]
+    pub insecure_http: bool,
+}
+
+impl std::fmt::Debug for UpstreamOidcConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UpstreamOidcConfig")
+            .field("id", &self.id)
+            .field("issuer", &self.issuer)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &self.client_secret.as_ref().map(|_| "…"))
+            .field("client_secret_file", &self.client_secret_file)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UpstreamOidcConfig {
+    /// The client secret, from wherever it was configured; empty for a
+    /// public client.
+    ///
+    /// # Errors
+    ///
+    /// When `client_secret_file` cannot be read — naming the file, never
+    /// the contents.
+    pub fn resolve_secret(&self) -> Result<String, String> {
+        if let Some(path) = &self.client_secret_file {
+            return std::fs::read_to_string(path)
+                .map(|text| text.trim_end_matches(['\r', '\n']).to_owned())
+                .map_err(|error| {
+                    format!(
+                        "auth.upstream_oidc {:?} client_secret_file {}: {error}",
+                        self.id,
+                        path.display()
+                    )
+                });
+        }
+        Ok(self.client_secret.clone().unwrap_or_default())
+    }
+}
+
+/// RFC 6749 §2.3 client authentication at the upstream token endpoint.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamClientAuth {
+    /// HTTP Basic, the method every provider must support.
+    #[default]
+    ClientSecretBasic,
+    /// The secret in the form body.
+    ClientSecretPost,
+    /// A public client: PKCE alone.
+    None,
+}
+
+fn default_upstream_scopes() -> Vec<String> {
+    ["openid", "profile", "email"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn default_localpart_claim() -> String {
+    "preferred_username".to_owned()
+}
+
+fn default_displayname_claim() -> String {
+    "name".to_owned()
 }
 
 /// The delegated provider, named explicitly rather than discovered at
@@ -1819,6 +1947,7 @@ impl Config {
             });
         }
         self.validate_builtin_oidc()?;
+        self.validate_upstream_oidc()?;
         if let Some(email) = &self.email {
             email.validate(self.auth.builtin_oidc)?;
         }
@@ -1952,9 +2081,98 @@ impl Config {
         Ok(())
     }
 
+    /// Upstream providers: never beside delegation, each with an id that
+    /// is safe in a URL and unique, an http(s) issuer, `openid` among its
+    /// scopes, and a secret configured exactly when its client method
+    /// presents one.
+    fn validate_upstream_oidc(&self) -> Result<(), ConfigError> {
+        let invalid = |message: String| ConfigError::Invalid {
+            field: "auth.upstream_oidc",
+            message,
+        };
+        if !self.auth.upstream_oidc.is_empty() && self.auth.delegated.is_some() {
+            return Err(invalid(
+                "cannot be combined with auth.delegated — the delegated provider owns sign-in"
+                    .to_owned(),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for provider in &self.auth.upstream_oidc {
+            let id = &provider.id;
+            if id.is_empty()
+                || id.len() > 64
+                || !id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c))
+            {
+                return Err(invalid(format!(
+                    "id {id:?} must be 1-64 characters of letters, digits and - . _ ~ \
+                     (it is part of the callback URL)"
+                )));
+            }
+            if !seen.insert(id.as_str()) {
+                return Err(invalid(format!("id {id:?} is used twice")));
+            }
+            let Some(rest) = provider
+                .issuer
+                .strip_prefix("https://")
+                .or_else(|| provider.issuer.strip_prefix("http://"))
+            else {
+                return Err(invalid(format!(
+                    "{id:?}: issuer {:?} is not an http(s) URL",
+                    provider.issuer
+                )));
+            };
+            if provider.issuer.starts_with("http://") && !provider.insecure_http {
+                let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+                let host = authority
+                    .strip_prefix('[')
+                    .and_then(|bracketed| bracketed.split_once(']'))
+                    .map_or_else(
+                        || {
+                            authority
+                                .rsplit_once(':')
+                                .map_or(authority, |(host, _)| host)
+                        },
+                        |(host, _)| host,
+                    );
+                let loopback = host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback());
+                if !loopback {
+                    return Err(invalid(format!(
+                        "{id:?}: issuer {:?} is plain http on a host that is not loopback; \
+                         use https, or set insecure_http = true for a test rig",
+                        provider.issuer
+                    )));
+                }
+            }
+            if provider.client_id.is_empty() {
+                return Err(invalid(format!("{id:?}: client_id is empty")));
+            }
+            if !provider.scopes.iter().any(|scope| scope == "openid") {
+                return Err(invalid(format!(
+                    "{id:?}: scopes must include \"openid\" — without it there is no ID token"
+                )));
+            }
+            let secrets = usize::from(provider.client_secret.is_some())
+                + usize::from(provider.client_secret_file.is_some());
+            let wants_secret = provider.token_endpoint_auth_method != UpstreamClientAuth::None;
+            if secrets > 1 || (secrets == 1) != wants_secret {
+                return Err(invalid(format!(
+                    "{id:?}: set exactly one of client_secret and client_secret_file, or \
+                     neither with token_endpoint_auth_method = \"none\""
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// The built-in provider's settings: never beside delegation, and
     /// `auth.oidc_issuer` meaningful only with the provider and an http(s)
-    /// origin with nothing after the host.
+    /// URL with no query, fragment or credentials, whose path (if any) is
+    /// one the server can tell apart from its own routes.
     fn validate_builtin_oidc(&self) -> Result<(), ConfigError> {
         // One identity authority is the point of both modes; a server
         // with two would mint accounts nobody can say who owns.
@@ -1986,21 +2204,67 @@ impl Config {
                 message: format!("{issuer:?} is not an http(s) URL"),
             });
         };
-        let host = rest.strip_suffix('/').unwrap_or(rest);
+        let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
         if host.is_empty()
-            || host.contains(['/', '?', '#', '@', ' ', '\\'])
+            || host.contains(['?', '#', '@', ' ', '\\'])
             || host.chars().any(char::is_control)
         {
             return Err(ConfigError::Invalid {
                 field: "auth.oidc_issuer",
                 message: format!(
-                    "{issuer:?} must be an origin such as \"https://auth.example.org/\" — \
-                     the provider's endpoints live at the root of the host, so a path, \
-                     query or credentials here would advertise URLs nothing serves"
+                    "{issuer:?} must be an http(s) URL such as \"https://auth.example.org/\" — \
+                     a query, fragment or credentials here would advertise URLs nothing serves"
                 ),
             });
         }
+        let path = path.trim_end_matches('/');
+        if !path.is_empty() {
+            let segments: Vec<&str> = path[1..].split('/').collect();
+            let plain = segments.iter().all(|segment| {
+                !segment.is_empty()
+                    && *segment != "."
+                    && *segment != ".."
+                    && segment
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c))
+            });
+            // The path is stripped from a request before routing; a first
+            // segment that is itself a route (or a `_matrix`-style prefix)
+            // would make a real request look like a prefixed one.
+            let first = segments.first().copied().unwrap_or_default();
+            let collides = first.starts_with(['_', '.'])
+                || ["account", "oauth2", "upstream", "health", "ready"].contains(&first);
+            if !plain || collides {
+                return Err(ConfigError::Invalid {
+                    field: "auth.oidc_issuer",
+                    message: format!(
+                        "{issuer:?} has a path the provider cannot be served under: use plain \
+                         segments (letters, digits, - . _ ~) whose first is not one of the \
+                         server's own routes, e.g. \"https://example.org/auth/\""
+                    ),
+                });
+            }
+        }
         Ok(())
+    }
+
+    /// The path of `auth.oidc_issuer`, without a trailing slash: `/auth`
+    /// for `https://example.org/auth/`, empty for an issuer at the root of
+    /// its host or none configured. Only the configured issuer counts: the
+    /// client base URL's path was never served as the provider's, and an
+    /// issuer that does not name one keeps the routes exactly where they were.
+    #[must_use]
+    pub fn oidc_issuer_path(&self) -> String {
+        let Some(issuer) = self.auth.oidc_issuer.as_deref() else {
+            return String::new();
+        };
+        let rest = issuer
+            .strip_prefix("https://")
+            .or_else(|| issuer.strip_prefix("http://"))
+            .unwrap_or(issuer);
+        rest.find('/').map_or_else(String::new, |at| {
+            rest[at..].trim_end_matches('/').to_owned()
+        })
     }
 
     /// The built-in provider's issuer without its trailing slash: the

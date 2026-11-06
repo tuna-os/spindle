@@ -118,9 +118,12 @@ struct PendingCode {
 
 /// The provider's in-flight state. Codes are memory-only on purpose: a
 /// code that does not survive a restart costs the user one more login
-/// page, while a durable code would be a credential at rest.
+/// page, while a durable code would be a credential at rest. The client
+/// API's email validation sessions (`threepid.rs`) are held the same way
+/// for the same reason.
 pub struct BuiltinOidc {
     codes: Mutex<HashMap<String, PendingCode>>,
+    pub(crate) threepid: crate::threepid::Sessions,
 }
 
 impl BuiltinOidc {
@@ -128,6 +131,7 @@ impl BuiltinOidc {
     pub fn new() -> Self {
         Self {
             codes: Mutex::new(HashMap::new()),
+            threepid: crate::threepid::Sessions::default(),
         }
     }
 }
@@ -520,6 +524,10 @@ fn login_page(
         format!("<p class=\"error\">{}</p>", escape(message))
     });
     let forgot = crate::recovery::recovery_links(state);
+    // An upstream sign-in ends back at this very authorization request,
+    // which then finds the browser session it started.
+    let upstream =
+        crate::upstream::buttons(state, &format!("/oauth2/authorize?{}", params.query(None)));
     let body = format!(
         "<form method=\"post\" action=\"/oauth2/authorize\">\
          <h1>Sign in to {server}</h1>\
@@ -527,7 +535,7 @@ fn login_page(
          <input name=\"username\" placeholder=\"Username\" autocomplete=\"username\" required>\
          <input name=\"password\" type=\"password\" placeholder=\"Password\" \
          autocomplete=\"current-password\" required>\
-         <button type=\"submit\">Sign in</button></form>{forgot}",
+         <button type=\"submit\">Sign in</button></form>{upstream}{forgot}",
         server = escape(&state.config.server.name),
         client = escape(client_name),
         host = escape(redirect_host(&params.redirect_uri)),
