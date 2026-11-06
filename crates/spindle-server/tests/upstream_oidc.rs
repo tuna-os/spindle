@@ -312,6 +312,10 @@ struct Instance {
 
 impl Instance {
     async fn start() -> Instance {
+        Self::start_with(false).await
+    }
+
+    async fn start_with(rate_limited: bool) -> Instance {
         let idp = start_idp().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
@@ -327,7 +331,7 @@ impl Instance {
         };
         let config = spindle_server::Config::parse(&format!(
             "[server]\nname = \"{name}\"\npublic_base_url = \"http://{name}\"\n\
-             [ratelimit]\nenabled = false\n[auth]\nbuiltin_oidc = true\n{}{}{}",
+             [ratelimit]\nenabled = {rate_limited}\n[auth]\nbuiltin_oidc = true\n{}{}{}",
             provider("mock", ""),
             provider("trusting", "link_existing_by_email = true\n"),
             provider(
@@ -392,6 +396,8 @@ impl Instance {
 #[derive(Default)]
 struct Browser {
     jar: HashMap<String, String>,
+    /// Every binding cookie the server set, to replay one by hand.
+    bindings: Vec<String>,
 }
 
 struct Page {
@@ -421,6 +427,9 @@ impl Browser {
             if value.is_empty() || text.contains("Max-Age=0") {
                 self.jar.remove(name);
             } else {
+                if name == "spindle_upstream" {
+                    self.bindings.push(value.to_owned());
+                }
                 self.jar.insert(name.to_owned(), value.to_owned());
             }
         }
@@ -748,10 +757,13 @@ async fn a_callback_works_once_and_only_in_the_browser_that_started_it() {
     )
     .await;
     assert_eq!(page.status, 303, "{}", page.body);
-    // Replayed: the flow (state and nonce with it) was spent.
+    // Replayed with the very cookie the flow was sealed in: the flow (its
+    // state and nonce with it) was spent.
     let mut replay = Browser::default();
-    replay.jar.clone_from(&browser.jar);
-    replay.jar.remove("spindle_session");
+    replay.jar.insert(
+        "spindle_upstream".to_owned(),
+        browser.bindings.last().unwrap().clone(),
+    );
     let page = replay.get(&server, &callback).await;
     assert_eq!(page.status, 400, "{}", page.body);
     assert!(!replay.signed_in());
@@ -895,4 +907,37 @@ async fn userinfo_fills_in_what_the_id_token_leaves_out() {
     .await;
     assert_eq!(page.status, 502, "{}", page.body);
     assert!(server.available("imposter").await);
+}
+
+/// #610 review: starting a flow holds nothing on the server and spends no
+/// budget, so nobody can use up sign-in for everyone behind the same
+/// address by opening flows. Failed callbacks are what cost, and they
+/// spend the per-source login budget.
+#[tokio::test]
+async fn starting_flows_is_free_and_failed_callbacks_are_counted() {
+    let server = Instance::start_with(true).await;
+    let mut redirect_uri = String::new();
+    for attempt in 0..40 {
+        let page = Browser::default()
+            .get(&server, &server.url("/upstream/authorize/mock"))
+            .await;
+        assert_eq!(page.status, 303, "start {attempt}: {}", page.body);
+        redirect_uri = form_urlencoded::parse(page.location.split_once('?').unwrap().1.as_bytes())
+            .find(|(name, _)| name == "redirect_uri")
+            .unwrap()
+            .1
+            .into_owned();
+    }
+    let mut statuses = Vec::new();
+    for _ in 0..31 {
+        let page = Browser::default()
+            .get(&server, &format!("{redirect_uri}?code=x&state=forged"))
+            .await;
+        statuses.push(page.status);
+    }
+    assert!(
+        statuses[..30].iter().all(|status| *status == 403),
+        "{statuses:?}"
+    );
+    assert_eq!(statuses[30], 429, "the 31st failure in a minute is refused");
 }

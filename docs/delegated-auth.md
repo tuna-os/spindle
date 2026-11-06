@@ -385,13 +385,19 @@ The issuer that clients know stays the issuer of Spindle.
 `spindle.example.toml` shows each key of `[[auth.upstream_oidc]]`.
 Register `{issuer}/upstream/callback/{id}` as the redirect URI at the
 provider. The server does not start if `[auth.delegated]` is also set.
+The issuer must use https, but Spindle accepts plain http on loopback, or
+with `insecure_http = true` for a test rig.
 
 - The sign-in pages show a "Sign in with …" button for each provider.
   `GET /login` shows `m.login.sso` with the providers, and
   `/login/sso/redirect` and `/login/sso/redirect/{idpId}` start the flow.
 - The flow is the authorization code flow with PKCE `S256`, a `state`
-  and a `nonce`. A cookie binds the flow to the browser that started it.
-  The flow works once and stops after ten minutes.
+  and a `nonce`. The server keeps no flow. It seals each flow into the
+  cookie that binds it to the browser (ChaCha20-Poly1305, with a key per
+  process). Thus open flows use no memory on the server. A flow works
+  once and stops after ten minutes.
+- A failed callback spends the login budget of its source (30 a minute).
+  A successful callback resets it.
 - Spindle reads the discovery document and the JWKS at first use and
   keeps them for an hour. Spindle checks the signature of the ID token
   (RS256, PS256, ES256, ES384 or EdDSA). It also checks the issuer, the
@@ -399,11 +405,13 @@ provider. The server does not start if `[auth.delegated]` is also set.
 - The link table (keyspace `0x49`) maps the provider `id` and the `sub`
   to an account. A second sign-in uses the link, not the name.
 - A first sign-in makes an account from `localpart_claim`. It sets the
-  display name, and binds the email address if the provider marks it as
-  verified. If an account has that name, the sign-in fails: Spindle does
-  not give an existing account to a new identity. With
-  `link_existing_by_email`, a verified address that an account here holds
-  links to that account. This is off by default.
+  display name. It also binds the `email` claim if `email_verified` is
+  true, because that flag applies to that claim only. Spindle refuses
+  addresses with characters that are not ASCII: in Unicode, two different
+  addresses can become equal in lowercase. If an account has that
+  name, the sign-in fails: Spindle does not give an existing account to a
+  new identity. With `link_existing_by_email`, a verified address that an
+  account here holds links to that account. This is off by default.
 - For the client API, the callback shows a page with a link back to the
   client. The link has a single-use login token for `m.login.token`.
 

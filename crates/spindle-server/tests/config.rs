@@ -712,3 +712,36 @@ fn the_smtp_password_can_come_from_a_file() {
         "from-a-file"
     );
 }
+
+fn upstream(issuer: &str, extra: &str) -> Result<Config, ConfigError> {
+    parse(&format!(
+        "[server]\nname = \"example.org\"\n[auth]\nbuiltin_oidc = true\n\
+         [[auth.upstream_oidc]]\nid = \"sso\"\nissuer = \"{issuer}\"\nclient_id = \"c\"\n\
+         client_secret = \"s\"\n{extra}"
+    ))
+}
+
+/// #610 review: an upstream's discovery, keys and token answer decide who
+/// signs in, so they travel over TLS — plain http only on loopback, or
+/// when the operator says so for a test rig.
+#[test]
+fn an_upstream_issuer_is_https_unless_loopback_or_explicitly_insecure() {
+    assert!(upstream("https://sso.example.org", "").is_ok());
+    for loopback in [
+        "http://127.0.0.1:8080",
+        "http://localhost:8080/realm",
+        "http://[::1]:9000",
+    ] {
+        assert!(upstream(loopback, "").is_ok(), "{loopback}");
+    }
+    let error = upstream("http://sso.example.org", "").expect_err("plain http off loopback");
+    assert!(error.to_string().contains("insecure_http"), "{error}");
+    assert!(upstream("http://sso.example.org", "insecure_http = true\n").is_ok());
+}
+
+/// #610 review: `email_verified` speaks for the `email` claim only, so
+/// there is no setting that reads an address from another claim.
+#[test]
+fn an_upstream_email_claim_cannot_be_redirected() {
+    assert!(upstream("https://sso.example.org", "email_claim = \"mail\"\n").is_err());
+}

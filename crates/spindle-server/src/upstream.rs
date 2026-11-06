@@ -60,9 +60,11 @@ use crate::web::{self, FormTargets, escape, urlencode};
 /// for a person to type a password and pass a second factor upstream.
 const FLOW_LIFETIME: Duration = Duration::from_secs(600);
 
-/// The most flows held at once. Each is a few hundred bytes; the bound only
-/// keeps a flood of unfinished flows from growing memory without limit.
-const MAX_FLOWS: usize = 10_000;
+/// The most finished flows remembered as spent. A flow lives in its
+/// browser's cookie, not here; this set only stops a callback from being
+/// replayed with the same cookie, and only callbacks that carried a valid
+/// cookie and passed the per-source budget ever enter it.
+const MAX_SPENT: usize = 100_000;
 
 /// How long a discovery document or key set is trusted before it is read
 /// again.
@@ -82,11 +84,20 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// The cookie that binds a flow to the browser that started it.
 const BINDING_COOKIE: &str = "spindle_upstream";
 
-/// The configured providers and the flows in progress.
+/// The configured providers, the key that seals flows into their binding
+/// cookies, and the flows already finished.
 pub struct Upstream {
     providers: Vec<Provider>,
     http: reqwest::Client,
-    flows: Mutex<HashMap<String, Flow>>,
+    /// A flow is sealed (ChaCha20-Poly1305) into the cookie that binds it to
+    /// its browser, so opening one costs the server nothing to hold: a
+    /// flood of unfinished flows is a flood of cookies in other people's
+    /// browsers, not of rows here. The key is per process; a restart only
+    /// costs flows in progress one more click.
+    sealing: ring::aead::LessSafeKey,
+    /// The `state` digests of flows already used, until they would have
+    /// lapsed anyway.
+    spent: Mutex<HashMap<[u8; 32], Instant>>,
 }
 
 struct Provider {
@@ -136,7 +147,7 @@ struct Jwk {
 }
 
 /// Where a finished sign-in goes.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 enum Target {
     /// The built-in provider's pages: a browser session, then this path on
     /// this server (an authorization request, or an account page).
@@ -145,15 +156,15 @@ enum Target {
     Sso { redirect_url: String },
 }
 
-/// One flow, under its `state`.
+/// One flow, as sealed into its binding cookie.
+#[derive(Deserialize, Serialize)]
 struct Flow {
     provider: String,
+    state: String,
     nonce: String,
     verifier: String,
-    /// The BLAKE3 digest of the binding cookie's value.
-    binding: [u8; 32],
     target: Target,
-    expires: Instant,
+    expires_ms: u64,
 }
 
 /// The stored account link.
@@ -230,10 +241,18 @@ impl Upstream {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| format!("auth.upstream_oidc: {error}"))?;
+        let mut key = [0_u8; 32];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut key)
+            .map_err(|_| "auth.upstream_oidc: no randomness for the flow key".to_owned())?;
+        let sealing = ring::aead::LessSafeKey::new(
+            ring::aead::UnboundKey::new(&ring::aead::CHACHA20_POLY1305, &key)
+                .map_err(|_| "auth.upstream_oidc: the flow key was refused".to_owned())?,
+        );
         Ok(Some(Self {
             providers,
             http,
-            flows: Mutex::new(HashMap::new()),
+            sealing,
+            spent: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -243,10 +262,64 @@ impl Upstream {
             .find(|provider| provider.config.id == id)
     }
 
-    fn flows(&self) -> std::sync::MutexGuard<'_, HashMap<String, Flow>> {
-        self.flows
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// A flow as a cookie value: a fresh nonce, then the sealed JSON.
+    fn seal(&self, flow: &Flow) -> Option<String> {
+        let mut nonce = [0_u8; ring::aead::NONCE_LEN];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut nonce).ok()?;
+        let mut sealed = serde_json::to_vec(flow).ok()?;
+        self.sealing
+            .seal_in_place_append_tag(
+                ring::aead::Nonce::assume_unique_for_key(nonce),
+                ring::aead::Aad::from(BINDING_COOKIE.as_bytes()),
+                &mut sealed,
+            )
+            .ok()?;
+        Some(crate::oidc::base64url_unpadded(
+            &[&nonce[..], &sealed].concat(),
+        ))
+    }
+
+    /// The flow a cookie value carries, if this process sealed it.
+    fn open(&self, value: &str) -> Option<Flow> {
+        let raw = b64(value)?;
+        if raw.len() <= ring::aead::NONCE_LEN {
+            return None;
+        }
+        let (nonce, sealed) = raw.split_at(ring::aead::NONCE_LEN);
+        let mut sealed = sealed.to_vec();
+        let plain = self
+            .sealing
+            .open_in_place(
+                ring::aead::Nonce::try_assume_unique_for_key(nonce).ok()?,
+                ring::aead::Aad::from(BINDING_COOKIE.as_bytes()),
+                &mut sealed,
+            )
+            .ok()?;
+        serde_json::from_slice(plain).ok()
+    }
+
+    /// Record a flow as used; `false` if it already was.
+    fn spend(&self, state: &str, expires_ms: u64) -> bool {
+        let now = Instant::now();
+        let until = now
+            + Duration::from_millis(expires_ms.saturating_sub(web::now_ms())).min(FLOW_LIFETIME);
+        let mut spent = lock(&self.spent);
+        if spent.len() >= MAX_SPENT {
+            spent.retain(|_, lapses| *lapses > now);
+        }
+        if spent.len() >= MAX_SPENT {
+            // Still full of live entries: drop the one closest to lapsing.
+            // A replay of it would still need the upstream to redeem its
+            // code a second time, which a provider refuses.
+            if let Some(oldest) = spent
+                .iter()
+                .min_by_key(|(_, lapses)| **lapses)
+                .map(|(k, _)| *k)
+            {
+                spent.remove(&oldest);
+            }
+        }
+        spent.insert(web::digest(state), until).is_none()
     }
 
     async fn get_json<T: DeserializeOwned>(
@@ -402,7 +475,8 @@ pub(crate) fn buttons(state: &AppState, next: &str) -> String {
 /// [`web::safe_next`] has it.
 fn safe_next(next: Option<&str>) -> String {
     if let Some(next) = next
-        && next.len() <= 4096
+        // Bounded so the flow it rides in still fits in a cookie.
+        && next.len() <= 2048
         && next.starts_with("/oauth2/authorize?")
         && !next.contains("//")
         && !next.contains('\\')
@@ -436,12 +510,11 @@ struct NextQuery {
 async fn authorize(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    source: ClientAddr,
     Query(query): Query<NextQuery>,
 ) -> Result<Response, MatrixError> {
     crate::oidc::provider(&state)?;
     let next = safe_next(query.next.as_deref());
-    begin(&state, &id, Target::Page { next }, &source.to_string()).await
+    begin(&state, &id, Target::Page { next }).await
 }
 
 #[derive(Deserialize)]
@@ -451,34 +524,47 @@ struct SsoQuery {
 }
 
 /// The client URL a login token may be handed to: an absolute URI with a
-/// scheme (apps register custom ones), never a script-carrying one.
+/// scheme (apps register custom ones), never a script-carrying one, and
+/// never one with credentials in it — `https://bank.example@evil.example/`
+/// is how a URL lies about its host.
 fn check_redirect_url(redirect_url: Option<String>) -> Result<String, MatrixError> {
     let invalid =
         |message: &str| MatrixError::new(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", message);
     let url = redirect_url.ok_or_else(|| MatrixError::missing_param("redirectUrl is required"))?;
-    let scheme = url
-        .split_once(':')
-        .map(|(scheme, _)| scheme.to_ascii_lowercase());
-    let well_formed = scheme.as_deref().is_some_and(|scheme| {
-        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-            && scheme
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
-    });
-    if !well_formed || url.len() > 2048 || url.chars().any(char::is_control) {
-        return Err(invalid("redirectUrl must be an absolute URI"));
-    }
-    if matches!(scheme.as_deref(), Some("javascript" | "data" | "vbscript")) {
+    let parsed = reqwest::Url::parse(&url)
+        .ok()
+        .filter(|_| url.len() <= 2048)
+        .ok_or_else(|| invalid("redirectUrl must be an absolute URI"))?;
+    if matches!(parsed.scheme(), "javascript" | "data" | "vbscript") {
         return Err(invalid("redirectUrl may not be a script"));
     }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(invalid("redirectUrl may not carry credentials"));
+    }
     Ok(url)
+}
+
+/// How the confirmation page names where a token goes: the host as the URL
+/// parser reads it (internationalised names in their ASCII form, so a
+/// look-alike cannot pass for the real one), or, for an app's own scheme,
+/// the scheme alone.
+fn destination_label(redirect_url: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(redirect_url) else {
+        return String::new();
+    };
+    match (url.scheme(), url.host_str()) {
+        ("http" | "https", Some(host)) => match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_owned(),
+        },
+        (scheme, _) => format!("{scheme}:"),
+    }
 }
 
 /// `GET /_matrix/client/v3/login/sso/redirect` — with one provider, its
 /// flow; with several, a page to choose.
 async fn sso_redirect(
     State(state): State<AppState>,
-    source: ClientAddr,
     Query(query): Query<SsoQuery>,
 ) -> Result<Response, MatrixError> {
     if state.delegated.is_some() {
@@ -487,13 +573,7 @@ async fn sso_redirect(
     let upstream = state.upstream.clone().ok_or_else(not_configured)?;
     let redirect_url = check_redirect_url(query.redirect_url)?;
     if let [only] = upstream.providers.as_slice() {
-        return begin(
-            &state,
-            &only.config.id,
-            Target::Sso { redirect_url },
-            &source.to_string(),
-        )
-        .await;
+        return begin(&state, &only.config.id, Target::Sso { redirect_url }).await;
     }
     let mut list = String::new();
     for provider in &upstream.providers {
@@ -521,29 +601,19 @@ async fn sso_redirect(
 async fn sso_redirect_to(
     State(state): State<AppState>,
     Path(idp_id): Path<String>,
-    source: ClientAddr,
     Query(query): Query<SsoQuery>,
 ) -> Result<Response, MatrixError> {
     if state.delegated.is_some() {
         return Err(not_configured());
     }
     let redirect_url = check_redirect_url(query.redirect_url)?;
-    begin(
-        &state,
-        &idp_id,
-        Target::Sso { redirect_url },
-        &source.to_string(),
-    )
-    .await
+    begin(&state, &idp_id, Target::Sso { redirect_url }).await
 }
 
-/// Open a flow and send the browser upstream.
-async fn begin(
-    state: &AppState,
-    id: &str,
-    target: Target,
-    source: &str,
-) -> Result<Response, MatrixError> {
+/// Open a flow and send the browser upstream. Nothing is stored: the flow
+/// is sealed into the binding cookie, so starting one is free for the
+/// server and cannot fill anything up.
+async fn begin(state: &AppState, id: &str, target: Target) -> Result<Response, MatrixError> {
     let upstream = state.upstream.clone().ok_or_else(not_configured)?;
     let Some(provider) = upstream.provider(id) else {
         return Err(MatrixError::new(
@@ -552,27 +622,10 @@ async fn begin(
             "no such identity provider",
         ));
     };
-    // The login budget per source: each flow costs a fetch upstream and a
-    // row in memory.
-    if state
-        .limiter
-        .check(
-            &format!("upstream:source:{source}"),
-            FAILED_LOGIN_PER_SOURCE,
-        )
-        .is_err()
-    {
-        return Ok(notice(
-            state,
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many sign-ins",
-            "Wait a minute and try again.",
-        ));
-    }
     let metadata = match upstream.metadata(provider).await {
         Ok(metadata) => metadata,
         Err(failure) => {
-            tracing::warn!(provider = id, reason = %failure.logged, "upstream sign-in could not start");
+            tracing::warn!(provider = ?id, reason = ?failure.logged, "upstream sign-in could not start");
             return Ok(notice(
                 state,
                 failure.status,
@@ -581,43 +634,28 @@ async fn begin(
             ));
         }
     };
-    let flow_state = web::random_secret();
-    let nonce = web::random_secret();
     let verifier = web::random_secret();
-    let binding = web::random_secret();
     let challenge = crate::oidc::base64url_unpadded(&sha2::Sha256::digest(verifier.as_bytes()));
-    {
-        let now = Instant::now();
-        let mut flows = upstream.flows();
-        flows.retain(|_, flow| flow.expires > now);
-        if flows.len() >= MAX_FLOWS {
-            return Ok(notice(
-                state,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Too many sign-ins",
-                "Too many sign-ins are in progress. Try again in a few minutes.",
-            ));
-        }
-        flows.insert(
-            flow_state.clone(),
-            Flow {
-                provider: id.to_owned(),
-                nonce: nonce.clone(),
-                verifier,
-                binding: web::digest(&binding),
-                target,
-                expires: now + FLOW_LIFETIME,
-            },
-        );
-    }
+    let flow = Flow {
+        provider: id.to_owned(),
+        state: web::random_secret(),
+        nonce: web::random_secret(),
+        verifier,
+        target,
+        expires_ms: web::now_ms()
+            .saturating_add(u64::try_from(FLOW_LIFETIME.as_millis()).unwrap_or(u64::MAX)),
+    };
+    let Some(cookie) = upstream.seal(&flow) else {
+        return Err(MatrixError::internal("the flow could not be sealed"));
+    };
     let mut query = form_urlencoded::Serializer::new(String::new());
     query
         .append_pair("response_type", "code")
         .append_pair("client_id", &provider.config.client_id)
         .append_pair("redirect_uri", &callback_url(state, id))
         .append_pair("scope", &provider.config.scopes.join(" "))
-        .append_pair("state", &flow_state)
-        .append_pair("nonce", &nonce)
+        .append_pair("state", &flow.state)
+        .append_pair("nonce", &flow.nonce)
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256");
     let separator = if metadata.authorization_endpoint.contains('?') {
@@ -632,7 +670,7 @@ async fn begin(
     );
     Ok(web::with_cookie(
         web::see_other(&location),
-        &web::set_cookie(state, BINDING_COOKIE, &binding, FLOW_LIFETIME.as_secs()),
+        &web::set_cookie(state, BINDING_COOKIE, &cookie, FLOW_LIFETIME.as_secs()),
     ))
 }
 
@@ -650,20 +688,44 @@ struct CallbackQuery {
 }
 
 /// `GET /upstream/callback/{id}`
+///
+/// Callbacks are what cost: an upstream round trip and a signature check
+/// each. They spend the per-source login budget, and a successful one gives
+/// it back, as a correct password does.
 async fn callback(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    source: ClientAddr,
     headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> Result<Response, MatrixError> {
     let upstream = state.upstream.clone().ok_or_else(not_configured)?;
+    let budget = format!("upstream:callback:{source}");
+    if state
+        .limiter
+        .check(&budget, FAILED_LOGIN_PER_SOURCE)
+        .is_err()
+    {
+        return Ok(notice(
+            &state,
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many sign-ins",
+            "Wait a minute and try again.",
+        ));
+    }
     let (target, localpart) = match finish(&state, &upstream, &id, &headers, query).await {
         Ok(done) => done,
         Err(failure) => {
             state
                 .metrics
                 .record_login(LoginMethod::Upstream, LoginResult::Error);
-            tracing::warn!(provider = %id, reason = %failure.logged, "upstream sign-in refused");
+            // Debug formatting: the reason can quote what the request
+            // carried, and a newline in it must not forge a log line. The
+            // id is named only when it is a configured provider's.
+            let provider = upstream
+                .provider(&id)
+                .map(|provider| provider.config.id.as_str());
+            tracing::warn!(provider = ?provider, reason = ?failure.logged, "upstream sign-in refused");
             return Ok(notice(
                 &state,
                 failure.status,
@@ -672,6 +734,7 @@ async fn callback(
             ));
         }
     };
+    state.limiter.forget(&budget);
     state
         .metrics
         .record_login(LoginMethod::Upstream, LoginResult::Success);
@@ -699,19 +762,14 @@ async fn callback(
 fn sso_confirmation(state: &AppState, redirect_url: &str, token: &str, user_id: &str) -> Response {
     let separator = if redirect_url.contains('?') { '&' } else { '?' };
     let target = format!("{redirect_url}{separator}loginToken={}", urlencode(token));
-    let host = redirect_url
-        .split_once("://")
-        .map_or(redirect_url, |(_, rest)| rest)
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
+    let host = destination_label(redirect_url);
     let body = format!(
         "<h1>Continue to your application?</h1>\
          <p>You are signed in as <strong>{user}</strong>. Continue only if you started this \
          sign-in yourself, in the application at <code>{host}</code>.</p>\
          <p><a href=\"{target}\">Continue to {host}</a></p>",
         user = escape(user_id),
-        host = escape(host),
+        host = escape(&host),
         target = escape(&target),
     );
     web::html(
@@ -733,27 +791,33 @@ async fn finish(
         Failure::refused(
             StatusCode::BAD_REQUEST,
             "This sign-in has expired or was already used. Start again.",
-            "unknown, spent or lapsed state",
+            "spent or lapsed flow",
         )
     };
-    // Taken, not read: a flow finishes once, so a replayed callback (and
-    // with it a replayed nonce) finds nothing.
-    let flow = query
-        .state
-        .as_deref()
-        .and_then(|flow_state| upstream.flows().remove(flow_state))
-        .ok_or_else(expired)?;
-    if flow.provider != id || flow.expires <= Instant::now() {
-        return Err(expired());
-    }
-    let bound = web::cookie(headers, BINDING_COOKIE)
-        .is_some_and(|value| web::ct_eq(&web::digest(&value), &flow.binding));
-    if !bound {
-        return Err(Failure::refused(
+    let elsewhere = || {
+        Failure::refused(
             StatusCode::FORBIDDEN,
             "This sign-in was started in another browser. Start again from this one.",
-            "the binding cookie is missing or wrong",
-        ));
+            "the binding cookie is missing, forged or for another flow",
+        )
+    };
+    // The flow comes from this browser's cookie, sealed by this process, and
+    // must be the one the upstream answered (its `state`): an attacker's
+    // flow cannot be finished in someone else's browser.
+    let flow = web::cookie(headers, BINDING_COOKIE)
+        .and_then(|value| upstream.open(&value))
+        .ok_or_else(elsewhere)?;
+    let answered = query
+        .state
+        .as_deref()
+        .is_some_and(|answered| web::ct_eq(answered.as_bytes(), flow.state.as_bytes()));
+    if !answered || flow.provider != id {
+        return Err(elsewhere());
+    }
+    // Spent before anything else is done with it: a flow finishes once, so a
+    // replayed callback (and its nonce) is refused even with the cookie.
+    if flow.expires_ms <= web::now_ms() || !upstream.spend(&flow.state, flow.expires_ms) {
+        return Err(expired());
     }
     if let Some(error) = query.error {
         return Err(Failure::refused(
@@ -920,8 +984,11 @@ fn resolve_account(
         return Ok(link.localpart);
     }
 
+    // OIDC's `email_verified` vouches for the standard `email` claim, and
+    // only that one is read. `normalize` refuses non-ASCII addresses, so a
+    // Unicode look-alike cannot fold into someone else's address.
     let verified_address = (claims.get("email_verified") == Some(&Value::Bool(true)))
-        .then(|| claims.get(&config.email_claim).and_then(Value::as_str))
+        .then(|| claims.get("email").and_then(Value::as_str))
         .flatten()
         .and_then(crate::email::normalize);
     if config.link_existing_by_email
@@ -1379,6 +1446,33 @@ mod tests {
         assert!(check_redirect_url(Some("/relative".to_owned())).is_err());
         assert!(check_redirect_url(Some("javascript:alert(1)".to_owned())).is_err());
         assert!(check_redirect_url(None).is_err());
+    }
+
+    /// #610 review: the confirmation page names the host the URL parser
+    /// sees, never a host-looking prefix a URL can carry as credentials.
+    #[test]
+    fn the_confirmation_names_the_real_destination() {
+        assert!(
+            check_redirect_url(Some("https://bank.example@evil.example/cb".to_owned())).is_err()
+        );
+        assert!(check_redirect_url(Some("https://u:p@app.example/cb".to_owned())).is_err());
+        assert_eq!(
+            destination_label("https://app.example/cb?x=1"),
+            "app.example"
+        );
+        assert_eq!(
+            destination_label("https://app.example:8443/cb"),
+            "app.example:8443"
+        );
+        assert_eq!(
+            destination_label("https://bücher.example/cb"),
+            "xn--bcher-kva.example",
+            "an internationalised name in its ASCII form"
+        );
+        assert_eq!(
+            destination_label("io.element.app:/callback"),
+            "io.element.app:"
+        );
     }
 
     /// RFC 7515 Appendix A.2: an RS256 JWS and the public half of its key.

@@ -756,12 +756,10 @@ pub struct UpstreamOidcConfig {
     /// The claim a new account's display name is taken from.
     #[serde(default = "default_displayname_claim")]
     pub displayname_claim: String,
-    /// The claim an email address is taken from; it is used only when the
-    /// provider also says `email_verified: true`.
-    #[serde(default = "default_email_claim")]
-    pub email_claim: String,
     /// Link a first sign-in to the existing account whose confirmed address
-    /// is the provider's verified one. Off by default: it hands the account
+    /// is the provider's verified one — the standard `email` claim, with
+    /// `email_verified: true`, which is the only claim that flag vouches
+    /// for. Off by default: it hands the account
     /// to whoever controls that address at the provider, which is only as
     /// safe as the provider's own address verification.
     #[serde(default)]
@@ -770,6 +768,13 @@ pub struct UpstreamOidcConfig {
     /// (Authelia, by default) that puts only `sub` in its ID token.
     #[serde(default)]
     pub fetch_userinfo: bool,
+    /// Allow a plain-http `issuer` on a host other than loopback. Off: the
+    /// discovery document, the keys and the token answer would otherwise
+    /// cross the network unauthenticated, and whoever sits in between
+    /// could sign anyone in. A test rig's provider on another container may
+    /// need it.
+    #[serde(default)]
+    pub insecure_http: bool,
 }
 
 impl std::fmt::Debug for UpstreamOidcConfig {
@@ -835,10 +840,6 @@ fn default_localpart_claim() -> String {
 
 fn default_displayname_claim() -> String {
     "name".to_owned()
-}
-
-fn default_email_claim() -> String {
-    "email".to_owned()
 }
 
 /// The delegated provider, named explicitly rather than discovered at
@@ -2112,11 +2113,40 @@ impl Config {
             if !seen.insert(id.as_str()) {
                 return Err(invalid(format!("id {id:?} is used twice")));
             }
-            if !provider.issuer.starts_with("https://") && !provider.issuer.starts_with("http://") {
+            let Some(rest) = provider
+                .issuer
+                .strip_prefix("https://")
+                .or_else(|| provider.issuer.strip_prefix("http://"))
+            else {
                 return Err(invalid(format!(
                     "{id:?}: issuer {:?} is not an http(s) URL",
                     provider.issuer
                 )));
+            };
+            if provider.issuer.starts_with("http://") && !provider.insecure_http {
+                let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+                let host = authority
+                    .strip_prefix('[')
+                    .and_then(|bracketed| bracketed.split_once(']'))
+                    .map_or_else(
+                        || {
+                            authority
+                                .rsplit_once(':')
+                                .map_or(authority, |(host, _)| host)
+                        },
+                        |(host, _)| host,
+                    );
+                let loopback = host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback());
+                if !loopback {
+                    return Err(invalid(format!(
+                        "{id:?}: issuer {:?} is plain http on a host that is not loopback; \
+                         use https, or set insecure_http = true for a test rig",
+                        provider.issuer
+                    )));
+                }
             }
             if provider.client_id.is_empty() {
                 return Err(invalid(format!("{id:?}: client_id is empty")));

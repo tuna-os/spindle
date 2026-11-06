@@ -326,9 +326,10 @@ registrations = []
 # scopes = ["openid", "profile", "email"]
 # localpart_claim = "preferred_username"
 # displayname_claim = "name"
-# email_claim = "email"              # used only with email_verified = true
-# link_existing_by_email = false     # link a first sign-in by verified address
+# link_existing_by_email = false     # link a first sign-in by its verified
+#                                    # `email` claim (email_verified = true)
 # fetch_userinfo = false             # read claims from userinfo too (Authelia)
+# insecure_http = false              # allow a plain-http issuer off loopback
 
 # MSC3861 delegation: an external OIDC provider (typically the Matrix
 # Authentication Service) owns identity, and this server validates its
