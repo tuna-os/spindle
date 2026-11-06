@@ -961,17 +961,15 @@ fn resolve_account(
         .get("sub")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let key = keys::upstream_link(&config.id, subject);
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     let storage = |error: &dyn std::fmt::Display| {
         Failure::internal(&MatrixError::internal(&error.to_string()))
     };
-    let linked = ReadView::get(state.store.as_ref(), &key)
-        .map_err(|error| storage(&error))?
-        .and_then(|raw| serde_json::from_slice::<Link>(&raw).ok());
-    if let Some(link) = linked {
+    let linked = linked_account(state.store.as_ref(), &config.id, subject)
+        .map_err(|error| storage(&error))?;
+    if let Some(linked) = linked {
         let usable = accounts
-            .account(&link.localpart)
+            .account(&linked)
             .map_err(|error| storage(&error))?
             .is_some_and(|account| !account.deactivated && !account.locked);
         if !usable {
@@ -981,7 +979,7 @@ fn resolve_account(
                 "the linked account cannot sign in",
             ));
         }
-        return Ok(link.localpart);
+        return Ok(linked);
     }
 
     // OIDC's `email_verified` vouches for the standard `email` claim, and
@@ -1001,13 +999,13 @@ fn resolve_account(
             .map_err(|error| storage(&error))?
             .is_some_and(|account| !account.deactivated && !account.locked);
         if usable {
-            write_link(state, &key, &owner)?;
+            write_link(state, &config.id, subject, &owner)?;
             return Ok(owner);
         }
     }
 
     let localpart = provision(state, config, claims)?;
-    write_link(state, &key, &localpart)?;
+    write_link(state, &config.id, subject, &localpart)?;
     let user_id = accounts.user_id(&localpart);
     if let Some(name) = claims
         .get(&config.displayname_claim)
@@ -1080,14 +1078,51 @@ fn provision(
     }
 }
 
-fn write_link(state: &AppState, key: &[u8], localpart: &str) -> Result<(), Failure> {
+fn write_link(
+    state: &AppState,
+    provider: &str,
+    subject: &str,
+    localpart: &str,
+) -> Result<(), Failure> {
+    store_link(state.store.as_ref(), provider, subject, localpart)
+        .map_err(|error| Failure::internal(&MatrixError::internal(&error.to_string())))
+}
+
+/// The account an upstream identity is linked to, if any.
+///
+/// # Errors
+///
+/// A storage error.
+pub(crate) fn linked_account(
+    store: &(impl ReadView + ?Sized),
+    provider: &str,
+    subject: &str,
+) -> Result<Option<String>, spindle_store::StoreError> {
+    Ok(
+        ReadView::get(store, &keys::upstream_link(provider, subject))?
+            .and_then(|raw| serde_json::from_slice::<Link>(&raw).ok())
+            .map(|link| link.localpart),
+    )
+}
+
+/// Link an upstream identity to an account: what a first sign-in does, and
+/// what the MAS importer does with MAS's `upstream_oauth_links` (#797).
+///
+/// # Errors
+///
+/// A storage error.
+pub(crate) fn store_link(
+    store: &(impl Store + ?Sized),
+    provider: &str,
+    subject: &str,
+    localpart: &str,
+) -> Result<(), spindle_store::StoreError> {
     let row = serde_json::to_vec(&Link {
         localpart: localpart.to_owned(),
         linked_ms: web::now_ms(),
     })
-    .map_err(|error| Failure::internal(&MatrixError::internal(&error.to_string())))?;
-    Store::put(state.store.as_ref(), key, &row)
-        .map_err(|error| Failure::internal(&MatrixError::internal(&error.to_string())))
+    .map_err(|error| spindle_store::StoreError::Backend(error.to_string()))?;
+    Store::put(store, &keys::upstream_link(provider, subject), &row)
 }
 
 /// What an ID token must say.

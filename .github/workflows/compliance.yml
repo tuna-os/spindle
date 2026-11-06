@@ -130,9 +130,37 @@ jobs:
       # This builds and runs it. No Synapse checkout is cloned: the one test
       # that needs real DDL skips itself, and the rest carry the shapes that
       # actually bite (a legacy is_state edge, an edge with a NULL room_id).
+      #
+      # Built with `mas-import` as well, so the MAS step below reuses this
+      # build rather than compiling the crate a third time.
       - name: Check the Synapse reader still builds and passes
         if: ${{ !cancelled() }}
-        run: cargo test --features synapse-import --test synapse_reader
+        run: cargo test --features synapse-import,mas-import --test synapse_reader
+
+      # The MAS importer (#797) against the schema of MAS 1.23.0, the
+      # release production runs. MAS's own `database migrate`, from the
+      # image the rehearsal rig pins, writes it into an empty PostgreSQL:
+      # column names are what a schema written by hand cannot check.
+      - name: Check the MAS importer against MAS 1.23.0's schema
+        if: ${{ !cancelled() }}
+        run: |
+          docker run -d --name mas-pg -e POSTGRES_PASSWORD=mas -e POSTGRES_DB=mas \
+            -p 127.0.0.1:5434:5432 postgres:16-alpine@sha256:e0e53cfa0884f3cc216a621033e4f38dceb49e52218ac77facc8e48f02973093
+          # Over TCP: the entrypoint's first, socket-only server answers a
+          # socket check before the real one is up (see bench-sitting.yml).
+          for _ in $(seq 1 60); do
+            docker exec mas-pg pg_isready -U postgres -h 127.0.0.1 -q && break
+            sleep 1
+          done
+          docker exec mas-pg pg_isready -U postgres -h 127.0.0.1
+          printf 'database:\n  uri: postgresql://postgres:mas@127.0.0.1:5434/mas\n' \
+            > "$RUNNER_TEMP/mas.yaml"
+          docker run --rm --network host -e MAS_CONFIG=/conf/config.yaml \
+            -v "$RUNNER_TEMP/mas.yaml:/conf/config.yaml:ro" \
+            ghcr.io/element-hq/matrix-authentication-service:1.23.0@sha256:e82b2e4a5f9c7ca74096743349160795f5b5a792556fb85c6b5166a9180a5985 \
+            database migrate
+          SPINDLE_MAS_TEST_POSTGRES="host=127.0.0.1 port=5434 user=postgres password=mas dbname=mas" \
+            cargo test --features synapse-import,mas-import --test mas_reader -- --nocapture
 
       - name: Build the server
         id: build

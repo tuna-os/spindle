@@ -52,8 +52,20 @@ const TOKEN_BYTES: usize = 32;
 )]
 pub struct Account {
     pub localpart: String,
-    /// Argon2id PHC string, salt included.
+    /// Argon2 PHC string, salt included; or, imported from MAS or Synapse,
+    /// a bcrypt hash (#797).
     pub password_hash: String,
+    /// How `password_hash` is checked when MAS's scheme did more than hash
+    /// the password as typed (#797). `None` for every hash made here, and
+    /// cleared whenever the password changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_scheme: Option<PasswordScheme>,
+    /// BLAKE3 of the last hash `import-mas` stored (#797). A password
+    /// change leaves it on purpose: a rerun compares it with the current
+    /// hash, which tells a password the user changed here (kept) from one
+    /// still as imported (brought up to date).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_hash_digest: Option<String>,
     /// Deactivated accounts keep their row — the localpart stays taken
     /// forever, because releasing it would let a stranger inherit the
     /// old user's identity — but no longer authenticate.
@@ -82,6 +94,21 @@ pub struct Account {
     /// not joined when they were sent, as Synapse does (#576).
     #[serde(default)]
     pub erased: bool,
+}
+
+/// What a MAS password scheme adds to the plain hash (#797). MAS keeps it
+/// in its configuration, not with the hash, so the importer copies it here:
+/// without it the hash can never verify.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PasswordScheme {
+    /// The scheme's `secret` (pepper), hex-encoded. bcrypt appends it to the
+    /// password; Argon2 takes it as its secret input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pepper: Option<String>,
+    /// NFKC-normalize the password before hashing it (MAS's
+    /// `unicode_normalization`, which syn2mas sets for Synapse's hashes).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nfkc: bool,
 }
 
 /// One logged-in device.
@@ -192,6 +219,8 @@ impl<'a, S: Store> Accounts<'a, S> {
         let account = Account {
             localpart: localpart.to_owned(),
             password_hash,
+            password_scheme: None,
+            imported_hash_digest: None,
             deactivated: false,
             admin: false,
             locked: false,
@@ -228,6 +257,8 @@ impl<'a, S: Store> Accounts<'a, S> {
         let account = Account {
             localpart: localpart.to_owned(),
             password_hash: password_hash.to_owned(),
+            password_scheme: None,
+            imported_hash_digest: None,
             deactivated: false,
             admin: false,
             locked: false,
@@ -390,11 +421,10 @@ impl<'a, S: Store> Accounts<'a, S> {
     /// full. Busy is not `false`: the password was never checked.
     pub fn verify_password(&self, localpart: &str, password: &str) -> Result<bool, AccountError> {
         let account = self.account(localpart)?;
-        let hash = account.as_ref().map_or(DUMMY_HASH, |a| &a.password_hash);
-        let parsed = PasswordHash::new(hash).map_err(|e| AccountError::Hashing(e.to_string()))?;
-        let matches = passwords::with_workspace(|argon| {
-            argon.verify_password(password.as_bytes(), &parsed).is_ok()
-        })?;
+        let (hash, scheme) = account.as_ref().map_or((DUMMY_HASH, None), |a| {
+            (a.password_hash.as_str(), a.password_scheme.as_ref())
+        });
+        let matches = verify_hash(hash, scheme, password)?;
         // A deactivated account keeps its hash (the row is the localpart
         // reservation) but no longer authenticates.
         Ok(matches && account.is_some_and(|account| !account.deactivated))
@@ -735,6 +765,7 @@ impl<'a, S: Store> Accounts<'a, S> {
             return Ok(false);
         };
         account.password_hash = password_hash;
+        account.password_scheme = None;
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
         Ok(true)
@@ -768,6 +799,48 @@ impl<'a, S: Store> Accounts<'a, S> {
             return Ok(false);
         };
         password_hash.clone_into(&mut account.password_hash);
+        account.password_scheme = None;
+        self.store
+            .put(&account_key(localpart), &encode(&account)?)?;
+        Ok(true)
+    }
+
+    /// Store a password hash read from MAS, with the scheme it needs
+    /// (#797), and remember which hash that was in
+    /// [`Account::imported_hash_digest`]. `false` for an account that does
+    /// not exist.
+    ///
+    /// # Errors
+    ///
+    /// [`AccountError::InvalidHash`] for a hash or pepper this server will
+    /// not store, or a storage or decoding error.
+    pub fn import_password_hash(
+        &self,
+        localpart: &str,
+        password_hash: &str,
+        scheme: Option<PasswordScheme>,
+    ) -> Result<bool, AccountError> {
+        validate_password_hash(password_hash)?;
+        if let Some(pepper) = scheme.as_ref().and_then(|scheme| scheme.pepper.as_deref())
+            && unhex(pepper).is_none()
+        {
+            return Err(AccountError::InvalidHash(
+                "the pepper must be hex-encoded".to_owned(),
+            ));
+        }
+        // All account updates share the erasure lock so a concurrent
+        // flag/password write cannot restore an older erasure decision.
+        let _guard = ERASURE_POLICY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(mut account) = self.account(localpart)? else {
+            return Ok(false);
+        };
+        password_hash.clone_into(&mut account.password_hash);
+        // A scheme that adds nothing is stored as none, so the account
+        // reads the same as one whose hash was made here.
+        account.password_scheme = scheme.filter(|scheme| *scheme != PasswordScheme::default());
+        account.imported_hash_digest = Some(hash_digest(password_hash));
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
         Ok(true)
@@ -958,22 +1031,94 @@ const MAX_HASH_MEMORY_KIB: u32 = 256 * 1024;
 const MAX_HASH_TIME_COST: u32 = 16;
 const MAX_HASH_LANES: u32 = 16;
 
-/// Check a PHC password hash before it is stored (#611).
+/// The highest bcrypt cost a stored hash may ask for: four times the work
+/// of the cost of 12 that MAS and Synapse use by default. bcrypt doubles
+/// its work with each step, and each login pays it.
+const MAX_BCRYPT_COST: u32 = 14;
+
+/// BLAKE3 of a stored hash, hex: how [`Account::imported_hash_digest`]
+/// remembers a hash without a second copy of it.
+#[must_use]
+pub fn hash_digest(password_hash: &str) -> String {
+    blake3::hash(password_hash.as_bytes()).to_hex().to_string()
+}
+
+fn is_bcrypt(hash: &str) -> bool {
+    ["$2a$", "$2b$", "$2y$"]
+        .iter()
+        .any(|prefix| hash.starts_with(prefix))
+}
+
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(text.get(at..at + 2)?, 16).ok())
+        .collect()
+}
+
+/// Check `password` against a stored hash and the scheme it was made
+/// under. Both algorithms run in a workspace of the hashing pool, so a
+/// bcrypt check waits in, and is refused by, the same queue as an Argon2
+/// one (#571).
+fn verify_hash(
+    hash: &str,
+    scheme: Option<&PasswordScheme>,
+    password: &str,
+) -> Result<bool, AccountError> {
+    use unicode_normalization::UnicodeNormalization as _;
+    let normalized: String;
+    let password = if scheme.is_some_and(|scheme| scheme.nfkc) {
+        normalized = password.nfkc().collect();
+        normalized.as_str()
+    } else {
+        password
+    };
+    let pepper = match scheme.and_then(|scheme| scheme.pepper.as_deref()) {
+        Some(text) => Some(
+            unhex(text)
+                .ok_or_else(|| AccountError::Hashing("the stored pepper is not hex".to_owned()))?,
+        ),
+        None => None,
+    };
+    if is_bcrypt(hash) {
+        // MAS's bcrypt scheme, like Synapse's, appends the pepper. A bcrypt
+        // check takes longer than the Argon2 dummy an unknown user costs, so
+        // the time tells such an account exists: no more than
+        // `/register/available` answers anyone.
+        let mut input = password.as_bytes().to_vec();
+        input.extend_from_slice(pepper.as_deref().unwrap_or_default());
+        return Ok(passwords::with_workspace(|_| {
+            bcrypt::verify(&input, hash).unwrap_or(false)
+        })?);
+    }
+    let parsed = PasswordHash::new(hash).map_err(|e| AccountError::Hashing(e.to_string()))?;
+    Ok(passwords::with_keyed_workspace(
+        pepper.as_deref(),
+        |argon| argon.verify_password(password.as_bytes(), &parsed).is_ok(),
+    )?)
+}
+
+/// Check a password hash before it is stored (#611, #797).
 ///
-/// Accepted: Argon2 in any of its three variants (`argon2id`, `argon2i`,
-/// `argon2d`), version 0x10 or 0x13, with exactly the `m`, `t` and `p`
-/// parameters, a salt and a hash — which is what MAS, Synapse-adjacent
-/// tooling and Spindle itself write. Refused, each for a reason:
+/// Accepted: Argon2 in PHC form, in any of its three variants (`argon2id`,
+/// `argon2i`, `argon2d`), version 0x10 or 0x13, with exactly the `m`, `t`
+/// and `p` parameters, a salt and a hash — which is what MAS,
+/// Synapse-adjacent tooling and Spindle itself write; and bcrypt (`$2a$`,
+/// `$2b$`, `$2y$`), which Synapse writes and MAS keeps for users that
+/// syn2mas moved. Refused, each for a reason:
 ///
-/// - **Any other algorithm** (bcrypt, pbkdf2, scrypt…): verification here
-///   is Argon2 only, and a stored hash nothing can check is an account
-///   nobody can enter.
+/// - **Any other algorithm** (pbkdf2, scrypt…): nothing here can check
+///   it, and a stored hash nothing can check is an account nobody can
+///   enter.
 /// - **Keyed (`keyid=`) or associated-data (`data=`) hashes**: they were
 ///   computed with a secret pepper this server does not have, so they can
 ///   never verify. Note the converse: a hash computed with a pepper that
 ///   is *not* recorded in the string (MAS's `secret` scheme option) looks
-///   ordinary and is accepted, and then never verifies. Nothing in the
-///   string can reveal that; the operator has to know.
+///   ordinary and is accepted, and then verifies only with the pepper that
+///   `import-mas` stores beside it. Nothing in the string can reveal that.
 /// - **Costs beyond the bounds above**: a denial of service waiting for
 ///   the first login.
 ///
@@ -983,6 +1128,9 @@ const MAX_HASH_LANES: u32 = 16;
 /// echoes the hash.
 pub fn validate_password_hash(phc: &str) -> Result<(), AccountError> {
     let invalid = |why: &str| Err(AccountError::InvalidHash(why.to_owned()));
+    if is_bcrypt(phc) {
+        return validate_bcrypt(phc);
+    }
     let mut parts = phc.split('$');
     if parts.next() != Some("") {
         return invalid("not a PHC string: it must start with '$'");
@@ -990,8 +1138,8 @@ pub fn validate_password_hash(phc: &str) -> Result<(), AccountError> {
     let algorithm = parts.next().unwrap_or_default();
     if !matches!(algorithm, "argon2id" | "argon2i" | "argon2d") {
         return Err(AccountError::InvalidHash(format!(
-            "unsupported algorithm {algorithm:?}: only argon2id, argon2i and argon2d \
-             hashes can be verified here"
+            "unsupported algorithm {algorithm:?}: only argon2id, argon2i, argon2d \
+             and bcrypt hashes can be verified here"
         )));
     }
     let mut next = parts.next().unwrap_or_default();
@@ -1058,6 +1206,39 @@ pub fn validate_password_hash(phc: &str) -> Result<(), AccountError> {
     PasswordHash::new(phc)
         .map(|_| ())
         .map_err(|_| AccountError::InvalidHash("not a well-formed PHC string".to_owned()))
+}
+
+/// The shape of a bcrypt hash: `$2b$`, a two-digit cost, `$`, then 22
+/// characters of salt and 31 of hash in bcrypt's base64 alphabet.
+fn validate_bcrypt(hash: &str) -> Result<(), AccountError> {
+    let invalid = |why: &str| Err(AccountError::InvalidHash(why.to_owned()));
+    let (Some(cost), Some(body)) = (hash.get(4..6), hash.get(6..)) else {
+        return invalid("a bcrypt hash needs a two-digit cost");
+    };
+    let Some(cost) = cost
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then(|| cost.parse::<u32>().ok())
+        .flatten()
+    else {
+        return invalid("a bcrypt hash needs a two-digit cost");
+    };
+    if !(4..=MAX_BCRYPT_COST).contains(&cost) {
+        return Err(AccountError::InvalidHash(format!(
+            "bcrypt cost out of bounds: 4 <= cost <= {MAX_BCRYPT_COST}"
+        )));
+    }
+    let Some(rest) = body.strip_prefix('$') else {
+        return invalid("a bcrypt hash has '$' after its cost");
+    };
+    if rest.len() != 53
+        || !rest
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'/')
+    {
+        return invalid("a bcrypt hash ends with 53 characters of salt and hash");
+    }
+    Ok(())
 }
 
 /// Why an account operation failed.
@@ -1277,7 +1458,11 @@ mod password_hash_tests {
         for hash in [
             String::new(),
             "plaintext".to_owned(),
-            "$2b$12$abcdefghijklmnopqrstuuJ7nGq1k7h8yQ0e1lQ9n6S1d1x8Zb2K".to_owned(),
+            "$2b$12$tooshort".to_owned(),
+            "$2b$31$mqjtwG6w3GawhuQQdwBCqOt0TQ0V4vGhB.tMuCZO8WL.ycBHkOLca".to_owned(),
+            "$2b$1x$mqjtwG6w3GawhuQQdwBCqOt0TQ0V4vGhB.tMuCZO8WL.ycBHkOLca".to_owned(),
+            "$2b$10$mqjtwG6w3GawhuQQdwBCqOt0TQ0V4vGhB.tMuCZO8WL.ycBHkOLc!".to_owned(),
+            "$2x$10$mqjtwG6w3GawhuQQdwBCqOt0TQ0V4vGhB.tMuCZO8WL.ycBHkOLca".to_owned(),
             format!("$pbkdf2-sha256$i=1000${salt}${out}"),
             format!("$scrypt$ln=16,r=8,p=1${salt}${out}"),
             format!("$argon2id$v=19$m=19456,t=2,p=1,keyid=abc${salt}${out}"),
@@ -1301,5 +1486,108 @@ mod password_hash_tests {
             );
         }
         assert!(accounts.verify_password("carol", "her password").unwrap());
+    }
+
+    // MAS's own outputs (#797): the insta snapshots of MAS 1.23.0's
+    // `passwords.rs` tests, which hash "hunter2" with and without the pepper
+    // "a-secret-pepper". MAS made them, so a pass here is this server
+    // agreeing with MAS rather than with itself.
+    const MAS_BCRYPT_PEPPERED: &str =
+        "$2b$10$c/EX8bTbEMfTn4oCvcQyBOR1zPyLmGzZ2pMXoElLASqv2qpq5X15i";
+    const MAS_BCRYPT: &str = "$2b$10$mqjtwG6w3GawhuQQdwBCqOt0TQ0V4vGhB.tMuCZO8WL.ycBHkOLca";
+    const MAS_ARGON2_PEPPERED: &str = "$argon2id$v=19$m=19456,t=2,p=1$eEi11xG8mIOZYxej+ckCaQ$\
+        eBeygPqiuImQAaFQOkE6oVkPfqxIGgnqpQd/MwW4YX4";
+    const MAS_ARGON2: &str = "$argon2id$v=19$m=19456,t=2,p=1$1WdxAF1UChkYSTnJ6NDbKg$\
+        ajKAfwlUmkbxITSdh55j+Hvoxzppx20ArNUF44oV9Nk";
+
+    fn pepper() -> Option<PasswordScheme> {
+        Some(PasswordScheme {
+            pepper: Some(hex(b"a-secret-pepper")),
+            nfkc: false,
+        })
+    }
+
+    #[test]
+    fn mas_bcrypt_and_peppered_hashes_verify_with_their_scheme_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        let accounts = Accounts::new(&store, "example.org");
+        accounts.register("dave", "unused").unwrap();
+        for (hash, scheme) in [
+            (MAS_BCRYPT, None),
+            (MAS_BCRYPT_PEPPERED, pepper()),
+            (MAS_ARGON2, None),
+            (MAS_ARGON2_PEPPERED, pepper()),
+        ] {
+            let peppered = scheme.is_some();
+            assert!(accounts.import_password_hash("dave", hash, scheme).unwrap());
+            assert!(
+                accounts.verify_password("dave", "hunter2").unwrap(),
+                "{hash}"
+            );
+            assert!(!accounts.verify_password("dave", "wrong-password").unwrap());
+            // The same hash without its pepper never verifies: the scheme is
+            // what carries it.
+            accounts.set_password_hash("dave", hash).unwrap();
+            assert_eq!(
+                accounts.verify_password("dave", "hunter2").unwrap(),
+                !peppered,
+                "{hash}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_normalizing_scheme_folds_the_password_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        let accounts = Accounts::new(&store, "example.org");
+        accounts.register("erin", "unused").unwrap();
+        let fullwidth = "\u{ff48}\u{ff55}\u{ff4e}\u{ff54}\u{ff45}\u{ff52}\u{ff12}";
+        accounts
+            .import_password_hash("erin", MAS_BCRYPT, None)
+            .unwrap();
+        assert!(!accounts.verify_password("erin", fullwidth).unwrap());
+        let nfkc = Some(PasswordScheme {
+            pepper: None,
+            nfkc: true,
+        });
+        accounts
+            .import_password_hash("erin", MAS_BCRYPT, nfkc)
+            .unwrap();
+        assert!(accounts.verify_password("erin", fullwidth).unwrap());
+        assert!(accounts.verify_password("erin", "hunter2").unwrap());
+    }
+
+    #[test]
+    fn a_password_change_drops_the_scheme_and_keeps_the_import_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        let accounts = Accounts::new(&store, "example.org");
+        accounts.register("fay", "unused").unwrap();
+        accounts
+            .import_password_hash("fay", MAS_ARGON2_PEPPERED, pepper())
+            .unwrap();
+        let imported = accounts.account("fay").unwrap().unwrap();
+        assert_eq!(imported.password_scheme, pepper());
+        assert_eq!(
+            imported.imported_hash_digest.as_deref(),
+            Some(hash_digest(MAS_ARGON2_PEPPERED).as_str())
+        );
+        accounts.set_password("fay", "a new one").unwrap();
+        let changed = accounts.account("fay").unwrap().unwrap();
+        assert_eq!(changed.password_scheme, None);
+        assert_eq!(changed.imported_hash_digest, imported.imported_hash_digest);
+        assert!(accounts.verify_password("fay", "a new one").unwrap());
+        // A pepper that is not hex is refused before anything is written.
+        let bad = Some(PasswordScheme {
+            pepper: Some("not hex".to_owned()),
+            nfkc: false,
+        });
+        assert!(matches!(
+            accounts.import_password_hash("fay", MAS_BCRYPT, bad),
+            Err(AccountError::InvalidHash(_))
+        ));
+        assert!(accounts.verify_password("fay", "a new one").unwrap());
     }
 }

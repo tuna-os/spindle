@@ -17,7 +17,8 @@
 # tag and the digest together. complement/Dockerfile pins the same two.
 FROM rust:1.99-bookworm@sha256:7085845219c18e7c5b1f34ed9ce89b84f822f2e3d54a02774cedc996ac0f304f AS build
 # Extra cargo features, empty for the release image. The Synapse migration
-# rehearsal image passes FEATURES=synapse-import.
+# rehearsal image passes FEATURES=synapse-import; an image for a MAS
+# cutover (`spindle import-mas`), FEATURES=mas-import.
 ARG FEATURES=""
 WORKDIR /src
 COPY . .

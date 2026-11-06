@@ -40,6 +40,11 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDequ
 #[cfg(feature = "synapse-import")]
 pub mod synapse;
 
+/// Moving accounts from a Matrix Authentication Service database into the
+/// built-in provider (#797). The plan-and-apply half needs no database, so
+/// it builds by default; only its `PostgreSQL` reader is behind a feature.
+pub mod mas;
+
 use std::sync::Arc;
 
 use spindle_core::{

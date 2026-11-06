@@ -65,13 +65,27 @@ pub(crate) fn configure(limits: &LimitsConfig) {
 ///
 /// [`Busy`] when every workspace is in use and the queue is full.
 pub(crate) fn with_workspace<T>(work: impl FnOnce(&Workspace<'_>) -> T) -> Result<T, Busy> {
+    with_keyed_workspace(None, work)
+}
+
+/// [`with_workspace`], with Argon2's secret input set to `secret`: the
+/// pepper of a hash imported from MAS (#797), whose scheme `secret` is
+/// that input and is recorded nowhere in the PHC string.
+///
+/// # Errors
+///
+/// [`Busy`] when every workspace is in use and the queue is full.
+pub(crate) fn with_keyed_workspace<T>(
+    secret: Option<&[u8]>,
+    work: impl FnOnce(&Workspace<'_>) -> T,
+) -> Result<T, Busy> {
     POOL.get_or_init(|| {
         HashPool::new(
             DEFAULT_PASSWORD_HASHES_AT_ONCE,
             DEFAULT_PASSWORD_HASHES_WAITING,
         )
     })
-    .with_workspace(work)
+    .with_keyed_workspace(secret, work)
 }
 
 /// Every workspace is in use and the queue for them is full.
@@ -125,7 +139,16 @@ impl HashPool {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    #[cfg(test)]
     fn with_workspace<T>(&self, work: impl FnOnce(&Workspace<'_>) -> T) -> Result<T, Busy> {
+        self.with_keyed_workspace(None, work)
+    }
+
+    fn with_keyed_workspace<T>(
+        &self,
+        secret: Option<&[u8]>,
+        work: impl FnOnce(&Workspace<'_>) -> T,
+    ) -> Result<T, Busy> {
         // Admitted or refused before the blocking section, so a refusal
         // costs no hand-off of this worker's queue to another thread.
         let lent = {
@@ -144,6 +167,7 @@ impl HashPool {
             work(&Workspace {
                 pool: self,
                 memory: RefCell::new(memory),
+                secret,
             })
         }))
     }
@@ -164,6 +188,7 @@ impl HashPool {
 pub(crate) struct Workspace<'a> {
     pool: &'a HashPool,
     memory: RefCell<Vec<Block>>,
+    secret: Option<&'a [u8]>,
 }
 
 impl Drop for Workspace<'_> {
@@ -204,7 +229,10 @@ impl CustomizedPasswordHasher<PasswordHash> for Workspace<'_> {
             .ok_or(password_hash::Error::OutputSize)?;
         let encoded_params = ParamsString::try_from(&params)?;
         let block_count = params.block_count();
-        let argon = Argon2::new(algorithm, version, params);
+        let argon = match self.secret {
+            Some(secret) => Argon2::new_with_secret(secret, algorithm, version, params)?,
+            None => Argon2::new(algorithm, version, params),
+        };
         {
             let mut memory = self.memory.borrow_mut();
             // Keep the largest trusted stored hash's workspace, so a

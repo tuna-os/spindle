@@ -70,6 +70,10 @@ async fn main() -> ExitCode {
         }
     }
 
+    if let Some(code) = mas_import_command() {
+        return code;
+    }
+
     // `spindle promote-admin <config> <localpart>` — the offline path
     // that mints the FIRST admin (#83). Every later admin is granted
     // through the API by an existing one, which keeps the grant in the
@@ -240,6 +244,123 @@ fn rehearsal_password(localpart: &str) -> Result<String, String> {
         return Err(format!("the rehearsal password for {localpart} is empty"));
     }
     Ok(password)
+}
+
+/// `spindle import-mas <config> --mas-database <postgres> [--mas-config
+/// <file>] [--dry-run]` -- carry MAS's accounts into the built-in provider
+/// (#797); see `import_mas`. `None` for any other command.
+fn mas_import_command() -> Option<ExitCode> {
+    if std::env::args().nth(1).as_deref() != Some("import-mas") {
+        return None;
+    }
+    #[cfg(feature = "mas-import")]
+    {
+        let arguments: Vec<String> = std::env::args().skip(2).collect();
+        // The postgres client runs a runtime of its own, which must not
+        // start inside this one.
+        Some(
+            if let Ok(code) = std::thread::spawn(move || import_mas(&arguments)).join() {
+                code
+            } else {
+                eprintln!("spindle: MAS import worker panicked");
+                ExitCode::FAILURE
+            },
+        )
+    }
+    #[cfg(not(feature = "mas-import"))]
+    {
+        eprintln!("spindle: rebuild with --features mas-import to use this command");
+        Some(ExitCode::FAILURE)
+    }
+}
+
+#[cfg(feature = "mas-import")]
+const IMPORT_MAS_USAGE: &str = "usage: spindle import-mas <config> --mas-database <postgres> \
+    [--mas-config <MAS config.yaml>] [--dry-run]";
+
+/// `spindle import-mas`: carry MAS's users, passwords, addresses, upstream
+/// links, admin flags and locks into the store (#797), offline.
+///
+/// * `--mas-database`: MAS's `PostgreSQL`, as a URL or key=value string.
+///   The password may come from `SPINDLE_MAS_DB_PASSWORD` instead.
+/// * `--mas-config`: the `config.yaml` MAS runs with. Its
+///   `passwords.schemes` say how each stored hash was made, secrets
+///   (peppers) included; without it MAS's default scheme is assumed.
+/// * `--dry-run`: decide and count everything, write nothing.
+///
+/// The JSON report goes to stdout. The exit is non-zero when anything MAS
+/// has was refused, so a script can tell a clean import from one that
+/// needs a look.
+#[cfg(feature = "mas-import")]
+fn import_mas(arguments: &[String]) -> ExitCode {
+    use spindle_server::import::mas;
+    let mut positional = Vec::new();
+    let (mut database, mut mas_config, mut dry_run) = (None, None, false);
+    let mut rest = arguments.iter();
+    while let Some(argument) = rest.next() {
+        match argument.as_str() {
+            "--mas-database" => database = rest.next(),
+            "--mas-config" => mas_config = rest.next(),
+            "--dry-run" => dry_run = true,
+            _ => positional.push(argument),
+        }
+    }
+    let ([config_path], Some(database)) = (positional.as_slice(), database) else {
+        eprintln!("{IMPORT_MAS_USAGE}");
+        return ExitCode::FAILURE;
+    };
+    let schemes = match mas_config {
+        Some(path) => match std::fs::read_to_string(path)
+            .map_err(|error| format!("{path}: {error}"))
+            .and_then(|yaml| mas::Schemes::from_mas_config(&yaml))
+        {
+            Ok(schemes) => schemes,
+            Err(error) => {
+                eprintln!("spindle: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => mas::Schemes::default(),
+    };
+    let Some((store, config)) = open_store_with_config(config_path) else {
+        return ExitCode::FAILURE;
+    };
+    let password = std::env::var("SPINDLE_MAS_DB_PASSWORD").ok();
+    let snapshot = match mas::postgres::connect_no_tls(database, password.as_deref())
+        .and_then(|mut client| mas::postgres::read(&mut client))
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!("spindle: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let report = match mas::apply(&store, &config, &snapshot, &schemes, dry_run) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("spindle: MAS import stopped: {error}; run it again to continue");
+            return ExitCode::FAILURE;
+        }
+    };
+    match serde_json::to_string_pretty(&report) {
+        Ok(text) => println!("{text}"),
+        Err(error) => {
+            eprintln!("spindle: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    if dry_run {
+        eprintln!("spindle: dry run, nothing written");
+    }
+    if report.refused.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "spindle: {} item(s) refused; see \"refused\" in the report",
+            report.refused.len()
+        );
+        ExitCode::FAILURE
+    }
 }
 
 #[cfg(feature = "synapse-import")]
@@ -1076,11 +1197,12 @@ fn promote_admin(config_path: &str, localpart: &str) -> ExitCode {
 }
 
 /// The credential commands, offline against the store:
-/// `spindle set-password-hash <config> [<localpart>]` stores Argon2 PHC
-/// hashes computed elsewhere (#611), read from stdin so they never sit in a
-/// process listing or shell history (with a localpart, stdin is that
-/// account's one hash; without, each line is `<localpart> <hash>`, the bulk
-/// path a MAS migration takes); and `spindle issue-reset-link <config>
+/// `spindle set-password-hash <config> [<localpart>]` stores Argon2 PHC or
+/// bcrypt hashes computed elsewhere (#611), read from stdin so they never
+/// sit in a process listing or shell history (with a localpart, stdin is
+/// that account's one hash; without, each line is `<localpart> <hash>`;
+/// a MAS migration takes `import-mas`, which also carries each hash's
+/// scheme); and `spindle issue-reset-link <config>
 /// <localpart> [--ttl 24h]` prints a password-reset link for a server that
 /// sends no mail (the running server's equivalent is the admin API's
 /// `reset_link`). `None` when the command is neither.
